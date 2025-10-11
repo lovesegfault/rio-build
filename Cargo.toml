@@ -19,8 +19,11 @@ tonic = "0.12"
 prost = "0.13"
 
 # SSH
-russh = "0.45"
-russh-keys = "0.45"
+russh = "0.54.5"
+rand_core = "0.6"
+
+# Async traits
+async-trait = "0.1"
 
 # Nix protocol
 nix-daemon = "0.1"
