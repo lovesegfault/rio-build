@@ -48,5 +48,8 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 
+# CLI
+clap = { workspace = true }
+
 [dev-dependencies]
 tokio-stream = "0.1"

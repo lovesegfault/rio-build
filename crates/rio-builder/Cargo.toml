@@ -38,3 +38,6 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 hostname = "0.4"
 num_cpus = "1.16"
+
+# CLI
+clap = { workspace = true }
