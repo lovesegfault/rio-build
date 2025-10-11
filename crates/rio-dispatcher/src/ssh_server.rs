@@ -208,3 +208,116 @@ impl server::Handler for SshHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_generate_temporary_key() {
+        // Should generate a key without saving to disk
+        let key = SshServer::load_or_generate_host_key(None)
+            .await
+            .expect("Failed to generate temporary key");
+
+        // Verify we got a valid key that can be serialized
+        let serialized = key
+            .to_openssh(LineEnding::LF)
+            .expect("Should be able to serialize key");
+        assert!(!serialized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_and_save_key() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let key_path = Utf8Path::from_path(temp_dir.path())
+            .expect("Path is not UTF-8")
+            .join("test_host_key");
+
+        // Generate and save key
+        let key1 = SshServer::load_or_generate_host_key(Some(&key_path))
+            .await
+            .expect("Failed to generate key");
+
+        // Verify file was created
+        assert!(key_path.exists(), "Key file should exist");
+
+        // Verify file content is valid OpenSSH format
+        let content = std::fs::read_to_string(key_path.as_std_path())
+            .expect("Should be able to read key file");
+        assert!(content.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+
+        // Verify permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata =
+                std::fs::metadata(key_path.as_std_path()).expect("Failed to get metadata");
+            let mode = metadata.permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "Key file should have 0600 permissions");
+        }
+
+        // Load the key back
+        let key2 = SshServer::load_or_generate_host_key(Some(&key_path))
+            .await
+            .expect("Failed to load key");
+
+        // Verify both keys can be serialized (they're valid)
+        let ser1 = key1
+            .to_openssh(LineEnding::LF)
+            .expect("Key1 should serialize");
+        let ser2 = key2
+            .to_openssh(LineEnding::LF)
+            .expect("Key2 should serialize");
+
+        // The serialized keys should be identical
+        assert_eq!(
+            ser1.as_str(),
+            ser2.as_str(),
+            "Loaded key should match saved key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_nonexistent_key_generates_new() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let key_path = Utf8Path::from_path(temp_dir.path())
+            .expect("Path is not UTF-8")
+            .join("nonexistent_key");
+
+        // Should generate a new key since file doesn't exist
+        let key = SshServer::load_or_generate_host_key(Some(&key_path))
+            .await
+            .expect("Failed to generate key");
+
+        assert!(key_path.exists(), "Key file should have been created");
+
+        // Verify it's a valid key
+        let serialized = key
+            .to_openssh(LineEnding::LF)
+            .expect("Should be able to serialize key");
+        assert!(!serialized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_parent_directory() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let key_path = Utf8Path::from_path(temp_dir.path())
+            .expect("Path is not UTF-8")
+            .join("nested")
+            .join("directories")
+            .join("host_key");
+
+        // Should create parent directories automatically
+        let _key = SshServer::load_or_generate_host_key(Some(&key_path))
+            .await
+            .expect("Failed to generate key with nested directories");
+
+        assert!(key_path.exists(), "Key file should exist");
+        assert!(
+            key_path.parent().unwrap().exists(),
+            "Parent directory should exist"
+        );
+    }
+}
