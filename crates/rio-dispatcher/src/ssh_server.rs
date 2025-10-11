@@ -1,10 +1,13 @@
 // SSH server implementation using russh
 
 use anyhow::{Context, Result};
-use russh::keys::{PrivateKey, PublicKey};
+use rand_core::OsRng;
+use russh::keys::ssh_encoding::LineEnding;
+use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
@@ -39,6 +42,71 @@ pub struct SshServer {
 impl SshServer {
     pub fn new(config: SshConfig) -> Self {
         Self { config }
+    }
+
+    /// Generate or load SSH host key
+    pub async fn load_or_generate_host_key(path: Option<&Path>) -> Result<PrivateKey> {
+        if let Some(key_path) = path {
+            // Try to load existing key
+            if key_path.exists() {
+                info!("Loading SSH host key from {:?}", key_path);
+                let key_data = tokio::fs::read(key_path)
+                    .await
+                    .context("Failed to read SSH host key file")?;
+
+                let key =
+                    PrivateKey::from_openssh(&key_data).context("Failed to parse SSH host key")?;
+
+                info!("Successfully loaded SSH host key");
+                return Ok(key);
+            } else {
+                info!("Host key not found at {:?}, generating new key", key_path);
+            }
+        } else {
+            info!("No host key path specified, generating temporary key");
+        }
+
+        // Generate new Ed25519 key
+        info!("Generating new Ed25519 SSH host key");
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .context("Failed to generate SSH host key")?;
+
+        // Save key if path was provided
+        if let Some(key_path) = path {
+            // Create parent directory if needed
+            if let Some(parent) = key_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context("Failed to create host key directory")?;
+            }
+
+            // Save key in OpenSSH format
+            let key_data = key
+                .to_openssh(LineEnding::LF)
+                .context("Failed to serialize SSH host key")?;
+
+            tokio::fs::write(key_path, key_data)
+                .await
+                .context("Failed to write SSH host key file")?;
+
+            // Set restrictive permissions on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = tokio::fs::metadata(key_path)
+                    .await
+                    .context("Failed to get key file metadata")?
+                    .permissions();
+                perms.set_mode(0o600);
+                tokio::fs::set_permissions(key_path, perms)
+                    .await
+                    .context("Failed to set key file permissions")?;
+            }
+
+            info!("Saved SSH host key to {:?}", key_path);
+        }
+
+        Ok(key)
     }
 
     /// Start the SSH server
