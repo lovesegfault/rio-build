@@ -1,0 +1,55 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "filter": {
+          "toolNames": ["Edit", "Write"]
+        },
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-edit.sh",
+            "args": ["{{file_path}}"],
+            "stdin": "{{new_string}}"
+          }
+        ]
+      },
+      {
+        "filter": {
+          "toolNames": ["Bash"]
+        },
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-bash.sh",
+            "args": ["{{command}}"]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "filter": {
+          "toolNames": ["Edit"]
+        },
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/post-edit.sh",
+            "args": ["{{file_path}}"]
+          }
+        ]
+      }
+    ]
+  }
+}
