@@ -142,7 +142,7 @@
 
           # Configure git hooks
           pre-commit = {
-            check.enable = false; # Disable check until we have a Rust project
+            check.enable = true;
 
             settings = {
               hooks = {
