@@ -10,7 +10,7 @@ use tracing::{error, info};
 use crate::builder_pool::BuilderPool;
 
 pub struct BuildServiceImpl {
-    builder_pool: BuilderPool,
+    pub(crate) builder_pool: BuilderPool,
 }
 
 impl BuildServiceImpl {
@@ -110,7 +110,16 @@ impl BuildService for BuildServiceImpl {
         let builder_id = BuilderId::from_string(request.into_inner().builder_id);
 
         match self.builder_pool.get_builder(&builder_id).await {
-            Some(builder_info) => Ok(Response::new(builder_info.status)),
+            Some(builder_info) => Ok(Response::new(BuilderStatus {
+                builder_id: builder_info.id.to_string(),
+                state: builder_info.status.state,
+                capacity: builder_info.status.capacity,
+                available_capacity: builder_info.status.available_capacity,
+                current_jobs: builder_info.status.current_jobs,
+                total_builds: builder_info.status.total_builds,
+                successful_builds: builder_info.status.successful_builds,
+                failed_builds: builder_info.status.failed_builds,
+            })),
             None => Err(Status::not_found("Builder not found")),
         }
     }

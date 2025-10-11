@@ -73,9 +73,11 @@ This file tracks all implementation tasks for Rio, organized by development phas
 - [x] Create placeholder executor module
 
 ### Testing ✅
-- [x] End-to-end test: Builder registration
-- [x] End-to-end test: Heartbeat streaming
-- [x] Verify builder appears in dispatcher pool
+- [x] Integration test: Builder registration
+- [x] Integration test: Multiple builder registration
+- [x] Integration test: Builder status query
+- [x] Integration test: Heartbeat streaming
+- [x] Verify builders appear in dispatcher pool
 
 ## Phase 2: SSH Server & Nix Protocol (In Progress)
 

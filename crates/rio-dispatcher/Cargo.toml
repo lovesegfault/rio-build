@@ -9,6 +9,10 @@ license.workspace = true
 name = "rio-dispatcher"
 path = "src/main.rs"
 
+[lib]
+name = "rio_dispatcher"
+path = "src/lib.rs"
+
 [dependencies]
 rio-common = { path = "../rio-common" }
 
@@ -43,3 +47,6 @@ thiserror = { workspace = true }
 # Utilities
 uuid = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = "0.1"
