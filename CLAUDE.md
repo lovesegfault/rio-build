@@ -41,11 +41,21 @@ cargo fmt
 # Watch for changes and rebuild
 cargo watch -x check
 
-# Run the dispatcher
+# Run the dispatcher (with defaults)
 cargo run -p rio-dispatcher
 
-# Run a builder
+# Run the dispatcher with custom settings
+cargo run -p rio-dispatcher -- --grpc-addr=0.0.0.0:50051 --ssh-addr=0.0.0.0:2222 --log-level=debug
+
+# Run a builder (auto-detects platform)
 cargo run -p rio-builder
+
+# Run a builder with custom settings
+cargo run -p rio-builder -- --dispatcher-endpoint=http://dispatcher:50051 --platforms=x86_64-linux,aarch64-linux --features=kvm
+
+# View CLI help
+cargo run -p rio-dispatcher -- --help
+cargo run -p rio-builder -- --help
 ```
 
 ## Architecture Overview

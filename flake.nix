@@ -145,30 +145,8 @@
               # Run treefmt on all files
               treefmt.enable = true;
 
-              # Rust-specific hooks (only run if Cargo.toml exists)
-              cargo-check = {
-                enable = true;
-                description = "Run cargo check";
-                entry = "${pkgs.writeShellScript "cargo-check-hook" ''
-                  if [ -f "Cargo.toml" ]; then
-                    ${rustToolchain}/bin/cargo check
-                  fi
-                ''}";
-                files = "\\.rs$";
-                pass_filenames = false;
-              };
-
-              clippy = {
-                enable = true;
-                description = "Run cargo clippy";
-                entry = "${pkgs.writeShellScript "clippy-hook" ''
-                  if [ -f "Cargo.toml" ]; then
-                    ${rustToolchain}/bin/cargo clippy -- -D warnings
-                  fi
-                ''}";
-                files = "\\.rs$";
-                pass_filenames = false;
-              };
+              # Note: cargo-check and clippy hooks disabled in favor of crane checks
+              # which run via 'nix flake check' and properly handle protoc dependency
             };
           };
         };

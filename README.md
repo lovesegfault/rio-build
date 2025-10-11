@@ -63,12 +63,32 @@ Terminal 1 - Start dispatcher:
 ```bash
 nix develop
 cargo run -p rio-dispatcher
+# or with custom settings:
+cargo run -p rio-dispatcher -- --grpc-addr=0.0.0.0:50051 --log-level=debug
 ```
 
 Terminal 2 - Start a builder:
 ```bash
 nix develop
 cargo run -p rio-builder
+# or with custom settings:
+cargo run -p rio-builder -- --platforms=x86_64-linux --features=kvm
 ```
 
 You should see the builder register and start sending heartbeats!
+
+## CLI Reference
+
+Both binaries support configuration via CLI arguments or environment variables:
+
+**rio-dispatcher:**
+- `--grpc-addr` (env: `RIO_GRPC_ADDR`): gRPC server address (default: 0.0.0.0:50051)
+- `--ssh-addr` (env: `RIO_SSH_ADDR`): SSH server address (default: 0.0.0.0:2222)
+- `--ssh-host-key` (env: `RIO_SSH_HOST_KEY`): Path to SSH host key
+- `--log-level` (env: `RIO_LOG_LEVEL`): Log level (default: info)
+
+**rio-builder:**
+- `--dispatcher-endpoint` (env: `RIO_DISPATCHER_ENDPOINT`): Dispatcher to connect to (default: http://localhost:50051)
+- `--platforms` (env: `RIO_PLATFORMS`): Platforms to support, comma-separated (auto-detected if not provided)
+- `--features` (env: `RIO_FEATURES`): Features to advertise, comma-separated
+- `--log-level` (env: `RIO_LOG_LEVEL`): Log level (default: info)
