@@ -1,10 +1,11 @@
-use rio_common::{proto::BuilderStatus, BuilderId, Platform};
+use rio_common::{BuilderId, Platform, proto::BuilderStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct BuilderInfo {
     pub id: BuilderId,
     pub endpoint: String,
@@ -34,12 +35,12 @@ impl BuilderPool {
         platforms: Vec<String>,
         features: Vec<String>,
     ) -> Result<(), String> {
-        let platforms: Vec<Platform> = platforms.iter().map(|s| Platform::from_str(s)).collect();
+        let platforms: Vec<Platform> = platforms
+            .iter()
+            .map(|s| s.parse().expect("Invalid platform string"))
+            .collect();
 
-        info!(
-            "Registering builder {} with platforms: {:?}",
-            id, platforms
-        );
+        info!("Registering builder {} with platforms: {:?}", id, platforms);
 
         let builder_info = BuilderInfo {
             id: id.clone(),
@@ -57,6 +58,7 @@ impl BuilderPool {
     }
 
     /// Remove a builder from the pool
+    #[allow(dead_code)]
     pub async fn unregister_builder(&self, id: &BuilderId) {
         let mut builders = self.builders.write().await;
         if builders.remove(id).is_some() {
@@ -73,12 +75,14 @@ impl BuilderPool {
     }
 
     /// Get all registered builders
+    #[allow(dead_code)]
     pub async fn get_all_builders(&self) -> Vec<BuilderInfo> {
         let builders = self.builders.read().await;
         builders.values().cloned().collect()
     }
 
     /// Get builders that support a specific platform
+    #[allow(dead_code)]
     pub async fn get_builders_for_platform(&self, platform: &Platform) -> Vec<BuilderInfo> {
         let builders = self.builders.read().await;
         builders
@@ -89,6 +93,7 @@ impl BuilderPool {
     }
 
     /// Get count of registered builders
+    #[allow(dead_code)]
     pub async fn builder_count(&self) -> usize {
         let builders = self.builders.read().await;
         builders.len()

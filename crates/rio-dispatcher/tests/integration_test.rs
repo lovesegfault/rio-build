@@ -1,8 +1,8 @@
 use rio_common::proto::{
-    build_service_client::BuildServiceClient, BuilderCapacity, RegisterBuilderRequest,
+    BuilderCapacity, RegisterBuilderRequest, build_service_client::BuildServiceClient,
 };
 use std::net::SocketAddr;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Helper to start dispatcher in background
 async fn start_test_dispatcher() -> (tokio::task::JoinHandle<()>, SocketAddr) {
@@ -63,8 +63,7 @@ async fn test_builder_registration() {
 
     assert!(response.success, "Registration should succeed");
     assert_eq!(
-        response.message,
-        "Builder registered successfully",
+        response.message, "Builder registered successfully",
         "Expected success message"
     );
 }
@@ -90,7 +89,11 @@ async fn test_multiple_builder_registration() {
         features: vec![],
     };
 
-    let response1 = client1.register_builder(request1).await.unwrap().into_inner();
+    let response1 = client1
+        .register_builder(request1)
+        .await
+        .unwrap()
+        .into_inner();
     assert!(response1.success);
 
     // Register second builder
@@ -110,7 +113,11 @@ async fn test_multiple_builder_registration() {
         features: vec!["kvm".to_string()],
     };
 
-    let response2 = client2.register_builder(request2).await.unwrap().into_inner();
+    let response2 = client2
+        .register_builder(request2)
+        .await
+        .unwrap()
+        .into_inner();
     assert!(response2.success);
 }
 

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use rio_common::{
-    proto::{
-        build_service_client::BuildServiceClient, BuilderCapacity, HeartbeatRequest,
-        RegisterBuilderRequest,
-    },
     BuilderId, Platform,
+    proto::{
+        BuilderCapacity, HeartbeatRequest, RegisterBuilderRequest,
+        build_service_client::BuildServiceClient,
+    },
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::transport::Channel;
@@ -35,10 +35,7 @@ impl Builder {
 
     /// Connect to the dispatcher
     pub async fn connect(&mut self) -> Result<()> {
-        info!(
-            "Connecting to dispatcher at {}",
-            self.dispatcher_endpoint
-        );
+        info!("Connecting to dispatcher at {}", self.dispatcher_endpoint);
 
         let client = BuildServiceClient::connect(self.dispatcher_endpoint.clone())
             .await
