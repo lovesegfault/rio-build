@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package rio.v1;
+
+// Service for communication between dispatcher and builders
+service BuildService {
+  // Builder registers with dispatcher on startup
+  rpc RegisterBuilder(RegisterBuilderRequest) returns (RegisterBuilderResponse);
+
+  // Builder sends periodic heartbeats to dispatcher
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // Dispatcher sends build job to builder
+  rpc ExecuteBuild(ExecuteBuildRequest) returns (stream ExecuteBuildResponse);
+
+  // Dispatcher queries builder status
+  rpc GetBuilderStatus(GetBuilderStatusRequest) returns (BuilderStatus);
+}
+
+// Builder registration
+message RegisterBuilderRequest {
+  string builder_id = 1;
+  string endpoint = 2;
+  BuilderCapacity capacity = 3;
+  repeated string platforms = 4; // e.g., "x86_64-linux", "aarch64-darwin"
+  repeated string features = 5; // e.g., "kvm", "benchmark"
+}
+
+message RegisterBuilderResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Heartbeat
+message HeartbeatRequest {
+  string builder_id = 1;
+  int64 timestamp = 2; // Unix timestamp
+  float current_load = 3; // 0.0 - 1.0
+  BuilderCapacity available_capacity = 4;
+}
+
+message HeartbeatResponse {
+  // Dispatcher can send commands or config updates
+  repeated string commands = 1;
+}
+
+// Build execution
+message ExecuteBuildRequest {
+  string job_id = 1;
+  bytes derivation = 2; // Serialized .drv file
+  repeated string required_systems = 3;
+  map<string, string> env = 4;
+  optional int32 timeout_seconds = 5;
+}
+
+message ExecuteBuildResponse {
+  string job_id = 1;
+  oneof update {
+    LogLine log = 2;
+    BuildCompleted completed = 3;
+    BuildFailed failed = 4;
+  }
+}
+
+message LogLine {
+  int64 timestamp = 1;
+  string line = 2;
+}
+
+message BuildCompleted {
+  repeated string output_paths = 1; // Store paths of build outputs
+  int64 duration_ms = 2;
+}
+
+message BuildFailed {
+  string error = 1;
+  optional string stderr = 2;
+  int32 exit_code = 3;
+}
+
+// Builder status query
+message GetBuilderStatusRequest {
+  string builder_id = 1;
+}
+
+message BuilderStatus {
+  string builder_id = 1;
+  BuilderState state = 2;
+  BuilderCapacity capacity = 3;
+  BuilderCapacity available_capacity = 4;
+  repeated string current_jobs = 5;
+  int64 total_builds = 6;
+  int64 successful_builds = 7;
+  int64 failed_builds = 8;
+}
+
+enum BuilderState {
+  BUILDER_STATE_UNSPECIFIED = 0;
+  BUILDER_STATE_AVAILABLE = 1;
+  BUILDER_STATE_BUSY = 2;
+  BUILDER_STATE_OFFLINE = 3;
+}
+
+// Builder capacity
+message BuilderCapacity {
+  int32 cpu_cores = 1;
+  int64 memory_mb = 2;
+  int64 disk_gb = 3;
+}
