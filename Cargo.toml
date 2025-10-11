@@ -43,6 +43,7 @@ thiserror = "2.0"
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
 bytes = "1.9"
+camino = "1.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
