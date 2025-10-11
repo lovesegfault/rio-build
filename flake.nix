@@ -146,6 +146,11 @@
             cargo-expand
             cargo-outdated
 
+            # Build dependencies
+            protobuf
+            pkg-config
+            openssl
+
             # Development tools
             git
             just
