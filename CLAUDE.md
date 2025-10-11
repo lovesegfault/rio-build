@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Quick Start Commands
 
-This is a Rust library project managed with Nix flakes for the development environment.
+This is a Rust workspace project with two binaries (`rio-dispatcher` and `rio-builder`) managed with Nix flakes.
 
 ```bash
 # Enter development environment (using direnv, already configured)
@@ -13,8 +13,12 @@ direnv allow
 # Or manually enter the Nix development shell
 nix develop
 
-# Build the project
+# Build all workspace members
 cargo build
+
+# Build specific binary
+cargo build -p rio-dispatcher
+cargo build -p rio-builder
 
 # Run tests
 cargo test
@@ -36,27 +40,46 @@ cargo fmt
 
 # Watch for changes and rebuild
 cargo watch -x check
+
+# Run the dispatcher
+cargo run -p rio-dispatcher
+
+# Run a builder
+cargo run -p rio-builder
 ```
 
 ## Architecture Overview
 
-**Project Type**: Rust library for distributed Nix builds
+**Project Type**: Distributed build service for Nix (open-source nixbuild.net alternative)
+
+**Project Structure**:
+- Cargo workspace with 3 crates:
+  - `rio-dispatcher`: Fleet manager and SSH frontend (binary)
+  - `rio-builder`: Worker node that executes builds (binary)
+  - `rio-common`: Shared types and gRPC protocol definitions (library)
 
 **Development Environment**:
 - Managed by Nix flakes with flake-parts
-- Uses rust-overlay for stable Rust toolchain with extensions (rust-src, rust-analyzer, clippy, rustfmt)
+- Uses rust-overlay for stable Rust toolchain with extensions
+- Requires protobuf compiler (protoc) for gRPC code generation
 - Pre-commit hooks configured via git-hooks.nix (cargo check, clippy)
 - Multi-formatter setup with treefmt (alejandra for Nix, rustfmt for Rust, taplo for TOML)
 
 **Key Files**:
 - `flake.nix`: Defines development environment, tools, and hooks
-- `Cargo.toml`: Rust project metadata (edition 2024)
-- `src/lib.rs`: Library entry point
+- `DESIGN.md`: Comprehensive architecture and design decisions
+- `Cargo.toml`: Workspace manifest
+- `crates/rio-common/proto/build_service.proto`: gRPC service definition
 
-**Tooling**:
-- Cargo extensions available: cargo-edit, cargo-watch, cargo-expand, cargo-outdated
-- Debugging tools: lldb, gdb
-- Pre-commit hooks will auto-install when entering dev shell
+**Communication**:
+- Client ↔ Dispatcher: SSH with Nix daemon protocol (using `nix-daemon` crate)
+- Dispatcher ↔ Builder: gRPC (using `tonic`)
+
+**Dependencies**:
+- `nix-daemon` (0.1.x): Nix protocol implementation in Rust
+- `russh`: SSH server/client
+- `tonic`: gRPC framework
+- `tokio`: Async runtime
 
 ## Development Gotchas
 
