@@ -1,13 +1,13 @@
 // SSH server implementation using russh
 
 use anyhow::{Context, Result};
+use camino::Utf8Path;
 use rand_core::OsRng;
 use russh::keys::ssh_encoding::LineEnding;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
@@ -45,22 +45,23 @@ impl SshServer {
     }
 
     /// Generate or load SSH host key
-    pub async fn load_or_generate_host_key(path: Option<&Path>) -> Result<PrivateKey> {
+    pub async fn load_or_generate_host_key(path: Option<&Utf8Path>) -> Result<PrivateKey> {
         if let Some(key_path) = path {
             // Try to load existing key
             if key_path.exists() {
-                info!("Loading SSH host key from {:?}", key_path);
+                info!("Loading SSH host key from {}", key_path);
                 let key_data = tokio::fs::read(key_path)
                     .await
-                    .context("Failed to read SSH host key file")?;
+                    .with_context(|| format!("Failed to read SSH host key file: {}", key_path))?;
 
-                let key =
-                    PrivateKey::from_openssh(&key_data).context("Failed to parse SSH host key")?;
+                let key = PrivateKey::from_openssh(&key_data).with_context(|| {
+                    format!("Failed to parse SSH host key from file: {}", key_path)
+                })?;
 
-                info!("Successfully loaded SSH host key");
+                info!("Successfully loaded SSH host key from {}", key_path);
                 return Ok(key);
             } else {
-                info!("Host key not found at {:?}, generating new key", key_path);
+                info!("Host key not found at {}, generating new key", key_path);
             }
         } else {
             info!("No host key path specified, generating temporary key");
@@ -77,33 +78,35 @@ impl SshServer {
             if let Some(parent) = key_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
-                    .context("Failed to create host key directory")?;
+                    .with_context(|| format!("Failed to create host key directory: {}", parent))?;
             }
 
             // Save key in OpenSSH format
             let key_data = key
                 .to_openssh(LineEnding::LF)
-                .context("Failed to serialize SSH host key")?;
+                .context("Failed to serialize SSH host key to OpenSSH format")?;
 
             tokio::fs::write(key_path, key_data)
                 .await
-                .context("Failed to write SSH host key file")?;
+                .with_context(|| format!("Failed to write SSH host key file: {}", key_path))?;
 
             // Set restrictive permissions on Unix
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = tokio::fs::metadata(key_path)
+                let metadata = tokio::fs::metadata(key_path).await.with_context(|| {
+                    format!("Failed to get file metadata for key file: {}", key_path)
+                })?;
+                let mut new_perms = metadata.permissions();
+                new_perms.set_mode(0o600);
+                tokio::fs::set_permissions(key_path, new_perms)
                     .await
-                    .context("Failed to get key file metadata")?
-                    .permissions();
-                perms.set_mode(0o600);
-                tokio::fs::set_permissions(key_path, perms)
-                    .await
-                    .context("Failed to set key file permissions")?;
+                    .with_context(|| {
+                        format!("Failed to set permissions (0600) on key file: {}", key_path)
+                    })?;
             }
 
-            info!("Saved SSH host key to {:?}", key_path);
+            info!("Saved SSH host key to {}", key_path);
         }
 
         Ok(key)

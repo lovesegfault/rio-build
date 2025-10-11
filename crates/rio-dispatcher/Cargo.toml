@@ -48,6 +48,7 @@ thiserror = { workspace = true }
 # Utilities
 uuid = { workspace = true }
 bytes = { workspace = true }
+camino = { workspace = true }
 
 # CLI
 clap = { workspace = true }
