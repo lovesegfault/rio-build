@@ -81,21 +81,24 @@ This file tracks all implementation tasks for Rio, organized by development phas
 
 ## Phase 2: SSH Server & Nix Protocol (In Progress)
 
-### SSH Server Implementation
-- [ ] Set up russh SSH server in dispatcher
-  - [ ] Configure SSH server listener
-  - [ ] Public key authentication
-  - [ ] Session management
-  - [ ] Channel handling for Nix protocol
-- [ ] Implement SSH connection handling
-  - [ ] Accept incoming SSH connections
-  - [ ] Authenticate clients
-  - [ ] Create session for each connection
-  - [ ] Route to Nix protocol handler
-- [ ] Configuration
-  - [ ] SSH server port (default 2222)
-  - [ ] Host key generation/loading
-  - [ ] Authorized keys management
+### SSH Server Implementation ✅
+- [x] Set up russh SSH server in dispatcher
+  - [x] Configure SSH server listener (russh 0.54.5)
+  - [x] Basic Handler trait implementation
+  - [ ] Public key authentication (accepting all for now - TODO: proper auth)
+  - [x] Session management
+  - [x] Channel handling (basic echo for testing)
+- [x] Implement SSH connection handling
+  - [x] Accept incoming SSH connections
+  - [x] Authenticate clients (development mode - accept all)
+  - [x] Create session for each connection
+  - [ ] Route to Nix protocol handler (TODO)
+- [x] Configuration
+  - [x] SSH server port (default 2222, via CLI args)
+  - [x] Host key generation/loading (Ed25519, OpenSSH format)
+  - [x] Auto-generate keys if missing
+  - [x] Proper file permissions (0600 on Unix)
+  - [ ] Authorized keys management (TODO)
 
 ### Nix Protocol Implementation
 - [ ] Study nix-daemon crate API
@@ -384,15 +387,20 @@ This file tracks all implementation tasks for Rio, organized by development phas
 
 ## Current Focus
 
-**Next Up: Phase 2 - SSH Server & Nix Protocol**
+**Phase 2 Progress:**
+- ✅ SSH server infrastructure (russh 0.54.5)
+- ✅ Host key generation/loading with tests
+- ✅ 79.4% test coverage on implemented features
+- 🚧 Next: Nix protocol Store trait implementation
 
-Priority tasks:
-1. Set up russh SSH server in dispatcher
-2. Implement basic Nix protocol Store trait
-3. Parse derivation files
-4. Implement build queue
-5. Implement basic scheduler (round-robin)
+**Priority tasks:**
+1. Study nix-daemon crate API and Store trait
+2. Implement basic Nix protocol Store trait for Dispatcher
+3. Connect SSH channels to Nix protocol handler
+4. Parse derivation files
+5. Implement build queue
+6. Implement basic scheduler (round-robin)
 
 ---
 
-Last updated: 2025-10-11
+Last updated: 2025-10-11 (4 commits, 79.4% coverage)
