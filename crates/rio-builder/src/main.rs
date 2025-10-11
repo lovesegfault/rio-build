@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rio_common::Platform;
-use tracing::{error, info, Level};
+use tracing::{Level, error, info};
 
 mod builder;
 mod executor;

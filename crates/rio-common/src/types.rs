@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// Unique identifier for a builder
@@ -73,16 +74,6 @@ pub enum Platform {
 }
 
 impl Platform {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "x86_64-linux" => Platform::X86_64Linux,
-            "aarch64-linux" => Platform::Aarch64Linux,
-            "x86_64-darwin" => Platform::X86_64Darwin,
-            "aarch64-darwin" => Platform::Aarch64Darwin,
-            other => Platform::Other(other.to_string()),
-        }
-    }
-
     pub fn as_str(&self) -> &str {
         match self {
             Platform::X86_64Linux => "x86_64-linux",
@@ -91,6 +82,20 @@ impl Platform {
             Platform::Aarch64Darwin => "aarch64-darwin",
             Platform::Other(s) => s,
         }
+    }
+}
+
+impl FromStr for Platform {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "x86_64-linux" => Platform::X86_64Linux,
+            "aarch64-linux" => Platform::Aarch64Linux,
+            "x86_64-darwin" => Platform::X86_64Darwin,
+            "aarch64-darwin" => Platform::Aarch64Darwin,
+            other => Platform::Other(other.to_string()),
+        })
     }
 }
 

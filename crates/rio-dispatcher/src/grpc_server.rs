@@ -1,10 +1,10 @@
+use rio_common::BuilderId;
 use rio_common::proto::{
-    build_service_server::{BuildService, BuildServiceServer},
     BuilderStatus, ExecuteBuildRequest, ExecuteBuildResponse, GetBuilderStatusRequest,
     HeartbeatRequest, HeartbeatResponse, RegisterBuilderRequest, RegisterBuilderResponse,
+    build_service_server::{BuildService, BuildServiceServer},
 };
-use rio_common::BuilderId;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info};
 
 use crate::builder_pool::BuilderPool;
@@ -36,12 +36,7 @@ impl BuildService for BuildServiceImpl {
 
         match self
             .builder_pool
-            .register_builder(
-                builder_id,
-                req.endpoint,
-                req.platforms,
-                req.features,
-            )
+            .register_builder(builder_id, req.endpoint, req.platforms, req.features)
             .await
         {
             Ok(()) => Ok(Response::new(RegisterBuilderResponse {
@@ -58,7 +53,8 @@ impl BuildService for BuildServiceImpl {
         }
     }
 
-    type HeartbeatStream = tokio_stream::wrappers::ReceiverStream<Result<HeartbeatResponse, Status>>;
+    type HeartbeatStream =
+        tokio_stream::wrappers::ReceiverStream<Result<HeartbeatResponse, Status>>;
 
     async fn heartbeat(
         &self,
@@ -98,9 +94,7 @@ impl BuildService for BuildServiceImpl {
         _request: Request<ExecuteBuildRequest>,
     ) -> Result<Response<Self::ExecuteBuildStream>, Status> {
         // TODO: Implement build execution
-        Err(Status::unimplemented(
-            "Build execution not yet implemented",
-        ))
+        Err(Status::unimplemented("Build execution not yet implemented"))
     }
 
     async fn get_builder_status(

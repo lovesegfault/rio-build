@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::net::SocketAddr;
-use tracing::{info, Level};
+use tracing::{Level, info};
 
 mod build_queue;
 mod builder_pool;

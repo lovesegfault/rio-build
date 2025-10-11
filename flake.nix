@@ -11,6 +11,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    crane.url = "github:ipetkov/crane";
+
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -59,13 +61,52 @@
           targets = [pkgs.hostPlatform.rust.rustcTarget];
         };
 
-        # Build inputs for Rust projects
+        # Crane library for building Rust packages
+        craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+        # Source filter to include proto files
+        protoFilter = path: _type: builtins.match ".*proto$" path != null;
+        protoOrCargo = path: type:
+          (protoFilter path type) || (craneLib.filterCargoSources path type);
+
+        # Common arguments for all crane builds
+        commonArgs = {
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = protoOrCargo;
+          };
+          strictDeps = true;
+
+          pname = "rio";
+          version = "0.1.0";
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            protobuf
+          ];
+
+          buildInputs = with pkgs; [
+            openssl
+          ];
+        };
+
+        # Build dependencies only (for caching)
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        # Build the workspace
+        rio-workspace = craneLib.buildPackage (commonArgs
+          // {
+            inherit cargoArtifacts;
+            doCheck = false; # We'll run checks separately
+          });
+
+        # Build inputs for Rust projects (for devShell)
         buildInputs = with pkgs; [
           openssl
           pkg-config
         ];
 
-        # Native build inputs
+        # Native build inputs (for devShell)
         nativeBuildInputs = with pkgs; [
           pkg-config
         ];
@@ -180,6 +221,51 @@
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         };
 
+        # Packages
+        packages = {
+          default = rio-workspace;
+          rio-workspace = rio-workspace;
+
+          # Individual binaries (using workspace build)
+          rio-dispatcher = pkgs.runCommand "rio-dispatcher" {} ''
+            mkdir -p $out/bin
+            cp ${rio-workspace}/bin/rio-dispatcher $out/bin/
+          '';
+
+          rio-builder = pkgs.runCommand "rio-builder" {} ''
+            mkdir -p $out/bin
+            cp ${rio-workspace}/bin/rio-builder $out/bin/
+          '';
+        };
+
+        # Checks (run with 'nix flake check')
+        checks = {
+          # Clippy lints
+          rio-clippy = craneLib.cargoClippy (commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            });
+
+          # Run tests
+          rio-test = craneLib.cargoTest (commonArgs
+            // {
+              inherit cargoArtifacts;
+            });
+
+          # Documentation check
+          rio-doc = craneLib.cargoDoc (commonArgs
+            // {
+              inherit cargoArtifacts;
+            });
+
+          # Test coverage with tarpaulin
+          rio-coverage = craneLib.cargoTarpaulin (commonArgs
+            // {
+              inherit cargoArtifacts;
+            });
+        };
+
         # Formatter for 'nix fmt'
         formatter = config.treefmt.build.wrapper;
 
@@ -188,6 +274,16 @@
           format = {
             type = "app";
             program = "${config.treefmt.build.wrapper}/bin/treefmt";
+          };
+
+          dispatcher = {
+            type = "app";
+            program = "${self'.packages.rio-dispatcher}/bin/rio-dispatcher";
+          };
+
+          builder = {
+            type = "app";
+            program = "${self'.packages.rio-builder}/bin/rio-builder";
           };
         };
       };
