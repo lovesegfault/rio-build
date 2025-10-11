@@ -1,0 +1,19 @@
+# Ignore build outputs from performing a nix-build or `nix build` command
+result
+result-*
+
+# Ignore automatically generated direnv output
+.direnv
+
+# Pre-commit hooks
+.pre-commit-config.yaml
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+
+# Added by cargo
+
+/target
