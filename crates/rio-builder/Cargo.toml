@@ -38,6 +38,7 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 hostname = { workspace = true }
 num_cpus = { workspace = true }
+chrono = { workspace = true }
 
 # CLI
 clap = { workspace = true }

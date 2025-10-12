@@ -190,25 +190,28 @@ This file tracks all implementation tasks for Rio, organized by development phas
 
 ## Phase 3: Build Execution (Planned)
 
-### Builder Execution Engine
-- [ ] Implement Executor in rio-builder
-  - [ ] Receive build jobs via gRPC
-  - [ ] Parse derivation
-  - [ ] Check local /nix/store for dependencies
+### Builder Execution Engine 🚧
+- [x] Implement Executor in rio-builder
+  - [x] Create Executor struct with execute_build() method
+  - [x] Return simulated build responses (log + completion)
+  - [x] Add tracing instrumentation with job_id field
+  - [ ] Parse derivation bytes and save to temp file (TODO)
+  - [ ] Check local /nix/store for dependencies (TODO)
 - [ ] Invoke nix-build
-  - [ ] Execute: `nix-build /nix/store/xxx.drv`
-  - [ ] Capture stdout/stderr
-  - [ ] Stream logs to dispatcher in real-time
-  - [ ] Handle build timeouts
+  - [x] Add run_nix_build() helper method
+  - [x] Capture stdout/stderr with tokio::process::Command
+  - [x] Handle exit status and errors
+  - [ ] Stream logs to dispatcher in real-time (TODO: wire to gRPC)
+  - [ ] Handle build timeouts (TODO)
 - [ ] Handle build outputs
-  - [ ] Locate output paths
-  - [ ] Verify output hashes
-  - [ ] Prepare for transfer
+  - [ ] Locate output paths (TODO)
+  - [ ] Verify output hashes (TODO)
+  - [ ] Prepare for transfer (TODO)
 - [ ] Error handling
-  - [ ] Build failures
-  - [ ] Dependency fetch failures
-  - [ ] Timeout errors
-  - [ ] Out of disk space
+  - [x] Build failures (exit status check implemented)
+  - [ ] Dependency fetch failures (TODO)
+  - [ ] Timeout errors (TODO)
+  - [ ] Out of disk space (TODO)
 
 ### Output Transfer
 - [ ] Transfer build outputs to dispatcher
