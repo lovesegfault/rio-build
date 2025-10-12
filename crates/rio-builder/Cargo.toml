@@ -15,7 +15,7 @@ rio-common = { path = "../rio-common" }
 # Async
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 
 # gRPC client
 tonic = { workspace = true }
@@ -36,8 +36,8 @@ thiserror = { workspace = true }
 # Utilities
 uuid = { workspace = true }
 bytes = { workspace = true }
-hostname = "0.4"
-num_cpus = "1.16"
+hostname = { workspace = true }
+num_cpus = { workspace = true }
 
 # CLI
 clap = { workspace = true }

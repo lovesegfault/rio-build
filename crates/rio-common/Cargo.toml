@@ -12,7 +12,8 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 bytes = { workspace = true }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = { workspace = true }
