@@ -92,6 +92,51 @@
         "type": "github"
       }
     },
+    "nix": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1756804961,
+        "narHash": "sha256-TUkkfeQnfI7569O7bWI/v01GJct0OPYydLwINC6ksRo=",
+        "owner": "NixOS",
+        "repo": "nix",
+        "rev": "e7540a269b3b711d67ae27b1bc2f93cc2d39eb21",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "2.31-maintenance",
+        "repo": "nix",
+        "type": "github"
+      }
+    },
+    "nix-eval-jobs": {
+      "inputs": {
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "nix": "nix",
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "treefmt-nix": [
+          "treefmt-nix"
+        ]
+      },
+      "locked": {
+        "lastModified": 1759840730,
+        "narHash": "sha256-f51famzP/h5ShLmPZo9KHKgd21LO6xyPidgZn3MaGok=",
+        "owner": "lovesegfault",
+        "repo": "nix-eval-jobs",
+        "rev": "2f0b442853ac3221dc5303ac7128846100e7972e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "lovesegfault",
+        "ref": "for-rio",
+        "repo": "nix-eval-jobs",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1760038930,
@@ -128,6 +173,7 @@
         "crane": "crane",
         "flake-parts": "flake-parts",
         "git-hooks-nix": "git-hooks-nix",
+        "nix-eval-jobs": "nix-eval-jobs",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay",
         "treefmt-nix": "treefmt-nix"
