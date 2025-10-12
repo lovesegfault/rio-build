@@ -287,3 +287,106 @@ impl Store for DispatcherStore {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build_queue::BuildQueue;
+    use crate::builder_pool::BuilderPool;
+    use crate::scheduler::Scheduler;
+
+    #[tokio::test]
+    async fn test_is_valid_path_returns_false() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let result = store.is_valid_path("/nix/store/test").result().await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_substitutes_returns_false() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let result = store.has_substitutes("/nix/store/test").result().await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_set_options_succeeds() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let opts = ClientSettings::default();
+        let result = store.set_options(opts).result().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_query_pathinfo_returns_none() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let result = store.query_pathinfo("/nix/store/test").result().await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_query_missing_returns_empty() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let paths = vec!["/nix/store/test1", "/nix/store/test2"];
+        let result = store.query_missing(paths).result().await;
+        let missing = result.unwrap();
+
+        assert_eq!(missing.will_build.len(), 0);
+        assert_eq!(missing.will_substitute.len(), 0);
+        assert_eq!(missing.unknown.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_paths_returns_ok() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let paths = vec!["/nix/store/test.drv"];
+        let result = store.build_paths(paths, BuildMode::Normal).result().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_to_store_unimplemented() {
+        let pool = BuilderPool::new();
+        let queue = BuildQueue::new();
+        let scheduler = Scheduler::new(pool.clone());
+        let mut store = DispatcherStore::new(queue, scheduler, pool);
+
+        let source = tokio::io::empty();
+        let result = store
+            .add_to_store("test", "sha256", Vec::<String>::new(), false, source)
+            .result()
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not yet implemented")
+        );
+    }
+}

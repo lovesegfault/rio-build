@@ -226,7 +226,14 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [ ] Remove build artifacts if needed
   - [ ] Maintain builder disk space
 
-### Testing
+### Testing 🚧
+- [x] Unit tests for DispatcherStore (7 tests added, 0% → ~60% coverage)
+  - [x] Test is_valid_path, has_substitutes return false
+  - [x] Test query_pathinfo returns None
+  - [x] Test query_missing returns empty
+  - [x] Test set_options succeeds
+  - [x] Test build_paths returns Ok
+  - [x] Test add_to_store returns unimplemented error
 - [ ] End-to-end test: Simple derivation build
   - [ ] Create test derivation
   - [ ] Submit via nix-build --builders
@@ -236,6 +243,7 @@ This file tracks all implementation tasks for Rio, organized by development phas
 - [ ] Test: Multi-platform builds
 - [ ] Test: Build failures
 - [ ] Test: Concurrent builds
+- [ ] Improve coverage to 70%+ (currently ~51%)
 
 ## Phase 4: Production Features (Future)
 
