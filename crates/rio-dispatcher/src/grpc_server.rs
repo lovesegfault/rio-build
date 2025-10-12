@@ -1,10 +1,10 @@
-use rio_common::BuilderId;
 use rio_common::proto::{
     BuilderStatus, ExecuteBuildRequest, ExecuteBuildResponse, GetBuilderStatusRequest,
     HeartbeatRequest, HeartbeatResponse, RegisterBuilderRequest, RegisterBuilderResponse,
     build_service_client::BuildServiceClient,
     build_service_server::{BuildService, BuildServiceServer},
 };
+use rio_common::{BuilderId, DerivationInfo};
 use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info, warn};
 
@@ -25,6 +25,30 @@ impl BuildServiceImpl {
             build_queue,
             scheduler,
         }
+    }
+
+    /// Parse derivation bytes to extract the platform
+    async fn parse_derivation_platform(&self, derivation_bytes: &[u8]) -> anyhow::Result<String> {
+        use tokio::io::AsyncWriteExt;
+
+        // Write derivation to temporary file
+        let temp_dir = "/tmp/rio-dispatcher";
+        tokio::fs::create_dir_all(temp_dir).await?;
+
+        let drv_path = format!("{}/parse-{}.drv", temp_dir, uuid::Uuid::new_v4());
+
+        let mut file = tokio::fs::File::create(&drv_path).await?;
+        file.write_all(derivation_bytes).await?;
+        file.flush().await?;
+        drop(file);
+
+        // Parse derivation
+        let result = DerivationInfo::from_file(&drv_path).await;
+
+        // Clean up temp file
+        let _ = tokio::fs::remove_file(&drv_path).await;
+
+        result.map(|info| info.system)
     }
 }
 
@@ -107,9 +131,25 @@ impl BuildService for BuildServiceImpl {
         let req = request.into_inner();
         info!("Received build request: job_id={}", req.job_id);
 
-        // TODO: Parse derivation to extract platform
-        // For now, assume x86_64-linux
-        let platform = "x86_64-linux".to_string();
+        // Parse derivation to extract platform
+        let platform = if !req.derivation.is_empty() {
+            // Write derivation to temp file and parse it
+            match self.parse_derivation_platform(&req.derivation).await {
+                Ok(platform) => {
+                    info!("Extracted platform from derivation: {}", platform);
+                    platform
+                }
+                Err(e) => {
+                    error!("Failed to parse derivation: {}", e);
+                    // Fall back to x86_64-linux as a reasonable default
+                    warn!("Falling back to x86_64-linux platform");
+                    "x86_64-linux".to_string()
+                }
+            }
+        } else {
+            // No derivation provided, use default
+            "x86_64-linux".to_string()
+        };
 
         // Create build job
         let job = BuildJob::new(format!("/nix/store/{}.drv", req.job_id), platform);
