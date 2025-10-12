@@ -5,5 +5,6 @@ pub mod grpc_server;
 // Internal modules
 mod build_queue;
 mod dispatcher;
+mod nix_store;
 mod scheduler;
 mod ssh_server;
