@@ -70,6 +70,15 @@
           # Source root for filesets
           unfilteredRoot = ./.;
 
+          # Source for VM tests and modules (separate from crane builds)
+          testAndModuleSrc = pkgs.lib.fileset.toSource {
+            root = unfilteredRoot;
+            fileset = pkgs.lib.fileset.unions [
+              ./tests
+              ./modules
+            ];
+          };
+
           # Common arguments for all crane builds
           commonArgs = {
             src = pkgs.lib.fileset.toSource {
@@ -244,6 +253,77 @@
                 inherit cargoArtifacts;
               }
             );
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # VM end-to-end test (Linux only - requires KVM)
+            vm-e2e =
+              let
+                dispatcherModule = import ./modules/dispatcher.nix;
+                builderModule = import ./modules/builder.nix;
+              in
+              pkgs.testers.runNixOSTest {
+                name = "rio-distributed-build-e2e";
+
+                nodes = {
+                  dispatcher = {
+                    imports = [ dispatcherModule ];
+                    services.rio-dispatcher = {
+                      enable = true;
+                      package = self'.packages.rio-dispatcher;
+                      grpcAddress = "0.0.0.0:50051";
+                      sshAddress = "0.0.0.0:2222";
+                      logLevel = "debug";
+                    };
+                    nix.settings = {
+                      experimental-features = [
+                        "nix-command"
+                        "flakes"
+                      ];
+                      sandbox = false;
+                    };
+                  };
+
+                  builder = {
+                    imports = [ builderModule ];
+                    services.rio-builder = {
+                      enable = true;
+                      package = self'.packages.rio-builder;
+                      dispatcherEndpoint = "http://dispatcher:50051";
+                      grpcAddress = "0.0.0.0:50052";
+                      logLevel = "debug";
+                    };
+                    nix.settings = {
+                      experimental-features = [
+                        "nix-command"
+                        "flakes"
+                      ];
+                      sandbox = false;
+                    };
+                  };
+
+                  client = {
+                    environment.systemPackages = with pkgs; [
+                      nix
+                      openssh
+                    ];
+                    nix.settings = {
+                      experimental-features = [
+                        "nix-command"
+                        "flakes"
+                      ];
+                      max-jobs = 0;
+                    };
+                    programs.ssh.extraConfig = ''
+                      Host dispatcher
+                        StrictHostKeyChecking no
+                        UserKnownHostsFile /dev/null
+                        LogLevel ERROR
+                    '';
+                  };
+                };
+
+                testScript = builtins.readFile ./tests/vm-e2e-script.py;
+              };
           };
 
           # Formatter for 'nix fmt'
@@ -262,7 +342,37 @@
               program = "${self'.packages.rio-builder}/bin/rio-builder";
               meta.description = "Rio distributed build worker - executes Nix builds on worker nodes";
             };
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Interactive VM test runner (Linux only)
+            vm-test-interactive = {
+              type = "app";
+              program = toString (
+                pkgs.writeShellScript "vm-test-interactive" ''
+                  ${config.checks.vm-e2e.driverInteractive}/bin/nixos-test-driver
+                ''
+              );
+            };
           };
         };
+
+      # Flake-level outputs (not perSystem)
+      flake = {
+        # Export NixOS modules for use in other flakes
+        nixosModules = {
+          rio-dispatcher = import ./modules/dispatcher.nix;
+          rio-builder = import ./modules/builder.nix;
+
+          # Combined module that imports both
+          default =
+            { ... }:
+            {
+              imports = [
+                (import ./modules/dispatcher.nix)
+                (import ./modules/builder.nix)
+              ];
+            };
+        };
+      };
     };
 }
