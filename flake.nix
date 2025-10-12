@@ -198,22 +198,22 @@
             default = rio-workspace;
 
             # Individual packages built separately for better modularity
-            rio-dispatcher = craneLib.buildPackage (
+            rio-build = craneLib.buildPackage (
               commonArgs
               // {
                 inherit cargoArtifacts;
-                pname = "rio-dispatcher";
-                cargoExtraArgs = "-p rio-dispatcher";
+                pname = "rio-build";
+                cargoExtraArgs = "-p rio-build";
                 doCheck = false;
               }
             );
 
-            rio-builder = craneLib.buildPackage (
+            rio-agent = craneLib.buildPackage (
               commonArgs
               // {
                 inherit cargoArtifacts;
-                pname = "rio-builder";
-                cargoExtraArgs = "-p rio-builder";
+                pname = "rio-agent";
+                cargoExtraArgs = "-p rio-agent";
                 doCheck = false;
               }
             );
@@ -331,16 +331,16 @@
 
           # Apps
           apps = {
-            dispatcher = {
+            build = {
               type = "app";
-              program = "${self'.packages.rio-dispatcher}/bin/rio-dispatcher";
-              meta.description = "Rio distributed build dispatcher - manages build fleet and SSH frontend";
+              program = "${self'.packages.rio-build}/bin/rio-build";
+              meta.description = "Rio build CLI - submit builds to distributed agent cluster";
             };
 
-            builder = {
+            agent = {
               type = "app";
-              program = "${self'.packages.rio-builder}/bin/rio-builder";
-              meta.description = "Rio distributed build worker - executes Nix builds on worker nodes";
+              program = "${self'.packages.rio-agent}/bin/rio-agent";
+              meta.description = "Rio agent - cluster node that executes builds with Raft coordination";
             };
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {

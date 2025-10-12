@@ -1,105 +1,54 @@
 # Rio Implementation TODO
 
-This file tracks all implementation tasks for Rio, organized by development phase.
+This file tracks implementation tasks for the brokerless Rio architecture.
 
-## Phase 0: Project Setup ✅
+## Phase 1: Project Setup ✅
 
-- [x] Initialize Cargo workspace structure
-- [x] Set up Nix flake with Rust development environment
-- [x] Configure rust-overlay for stable toolchain
-- [x] Add protobuf compiler to development environment
-- [x] Set up pre-commit hooks (cargo check, clippy)
-- [x] Configure treefmt for code formatting
-- [x] Create .gitignore for Rust and Nix artifacts
-- [x] Write DESIGN.md with architecture documentation
-- [x] Write CLAUDE.md for development guidance
-- [x] Update README.md with project overview
+- [x] Clean up old broker-based architecture
+- [x] Create rio-build and rio-agent crates
+- [x] Update workspace structure
+- [x] Reset documentation for new design
 
-## Phase 1: gRPC Infrastructure ✅
+## Phase 2: Core Infrastructure (Next)
 
-### rio-common (Shared Protocol) ✅
-- [x] Define protobuf service specification (build_service.proto)
-  - [x] RegisterBuilder RPC
-  - [x] Heartbeat bidirectional streaming RPC
-  - [x] ExecuteBuild streaming RPC
-  - [x] GetBuilderStatus RPC
-- [x] Define protobuf messages
-  - [x] BuilderCapacity
-  - [x] BuilderStatus with state enum
-  - [x] Build request/response messages
-  - [x] Heartbeat request/response messages
-- [x] Create shared Rust types
-  - [x] BuilderId with UUID generation
-  - [x] JobId with UUID generation
-  - [x] Platform enum (x86_64-linux, aarch64-linux, etc.)
-- [x] Set up tonic-build for protobuf compilation
+### rio-common (Shared Protocol)
+- [ ] Design gRPC service for CLI ↔ Agent communication
+- [ ] Design agent discovery RPC (GetClusterMembers)
+- [ ] Design build submission RPC (SubmitBuild)
+- [ ] Design build status RPC (GetJobStatus)
+- [ ] Define protobuf messages for new architecture
+- [ ] Remove old broker-specific protocol definitions
 
-### rio-dispatcher (Fleet Manager) ✅
-- [x] Implement BuilderPool
-  - [x] Thread-safe builder registry (Arc<RwLock<HashMap>>)
-  - [x] Builder registration
-  - [x] Builder lookup by ID
-  - [x] Query builders by platform
-  - [x] Builder capacity tracking
-- [x] Implement gRPC server
-  - [x] RegisterBuilder RPC handler
-  - [x] Heartbeat bidirectional stream handler
-  - [x] GetBuilderStatus RPC handler
-  - [x] ExecuteBuild RPC stub
-- [x] Main dispatcher binary
-  - [x] Initialize gRPC server on port 50051
-  - [x] Graceful shutdown handling
-- [x] Create placeholder modules
-  - [x] build_queue.rs
-  - [x] scheduler.rs
-  - [x] ssh_server.rs
-  - [x] dispatcher.rs
+### rio-build (CLI Client)
+- [ ] Configuration management (~/.config/rio/config.toml)
+- [ ] Agent discovery from seed nodes
+- [ ] Cluster member caching
+- [ ] gRPC client for agent communication
+- [ ] Build submission logic
+- [ ] Log streaming from agent
+- [ ] Output retrieval and storage
 
-### rio-builder (Worker Node) ✅
-- [x] Implement Builder client
-  - [x] Connect to dispatcher via gRPC
-  - [x] Register with dispatcher
-  - [x] Platform auto-detection
-  - [x] Capacity reporting (CPU, memory, disk)
-- [x] Implement heartbeat mechanism
-  - [x] Periodic heartbeat sending (every 30s)
-  - [x] Bidirectional stream handling
-  - [x] Load reporting
-  - [x] Command reception from dispatcher
-- [x] Main builder binary
-  - [x] Configuration via environment variables
-  - [x] Connection lifecycle management
-  - [x] Graceful shutdown handling
-- [x] Create placeholder executor module
+### rio-agent (Cluster Node)
+- [ ] Raft consensus integration (tikv/raft-rs or async-raft)
+- [ ] Cluster membership management
+- [ ] gRPC server for CLI requests
+- [ ] gRPC server for agent-to-agent communication
+- [ ] Build execution engine
+- [ ] Capacity reporting
+- [ ] Health monitoring
 
-### Testing ✅
-- [x] Integration test: Builder registration
-- [x] Integration test: Multiple builder registration
-- [x] Integration test: Builder status query
-- [x] Integration test: Heartbeat streaming
-- [x] Verify builders appear in dispatcher pool
+## Phase 3: Build Execution
 
-## Phase 2: SSH Server & Nix Protocol ✅ COMPLETE
+- [ ] Nix build invocation
+- [ ] Build log streaming
+- [ ] Output path management
+- [ ] Build artifact transfer to CLI
+- [ ] Error handling and retries
+- [ ] Build timeout handling
 
-### SSH Server Implementation ✅
-- [x] Set up russh SSH server in dispatcher
-  - [x] Configure SSH server listener (russh 0.54.5)
-  - [x] Basic Handler trait implementation
-  - [ ] Public key authentication (accepting all for now - TODO: proper auth)
-  - [x] Session management
-  - [x] Channel handling (basic echo for testing)
-- [x] Implement SSH connection handling
-  - [x] Accept incoming SSH connections
-  - [x] Authenticate clients (development mode - accept all)
-  - [x] Create session for each connection
-  - [ ] Route to Nix protocol handler (TODO)
-- [x] Configuration
-  - [x] SSH server port (default 2222, via CLI args)
-  - [x] Host key generation/loading (Ed25519, OpenSSH format)
-  - [x] Auto-generate keys if missing
-  - [x] Proper file permissions (0600 on Unix)
-  - [ ] Authorized keys management (TODO)
+## Phase 4: Production Features
 
+<<<<<<< HEAD
 ### Nix Protocol Implementation 🚧
 - [x] Study nix-daemon crate API
   - [x] Review Store trait requirements (16 methods)
@@ -441,48 +390,14 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [ ] dispatcher image
   - [ ] builder image
   - [ ] Multi-platform builds
+- [ ] Binary cache integration
+- [ ] Build result caching
+- [ ] Multi-platform support verification
+- [ ] TLS/mTLS for agent communication
+- [ ] Authentication for CLI clients
+- [ ] Monitoring and metrics
+- [ ] Web UI for cluster status
 
 ## Current Focus
 
-**Phase 3 Build Execution - COMPLETE! ✅**
-
-Major achievements this session:
-- ✅ Builder gRPC server integration (runs concurrently with heartbeat)
-- ✅ Real build execution with nix-build (not simulation)
-- ✅ Derivation parsing with platform extraction (9 tests)
-- ✅ Background DispatcherLoop for async job processing (9 tests with AsyncProgress)
-- ✅ NAR-based output transfer (builder → dispatcher, 7 tests)
-- ✅ Critical Store trait methods (is_valid_path, query_valid_paths, add_to_store)
-- ✅ Component integration tests (6 comprehensive tests)
-- ✅ All 70 tests passing, 0 failures
-
-**Complete build pipeline:**
-```
-SSH Client → Store.build_paths() → BuildQueue → DispatcherLoop
-  → Scheduler → Builder gRPC → nix-build execution
-  → NAR export → chunk streaming → dispatcher import
-  → query_pathinfo returns metadata
-```
-
-**Test breakdown:**
-- 10 Store trait tests
-- 5 BuildQueue tests
-- 5 Scheduler tests
-- 4 AsyncProgress tests
-- 5 DispatcherLoop tests
-- 5 Executor tests
-- 9 DerivationInfo tests
-- 7 NAR export/import tests
-- 5 gRPC integration tests
-- 4 SSH protocol tests
-- 6 component integration tests
-- 5 channel bridge tests
-
-**Ready for:** End-to-end testing with real SSH/Nix clients
-
-**Next priorities:**
-1. Manual end-to-end test with nix-build --store ssh://localhost:2222
-2. Observe any missing Store methods or protocol issues
-3. Add SSH integration test with real protocol
-4. Fix any remaining issues
-5. Document usage and deployment
+**Phase 2:** Design and implement core infrastructure for brokerless architecture
