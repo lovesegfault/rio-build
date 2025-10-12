@@ -35,6 +35,14 @@ Rio is an open-source distributed build service for Nix that eliminates the trad
 
 **Critical Insight:** Raft is the **control plane** (who's in the cluster, who's building what). The **data plane** (actual derivations, logs, outputs) bypasses Raft entirely and flows directly CLI ↔ Agent.
 
+**Automatic Build Recovery:**
+
+When an agent fails, no manual intervention or complex reassignment logic is needed:
+1. Raft cleanup removes failed agent's builds
+2. Each affected CLI independently retries
+3. Affinity + deduplication naturally re-group builds on new agent
+4. Work continues seamlessly
+
 ## Core Design Decisions
 
 ### 1. What Does Raft Coordinate?
@@ -791,18 +799,49 @@ fn apply_build_completed(
 
 ### 5. Failure Handling
 
-**Scenario A: Agent dies mid-build**
+**Scenario A: Agent dies with active and queued builds**
 
 ```
-1. CLI notices stream disconnection
-2. CLI connects to another agent (from cached cluster members)
-3. CLI calls GetJobStatus(derivation_hash)
-4. Agent queries Raft state:
-   - Build was assigned to agent-5
-   - agent-5 last heartbeat: 5 minutes ago (DEAD)
-5. Agent responds: JobStatus { state: Failed, error: "Agent died" }
-6. CLI retries: selects new agent, resubmits build
-7. Any builds queued on dead agent are also marked failed (cascading)
+Time T0: User A submits foo
+- builds_in_progress[hash(foo)] = { agent_id: K, status: Building }
+- User A's CLI → Agent K (streaming logs)
+
+Time T1: User B submits bar (depends on foo)
+- CLI detects foo building on Agent K (affinity!)
+- builds_in_progress[hash(bar)] = { agent_id: K, status: Queued { blocked_on: [foo] } }
+- User B's CLI → Agent K (sees "Waiting for dependencies...")
+
+Time T2: Agent K crashes
+- Both CLIs detect stream disconnection
+- Raft heartbeat timeout (30s)
+- Raft marks Agent K as Down
+- Raft cleanup removes ALL of Agent K's builds:
+  * builds_in_progress.remove(hash(foo))
+  * builds_in_progress.remove(hash(bar))
+  * Remove dependencies of foo and bar
+
+Time T3: User A retries foo
+- CLI: GetJobStatus(hash(foo)) → NotFound (cleaned up)
+- CLI: Resubmit foo to cluster
+- CLI selects Agent J (available)
+- Agent J starts building foo
+- builds_in_progress[hash(foo)] = { agent_id: J, status: Building }
+
+Time T3+1ms: User B retries bar (nearly simultaneous)
+- CLI: GetJobStatus(hash(bar)) → NotFound
+- CLI: Resubmit bar, check dependencies
+- Raft shows: hash(foo) = { agent_id: J, status: Building } ← User A's build!
+- CLI selects Agent J (affinity with foo!)
+- Agent J receives bar, detects foo building on self
+- Agent J queues: Queued { blocked_on: [hash(foo)] }
+- builds_in_progress[hash(bar)] = { agent_id: J, status: Queued }
+- User B's CLI reconnects to Agent J: "Waiting for dependencies..."
+
+Time T4: foo completes on Agent J
+- Agent J auto-starts bar
+- User B's build continues seamlessly
+
+Result: Both builds naturally migrate to Agent J via independent retry + affinity!
 ```
 
 **Scenario B: Network partition during submission**
@@ -850,11 +889,16 @@ rio-agent --join=https://agent1.example.com:50051 --listen=0.0.0.0:50051
 - agent1 (or leader) proposes RaftCommand::AgentJoined
 - Once committed, new agent becomes voting member
 
-**Heartbeats:**
+**Heartbeats and Failure Detection:**
 
 - Every 10 seconds, each agent proposes RaftCommand::AgentHeartbeat
 - If agent misses 3 heartbeats (30s), marked as Down
-- All builds on down agents marked as failed (including cascading failures for queued builds)
+- When agent marked as Down, Raft automatically:
+  * Removes all builds assigned to that agent (Building or Queued)
+  * Removes dependencies registered by those builds
+  * Clears the builds from Raft state
+- Disconnected CLIs automatically retry on different agents
+- Affinity mechanism naturally re-groups related builds on new agent
 
 **Graceful shutdown:**
 
