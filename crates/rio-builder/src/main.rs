@@ -8,6 +8,8 @@ mod executor;
 mod grpc_server;
 
 use builder::Builder;
+use executor::Executor;
+use grpc_server::start_grpc_server;
 
 /// Rio Builder - Worker node for executing Nix builds
 #[derive(Parser, Debug)]
@@ -29,6 +31,10 @@ struct Cli {
     /// Features this builder supports (e.g., kvm, benchmark)
     #[arg(long, env = "RIO_FEATURES", value_delimiter = ',')]
     features: Vec<String>,
+
+    /// gRPC server address for receiving build requests
+    #[arg(long, env = "RIO_GRPC_ADDR", default_value = "0.0.0.0:50052")]
+    grpc_addr: String,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "RIO_LOG_LEVEL", default_value = "info")]
@@ -74,6 +80,7 @@ async fn main() -> Result<()> {
 
     info!("Starting Rio Builder v{}", env!("CARGO_PKG_VERSION"));
     info!("Dispatcher endpoint: {}", cli.dispatcher_endpoint);
+    info!("gRPC server address: {}", cli.grpc_addr);
 
     // Determine platforms to advertise
     let platforms: Vec<Platform> = if cli.platforms.is_empty() {
@@ -111,20 +118,46 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-    // Start heartbeat loop
-    if let Err(e) = builder.start_heartbeat_loop().await {
-        error!("Failed to start heartbeat loop: {}", e);
-        return Err(e);
-    }
+    info!("Rio Builder {} registered with dispatcher", builder.id());
+
+    // Parse gRPC address
+    let grpc_addr: std::net::SocketAddr =
+        cli.grpc_addr.parse().expect("Invalid gRPC address format");
+
+    // Create executor for handling build requests
+    let executor = Executor::new();
+
+    // Start gRPC server in a separate task
+    let grpc_server_handle = tokio::spawn(async move {
+        if let Err(e) = start_grpc_server(grpc_addr, executor).await {
+            error!("gRPC server error: {}", e);
+        }
+    });
+
+    // Start heartbeat loop in a separate task
+    let heartbeat_handle = tokio::spawn(async move {
+        if let Err(e) = builder.start_heartbeat_loop().await {
+            error!("Heartbeat loop error: {}", e);
+        }
+    });
 
     info!(
-        "Rio Builder {} started successfully and registered with dispatcher",
-        builder.id()
+        "Rio Builder started successfully (gRPC server running on {})",
+        grpc_addr
     );
 
-    // Keep running
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    // Wait for either task to complete or Ctrl+C
+    tokio::select! {
+        _ = grpc_server_handle => {
+            error!("gRPC server terminated unexpectedly");
+        }
+        _ = heartbeat_handle => {
+            error!("Heartbeat loop terminated unexpectedly");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutting down...");
+        }
+    }
 
     Ok(())
 }
