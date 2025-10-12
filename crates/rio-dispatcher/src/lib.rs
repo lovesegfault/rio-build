@@ -3,9 +3,9 @@ pub mod builder_pool;
 pub mod grpc_server;
 
 // Internal modules
-mod build_queue;
-mod channel_bridge;
+pub(crate) mod build_queue;
+pub(crate) mod channel_bridge;
 mod dispatcher;
-mod nix_store;
-mod scheduler;
-mod ssh_server;
+pub(crate) mod nix_store;
+pub(crate) mod scheduler;
+pub(crate) mod ssh_server;
