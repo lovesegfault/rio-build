@@ -1,21 +1,13 @@
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
+use rio_dispatcher::build_queue::BuildQueue;
+use rio_dispatcher::builder_pool::BuilderPool;
+use rio_dispatcher::grpc_server;
+use rio_dispatcher::scheduler::Scheduler;
+use rio_dispatcher::ssh_server::{SshConfig, SshHandler, SshServer};
 use std::net::SocketAddr;
 use tracing::{Level, info};
-
-mod build_queue;
-mod builder_pool;
-mod dispatcher;
-mod grpc_server;
-mod nix_store;
-mod scheduler;
-mod ssh_server;
-
-use build_queue::BuildQueue;
-use builder_pool::BuilderPool;
-use scheduler::Scheduler;
-use ssh_server::{SshConfig, SshHandler, SshServer};
 
 /// Rio Dispatcher - Fleet manager for distributed Nix builds
 #[derive(Parser, Debug)]

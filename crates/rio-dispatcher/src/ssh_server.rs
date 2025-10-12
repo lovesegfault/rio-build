@@ -14,10 +14,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::build_queue::BuildQueue;
 use crate::builder_pool::BuilderPool;
+use crate::channel_bridge;
+use crate::nix_store::DispatcherStore;
 use crate::scheduler::Scheduler;
 
 /// SSH server configuration
@@ -186,13 +188,79 @@ impl server::Server for SshHandler {
 impl server::Handler for SshHandler {
     type Error = anyhow::Error;
 
-    #[tracing::instrument(skip(self, _session), fields(channel_id = %channel.id()))]
+    #[tracing::instrument(skip(self, session), fields(channel_id = %channel.id()))]
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        info!("Channel session opened");
+        let channel_id = channel.id();
+        info!("Opening session channel");
+
+        // Create bidirectional channels for SSH <-> Nix protocol communication
+        let (to_protocol_tx, to_protocol_rx) = mpsc::channel(100);
+        let (from_protocol_tx, from_protocol_rx) = mpsc::channel(100);
+
+        // Create channel bridge adapters
+        let reader = channel_bridge::channel_reader(to_protocol_rx);
+        let writer = channel_bridge::channel_writer(from_protocol_tx);
+
+        // Create a DispatcherStore for this session
+        let mut store = DispatcherStore::new(
+            self.build_queue.clone(),
+            self.scheduler.clone(),
+            self.builder_pool.clone(),
+        );
+
+        // Spawn a task to run the Nix daemon protocol adapter
+        let session_handle = session.handle();
+        tokio::spawn(async move {
+            info!(
+                "Starting Nix daemon protocol adapter for channel {}",
+                channel_id
+            );
+
+            // Create and run the protocol adapter
+            match nix_daemon::nix::DaemonProtocolAdapter::builder(&mut store)
+                .adopt(reader, writer)
+                .await
+            {
+                Ok(mut adapter) => {
+                    info!("Protocol adapter negotiated for channel {}", channel_id);
+
+                    // Run the adapter until client disconnects
+                    if let Err(e) = adapter.run().await {
+                        error!("Protocol adapter error on channel {}: {:?}", channel_id, e);
+                    } else {
+                        info!(
+                            "Protocol adapter completed successfully for channel {}",
+                            channel_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create protocol adapter for channel {}: {:?}",
+                        channel_id, e
+                    );
+                }
+            }
+
+            // Close the SSH channel when protocol adapter finishes
+            let _ = session_handle.close(channel_id).await;
+        });
+
+        // Store channel state for forwarding data
+        let state = ChannelState {
+            to_protocol_tx,
+            from_protocol_rx,
+        };
+
+        let mut channels = self.channels.lock().await;
+        channels.insert(channel_id, state);
+        drop(channels);
+
+        info!("Session channel {} ready", channel_id);
         Ok(true)
     }
 
