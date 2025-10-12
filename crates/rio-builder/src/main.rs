@@ -5,6 +5,7 @@ use tracing::{Level, error, info};
 
 mod builder;
 mod executor;
+mod grpc_server;
 
 use builder::Builder;
 
