@@ -10,4 +10,4 @@ pub mod ssh_server;
 pub(crate) mod async_progress;
 pub(crate) mod channel_bridge;
 mod dispatcher;
-pub(crate) mod nix_store;
+pub mod nix_store; // Public for integration tests
