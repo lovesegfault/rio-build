@@ -21,9 +21,15 @@ pub struct SshConfig {
 }
 
 /// Handler for SSH sessions
+///
+/// Each SSH session will have its own DispatcherStore instance and protocol adapter.
+/// We need to bridge russh's callback-based API with the async stream-based
+/// Nix daemon protocol.
 #[derive(Clone)]
 #[allow(dead_code)]
-pub struct SshHandler {}
+pub struct SshHandler {
+    // TODO: Will need to create per-session state for protocol adapter
+}
 
 #[allow(dead_code)]
 impl SshHandler {
