@@ -3,6 +3,7 @@ use camino::Utf8PathBuf;
 use clap::Parser;
 use rio_dispatcher::build_queue::BuildQueue;
 use rio_dispatcher::builder_pool::BuilderPool;
+use rio_dispatcher::dispatcher_loop::DispatcherLoop;
 use rio_dispatcher::grpc_server;
 use rio_dispatcher::scheduler::Scheduler;
 use rio_dispatcher::ssh_server::{SshConfig, SshHandler, SshServer};
@@ -66,6 +67,17 @@ async fn main() -> Result<()> {
     info!("gRPC server will listen on {}", grpc_addr);
     info!("SSH server will listen on {}", ssh_addr);
 
+    // Create shutdown channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Start background dispatcher loop
+    let dispatcher_loop =
+        DispatcherLoop::new(build_queue.clone(), scheduler.clone(), builder_pool.clone());
+
+    let loop_handle = tokio::spawn(async move {
+        dispatcher_loop.run(shutdown_rx).await;
+    });
+
     // Load or generate SSH host key
     let host_key = SshServer::load_or_generate_host_key(cli.ssh_host_key.as_deref()).await?;
     info!("SSH host key loaded");
@@ -79,21 +91,26 @@ async fn main() -> Result<()> {
     let ssh_server = SshServer::new(ssh_config);
     let ssh_handler = SshHandler::new(build_queue.clone(), scheduler.clone(), builder_pool.clone());
 
-    // Start servers concurrently
-    tokio::select! {
-        result = grpc_server::start_grpc_server(grpc_addr, builder_pool.clone(), build_queue, scheduler) => {
-            info!("gRPC server exited");
-            result?;
-        }
-        result = ssh_server.start(ssh_handler) => {
-            info!("SSH server exited");
-            result?;
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
-        }
-    }
+    // Start gRPC server
+    let grpc_handle = tokio::spawn(async move {
+        grpc_server::start_grpc_server(grpc_addr, builder_pool, build_queue, scheduler).await
+    });
 
-    info!("Shutting down...");
+    // Start SSH server
+    let ssh_handle = tokio::spawn(async move { ssh_server.start(ssh_handler).await });
+
+    info!("All services started");
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    info!("Received Ctrl+C, shutting down...");
+
+    // Send shutdown signal to dispatcher loop
+    let _ = shutdown_tx.send(true);
+
+    // Wait for all tasks to complete
+    let _ = tokio::join!(loop_handle, grpc_handle, ssh_handle);
+
+    info!("Shutdown complete");
     Ok(())
 }
