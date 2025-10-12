@@ -1,8 +1,12 @@
 use rio_common::proto::{
-    BuilderCapacity, RegisterBuilderRequest, build_service_client::BuildServiceClient,
+    BuildCompleted, BuilderCapacity, ExecuteBuildRequest, ExecuteBuildResponse, LogLine,
+    RegisterBuilderRequest,
+    build_service_client::BuildServiceClient,
+    build_service_server::{BuildService, BuildServiceServer},
 };
 use std::net::SocketAddr;
 use tokio::time::{Duration, sleep};
+use tonic::{Request, Response, Status};
 
 /// Helper to start dispatcher in background
 async fn start_test_dispatcher() -> (tokio::task::JoinHandle<()>, SocketAddr) {
@@ -222,4 +226,197 @@ async fn test_heartbeat_stream() {
         response.commands.is_empty(),
         "No commands expected for this test"
     );
+}
+
+/// Mock builder service for testing
+struct MockBuilderService {}
+
+#[tonic::async_trait]
+impl BuildService for MockBuilderService {
+    async fn register_builder(
+        &self,
+        _request: Request<RegisterBuilderRequest>,
+    ) -> Result<Response<rio_common::proto::RegisterBuilderResponse>, Status> {
+        Err(Status::unimplemented("Not used in builder"))
+    }
+
+    type HeartbeatStream = tokio_stream::wrappers::ReceiverStream<
+        Result<rio_common::proto::HeartbeatResponse, Status>,
+    >;
+
+    async fn heartbeat(
+        &self,
+        _request: Request<tonic::Streaming<rio_common::proto::HeartbeatRequest>>,
+    ) -> Result<Response<Self::HeartbeatStream>, Status> {
+        Err(Status::unimplemented("Not used in builder"))
+    }
+
+    type ExecuteBuildStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecuteBuildResponse, Status>>;
+
+    async fn execute_build(
+        &self,
+        request: Request<ExecuteBuildRequest>,
+    ) -> Result<Response<Self::ExecuteBuildStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        // Simulate build execution
+        tokio::spawn(async move {
+            // Send log message
+            let _ = tx
+                .send(Ok(ExecuteBuildResponse {
+                    job_id: req.job_id.clone(),
+                    update: Some(rio_common::proto::execute_build_response::Update::Log(
+                        LogLine {
+                            timestamp: 1234567890,
+                            line: "Mock build started".to_string(),
+                        },
+                    )),
+                }))
+                .await;
+
+            // Send completion
+            let _ = tx
+                .send(Ok(ExecuteBuildResponse {
+                    job_id: req.job_id.clone(),
+                    update: Some(
+                        rio_common::proto::execute_build_response::Update::Completed(
+                            BuildCompleted {
+                                output_paths: vec!["/nix/store/mock-output".to_string()],
+                                duration_ms: 100,
+                            },
+                        ),
+                    ),
+                }))
+                .await;
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn get_builder_status(
+        &self,
+        _request: Request<rio_common::proto::GetBuilderStatusRequest>,
+    ) -> Result<Response<rio_common::proto::BuilderStatus>, Status> {
+        Err(Status::unimplemented("Not used in builder"))
+    }
+}
+
+/// Helper to start a mock builder gRPC server
+async fn start_mock_builder() -> (tokio::task::JoinHandle<()>, SocketAddr) {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let actual_addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(BuildServiceServer::new(MockBuilderService {}))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    // Give server time to start
+    sleep(Duration::from_millis(100)).await;
+
+    (handle, actual_addr)
+}
+
+#[tokio::test]
+async fn test_end_to_end_build_dispatching() {
+    // Start dispatcher
+    let (_dispatcher_handle, dispatcher_addr) = start_test_dispatcher().await;
+
+    // Start mock builder
+    let (_builder_handle, builder_addr) = start_mock_builder().await;
+
+    // Connect to dispatcher as a builder to register
+    let mut dispatcher_client = BuildServiceClient::connect(format!("http://{}", dispatcher_addr))
+        .await
+        .expect("Failed to connect to dispatcher");
+
+    // Register builder with dispatcher, providing builder's gRPC endpoint
+    let builder_id = "test-builder-e2e-001";
+    let register_request = RegisterBuilderRequest {
+        builder_id: builder_id.to_string(),
+        endpoint: format!("http://{}", builder_addr),
+        capacity: Some(BuilderCapacity {
+            cpu_cores: 4,
+            memory_mb: 8192,
+            disk_gb: 100,
+        }),
+        platforms: vec!["x86_64-linux".to_string()],
+        features: vec![],
+    };
+
+    let register_response = dispatcher_client
+        .register_builder(register_request)
+        .await
+        .expect("Failed to register builder")
+        .into_inner();
+
+    assert!(
+        register_response.success,
+        "Builder registration should succeed"
+    );
+
+    // Now send a build request to the dispatcher
+    let build_request = ExecuteBuildRequest {
+        job_id: "test-job-001".to_string(),
+        derivation: vec![0x00, 0x01, 0x02], // Mock derivation bytes
+        required_systems: vec!["x86_64-linux".to_string()],
+        env: Default::default(),
+        timeout_seconds: Some(300),
+    };
+
+    let mut build_response_stream = dispatcher_client
+        .execute_build(build_request)
+        .await
+        .expect("Failed to execute build")
+        .into_inner();
+
+    // Collect all responses
+    let mut responses = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), build_response_stream.message()).await {
+            Ok(Ok(Some(response))) => {
+                responses.push(response);
+            }
+            Ok(Ok(None)) => {
+                // Stream ended
+                break;
+            }
+            Ok(Err(e)) => {
+                panic!("Error receiving response: {:?}", e);
+            }
+            Err(_) => {
+                // Timeout - no more messages
+                break;
+            }
+        }
+    }
+
+    // Verify we got responses
+    assert!(!responses.is_empty(), "Should receive build responses");
+
+    // Verify log message
+    let has_log = responses.iter().any(|r| {
+        matches!(
+            r.update,
+            Some(rio_common::proto::execute_build_response::Update::Log(_))
+        )
+    });
+    assert!(has_log, "Should receive at least one log message");
+
+    // Verify completion
+    let has_completion = responses.iter().any(|r| {
+        matches!(
+            r.update,
+            Some(rio_common::proto::execute_build_response::Update::Completed(_))
+        )
+    });
+    assert!(has_completion, "Should receive build completion");
 }
