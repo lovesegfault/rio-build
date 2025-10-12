@@ -1,41 +1,50 @@
 # Rio
 
-**Distributed builds for Nix** - An open-source alternative to nixbuild.net
+**Distributed builds for Nix** - A brokerless, peer-to-peer build service
 
-Rio is a build service for Nix that presents itself as a single remote builder while dispatching builds to an elastic fleet of workers.
-
-## Overview
-
-Rio acts as a remote builder endpoint for Nix, accepting SSH connections using the standard Nix protocols (`ssh://` and `ssh-ng://`). Behind the scenes, it intelligently dispatches builds to a pool of worker nodes, providing the illusion of "a single Nix machine with infinite CPUs."
+Rio is a distributed build service for Nix that eliminates the traditional broker architecture by using a peer-to-peer agent cluster coordinated via Raft consensus.
 
 ## Architecture
 
-- **rio-dispatcher**: Fleet manager and SSH frontend that Nix clients connect to
-- **rio-builder**: Worker nodes that execute builds
+Unlike traditional architectures with a central dispatcher, Rio uses a **brokerless design**:
 
 ```
-Nix Client → (SSH) → rio-dispatcher → (gRPC) → rio-builder(s)
+┌──────────────┐
+│  rio-build   │ (your CLI)
+│   (client)   │
+└──────┬───────┘
+       │ gRPC to any agent
+       ▼
+┌────────────────────────────────────┐
+│      rio-agent cluster (Raft)     │
+│                                    │
+│  ┌────────┐  ┌────────┐  ┌────────┐
+│  │ Agent  │←→│ Agent  │←→│ Agent  │
+│  │   1    │  │   2    │  │   3    │
+│  └────────┘  └────────┘  └────────┘
+└────────────────────────────────────┘
 ```
 
-## Features
+**Key Benefits:**
+- No single point of failure
+- No central bottleneck for build artifacts
+- Horizontal scalability via Raft
+- Direct CLI ↔ Agent communication
 
-### Implemented ✅
-- gRPC communication between dispatcher and builders
-- Builder registration and heartbeat mechanism
-- Builder pool management
-- Multi-platform support detection (x86_64-linux, aarch64-linux, etc.)
+## Components
 
-### In Progress 🚧
-- SSH server for Nix client connections
-- Nix protocol handler using nix-daemon crate
-- Build queue and scheduler
-- Build execution on worker nodes
+- **rio-build**: CLI client for submitting builds and streaming logs
+- **rio-agent**: Cluster node that participates in Raft consensus and executes builds
+- **rio-common**: Shared protocol definitions (gRPC)
 
-### Planned 📋
-- Binary cache integration
-- Build result caching
-- Horizontal scaling of dispatcher
-- Web UI for monitoring
+## Status
+
+🚧 **Clean slate** - Project restructured for brokerless architecture
+
+**Next steps:**
+- Design new gRPC protocol for CLI ↔ Agent communication
+- Integrate Raft consensus library
+- Implement cluster discovery and membership
 
 ## Getting Started
 
@@ -43,52 +52,47 @@ See [DESIGN.md](DESIGN.md) for comprehensive architecture documentation.
 
 See [CLAUDE.md](CLAUDE.md) for development setup and commands.
 
-## Status
+See [TODO.md](TODO.md) for implementation roadmap.
 
-🚧 **Early development** - Basic gRPC infrastructure is working!
+## Quick Commands
 
-**What's working:**
-- ✅ Builders can register with dispatcher via gRPC
-- ✅ Heartbeat mechanism keeps connection alive
-- ✅ Builder pool tracks available builders
-
-**What's next:**
-- SSH server for Nix client connections
-- Nix protocol integration
-- Actual build execution
-
-## Quick Test
-
-Terminal 1 - Start dispatcher:
 ```bash
+# Enter development environment
 nix develop
-cargo run -p rio-dispatcher
-# or with custom settings:
-cargo run -p rio-dispatcher -- --grpc-addr=0.0.0.0:50051 --log-level=debug
+
+# Build all workspace members
+cargo build
+
+# Build specific binary
+cargo build -p rio-build
+cargo build -p rio-agent
+
+# Run tests
+cargo test
+
+# Run clippy linter
+cargo clippy
+
+# Format code
+nix fmt
+
+# Full check (clippy + tests + docs + coverage)
+nix flake check
 ```
 
-Terminal 2 - Start a builder:
+## Future Vision
+
+Once implemented, usage will look like:
+
 ```bash
-nix develop
-cargo run -p rio-builder
-# or with custom settings:
-cargo run -p rio-builder -- --platforms=x86_64-linux --features=kvm
+# Configure agent cluster
+rio-build config set agents https://agent1.example.com:50051,https://agent2.example.com:50051
+
+# Submit a build
+rio-build ./my-package.nix
+
+# Agents discover each other via Raft
+# Build executes on available agent
+# Logs stream back to CLI
+# Outputs stored locally
 ```
-
-You should see the builder register and start sending heartbeats!
-
-## CLI Reference
-
-Both binaries support configuration via CLI arguments or environment variables:
-
-**rio-dispatcher:**
-- `--grpc-addr` (env: `RIO_GRPC_ADDR`): gRPC server address (default: 0.0.0.0:50051)
-- `--ssh-addr` (env: `RIO_SSH_ADDR`): SSH server address (default: 0.0.0.0:2222)
-- `--ssh-host-key` (env: `RIO_SSH_HOST_KEY`): Path to SSH host key
-- `--log-level` (env: `RIO_LOG_LEVEL`): Log level (default: info)
-
-**rio-builder:**
-- `--dispatcher-endpoint` (env: `RIO_DISPATCHER_ENDPOINT`): Dispatcher to connect to (default: http://localhost:50051)
-- `--platforms` (env: `RIO_PLATFORMS`): Platforms to support, comma-separated (auto-detected if not provided)
-- `--features` (env: `RIO_FEATURES`): Features to advertise, comma-separated
-- `--log-level` (env: `RIO_LOG_LEVEL`): Log level (default: info)

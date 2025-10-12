@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Quick Start Commands
 
-This is a Rust workspace project with two binaries (`rio-dispatcher` and `rio-builder`) managed with Nix flakes.
+This is a Rust workspace project with two binaries (`rio-build` and `rio-agent`) managed with Nix flakes.
 
 ```bash
 # Enter development environment (using direnv, already configured)
@@ -17,8 +17,8 @@ nix develop
 cargo build
 
 # Build specific binary
-cargo build -p rio-dispatcher
-cargo build -p rio-builder
+cargo build -p rio-build
+cargo build -p rio-agent
 
 # Run tests
 cargo test
@@ -41,55 +41,44 @@ cargo fmt
 # Watch for changes and rebuild
 cargo watch -x check
 
-# Run the dispatcher (with defaults)
-cargo run -p rio-dispatcher
+# Run the CLI client
+cargo run -p rio-build
 
-# Run the dispatcher with custom settings
-cargo run -p rio-dispatcher -- --grpc-addr=0.0.0.0:50051 --ssh-addr=0.0.0.0:2222 --log-level=debug
-
-# Run a builder (auto-detects platform)
-cargo run -p rio-builder
-
-# Run a builder with custom settings
-cargo run -p rio-builder -- --dispatcher-endpoint=http://dispatcher:50051 --platforms=x86_64-linux,aarch64-linux --features=kvm
-
-# View CLI help
-cargo run -p rio-dispatcher -- --help
-cargo run -p rio-builder -- --help
+# Run an agent node
+cargo run -p rio-agent
 ```
 
 ## Architecture Overview
 
-**Project Type**: Distributed build service for Nix (open-source nixbuild.net alternative)
+**Project Type**: Brokerless distributed build service for Nix
 
 **Project Structure**:
 - Cargo workspace with 3 crates:
-  - `rio-dispatcher`: Fleet manager and SSH frontend (binary)
-  - `rio-builder`: Worker node that executes builds (binary)
+  - `rio-build`: CLI client for submitting builds (binary)
+  - `rio-agent`: Cluster node with Raft coordination (binary)
   - `rio-common`: Shared types and gRPC protocol definitions (library)
 
 **Development Environment**:
 - Managed by Nix flakes with flake-parts
 - Uses rust-overlay for stable Rust toolchain with extensions
 - Requires protobuf compiler (protoc) for gRPC code generation
-- Pre-commit hooks configured via git-hooks.nix (cargo check, clippy)
+- Pre-commit hooks configured via git-hooks.nix (treefmt)
 - Multi-formatter setup with treefmt (nixfmt for Nix, rustfmt for Rust, taplo for TOML)
 
 **Key Files**:
 - `flake.nix`: Defines development environment, tools, and hooks
 - `DESIGN.md`: Comprehensive architecture and design decisions
 - `Cargo.toml`: Workspace manifest
-- `crates/rio-common/proto/build_service.proto`: gRPC service definition
+- `crates/rio-common/proto/*.proto`: gRPC service definitions
 
 **Communication**:
-- Client ↔ Dispatcher: SSH with Nix daemon protocol (using `nix-daemon` crate)
-- Dispatcher ↔ Builder: gRPC (using `tonic`)
+- CLI ↔ Agent: gRPC (using `tonic`)
+- Agent ↔ Agent: Raft consensus protocol
 
 **Dependencies**:
-- `nix-daemon` (0.1.x): Nix protocol implementation in Rust
-- `russh`: SSH server/client
 - `tonic`: gRPC framework
 - `tokio`: Async runtime
+- Raft library (TBD: `tikv/raft-rs` or `async-raft`)
 
 ## Development Best Practices
 
@@ -109,7 +98,7 @@ This runs:
 
 **Commit Message Format**: Clean, professional commit messages. Do NOT add Claude Code branding or Co-Authored-By lines.
 
-**TODO.md Updates**: Update TODO.md when meaningful progress is made (not on every commit). Remove "last updated" lines - TODO.md tracks implementation status, not commit counts.
+**TODO.md Updates**: Update TODO.md when meaningful progress is made (not on every commit).
 
 ### Dependencies
 
@@ -123,9 +112,7 @@ dependency-name = { workspace = true }
 **Current versions** (as of this writing):
 - tonic = "0.14" (with tonic-prost split)
 - prost = "0.14"
-- russh = "0.54.5" (no russh-keys needed, native async traits)
 - tokio = "1.42"
-- nix-daemon = "0.1"
 
 ### Error Handling
 
@@ -142,38 +129,30 @@ tokio::fs::read(path)
 
 **Use `#[tracing::instrument]` on all public async functions:**
 ```rust
-#[tracing::instrument(skip(self, large_data), fields(job_id = %job.id, platform = %job.platform))]
-pub async fn enqueue(&self, job: BuildJob) -> JobId {
+#[tracing::instrument(skip(self, large_data), fields(job_id = %job.id))]
+pub async fn submit_build(&self, job: BuildRequest) -> JobId {
     // ...
 }
 ```
 
 - Use `skip()` for large/sensitive data
 - Extract key identifiers as fields for correlation
-- See METRICS.md for full observability strategy
 
 ### Testing
 
 **Write tests for new functionality** - aim for 70%+ coverage:
 ```bash
-cargo test -p rio-dispatcher module::tests
+cargo test -p rio-build module::tests
 ```
 
-**Use tokio's built-in utilities** instead of hand-rolling:
-- `StreamReader` for AsyncRead from Stream
-- `SinkWriter` + `PollSender` + `CopyToBytes` for AsyncWrite from mpsc::Sender
-- `ReceiverStream` for Stream from mpsc::Receiver
-
-### Architecture Notes
-
-**russh 0.54.5**: Uses native async traits (Rust 1.75+), no async-trait crate needed. Handler trait methods work with async fn declarations.
+## Architecture Notes
 
 **tonic 0.14**: Prost functionality split into separate crates:
 - Runtime: `tonic` + `tonic-prost`
 - Build: `tonic-prost-build` (not `tonic-build`)
 - Update build.rs: `tonic_prost_build::configure()...`
 
-**nix-daemon crate**: Implement the `Store` trait and return `Progress` values. Use a simple helper struct that implements Progress for immediate returns.
+**Raft Integration**: TBD - evaluate `tikv/raft-rs` vs `async-raft` for cluster coordination.
 
 ## Development Gotchas
 
@@ -184,4 +163,4 @@ cargo test -p rio-dispatcher module::tests
 **Cross-Platform Targets**: The flake automatically configures the correct Rust target triple for your platform using `pkgs.hostPlatform.rust.rustcTarget`.
 
 **Generated Files**: `.pre-commit-config.yaml` is auto-generated by git-hooks.nix and should not be edited manually. It's already in `.gitignore`.
-- run cargo clippy before committing
+- Never include Co-Authored-By or other Claude information in commit messages
