@@ -2043,7 +2043,6 @@ name = "rio-dispatcher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bytes",
  "camino",
  "clap",
