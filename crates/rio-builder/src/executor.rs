@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tracing::info;
 
 /// Executes build jobs using local Nix
+#[derive(Clone)]
 pub struct Executor {}
 
 impl Executor {
