@@ -57,6 +57,7 @@ impl BuildQueue {
     }
 
     /// Add a job to the queue
+    #[tracing::instrument(skip(self, job), fields(job_id = %job.job_id, derivation = %job.derivation_path, platform = %job.platform))]
     pub async fn enqueue(&self, job: BuildJob) -> JobId {
         let job_id = job.job_id.clone();
         info!(
@@ -77,6 +78,7 @@ impl BuildQueue {
     }
 
     /// Dequeue the next job
+    #[tracing::instrument(skip(self))]
     pub async fn dequeue(&self) -> Option<BuildJob> {
         let mut queue = self.queue.lock().await;
         let job = queue.pop_front()?;
@@ -97,6 +99,7 @@ impl BuildQueue {
     }
 
     /// Update job status
+    #[tracing::instrument(skip(self), fields(job_id = %job_id, status = ?status))]
     pub async fn update_status(&self, job_id: &JobId, status: JobStatus) {
         let mut jobs = self.jobs.write().await;
         if let Some(job) = jobs.get_mut(job_id) {

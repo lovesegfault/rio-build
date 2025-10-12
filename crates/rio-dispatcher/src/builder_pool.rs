@@ -28,6 +28,7 @@ impl BuilderPool {
     }
 
     /// Register a new builder
+    #[tracing::instrument(skip(self), fields(builder_id = %id, platforms = ?platforms))]
     pub async fn register_builder(
         &self,
         id: BuilderId,

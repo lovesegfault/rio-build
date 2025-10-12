@@ -51,6 +51,7 @@ impl SshServer {
     }
 
     /// Generate or load SSH host key
+    #[tracing::instrument(skip_all, fields(key_path = ?path))]
     pub async fn load_or_generate_host_key(path: Option<&Utf8Path>) -> Result<PrivateKey> {
         if let Some(key_path) = path {
             // Try to load existing key
@@ -119,6 +120,7 @@ impl SshServer {
     }
 
     /// Start the SSH server
+    #[tracing::instrument(skip(self, handler), fields(addr = %self.config.addr))]
     pub async fn start(self, handler: SshHandler) -> Result<()> {
         info!("Starting SSH server on {}", self.config.addr);
 
@@ -158,21 +160,23 @@ impl server::Server for SshHandler {
 impl server::Handler for SshHandler {
     type Error = anyhow::Error;
 
+    #[tracing::instrument(skip(self, _session), fields(channel_id = %channel.id()))]
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        info!("Channel open session request (channel_id={})", channel.id());
+        info!("Channel session opened");
         Ok(true)
     }
 
+    #[tracing::instrument(skip(self, _user, _public_key))]
     async fn auth_publickey(
         &mut self,
-        user: &str,
+        _user: &str,
         _public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        info!("Public key auth attempt for user: {}", user);
+        info!("Public key authentication attempt");
 
         // TODO: Implement proper public key authentication
         // For now, accept all keys for development
@@ -181,13 +185,14 @@ impl server::Handler for SshHandler {
         Ok(Auth::Accept)
     }
 
+    #[tracing::instrument(skip(self, data, session), fields(channel_id = %channel, data_len = data.len()))]
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        debug!("Received {} bytes on channel {}", data.len(), channel);
+        debug!("Received data on channel");
 
         // TODO: Forward data to Nix protocol handler
         // For now, just echo it back for testing
@@ -196,21 +201,23 @@ impl server::Handler for SshHandler {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, _session), fields(channel_id = %channel))]
     async fn channel_close(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("Channel {} closed", channel);
+        info!("Channel closed");
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, _session), fields(channel_id = %channel))]
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        debug!("Channel {} EOF", channel);
+        debug!("Channel EOF");
         Ok(())
     }
 }
