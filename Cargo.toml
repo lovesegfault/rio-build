@@ -12,7 +12,8 @@ repository = "https://github.com/yourusername/rio-build"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+futures-util = "0.3"
 
 # gRPC
 tonic = "0.12"
