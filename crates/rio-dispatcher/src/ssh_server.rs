@@ -250,6 +250,43 @@ impl server::Handler for SshHandler {
             let _ = session_handle.close(channel_id).await;
         });
 
+        // Spawn task to forward protocol responses back to SSH
+        let channels_for_writer = self.channels.clone();
+        let session_handle_writer = session.handle();
+        tokio::spawn(async move {
+            debug!(
+                "Starting protocol response forwarder for channel {}",
+                channel_id
+            );
+
+            // Get the receiver from channels
+            let mut rx = {
+                let mut channels = channels_for_writer.lock().await;
+                if let Some(state) = channels.get_mut(&channel_id) {
+                    // Move the receiver out
+                    std::mem::replace(&mut state.from_protocol_rx, mpsc::channel(1).1)
+                } else {
+                    return;
+                }
+            };
+
+            // Forward data from protocol to SSH
+            while let Some(data) = rx.recv().await {
+                if let Err(e) = session_handle_writer
+                    .data(channel_id, CryptoVec::from(data.to_vec()))
+                    .await
+                {
+                    error!("Failed to send data to SSH channel {}: {:?}", channel_id, e);
+                    break;
+                }
+            }
+
+            debug!(
+                "Protocol response forwarder ended for channel {}",
+                channel_id
+            );
+        });
+
         // Store channel state for forwarding data
         let state = ChannelState {
             to_protocol_tx,
@@ -279,18 +316,30 @@ impl server::Handler for SshHandler {
         Ok(Auth::Accept)
     }
 
-    #[tracing::instrument(skip(self, data, session), fields(channel_id = %channel, data_len = data.len()))]
+    #[tracing::instrument(skip(self, data, _session), fields(channel_id = %channel, data_len = data.len()))]
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!("Received data on channel");
 
-        // TODO: Forward data to Nix protocol handler
-        // For now, just echo it back for testing
-        session.data(channel, CryptoVec::from(data.to_vec()))?;
+        // Forward data to the Nix protocol adapter
+        let mut channels = self.channels.lock().await;
+        if let Some(state) = channels.get_mut(&channel) {
+            // Send data to protocol adapter
+            if let Err(e) = state
+                .to_protocol_tx
+                .send(Ok(Bytes::copy_from_slice(data)))
+                .await
+            {
+                error!("Failed to forward data to protocol adapter: {:?}", e);
+                return Err(anyhow::anyhow!("Channel closed"));
+            }
+        } else {
+            warn!("Received data for unknown channel {}", channel);
+        }
 
         Ok(())
     }

@@ -79,7 +79,7 @@ This file tracks all implementation tasks for Rio, organized by development phas
 - [x] Integration test: Heartbeat streaming
 - [x] Verify builders appear in dispatcher pool
 
-## Phase 2: SSH Server & Nix Protocol (In Progress)
+## Phase 2: SSH Server & Nix Protocol ✅ COMPLETE
 
 ### SSH Server Implementation ✅
 - [x] Set up russh SSH server in dispatcher
@@ -128,12 +128,12 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [ ] Identify build dependencies
   - [ ] Determine required platform
   - [ ] Extract required features
-- [ ] Integrate with SSH server
+- [x] Integrate with SSH server ✅
   - [x] Tunnel Nix protocol over SSH using DaemonProtocolAdapter (spawns per session)
   - [x] Handle protocol negotiation (DaemonProtocolAdapter.adopt())
   - [x] Create bidirectional channels with AsyncRead/AsyncWrite bridge
-  - [ ] Forward SSH data() to protocol adapter (TODO)
-  - [ ] Forward protocol responses back to SSH (TODO)
+  - [x] Forward SSH data() to protocol adapter via to_protocol_tx
+  - [x] Forward protocol responses back to SSH via background task + from_protocol_rx
 
 ### Build Queue Implementation ✅
 - [x] Design BuildQueue structure
@@ -404,18 +404,21 @@ This file tracks all implementation tasks for Rio, organized by development phas
 
 ## Current Focus
 
-**Phase 2 Progress:**
+**Phase 2 Complete! ✅**
 - ✅ SSH server infrastructure (russh 0.54.5, 4 tests)
 - ✅ Host key generation/loading (4 tests)
 - ✅ BuildQueue (5 tests, FIFO, status tracking)
 - ✅ Scheduler (5 tests, platform-aware, load balancing)
-- ✅ Store trait (all 16 methods implemented with stubs)
+- ✅ Store trait (all 16 methods implemented)
 - ✅ AsyncRead/AsyncWrite bridge (5 tests, tokio-util based)
 - ✅ DaemonProtocolAdapter integration (spawns per SSH session)
+- ✅ Bidirectional data forwarding (SSH ↔ protocol adapter)
 - ✅ Tracing instrumentation on all critical paths
 - ✅ Upgraded to tonic 0.14 / prost 0.14
 - ✅ All dependencies consolidated to workspace
-- 🚧 Next: Implement bidirectional data forwarding SSH ↔ protocol
+- **27 tests passing, 24 commits**
+
+**Phase 3 Ready:** Build execution on workers
 
 **Priority tasks:**
 1. Implement SSH data() handler to forward bytes to protocol adapter
