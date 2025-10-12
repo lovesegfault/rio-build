@@ -129,9 +129,11 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [ ] Determine required platform
   - [ ] Extract required features
 - [ ] Integrate with SSH server
-  - [ ] Tunnel Nix protocol over SSH using DaemonProtocolAdapter
-  - [ ] Handle protocol negotiation
-  - [ ] Stream data bidirectionally between SSH and Store
+  - [x] Tunnel Nix protocol over SSH using DaemonProtocolAdapter (spawns per session)
+  - [x] Handle protocol negotiation (DaemonProtocolAdapter.adopt())
+  - [x] Create bidirectional channels with AsyncRead/AsyncWrite bridge
+  - [ ] Forward SSH data() to protocol adapter (TODO)
+  - [ ] Forward protocol responses back to SSH (TODO)
 
 ### Build Queue Implementation ✅
 - [x] Design BuildQueue structure
@@ -403,16 +405,21 @@ This file tracks all implementation tasks for Rio, organized by development phas
 ## Current Focus
 
 **Phase 2 Progress:**
-- ✅ SSH server infrastructure (russh 0.54.5, 4 tests, 80% coverage)
-- ✅ Host key generation/loading with tests
+- ✅ SSH server infrastructure (russh 0.54.5, 4 tests)
+- ✅ Host key generation/loading (4 tests)
 - ✅ BuildQueue (5 tests, FIFO, status tracking)
 - ✅ Scheduler (5 tests, platform-aware, load balancing)
-- ✅ Store trait (16 methods, all stubbed)
-- 🚧 Next: Connect SSH to Nix protocol (DaemonProtocolAdapter)
+- ✅ Store trait (all 16 methods implemented with stubs)
+- ✅ AsyncRead/AsyncWrite bridge (5 tests, tokio-util based)
+- ✅ DaemonProtocolAdapter integration (spawns per SSH session)
+- ✅ Tracing instrumentation on all critical paths
+- ✅ Upgraded to tonic 0.14 / prost 0.14
+- ✅ All dependencies consolidated to workspace
+- 🚧 Next: Implement bidirectional data forwarding SSH ↔ protocol
 
 **Priority tasks:**
-1. Connect SSH data handler to DispatcherStore via DaemonProtocolAdapter
-2. Wire up SSH server startup in main.rs
-3. Parse derivation files to extract platform
-4. Implement actual build dispatching in build_paths()
-5. Test end-to-end: SSH connection → build request → dispatcher
+1. Implement SSH data() handler to forward bytes to protocol adapter
+2. Spawn task to forward protocol responses back to SSH session
+3. Test actual SSH connection with protocol adapter
+4. Parse derivation files to extract platform info
+5. Implement actual build dispatching via gRPC ExecuteBuild RPC
