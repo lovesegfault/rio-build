@@ -100,63 +100,73 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [x] Proper file permissions (0600 on Unix)
   - [ ] Authorized keys management (TODO)
 
-### Nix Protocol Implementation
-- [ ] Study nix-daemon crate API
-  - [ ] Review Store trait requirements
-  - [ ] Understand DaemonProtocolAdapter usage
+### Nix Protocol Implementation 🚧
+- [x] Study nix-daemon crate API
+  - [x] Review Store trait requirements (16 methods)
+  - [x] Understand Progress trait and return types
+  - [ ] Study DaemonProtocolAdapter usage
   - [ ] Study protocol version compatibility
-- [ ] Implement Store trait for Dispatcher
-  - [ ] queryPathInfo - query store path metadata
-  - [ ] queryPathFromHashPart - find path by hash
-  - [ ] queryValidPaths - check path validity
-  - [ ] querySubstitutablePaths - check substitutability
-  - [ ] isValidPath - validate single path
-  - [ ] buildPaths - **core build operation**
-  - [ ] buildDerivation - build from derivation
-  - [ ] ensurePath - ensure path exists
-  - [ ] addToStore - add path to store
-  - [ ] addTextToStore - add text file
-  - [ ] exportPath - export for transfer
-  - [ ] importPaths - import transferred paths
+- [x] Implement Store trait for Dispatcher (DispatcherStore)
+  - [x] is_valid_path - validate single path (stub)
+  - [x] has_substitutes - check substitutability (stub)
+  - [x] query_pathinfo - query store path metadata (stub)
+  - [x] query_valid_paths - check path validity (stub)
+  - [x] query_substitutable_paths - check substitutability (stub)
+  - [x] query_valid_derivers - find derivers (stub)
+  - [x] query_missing - determine what to build/download (stub)
+  - [x] query_derivation_output_map - get derivation outputs (stub)
+  - [x] build_paths - **core build operation** (basic queueing, TODO: actual dispatch)
+  - [x] build_paths_with_results - build with detailed results (stub)
+  - [x] ensure_path - ensure path exists (stub)
+  - [x] add_to_store - add path to store (stub)
+  - [x] add_temp_root - temp GC root (stub)
+  - [x] add_indirect_root - persistent GC root (stub)
+  - [x] find_roots - list GC roots (stub)
+  - [x] set_options - apply client options (stub)
 - [ ] Parse derivation files (.drv)
   - [ ] Extract derivation metadata
   - [ ] Identify build dependencies
   - [ ] Determine required platform
   - [ ] Extract required features
 - [ ] Integrate with SSH server
-  - [ ] Tunnel Nix protocol over SSH
+  - [ ] Tunnel Nix protocol over SSH using DaemonProtocolAdapter
   - [ ] Handle protocol negotiation
-  - [ ] Stream data bidirectionally
+  - [ ] Stream data bidirectionally between SSH and Store
 
-### Build Queue Implementation
-- [ ] Design BuildQueue structure
-  - [ ] Job queue data structure (VecDeque or channel)
-  - [ ] Job priority handling
-  - [ ] Job metadata storage
-- [ ] Implement job queueing
-  - [ ] Add job to queue from buildPaths
-  - [ ] Job deduplication (same derivation)
-  - [ ] Queue size limits
-- [ ] Implement job status tracking
-  - [ ] Job states (Queued, Dispatched, Building, Completed, Failed)
-  - [ ] Status queries by job ID
-  - [ ] Job completion callbacks
+### Build Queue Implementation ✅
+- [x] Design BuildQueue structure
+  - [x] Job queue data structure (VecDeque with Mutex)
+  - [x] Job metadata storage (HashMap with RwLock)
+  - [ ] Job priority handling (future)
+  - [ ] Job deduplication (future)
+- [x] Implement job queueing
+  - [x] Add job to queue from buildPaths
+  - [x] FIFO ordering
+  - [ ] Queue size limits (future)
+- [x] Implement job status tracking
+  - [x] Job states (Queued, Dispatched, Building, Completed, Failed)
+  - [x] Status queries by job ID
+  - [x] Update job status
+  - [ ] Job completion callbacks (future)
+- [x] Tests: 5 unit tests covering enqueue, dequeue, FIFO, status updates
 
-### Scheduler Implementation
-- [ ] Design scheduling algorithm
-  - [ ] Round-robin for MVP
-  - [ ] Platform matching (required)
-  - [ ] Feature matching (required)
-  - [ ] Load balancing (least loaded)
-- [ ] Implement scheduler
-  - [ ] Select builder for job
-  - [ ] Handle no available builders
-  - [ ] Retry logic for failed builds
+### Scheduler Implementation ✅
+- [x] Design scheduling algorithm
+  - [x] Platform matching (required)
+  - [x] Load balancing (select builder with fewest jobs)
+  - [ ] Feature matching (future)
+  - [ ] Round-robin tie-breaking (future)
+- [x] Implement scheduler
+  - [x] Select builder for job
+  - [x] Handle no available builders
+  - [x] Get builders by platform
+  - [ ] Retry logic for failed builds (future)
   - [ ] Builder affinity (future optimization)
 - [ ] Integrate with BuildQueue
   - [ ] Poll queue for new jobs
   - [ ] Dispatch jobs to selected builders
   - [ ] Handle builder failures
+- [x] Tests: 5 unit tests covering selection, platform matching, load balancing
 
 ### Build Dispatching
 - [ ] Implement ExecuteBuild RPC
@@ -388,19 +398,20 @@ This file tracks all implementation tasks for Rio, organized by development phas
 ## Current Focus
 
 **Phase 2 Progress:**
-- ✅ SSH server infrastructure (russh 0.54.5)
+- ✅ SSH server infrastructure (russh 0.54.5, 4 tests, 80% coverage)
 - ✅ Host key generation/loading with tests
-- ✅ 79.4% test coverage on implemented features
-- 🚧 Next: Nix protocol Store trait implementation
+- ✅ BuildQueue (5 tests, FIFO, status tracking)
+- ✅ Scheduler (5 tests, platform-aware, load balancing)
+- ✅ Store trait (16 methods, all stubbed)
+- 🚧 Next: Connect SSH to Nix protocol (DaemonProtocolAdapter)
 
 **Priority tasks:**
-1. Study nix-daemon crate API and Store trait
-2. Implement basic Nix protocol Store trait for Dispatcher
-3. Connect SSH channels to Nix protocol handler
-4. Parse derivation files
-5. Implement build queue
-6. Implement basic scheduler (round-robin)
+1. Connect SSH data handler to DispatcherStore via DaemonProtocolAdapter
+2. Wire up SSH server startup in main.rs
+3. Parse derivation files to extract platform
+4. Implement actual build dispatching in build_paths()
+5. Test end-to-end: SSH connection → build request → dispatcher
 
 ---
 
-Last updated: 2025-10-11 (4 commits, 79.4% coverage)
+Last updated: 2025-10-12 (8 commits, 22 tests passing)
