@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
 /// Status of a build job
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub enum JobStatus {
     Queued,

@@ -1,6 +1,7 @@
 // Nix Store trait implementation for dispatcher
 
-use crate::build_queue::BuildQueue;
+use crate::async_progress::AsyncProgress;
+use crate::build_queue::{BuildJob, BuildQueue};
 use crate::builder_pool::BuilderPool;
 use crate::scheduler::Scheduler;
 use nix_daemon::{
@@ -121,7 +122,7 @@ impl Store for DispatcherStore {
 
     fn build_paths<Paths>(
         &mut self,
-        _paths: Paths,
+        paths: Paths,
         mode: BuildMode,
     ) -> impl Progress<T = (), Error = Self::Error>
     where
@@ -131,13 +132,25 @@ impl Store for DispatcherStore {
     {
         info!("build_paths: mode={:?}", mode);
 
-        let _build_queue = self.build_queue.clone();
-        let _scheduler = self.scheduler.clone();
+        let paths: Vec<String> = paths.into_iter().map(|p| p.as_ref().to_string()).collect();
 
-        // Create a future that does the actual work
-        SimpleProgress {
-            result: Some(Ok(())), // Placeholder - will be replaced with actual async logic
-        }
+        let build_queue = self.build_queue.clone();
+
+        AsyncProgress::new(async move {
+            for path in paths {
+                info!("Enqueuing build for path: {}", path);
+
+                // For now, default to x86_64-linux
+                // TODO: Parse derivation file to extract actual platform
+                let platform = "x86_64-linux".to_string();
+
+                let job = BuildJob::new(path.clone(), platform);
+                build_queue.enqueue(job).await;
+
+                info!("Enqueued job for {}", path);
+            }
+            Ok(())
+        })
     }
 
     fn ensure_path<Path: AsRef<str> + Send + Sync + Debug>(
