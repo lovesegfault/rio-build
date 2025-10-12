@@ -64,8 +64,8 @@ async fn main() -> Result<()> {
 
     // Initialize shared components
     let builder_pool = BuilderPool::new();
-    let _build_queue = BuildQueue::new();
-    let _scheduler = Scheduler::new(builder_pool.clone());
+    let build_queue = BuildQueue::new();
+    let scheduler = Scheduler::new(builder_pool.clone());
 
     // Parse addresses
     let grpc_addr: SocketAddr = cli.grpc_addr.parse()?;
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     };
 
     let ssh_server = SshServer::new(ssh_config);
-    let ssh_handler = SshHandler::new();
+    let ssh_handler = SshHandler::new(build_queue, scheduler, builder_pool.clone());
 
     // Start servers concurrently
     tokio::select! {

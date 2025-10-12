@@ -1,16 +1,24 @@
 // SSH server implementation using russh
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use camino::Utf8Path;
 use rand_core::OsRng;
 use russh::keys::ssh_encoding::LineEnding;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, CryptoVec};
+use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
+
+use crate::build_queue::BuildQueue;
+use crate::builder_pool::BuilderPool;
+use crate::scheduler::Scheduler;
 
 /// SSH server configuration
 #[derive(Clone)]
@@ -18,6 +26,15 @@ use tracing::{debug, info, warn};
 pub struct SshConfig {
     pub addr: SocketAddr,
     pub host_key: PrivateKey,
+}
+
+/// Per-channel state for protocol adapter
+#[allow(dead_code)]
+struct ChannelState {
+    /// Send data from SSH channel to Nix protocol
+    to_protocol_tx: mpsc::Sender<Result<Bytes, io::Error>>,
+    /// Receive data from Nix protocol to send to SSH channel
+    from_protocol_rx: mpsc::Receiver<Bytes>,
 }
 
 /// Handler for SSH sessions
@@ -28,13 +45,22 @@ pub struct SshConfig {
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct SshHandler {
-    // TODO: Will need to create per-session state for protocol adapter
+    build_queue: BuildQueue,
+    scheduler: Scheduler,
+    builder_pool: BuilderPool,
+    /// Per-channel state (channel_id -> state)
+    channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
 }
 
 #[allow(dead_code)]
 impl SshHandler {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(build_queue: BuildQueue, scheduler: Scheduler, builder_pool: BuilderPool) -> Self {
+        Self {
+            build_queue,
+            scheduler,
+            builder_pool,
+            channels: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
