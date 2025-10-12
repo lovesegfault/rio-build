@@ -20,6 +20,7 @@ rio-common = { path = "../rio-common" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = "0.1"
+futures-util = { workspace = true }
 
 # gRPC server
 tonic = { workspace = true }
