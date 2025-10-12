@@ -22,6 +22,15 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Fork with PR #387 applied (--show-required-system-features support)
+    # TODO: Switch to upstream once PR is merged
+    nix-eval-jobs = {
+      url = "github:lovesegfault/nix-eval-jobs/for-rio";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-parts.follows = "flake-parts";
+      inputs.treefmt-nix.follows = "treefmt-nix";
+    };
   };
 
   outputs =
@@ -182,6 +191,9 @@
               # Debugging tools
               lldb
               gdb
+
+              # Nix tooling (fork with system-features support)
+              inputs'.nix-eval-jobs.packages.default
             ];
 
             # Shell hook for pre-commit
