@@ -122,10 +122,19 @@ impl BuildService for BuildServiceImpl {
             Some(builder_id) => {
                 info!("Selected builder {} for job {}", builder_id, job_id);
 
-                // TODO: Actually send job to builder via gRPC client
-                // TODO: Stream build logs back
+                // Get builder info to get endpoint
+                let builder_info = match self.builder_pool.get_builder(&builder_id).await {
+                    Some(info) => info,
+                    None => {
+                        error!("Builder {} not found in pool", builder_id);
+                        return Err(Status::internal("Builder disappeared from pool"));
+                    }
+                };
 
-                // For now, return success immediately
+                info!("Dispatching to builder at {}", builder_info.endpoint);
+
+                // TODO: Create gRPC client to builder and call ExecuteBuild
+                // For now, return placeholder response
                 let (tx, rx) = tokio::sync::mpsc::channel(10);
 
                 tokio::spawn(async move {
