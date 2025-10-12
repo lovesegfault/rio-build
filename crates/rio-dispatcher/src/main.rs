@@ -1,4 +1,5 @@
 use anyhow::Result;
+use camino::Utf8PathBuf;
 use clap::Parser;
 use std::net::SocketAddr;
 use tracing::{Level, info};
@@ -7,10 +8,14 @@ mod build_queue;
 mod builder_pool;
 mod dispatcher;
 mod grpc_server;
+mod nix_store;
 mod scheduler;
 mod ssh_server;
 
+use build_queue::BuildQueue;
 use builder_pool::BuilderPool;
+use scheduler::Scheduler;
+use ssh_server::{SshConfig, SshHandler, SshServer};
 
 /// Rio Dispatcher - Fleet manager for distributed Nix builds
 #[derive(Parser, Debug)]
@@ -27,7 +32,7 @@ struct Cli {
 
     /// Path to SSH host key (generated if not exists)
     #[arg(long, env = "RIO_SSH_HOST_KEY")]
-    ssh_host_key: Option<String>,
+    ssh_host_key: Option<Utf8PathBuf>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, env = "RIO_LOG_LEVEL", default_value = "info")]
@@ -57,20 +62,45 @@ async fn main() -> Result<()> {
     info!("gRPC address: {}", cli.grpc_addr);
     info!("SSH address: {}", cli.ssh_addr);
 
-    // Initialize builder pool
+    // Initialize shared components
     let builder_pool = BuilderPool::new();
+    let _build_queue = BuildQueue::new();
+    let _scheduler = Scheduler::new(builder_pool.clone());
 
-    // Parse gRPC server address
+    // Parse addresses
     let grpc_addr: SocketAddr = cli.grpc_addr.parse()?;
+    let ssh_addr: SocketAddr = cli.ssh_addr.parse()?;
 
     info!("gRPC server will listen on {}", grpc_addr);
+    info!("SSH server will listen on {}", ssh_addr);
 
-    // TODO: Start SSH server on cli.ssh_addr
-    // TODO: Load/generate SSH host key from cli.ssh_host_key
+    // Load or generate SSH host key
+    let host_key = SshServer::load_or_generate_host_key(cli.ssh_host_key.as_deref()).await?;
+    info!("SSH host key loaded");
 
-    // Start gRPC server
-    // This will block until shutdown
-    grpc_server::start_grpc_server(grpc_addr, builder_pool).await?;
+    // Create SSH server configuration
+    let ssh_config = SshConfig {
+        addr: ssh_addr,
+        host_key,
+    };
+
+    let ssh_server = SshServer::new(ssh_config);
+    let ssh_handler = SshHandler::new();
+
+    // Start servers concurrently
+    tokio::select! {
+        result = grpc_server::start_grpc_server(grpc_addr, builder_pool.clone()) => {
+            info!("gRPC server exited");
+            result?;
+        }
+        result = ssh_server.start(ssh_handler) => {
+            info!("SSH server exited");
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C, shutting down...");
+        }
+    }
 
     info!("Shutting down...");
     Ok(())
