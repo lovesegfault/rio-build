@@ -21,6 +21,7 @@ impl BuildServiceImpl {
 
 #[tonic::async_trait]
 impl BuildService for BuildServiceImpl {
+    #[tracing::instrument(skip(self, request), fields(builder_id = request.get_ref().builder_id.as_str()))]
     async fn register_builder(
         &self,
         request: Request<RegisterBuilderRequest>,

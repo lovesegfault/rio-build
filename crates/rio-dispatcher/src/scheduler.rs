@@ -25,6 +25,7 @@ impl Scheduler {
     /// 2. Builder must have all required features (future)
     /// 3. Builder must be available (not offline)
     /// 4. Prefer builder with fewest current jobs (load balancing)
+    #[tracing::instrument(skip(self, job), fields(job_id = %job.job_id, platform = %job.platform))]
     pub async fn select_builder(&self, job: &BuildJob) -> Option<BuilderId> {
         debug!(
             "Selecting builder for job {} (platform: {})",
