@@ -2032,11 +2032,13 @@ dependencies = [
 name = "rio-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "prost",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
