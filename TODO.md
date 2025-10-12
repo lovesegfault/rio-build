@@ -259,20 +259,25 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [ ] Builder statistics
   - [ ] Builder availability history
 
-### Monitoring & Metrics
-- [ ] Implement Prometheus metrics
-  - [ ] Build queue depth
-  - [ ] Builder utilization
-  - [ ] Build duration histogram
-  - [ ] Build success/failure rates
-  - [ ] Active SSH connections
-- [ ] Implement tracing
-  - [ ] Trace build requests end-to-end
-  - [ ] Performance profiling
+### Monitoring & Metrics 🚧
+- [x] Implement structured tracing (documented in METRICS.md)
+  - [x] Add #[tracing::instrument] to all critical paths
+  - [x] SSH operations: auth, channel lifecycle, data transfer
+  - [x] BuildQueue: enqueue, dequeue, status updates
+  - [x] Scheduler: builder selection
+  - [x] gRPC handlers: builder registration
+  - [x] Structured fields: job_id, platform, builder_id, channel_id, derivation_path
+  - [x] Span hierarchies for request correlation
+  - [ ] JSON logging for production (future)
+- [ ] Implement Prometheus metrics (Phase 3+, planned in METRICS.md)
+  - [ ] Counters: builds_total, ssh_connections_total, grpc_requests_total
+  - [ ] Gauges: queue_size, builders_active, builds_in_progress
+  - [ ] Histograms: build_duration_seconds, queue_wait_time_seconds
+  - [ ] HTTP /metrics endpoint
 - [ ] Health check endpoints
   - [ ] Dispatcher health
   - [ ] Builder health
-  - [ ] Database connectivity
+  - [ ] Database connectivity (Phase 4+)
 
 ### Advanced Scheduling
 - [ ] Priority queues
