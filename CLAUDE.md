@@ -73,7 +73,7 @@ cargo run -p rio-builder -- --help
 - Uses rust-overlay for stable Rust toolchain with extensions
 - Requires protobuf compiler (protoc) for gRPC code generation
 - Pre-commit hooks configured via git-hooks.nix (cargo check, clippy)
-- Multi-formatter setup with treefmt (alejandra for Nix, rustfmt for Rust, taplo for TOML)
+- Multi-formatter setup with treefmt (nixfmt for Nix, rustfmt for Rust, taplo for TOML)
 
 **Key Files**:
 - `flake.nix`: Defines development environment, tools, and hooks

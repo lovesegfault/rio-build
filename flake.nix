@@ -67,15 +67,19 @@
           # Crane library for building Rust packages
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-          # Source filter to include proto files
-          protoFilter = path: _type: builtins.match ".*proto$" path != null;
-          protoOrCargo = path: type: (protoFilter path type) || (craneLib.filterCargoSources path type);
+          # Source root for filesets
+          unfilteredRoot = ./.;
 
           # Common arguments for all crane builds
           commonArgs = {
-            src = pkgs.lib.cleanSourceWith {
-              src = ./.;
-              filter = protoOrCargo;
+            src = pkgs.lib.fileset.toSource {
+              root = unfilteredRoot;
+              fileset = pkgs.lib.fileset.unions [
+                # All standard Cargo sources (Cargo.toml, Cargo.lock, .rs files, etc.)
+                (craneLib.fileset.commonCargoSources unfilteredRoot)
+                # Proto files for gRPC code generation
+                (pkgs.lib.fileset.fileFilter (file: file.hasExt "proto") unfilteredRoot)
+              ];
             };
             strictDeps = true;
 
@@ -87,9 +91,15 @@
               protobuf
             ];
 
-            buildInputs = with pkgs; [
-              openssl
-            ];
+            buildInputs =
+              with pkgs;
+              [
+                openssl
+              ]
+              ++ lib.optionals stdenv.isDarwin [
+                darwin.apple_sdk.frameworks.Security
+                libiconv
+              ];
           };
 
           # Build dependencies only (for caching)
@@ -103,17 +113,6 @@
               doCheck = false; # We'll run checks separately
             }
           );
-
-          # Build inputs for Rust projects (for devShell)
-          buildInputs = with pkgs; [
-            openssl
-            pkg-config
-          ];
-
-          # Native build inputs (for devShell)
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
         in
         {
           # Import rust-overlay
@@ -156,64 +155,59 @@
           };
 
           # Development shell
-          devShells.default = pkgs.mkShell {
-            inherit buildInputs nativeBuildInputs;
+          devShells.default = craneLib.devShell {
+            # Inherit inputs from the package build
+            inputsFrom = [ rio-workspace ];
 
+            # Inherit inputs from checks
+            checks = config.checks;
+
+            # Additional development packages
             packages = with pkgs; [
-              # Rust toolchain
-              rustToolchain
-
               # Cargo tools
               cargo-edit
               cargo-watch
               cargo-expand
               cargo-outdated
 
-              # Build dependencies
-              protobuf
-              pkg-config
-              openssl
-
               # Debugging tools
               lldb
               gdb
             ];
 
-            shellHook = ''
-              ${config.pre-commit.installationScript}
-
-              echo "🦀 Rust development environment loaded!"
-              echo "Rust version: $(rustc --version)"
-              echo ""
-              echo "Available commands:"
-              echo "  cargo build      - Build the project"
-              echo "  cargo test       - Run tests"
-              echo "  cargo run        - Run the project"
-              echo "  cargo clippy     - Run linter"
-              echo "  treefmt          - Format all files"
-              echo ""
-            '';
+            # Shell hook for pre-commit
+            shellHook = config.pre-commit.installationScript;
 
             # Environment variables
             RUST_BACKTRACE = "1";
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
           };
 
           # Packages
           packages = {
             default = rio-workspace;
-            rio-workspace = rio-workspace;
 
-            # Individual binaries (using workspace build)
-            rio-dispatcher = pkgs.runCommand "rio-dispatcher" { } ''
-              mkdir -p $out/bin
-              cp ${rio-workspace}/bin/rio-dispatcher $out/bin/
-            '';
+            # Individual packages built separately for better modularity
+            rio-dispatcher = craneLib.buildPackage (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                pname = "rio-dispatcher";
+                cargoExtraArgs = "-p rio-dispatcher";
+                doCheck = false;
+              }
+            );
 
-            rio-builder = pkgs.runCommand "rio-builder" { } ''
-              mkdir -p $out/bin
-              cp ${rio-workspace}/bin/rio-builder $out/bin/
-            '';
+            rio-builder = craneLib.buildPackage (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                pname = "rio-builder";
+                cargoExtraArgs = "-p rio-builder";
+                doCheck = false;
+              }
+            );
           };
 
           # Checks (run with 'nix flake check')
@@ -257,19 +251,16 @@
 
           # Apps
           apps = {
-            format = {
-              type = "app";
-              program = "${config.treefmt.build.wrapper}/bin/treefmt";
-            };
-
             dispatcher = {
               type = "app";
               program = "${self'.packages.rio-dispatcher}/bin/rio-dispatcher";
+              meta.description = "Rio distributed build dispatcher - manages build fleet and SSH frontend";
             };
 
             builder = {
               type = "app";
               program = "${self'.packages.rio-builder}/bin/rio-builder";
+              meta.description = "Rio distributed build worker - executes Nix builds on worker nodes";
             };
           };
         };
