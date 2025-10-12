@@ -7,15 +7,23 @@ use rio_common::proto::{
 use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info};
 
+use crate::build_queue::{BuildJob, BuildQueue};
 use crate::builder_pool::BuilderPool;
+use crate::scheduler::Scheduler;
 
 pub struct BuildServiceImpl {
     pub(crate) builder_pool: BuilderPool,
+    pub(crate) build_queue: BuildQueue,
+    pub(crate) scheduler: Scheduler,
 }
 
 impl BuildServiceImpl {
-    pub fn new(builder_pool: BuilderPool) -> Self {
-        Self { builder_pool }
+    pub fn new(builder_pool: BuilderPool, build_queue: BuildQueue, scheduler: Scheduler) -> Self {
+        Self {
+            builder_pool,
+            build_queue,
+            scheduler,
+        }
     }
 }
 
@@ -90,12 +98,63 @@ impl BuildService for BuildServiceImpl {
     type ExecuteBuildStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecuteBuildResponse, Status>>;
 
+    #[tracing::instrument(skip(self, request), fields(job_id = request.get_ref().job_id.as_str()))]
     async fn execute_build(
         &self,
-        _request: Request<ExecuteBuildRequest>,
+        request: Request<ExecuteBuildRequest>,
     ) -> Result<Response<Self::ExecuteBuildStream>, Status> {
-        // TODO: Implement build execution
-        Err(Status::unimplemented("Build execution not yet implemented"))
+        let req = request.into_inner();
+        info!("Received build request: job_id={}", req.job_id);
+
+        // TODO: Parse derivation to extract platform
+        // For now, assume x86_64-linux
+        let platform = "x86_64-linux".to_string();
+
+        // Create build job
+        let job = BuildJob::new(format!("/nix/store/{}.drv", req.job_id), platform);
+
+        // Enqueue the job
+        let job_id = self.build_queue.enqueue(job.clone()).await;
+        info!("Enqueued build job {}", job_id);
+
+        // Select a builder
+        match self.scheduler.select_builder(&job).await {
+            Some(builder_id) => {
+                info!("Selected builder {} for job {}", builder_id, job_id);
+
+                // TODO: Actually send job to builder via gRPC client
+                // TODO: Stream build logs back
+
+                // For now, return success immediately
+                let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+                tokio::spawn(async move {
+                    // Placeholder: send a completion message
+                    use rio_common::proto::{BuildCompleted, ExecuteBuildResponse};
+                    let _ = tx
+                        .send(Ok(ExecuteBuildResponse {
+                            job_id: job_id.to_string(),
+                            update: Some(
+                                rio_common::proto::execute_build_response::Update::Completed(
+                                    BuildCompleted {
+                                        output_paths: vec![],
+                                        duration_ms: 0,
+                                    },
+                                ),
+                            ),
+                        }))
+                        .await;
+                });
+
+                Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                    rx,
+                )))
+            }
+            None => {
+                error!("No builder available for job {}", job_id);
+                Err(Status::unavailable("No builder available"))
+            }
+        }
     }
 
     async fn get_builder_status(
@@ -124,8 +183,10 @@ impl BuildService for BuildServiceImpl {
 pub async fn start_grpc_server(
     addr: std::net::SocketAddr,
     builder_pool: BuilderPool,
+    build_queue: BuildQueue,
+    scheduler: Scheduler,
 ) -> anyhow::Result<()> {
-    let service = BuildServiceImpl::new(builder_pool);
+    let service = BuildServiceImpl::new(builder_pool, build_queue, scheduler);
 
     info!("Starting gRPC server on {}", addr);
 

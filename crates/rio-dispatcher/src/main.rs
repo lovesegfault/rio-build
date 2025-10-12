@@ -77,11 +77,11 @@ async fn main() -> Result<()> {
     };
 
     let ssh_server = SshServer::new(ssh_config);
-    let ssh_handler = SshHandler::new(build_queue, scheduler, builder_pool.clone());
+    let ssh_handler = SshHandler::new(build_queue.clone(), scheduler.clone(), builder_pool.clone());
 
     // Start servers concurrently
     tokio::select! {
-        result = grpc_server::start_grpc_server(grpc_addr, builder_pool.clone()) => {
+        result = grpc_server::start_grpc_server(grpc_addr, builder_pool.clone(), build_queue, scheduler) => {
             info!("gRPC server exited");
             result?;
         }
