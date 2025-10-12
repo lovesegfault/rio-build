@@ -28,7 +28,6 @@ prost = { workspace = true }
 # SSH server
 russh = { workspace = true }
 rand_core = { workspace = true }
-async-trait = { workspace = true }
 
 # Nix protocol
 nix-daemon = { workspace = true }

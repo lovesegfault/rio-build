@@ -22,9 +22,6 @@ prost = "0.13"
 russh = "0.54.5"
 rand_core = "0.6"
 
-# Async traits
-async-trait = "0.1"
-
 # Nix protocol
 nix-daemon = "0.1"
 
