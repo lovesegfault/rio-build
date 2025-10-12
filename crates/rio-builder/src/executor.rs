@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use rio_common::proto::{
-    BuildCompleted, BuildFailed, ExecuteBuildRequest, ExecuteBuildResponse, LogLine,
+    BuildCompleted, BuildFailed, ExecuteBuildRequest, ExecuteBuildResponse, LogLine, OutputData,
 };
 use std::process::Stdio;
 use std::time::Instant;
@@ -268,11 +268,20 @@ impl Executor {
                 job_id: job_id.to_string(),
                 update: Some(
                     rio_common::proto::execute_build_response::Update::Completed(BuildCompleted {
-                        output_paths,
+                        output_paths: output_paths.clone(),
                         duration_ms,
                     }),
                 ),
             });
+
+            // Stream output NAR data for each output path
+            for output_path in &output_paths {
+                info!("Streaming output: {}", output_path);
+                let output_chunks = self
+                    .stream_output_chunks(output_path.clone(), job_id.to_string())
+                    .await;
+                responses.extend(output_chunks);
+            }
         } else {
             let exit_code = status.code().unwrap_or(-1);
             error!("Build failed with exit code {}", exit_code);
@@ -290,6 +299,96 @@ impl Executor {
         }
 
         Ok(responses)
+    }
+
+    /// Export a store path as NAR format using nix-store --dump
+    async fn export_path_as_nar(&self, store_path: &str) -> Result<Vec<u8>> {
+        info!("Exporting {} as NAR", store_path);
+
+        let output = Command::new("nix-store")
+            .arg("--dump")
+            .arg(store_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("Failed to run nix-store --dump")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("nix-store --dump failed for {}: {}", store_path, stderr);
+        }
+
+        info!(
+            "Exported {} as NAR ({} bytes)",
+            store_path,
+            output.stdout.len()
+        );
+
+        Ok(output.stdout)
+    }
+
+    /// Stream output path as NAR chunks
+    async fn stream_output_chunks(
+        &self,
+        store_path: String,
+        job_id: String,
+    ) -> Vec<ExecuteBuildResponse> {
+        const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+
+        let mut responses = Vec::new();
+
+        match self.export_path_as_nar(&store_path).await {
+            Ok(nar_data) => {
+                let total_chunks = nar_data.len().div_ceil(CHUNK_SIZE);
+                info!(
+                    "Streaming {} in {} chunks of {}KB",
+                    store_path,
+                    total_chunks,
+                    CHUNK_SIZE / 1024
+                );
+
+                for (index, chunk) in nar_data.chunks(CHUNK_SIZE).enumerate() {
+                    let is_final = index == total_chunks - 1;
+
+                    responses.push(ExecuteBuildResponse {
+                        job_id: job_id.clone(),
+                        update: Some(rio_common::proto::execute_build_response::Update::Output(
+                            OutputData {
+                                store_path: store_path.clone(),
+                                nar_chunk: chunk.to_vec(),
+                                chunk_index: index as u64,
+                                is_final_chunk: is_final,
+                            },
+                        )),
+                    });
+
+                    if is_final {
+                        info!(
+                            "Completed streaming {} ({} chunks, {} bytes total)",
+                            store_path,
+                            index + 1,
+                            nar_data.len()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to export {}: {}", store_path, e);
+                // Send error as log
+                responses.push(ExecuteBuildResponse {
+                    job_id: job_id.clone(),
+                    update: Some(rio_common::proto::execute_build_response::Update::Log(
+                        LogLine {
+                            timestamp: chrono::Utc::now().timestamp(),
+                            line: format!("Error exporting {}: {}", store_path, e),
+                        },
+                    )),
+                });
+            }
+        }
+
+        responses
     }
 }
 
@@ -416,5 +515,91 @@ derivation {
 
         // Cleanup
         let _ = tokio::fs::remove_file(nix_file).await;
+    }
+
+    #[tokio::test]
+    async fn test_export_path_as_nar() {
+        let executor = Executor::new();
+
+        // Create a simple file in a temp location to test export
+        let test_dir = "/tmp/rio-test-export";
+        tokio::fs::create_dir_all(test_dir).await.unwrap();
+        let test_file = format!("{}/test-file.txt", test_dir);
+        tokio::fs::write(&test_file, b"test content").await.unwrap();
+
+        // Export as NAR
+        let result = executor.export_path_as_nar(&test_file).await;
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(test_dir).await;
+
+        // Should succeed
+        assert!(result.is_ok(), "NAR export should succeed");
+        let nar_data = result.unwrap();
+
+        // NAR should have some data
+        assert!(!nar_data.is_empty(), "NAR should have data");
+
+        // NAR format starts with specific magic bytes
+        assert!(
+            nar_data.len() > 8,
+            "NAR should be at least 8 bytes (header)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_output_chunks() {
+        let executor = Executor::new();
+
+        // Create a test file
+        let test_dir = "/tmp/rio-test-chunks";
+        tokio::fs::create_dir_all(test_dir).await.unwrap();
+        let test_file = format!("{}/test.txt", test_dir);
+        tokio::fs::write(&test_file, b"test").await.unwrap();
+
+        // Stream as chunks
+        let responses = executor
+            .stream_output_chunks(test_file.clone(), "test-job".to_string())
+            .await;
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(test_dir).await;
+
+        // Should have at least one response
+        assert!(!responses.is_empty(), "Should have output responses");
+
+        // Check for OutputData messages
+        let has_output = responses.iter().any(|r| {
+            matches!(
+                r.update,
+                Some(rio_common::proto::execute_build_response::Update::Output(_))
+            )
+        });
+        assert!(has_output, "Should have OutputData messages");
+
+        // Verify final chunk is marked
+        let has_final = responses.iter().any(|r| {
+            if let Some(rio_common::proto::execute_build_response::Update::Output(output)) =
+                &r.update
+            {
+                output.is_final_chunk
+            } else {
+                false
+            }
+        });
+        assert!(has_final, "Should have final chunk marked");
+    }
+
+    #[tokio::test]
+    async fn test_export_nonexistent_path() {
+        let executor = Executor::new();
+
+        // Try to export a path that doesn't exist
+        let result = executor
+            .export_path_as_nar("/nix/store/nonexistent-path")
+            .await;
+
+        // Should fail
+        assert!(result.is_err(), "Exporting nonexistent path should fail");
     }
 }

@@ -4,6 +4,7 @@ use crate::async_progress::AsyncProgress;
 use crate::build_queue::{BuildJob, BuildQueue};
 use crate::builder_pool::BuilderPool;
 use crate::scheduler::Scheduler;
+use anyhow::Context;
 use nix_daemon::{
     BuildMode, BuildResult, ClientSettings, Missing, PathInfo, Progress, Stderr, Store,
 };
@@ -62,6 +63,52 @@ impl DispatcherStore {
             builder_pool,
         }
     }
+}
+
+/// Get path info using nix path-info command
+async fn get_path_info(path: &str) -> anyhow::Result<PathInfo> {
+    use tokio::process::Command;
+
+    let output = Command::new("nix")
+        .args(["path-info", "--json", path])
+        .output()
+        .await
+        .context("Failed to run nix path-info")?;
+
+    if !output.status.success() {
+        anyhow::bail!("nix path-info failed for {}", path);
+    }
+
+    // Parse JSON output
+    let json_str = String::from_utf8(output.stdout).context("Invalid UTF-8 from nix path-info")?;
+
+    #[derive(serde::Deserialize)]
+    struct NixPathInfo {
+        #[serde(rename = "narSize")]
+        nar_size: u64,
+        #[serde(rename = "narHash")]
+        nar_hash: String,
+        #[serde(default)]
+        references: Vec<String>,
+    }
+
+    let path_infos: Vec<NixPathInfo> =
+        serde_json::from_str(&json_str).context("Failed to parse nix path-info JSON")?;
+
+    let path_info = path_infos
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No path info returned"))?;
+
+    Ok(PathInfo {
+        references: path_info.references.clone(),
+        nar_size: path_info.nar_size,
+        nar_hash: path_info.nar_hash.clone(),
+        ca: None,
+        signatures: Vec::new(),
+        deriver: None,
+        registration_time: chrono::Utc::now(),
+        ultimate: false,
+    })
 }
 
 impl Store for DispatcherStore {
@@ -207,8 +254,35 @@ impl Store for DispatcherStore {
         let path = path.as_ref().to_string();
         debug!("query_pathinfo: {}", path);
 
-        // TODO: Query path info from builders
-        ok(None)
+        AsyncProgress::new(async move {
+            // Check if path exists in local /nix/store
+            if tokio::fs::metadata(&path).await.is_ok() {
+                // Get path info using nix path-info
+                match get_path_info(&path).await {
+                    Ok(info) => {
+                        debug!("Path {} exists in local store", path);
+                        Ok(Some(info))
+                    }
+                    Err(e) => {
+                        debug!("Path {} exists but couldn't get info: {}", path, e);
+                        // Path exists but we can't get full info - return minimal PathInfo
+                        Ok(Some(PathInfo {
+                            references: Vec::new(),
+                            nar_size: 0,
+                            nar_hash: String::new(),
+                            ca: None,
+                            signatures: Vec::new(),
+                            deriver: None,
+                            registration_time: chrono::Utc::now(),
+                            ultimate: false,
+                        }))
+                    }
+                }
+            } else {
+                debug!("Path {} not found in local store", path);
+                Ok(None)
+            }
+        })
     }
 
     fn query_valid_paths<Paths>(
