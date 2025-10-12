@@ -34,7 +34,7 @@ async fn test_ssh_server_configuration() {
     let builder_pool = BuilderPool::new();
     let build_queue = BuildQueue::new();
     let scheduler = Scheduler::new(builder_pool.clone());
-    let handler = SshHandler::new(build_queue, scheduler, builder_pool);
+    let _handler = SshHandler::new(build_queue, scheduler, builder_pool);
 
     let _server = SshServer::new(config);
 

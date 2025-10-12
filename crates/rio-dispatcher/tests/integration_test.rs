@@ -6,11 +6,15 @@ use tokio::time::{Duration, sleep};
 
 /// Helper to start dispatcher in background
 async fn start_test_dispatcher() -> (tokio::task::JoinHandle<()>, SocketAddr) {
+    use rio_dispatcher::build_queue::BuildQueue;
     use rio_dispatcher::builder_pool::BuilderPool;
     use rio_dispatcher::grpc_server;
+    use rio_dispatcher::scheduler::Scheduler;
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap(); // Use random port
     let builder_pool = BuilderPool::new();
+    let build_queue = BuildQueue::new();
+    let scheduler = Scheduler::new(builder_pool.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
@@ -19,7 +23,7 @@ async fn start_test_dispatcher() -> (tokio::task::JoinHandle<()>, SocketAddr) {
         tonic::transport::Server::builder()
             .add_service(
                 rio_common::proto::build_service_server::BuildServiceServer::new(
-                    grpc_server::BuildServiceImpl::new(builder_pool),
+                    grpc_server::BuildServiceImpl::new(builder_pool, build_queue, scheduler),
                 ),
             )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
