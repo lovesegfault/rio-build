@@ -170,12 +170,19 @@ This file tracks all implementation tasks for Rio, organized by development phas
   - [ ] Handle builder failures
 - [x] Tests: 5 unit tests covering selection, platform matching, load balancing
 
-### Build Dispatching
-- [ ] Implement ExecuteBuild RPC
-  - [ ] Send derivation to builder
-  - [ ] Stream build logs back to client
-  - [ ] Handle build completion
-  - [ ] Handle build failures
+### Build Dispatching 🚧
+- [x] Implement ExecuteBuild RPC (dispatcher side)
+  - [x] Create gRPC client to builder
+  - [x] Send build request to selected builder
+  - [x] Stream build logs back to client
+  - [x] Handle build completion messages
+  - [x] Handle build failures and connection errors
+  - [ ] Parse derivation to extract actual platform (hardcoded for now)
+- [ ] Implement ExecuteBuild RPC (builder side)
+  - [ ] Receive build jobs via gRPC
+  - [ ] Execute nix-build
+  - [ ] Stream logs back
+  - [ ] Return build results
 - [ ] Transfer build dependencies
   - [ ] Check which inputs builder already has
   - [ ] Transfer missing inputs

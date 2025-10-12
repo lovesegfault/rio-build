@@ -2,10 +2,11 @@ use rio_common::BuilderId;
 use rio_common::proto::{
     BuilderStatus, ExecuteBuildRequest, ExecuteBuildResponse, GetBuilderStatusRequest,
     HeartbeatRequest, HeartbeatResponse, RegisterBuilderRequest, RegisterBuilderResponse,
+    build_service_client::BuildServiceClient,
     build_service_server::{BuildService, BuildServiceServer},
 };
 use tonic::{Request, Response, Status, transport::Server};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::build_queue::{BuildJob, BuildQueue};
 use crate::builder_pool::BuilderPool;
@@ -133,26 +134,80 @@ impl BuildService for BuildServiceImpl {
 
                 info!("Dispatching to builder at {}", builder_info.endpoint);
 
-                // TODO: Create gRPC client to builder and call ExecuteBuild
-                // For now, return placeholder response
-                let (tx, rx) = tokio::sync::mpsc::channel(10);
+                // Create response channel
+                let (tx, rx) = tokio::sync::mpsc::channel(100);
 
+                // Spawn task to dispatch to builder
+                let builder_endpoint = builder_info.endpoint.clone();
                 tokio::spawn(async move {
-                    // Placeholder: send a completion message
-                    use rio_common::proto::{BuildCompleted, ExecuteBuildResponse};
-                    let _ = tx
-                        .send(Ok(ExecuteBuildResponse {
-                            job_id: job_id.to_string(),
-                            update: Some(
-                                rio_common::proto::execute_build_response::Update::Completed(
-                                    BuildCompleted {
-                                        output_paths: vec![],
-                                        duration_ms: 0,
-                                    },
-                                ),
-                            ),
-                        }))
-                        .await;
+                    // Connect to builder
+                    match BuildServiceClient::connect(builder_endpoint.clone()).await {
+                        Ok(mut client) => {
+                            info!("Connected to builder at {}", builder_endpoint);
+
+                            // Create ExecuteBuild request
+                            let build_request = ExecuteBuildRequest {
+                                job_id: job_id.to_string(),
+                                derivation: req.derivation,
+                                required_systems: req.required_systems,
+                                env: req.env,
+                                timeout_seconds: req.timeout_seconds,
+                            };
+
+                            // Call builder's ExecuteBuild
+                            match client.execute_build(build_request).await {
+                                Ok(response) => {
+                                    // Stream responses from builder back to client
+                                    let mut stream = response.into_inner();
+
+                                    while let Ok(Some(msg)) = stream.message().await {
+                                        if tx.send(Ok(msg)).await.is_err() {
+                                            warn!("Client disconnected");
+                                            break;
+                                        }
+                                    }
+
+                                    info!("Build stream completed for job {}", job_id);
+                                }
+                                Err(e) => {
+                                    error!("Failed to execute build on builder: {:?}", e);
+                                    use rio_common::proto::BuildFailed;
+                                    let _ = tx
+                                        .send(Ok(ExecuteBuildResponse {
+                                            job_id: job_id.to_string(),
+                                            update: Some(
+                                                rio_common::proto::execute_build_response::Update::Failed(
+                                                    BuildFailed {
+                                                        error: format!("Builder RPC failed: {}", e),
+                                                        stderr: None,
+                                                        exit_code: -1,
+                                                    },
+                                                ),
+                                            ),
+                                        }))
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to builder {}: {:?}", builder_endpoint, e);
+                            use rio_common::proto::BuildFailed;
+                            let _ = tx
+                                .send(Ok(ExecuteBuildResponse {
+                                    job_id: job_id.to_string(),
+                                    update: Some(
+                                        rio_common::proto::execute_build_response::Update::Failed(
+                                            BuildFailed {
+                                                error: format!("Connection failed: {}", e),
+                                                stderr: None,
+                                                exit_code: -1,
+                                            },
+                                        ),
+                                    ),
+                                }))
+                                .await;
+                        }
+                    }
                 });
 
                 Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
