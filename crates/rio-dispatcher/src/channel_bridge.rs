@@ -2,7 +2,11 @@
 
 use bytes::Bytes;
 use futures_util::SinkExt;
+use std::fmt;
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{CopyToBytes, SinkWriter, StreamReader};
@@ -19,16 +23,55 @@ pub fn channel_reader(rx: mpsc::Receiver<Result<Bytes, io::Error>>) -> ChannelRe
     StreamReader::new(stream)
 }
 
-/// Create an AsyncWrite from an mpsc::Sender
-/// Returns an opaque type that implements AsyncWrite
+// Type alias to reduce complexity
+type ErrorMappedSink = futures_util::sink::SinkMapErr<
+    PollSender<Bytes>,
+    fn(tokio_util::sync::PollSendError<Bytes>) -> io::Error,
+>;
+
+/// Wrapper for SinkWriter that implements Debug
 #[allow(dead_code)]
-pub fn channel_writer(
-    tx: mpsc::Sender<Bytes>,
-) -> impl tokio::io::AsyncWrite + Send + Unpin + 'static {
+pub struct DebugSinkWriter {
+    inner: SinkWriter<CopyToBytes<ErrorMappedSink>>,
+}
+
+impl fmt::Debug for DebugSinkWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DebugSinkWriter").finish()
+    }
+}
+
+impl AsyncWrite for DebugSinkWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Create an AsyncWrite from an mpsc::Sender
+#[allow(dead_code)]
+pub fn channel_writer(tx: mpsc::Sender<Bytes>) -> DebugSinkWriter {
+    fn map_err(_: tokio_util::sync::PollSendError<Bytes>) -> io::Error {
+        io::Error::from(io::ErrorKind::BrokenPipe)
+    }
+
     let poll_sender = PollSender::new(tx);
-    let sink = poll_sender.sink_map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe));
+    let sink = poll_sender.sink_map_err(map_err as fn(_) -> _);
     let copy_to_bytes = CopyToBytes::new(sink);
-    SinkWriter::new(copy_to_bytes)
+    let writer = SinkWriter::new(copy_to_bytes);
+
+    DebugSinkWriter { inner: writer }
 }
 
 #[cfg(test)]

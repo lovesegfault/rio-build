@@ -49,6 +49,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 camino = { workspace = true }
+static_assertions = { workspace = true }
 
 # CLI
 clap = { workspace = true }
