@@ -59,7 +59,15 @@ message ExecuteBuildResponse {
     LogLine log = 2;
     BuildCompleted completed = 3;
     BuildFailed failed = 4;
+    OutputData output = 5;
   }
+}
+
+message OutputData {
+  string store_path = 1;
+  bytes nar_chunk = 2;
+  uint64 chunk_index = 3;
+  bool is_final_chunk = 4;
 }
 
 message LogLine {
