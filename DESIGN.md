@@ -156,39 +156,27 @@ When a build is queued, the Raft state machine (running on ALL agents) determini
 
 ```rust
 fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
-    // 1. Filter eligible agents (try Available first, fall back to Busy)
-    let mut eligible: Vec<_> = state.agents.values()
+    // 1. Filter eligible agents (platform + features, status-blind)
+    let eligible: Vec<_> = state.agents.values()
         .filter(|a| {
             a.platforms.contains(&cmd.platform) &&
             cmd.features.iter().all(|f| a.features.contains(f)) &&
-            a.status == AgentStatus::Available
+            a.status != AgentStatus::Down  // Only exclude Down agents
         })
         .collect();
 
     if eligible.is_empty() {
-        // No Available agents - assign to Busy agent (will queue)
-        eligible = state.agents.values()
-            .filter(|a| {
-                a.platforms.contains(&cmd.platform) &&
-                cmd.features.iter().all(|f| a.features.contains(f)) &&
-                a.status == AgentStatus::Busy
-            })
-            .collect();
-    }
-
-    if eligible.is_empty() {
-        // No Available or Busy agents - only Down agents exist
         panic!("No eligible agents for platform {} with features {:?}",
                cmd.platform, cmd.features);
     }
 
-    // 2. Score by affinity (count matching dependencies)
+    // 2. Score ALL agents by affinity (Available and Busy compete equally)
     let mut scores: HashMap<AgentId, usize> = HashMap::new();
-    for dep_hash in &cmd.dependencies {
-        if let Some(tracker) = state.builds_in_progress.get(dep_hash) {
+    for dep_path in &cmd.dependencies {
+        if let Some(tracker) = state.builds_in_progress.get(dep_path) {
             *scores.entry(tracker.agent_id).or_insert(0) += 1;
         }
-        if let Some(completed) = state.completed_builds.get(dep_hash) {
+        if let Some(completed) = state.completed_builds.get(dep_path) {
             *scores.entry(completed.agent_id).or_insert(0) += 1;
         }
     }
@@ -199,19 +187,19 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
         .max_by_key(|(_, score)| *score)
         .map(|(id, _)| *id)
         .or_else(|| eligible.iter().min_by_key(|a| &a.id).map(|a| a.id))
-        .expect("No eligible agents");
+        .expect("Should have at least one eligible agent");
 
     // 4. Update state (all agents do this identically)
     state.builds_in_progress.insert(cmd.top_level, BuildTracker {
         agent_id: selected,
-        status: BuildStatus::Building,
+        status: BuildStatus::Building,  // Agent will queue if busy
         parent_build: None,
         started_at: now(),
     });
 
     // Register dependencies
-    for dep_hash in cmd.dependencies {
-        state.builds_in_progress.entry(dep_hash).or_insert(BuildTracker {
+    for dep_path in cmd.dependencies {
+        state.builds_in_progress.entry(dep_path).or_insert(BuildTracker {
             agent_id: selected,
             status: BuildStatus::Building,
             parent_build: Some(cmd.top_level),
@@ -219,10 +207,14 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
         });
     }
 
-    // Store derivation in state (all agents have it now)
+    // Store derivation NAR (all agents have it now)
     state.pending_derivations.insert(cmd.top_level, cmd.derivation_nar);
 
-    state.agents.get_mut(&selected).status = AgentStatus::Busy;
+    // Mark agent as Busy (may already be Busy, that's fine)
+    if let Some(agent) = state.agents.get_mut(&selected) {
+        agent.status = AgentStatus::Busy;
+    }
+
     selected  // All agents compute the same result!
 }
 ```
@@ -230,21 +222,30 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
 **Why this works:**
 - ✅ Deterministic - Same cluster state + same BuildQueued command = same agent selected
 - ✅ No races - Assignment happens in state machine, not via distributed claiming
-- ✅ Best agent wins - Affinity scoring is explicit and deterministic
+- ✅ Best agent wins - Affinity scoring selects optimal agent
 - ✅ Consistent - All agents agree on who was assigned
-- ✅ Queuing support - Can assign to Busy agents (derivation available in Raft)
-- ✅ Durable - Survives leader election (derivations in RocksDB)
+- ✅ Status-blind - Available and Busy agents compete equally (simpler!)
+- ✅ Automatic queueing - Busy agents queue builds in `pending_builds`
+- ✅ Durable - Derivations in Raft survive leader election
 
-**Handling "All Agents Busy":**
+**Simplification: Status-Blind Assignment**
 
-When all eligible agents are currently building:
-1. State machine falls back to Busy agents (second filter pass)
-2. Affinity scoring still applies (prefer agent with matching deps)
-3. Build is assigned to best Busy agent
-4. Agent receives assignment, queues in `pending_builds`
-5. Agent starts build when current build completes
-6. User sees "Queued - position N in queue" status
-7. No CLI retry needed - automatic queueing
+Unlike traditional schedulers that prefer "Available" agents, Rio's assignment is **status-blind**:
+
+1. **Only filter by capabilities** (platform, features, not Down)
+2. **Affinity is the only criterion** - best agent wins regardless of current load
+3. **Agent handles queueing locally** - if busy, adds to `pending_builds`
+
+**Benefits:**
+- Simpler algorithm (no Available vs Busy logic)
+- Better affinity (builds stay where dependencies are, even if agent is busy)
+- Natural load balancing (affinity distributes work)
+- Automatic queueing (no special "all agents busy" handling)
+
+**Why this is safe:**
+- Affinity scoring naturally distributes work (agents with no deps score 0)
+- Agent local queue prevents overload (bounded by pending_builds)
+- Deterministic tie-breaking prevents hot-spots
 
 **Build Deduplication:**
 
@@ -355,12 +356,14 @@ User runs: rio-build ./my-package.nix
 └─────────────────────────────────────────────────────┘
    ALL agents apply BuildQueued to state machine:
 
-   1. Filter eligible agents (platform + features + Available)
-   2. Score agents by affinity (count matching dependencies)
-   3. Select highest score
+   1. Filter eligible agents (platform + features, not Down)
+   2. Score ALL agents by affinity (count matching dependencies)
+      - Busy and Available agents compete equally
+   3. Select highest affinity score
    4. Tie-breaker: lexicographically smallest agent_id
    5. Update state:
       - builds_in_progress[derivation_path] = { agent_id: selected, ... }
+      - pending_derivations[derivation_path] = derivation_nar
       - agents[selected].status = Busy
 
    Result: ALL agents agree on assignment (deterministic!)
