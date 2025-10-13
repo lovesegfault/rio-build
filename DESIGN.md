@@ -128,7 +128,7 @@ enum RaftCommand {
     // Agent updates status when starting/queuing
     BuildStatusChanged {
         derivation_path: DerivationPath,
-        status: BuildStatus,  // Queued or Building
+        status: BuildStatus,  // Building, QueuedDependency, or QueuedCapacity
     },
     BuildCompleted {
         derivation_path: DerivationPath,
@@ -600,24 +600,25 @@ Time T0: User A submits /nix/store/abc123-foo.drv
    - bar.drv (dependency)
    - baz.drv (dependency)
 2. CLI → Leader: QueueBuild(foo_path, foo_nar_bytes, deps=[bar_path, baz_path])
-3. Leader stores: /tmp/rio-pending/foo_path.nar
-4. Leader proposes: BuildQueued {
+3. Leader proposes: BuildQueued {
      top_level: foo_path,
+     derivation_nar: foo_nar_bytes,
      dependencies: [bar_path, baz_path],
      platform: "x86_64-linux",
      features: []
    }
-5. Raft state machine (on ALL agents) applies BuildQueued:
-   - Filters eligible agents
+4. Raft replicates to all agents, state machine applies BuildQueued:
+   - Filters eligible agents (platform + features, not Down)
    - Scores by affinity (no deps yet, all score 0)
    - Tie-breaks: selects Agent K (smallest agent_id among eligible)
    - Atomically registers:
      * builds_in_progress[foo_path] = { agent: K, parent: None, status: Building }
      * builds_in_progress[bar_path] = { agent: K, parent: Some(foo_path), status: Building }
      * builds_in_progress[baz_path] = { agent: K, parent: Some(foo_path), status: Building }
+     * pending_derivations[foo_path] = foo_nar_bytes
      * agents[K].status = Busy
-6. Agent K sees assignment, fetches nar_bytes from leader
-7. Agent K starts building, streaming logs to User A
+5. Agent K sees assignment, reads NAR from own Raft storage
+6. Agent K starts building, streaming logs to User A
 
 Time T1: User B submits same foo.drv (30s later)
 1. CLI extracts build closure: [foo, bar, baz]
@@ -663,188 +664,10 @@ Time T3: User C submits same derivation (3 minutes later)
 
 **Agent-Side Implementation:**
 
-```rust
-struct Agent {
-    // Currently executing build (one at a time)
-    current_build: Option<DerivationPath>,
+When an agent is notified of a build assignment (by watching Raft commits), it determines
+the appropriate BuildStatus and manages its local queue.
 
-    // Builds waiting for dependencies to complete
-    pending_builds: HashMap<DerivationPath, PendingBuild>,
-
-    // Build state with multiple subscribers (keyed by derivation path)
-    build_jobs: HashMap<DerivationPath, BuildJob>,
-}
-
-struct PendingBuild {
-    derivation: Vec<u8>,
-    blocked_on: Vec<DerivationPath>,
-    subscribers: Vec<BuildSubscriber>,
-}
-
-struct BuildJob {
-    derivation_path: DerivationPath,  // /nix/store/abc123-foo.drv
-    process: Child,  // nix-build process
-    subscribers: Vec<BuildSubscriber>,
-    log_history: Vec<LogLine>,  // For late joiners (last 10,000 lines)
-}
-
-struct BuildSubscriber {
-    stream: ResponseStream,
-    joined_at_line: usize,  // Log line index when they joined
-}
-
-impl Agent {
-    async fn submit_build(&self, req: SubmitBuildRequest) -> Result<Stream<BuildUpdate>> {
-        let drv_path = req.derivation_path.clone();
-
-        // Check Raft state
-        let existing = self.raft.query_build(&drv_path).await?;
-
-        match existing {
-            None => {
-                // Check which dependencies are building on THIS agent
-                let mut deps_building_here = Vec::new();
-                for dep_path in &req.dependency_paths {
-                    if let Some(tracker) = self.raft.query_build(dep_path).await? {
-                        if tracker.agent_id == self.id {
-                            deps_building_here.push(dep_path.clone());
-                        }
-                    }
-                }
-
-                let status = if deps_building_here.is_empty() {
-                    BuildStatus::Building
-                } else {
-                    BuildStatus::Queued { blocked_on: deps_building_here.clone() }
-                };
-
-                // Register atomically
-                self.raft.propose(BuildStartedWithDependencies {
-                    top_level: drv_path.clone(),
-                    dependencies: req.dependency_paths,
-                    agent_id: self.id,
-                    platform: req.platform,
-                    status: status.clone(),
-                }).await?;
-
-                // Mark agent as Busy
-                self.raft.propose(AgentStatusChanged {
-                    agent_id: self.id,
-                    status: AgentStatus::Busy,
-                }).await?;
-
-                if matches!(status, BuildStatus::Queued { .. }) {
-                    self.queue_build(drv_path, req, deps_building_here).await
-                } else {
-                    self.start_build(drv_path, req).await
-                }
-            }
-            Some(BuildTracker { agent_id, status, .. }) if agent_id == self.id => {
-                // Building/queued on THIS agent - add subscriber
-                self.subscribe_to_build(drv_path).await
-            }
-            Some(BuildTracker { agent_id, .. }) => {
-                // Building on different agent - redirect
-                Err(RedirectToAgent { agent_id, derivation_path: drv_path })
-            }
-            Some(CompletedBuild { output_paths, .. }) => {
-                // Recently completed - stream outputs from /nix/store
-                self.stream_completed_build(drv_path, output_paths).await
-            }
-        }
-    }
-
-    async fn on_build_completed(&mut self, drv_path: DerivationPath, outputs: Vec<Utf8PathBuf>) {
-        // Propose completion to Raft
-        self.raft.propose(BuildCompleted {
-            derivation_path: drv_path.clone(),
-            output_paths: outputs.clone(),
-        }).await?;
-
-        // Broadcast to all subscribers
-        self.broadcast_to_subscribers(&drv_path, BuildUpdate::Completed(...)).await?;
-
-        // Check pending builds waiting on this dependency
-        let mut unblocked = Vec::new();
-
-        for (pending_path, pending) in &mut self.pending_builds {
-            pending.blocked_on.retain(|p| p != &drv_path);
-
-            if pending.blocked_on.is_empty() {
-                unblocked.push(pending_path.clone());
-            }
-        }
-
-        // Start unblocked builds
-        if let Some(next_path) = unblocked.first() {
-            let pending = self.pending_builds.remove(next_path)?;
-            self.current_build = Some(next_path.clone());
-            self.start_build(next_path.clone(), pending.derivation).await?;
-        } else {
-            // No more work - mark as Available
-            self.current_build = None;
-            self.raft.propose(AgentStatusChanged {
-                agent_id: self.id,
-                status: AgentStatus::Available,
-            }).await?;
-        }
-    }
-
-    async fn on_build_failed(&mut self, drv_path: DerivationPath, error: String) {
-        // Propose failure to Raft
-        self.raft.propose(BuildFailed {
-            derivation_path: drv_path.clone(),
-            error: error.clone(),
-        }).await?;
-
-        // Find all builds waiting on this dependency (cascading failures)
-        let dependents: Vec<_> = self.pending_builds.iter()
-            .filter(|(_, pending)| pending.blocked_on.contains(&drv_path))
-            .map(|(path, _)| path.clone())
-            .collect();
-
-        // Recursively fail dependents
-        for dependent_path in dependents {
-            self.fail_build_cascade(dependent_path.clone(), format!(
-                "Dependency {} failed: {}", drv_path, error
-            )).await?;
-        }
-
-        // Mark agent as Available (unless other pending builds exist)
-        if self.pending_builds.is_empty() {
-            self.current_build = None;
-            self.raft.propose(AgentStatusChanged {
-                agent_id: self.id,
-                status: AgentStatus::Available,
-            }).await?;
-        }
-    }
-}
-```
-
-**CLI Handling of Redirects:**
-
-```rust
-async fn submit_build_with_retry(drv_path: Utf8PathBuf) -> Result<()> {
-    let drv_bytes = tokio::fs::read(&drv_path).await?;
-    let mut agent = select_agent(&cluster)?;
-
-    loop {
-        match agent.submit_build(drv_bytes.clone()).await {
-            Ok(stream) => {
-                return handle_build_stream(stream).await;
-            }
-            Err(RedirectToAgent { agent_id, derivation_path }) => {
-                // Transparently redirect to correct agent
-                agent = cluster.find_agent(agent_id)?;
-                // Retry will call SubscribeToBuild instead
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-```
+See "How BuildStatus is determined" section above for the complete logic.
 
 **Cache Duration:**
 - Active builds: In Raft until BuildCompleted/BuildFailed
@@ -913,22 +736,25 @@ let deps = [hash(dep1.drv), hash(dep2.drv)];  // NOT dep3, dep4!
 agent.submit_build(my-app_bytes, deps);
 ```
 
-**Agent atomically registers all derivations:**
+**State machine atomically registers all derivations:**
+
+When BuildQueued is applied, the state machine registers the top-level and all dependencies:
 
 ```rust
-// Agent proposes single Raft command
-BuildStartedWithDependencies {
+// Leader proposes BuildQueued (includes dependencies)
+BuildQueued {
     top_level: "/nix/store/xyz-my-app.drv",
+    derivation_nar: <NAR bytes>,
     dependencies: [
         "/nix/store/abc-dep1.drv",
         "/nix/store/def-dep2.drv",
         "/nix/store/ghi-dep3.drv"
     ],
-    agent_id: "agent-1",
     platform: "x86_64-linux",
+    features: [],
 }
 
-// Raft state machine applies atomically:
+// Raft state machine applies atomically (on ALL agents):
 builds_in_progress["/nix/store/xyz-my-app.drv"] = BuildTracker {
     agent_id: agent-1,
     parent_build: None,  // Top-level
@@ -1011,7 +837,7 @@ sequenceDiagram
     UserB->>AgentK: SubscribeToBuild(bar)
 
     AgentK->>AgentK: Check: foo building on self<br/>→ Queue bar (blocked on foo)
-    AgentK->>Raft: BuildStatusChanged(bar, Queued)
+    AgentK->>Raft: BuildStatusChanged(bar, QueuedDependency)
     AgentK-->>UserB: "Waiting for dependency foo..."
 
     Note over AgentK: foo completes
@@ -1035,26 +861,21 @@ Time T0: User A runs: rio-build ./foo.nix
 
 Time T1: User B runs: rio-build ./bar.nix (bar depends on foo)
 - CLI extracts closure: [bar.drv, foo.drv]
-- CLI checks cluster:
-  - foo is building on Agent K
-- CLI scores agents:
+- CLI → Leader: QueueBuild(bar, bar_nar, deps=[foo])
+- Raft state machine scores agents:
   - Agent K: affinity=1 (has foo building)
   - Agent J: affinity=0
   - Agent M: affinity=0
-- CLI selects Agent K (best affinity!)
-- CLI → Agent K: SubmitBuild(bar_bytes, deps=[hash(foo)])
+- State machine selects Agent K (best affinity!)
+- Leader → CLI: BuildAssigned(K, bar)
 
-Time T2: Agent K receives bar submission
-- Checks: foo is building on me (self.current_build = Some(hash(foo)))
-- Status: Queued { blocked_on: [hash(foo)] }
-- Registers in Raft: BuildStartedWithDependencies {
-    top_level: hash(bar),
-    dependencies: [hash(foo)],
-    agent_id: K,
-    status: Queued
-  }
-- Adds bar to pending_builds queue
-- Sends to User B: "Waiting for dependency /nix/store/abc-foo.drv..."
+Time T2: Raft assigns bar to Agent K (affinity with foo)
+- Agent K sees assignment in Raft log
+- Agent K is busy building foo
+- Agent K checks: foo is currently building on me
+- Agent K proposes: BuildStatusChanged { bar, QueuedDependency { blocked_on: [foo] } }
+- Agent K adds bar to pending_builds queue
+- Agent K sends to User B: "Waiting for dependency /nix/store/abc-foo.drv..."
 
 Time T3: foo build completes
 - Agent K marks foo complete in Raft
@@ -1217,8 +1038,8 @@ Time T0: User A submits foo
 - User A's CLI → Agent K (streaming logs)
 
 Time T1: User B submits bar (depends on foo)
-- CLI detects foo building on Agent K (affinity!)
-- builds_in_progress[bar_path] = { agent_id: K, status: Queued { blocked_on: [foo_path] } }
+- Raft assigns to Agent K (affinity!)
+- builds_in_progress[bar_path] = { agent_id: K, status: QueuedDependency { blocked_on: [foo_path] } }
 - User B's CLI → Agent K (sees "Waiting for dependencies...")
 
 Time T2: Agent K crashes
@@ -1241,10 +1062,10 @@ Time T3+1ms: User B retries bar (nearly simultaneous)
 - CLI: GetBuildStatus(bar_path) → NotFound
 - CLI: Resubmit bar, check dependencies
 - Raft shows: foo_path = { agent_id: J, status: Building } ← User A's build!
-- CLI selects Agent J (affinity with foo!)
-- Agent J receives bar, detects foo building on self
-- Agent J queues: Queued { blocked_on: [foo_path] }
-- builds_in_progress[bar_path] = { agent_id: J, status: Queued }
+- Raft assigns to Agent J (affinity with foo!)
+- Agent J receives assignment, detects foo building on self
+- Agent J proposes: BuildStatusChanged { bar, QueuedDependency { blocked_on: [foo_path] } }
+- builds_in_progress[bar_path] = { agent_id: J, status: QueuedDependency { blocked_on: [foo_path] } }
 - User B's CLI reconnects to Agent J: "Waiting for dependencies..."
 
 Time T4: foo completes on Agent J
@@ -1471,7 +1292,7 @@ service RioAgent {
       returns (ClusterMembers);
 
   // Build submission (leader only - queues work for Raft assignment)
-  // Leader stores derivation temporarily and proposes to Raft
+  // Leader includes derivation NAR in BuildQueued command for Raft
   rpc QueueBuild(QueueBuildRequest)
       returns (QueueBuildResponse);
 
