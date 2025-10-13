@@ -1896,6 +1896,33 @@ where
                         drv_path, output_path
                     );
                 }
+                Ok(wire::Op::NarFromPath) => {
+                    let path = wire::read_string(&mut self.r)
+                        .await
+                        .with_field("NarFromPath.path")?;
+
+                    info!("NarFromPath: path={}", path);
+
+                    // Export the path as NAR and send it framed
+                    // For now, delegate to our Store's query methods and send empty
+                    // TODO: Actually export the NAR data
+                    let path_exists =
+                        forward_stderr(&mut self.w, self.store.is_valid_path(&path)).await?;
+
+                    if path_exists {
+                        // Should export NAR here, but for now send empty framed data
+                        wire::write_u64(&mut self.w, 0)
+                            .await
+                            .with_field("NarFromPath.nar_size")?;
+                    } else {
+                        // Path doesn't exist, send empty
+                        wire::write_u64(&mut self.w, 0)
+                            .await
+                            .with_field("NarFromPath.empty")?;
+                    }
+
+                    info!("NarFromPath: completed for {}", path);
+                }
                 Ok(v) => todo!("{:#?}", v),
 
                 Err(Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
