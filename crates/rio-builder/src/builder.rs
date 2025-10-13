@@ -57,7 +57,7 @@ impl Builder {
 
         let request = RegisterBuilderRequest {
             builder_id: self.id.to_string(),
-            endpoint: format!("{}:{}", hostname::get()?.to_string_lossy(), 50052),
+            endpoint: format!("http://{}:50052", hostname::get()?.to_string_lossy()),
             capacity: Some(BuilderCapacity {
                 cpu_cores: num_cpus::get() as i32,
                 memory_mb: 8192, // TODO: Get actual memory
@@ -137,17 +137,15 @@ impl Builder {
             .context("Failed to start heartbeat stream")?
             .into_inner();
 
-        // Process responses from dispatcher
-        tokio::spawn(async move {
-            while let Ok(Some(response)) = response_stream.message().await {
-                if !response.commands.is_empty() {
-                    info!("Received commands from dispatcher: {:?}", response.commands);
-                    // TODO: Process commands
-                }
+        // Process responses from dispatcher (this blocks until stream ends)
+        while let Ok(Some(response)) = response_stream.message().await {
+            if !response.commands.is_empty() {
+                info!("Received commands from dispatcher: {:?}", response.commands);
+                // TODO: Process commands
             }
-            info!("Heartbeat response stream ended");
-        });
+        }
 
+        info!("Heartbeat response stream ended");
         Ok(())
     }
 

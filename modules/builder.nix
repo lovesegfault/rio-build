@@ -151,6 +151,7 @@ in
         ReadWritePaths = [
           "/var/lib/rio-builder"
           "/nix/store"
+          "/nix/var" # Needed for nix-store operations (database writes)
           "/tmp"
         ];
 

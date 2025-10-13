@@ -106,11 +106,34 @@ async fn main() -> Result<()> {
     // Create builder
     let mut builder = Builder::new(cli.dispatcher_endpoint, platforms, cli.features);
 
-    // Connect to dispatcher
-    if let Err(e) = builder.connect().await {
-        error!("Failed to connect to dispatcher: {}", e);
-        return Err(e);
+    // Connect to dispatcher with retries
+    let max_retries = 10;
+    let mut retry_count = 0;
+    let mut delay = std::time::Duration::from_secs(1);
+
+    loop {
+        match builder.connect().await {
+            Ok(()) => break,
+            Err(e) => {
+                retry_count += 1;
+                if retry_count >= max_retries {
+                    error!(
+                        "Failed to connect to dispatcher after {} attempts: {}",
+                        retry_count, e
+                    );
+                    return Err(e);
+                }
+                info!(
+                    "Connection attempt {} failed, retrying in {:?}...",
+                    retry_count, delay
+                );
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(30));
+            }
+        }
     }
+
+    info!("Connected to dispatcher successfully");
 
     // Register with dispatcher
     if let Err(e) = builder.register().await {

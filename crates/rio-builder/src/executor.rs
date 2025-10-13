@@ -301,29 +301,25 @@ impl Executor {
         Ok(responses)
     }
 
-    /// Export a store path as NAR format using nix-store --dump
+    /// Export a store path using nix-store --export (includes NAR + metadata)
     async fn export_path_as_nar(&self, store_path: &str) -> Result<Vec<u8>> {
-        info!("Exporting {} as NAR", store_path);
+        info!("Exporting {} with nix-store --export", store_path);
 
         let output = Command::new("nix-store")
-            .arg("--dump")
+            .arg("--export")
             .arg(store_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .await
-            .context("Failed to run nix-store --dump")?;
+            .context("Failed to run nix-store --export")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("nix-store --dump failed for {}: {}", store_path, stderr);
+            anyhow::bail!("nix-store --export failed for {}: {}", store_path, stderr);
         }
 
-        info!(
-            "Exported {} as NAR ({} bytes)",
-            store_path,
-            output.stdout.len()
-        );
+        info!("Exported {} ({} bytes)", store_path, output.stdout.len());
 
         Ok(output.stdout)
     }
