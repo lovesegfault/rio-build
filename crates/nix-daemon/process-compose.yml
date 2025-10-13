@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2025 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: EUPL-1.2
+
+version: "0.5"
+
+processes:
+  gorgond:
+    description: Gorgon Daemon
+    command: |
+      eval "$(direnv export bash)"
+      createdb $PGDATABASE 2>/dev/null
+      cargo run -p gorgond -- -v run
+    is_foreground: true
+    depends_on:
+      postgres: { condition: process_healthy }
+    readiness_probe:
+      http_get:
+        host: localhost
+        port: 9999
+
+  postgres:
+    description: PostgreSQL Server
+    command: |
+      eval "$(direnv export bash)"
+
+      echo "Postgres data to be stored in $$PGDATA"
+      if [ ! -d $$PGDATA ]; then
+        echo 'Initializing postgresql database...'
+        initdb $$PGDATA
+      fi
+
+      postgres -D $$PGDATA -h '' -k $$PGHOST
+    readiness_probe:
+      exec:
+        command: direnv exec . pg_isready -d postgres

@@ -1,0 +1,20 @@
+#!/usr/bin/env fish
+
+# SPDX-FileCopyrightText: 2025 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: EUPL-1.2
+
+argparse 'url=' 'rev=' -- $argv
+or exit 1
+
+if test -z "$_flag_url"
+    echo "--url" is required
+    exit 1
+end
+if test -z "$_flag_rev"
+    echo "--rev" is required
+    exit 1
+end
+
+git clone $_flag_url .
+git checkout $_flag_rev

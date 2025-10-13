@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2023 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+[Unit]
+Description=Nix Supervisor
+After=network.target
+After=nix-supervisor.socket
+Requires=nix-supervisor.socket
+
+[Service]
+ExecStart=nix-supervisor --db-path=${STATE_DIRECTORY}/db.sqlite3 -v
+StateDirectory=nix-supervisor
+
+# Run as a temporary, unprivileged user. Implies a wide range of restrictions.
+DynamicUser=true
+
+# Bind the only paths we're allowed to access normally.
+TemporaryFileSystem=/nix
+BindPaths=/nix/var/nix/daemon-socket/socket
+
+# We only need the nix store because that's typically where our binaries are.
+BindReadOnlyPaths=/nix/store
+
+# Run in a private network namespace, where we can communicate only through the
+# accompanying socket unit. If you don't want this, comment this out and remove
+# After=nix-supervisor.socket and Requires=nix-supervisor.socket from [Unit].
+PrivateNetwork=true
+
+# Society if systemd had a switch that let me opt into things instead of having
+# to manually disable every feature in Linux one-by-one.
+# At least systemd-analyze security is friend-shaped.
+PrivateUsers=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectProc=ptraceable
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

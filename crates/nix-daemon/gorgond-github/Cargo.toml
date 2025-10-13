@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2025 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: EUPL-1.2
+
+[package]
+name = "gorgond-github"
+version = "0.1.0"
+edition = "2024"
+license = "EUPL-1.2"
+
+[dependencies]
+gorgond-client = { path = "../gorgond-client" }
+gorgond-diesel = { path = "../gorgond-diesel" }
+gorgon-util-cli = { path = "../gorgon-util-cli" }
+gorgon-build-helper = { path = "../gorgon-build-helper" }
+
+chrono.workspace = true
+clap.workspace = true
+diesel-async.workspace = true
+diesel-derive-enum.workspace = true
+diesel_migrations.workspace = true
+diesel = { workspace = true, features = ["chrono", "uuid", "serde_json", "postgres_backend", "with-deprecated"] }
+hex = "0.4.3"
+miette.workspace = true
+octocrab = { version = "0.44.1", default-features = false }
+rayon = "1.10.0"
+scoped-futures.workspace = true
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+strum.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+tracing.workspace = true

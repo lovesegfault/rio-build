@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2025 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: EUPL-1.2
+
+[package]
+name = "gorgond-client"
+version = "0.1.0"
+edition = "2021"
+license = "EUPL-1.2"
+
+[dependencies]
+axum = { workspace = true, optional = true }
+axum-extra = { workspace = true, features = ["erased-json"], optional = true }
+chrono.workspace = true
+derive_more.workspace = true
+diesel = { workspace = true, optional = true }
+diesel-async = { workspace = true, features = ["deadpool"], optional = true }
+miette.workspace = true
+minicbor = { workspace = true, features = ["derive"] }
+ownable.workspace = true
+percent-encoding = "2.3.1"
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+yoke = { workspace = true, features = ["derive"] }
+
+[features]
+axum = ["dep:axum", "dep:axum-extra"]
+diesel = ["dep:diesel", "dep:diesel-async"]
