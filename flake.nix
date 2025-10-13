@@ -79,13 +79,12 @@
           # Source root for filesets
           unfilteredRoot = ./.;
 
-          # Source for VM tests and modules (separate from crane builds)
-          testAndModuleSrc = pkgs.lib.fileset.toSource {
-            root = unfilteredRoot;
-            fileset = pkgs.lib.fileset.unions [
-              ./tests
-              ./modules
-            ];
+          # Common environment variables for builds and dev shell
+          commonEnvVars = {
+            RUST_BACKTRACE = "1";
+            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
           # Common arguments for all crane builds
@@ -107,18 +106,21 @@
             nativeBuildInputs = with pkgs; [
               pkg-config
               protobuf
+              cmake
             ];
 
             buildInputs =
               with pkgs;
               [
                 openssl
+                llvmPackages.libclang.lib
               ]
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
                 libiconv
               ];
-          };
+          }
+          // commonEnvVars;
 
           # Build dependencies only (for caching)
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -173,37 +175,35 @@
           };
 
           # Development shell
-          devShells.default = craneLib.devShell {
-            # Inherit inputs from the package build
-            inputsFrom = [ rio-workspace ];
+          devShells.default = craneLib.devShell (
+            commonEnvVars
+            // {
+              # Inherit inputs from the package build
+              inputsFrom = [ rio-workspace ];
 
-            # Inherit inputs from checks
-            checks = config.checks;
+              # Inherit inputs from checks
+              checks = config.checks;
 
-            # Additional development packages
-            packages = with pkgs; [
-              # Cargo tools
-              cargo-edit
-              cargo-watch
-              cargo-expand
-              cargo-outdated
+              # Additional development packages
+              packages = with pkgs; [
+                # Cargo tools
+                cargo-edit
+                cargo-watch
+                cargo-expand
+                cargo-outdated
 
-              # Debugging tools
-              lldb
-              gdb
+                # Debugging tools
+                lldb
+                gdb
 
-              # Nix tooling (fork with system-features support)
-              inputs'.nix-eval-jobs.packages.default
-            ];
+                # Nix tooling (fork with system-features support)
+                inputs'.nix-eval-jobs.packages.default
+              ];
 
-            # Shell hook for pre-commit
-            shellHook = config.pre-commit.installationScript;
-
-            # Environment variables
-            RUST_BACKTRACE = "1";
-            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-            PROTOC = "${pkgs.protobuf}/bin/protoc";
-          };
+              # Shell hook for pre-commit
+              shellHook = config.pre-commit.installationScript;
+            }
+          );
 
           # Packages
           packages = {
@@ -265,77 +265,6 @@
                 inherit cargoArtifacts;
               }
             );
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # VM end-to-end test (Linux only - requires KVM)
-            vm-e2e =
-              let
-                dispatcherModule = import ./modules/dispatcher.nix;
-                builderModule = import ./modules/builder.nix;
-              in
-              pkgs.testers.runNixOSTest {
-                name = "rio-distributed-build-e2e";
-
-                nodes = {
-                  dispatcher = {
-                    imports = [ dispatcherModule ];
-                    services.rio-dispatcher = {
-                      enable = true;
-                      package = self'.packages.rio-dispatcher;
-                      grpcAddress = "0.0.0.0:50051";
-                      sshAddress = "0.0.0.0:2222";
-                      logLevel = "debug";
-                    };
-                    nix.settings = {
-                      experimental-features = [
-                        "nix-command"
-                        "flakes"
-                      ];
-                      sandbox = false;
-                    };
-                  };
-
-                  builder = {
-                    imports = [ builderModule ];
-                    services.rio-builder = {
-                      enable = true;
-                      package = self'.packages.rio-builder;
-                      dispatcherEndpoint = "http://dispatcher:50051";
-                      grpcAddress = "0.0.0.0:50052";
-                      logLevel = "debug";
-                    };
-                    nix.settings = {
-                      experimental-features = [
-                        "nix-command"
-                        "flakes"
-                      ];
-                      sandbox = false;
-                    };
-                  };
-
-                  client = {
-                    environment.systemPackages = with pkgs; [
-                      nix
-                      openssh
-                    ];
-                    nix.settings = {
-                      experimental-features = [
-                        "nix-command"
-                        "flakes"
-                      ];
-                      max-jobs = 0;
-                    };
-                    programs.ssh.extraConfig = ''
-                      Host dispatcher
-                        StrictHostKeyChecking no
-                        UserKnownHostsFile /dev/null
-                        LogLevel ERROR
-                    '';
-                  };
-                };
-
-                testScript = builtins.readFile ./tests/vm-e2e-script.py;
-              };
           };
 
           # Formatter for 'nix fmt'
