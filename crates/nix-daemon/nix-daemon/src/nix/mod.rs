@@ -1709,8 +1709,11 @@ where
 
                     info!("AddMultipleToStore: repair={}", repair);
 
-                    // Read count of paths
-                    let count = wire::read_u64(&mut self.r)
+                    // Create FramedReader for the entire batch
+                    let mut framed_source = wire::FramedReader::new(&mut self.r);
+
+                    // Read count of paths from the framed source
+                    let count = wire::read_u64(&mut framed_source)
                         .await
                         .with_field("AddMultipleToStore.count")?;
 
@@ -1718,8 +1721,8 @@ where
 
                     // Process each path
                     for i in 0..count {
-                        // Read ValidPathInfo (using protocol version 16 as per Nix implementation)
-                        let path_info = wire::read_pathinfo(&mut self.r, Proto(1, 16))
+                        // Read ValidPathInfo from framed source (using protocol version 16 as per Nix)
+                        let path_info = wire::read_pathinfo(&mut framed_source, Proto(1, 16))
                             .await
                             .with_field("AddMultipleToStore.pathInfo")?;
 
@@ -1729,8 +1732,9 @@ where
                             path_info.references.len()
                         );
 
-                        // Read the framed NAR data for this path
-                        let mut source = wire::FramedReader::new(&mut self.r);
+                        // Read the NAR data for this path from the framed source
+                        // The NAR data is also framed within the outer frame
+                        let mut nar_source = wire::FramedReader::new(&mut framed_source);
 
                         // Extract store path name from the last component
                         // PathInfo doesn't have the store path itself, but we can generate a name
@@ -1744,19 +1748,25 @@ where
                                 path_info.nar_hash.clone(),
                                 path_info.references.clone(),
                                 repair,
-                                &mut source,
+                                &mut nar_source,
                             ),
                         )
                         .await?;
 
                         info!("AddMultipleToStore[{}]: added path {}", i, added_path);
 
-                        // Ensure source is fully drained
+                        // Ensure NAR source is fully drained
                         let mut sink = tokio::io::sink();
-                        tokio::io::copy(&mut source, &mut sink)
+                        tokio::io::copy(&mut nar_source, &mut sink)
                             .await
                             .map_err(|e| Error::IO(e))?;
                     }
+
+                    // Drain the outer framed source
+                    let mut sink = tokio::io::sink();
+                    tokio::io::copy(&mut framed_source, &mut sink)
+                        .await
+                        .map_err(|e| Error::IO(e))?;
 
                     info!("AddMultipleToStore: completed {} paths", count);
                 }
