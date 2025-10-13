@@ -119,6 +119,7 @@ in
         ReadWritePaths = [
           "/var/lib/rio-dispatcher"
           "/nix/store"
+          "/nix/var" # Needed for nix-store operations (database writes)
         ];
 
         # Logging

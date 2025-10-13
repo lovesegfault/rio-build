@@ -122,6 +122,53 @@ impl BuildQueue {
         let jobs = self.jobs.read().await;
         jobs.values().cloned().collect()
     }
+
+    /// Wait for a job to reach a terminal status (Completed or Failed)
+    ///
+    /// Polls the job status with exponential backoff until it reaches a terminal state.
+    /// Returns the final job status.
+    #[tracing::instrument(skip(self), fields(job_id = %job_id))]
+    pub async fn wait_for_completion(&self, job_id: &JobId) -> Option<JobStatus> {
+        use tokio::time::{Duration, sleep};
+
+        let mut delay = Duration::from_millis(50);
+        let max_delay = Duration::from_secs(1);
+        let max_wait = Duration::from_secs(300); // 5 minute timeout
+        let start = tokio::time::Instant::now();
+
+        loop {
+            // Check if job exists and its status
+            if let Some(job) = self.get_job(job_id).await {
+                match job.status {
+                    JobStatus::Completed | JobStatus::Failed => {
+                        debug!("Job {} reached terminal status: {:?}", job_id, job.status);
+                        return Some(job.status);
+                    }
+                    _ => {
+                        // Job still in progress
+                        debug!(
+                            "Job {} still in progress (status: {:?}), waiting...",
+                            job_id, job.status
+                        );
+                    }
+                }
+            } else {
+                // Job not found
+                debug!("Job {} not found", job_id);
+                return None;
+            }
+
+            // Check timeout
+            if start.elapsed() > max_wait {
+                info!("Job {} wait timed out after {:?}", job_id, max_wait);
+                return None;
+            }
+
+            // Sleep with exponential backoff
+            sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
+        }
+    }
 }
 
 impl Default for BuildQueue {

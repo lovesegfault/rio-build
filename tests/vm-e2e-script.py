@@ -45,28 +45,41 @@ else:
 # === Phase 2: Create Test Derivation ===
 info("Phase 2: Creating test derivation on client")
 
+# Create derivation on client for remote builder workflow
 client.succeed("""
-  cat > /tmp/rio-vm-test.nix << 'EOF'
-  derivation {
-    name = "rio-vm-e2e-test";
-    system = builtins.currentSystem;
-    builder = "/bin/sh";
-    args = [ "-c" "echo 'Successfully built by Rio in VM!' > $out" ];
-  }
-  EOF
+cat > /tmp/rio-vm-test.nix << 'EOF'
+derivation {
+  name = "rio-vm-e2e-test";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "echo 'Successfully built by Rio in VM!' > $out" ];
+}
+EOF
 """)
 
 drv_path = client.succeed("nix-instantiate /tmp/rio-vm-test.nix").strip()
 print(f"✓ Created derivation: {drv_path}")
 
-# === Phase 3: Submit Build via SSH ===
-info("Phase 3: Submitting build to Rio via SSH")
+# === Phase 3: Submit Build via Remote Builder ===
+info("Phase 3: Submitting build to Rio as remote builder")
 
-print("Attempting: nix-build --store ssh://dispatcher:2222")
+# Configure Rio as a remote builder on the client using ssh-ng://
+client.succeed("""
+mkdir -p ~/.config/nix
+cat > ~/.config/nix/nix.conf << 'EOF'
+builders = ssh-ng://dispatcher:2222 x86_64-linux - 10 1
+builders-use-substitutes = false
+EOF
+""")
+print("✓ Configured Rio as remote builder (ssh-ng protocol)")
+
+# Trigger a build that requires the platform
+# The client will evaluate locally but delegate the build to Rio
+print(f"Building {drv_path} using remote builder...")
 
 try:
     output = client.succeed(
-        f"nix-build --store ssh://dispatcher:2222 {drv_path} --no-out-link 2>&1",
+        f"nix-build {drv_path} --option max-jobs 0 --no-out-link 2>&1",
         timeout=60
     )
     output_path = output.strip().split('\n')[-1]
@@ -90,12 +103,12 @@ if not output_path.startswith("/nix/store/"):
     print(f"❌ Output is not a store path: {output_path}")
     sys.exit(1)
 
-# The output should exist on the dispatcher
-dispatcher.succeed(f"test -f {output_path}")
-print(f"✓ Output exists on dispatcher: {output_path}")
+# With remote builder mode, output should be on the client (transferred back)
+client.succeed(f"test -f {output_path}")
+print(f"✓ Output exists on client: {output_path}")
 
 # Read and verify content
-content = dispatcher.succeed(f"cat {output_path}")
+content = client.succeed(f"cat {output_path}")
 expected = "Successfully built by Rio in VM!"
 
 if expected not in content:
@@ -107,28 +120,33 @@ print(f"✓ Output has correct content: '{content.strip()}'")
 # === Phase 5: Test Concurrent Builds ===
 info("Phase 5: Testing concurrent builds")
 
-# Create multiple test derivations
+# Create multiple test derivations on client
+drv_paths = []
 for i in range(3):
     client.succeed(f"""
-      cat > /tmp/concurrent-{i}.nix << 'EOF'
-      derivation {{{{
-        name = "concurrent-test-{i}";
-        system = builtins.currentSystem;
-        builder = "/bin/sh";
-        args = [ "-c" "echo 'Concurrent build {i}' > $out" ];
-      }}}}
-      EOF
-    """)
+cat > /tmp/concurrent-{i}.nix << 'EOF'
+derivation {{{{
+  name = "concurrent-test-{i}";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "echo 'Concurrent build {i}' > $out" ];
+}}}}
+EOF
+""")
+    # Instantiate on client
+    drv_path = client.succeed(f"nix-instantiate /tmp/concurrent-{i}.nix").strip()
+    drv_paths.append(drv_path)
+    print(f"✓ Concurrent derivation {i} created: {drv_path}")
 
-# Submit concurrent builds
+# Submit concurrent builds from client using remote builder
 try:
-    client.succeed("""
-      nix-build --store ssh://dispatcher:2222 /tmp/concurrent-0.nix --no-out-link &
-      nix-build --store ssh://dispatcher:2222 /tmp/concurrent-1.nix --no-out-link &
-      nix-build --store ssh://dispatcher:2222 /tmp/concurrent-2.nix --no-out-link &
+    client.succeed(f"""
+      nix-build {drv_paths[0]} --option max-jobs 0 --no-out-link &
+      nix-build {drv_paths[1]} --option max-jobs 0 --no-out-link &
+      nix-build {drv_paths[2]} --option max-jobs 0 --no-out-link &
       wait
     """, timeout=120)
-    print("Concurrent builds completed")
+    print("✓ Concurrent builds completed")
 except Exception as e:
     print(f"⚠ Some concurrent builds may have issues: {e}")
 

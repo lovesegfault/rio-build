@@ -260,6 +260,11 @@ impl Store for DispatcherStore {
         let build_queue = self.build_queue.clone();
 
         AsyncProgress::new(async move {
+            use crate::build_queue::JobStatus;
+
+            let mut job_ids = Vec::new();
+
+            // Enqueue all paths
             for path in paths {
                 info!("Enqueuing build for path: {}", path);
 
@@ -268,10 +273,29 @@ impl Store for DispatcherStore {
                 let platform = "x86_64-linux".to_string();
 
                 let job = BuildJob::new(path.clone(), platform);
-                build_queue.enqueue(job).await;
+                let job_id = build_queue.enqueue(job).await;
 
-                info!("Enqueued job for {}", path);
+                info!("Enqueued job {} for {}", job_id, path);
+                job_ids.push(job_id);
             }
+
+            // Wait for all jobs to complete
+            info!("Waiting for {} job(s) to complete", job_ids.len());
+            for job_id in &job_ids {
+                match build_queue.wait_for_completion(job_id).await {
+                    Some(JobStatus::Completed) => {
+                        info!("Job {} completed successfully", job_id);
+                    }
+                    Some(JobStatus::Failed) => {
+                        anyhow::bail!("Job {} failed", job_id);
+                    }
+                    _ => {
+                        anyhow::bail!("Job {} timed out or disappeared", job_id);
+                    }
+                }
+            }
+
+            info!("All {} job(s) completed", job_ids.len());
             Ok(())
         })
     }

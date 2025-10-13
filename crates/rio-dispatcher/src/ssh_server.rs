@@ -301,6 +301,17 @@ impl server::Handler for SshHandler {
         Ok(true)
     }
 
+    #[tracing::instrument(skip(self, _user))]
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        info!("Anonymous authentication attempt");
+
+        // TODO: Implement proper authentication
+        // For now, accept anonymous for development/testing
+        warn!("Accepting anonymous auth (development mode)");
+
+        Ok(Auth::Accept)
+    }
+
     #[tracing::instrument(skip(self, _user, _public_key))]
     async fn auth_publickey(
         &mut self,
