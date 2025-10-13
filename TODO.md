@@ -8,19 +8,26 @@ Detailed implementation plan for the brokerless Rio architecture.
 
 **Goal:** Prove the data plane works end-to-end without any Raft coordination. Single agent, single CLI, basic build execution.
 
-### 1.1 Protocol Definitions (rio-common)
+### 1.1 Protocol Definitions (rio-common) ✅ COMPLETED
 
-- [ ] Create `proto/rio/v1/agent.proto` with complete gRPC service definition
-  - [ ] Define `RioAgent` service with 7 RPCs (see DESIGN.md section 9)
-  - [ ] Define message types: `QueueBuildRequest`, `BuildUpdate`, `OutputChunk`, etc.
-  - [ ] Define enums: `AgentStatus`, `BuildState`, `CompressionType`
-  - [ ] Add proper field numbers and deprecation comments
-- [ ] Set up `tonic-prost-build` in `rio-common/build.rs`
-- [ ] Generate Rust code from protobuf definitions
-- [ ] Create `rio-common/src/types.rs` with shared types:
-  - [ ] `DerivationHash` newtype (SHA256 hash of derivation bytes)
-  - [ ] `AgentId` newtype (UUID)
-  - [ ] Helper functions: `hash_derivation(&[u8]) -> DerivationHash`
+- [x] Create `proto/rio/v1/agent.proto` with complete gRPC service definition
+  - [x] Define `RioAgent` service with 7 RPCs (see DESIGN.md section 9)
+  - [x] Define message types: `QueueBuildRequest`, `BuildUpdate`, `OutputChunk`, etc.
+  - [x] Define enums: `AgentStatus`, `BuildState`, `CompressionType` (without UNSPECIFIED variants)
+  - [x] Add proper field numbers and comments
+- [x] Set up `tonic-prost-build` in `rio-common/build.rs`
+- [x] Generate Rust code from protobuf definitions (49KB generated)
+- [x] Create `rio-common/src/types.rs` with shared types:
+  - [x] `DerivationPath` type alias (Utf8PathBuf) - uses full Nix store path
+  - [x] `AgentId` type alias (Uuid)
+  - [x] Added `camino` dependency for UTF-8 path support
+
+**Design decisions:**
+- Removed UNSPECIFIED enum variants - enums now use meaningful defaults (0 values)
+- Use full derivation path as identifier (e.g., `/nix/store/abc123-foo.drv`) instead of just hash
+  - More debuggable (includes package name)
+  - Already unique (guaranteed by Nix)
+  - No parsing needed
 
 ### 1.2 Nix Integration Utilities (rio-common)
 
@@ -1006,7 +1013,8 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 **Phase 1:** Single-Agent MVP - Prove data plane works without Raft complexity.
 
 **Next Milestones:**
-1. Complete protocol definitions (1.1)
-2. Implement basic CLI flow (1.3)
-3. Implement basic agent build execution (1.4-1.5)
-4. End-to-end test (1.8)
+1. ~~Complete protocol definitions (1.1)~~ ✅ DONE
+2. Complete Nix integration utilities (1.2) - IN PROGRESS
+3. Implement basic CLI flow (1.3)
+4. Implement basic agent build execution (1.4-1.5)
+5. End-to-end test (1.8)
