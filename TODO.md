@@ -85,84 +85,80 @@ Detailed implementation plan for the brokerless Rio architecture.
 - BTreeMap uses `i32` for chunk indices (matches protobuf type, no casting)
 - BuildInfo reads derivation bytes in evaluator (not a separate helper)
 
-### 1.4 Agent Basic Structure (rio-agent)
+### 1.4 Agent Basic Structure (rio-agent) ✅ COMPLETED
 
 **Phase 1:** Single-threaded, no Raft, no concurrency. One build at a time.
 
-- [ ] Create `rio-agent/src/main.rs` with argument parsing
-  - [ ] Flag: `--listen <addr:port>` (default: `0.0.0.0:50051`)
-  - [ ] Flag: `--data-dir <path>` (default: `/var/lib/rio`)
-- [ ] Create `rio-agent/src/agent.rs`
-  - [ ] Struct: `Agent` with fields:
-    - [ ] `id: AgentId` (generate UUID on startup)
-    - [ ] `platforms: Vec<String>` (from nix config)
-    - [ ] `features: Vec<String>` (from nix config)
-    - [ ] `current_build: Option<BuildJob>` (None = available)
-    - [ ] `pending_dir: PathBuf` (`/tmp/rio-agent`)
-  - [ ] Method: `new(data_dir) -> Agent` - queries nix config, creates pending_dir
-  - [ ] Struct: `BuildJob` with fields:
-    - [ ] `drv_hash: DerivationHash`
-    - [ ] `drv_path: PathBuf`
-    - [ ] `process: Child` (nix-build process)
-    - [ ] `log_tx: mpsc::Sender<String>` (for log streaming)
-    - [ ] `subscribers: Vec<mpsc::Sender<BuildUpdate>>`
-- [ ] Create `rio-agent/src/grpc_server.rs`
-  - [ ] Implement `RioAgent` gRPC service trait
-  - [ ] Phase 1 minimal implementations:
-    - [ ] `queue_build()` - stores drv to temp file, starts build, returns BuildAssigned
-    - [ ] `subscribe_to_build()` - adds subscriber to current build, streams updates
-    - [ ] Other RPCs: return `Unimplemented` status
+- [x] Create `rio-agent/src/main.rs` with argument parsing
+  - [x] Flag: `--listen <addr:port>` (default: `0.0.0.0:50051`)
+  - [x] Flag: `--data-dir <path>` (default: `/var/lib/rio`)
+  - [x] Initialize tracing
+- [x] Create `rio-agent/src/agent.rs`
+  - [x] Struct: `Agent` with fields:
+    - [x] `id: AgentId` (Uuid::new_v4())
+    - [x] `platforms: Vec<String>` (from NixConfig::parse())
+    - [x] `features: Vec<String>` (from nix config)
+    - [x] `current_build: Arc<Mutex<Option<BuildJob>>>`
+    - [x] `data_dir: Utf8PathBuf`
+  - [x] Method: `new(data_dir) -> Agent` - queries nix config, creates data_dir
+  - [x] Struct: `BuildJob` with fields:
+    - [x] `drv_path: DerivationPath`
+    - [x] `process: Child` (nix-build process)
+    - [x] `subscribers: Vec<mpsc::Sender<Result<BuildUpdate, Status>>>`
+- [x] Create `rio-agent/src/grpc_server.rs`
+  - [x] Implement `RioAgent` gRPC service trait
+  - [x] Phase 1 minimal implementations:
+    - [x] `queue_build()` - stores drv to data_dir, starts build, returns BuildAssigned
+    - [x] `subscribe_to_build()` - adds subscriber to current build, streams updates
+    - [x] Other RPCs: return `Unimplemented` status
 
-### 1.5 Agent Build Execution (rio-agent)
+### 1.5 Agent Build Execution (rio-agent) ✅ COMPLETED
 
-- [ ] Create `rio-agent/src/builder.rs`
-  - [ ] Function: `start_build(agent, drv_hash, drv_bytes) -> Result<BuildJob>`
-    - [ ] Write drv_bytes to `/tmp/rio-agent/{drv_hash}.drv`
-    - [ ] Spawn `nix-build /tmp/rio-agent/{drv_hash}.drv`
-    - [ ] Capture stdout/stderr as async stream
-    - [ ] Return BuildJob with process handle and log channel
-  - [ ] Function: `stream_logs(build_job) -> impl Stream<BuildUpdate>`
-    - [ ] Read lines from process stdout/stderr
-    - [ ] Wrap in `BuildUpdate::LogLine` messages
-    - [ ] Stream until process exits
-  - [ ] Function: `wait_for_completion(build_job) -> Result<Vec<PathBuf>>`
-    - [ ] Wait for process to exit
-    - [ ] Parse output for result paths (parse nix-build output)
-    - [ ] If exit code != 0, return BuildFailed
-    - [ ] Return output paths on success
+- [x] Create `rio-agent/src/builder.rs`
+  - [x] Function: `start_build(agent, drv_path, drv_bytes)`
+    - [x] Write drv_bytes to `data_dir/{drv_filename}`
+    - [x] Spawn `nix-build {drv_path}`
+    - [x] Create BuildJob and store in agent.current_build
+    - [x] Spawn background task for build completion handling
+  - [x] Function: `handle_build_completion()` (background task)
+    - [x] Stream logs from stdout/stderr
+    - [x] Wait for process to exit
+    - [x] On success: stream outputs via nar_exporter, send BuildCompleted
+    - [x] On failure: send BuildFailed
+    - [x] Clean up temporary files
+  - [x] Function: `stream_logs()` (async)
+    - [x] Read lines from stdout and stderr with tokio::select!
+    - [x] Wrap in `BuildUpdate::LogLine` with timestamps
+    - [x] Broadcast to all subscribers
 
-### 1.6 Agent Output Streaming (rio-agent)
+### 1.6 Agent Output Streaming (rio-agent) ✅ COMPLETED
 
 Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implementation Pattern".
 
-- [ ] Create `rio-agent/src/nar_exporter.rs`
-  - [ ] Function: `stream_outputs(output_paths, tx: mpsc::Sender<BuildUpdate>)`
-    - [ ] Create unbounded channel for NAR chunks
-    - [ ] Spawn blocking task:
-      - [ ] Run `nix-store --export {paths...}` with pipe
-      - [ ] Read chunks (1MB buffer)
-      - [ ] Compress each chunk with `zstd::encode_all(chunk, 3)`
-      - [ ] Send compressed chunks to channel
-    - [ ] Async task:
-      - [ ] Receive chunks from channel
-      - [ ] Wrap in `BuildUpdate::OutputChunk` with sequence numbers
-      - [ ] Send to subscriber stream
-      - [ ] Send final chunk with `last_chunk: true`
-    - [ ] Use `tokio::try_join` to run both tasks concurrently
+- [x] Create `rio-agent/src/nar_exporter.rs`
+  - [x] Function: `stream_outputs(output_paths, drv_path, subscribers)`
+    - [x] Spawn `nix-store --export {paths...}`
+    - [x] Read chunks from stdout (1MB buffer)
+    - [x] Compress each chunk with `zstd::encode_all(chunk, 3)`
+    - [x] Send to all subscribers as `OutputChunk` with sequence numbers
+    - [x] Send final chunk with `last_chunk: true`
+    - [x] Wait for nix-store process completion
 
-### 1.7 CLI Output Import (rio-build)
+### 1.7 CLI Output Import (rio-build) ✅ COMPLETED
 
-- [ ] Enhance `rio-build/src/output_handler.rs`
-  - [ ] Struct: `NarAssembler` - collects and orders chunks
-    - [ ] Field: `chunks: BTreeMap<u32, Vec<u8>>` (chunk_index -> compressed data)
-    - [ ] Method: `add_chunk(chunk: OutputChunk)`
-    - [ ] Method: `is_complete() -> bool` (received last_chunk)
-    - [ ] Method: `assemble() -> Result<Vec<u8>>` (decompress and concatenate in order)
-  - [ ] Function: `import_nar(nar_bytes: &[u8]) -> Result<()>`
-    - [ ] Spawn `nix-store --import`
-    - [ ] Write nar_bytes to stdin
-    - [ ] Wait for process completion
-    - [ ] Return error if exit code != 0
+*Note: Implemented in Phase 1.3 alongside output_handler.rs*
+
+- [x] Enhance `rio-build/src/output_handler.rs`
+  - [x] Struct: `NarAssembler` - collects and orders chunks
+    - [x] Field: `chunks: BTreeMap<i32, Vec<u8>>` (matches protobuf i32 type)
+    - [x] Method: `add_chunk(chunk: OutputChunk)`
+    - [x] Method: `is_complete() -> bool` (received last_chunk)
+    - [x] Method: `assemble() -> Result<Vec<u8>>` (decompress and concatenate in order)
+  - [x] Function: `import_nar(nar_bytes: &[u8]) -> Result<()>`
+    - [x] Spawn `nix-store --import`
+    - [x] Write nar_bytes to stdin with AsyncWriteExt
+    - [x] Wait for process completion
+    - [x] Return error if exit code != 0
 
 ### 1.8 Phase 1 Testing
 
@@ -674,6 +670,6 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 **Next Milestones:**
 1. ~~Complete protocol definitions (1.1)~~ ✅ DONE
 2. ~~Complete Nix integration utilities (1.2)~~ ✅ DONE
-3. ~~Implement basic CLI flow (1.3)~~ ✅ DONE
-4. Implement basic agent build execution (1.4-1.5) - NEXT
-5. End-to-end test (1.8)
+3. ~~Implement basic CLI flow (1.3, includes 1.7)~~ ✅ DONE
+4. ~~Implement basic agent (1.4-1.6)~~ ✅ DONE
+5. End-to-end integration test (1.8) - NEXT
