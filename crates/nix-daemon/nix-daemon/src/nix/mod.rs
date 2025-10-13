@@ -1769,6 +1769,11 @@ where
                         .map_err(|e| Error::IO(e))?;
 
                     info!("AddMultipleToStore: completed {} paths", count);
+
+                    // Send empty stderr to signal completion (like logger->stopWork() in Nix)
+                    wire::write_stderr(&mut self.w, None)
+                        .await
+                        .with_field("AddMultipleToStore.stderr")?;
                 }
                 Ok(v) => todo!("{:#?}", v),
 
