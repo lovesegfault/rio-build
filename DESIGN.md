@@ -75,8 +75,9 @@ struct BuildTracker {
 }
 
 enum BuildStatus {
-    Queued { blocked_on: Vec<DerivationPath> },  // Waiting for dependencies
-    Building,  // Currently executing
+    Building,                                    // Currently executing on agent
+    QueuedDependency { blocked_on: Vec<DerivationPath> },  // Waiting for dependencies
+    QueuedCapacity,                              // Waiting for agent capacity (agent is busy)
 }
 
 struct CompletedBuild {
@@ -170,7 +171,7 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
                cmd.platform, cmd.features);
     }
 
-    // 2. Score ALL agents by affinity (Available and Busy compete equally)
+    // 2. Score by affinity (count matching dependencies)
     let mut scores: HashMap<AgentId, usize> = HashMap::new();
     for dep_path in &cmd.dependencies {
         if let Some(tracker) = state.builds_in_progress.get(dep_path) {
@@ -184,7 +185,12 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
     // 3. Select highest affinity, tie-break by smallest agent_id
     let selected = scores.iter()
         .filter(|(id, _)| eligible.iter().any(|a| &a.id == *id))
-        .max_by_key(|(_, score)| *score)
+        .max_by(|(id_a, score_a), (id_b, score_b)| {
+            match score_a.cmp(score_b) {
+                std::cmp::Ordering::Equal => id_b.cmp(id_a),  // Smaller ID wins
+                other => other,
+            }
+        })
         .map(|(id, _)| *id)
         .or_else(|| eligible.iter().min_by_key(|a| &a.id).map(|a| a.id))
         .expect("Should have at least one eligible agent");
@@ -228,24 +234,114 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
 - ✅ Automatic queueing - Busy agents queue builds in `pending_builds`
 - ✅ Durable - Derivations in Raft survive leader election
 
-**Simplification: Status-Blind Assignment**
+**Simplification: Pure Affinity Assignment (Status-Blind)**
 
-Unlike traditional schedulers that prefer "Available" agents, Rio's assignment is **status-blind**:
+Unlike traditional schedulers that prefer "Available" agents, Rio's assignment uses **pure affinity scoring**:
 
-1. **Only filter by capabilities** (platform, features, not Down)
-2. **Affinity is the only criterion** - best agent wins regardless of current load
-3. **Agent handles queueing locally** - if busy, adds to `pending_builds`
+1. **Filter by capabilities only** (platform, features, not Down)
+2. **Score by affinity alone** (count matching dependencies)
+3. **Highest affinity wins** (tie-break by smallest agent_id)
+
+**Why queue depth doesn't matter:**
+
+Deep queues only occur with dependency chains. In that case, affinity is exactly right:
+- Agent K building d1→d2→...→d100 (100-deep queue)
+- New build d101 depends on d100
+- Affinity assigns to K (score=1 vs others' score=0)
+- d101 queues behind d100, but gets instant cache hit when d100 completes
+- Alternative would be: Assign to idle agent, must fetch/wait for d100 (slower!)
+
+**Independent builds distribute naturally:**
+- No dependencies → affinity scores are all 0
+- Deterministic tie-break by agent_id
+- Due to UUID randomness, builds spread across agents
+- No artificial queueing on one agent
+
+**BuildStatus tracks queue reasons (for visibility):**
+- `Building`: Currently executing
+- `QueuedDependency { blocked_on }`: Waiting for specific dependencies
+- `QueuedCapacity`: Waiting for agent capacity (agent is busy)
+
+Agents report status changes via BuildStatusChanged, allowing:
+- CLI to show meaningful status ("Queued - waiting for dep foo")
+- Monitoring/debugging (see why builds are queued)
+- Future optimizations if needed
 
 **Benefits:**
-- Simpler algorithm (no Available vs Busy logic)
-- Better affinity (builds stay where dependencies are, even if agent is busy)
-- Natural load balancing (affinity distributes work)
-- Automatic queueing (no special "all agents busy" handling)
+- Simplest possible algorithm (pure affinity)
+- Optimal for dependency chains (which is the common case)
+- Natural load distribution (independent builds spread)
+- No tunable parameters (no affinity vs queue weight to configure)
 
-**Why this is safe:**
-- Affinity scoring naturally distributes work (agents with no deps score 0)
-- Agent local queue prevents overload (bounded by pending_builds)
-- Deterministic tie-breaking prevents hot-spots
+**How BuildStatus is determined:**
+
+When an agent receives a build assignment from Raft, it proposes the appropriate status:
+
+```rust
+async fn on_build_assigned(drv_path, dependencies) {
+    let nar = read_from_raft(drv_path);
+
+    if self.current_build.is_some() {
+        // Agent is currently building - must queue
+
+        // Check if any dependencies are in our local queue
+        let blocked_on: Vec<_> = dependencies.iter()
+            .filter(|dep| self.pending_builds.contains_key(dep) ||
+                         self.current_build.as_ref() == Some(dep))
+            .cloned()
+            .collect();
+
+        if blocked_on.is_empty() {
+            // No dependencies in our queue - waiting for capacity only
+            self.pending_builds.insert(drv_path, ...);
+            raft.propose(BuildStatusChanged {
+                derivation_path: drv_path,
+                status: QueuedCapacity,
+            });
+        } else {
+            // Dependencies in our queue - waiting for them
+            self.pending_builds.insert(drv_path, PendingBuild {
+                blocked_on: blocked_on.clone(),
+                ...
+            });
+            raft.propose(BuildStatusChanged {
+                derivation_path: drv_path,
+                status: QueuedDependency { blocked_on },
+            });
+        }
+    } else {
+        // Agent is available - start immediately
+        self.start_build(drv_path, nar);
+        raft.propose(BuildStatusChanged {
+            derivation_path: drv_path,
+            status: Building,
+        });
+    }
+}
+```
+
+**Example scenario:**
+```
+Agent K state:
+- current_build: foo.drv (Building)
+- pending_builds: { drv-1 → QueuedCapacity }
+
+New assignment: drv-2 (depends on drv-1)
+
+Agent K logic:
+1. Is agent busy? Yes (foo is building)
+2. Check dependencies: drv-1 is in pending_builds
+3. Status: QueuedDependency { blocked_on: [drv-1] }
+
+Result:
+- foo: Building
+- drv-1: QueuedCapacity (waiting for foo)
+- drv-2: QueuedDependency { blocked_on: [drv-1] } (waiting for drv-1)
+```
+
+The distinction allows meaningful user messaging:
+- QueuedCapacity: "Agent is busy, build will start when current build completes"
+- QueuedDependency: "Waiting for dependencies: /nix/store/drv-1.drv"
 
 **Build Deduplication:**
 
