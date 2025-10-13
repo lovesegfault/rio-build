@@ -61,6 +61,10 @@ struct ClusterState {
 
     // Recently completed builds (5 minute LRU cache for fast retrieval)
     completed_builds: LruCache<DerivationPath, CompletedBuild>,
+
+    // Pending derivations: NAR bytes cached while build is active
+    // Removed on BuildCompleted/BuildFailed via log compaction
+    pending_derivations: HashMap<DerivationPath, Vec<u8>>,
 }
 
 struct BuildTracker {
@@ -115,6 +119,7 @@ enum RaftCommand {
     // State machine deterministically assigns to best agent
     BuildQueued {
         top_level: DerivationPath,
+        derivation_nar: Vec<u8>,  // NAR bytes, replicated to all agents
         dependencies: Vec<DerivationPath>,
         platform: String,
         features: Vec<String>,
@@ -135,11 +140,15 @@ enum RaftCommand {
 }
 ```
 
+**What Raft Stores:**
+
+- Build metadata (which agent building, dependencies, status)
+- Derivation NARs (temporarily while build is active, compacted after completion)
+
 **What Raft Does NOT Store:**
 
-- Build derivations (too large, sent via gRPC to leader, then fetched by assigned agent)
-- Build logs (streamed to subscribers in real-time)
-- Build outputs (stored in agent's /nix/store, exported on demand)
+- Build logs (streamed to subscribers in real-time via gRPC)
+- Build outputs (stored in agent's /nix/store, exported on demand via gRPC)
 
 **Deterministic Agent Assignment:**
 
@@ -147,14 +156,31 @@ When a build is queued, the Raft state machine (running on ALL agents) determini
 
 ```rust
 fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
-    // 1. Filter eligible agents
-    let eligible: Vec<_> = state.agents.values()
+    // 1. Filter eligible agents (try Available first, fall back to Busy)
+    let mut eligible: Vec<_> = state.agents.values()
         .filter(|a| {
             a.platforms.contains(&cmd.platform) &&
             cmd.features.iter().all(|f| a.features.contains(f)) &&
             a.status == AgentStatus::Available
         })
         .collect();
+
+    if eligible.is_empty() {
+        // No Available agents - assign to Busy agent (will queue)
+        eligible = state.agents.values()
+            .filter(|a| {
+                a.platforms.contains(&cmd.platform) &&
+                cmd.features.iter().all(|f| a.features.contains(f)) &&
+                a.status == AgentStatus::Busy
+            })
+            .collect();
+    }
+
+    if eligible.is_empty() {
+        // No Available or Busy agents - only Down agents exist
+        panic!("No eligible agents for platform {} with features {:?}",
+               cmd.platform, cmd.features);
+    }
 
     // 2. Score by affinity (count matching dependencies)
     let mut scores: HashMap<AgentId, usize> = HashMap::new();
@@ -193,6 +219,9 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
         });
     }
 
+    // Store derivation in state (all agents have it now)
+    state.pending_derivations.insert(cmd.top_level, cmd.derivation_nar);
+
     state.agents.get_mut(&selected).status = AgentStatus::Busy;
     selected  // All agents compute the same result!
 }
@@ -203,6 +232,19 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
 - ✅ No races - Assignment happens in state machine, not via distributed claiming
 - ✅ Best agent wins - Affinity scoring is explicit and deterministic
 - ✅ Consistent - All agents agree on who was assigned
+- ✅ Queuing support - Can assign to Busy agents (derivation available in Raft)
+- ✅ Durable - Survives leader election (derivations in RocksDB)
+
+**Handling "All Agents Busy":**
+
+When all eligible agents are currently building:
+1. State machine falls back to Busy agents (second filter pass)
+2. Affinity scoring still applies (prefer agent with matching deps)
+3. Build is assigned to best Busy agent
+4. Agent receives assignment, queues in `pending_builds`
+5. Agent starts build when current build completes
+6. User sees "Queued - position N in queue" status
+7. No CLI retry needed - automatic queueing
 
 **Build Deduplication:**
 
@@ -229,17 +271,15 @@ sequenceDiagram
     User->>CLI: rio-build ./app.nix
     CLI->>CLI: nix-eval-jobs<br/>(extract drv + deps)
 
-    CLI->>Leader: QueueBuild(drv_bytes, deps)
-    Leader->>Leader: Store /tmp/rio-pending/{hash}.drv
-    Leader->>Raft: Propose BuildQueued
-    Raft->>Raft: Deterministic assignment<br/>(select Agent K)
+    CLI->>Leader: QueueBuild(drv_nar_bytes, deps)
+    Leader->>Raft: Propose BuildQueued(with NAR)
+    Raft->>Raft: Replicate to all agents<br/>Deterministic assignment<br/>(select Agent K)
     Raft-->>Leader: Committed, assigned to K
     Leader->>CLI: BuildAssigned(agent_id: K)
 
     CLI->>Agent: SubscribeToBuild(derivation_path)
 
-    Agent->>Leader: FetchPendingBuild(derivation_path)
-    Leader-->>Agent: drv_nar_bytes
+    Agent->>Agent: Read NAR from Raft storage
 
     Agent->>Nix: nix-build {derivation_path}
     loop Build Logs
@@ -294,19 +334,21 @@ User runs: rio-build ./my-package.nix
 └─────────────────────────────────────────────────────┘
    CLI → Leader: QueueBuild(derivation_path, drv_nar_bytes, deps, platform, features)
 
-   Leader receives derivation NAR bytes (via gRPC, not Raft)
-   Leader stores temporarily: /tmp/rio-pending/{derivation_path}.nar
-   Leader returns: BuildQueued { derivation_path }
+   Leader receives derivation NAR bytes via gRPC
 
 ┌─────────────────────────────────────────────────────┐
-│ 4. Leader: Propose to Raft                          │
+│ 4. Leader: Propose to Raft (with derivation NAR)    │
 └─────────────────────────────────────────────────────┘
    Leader proposes: BuildQueued {
      derivation_path,
+     derivation_nar,  // NAR bytes included in Raft command
      platform,
      features,
      dependency_paths,
    }
+
+   Raft replicates to all agents (gRPC compresses on wire)
+   All agents store in RocksDB (compressed at rest)
 
 ┌─────────────────────────────────────────────────────┐
 │ 5. Raft: Deterministic agent assignment             │
@@ -324,21 +366,20 @@ User runs: rio-build ./my-package.nix
    Result: ALL agents agree on assignment (deterministic!)
 
 ┌─────────────────────────────────────────────────────┐
-│ 6. Assigned agent: Fetch derivation and start       │
+│ 6. Assigned agent: Read derivation and start        │
 └─────────────────────────────────────────────────────┘
    Agent K sees: "I was assigned derivation_path"
 
-   If K is leader:
-     - Read from /tmp/rio-pending/{derivation_path}.nar
-   Else:
-     - FetchPendingBuild(derivation_path) from leader via gRPC
+   Read derivation from Raft storage (already replicated):
+     - drv_nar = state_machine.pending_derivations.get(&derivation_path)
 
-   Import derivation to store:
-     - cat derivation.nar | nix-store --import
+   Import derivation to Nix store:
+     - echo drv_nar | nix-store --import
      - Returns canonical path: /nix/store/hash-foo.drv
 
-   Check dependencies:
-     - If deps building on self → Queue with Queued status
+   Check current workload:
+     - If currently building → Add to pending_builds queue
+     - Else if deps building on self → Queue with Queued status
      - Else → Start immediately with Building status
 
    Spawn: nix-build /nix/store/hash-foo.drv
@@ -389,12 +430,12 @@ User runs: rio-build ./my-package.nix
    - Propose RaftCommand::BuildCompleted { derivation_path, output_paths }
    - Raft removes top-level from builds_in_progress
    - Raft removes ALL dependencies (where parent_build = this path)
+   - Raft removes derivation from pending_derivations
+   - Raft compacts log entry (derivation NAR freed from storage)
    - Send BuildUpdate { completed: BuildCompleted { output_paths, duration } }
    - Check pending_builds for anything waiting on this derivation
    - Auto-start any builds that are now unblocked
    - If no pending builds: mark agent as Available
-   - Clean up temp files
-   - Leader deletes /tmp/rio-pending/{derivation_path}.nar
 
 ┌─────────────────────────────────────────────────────┐
 │ 13. CLI: Report success                             │
@@ -971,6 +1012,9 @@ fn apply_build_completed(
         tracker.parent_build != Some(drv_path.clone())
     });
 
+    // Remove derivation NAR (no longer needed)
+    state.pending_derivations.remove(&drv_path);
+
     // Cache result
     state.completed_builds.put(drv_path, CompletedBuild {
         agent_id: tracker.agent_id,
@@ -1351,11 +1395,6 @@ service RioAgent {
   // New agent calls this on seed agent to join Raft cluster
   rpc JoinCluster(JoinClusterRequest)
       returns (JoinClusterResponse);
-
-  // Agent-to-agent: Fetch pending derivation (non-leader needs drv_bytes)
-  // Assigned agent fetches derivation from leader after Raft assignment
-  rpc FetchPendingBuild(FetchPendingBuildRequest)
-      returns (FetchPendingBuildResponse);
 }
 
 // ============================================================================
@@ -1523,19 +1562,6 @@ message GetCompletedBuildRequest {
 }
 
 // Note: Both SubscribeToBuild and GetCompletedBuild return stream BuildUpdate
-
-// ============================================================================
-// Agent-to-Agent Communication
-// ============================================================================
-
-message FetchPendingBuildRequest {
-  string derivation_path = 1;  // Which pending build to fetch
-}
-
-message FetchPendingBuildResponse {
-  bytes derivation = 1;                  // NAR bytes from nix-store --export
-  repeated string dependency_paths = 2;  // Dependency list
-}
 ```
 
 **Output Compression:**
@@ -1717,8 +1743,9 @@ Raft requires persistence for:
 
 ```
 /var/lib/rio/agent-{id}/
-  raft-log/          # Raft log entries (RocksDB)
-  raft-state/        # Raft metadata (RocksDB)
+  raft.rocksdb/      # RocksDB with column families:
+    logs/            # Raft log entries (includes BuildQueued with derivation NARs)
+    store/           # Raft metadata (vote, committed, snapshots)
 ```
 
 ### Nix Integration
@@ -1802,16 +1829,34 @@ gRPC stream | zstd -d | nix-store --import
 - Enough for build deduplication and status queries
 - Future: External database for long-term history/analytics
 
-### 6. Leader stores pending derivations - what if leader changes?
+### 6. Derivation storage and leader election ✅ RESOLVED
 
-When leader election happens:
-- Old leader's /tmp/rio-pending/ data is lost
-- Builds in `builds_in_progress` but not yet started have no derivation bytes
-- CLI will timeout waiting for assignment response
-- CLI retries (has derivation bytes)
-- New leader receives, queues, assigns
+**Decision: Store derivations in Raft log itself**
 
-Acceptable for MVP - leader elections are rare
+Derivations are included in the BuildQueued command and replicated via Raft:
+- BuildQueued includes `derivation_nar: Vec<u8>` field (~1-100 KB)
+- Replicated to all agents via Raft consensus (gRPC compresses on wire)
+- Stored durably in RocksDB on each agent (compressed at rest)
+- Survives leader election, crashes, network partitions
+- Removed on BuildCompleted/BuildFailed via state machine cleanup
+
+**Benefits:**
+- ✅ No volatile /tmp storage on leader
+- ✅ No FetchPendingBuild RPC needed (simpler architecture)
+- ✅ Enables queueing on Busy agents (all agents have derivation)
+- ✅ Durable across leader elections
+- ✅ gRPC + RocksDB compression handle size efficiently
+
+**Size impact:**
+- Typical derivation: 1-10 KB (compressed to ~300-3000 bytes on wire/disk)
+- Large derivation: 100 KB (compressed to ~20-30 KB)
+- Network: 3x amplification for 3-node cluster (acceptable for small NARs)
+- Disk: Temporary, freed on BuildCompleted
+
+**Comparison to alternatives:**
+- Leader /tmp: Lost on election, requires FetchPendingBuild RPC
+- CLI retry: Wastes network, poor UX
+- Raft storage: Durable, simple, enables queueing
 
 ## Success Metrics
 
