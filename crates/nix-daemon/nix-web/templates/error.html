@@ -1,0 +1,19 @@
+{#
+SPDX-FileCopyrightText: 2023 embr <git@liclac.eu>
+
+SPDX-License-Identifier: EUPL-1.2
+#}
+
+{% extends "_base.html" %}
+{% block content %}
+
+<div class="card border-danger" style="margin-bottom: 10px;">
+  <div class="card-header">
+    <h5 class="text-danger" style="margin-bottom: 0;">Error</h5>
+  </div>
+  <div class="card-body">
+    <pre style="margin-bottom: 0;">{{ error }}</pre>
+  </div>
+</div>
+
+ {% endblock %}

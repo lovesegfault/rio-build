@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2025 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: EUPL-1.2
+
+[package]
+name = "gorgonctl"
+version = "0.1.0"
+edition = "2021"
+license = "EUPL-1.2"
+
+[dependencies]
+gorgond-client = { path = "../gorgond-client" }
+
+bytesize.workspace = true
+chrono.workspace = true
+clap.workspace = true
+colored_json.workspace = true
+comfy-table.workspace = true
+derive_more.workspace = true
+miette = { workspace = true, features = ["fancy", "syntect-highlighter"] }
+minicbor-io.workspace = true
+minicbor.workspace = true
+owo-colors.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+syntect.workspace = true
+terminal_size.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+zstd.workspace = true

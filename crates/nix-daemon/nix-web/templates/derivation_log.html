@@ -1,0 +1,57 @@
+{#
+SPDX-FileCopyrightText: 2023 embr <git@liclac.eu>
+
+SPDX-License-Identifier: EUPL-1.2
+#}
+
+{% extends "_base.html" %}
+{% block title %}{{ root_path }} | nix-web{% endblock %}
+{% block goto %}{{ root_path }}{% endblock %}
+{% block content %}
+<div id="card" class="derivation card {% if is_final %}border-success{% endif %}" style="margin-bottom: 10px;">
+  <div class="card-header d-flex align-items-center">
+    <h5 id="card-title" class="flex-grow-1 {% if is_final %}text-success{% endif %}" style="margin-bottom: 0;">
+      <code style="color: inherit;">{{ root_path }}</code>
+    </h5>
+    <ul class="nav nav-tabs card-header-tabs justify-content-end">
+      <li class="nav-item">
+        <a class="nav-link" href="{{ root_path }}">Derivation</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link active" aria-current="page">Log</a>
+      </li>
+    </ul>
+  </div>
+  <div class="card-body">
+    <pre id="log">{{ log }}</pre>
+  </div>
+</div>
+
+{% if !is_final %}
+<script type="text/javascript">
+  async function poll() {
+    const res = await fetch("/api{{ root_path }}/poll").then((res) => {
+      if (!res.ok) {
+        console.error("Error", res);
+      } else {
+        return res.json();
+      }
+    });
+    document.getElementById('log').innerHTML = res.log;
+
+    if (res.is_final) {
+      console.log("...build finished!");
+      document.getElementById('card').classList.add('border-success');
+      document.getElementById('card-title').classList.add('text-success');
+    } else {
+      console.log("...and again...");
+      setTimeout(poll, 1000);
+    }
+  }
+
+  console.log("Polling...");
+  poll();
+</script>
+{% endif %}
+
+{% endblock %}

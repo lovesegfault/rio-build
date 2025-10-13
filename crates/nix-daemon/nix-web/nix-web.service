@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2023 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+[Unit]
+Description=Nix Web UI
+After=network.target
+After=nix-web.socket
+Requires=nix-web.socket
+
+[Service]
+ExecStart=nix-web -v
+
+# Run as a temporary, unprivileged user. Implies a wide range of restrictions.
+DynamicUser=true
+
+# Run in a private network namespace, where we can communicate only through the
+# accompanying socket unit. If you don't want this, comment this out and remove
+# the After=nix-web.socket and Requires=nix-web.socket bits under [Unit] above.
+PrivateNetwork=true
+
+# Bind the only paths we're allowed to access.
+TemporaryFileSystem=/nix
+BindPaths=/nix/var
+BindReadOnlyPaths=/nix/store
+
+# Society if systemd had a switch that let me opt into things instead of having
+# to manually disable every feature in Linux one-by-one.
+# At least systemd-analyze security is friend-shaped.
+PrivateUsers=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectProc=ptraceable
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

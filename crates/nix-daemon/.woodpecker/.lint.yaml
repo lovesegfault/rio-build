@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2024 embr <git@liclac.eu>
+#
+# SPDX-License-Identifier: EUPL-1.2
+
+steps:
+- name: reuse
+  image: bash
+  commands:
+  # HACK: Work around a Woodpecker bug (TODO: report!):
+  # `woodpecker exec` uses volumes to mount the source dir, but these are ignored by the
+  # `local` backend, so it just tries running these commands in an empty directory.
+  #
+  # CI_HACK_WORK_DIR is set in `.envrc`, so make sure to either `direnv allow` or run as:
+  # $ CI_HACK_DIR=$PWD woodpecker exec
+  - test -n "$CI_HACK_WORK_DIR" && cd $CI_HACK_WORK_DIR; true
+  - nix-shell --run 'reuse lint'
+  failure: ignore
+
+- name: commitlint
+  image: bash
+  commands:
+  - test -n "$CI_HACK_WORK_DIR" && cd $CI_HACK_WORK_DIR; true
+  - nix-shell --run 'commitlint --from=552125f165ad6feb2f63fcbf29e4eac3238d7882'
+  failure: ignore
+
+- name: no-refs
+  image: bash
+  commands:
+  - test -n "$CI_HACK_WORK_DIR" && cd $CI_HACK_WORK_DIR; true
+  - nix-build --no-out-link nix/no-refs.nix
+  failure: ignore
+
+when:
+- event: [ push, pull_request, pull_request_closed, tag, release, manual, cron ]
