@@ -14,24 +14,30 @@ use crate::nar_exporter;
 
 /// Start a build
 ///
-/// Stores the derivation, spawns nix-build, and manages the build lifecycle.
-pub async fn start_build(agent: &Agent, drv_path: String, drv_bytes: Vec<u8>) -> Result<()> {
-    let drv_path = Utf8PathBuf::from(drv_path);
+/// Imports the derivation NAR to /nix/store, spawns nix-build, and manages the build lifecycle.
+pub async fn start_build(agent: &Agent, drv_path: String, drv_nar_bytes: Vec<u8>) -> Result<()> {
+    let expected_drv_path = Utf8PathBuf::from(drv_path);
     let start_time = Instant::now();
 
-    // Write derivation to data directory
-    let drv_filename = drv_path.file_name().context("Invalid derivation path")?;
-    let local_drv_path = agent.data_dir.join(drv_filename);
-
-    tokio::fs::write(&local_drv_path, &drv_bytes)
+    // Import derivation NAR to /nix/store
+    let actual_drv_path = import_derivation_nar(&drv_nar_bytes)
         .await
-        .with_context(|| format!("Failed to write derivation to: {}", local_drv_path))?;
+        .context("Failed to import derivation to Nix store")?;
 
-    tracing::info!("Wrote derivation to: {}", local_drv_path);
+    // Verify the path matches what CLI sent
+    if actual_drv_path != expected_drv_path {
+        anyhow::bail!(
+            "Derivation path mismatch: expected {}, got {}",
+            expected_drv_path,
+            actual_drv_path
+        );
+    }
+
+    tracing::info!("Imported derivation to: {}", actual_drv_path);
 
     // Spawn nix-build process
     let child = Command::new("nix-build")
-        .arg(local_drv_path.as_str())
+        .arg(actual_drv_path.as_str())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -39,7 +45,7 @@ pub async fn start_build(agent: &Agent, drv_path: String, drv_bytes: Vec<u8>) ->
 
     // Create BuildJob
     let build_job = BuildJob {
-        drv_path: drv_path.clone(),
+        drv_path: actual_drv_path.clone(),
         process: child,
         subscribers: Vec::new(),
     };
@@ -52,13 +58,10 @@ pub async fn start_build(agent: &Agent, drv_path: String, drv_bytes: Vec<u8>) ->
 
     // Spawn task to handle build completion
     let agent_clone = agent.current_build.clone();
-    let drv_path_clone = drv_path.clone();
-    let data_dir = agent.data_dir.clone();
+    let drv_path_clone = actual_drv_path.clone();
 
     tokio::spawn(async move {
-        if let Err(e) =
-            handle_build_completion(agent_clone, drv_path_clone, data_dir, start_time).await
-        {
+        if let Err(e) = handle_build_completion(agent_clone, drv_path_clone, start_time).await {
             tracing::error!("Build completion error: {}", e);
         }
     });
@@ -66,11 +69,53 @@ pub async fn start_build(agent: &Agent, drv_path: String, drv_bytes: Vec<u8>) ->
     Ok(())
 }
 
+/// Import a derivation NAR into the Nix store
+///
+/// Returns the canonical store path where the derivation was imported.
+async fn import_derivation_nar(nar_bytes: &[u8]) -> Result<Utf8PathBuf> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new("nix-store")
+        .arg("--import")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn nix-store --import")?;
+
+    // Write NAR bytes to stdin
+    let mut stdin = child.stdin.take().context("Failed to open stdin")?;
+    stdin
+        .write_all(nar_bytes)
+        .await
+        .context("Failed to write NAR to nix-store stdin")?;
+    stdin
+        .shutdown()
+        .await
+        .context("Failed to close nix-store stdin")?;
+
+    // Wait for process to complete and capture output
+    let output = child
+        .wait_with_output()
+        .await
+        .context("Failed to wait for nix-store")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nix-store --import failed: {}", stderr);
+    }
+
+    // Parse the output path (nix-store --import prints the imported path)
+    let stdout = String::from_utf8(output.stdout).context("nix-store output not UTF-8")?;
+    let store_path = stdout.trim();
+
+    Ok(Utf8PathBuf::from(store_path))
+}
+
 /// Handle build completion (runs in background task)
 async fn handle_build_completion(
     current_build: std::sync::Arc<tokio::sync::Mutex<Option<BuildJob>>>,
     drv_path: DerivationPath,
-    data_dir: Utf8PathBuf,
     start_time: Instant,
 ) -> Result<()> {
     // Stream logs
@@ -163,11 +208,6 @@ async fn handle_build_completion(
         let mut current = current_build.lock().await;
         *current = None;
     }
-
-    // Remove temporary derivation file
-    let drv_filename = drv_path.file_name().context("Invalid drv path")?;
-    let local_drv_path = data_dir.join(drv_filename);
-    let _ = tokio::fs::remove_file(&local_drv_path).await;
 
     Ok(())
 }
