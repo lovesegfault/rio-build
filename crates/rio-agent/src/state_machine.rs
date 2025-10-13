@@ -44,8 +44,9 @@ pub struct BuildTracker {
 /// Build status enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BuildStatus {
-    Queued { blocked_on: Vec<DerivationPath> }, // Waiting for dependencies
-    Building,                                   // Currently executing
+    Building,                                             // Currently executing on agent
+    QueuedDependency { blocked_on: Vec<DerivationPath> }, // Waiting for dependencies
+    QueuedCapacity, // Waiting for agent capacity (agent is busy)
 }
 
 /// Completed build information
@@ -68,6 +69,10 @@ pub struct ClusterState {
     /// Recently completed builds (will add LRU eviction in Phase 3)
     /// For now, just a HashMap (5 minute TTL will be enforced by periodic cleanup)
     pub completed_builds: HashMap<DerivationPath, CompletedBuild>,
+
+    /// Pending derivations: NAR bytes cached while build is active
+    /// Removed on BuildCompleted/BuildFailed, enables queueing and survives leader election
+    pub pending_derivations: HashMap<DerivationPath, Vec<u8>>,
 }
 
 /// Raft commands for cluster coordination
@@ -89,6 +94,7 @@ pub enum RaftCommand {
     // Build lifecycle commands
     BuildQueued {
         top_level: DerivationPath,
+        derivation_nar: Vec<u8>, // NAR bytes, replicated to all agents
         dependencies: Vec<DerivationPath>,
         platform: String,
         features: Vec<String>,
@@ -159,20 +165,22 @@ impl ClusterState {
 
             RaftCommand::BuildQueued {
                 top_level,
+                derivation_nar,
                 dependencies,
                 platform,
                 features,
             } => {
                 // Deterministic agent assignment algorithm (DESIGN.md Section 1)
+                // Status-blind: Available and Busy agents compete equally
 
-                // Step 1: Filter eligible agents
+                // Step 1: Filter eligible agents (platform + features, not Down)
                 let eligible: Vec<&AgentInfo> = self
                     .agents
                     .values()
                     .filter(|agent| {
                         agent.platforms.contains(&platform)
                             && features.iter().all(|f| agent.features.contains(f))
-                            && agent.status == AgentStatus::Available
+                            && agent.status != AgentStatus::Down
                     })
                     .collect();
 
@@ -249,6 +257,10 @@ impl ClusterState {
                     );
                 }
 
+                // Store derivation NAR (all agents have it now)
+                self.pending_derivations
+                    .insert(top_level.clone(), derivation_nar);
+
                 // Mark agent as Busy
                 if let Some(agent) = self.agents.get_mut(&selected_agent_id) {
                     agent.status = AgentStatus::Busy;
@@ -289,6 +301,9 @@ impl ClusterState {
                     // Remove dependencies (where parent_build = this derivation_path)
                     self.builds_in_progress
                         .retain(|_, t| t.parent_build.as_ref() != Some(&derivation_path));
+
+                    // Remove derivation NAR (no longer needed)
+                    self.pending_derivations.remove(&derivation_path);
                 }
                 RaftResponse::BuildCompletedAck
             }
@@ -302,6 +317,9 @@ impl ClusterState {
                     // Remove dependencies
                     self.builds_in_progress
                         .retain(|_, t| t.parent_build.as_ref() != Some(&derivation_path));
+
+                    // Remove derivation NAR (no longer needed)
+                    self.pending_derivations.remove(&derivation_path);
                 }
                 RaftResponse::BuildFailedAck
             }
@@ -362,6 +380,7 @@ mod tests {
         let drv_path = Utf8PathBuf::from("/nix/store/abc-foo.drv");
         let response = state.apply(RaftCommand::BuildQueued {
             top_level: drv_path.clone(),
+            derivation_nar: vec![1, 2, 3], // Placeholder NAR
             dependencies: vec![],
             platform: "x86_64-linux".to_string(),
             features: vec![],
@@ -404,6 +423,7 @@ mod tests {
 
         state.apply(RaftCommand::BuildQueued {
             top_level: top.clone(),
+            derivation_nar: vec![1, 2, 3],
             dependencies: vec![dep1.clone(), dep2.clone()],
             platform: "x86_64-linux".to_string(),
             features: vec![],
@@ -458,6 +478,7 @@ mod tests {
         // Queue build requiring x86_64-linux
         let response = state.apply(RaftCommand::BuildQueued {
             top_level: Utf8PathBuf::from("/nix/store/foo.drv"),
+            derivation_nar: vec![1, 2, 3],
             dependencies: vec![],
             platform: "x86_64-linux".to_string(),
             features: vec![],
@@ -506,6 +527,7 @@ mod tests {
         // Queue build requiring kvm feature
         let response = state.apply(RaftCommand::BuildQueued {
             top_level: Utf8PathBuf::from("/nix/store/vm-test.drv"),
+            derivation_nar: vec![1, 2, 3],
             dependencies: vec![],
             platform: "x86_64-linux".to_string(),
             features: vec!["kvm".to_string()],
@@ -567,6 +589,7 @@ mod tests {
         // Queue build that depends on the dep
         let response = state.apply(RaftCommand::BuildQueued {
             top_level: Utf8PathBuf::from("/nix/store/app.drv"),
+            derivation_nar: vec![1, 2, 3],
             dependencies: vec![dep],
             platform: "x86_64-linux".to_string(),
             features: vec![],
@@ -616,6 +639,7 @@ mod tests {
         // Queue build with no dependencies (both agents have affinity score 0)
         let response = state.apply(RaftCommand::BuildQueued {
             top_level: Utf8PathBuf::from("/nix/store/foo.drv"),
+            derivation_nar: vec![1, 2, 3],
             dependencies: vec![],
             platform: "x86_64-linux".to_string(),
             features: vec![],
@@ -650,6 +674,7 @@ mod tests {
         // Queue a build
         state.apply(RaftCommand::BuildQueued {
             top_level: Utf8PathBuf::from("/nix/store/foo.drv"),
+            derivation_nar: vec![1, 2, 3],
             dependencies: vec![],
             platform: "x86_64-linux".to_string(),
             features: vec![],
@@ -660,5 +685,94 @@ mod tests {
             state.agents.get(&agent_id).unwrap().status,
             AgentStatus::Busy
         );
+    }
+
+    #[test]
+    fn test_status_blind_assignment_to_busy_agent() {
+        let mut state = ClusterState::default();
+        let agent_id = AgentId::new_v4();
+
+        // Add one agent that is already Busy
+        state.agents.insert(
+            agent_id,
+            AgentInfo {
+                id: agent_id,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Busy, // Already busy!
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Queue a build - should still assign to Busy agent (status-blind)
+        let response = state.apply(RaftCommand::BuildQueued {
+            top_level: Utf8PathBuf::from("/nix/store/bar.drv"),
+            derivation_nar: vec![4, 5, 6],
+            dependencies: vec![],
+            platform: "x86_64-linux".to_string(),
+            features: vec![],
+        });
+
+        // Should assign to the Busy agent (only eligible agent)
+        match response {
+            RaftResponse::BuildAssigned {
+                agent_id: assigned_id,
+                ..
+            } => {
+                assert_eq!(assigned_id, agent_id);
+            }
+            _ => panic!("Expected BuildAssigned response"),
+        }
+
+        // Build should be registered
+        assert_eq!(state.builds_in_progress.len(), 1);
+        // Derivation should be stored
+        assert!(
+            state
+                .pending_derivations
+                .contains_key(&Utf8PathBuf::from("/nix/store/bar.drv"))
+        );
+    }
+
+    #[test]
+    fn test_pending_derivations_cleanup_on_completion() {
+        let mut state = ClusterState::default();
+        let agent_id = AgentId::new_v4();
+
+        state.agents.insert(
+            agent_id,
+            AgentInfo {
+                id: agent_id,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        let drv_path = Utf8PathBuf::from("/nix/store/test.drv");
+
+        // Queue build
+        state.apply(RaftCommand::BuildQueued {
+            top_level: drv_path.clone(),
+            derivation_nar: vec![7, 8, 9],
+            dependencies: vec![],
+            platform: "x86_64-linux".to_string(),
+            features: vec![],
+        });
+
+        // Derivation should be stored
+        assert!(state.pending_derivations.contains_key(&drv_path));
+
+        // Complete build
+        state.apply(RaftCommand::BuildCompleted {
+            derivation_path: drv_path.clone(),
+            output_paths: vec![Utf8PathBuf::from("/nix/store/test")],
+        });
+
+        // Derivation should be removed
+        assert!(!state.pending_derivations.contains_key(&drv_path));
     }
 }
