@@ -1783,46 +1783,48 @@ where
 
                     info!("BuildDerivation: drv_path={}", drv_path);
 
-                    // Read BasicDerivation structure
-                    // Format: outputs, inputSrcs, platform, builder, args, env
+                    // Read BasicDerivation structure and materialize it
+                    // For now, just read and discard it, then check if .drv already exists
 
                     // 1. Outputs
                     let outputs_count = wire::read_u64(&mut self.r)
                         .await
                         .with_field("BuildDerivation.outputs.count")?;
+                    let mut outputs = Vec::new();
                     for _ in 0..outputs_count {
-                        wire::read_string(&mut self.r)
+                        let name = wire::read_string(&mut self.r)
                             .await
                             .with_field("BuildDerivation.output.name")?;
-                        wire::read_string(&mut self.r)
+                        let path = wire::read_string(&mut self.r)
                             .await
                             .with_field("BuildDerivation.output.path")?;
-                        wire::read_string(&mut self.r)
+                        let hash_algo = wire::read_string(&mut self.r)
                             .await
                             .with_field("BuildDerivation.output.hashAlgo")?;
-                        wire::read_string(&mut self.r)
+                        let hash = wire::read_string(&mut self.r)
                             .await
                             .with_field("BuildDerivation.output.hash")?;
+                        outputs.push((name, path, hash_algo, hash));
                     }
 
                     // 2. Input sources
-                    wire::read_strings(&mut self.r)
+                    let _input_srcs = wire::read_strings(&mut self.r)
                         .collect::<Result<Vec<_>>>()
                         .await
                         .with_field("BuildDerivation.inputSrcs")?;
 
                     // 3. Platform
-                    wire::read_string(&mut self.r)
+                    let _platform = wire::read_string(&mut self.r)
                         .await
                         .with_field("BuildDerivation.platform")?;
 
                     // 4. Builder
-                    wire::read_string(&mut self.r)
+                    let _builder = wire::read_string(&mut self.r)
                         .await
                         .with_field("BuildDerivation.builder")?;
 
                     // 5. Args
-                    wire::read_strings(&mut self.r)
+                    let _args = wire::read_strings(&mut self.r)
                         .collect::<Result<Vec<_>>>()
                         .await
                         .with_field("BuildDerivation.args")?;
@@ -1846,11 +1848,13 @@ where
                         .with_field("BuildDerivation.buildMode")?;
 
                     info!(
-                        "BuildDerivation: drv_path={}, build_mode={}",
-                        drv_path, build_mode
+                        "BuildDerivation: drv_path={}, outputs={}, build_mode={}",
+                        drv_path,
+                        outputs.len(),
+                        build_mode
                     );
 
-                    // Build using build_paths
+                    // Build using build_paths - this will trigger the distributed build
                     forward_stderr(
                         &mut self.w,
                         self.store
@@ -1858,7 +1862,21 @@ where
                     )
                     .await?;
 
-                    // Create BuildResult with success status
+                    // Get the first output path from the outputs we read
+                    let output_path = if let Some((out_name, out_path, _, _)) = outputs.first() {
+                        info!("BuildDerivation: output '{}' -> {}", out_name, out_path);
+                        out_path.clone()
+                    } else {
+                        // Fallback: derive output path from drv path
+                        drv_path.trim_end_matches(".drv").to_string()
+                    };
+
+                    // Create BuildResult with the output path
+                    let mut built_outputs = HashMap::new();
+                    if let Some((out_name, out_path, _, _)) = outputs.first() {
+                        built_outputs.insert(out_name.clone(), out_path.clone());
+                    }
+
                     let result = crate::BuildResult {
                         status: crate::BuildResultStatus::Built,
                         error_msg: String::new(),
@@ -1866,14 +1884,17 @@ where
                         is_non_deterministic: false,
                         start_time: chrono::Utc::now(),
                         stop_time: chrono::Utc::now(),
-                        built_outputs: HashMap::new(), // TODO: Fill with actual outputs
+                        built_outputs,
                     };
 
                     wire::write_build_result(&mut self.w, &result, self.proto)
                         .await
                         .with_field("BuildDerivation.result")?;
 
-                    info!("BuildDerivation: completed for {}", drv_path);
+                    info!(
+                        "BuildDerivation: completed for {} -> {}",
+                        drv_path, output_path
+                    );
                 }
                 Ok(v) => todo!("{:#?}", v),
 
