@@ -10,30 +10,44 @@ Rio is an open-source distributed build service for Nix that eliminates the trad
 
 ### High-Level Design
 
-```
-┌──────────────┐
-│  rio-build   │ (CLI client)
-│    (user)    │
-└──────┬───────┘
-       │
-       │ Direct gRPC to selected agent
-       │ (derivations, logs, outputs)
-       ▼
-┌────────────────────────────────────────────┐
-│      rio-agent cluster (Raft)              │
-│                                            │
-│  ┌────────┐  ┌────────┐  ┌────────┐        │
-│  │ Agent  │←→│ Agent  │←→│ Agent  │        │
-│  │   1    │  │   2    │  │   3    │        │
-│  │(leader)│  │        │  │        │        │
-│  └────────┘  └────────┘  └────────┘        │
-│       ↑           ↑           ↑            │
-│       └───────────┴───────────┘            │
-│        Raft: membership + job tracking     │
-└────────────────────────────────────────────┘
+```mermaid
+graph TB
+    User[User<br/>rio-build CLI]
+
+    subgraph Cluster["rio-agent Cluster"]
+        Leader[Agent 1<br/>Leader]
+        Agent2[Agent 2<br/>Follower]
+        Agent3[Agent 3<br/>Follower]
+
+        Leader <-.Raft Consensus<br/>membership + build tracking.-> Agent2
+        Agent2 <-.Raft.-> Agent3
+        Agent3 <-.Raft.-> Leader
+    end
+
+    User -->|1. QueueBuild<br/>gRPC| Leader
+    Leader -.->|2. BuildQueued<br/>Raft log| Agent2
+    Leader -.->|2. BuildQueued<br/>Raft log| Agent3
+    Leader -->|3. BuildAssigned<br/>agent_id| User
+    User -->|4. SubscribeToBuild<br/>gRPC stream| Agent2
+    Agent2 -->|5. Logs + Outputs<br/>Direct stream| User
+
+    classDef userNode fill:#e1f5ff,stroke:#0288d1,stroke-width:2px
+    classDef leaderNode fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    classDef agentNode fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef clusterBox fill:#fafafa,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5
+
+    class User userNode
+    class Leader leaderNode
+    class Agent2,Agent3 agentNode
+    class Cluster clusterBox
 ```
 
-**Critical Insight:** Raft is the **control plane** (who's in the cluster, who's building what). The **data plane** (actual derivations, logs, outputs) bypasses Raft entirely and flows directly CLI ↔ Agent.
+**Critical Insights:**
+
+- **Control Plane (Raft):** Membership, build tracking, deterministic assignment
+- **Data Plane (gRPC):** Derivations, logs, outputs flow directly CLI ↔ Agent
+- **No Bottleneck:** Data bypasses Raft entirely, streams point-to-point
+- **Deterministic:** All agents run same state machine → agree on assignment
 
 **Automatic Build Recovery:**
 
@@ -213,6 +227,49 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
 
 ### 2. Build Submission Flow (End to End)
 
+#### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as rio-build CLI
+    participant Leader as Agent (Leader)
+    participant Raft as Raft Cluster
+    participant Agent as Assigned Agent
+    participant Nix as nix-build
+
+    User->>CLI: rio-build ./app.nix
+    CLI->>CLI: nix-eval-jobs<br/>(extract drv + deps)
+
+    CLI->>Leader: QueueBuild(drv_bytes, deps)
+    Leader->>Leader: Store /tmp/rio-pending/{hash}.drv
+    Leader->>Raft: Propose BuildQueued
+    Raft->>Raft: Deterministic assignment<br/>(select Agent K)
+    Raft-->>Leader: Committed, assigned to K
+    Leader->>CLI: BuildAssigned(agent_id: K)
+
+    CLI->>Agent: SubscribeToBuild(drv_hash)
+
+    Agent->>Leader: FetchPendingBuild(drv_hash)
+    Leader-->>Agent: drv_bytes
+
+    Agent->>Nix: nix-build {drv_hash}.drv
+    loop Build Logs
+        Nix-->>Agent: stdout/stderr
+        Agent->>CLI: BuildUpdate(log)
+    end
+
+    Nix-->>Agent: Build complete
+    Agent->>Agent: nix-store --export
+    Agent->>CLI: BuildUpdate(output_chunks)
+    Agent->>Raft: Propose BuildCompleted
+
+    CLI->>CLI: nix-store --import
+    CLI->>User: Build succeeded!
+```
+
+#### Detailed Steps
+
 ```
 User runs: rio-build ./my-package.nix
 
@@ -364,7 +421,46 @@ User runs: rio-build ./my-package.nix
 
 **Solution:** Transparent build sharing via Raft coordination.
 
-**Scenario: User B joins in-progress build**
+#### Deduplication Sequence
+
+```mermaid
+sequenceDiagram
+    actor UserA as User A
+    actor UserB as User B
+    participant Leader
+    participant Raft
+    participant AgentK as Agent K
+
+    Note over UserA,AgentK: User A submits foo.drv
+
+    UserA->>Leader: QueueBuild(foo)
+    Leader->>Raft: BuildQueued(foo)
+    Raft->>Raft: Assign to Agent K
+    Leader->>UserA: BuildAssigned(K, foo)
+    UserA->>AgentK: SubscribeToBuild(foo)
+    AgentK->>AgentK: Start building foo
+    AgentK-->>UserA: Log: "Building..."
+
+    Note over UserB,AgentK: User B submits same foo.drv (30s later)
+
+    UserB->>Leader: QueueBuild(foo)
+    Leader->>Leader: Check Raft:<br/>foo already building on K
+    Leader->>UserB: AlreadyBuilding(K, foo)
+    UserB->>AgentK: SubscribeToBuild(foo)
+    AgentK-->>UserB: Catch-up logs
+    AgentK-->>UserA: Log: "Continuing..."
+    AgentK-->>UserB: Log: "Continuing..."
+
+    Note over AgentK: Build completes
+
+    AgentK->>Raft: BuildCompleted(foo)
+    AgentK-->>UserA: Outputs
+    AgentK-->>UserB: Outputs
+    UserA->>UserA: Import
+    UserB->>UserB: Import
+```
+
+#### Detailed Scenario: User B joins in-progress build
 
 ```
 Time T0: User A submits /nix/store/abc123-foo.drv
@@ -754,6 +850,47 @@ Time T2: User C runs: rio-build ./dep3.nix (dep3 was in substituters)
 - No remote build needed!
 ```
 
+#### Build Affinity and Dependency Waiting
+
+```mermaid
+sequenceDiagram
+    actor UserA as User A
+    actor UserB as User B
+    participant Leader
+    participant Raft
+    participant AgentK as Agent K
+
+    Note over UserA,AgentK: User A builds foo
+
+    UserA->>Leader: QueueBuild(foo)
+    Leader->>Raft: BuildQueued(foo)
+    Raft->>Raft: Assign to Agent K
+    AgentK->>AgentK: Start building foo
+    AgentK-->>UserA: Logs streaming...
+
+    Note over UserB,AgentK: User B builds bar (depends on foo)
+
+    UserB->>Leader: QueueBuild(bar, deps=[foo])
+    Leader->>Raft: BuildQueued(bar, deps=[foo])
+    Raft->>Raft: Score agents:<br/>K has foo (affinity=1)<br/>→ Assign to Agent K
+    Leader->>UserB: BuildAssigned(K, bar)
+    UserB->>AgentK: SubscribeToBuild(bar)
+
+    AgentK->>AgentK: Check: foo building on self<br/>→ Queue bar (blocked on foo)
+    AgentK->>Raft: BuildStatusChanged(bar, Queued)
+    AgentK-->>UserB: "Waiting for dependency foo..."
+
+    Note over AgentK: foo completes
+
+    AgentK->>AgentK: Auto-start bar<br/>(foo in /nix/store)
+    AgentK->>Raft: BuildStatusChanged(bar, Building)
+    AgentK-->>UserB: "Dependencies ready, building..."
+    AgentK-->>UserB: bar logs streaming...
+
+    AgentK->>Raft: BuildCompleted(bar)
+    AgentK-->>UserB: Outputs
+```
+
 **Scenario: Build affinity with dependency waiting**
 
 ```
@@ -881,6 +1018,59 @@ fn apply_build_completed(
 - Much better than registering everything!
 
 ### 5. Failure Handling
+
+#### Agent Failure and Recovery
+
+```mermaid
+sequenceDiagram
+    actor UserA as User A
+    actor UserB as User B
+    participant Leader
+    participant Raft
+    participant AgentK as Agent K (dies)
+    participant AgentJ as Agent J
+
+    UserA->>Leader: QueueBuild(foo)
+    Leader->>Raft: BuildQueued(foo)
+    Raft->>Raft: Assign to K
+    AgentK->>AgentK: Building foo...
+    AgentK-->>UserA: Logs...
+
+    UserB->>Leader: QueueBuild(bar, deps=[foo])
+    Leader->>Raft: BuildQueued(bar, deps=[foo])
+    Raft->>Raft: Affinity → Assign to K
+    AgentK->>AgentK: Queue bar (blocked on foo)
+    AgentK-->>UserB: "Waiting for foo..."
+
+    Note over AgentK: Agent K crashes!
+
+    AgentK--xUserA: Stream disconnected
+    AgentK--xUserB: Stream disconnected
+
+    Note over Raft: Heartbeat timeout (30s)
+
+    Raft->>Raft: Mark K as Down<br/>Remove all K's builds<br/>(foo, bar)
+
+    UserA->>Leader: GetBuildStatus(foo)
+    Leader-->>UserA: NOT_FOUND
+    UserA->>Leader: QueueBuild(foo) [RETRY]
+    Leader->>Raft: BuildQueued(foo)
+    Raft->>Raft: Assign to J
+    AgentJ->>AgentJ: Start building foo
+
+    UserB->>Leader: GetBuildStatus(bar)
+    Leader-->>UserB: NOT_FOUND
+    UserB->>Leader: QueueBuild(bar, deps=[foo]) [RETRY]
+    Leader->>Raft: BuildQueued(bar, deps=[foo])
+    Raft->>Raft: Affinity with foo on J<br/>→ Assign to J
+    AgentJ->>AgentJ: Queue bar (blocked on foo)
+
+    Note over AgentJ: Builds naturally re-grouped!
+
+    AgentJ-->>UserA: foo completes
+    AgentJ->>AgentJ: Auto-start bar
+    AgentJ-->>UserB: bar completes
+```
 
 **Scenario A: Agent dies with active and queued builds**
 
