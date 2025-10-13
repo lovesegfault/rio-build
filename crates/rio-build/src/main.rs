@@ -5,10 +5,7 @@
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
-
-mod client;
-mod evaluator;
-mod output_handler;
+use rio_build::{client, evaluator, output_handler};
 
 /// Rio Build - Distributed Nix build client
 #[derive(Parser, Debug)]

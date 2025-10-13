@@ -7,7 +7,6 @@ use rio_common::proto::{BuildCompleted, BuildFailed, BuildUpdate, LogLine, build
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tonic::Status;
 
 use crate::agent::{Agent, BuildJob};
 use crate::nar_exporter;
@@ -38,15 +37,15 @@ pub async fn start_build(agent: &Agent, drv_path: String, drv_nar_bytes: Vec<u8>
     // Spawn nix-build process
     let child = Command::new("nix-build")
         .arg(actual_drv_path.as_str())
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("Failed to spawn nix-build")?;
 
-    // Create BuildJob
+    // Create BuildJob (metadata only, process owned by background task)
     let build_job = BuildJob {
         drv_path: actual_drv_path.clone(),
-        process: child,
         subscribers: Vec::new(),
     };
 
@@ -56,12 +55,14 @@ pub async fn start_build(agent: &Agent, drv_path: String, drv_nar_bytes: Vec<u8>
         *current = Some(build_job);
     }
 
-    // Spawn task to handle build completion
+    // Spawn task to handle build completion (owns the process)
     let agent_clone = agent.current_build.clone();
     let drv_path_clone = actual_drv_path.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = handle_build_completion(agent_clone, drv_path_clone, start_time).await {
+        if let Err(e) =
+            handle_build_completion(agent_clone, drv_path_clone, child, start_time).await
+        {
             tracing::error!("Build completion error: {}", e);
         }
     });
@@ -112,46 +113,67 @@ async fn import_derivation_nar(nar_bytes: &[u8]) -> Result<Utf8PathBuf> {
     Ok(Utf8PathBuf::from(store_path))
 }
 
-/// Handle build completion (runs in background task)
+/// Handle build completion (runs in background task, owns the process)
 async fn handle_build_completion(
     current_build: std::sync::Arc<tokio::sync::Mutex<Option<BuildJob>>>,
     drv_path: DerivationPath,
+    mut process: tokio::process::Child,
     start_time: Instant,
 ) -> Result<()> {
-    // Stream logs
-    {
-        let mut current = current_build.lock().await;
-        if let Some(ref mut build) = *current {
-            // Take stdout and stderr
-            let stdout = build.process.stdout.take().context("No stdout")?;
-            let stderr = build.process.stderr.take().context("No stderr")?;
+    tracing::info!("Build completion handler started for {}", drv_path);
 
-            // Spawn log streaming tasks
-            let subscribers = build.subscribers.clone();
-            tokio::spawn(stream_logs(stdout, stderr, drv_path.clone(), subscribers));
-        }
-    }
+    // Take stdout and stderr for streaming/capturing
+    let stdout = process.stdout.take().context("No stdout")?;
+    let stderr = process.stderr.take().context("No stderr")?;
 
-    // Wait for completion
-    let exit_status = {
-        let mut current = current_build.lock().await;
-        if let Some(ref mut build) = *current {
-            build
-                .process
-                .wait()
-                .await
-                .context("Failed to wait for nix-build")?
-        } else {
-            anyhow::bail!("Build disappeared");
-        }
-    };
+    // Spawn log streaming task (will read subscribers on each line)
+    let current_for_logs = current_build.clone();
+    tokio::spawn(stream_logs(stderr, drv_path.clone(), current_for_logs));
+
+    tracing::info!("Log streaming task spawned");
+
+    // Read stdout (nix-build output paths) in separate task
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut stdout_reader = stdout;
+        let mut buffer = Vec::new();
+        stdout_reader
+            .read_to_end(&mut buffer)
+            .await
+            .context("Failed to read stdout")?;
+        Ok::<Vec<u8>, anyhow::Error>(buffer)
+    });
+
+    tracing::info!("Waiting for nix-build to complete...");
+
+    // Wait for process completion (no lock needed - we own the process)
+    let exit_status = process
+        .wait()
+        .await
+        .context("Failed to wait for nix-build")?;
+
+    tracing::info!("nix-build exited with status: {:?}", exit_status);
+
+    // Get stdout output
+    let stdout_output = stdout_task.await.context("stdout task panicked")??;
+
+    tracing::info!("Got stdout: {} bytes", stdout_output.len());
 
     let duration_ms = start_time.elapsed().as_millis() as i64;
 
     // Handle result
     if exit_status.success() {
-        // Parse output paths from nix-build
-        let output_paths = vec![drv_path.as_str().replace(".drv", "")];
+        // Parse output paths from nix-build stdout
+        let stdout_str = String::from_utf8(stdout_output).context("nix-build output not UTF-8")?;
+        let output_paths: Vec<String> = stdout_str
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim().to_string())
+            .collect();
+
+        if output_paths.is_empty() {
+            anyhow::bail!("nix-build produced no output paths");
+        }
 
         tracing::info!("Build succeeded: {:?}", output_paths);
 
@@ -203,71 +225,38 @@ async fn handle_build_completion(
         }
     }
 
-    // Clean up
-    {
-        let mut current = current_build.lock().await;
-        *current = None;
-    }
-
+    // Clean up already done (process taken from current_build above)
     Ok(())
 }
 
-/// Stream build logs to subscribers
+/// Stream build logs to subscribers (from stderr)
 async fn stream_logs(
-    stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
     drv_path: DerivationPath,
-    subscribers: Vec<tokio::sync::mpsc::Sender<Result<BuildUpdate, Status>>>,
+    current_build: std::sync::Arc<tokio::sync::Mutex<Option<BuildJob>>>,
 ) {
-    let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
 
-    loop {
-        tokio::select! {
-            line = stdout_lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        let update = BuildUpdate {
-                            derivation_path: drv_path.as_str().to_string(),
-                            update: Some(build_update::Update::Log(LogLine {
-                                timestamp: chrono::Utc::now().timestamp_millis(),
-                                line: format!("{}\n", line),
-                            })),
-                        };
+    while let Ok(Some(line)) = stderr_lines.next_line().await {
+        let update = BuildUpdate {
+            derivation_path: drv_path.as_str().to_string(),
+            update: Some(build_update::Update::Log(LogLine {
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                line: format!("{}\n", line),
+            })),
+        };
 
-                        for sub in &subscribers {
-                            let _ = sub.send(Ok(update.clone())).await;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::error!("Error reading stdout: {}", e);
-                        break;
-                    }
-                }
-            }
-            line = stderr_lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        let update = BuildUpdate {
-                            derivation_path: drv_path.as_str().to_string(),
-                            update: Some(build_update::Update::Log(LogLine {
-                                timestamp: chrono::Utc::now().timestamp_millis(),
-                                line: format!("{}\n", line),
-                            })),
-                        };
+        // Get current subscribers (refreshed on each line to catch late joiners)
+        let subscribers = {
+            let current = current_build.lock().await;
+            current
+                .as_ref()
+                .map(|b| b.subscribers.clone())
+                .unwrap_or_default()
+        };
 
-                        for sub in &subscribers {
-                            let _ = sub.send(Ok(update.clone())).await;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::error!("Error reading stderr: {}", e);
-                        break;
-                    }
-                }
-            }
+        for sub in &subscribers {
+            let _ = sub.send(Ok(update.clone())).await;
         }
     }
 }

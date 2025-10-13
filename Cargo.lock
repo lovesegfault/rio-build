@@ -969,6 +969,7 @@ dependencies = [
  "clap",
  "rio-common",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",

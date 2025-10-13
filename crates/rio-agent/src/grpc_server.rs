@@ -15,6 +15,15 @@ pub struct RioAgentService {
     agent: Arc<Agent>,
 }
 
+impl RioAgentService {
+    /// Create a new RioAgentService
+    pub fn new(agent: Agent) -> Self {
+        Self {
+            agent: Arc::new(agent),
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl RioAgent for RioAgentService {
     /// Queue a build (Phase 1: stores drv, starts build, returns BuildAssigned)
