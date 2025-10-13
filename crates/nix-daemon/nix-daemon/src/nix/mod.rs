@@ -1775,6 +1775,100 @@ where
                         .await
                         .with_field("AddMultipleToStore.stderr")?;
                 }
+                Ok(wire::Op::BuildDerivation) => {
+                    // Read derivation path
+                    let drv_path = wire::read_string(&mut self.r)
+                        .await
+                        .with_field("BuildDerivation.drvPath")?;
+
+                    info!("BuildDerivation: drv_path={}", drv_path);
+
+                    // Read BasicDerivation structure
+                    // Format: outputs, inputSrcs, platform, builder, args, env
+
+                    // 1. Outputs
+                    let outputs_count = wire::read_u64(&mut self.r)
+                        .await
+                        .with_field("BuildDerivation.outputs.count")?;
+                    for _ in 0..outputs_count {
+                        wire::read_string(&mut self.r)
+                            .await
+                            .with_field("BuildDerivation.output.name")?;
+                        wire::read_string(&mut self.r)
+                            .await
+                            .with_field("BuildDerivation.output.path")?;
+                        wire::read_string(&mut self.r)
+                            .await
+                            .with_field("BuildDerivation.output.hashAlgo")?;
+                        wire::read_string(&mut self.r)
+                            .await
+                            .with_field("BuildDerivation.output.hash")?;
+                    }
+
+                    // 2. Input sources
+                    wire::read_strings(&mut self.r)
+                        .collect::<Result<Vec<_>>>()
+                        .await
+                        .with_field("BuildDerivation.inputSrcs")?;
+
+                    // 3. Platform
+                    wire::read_string(&mut self.r)
+                        .await
+                        .with_field("BuildDerivation.platform")?;
+
+                    // 4. Builder
+                    wire::read_string(&mut self.r)
+                        .await
+                        .with_field("BuildDerivation.builder")?;
+
+                    // 5. Args
+                    wire::read_strings(&mut self.r)
+                        .collect::<Result<Vec<_>>>()
+                        .await
+                        .with_field("BuildDerivation.args")?;
+
+                    // 6. Environment variables
+                    let env_count = wire::read_u64(&mut self.r)
+                        .await
+                        .with_field("BuildDerivation.env.count")?;
+                    for _ in 0..env_count {
+                        wire::read_string(&mut self.r)
+                            .await
+                            .with_field("BuildDerivation.env.key")?;
+                        wire::read_string(&mut self.r)
+                            .await
+                            .with_field("BuildDerivation.env.value")?;
+                    }
+
+                    // Read build mode
+                    let build_mode = wire::read_u64(&mut self.r)
+                        .await
+                        .with_field("BuildDerivation.buildMode")?;
+
+                    info!(
+                        "BuildDerivation: drv_path={}, build_mode={}",
+                        drv_path, build_mode
+                    );
+
+                    // Build using build_paths
+                    forward_stderr(
+                        &mut self.w,
+                        self.store
+                            .build_paths(vec![drv_path.clone()], BuildMode::Normal),
+                    )
+                    .await?;
+
+                    // Write BuildResult (status=0 for success)
+                    wire::write_u64(&mut self.w, 0)
+                        .await
+                        .with_field("BuildDerivation.result.status")?;
+                    // Empty error message
+                    wire::write_string(&mut self.w, "")
+                        .await
+                        .with_field("BuildDerivation.result.errorMsg")?;
+
+                    info!("BuildDerivation: completed for {}", drv_path);
+                }
                 Ok(v) => todo!("{:#?}", v),
 
                 Err(Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
