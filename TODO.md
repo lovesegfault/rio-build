@@ -236,22 +236,31 @@ Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implem
 - Full deterministic assignment will be implemented in Phase 2.3
 - All 12 tests passing (9 from Phase 1 + 2 storage + 3 state machine)
 
-### 2.3 Deterministic Agent Assignment (rio-agent)
+### 2.3 Deterministic Agent Assignment (rio-agent) ✅ COMPLETED
 
 Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment".
 
-- [ ] In `state_machine.rs`, implement `apply_build_queued()`
-  - [ ] Step 1: Filter eligible agents (platform + features + Available status)
-  - [ ] Step 2: Score agents by affinity
-    - [ ] Count matching deps in `builds_in_progress`
-    - [ ] Count matching deps in `completed_builds`
-  - [ ] Step 3: Select highest affinity agent
-  - [ ] Step 4: Tie-break by smallest agent_id (lexicographic)
-  - [ ] Step 5: Update state:
-    - [ ] Insert top-level build in `builds_in_progress`
-    - [ ] Insert all dependencies with parent_build pointer
-    - [ ] Set agent status to Busy
-  - [ ] Return selected agent_id
+- [x] In `state_machine.rs`, enhance BuildQueued handler
+  - [x] Step 1: Filter eligible agents (platform + features + Available status)
+  - [x] Step 2: Score agents by affinity
+    - [x] Count matching deps in `builds_in_progress`
+    - [x] Count matching deps in `completed_builds`
+  - [x] Step 3: Select highest affinity agent
+  - [x] Step 4: Tie-break by smallest agent_id (lexicographic)
+  - [x] Step 5: Update state:
+    - [x] Insert top-level build in `builds_in_progress`
+    - [x] Insert all dependencies with parent_build pointer
+    - [x] Set agent status to Busy
+  - [x] Return selected agent_id
+
+**Tests added:**
+- test_deterministic_assignment_platform_filter: Verify platform matching
+- test_deterministic_assignment_feature_filter: Verify feature requirement matching
+- test_deterministic_assignment_affinity: Verify affinity scoring works
+- test_deterministic_assignment_tie_break: Verify lexicographic tie-breaking
+- test_assignment_marks_agent_busy: Verify agent status update
+
+**All 16 tests passing** (11 state_machine + 2 common + 1 integration + 2 storage)
 
 ### 2.4 Cluster Membership (rio-agent)
 
