@@ -1392,9 +1392,16 @@ message LogLine {
 
 message OutputChunk {
   string output_path = 1;
-  bytes data = 2;
+  bytes data = 2;  // Compressed NAR data (zstd by default)
   int32 chunk_index = 3;
   bool last_chunk = 4;
+  CompressionType compression = 5;
+}
+
+enum CompressionType {
+  COMPRESSION_TYPE_UNSPECIFIED = 0;
+  COMPRESSION_TYPE_NONE = 1;
+  COMPRESSION_TYPE_ZSTD = 2;
 }
 
 message BuildCompleted {
@@ -1460,6 +1467,18 @@ message FetchPendingBuildResponse {
 // Note: SubscribeToBuild and GetCompletedBuild return stream BuildUpdate
 ```
 
+**Output Compression:**
+
+All build outputs are compressed with zstd (level 3) before streaming to reduce bandwidth usage:
+
+- **10GiB output → ~2-4GiB transfer**: Typical compression ratio 2.5-5x for build artifacts
+- **Agent side**: `nix-store --export | zstd -3 | chunk | gRPC stream`
+- **CLI side**: Reassemble chunks → decompress → `nix-store --import`
+- **Performance**: zstd level 3 provides good balance (~500MB/s compression, high ratio)
+- **Backward compatible**: CompressionType enum allows future algorithms or uncompressed fallback
+
+For large builds (>1GiB), this significantly reduces transfer time and agent bandwidth consumption.
+
 ## Technology Stack
 
 ### Nix Tooling
@@ -1490,6 +1509,12 @@ Alternative considered: `tikv/raft-rs` (too low-level, requires custom transport
 
 - `tonic` 0.14 + `tonic-prost` 0.14
 - Already in use, proven
+
+### Compression
+
+- `zstd` 0.13 for output compression
+- Level 3 compression (good speed/ratio balance)
+- Reduces large build output transfers by 2.5-5x
 
 ### Persistent Storage
 
