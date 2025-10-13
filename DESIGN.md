@@ -277,9 +277,8 @@ User runs: rio-build ./my-package.nix
      * neededSubstitutes: [list of paths fetchable from cache]
    - If cacheStatus is "cached" or "local":
      → Skip remote build, run `nix build` locally instead
-   - Read derivation bytes for top-level
-   - Compute DerivationHash for top-level and each neededBuilds entry
-   - Result: BuildInfo with minimal set of builds needed
+   - Export derivation as NAR: `nix-store --export /nix/store/abc123-foo.drv`
+   - Result: BuildInfo with derivation NAR bytes and minimal set of builds needed
 
 ┌─────────────────────────────────────────────────────┐
 │ 2. CLI: Connect to cluster leader                   │
@@ -293,11 +292,11 @@ User runs: rio-build ./my-package.nix
 ┌─────────────────────────────────────────────────────┐
 │ 3. CLI → Leader: Submit work to queue               │
 └─────────────────────────────────────────────────────┘
-   CLI → Leader: QueueBuild(drv_bytes, deps, platform, features)
+   CLI → Leader: QueueBuild(drv_nar_bytes, drv_path, deps, platform, features)
 
-   Leader receives derivation bytes (via gRPC, not Raft)
-   Leader stores temporarily: /tmp/rio-pending/{drv_hash}.drv
-   Leader returns: BuildQueued { drv_hash }
+   Leader receives derivation NAR bytes (via gRPC, not Raft)
+   Leader stores temporarily: /tmp/rio-pending/{drv_path}.nar
+   Leader returns: BuildQueued { drv_path }
 
 ┌─────────────────────────────────────────────────────┐
 │ 4. Leader: Propose to Raft                          │
@@ -327,19 +326,22 @@ User runs: rio-build ./my-package.nix
 ┌─────────────────────────────────────────────────────┐
 │ 6. Assigned agent: Fetch derivation and start       │
 └─────────────────────────────────────────────────────┘
-   Agent K sees: "I was assigned drv_hash"
+   Agent K sees: "I was assigned drv_path"
 
    If K is leader:
-     - Read from /tmp/rio-pending/{drv_hash}.drv
+     - Read from /tmp/rio-pending/{drv_path}.nar
    Else:
-     - FetchPendingBuild(drv_hash) from leader via gRPC
+     - FetchPendingBuild(drv_path) from leader via gRPC
+
+   Import derivation to store:
+     - cat derivation.nar | nix-store --import
+     - Returns canonical path: /nix/store/hash-foo.drv
 
    Check dependencies:
      - If deps building on self → Queue with Queued status
      - Else → Start immediately with Building status
 
-   Write derivation to /tmp/rio-agent/{drv_hash}.drv
-   Spawn: nix-build /tmp/rio-agent/{drv_hash}.drv
+   Spawn: nix-build /nix/store/hash-foo.drv
 
 ┌─────────────────────────────────────────────────────┐
 │ 7. Leader: Respond to CLI with assignment           │
@@ -1247,7 +1249,44 @@ Available agents: 3 (none match requirements)
 
 This is detected by the Raft state machine when applying BuildQueued - the `eligible` filter returns empty.
 
-### 8. Build Dependencies
+### 8. Derivation Transfer (CLI → Agent)
+
+**Critical Discovery:** Derivations must be transferred as NARs, not raw .drv bytes.
+
+**Why:**
+- `nix-build` requires derivations to be in `/nix/store` at their canonical path
+- Cannot build from `/tmp/foo.drv` or arbitrary locations
+- `nix-store --add` doesn't work for derivations (computes wrong hash from filename)
+- Must use `nix-store --import` to get derivations into the store
+
+**Correct Transfer Flow:**
+
+```bash
+# CLI side:
+nix-store --export /nix/store/x80j8hd76ca0yx7d8k4qn8fpqgbraqav-hello.drv > derivation.nar
+# Send NAR bytes via gRPC
+
+# Agent side:
+cat derivation.nar | nix-store --import
+# Returns: /nix/store/x80j8hd76ca0yx7d8k4qn8fpqgbraqav-hello.drv
+nix-build /nix/store/x80j8hd76ca0yx7d8k4qn8fpqgbraqav-hello.drv
+```
+
+**Implementation:**
+- CLI: Use `nix-store --export` to create NAR from derivation
+- Protocol: `QueueBuildRequest.derivation` contains NAR bytes (not raw .drv)
+- Agent: Pipe NAR bytes to `nix-store --import` to get canonical path
+- Agent: Build using the imported store path
+
+**Benefits:**
+- ✅ Consistent with output transfer (both use NAR export/import)
+- ✅ Derivation automatically placed at correct store path
+- ✅ No manual path construction or hash computation
+- ✅ Nix handles all validation
+
+**Note:** Same mechanism used for both derivations and build outputs throughout Rio.
+
+### 9. Build Dependencies
 
 **How does agent get dependencies?**
 
