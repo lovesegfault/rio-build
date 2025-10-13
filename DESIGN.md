@@ -367,9 +367,10 @@ User runs: rio-build ./my-package.nix
 └─────────────────────────────────────────────────────┘
    Send BuildUpdate {
        output_chunk: OutputChunk {
-           path: "/nix/store/abc123-result",
            data: [bytes...],
            chunk_index: 0,
+           last_chunk: false,
+           compression: COMPRESSION_TYPE_ZSTD,
        }
    }
 
@@ -1391,11 +1392,10 @@ message LogLine {
 }
 
 message OutputChunk {
-  string output_path = 1;
-  bytes data = 2;  // Compressed NAR data (zstd by default)
-  int32 chunk_index = 3;
-  bool last_chunk = 4;
-  CompressionType compression = 5;
+  bytes data = 1;  // Compressed NAR data (zstd by default)
+  int32 chunk_index = 2;
+  bool last_chunk = 3;
+  CompressionType compression = 4;
 }
 
 enum CompressionType {
@@ -1515,7 +1515,6 @@ async fn stream_build_outputs(
         while let Some(compressed_chunk) = chunk_rx.recv().await {
             build_update_tx.send(BuildUpdate {
                 output_chunk: Some(OutputChunk {
-                    output_path: output_paths[0].to_string(),
                     data: compressed_chunk,
                     chunk_index,
                     last_chunk: false,
@@ -1739,12 +1738,28 @@ Raft requires persistence for:
 - Refresh on failure (if selected agent is down)
 - Config option for cache TTL
 
-### 3. Should we support multi-output derivations?
+### 3. Multi-output derivations are fully supported
 
-Nix derivations can have multiple outputs: `out`, `dev`, `doc`, etc.
+Nix derivations commonly have multiple outputs: `out`, `dev`, `doc`, `man`, etc. Rio supports these naturally because:
 
-**MVP: Support only single-output derivations**
-Future: Export all outputs as separate NARs
+1. **NAR format is multi-output aware**: `nix-store --export` takes multiple paths and produces a single interleaved NAR stream containing all outputs
+2. **Import is automatic**: `nix-store --import` extracts all outputs from the stream automatically
+3. **Protocol represents all outputs**: `BuildCompleted` has `repeated string output_paths` to list all outputs
+4. **No special handling needed**: The streaming pipeline works identically whether exporting one output or fifty
+
+Example:
+```bash
+# Agent exports multiple outputs in single stream
+nix-store --export \
+  /nix/store/abc-hello \
+  /nix/store/def-hello-dev \
+  /nix/store/ghi-hello-doc \
+  | zstd -3 | gRPC stream
+
+# CLI imports single stream, gets all outputs
+gRPC stream | zstd -d | nix-store --import
+# Result: All three outputs in /nix/store
+```
 
 ### 4. How to handle concurrent builds on same agent?
 
