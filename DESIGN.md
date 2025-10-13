@@ -1479,6 +1479,119 @@ All build outputs are compressed with zstd (level 3) before streaming to reduce 
 
 For large builds (>1GiB), this significantly reduces transfer time and agent bandwidth consumption.
 
+**NAR Streaming Implementation Pattern:**
+
+Streaming build outputs requires bridging blocking `nix-store --export` with async gRPC. We use the **channel bridge pattern** inspired by hydra-queue-runner:
+
+```rust
+// Agent-side: Stream outputs to CLI
+async fn stream_build_outputs(
+    store: nix_utils::LocalStore,
+    output_paths: Vec<Utf8PathBuf>,
+    build_update_tx: mpsc::Sender<BuildUpdate>,
+) -> anyhow::Result<()> {
+    // 1. Create unbounded channel for NAR chunks
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // 2. Spawn blocking task for nix-store --export (runs in separate thread pool)
+    let export_task = tokio::task::spawn_blocking(move || {
+        // Callback closure: called by Nix with each chunk
+        let callback = move |data: &[u8]| {
+            // Compress chunk with zstd
+            let compressed = zstd::stream::encode_all(data, 3)?;
+
+            // Send to channel (thread-safe, async-safe)
+            chunk_tx.send(compressed).is_ok()
+        };
+
+        // Export NAR with callback (blocking)
+        store.export_paths(&output_paths, callback)?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // 3. Async task: Forward chunks to gRPC stream
+    let mut chunk_index = 0;
+    let stream_task = async {
+        while let Some(compressed_chunk) = chunk_rx.recv().await {
+            build_update_tx.send(BuildUpdate {
+                output_chunk: Some(OutputChunk {
+                    output_path: output_paths[0].to_string(),
+                    data: compressed_chunk,
+                    chunk_index,
+                    last_chunk: false,
+                    compression: CompressionType::Zstd as i32,
+                }),
+                ..Default::default()
+            }).await?;
+
+            chunk_index += 1;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    // 4. Run both tasks concurrently, wait for completion
+    futures::future::try_join(export_task.await?, stream_task).await?;
+
+    // 5. Send final chunk marker
+    build_update_tx.send(BuildUpdate {
+        output_chunk: Some(OutputChunk {
+            last_chunk: true,
+            chunk_index,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }).await?;
+
+    Ok(())
+}
+```
+
+**Key Components:**
+
+1. **`spawn_blocking`**: Runs blocking Nix calls in tokio's dedicated thread pool (doesn't block async runtime)
+2. **Callback closure**: `nix-store --export` calls this with each chunk as it's produced
+3. **mpsc channel**: Thread-safe bridge between blocking export and async streaming
+4. **`UnboundedReceiverStream`**: Wraps channel receiver as async `Stream` for gRPC
+5. **`try_join`**: Both tasks run concurrently until both complete
+
+**Benefits:**
+
+- ✅ **Constant memory**: Only current chunk buffered (~1MB), not entire NAR
+- ✅ **Non-blocking**: Export runs in separate thread, doesn't block tokio runtime
+- ✅ **Streaming starts immediately**: No waiting for full export
+- ✅ **Backpressure**: Channel naturally blocks if receiver is slow
+- ✅ **Clean separation**: Sync (Nix C++) and async (gRPC) worlds never mix
+
+**Log Streaming:**
+
+Same pattern applies for build logs:
+
+```rust
+let (mut child, mut log_output) = nix_utils::realise_drv(&drv, &options).await?;
+
+let log_stream = async_stream::stream! {
+    while let Some(chunk) = log_output.next().await {
+        match chunk {
+            Ok(line) => yield BuildUpdate {
+                log: Some(LogLine {
+                    timestamp: now(),
+                    line: format!("{line}\n"),
+                }),
+                ..Default::default()
+            },
+            Err(e) => {
+                tracing::error!("Log read error: {e}");
+                break;
+            }
+        }
+    }
+};
+
+client.subscribe_to_build(Request::new(log_stream)).await?;
+```
+
+Using `async_stream::stream!` macro simplifies creating streams from async iterators.
+
 ## Technology Stack
 
 ### Nix Tooling
@@ -1693,3 +1806,4 @@ Acceptable for MVP - leader elections are rare
 - [Nix Manual: Derivations](https://nixos.org/manual/nix/stable/language/derivations.html)
 - [Nix Manual: system-features](https://nix.dev/manual/nix/2.18/command-ref/conf-file.html#conf-system-features)
 - [nixbuild.net](https://nixbuild.net/) - Inspiration for distributed Nix builds
+- [hydra-queue-runner](https://github.com/helsinki-systems/hydra-queue-runner) - Rust rewrite of Hydra's queue runner with gRPC (inspired NAR streaming pattern)
