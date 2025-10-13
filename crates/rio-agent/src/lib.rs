@@ -6,4 +6,5 @@ pub mod agent;
 pub mod builder;
 pub mod grpc_server;
 pub mod nar_exporter;
+pub mod state_machine;
 pub mod storage;

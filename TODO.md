@@ -210,34 +210,31 @@ Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implem
 - Storage layout: `data_dir/raft.rocksdb` with two column families
 - All 9 tests passing (7 from Phase 1 + 2 new storage tests)
 
-### 2.2 Raft State Machine (rio-agent)
+### 2.2 Raft State Machine (rio-agent) ✅ COMPLETED
 
-- [ ] Create `rio-agent/src/state_machine.rs`
-  - [ ] Define `ClusterState` struct (matches DESIGN.md section 1):
-    ```rust
-    struct ClusterState {
-        agents: HashMap<AgentId, AgentInfo>,
-        builds_in_progress: HashMap<DerivationPath, BuildTracker>,
-        completed_builds: LruCache<DerivationPath, CompletedBuild>,
-    }
-    ```
-  - [ ] Define `RaftCommand` enum (matches DESIGN.md section 1):
-    ```rust
-    enum RaftCommand {
-        AgentJoined { id: AgentId, info: AgentInfo },
-        AgentLeft { id: AgentId },
-        AgentHeartbeat { id: AgentId, timestamp: Timestamp },
-        BuildQueued { top_level, dependencies, platform, features },
-        BuildStatusChanged { derivation_path, status },
-        BuildCompleted { derivation_path, output_paths },
-        BuildFailed { derivation_path, error },
-    }
-    ```
-  - [ ] Implement `openraft::RaftStateMachine` trait
-  - [ ] Method: `apply(command: RaftCommand) -> Result<Response>`
-    - [ ] Pattern match on command
-    - [ ] Update ClusterState accordingly
-    - [ ] Return response data (e.g., selected agent for BuildQueued)
+- [x] Create `rio-agent/src/state_machine.rs`
+  - [x] Define `ClusterState` struct with agents, builds_in_progress, completed_builds
+  - [x] Define `RaftCommand` enum with all 7 command variants
+  - [x] Define `RaftResponse` enum for command responses
+  - [x] Define supporting types: AgentInfo, BuildTracker, BuildStatus, CompletedBuild
+  - [x] Method: `ClusterState::apply(command) -> RaftResponse`
+    - [x] Pattern match on command variants
+    - [x] Update ClusterState accordingly
+    - [x] Return appropriate response
+- [x] Integrate with storage.rs
+  - [x] Updated TypeConfig to use D = RaftCommand, R = RaftResponse
+  - [x] Added ClusterState to StateMachineData
+  - [x] Updated apply() to delegate to ClusterState::apply()
+- [x] Tests
+  - [x] test_agent_joined: Verify agent registration
+  - [x] test_build_lifecycle: Verify build queue → complete flow
+  - [x] test_dependency_cleanup_on_completion: Verify parent_build cleanup
+
+**Implementation notes:**
+- Added chrono serde feature for DateTime serialization
+- Placeholder assignment logic (selects first available agent)
+- Full deterministic assignment will be implemented in Phase 2.3
+- All 12 tests passing (9 from Phase 1 + 2 storage + 3 state machine)
 
 ### 2.3 Deterministic Agent Assignment (rio-agent)
 
