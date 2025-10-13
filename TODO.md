@@ -209,8 +209,8 @@ Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implem
     ```rust
     struct ClusterState {
         agents: HashMap<AgentId, AgentInfo>,
-        builds_in_progress: HashMap<DerivationHash, BuildTracker>,
-        completed_builds: LruCache<DerivationHash, CompletedBuild>,
+        builds_in_progress: HashMap<DerivationPath, BuildTracker>,
+        completed_builds: LruCache<DerivationPath, CompletedBuild>,
     }
     ```
   - [ ] Define `RaftCommand` enum (matches DESIGN.md section 1):
@@ -220,9 +220,9 @@ Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implem
         AgentLeft { id: AgentId },
         AgentHeartbeat { id: AgentId, timestamp: Timestamp },
         BuildQueued { top_level, dependencies, platform, features },
-        BuildStatusChanged { drv_hash, status },
-        BuildCompleted { drv_hash, output_paths },
-        BuildFailed { drv_hash, error },
+        BuildStatusChanged { derivation_path, status },
+        BuildCompleted { derivation_path, output_paths },
+        BuildFailed { derivation_path, error },
     }
     ```
   - [ ] Implement `openraft::RaftStateMachine` trait
@@ -326,15 +326,15 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 
 - [ ] Enhance `grpc_server.rs`, implement `QueueBuild` RPC:
   - [ ] Leader receives QueueBuildRequest
-  - [ ] Compute drv_hash from derivation bytes
+  - [ ] Extract derivation_path from request
   - [ ] Check if build already in progress or completed:
-    - [ ] Query Raft state: `cluster_state.builds_in_progress.get(drv_hash)`
+    - [ ] Query Raft state: `cluster_state.builds_in_progress.get(derivation_path)`
     - [ ] If found: Return `AlreadyBuilding` or `AlreadyCompleted` response
-  - [ ] Store derivation temporarily: `/tmp/rio-pending/{drv_hash}.drv`
+  - [ ] Store derivation temporarily: `/tmp/rio-pending/{derivation_path}.nar`
   - [ ] Propose RaftCommand::BuildQueued to cluster
   - [ ] Wait for commit
   - [ ] Read assignment from state machine result
-  - [ ] Return `BuildAssigned { agent_id, drv_hash }`
+  - [ ] Return `BuildAssigned { agent_id, derivation_path }`
 
 ### 3.2 Agent Receives Assignment (rio-agent)
 
@@ -354,7 +354,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [ ] Change: `subscribers: Vec<mpsc::Sender<BuildUpdate>>`
   - [ ] Add: `log_history: VecDeque<LogLine>` (cap at 10,000 lines)
 - [ ] Enhance `SubscribeToBuild` RPC:
-  - [ ] Find existing `BuildJob` by drv_hash
+  - [ ] Find existing `BuildJob` by derivation_path
   - [ ] If not found: Return error "Build not found"
   - [ ] Create new subscriber channel
   - [ ] Send catch-up logs (from log_history)
@@ -370,7 +370,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [ ] After build succeeds, call `stream_outputs()` (from Phase 1)
   - [ ] After outputs streamed, propose RaftCommand::BuildCompleted
   - [ ] Send BuildUpdate::Completed to all subscribers
-  - [ ] Clean up temp files: `/tmp/rio-agent/{drv_hash}.drv`
+  - [ ] Clean up temp files: `/tmp/rio-agent/{derivation_path}.nar`
   - [ ] Check if any pending builds waiting on this one
   - [ ] If yes: Start next build from pending queue
   - [ ] If no: Mark agent as Available
@@ -388,7 +388,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
     - [ ] Remove from `builds_in_progress`
     - [ ] Insert in `completed_builds` with 5-minute TTL
 - [ ] Implement `GetCompletedBuild` RPC:
-  - [ ] Query Raft state for drv_hash
+  - [ ] Query Raft state for derivation_path
   - [ ] If in completed_builds:
     - [ ] Export outputs from /nix/store
     - [ ] Stream to CLI
@@ -398,13 +398,13 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 
 - [ ] CLI enhancement in `client.rs`:
   - [ ] On `AlreadyBuilding` response:
-    - [ ] Extract agent_id and drv_hash
+    - [ ] Extract agent_id and derivation_path
     - [ ] Connect to assigned agent
-    - [ ] Call `SubscribeToBuild(drv_hash)`
+    - [ ] Call `SubscribeToBuild(derivation_path)`
     - [ ] Handle stream normally (late joiner gets catch-up logs)
   - [ ] On `AlreadyCompleted` response:
     - [ ] Connect to agent with outputs
-    - [ ] Call `GetCompletedBuild(drv_hash)`
+    - [ ] Call `GetCompletedBuild(derivation_path)`
     - [ ] Receive and import outputs
 
 ### 3.7 Phase 3 Testing
@@ -440,14 +440,14 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 ### 4.1 Dependency Tracking (rio-agent)
 
 - [ ] Enhance `BuildTracker` in state_machine.rs:
-  - [ ] Add field: `parent_build: Option<DerivationHash>`
-  - [ ] When registering dependencies, set parent_build = Some(top_level_hash)
+  - [ ] Add field: `parent_build: Option<DerivationPath>`
+  - [ ] When registering dependencies, set parent_build = Some(top_level_path)
 - [ ] In state machine, enhance `apply_build_queued()`:
   - [ ] Register all dependencies atomically in same command
   - [ ] Each dependency gets `parent_build` pointer to top-level
 - [ ] In state machine, enhance `apply_build_completed()`:
   - [ ] Remove top-level from builds_in_progress
-  - [ ] Remove ALL dependencies where parent_build = completed hash
+  - [ ] Remove ALL dependencies where parent_build = completed path
   - [ ] Insert in completed_builds cache
 
 ### 4.2 Build Affinity (rio-agent)
@@ -462,8 +462,8 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 ### 4.3 Dependency Waiting (rio-agent)
 
 - [ ] Enhance agent to track pending builds:
-  - [ ] Field: `pending_builds: HashMap<DerivationHash, PendingBuild>`
-  - [ ] Struct PendingBuild: `{ drv_bytes, blocked_on: Vec<DerivationHash>, subscribers }`
+  - [ ] Field: `pending_builds: HashMap<DerivationPath, PendingBuild>`
+  - [ ] Struct PendingBuild: `{ drv_nar_bytes, blocked_on: Vec<DerivationPath>, subscribers }`
 - [ ] When assigned build has dependencies building on self:
   - [ ] Don't start immediately
   - [ ] Add to pending_builds
@@ -471,7 +471,7 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
   - [ ] Propose BuildStatusChanged with Queued status
 - [ ] On build completion:
   - [ ] Iterate pending_builds
-  - [ ] Remove completed drv_hash from all blocked_on lists
+  - [ ] Remove completed derivation_path from all blocked_on lists
   - [ ] If any pending build now has empty blocked_on:
     - [ ] Start that build
     - [ ] Send status: "Dependencies ready, building..."
@@ -502,9 +502,9 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 
 - [ ] Implement `FetchPendingBuild` RPC:
   - [ ] Non-leader agent requests derivation from leader
-  - [ ] Leader reads from `/tmp/rio-pending/{drv_hash}.drv`
-  - [ ] Returns drv_bytes and dependency list
-  - [ ] Non-leader writes to `/tmp/rio-agent/{drv_hash}.drv`
+  - [ ] Leader reads from `/tmp/rio-pending/{derivation_path}.nar`
+  - [ ] Returns drv_nar_bytes and dependency list
+  - [ ] Non-leader writes to `/tmp/rio-agent/{derivation_path}.nar`
 
 ### 4.7 Graceful Shutdown (rio-agent)
 
