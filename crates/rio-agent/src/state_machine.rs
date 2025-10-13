@@ -160,43 +160,102 @@ impl ClusterState {
             RaftCommand::BuildQueued {
                 top_level,
                 dependencies,
-                platform: _,
-                features: _,
+                platform,
+                features,
             } => {
-                // TODO: Implement deterministic assignment in Phase 2.3
-                // For now, just return a placeholder
-                let agent_id = self
-                    .agents
-                    .keys()
-                    .next()
-                    .cloned()
-                    .unwrap_or_else(|| AgentId::nil());
+                // Deterministic agent assignment algorithm (DESIGN.md Section 1)
 
+                // Step 1: Filter eligible agents
+                let eligible: Vec<&AgentInfo> = self
+                    .agents
+                    .values()
+                    .filter(|agent| {
+                        agent.platforms.contains(&platform)
+                            && features.iter().all(|f| agent.features.contains(f))
+                            && agent.status == AgentStatus::Available
+                    })
+                    .collect();
+
+                // If no eligible agents, return error response
+                // TODO: Add NoEligibleAgents response variant in Phase 3
+                if eligible.is_empty() {
+                    // For now, return with nil agent_id to signal error
+                    return RaftResponse::BuildAssigned {
+                        agent_id: AgentId::nil(),
+                        derivation_path: top_level,
+                    };
+                }
+
+                // Step 2: Score agents by affinity (count matching dependencies)
+                let mut scores: HashMap<AgentId, usize> = HashMap::new();
+
+                for dep_path in &dependencies {
+                    // Count dependencies in builds_in_progress
+                    if let Some(tracker) = self.builds_in_progress.get(dep_path) {
+                        *scores.entry(tracker.agent_id).or_insert(0) += 1;
+                    }
+                    // Count dependencies in completed_builds
+                    if let Some(completed) = self.completed_builds.get(dep_path) {
+                        *scores.entry(completed.agent_id).or_insert(0) += 1;
+                    }
+                }
+
+                // Step 3: Select highest affinity agent
+                // Step 4: Tie-break by smallest agent_id (lexicographic)
+                let selected_agent_id = scores
+                    .iter()
+                    .filter(|(id, _)| eligible.iter().any(|a| &a.id == *id))
+                    .max_by(|(id_a, score_a), (id_b, score_b)| {
+                        // First compare by score (higher is better)
+                        match score_a.cmp(score_b) {
+                            std::cmp::Ordering::Equal => {
+                                // Tie-break: smaller agent_id wins (deterministic)
+                                id_b.cmp(id_a)
+                            }
+                            other => other,
+                        }
+                    })
+                    .map(|(id, _)| *id)
+                    .or_else(|| {
+                        // No agents with affinity - select smallest agent_id among eligible
+                        eligible.iter().min_by_key(|a| &a.id).map(|a| a.id)
+                    })
+                    .expect("Should have at least one eligible agent");
+
+                // Step 5: Update state
+                let now = Utc::now();
+
+                // Insert top-level build
                 self.builds_in_progress.insert(
                     top_level.clone(),
                     BuildTracker {
-                        agent_id,
-                        started_at: Utc::now(),
+                        agent_id: selected_agent_id,
+                        started_at: now,
                         parent_build: None,
                         status: BuildStatus::Building,
                     },
                 );
 
-                // Register dependencies (placeholder - will enhance in Phase 2.3)
-                for dep in dependencies {
+                // Insert all dependencies with parent_build pointer
+                for dep in &dependencies {
                     self.builds_in_progress.insert(
                         dep.clone(),
                         BuildTracker {
-                            agent_id,
-                            started_at: Utc::now(),
+                            agent_id: selected_agent_id,
+                            started_at: now,
                             parent_build: Some(top_level.clone()),
                             status: BuildStatus::Building,
                         },
                     );
                 }
 
+                // Mark agent as Busy
+                if let Some(agent) = self.agents.get_mut(&selected_agent_id) {
+                    agent.status = AgentStatus::Busy;
+                }
+
                 RaftResponse::BuildAssigned {
-                    agent_id,
+                    agent_id: selected_agent_id,
                     derivation_path: top_level,
                 }
             }
@@ -362,5 +421,244 @@ mod tests {
         // Should remove top-level AND all dependencies
         assert_eq!(state.builds_in_progress.len(), 0);
         assert_eq!(state.completed_builds.len(), 1);
+    }
+
+    #[test]
+    fn test_deterministic_assignment_platform_filter() {
+        let mut state = ClusterState::default();
+
+        // Add two agents with different platforms
+        let agent_x86 = AgentId::new_v4();
+        let agent_arm = AgentId::new_v4();
+
+        state.agents.insert(
+            agent_x86,
+            AgentInfo {
+                id: agent_x86,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        state.agents.insert(
+            agent_arm,
+            AgentInfo {
+                id: agent_arm,
+                address: "localhost:50052".to_string(),
+                platforms: vec!["aarch64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Queue build requiring x86_64-linux
+        let response = state.apply(RaftCommand::BuildQueued {
+            top_level: Utf8PathBuf::from("/nix/store/foo.drv"),
+            dependencies: vec![],
+            platform: "x86_64-linux".to_string(),
+            features: vec![],
+        });
+
+        // Should assign to x86 agent only
+        match response {
+            RaftResponse::BuildAssigned { agent_id, .. } => {
+                assert_eq!(agent_id, agent_x86);
+            }
+            _ => panic!("Expected BuildAssigned response"),
+        }
+    }
+
+    #[test]
+    fn test_deterministic_assignment_feature_filter() {
+        let mut state = ClusterState::default();
+
+        let agent_with_kvm = AgentId::new_v4();
+        let agent_without_kvm = AgentId::new_v4();
+
+        state.agents.insert(
+            agent_with_kvm,
+            AgentInfo {
+                id: agent_with_kvm,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec!["kvm".to_string()],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        state.agents.insert(
+            agent_without_kvm,
+            AgentInfo {
+                id: agent_without_kvm,
+                address: "localhost:50052".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Queue build requiring kvm feature
+        let response = state.apply(RaftCommand::BuildQueued {
+            top_level: Utf8PathBuf::from("/nix/store/vm-test.drv"),
+            dependencies: vec![],
+            platform: "x86_64-linux".to_string(),
+            features: vec!["kvm".to_string()],
+        });
+
+        // Should assign to agent with kvm only
+        match response {
+            RaftResponse::BuildAssigned { agent_id, .. } => {
+                assert_eq!(agent_id, agent_with_kvm);
+            }
+            _ => panic!("Expected BuildAssigned response"),
+        }
+    }
+
+    #[test]
+    fn test_deterministic_assignment_affinity() {
+        let mut state = ClusterState::default();
+
+        let agent_a = AgentId::new_v4();
+        let agent_b = AgentId::new_v4();
+
+        // Add two eligible agents
+        state.agents.insert(
+            agent_a,
+            AgentInfo {
+                id: agent_a,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        state.agents.insert(
+            agent_b,
+            AgentInfo {
+                id: agent_b,
+                address: "localhost:50052".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Assign a dependency build to agent_a
+        let dep = Utf8PathBuf::from("/nix/store/dep.drv");
+        state.builds_in_progress.insert(
+            dep.clone(),
+            BuildTracker {
+                agent_id: agent_a,
+                started_at: Utc::now(),
+                parent_build: None,
+                status: BuildStatus::Building,
+            },
+        );
+
+        // Queue build that depends on the dep
+        let response = state.apply(RaftCommand::BuildQueued {
+            top_level: Utf8PathBuf::from("/nix/store/app.drv"),
+            dependencies: vec![dep],
+            platform: "x86_64-linux".to_string(),
+            features: vec![],
+        });
+
+        // Should assign to agent_a due to affinity
+        match response {
+            RaftResponse::BuildAssigned { agent_id, .. } => {
+                assert_eq!(agent_id, agent_a);
+            }
+            _ => panic!("Expected BuildAssigned response"),
+        }
+    }
+
+    #[test]
+    fn test_deterministic_assignment_tie_break() {
+        let mut state = ClusterState::default();
+
+        // Create two agents with deterministic IDs for tie-breaking test
+        let agent_a = AgentId::from_bytes([0u8; 16]); // Smaller
+        let agent_b = AgentId::from_bytes([1u8; 16]); // Larger
+
+        state.agents.insert(
+            agent_a,
+            AgentInfo {
+                id: agent_a,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        state.agents.insert(
+            agent_b,
+            AgentInfo {
+                id: agent_b,
+                address: "localhost:50052".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Queue build with no dependencies (both agents have affinity score 0)
+        let response = state.apply(RaftCommand::BuildQueued {
+            top_level: Utf8PathBuf::from("/nix/store/foo.drv"),
+            dependencies: vec![],
+            platform: "x86_64-linux".to_string(),
+            features: vec![],
+        });
+
+        // Should tie-break to smallest agent_id
+        match response {
+            RaftResponse::BuildAssigned { agent_id, .. } => {
+                assert_eq!(agent_id, agent_a);
+            }
+            _ => panic!("Expected BuildAssigned response"),
+        }
+    }
+
+    #[test]
+    fn test_assignment_marks_agent_busy() {
+        let mut state = ClusterState::default();
+        let agent_id = AgentId::new_v4();
+
+        state.agents.insert(
+            agent_id,
+            AgentInfo {
+                id: agent_id,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Queue a build
+        state.apply(RaftCommand::BuildQueued {
+            top_level: Utf8PathBuf::from("/nix/store/foo.drv"),
+            dependencies: vec![],
+            platform: "x86_64-linux".to_string(),
+            features: vec![],
+        });
+
+        // Agent should now be Busy
+        assert_eq!(
+            state.agents.get(&agent_id).unwrap().status,
+            AgentStatus::Busy
+        );
     }
 }
