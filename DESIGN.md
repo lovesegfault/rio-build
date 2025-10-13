@@ -12,34 +12,22 @@ Rio is an open-source distributed build service for Nix that eliminates the trad
 
 ```mermaid
 graph TB
-    User[User<br/>rio-build CLI]
+    CLI[rio-build CLI]
 
-    subgraph Cluster["rio-agent Cluster"]
-        Leader[Agent 1<br/>Leader]
-        Agent2[Agent 2<br/>Follower]
-        Agent3[Agent 3<br/>Follower]
+    subgraph Cluster[rio-agent Cluster]
+        Leader[Agent 1 - Leader]
+        Agent2[Agent 2]
+        Agent3[Agent 3]
 
-        Leader <-.Raft Consensus<br/>membership + build tracking.-> Agent2
-        Agent2 <-.Raft.-> Agent3
-        Agent3 <-.Raft.-> Leader
+        Leader <-->|Raft consensus| Agent2
+        Agent2 <-->|Raft consensus| Agent3
+        Agent3 <-->|Raft consensus| Leader
     end
 
-    User -->|1. QueueBuild<br/>gRPC| Leader
-    Leader -.->|2. BuildQueued<br/>Raft log| Agent2
-    Leader -.->|2. BuildQueued<br/>Raft log| Agent3
-    Leader -->|3. BuildAssigned<br/>agent_id| User
-    User -->|4. SubscribeToBuild<br/>gRPC stream| Agent2
-    Agent2 -->|5. Logs + Outputs<br/>Direct stream| User
-
-    classDef userNode fill:#e1f5ff,stroke:#0288d1,stroke-width:2px
-    classDef leaderNode fill:#fff3e0,stroke:#f57c00,stroke-width:2px
-    classDef agentNode fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
-    classDef clusterBox fill:#fafafa,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5
-
-    class User userNode
-    class Leader leaderNode
-    class Agent2,Agent3 agentNode
-    class Cluster clusterBox
+    CLI -->|QueueBuild| Leader
+    Leader -->|BuildAssigned| CLI
+    CLI -->|SubscribeToBuild| Agent2
+    Agent2 -->|Logs + Outputs| CLI
 ```
 
 **Critical Insights:**
