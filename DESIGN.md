@@ -109,18 +109,18 @@ enum RaftCommand {
     AgentHeartbeat { id: AgentId, timestamp: Timestamp },
 
     // Build lifecycle (derivation hash is the job identifier)
-    // Atomically registers top-level build + all dependencies
-    BuildStartedWithDependencies {
+    // Leader proposes this when CLI submits work
+    // State machine deterministically assigns to best agent
+    BuildQueued {
         top_level: DerivationHash,
         dependencies: Vec<DerivationHash>,
-        agent_id: AgentId,
         platform: String,
-        status: BuildStatus,  // Queued or Building
+        features: Vec<String>,
     },
-    // Agent status changes
-    AgentStatusChanged {
-        agent_id: AgentId,
-        status: AgentStatus,  // Available or Busy
+    // Agent updates status when starting/queuing
+    BuildStatusChanged {
+        derivation_hash: DerivationHash,
+        status: BuildStatus,  // Queued or Building
     },
     BuildCompleted {
         derivation_hash: DerivationHash,
@@ -135,15 +135,78 @@ enum RaftCommand {
 
 **What Raft Does NOT Store:**
 
-- Build derivations (too large, sent via gRPC stream)
+- Build derivations (too large, sent via gRPC to leader, then fetched by assigned agent)
 - Build logs (streamed to subscribers in real-time)
 - Build outputs (stored in agent's /nix/store, exported on demand)
 
+**Deterministic Agent Assignment:**
+
+When a build is queued, the Raft state machine (running on ALL agents) deterministically selects which agent should execute it:
+
+```rust
+fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
+    // 1. Filter eligible agents
+    let eligible: Vec<_> = state.agents.values()
+        .filter(|a| {
+            a.platforms.contains(&cmd.platform) &&
+            cmd.features.iter().all(|f| a.features.contains(f)) &&
+            a.status == AgentStatus::Available
+        })
+        .collect();
+
+    // 2. Score by affinity (count matching dependencies)
+    let mut scores: HashMap<AgentId, usize> = HashMap::new();
+    for dep_hash in &cmd.dependencies {
+        if let Some(tracker) = state.builds_in_progress.get(dep_hash) {
+            *scores.entry(tracker.agent_id).or_insert(0) += 1;
+        }
+        if let Some(completed) = state.completed_builds.get(dep_hash) {
+            *scores.entry(completed.agent_id).or_insert(0) += 1;
+        }
+    }
+
+    // 3. Select highest affinity, tie-break by smallest agent_id
+    let selected = scores.iter()
+        .filter(|(id, _)| eligible.iter().any(|a| &a.id == *id))
+        .max_by_key(|(_, score)| *score)
+        .map(|(id, _)| *id)
+        .or_else(|| eligible.iter().min_by_key(|a| &a.id).map(|a| a.id))
+        .expect("No eligible agents");
+
+    // 4. Update state (all agents do this identically)
+    state.builds_in_progress.insert(cmd.top_level, BuildTracker {
+        agent_id: selected,
+        status: BuildStatus::Building,
+        parent_build: None,
+        started_at: now(),
+    });
+
+    // Register dependencies
+    for dep_hash in cmd.dependencies {
+        state.builds_in_progress.entry(dep_hash).or_insert(BuildTracker {
+            agent_id: selected,
+            status: BuildStatus::Building,
+            parent_build: Some(cmd.top_level),
+            started_at: now(),
+        });
+    }
+
+    state.agents.get_mut(&selected).status = AgentStatus::Busy;
+    selected  // All agents compute the same result!
+}
+```
+
+**Why this works:**
+- ✅ Deterministic - Same cluster state + same BuildQueued command = same agent selected
+- ✅ No races - Assignment happens in state machine, not via distributed claiming
+- ✅ Best agent wins - Affinity scoring is explicit and deterministic
+- ✅ Consistent - All agents agree on who was assigned
+
 **Build Deduplication:**
 
-Raft tracks active and recently completed builds by derivation hash to avoid duplicate work:
 - Derivation hash serves as the job identifier (no separate JobId needed)
-- When User A submits a build, Raft records: `builds_in_progress[drv_hash] → BuildTracker`
+- When User A submits a build, leader proposes BuildQueued to Raft
+- State machine assigns to best agent
 - When User B submits the **same** derivation, they're transparently subscribed to the in-progress build
 - Both users receive logs and outputs from the single build execution
 - Completed builds cached for 5 minutes to serve late arrivals
@@ -174,75 +237,88 @@ User runs: rio-build ./my-package.nix
    - Result: BuildInfo with minimal set of builds needed
 
 ┌─────────────────────────────────────────────────────┐
-│ 2. CLI: Discover cluster                            │
+│ 2. CLI: Connect to cluster leader                   │
 └─────────────────────────────────────────────────────┘
    - Read seed agents from ~/.config/rio/config.toml
    - Connect to first available seed agent
    - Call GetClusterMembers() RPC
-   - Receive full cluster state from Raft
+   - Identify current leader from cluster state
+   - Connect to leader (or stay if already connected)
 
 ┌─────────────────────────────────────────────────────┐
-│ 3. CLI: Select agent (with build affinity)         │
+│ 3. CLI → Leader: Submit work to queue               │
 └─────────────────────────────────────────────────────┘
-   - Check which dependencies are currently building
-   - If dependencies building: prefer agent with most matching deps
-   - Else: filter by platform, features, Available status
-   - Pick best match (affinity > availability)
+   CLI → Leader: QueueBuild(drv_bytes, deps, platform, features)
+
+   Leader receives derivation bytes (via gRPC, not Raft)
+   Leader stores temporarily: /tmp/rio-pending/{drv_hash}.drv
+   Leader returns: BuildQueued { drv_hash }
 
 ┌─────────────────────────────────────────────────────┐
-│ 4. CLI → Agent: Submit build with dependencies      │
+│ 4. Leader: Propose to Raft                          │
 └─────────────────────────────────────────────────────┘
-   CLI: Open bidirectional stream SubmitBuild()
-   CLI: Send SubmitBuildRequest {
-       derivation_bytes: [...],
-       dependency_hashes: [hash(dep1.drv), hash(dep2.drv), ...],
-       platform: "x86_64-linux",
-       required_features: ["kvm", "big-parallel"],
-       timeout_seconds: 3600,
+   Leader proposes: BuildQueued {
+     drv_hash,
+     platform,
+     features,
+     dependency_hashes,
    }
 
 ┌─────────────────────────────────────────────────────┐
-│ 5. Agent: Check dependencies and register           │
+│ 5. Raft: Deterministic agent assignment             │
 └─────────────────────────────────────────────────────┘
-   - Compute top_level_hash from derivation bytes
-   - Check which dependencies are building on THIS agent
-   - If dependencies building here:
-       status = Queued { blocked_on: [...] }
-       Mark agent as Busy (even though queued)
-   - Else:
-       status = Building
-       Mark agent as Busy
-   - Propose RaftCommand::BuildStartedWithDependencies
-   - Wait for Raft consensus (commit)
-   - Raft atomically registers ALL derivations (top + deps)
+   ALL agents apply BuildQueued to state machine:
+
+   1. Filter eligible agents (platform + features + Available)
+   2. Score agents by affinity (count matching dependencies)
+   3. Select highest score
+   4. Tie-breaker: lexicographically smallest agent_id
+   5. Update state:
+      - builds_in_progress[drv_hash] = { agent_id: selected, ... }
+      - agents[selected].status = Busy
+
+   Result: ALL agents agree on assignment (deterministic!)
 
 ┌─────────────────────────────────────────────────────┐
-│ 6. Agent: Execute or queue build                    │
+│ 6. Assigned agent: Fetch derivation and start       │
 └─────────────────────────────────────────────────────┘
-   - If status = Queued:
-       Add to pending_builds, send "Waiting for dependencies" to CLI
-   - Else (status = Building):
-       Write derivation to /tmp/rio-agent/{drv-hash}.drv
-       Spawn: nix-build /tmp/rio-agent/{drv-hash}.drv
-       Capture stdout/stderr in real-time
+   Agent K sees: "I was assigned drv_hash"
+
+   If K is leader:
+     - Read from /tmp/rio-pending/{drv_hash}.drv
+   Else:
+     - FetchPendingBuild(drv_hash) from leader via gRPC
+
+   Check dependencies:
+     - If deps building on self → Queue with Queued status
+     - Else → Start immediately with Building status
+
+   Write derivation to /tmp/rio-agent/{drv_hash}.drv
+   Spawn: nix-build /tmp/rio-agent/{drv_hash}.drv
 
 ┌─────────────────────────────────────────────────────┐
-│ 7. Agent → CLI: Stream logs                         │
+│ 7. Leader: Respond to CLI with assignment           │
 └─────────────────────────────────────────────────────┘
-   For each stdout/stderr line:
-       Send BuildUpdate { log: LogLine { line, timestamp } }
-
-   CLI receives and displays to user in real-time
+   Leader waits for Raft commit
+   Leader reads state machine: drv_hash assigned to Agent K
+   Leader → CLI: BuildAssigned { agent_id: K, drv_hash }
 
 ┌─────────────────────────────────────────────────────┐
-│ 8. Agent: Export outputs                            │
+│ 8. CLI → Assigned Agent: Subscribe to build         │
+└─────────────────────────────────────────────────────┘
+   CLI → Agent K: SubscribeToBuild(drv_hash)
+   Agent K streams: logs + outputs
+   CLI displays logs in real-time
+
+┌─────────────────────────────────────────────────────┐
+│ 9. Agent: Export outputs                            │
 └─────────────────────────────────────────────────────┘
    - nix-build completes → /nix/store/abc123-result
    - Run: nix-store --export /nix/store/abc123-result
    - Capture NAR (Nix ARchive) bytes
 
 ┌─────────────────────────────────────────────────────┐
-│ 9. Agent → CLI: Stream outputs                      │
+│ 10. Agent → CLI: Stream outputs                     │
 └─────────────────────────────────────────────────────┘
    Send BuildUpdate {
        output_chunk: OutputChunk {
@@ -252,17 +328,15 @@ User runs: rio-build ./my-package.nix
        }
    }
 
-   (Stream NAR in chunks)
-
 ┌─────────────────────────────────────────────────────┐
-│ 10. CLI: Import outputs                             │
+│ 11. CLI: Import outputs                             │
 └─────────────────────────────────────────────────────┘
    - Receive all chunks, reassemble NAR
    - Run: nix-store --import < output.nar
    - Outputs now in local /nix/store
 
 ┌─────────────────────────────────────────────────────┐
-│ 11. Agent: Mark complete and unblock dependents     │
+│ 12. Agent: Mark complete and unblock dependents     │
 └─────────────────────────────────────────────────────┘
    - Propose RaftCommand::BuildCompleted { derivation_hash, output_paths }
    - Raft removes top-level from builds_in_progress
@@ -272,9 +346,10 @@ User runs: rio-build ./my-package.nix
    - Auto-start any builds that are now unblocked
    - If no pending builds: mark agent as Available
    - Clean up temp files
+   - Leader deletes /tmp/rio-pending/{drv_hash}.drv
 
 ┌─────────────────────────────────────────────────────┐
-│ 12. CLI: Report success                             │
+│ 13. CLI: Report success                             │
 └─────────────────────────────────────────────────────┘
    Print to user:
        Build succeeded!
@@ -297,36 +372,41 @@ Time T0: User A submits /nix/store/abc123-foo.drv
    - foo.drv (top-level)
    - bar.drv (dependency)
    - baz.drv (dependency)
-2. CLI → Agent-1: SubmitBuild(foo_drv_bytes, deps=[bar_hash, baz_hash])
-3. Agent-1 computes: foo_hash = hash(foo_drv_bytes)
-4. Agent-1 checks Raft: builds_in_progress[foo_hash] = None
-5. Agent-1 proposes: BuildStartedWithDependencies {
+2. CLI → Leader: QueueBuild(foo_drv_bytes, deps=[bar_hash, baz_hash])
+3. Leader stores: /tmp/rio-pending/foo_hash.drv
+4. Leader proposes: BuildQueued {
      top_level: foo_hash,
      dependencies: [bar_hash, baz_hash],
-     agent_id: "agent-1",
-     platform: "x86_64-linux"
+     platform: "x86_64-linux",
+     features: []
    }
-6. Raft atomically registers:
-   - builds_in_progress[foo_hash] = { agent-1, parent: None }
-   - builds_in_progress[bar_hash] = { agent-1, parent: Some(foo_hash) }
-   - builds_in_progress[baz_hash] = { agent-1, parent: Some(foo_hash) }
-7. Agent-1 starts building, streaming logs to User A
+5. Raft state machine (on ALL agents) applies BuildQueued:
+   - Filters eligible agents
+   - Scores by affinity (no deps yet, all score 0)
+   - Tie-breaks: selects Agent K (smallest agent_id among eligible)
+   - Atomically registers:
+     * builds_in_progress[foo_hash] = { agent: K, parent: None, status: Building }
+     * builds_in_progress[bar_hash] = { agent: K, parent: Some(foo), status: Building }
+     * builds_in_progress[baz_hash] = { agent: K, parent: Some(foo), status: Building }
+     * agents[K].status = Busy
+6. Agent K sees assignment, fetches drv_bytes from leader
+7. Agent K starts building, streaming logs to User A
 
 Time T1: User B submits same foo.drv (30s later)
 1. CLI extracts build closure: [foo, bar, baz]
-2. CLI → Agent-2: SubmitBuild(foo_drv_bytes, deps=[bar_hash, baz_hash])
-3. Agent-2 checks Raft: builds_in_progress[foo_hash] = Some(BuildTracker {
-     agent_id: "agent-1",
+2. CLI → Leader: QueueBuild(foo_drv_bytes, deps=[bar_hash, baz_hash])
+3. Leader checks Raft: builds_in_progress[foo_hash] = Some(BuildTracker {
+     agent_id: K,
      started_at: T0,
      parent_build: None
    })
-4. Agent-2 returns: Redirect { target_agent: "agent-1", derivation_hash: foo_hash }
-5. CLI reconnects to agent-1: SubscribeToBuild(derivation_hash: foo_hash)
-6. Agent-1 sends User B:
+4. Leader returns: AlreadyBuilding { agent_id: K, drv_hash: foo_hash }
+5. CLI → Agent K: SubscribeToBuild(foo_hash)
+6. Agent K sends User B:
    - Catch-up: All logs from T0 to T1
    - Live: New logs as they arrive
 7. Build completes at T2
-8. Agent-1 streams outputs to BOTH User A and User B
+8. Agent K streams outputs to BOTH User A and User B
 9. Both users import outputs, done
 ```
 
@@ -644,19 +724,22 @@ Time T0: User A runs: rio-build ./my-app.nix
 - nix-eval-jobs returns:
   * neededBuilds: [my-app.drv, dep1.drv, dep2.drv]
   * neededSubstitutes: [dep3, dep4, dep5, ...]  (will fetch from cache)
-- Registers only: my-app.drv (top), dep1.drv (dep), dep2.drv (dep)
-- Agent-1 starts: nix-build /nix/store/my-app.drv
+- CLI → Leader: QueueBuild(my-app_bytes, deps=[dep1, dep2])
+- Raft assigns to Agent K
+- Agent K starts: nix-build /nix/store/my-app.drv
 - Nix automatically fetches dep3, dep4, dep5 from substituters
 
 Time T1: User B runs: rio-build ./dep1.nix (30 seconds later)
 - nix-eval-jobs returns:
   * cacheStatus: "notBuilt"
   * neededBuilds: [dep1.drv]
-- Checks Raft: builds_in_progress[hash(dep1.drv)] = Some(BuildTracker {
-    agent_id: agent-1,
-    parent_build: Some(hash(my-app.drv))  // Being built as dependency!
+- CLI → Leader: QueueBuild(dep1_bytes, deps=[])
+- Leader checks Raft: builds_in_progress[hash(dep1)] = Some(BuildTracker {
+    agent_id: K,
+    parent_build: Some(hash(my-app))  // Being built as dependency!
   })
-- CLI redirects to agent-1: SubscribeToBuild(hash(dep1.drv))
+- Leader returns: AlreadyBuilding { agent_id: K, drv_hash: dep1 }
+- CLI → Agent K: SubscribeToBuild(hash(dep1))
 - User B receives logs for dep1 (even though it's part of my-app's build)
 - When my-app completes, dep1 outputs are included
 - User B gets dep1 outputs automatically!
@@ -861,9 +944,11 @@ Result: Both builds naturally migrate to Agent J via independent retry + affinit
 1. Agent is building, CLI crashes
 2. Agent completes build, tries to stream outputs
 3. Stream fails (CLI gone)
-4. Agent still marks job complete in Raft
-5. Agent keeps NAR cached locally for 1 hour
-6. If CLI comes back, can query job status and retrieve outputs
+4. Agent still marks build complete in Raft
+5. Build moved to completed_builds cache (5 minutes)
+6. Outputs remain in agent's /nix/store
+7. If CLI reconnects: GetCompletedBuild(drv_hash) from assigned agent
+8. Agent exports outputs from /nix/store on demand
 ```
 
 ### 6. Cluster Membership
@@ -973,79 +1058,15 @@ platforms.extend(extra_platforms);
 - `ca-derivations` - Supports content-addressed derivations
 - Custom features defined in `nix.conf`
 
-**CLI Agent Selection with Build Affinity:**
-
-```rust
-fn select_agent(
-    cluster: &ClusterState,
-    requirements: &BuildRequirements
-) -> Option<AgentId> {
-    // STEP 1: Filter by hard requirements (non-negotiable)
-    let eligible_agents: Vec<_> = cluster.agents.values()
-        .filter(|agent| {
-            agent.platforms.contains(&requirements.platform) &&
-            requirements.features.iter().all(|f| agent.features.contains(f)) &&
-            agent.status == AgentStatus::Available
-        })
-        .collect();
-
-    if eligible_agents.is_empty() {
-        return None;  // No agents satisfy requirements
-    }
-
-    // STEP 2: Calculate affinity among eligible agents only
-    let mut agent_affinity: HashMap<AgentId, usize> = HashMap::new();
-
-    for dep_hash in &requirements.dependency_hashes {
-        // Check active builds
-        if let Some(tracker) = cluster.builds_in_progress.get(dep_hash) {
-            // Only count if agent is eligible
-            if eligible_agents.iter().any(|a| a.id == tracker.agent_id) {
-                *agent_affinity.entry(tracker.agent_id).or_insert(0) += 1;
-            }
-        }
-        // Check recently completed (might still be in /nix/store)
-        if let Some(completed) = cluster.completed_builds.get(dep_hash) {
-            if eligible_agents.iter().any(|a| a.id == completed.agent_id) {
-                *agent_affinity.entry(completed.agent_id).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // STEP 3: Select agent with best affinity, or any eligible agent
-    agent_affinity.iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(id, _)| *id)
-        .or_else(|| eligible_agents.first().map(|a| a.id))
-}
-```
-
-**Selection Priority:**
-1. Platform compatibility (hard constraint)
-2. Feature requirements (hard constraint)
-3. Agent availability (hard constraint)
-4. Build affinity (optimization - best effort)
-
-**Trade-off: Requirements vs. Affinity**
-
-If a dependency is building on an agent that lacks required features, we sacrifice cache locality:
-
-```
-bar building on Agent X (no kvm)
-foo requires [kvm], depends on [bar]
-
-→ Select Agent Y (has kvm)
-→ Agent Y fetches bar from substituters
-→ Accepts non-optimal allocation for correctness
-```
-
-Future enhancement: agent-to-agent output transfer to recover locality.
+**Error Handling:**
 
 If no agents satisfy requirements:
 ```
 Error: No agents available for platform 'x86_64-linux' with features: [kvm, big-parallel]
 Available agents: 3 (none match requirements)
 ```
+
+This is detected by the Raft state machine when applying BuildQueued - the `eligible` filter returns empty.
 
 ### 8. Build Dependencies
 
@@ -1085,12 +1106,11 @@ service RioAgent {
   rpc GetClusterMembers(GetClusterMembersRequest)
       returns (ClusterMembers);
 
-  // Build submission (bidirectional stream)
-  // May return RedirectToAgent error if build is happening elsewhere
-  rpc SubmitBuild(stream BuildRequest)
-      returns (stream BuildUpdate);
+  // Build submission (leader only - queues work for Raft assignment)
+  rpc QueueBuild(QueueBuildRequest)
+      returns (QueueBuildResponse);
 
-  // Subscribe to an in-progress build (for deduplication)
+  // Subscribe to an in-progress build (for deduplication and redirects)
   rpc SubscribeToBuild(SubscribeToBuildRequest)
       returns (stream BuildUpdate);
 
@@ -1098,13 +1118,17 @@ service RioAgent {
   rpc GetCompletedBuild(GetCompletedBuildRequest)
       returns (stream BuildUpdate);
 
-  // Job status queries (for failure recovery)
-  rpc GetJobStatus(GetJobStatusRequest)
-      returns (JobStatus);
+  // Build status queries (for failure recovery)
+  rpc GetBuildStatus(GetBuildStatusRequest)
+      returns (BuildStatus);
 
   // Agent management (for joining cluster)
   rpc JoinCluster(JoinClusterRequest)
       returns (JoinClusterResponse);
+
+  // Agent-to-agent: Fetch pending derivation (non-leader needs drv_bytes)
+  rpc FetchPendingBuild(FetchPendingBuildRequest)
+      returns (FetchPendingBuildResponse);
 }
 
 message GetClusterMembersRequest {}
@@ -1136,18 +1160,41 @@ message BuilderCapacity {
   int64 disk_gb = 3;
 }
 
-message BuildRequest {
-  oneof payload {
-    SubmitBuildRequest submit = 1;
-  }
-}
-
-message SubmitBuildRequest {
+// Build submission to leader
+message QueueBuildRequest {
   bytes derivation = 1;
-  repeated string dependency_hashes = 2;  // Pre-computed hashes of all dependencies
+  repeated string dependency_hashes = 2;  // From neededBuilds
   string platform = 3;
   repeated string required_features = 4;
   optional int32 timeout_seconds = 5;
+}
+
+message QueueBuildResponse {
+  oneof result {
+    BuildAssigned assigned = 1;
+    AlreadyBuilding already_building = 2;
+    AlreadyCompleted already_completed = 3;
+    NoEligibleAgents no_agents = 4;
+  }
+}
+
+message BuildAssigned {
+  string agent_id = 1;
+  string derivation_hash = 2;
+}
+
+message AlreadyBuilding {
+  string agent_id = 1;
+  string derivation_hash = 2;
+}
+
+message AlreadyCompleted {
+  string agent_id = 1;  // Where outputs are
+  string derivation_hash = 2;
+}
+
+message NoEligibleAgents {
+  string reason = 1;  // "No agents with platform x86_64-linux and features [kvm]"
 }
 
 message BuildUpdate {
@@ -1182,11 +1229,11 @@ message BuildFailed {
   optional string stderr = 2;
 }
 
-message GetJobStatusRequest {
+message GetBuildStatusRequest {
   string derivation_hash = 1;
 }
 
-message JobStatus {
+message BuildStatus {
   string derivation_hash = 1;
   BuildState state = 2;
   optional string agent_id = 3;
@@ -1195,9 +1242,11 @@ message JobStatus {
 
 enum BuildState {
   BUILD_STATE_UNSPECIFIED = 0;
-  BUILD_STATE_RUNNING = 1;
-  BUILD_STATE_COMPLETED = 2;
-  BUILD_STATE_FAILED = 3;
+  BUILD_STATE_QUEUED = 1;
+  BUILD_STATE_BUILDING = 2;
+  BUILD_STATE_COMPLETED = 3;
+  BUILD_STATE_FAILED = 4;
+  BUILD_STATE_NOT_FOUND = 5;
 }
 
 message JoinClusterRequest {
@@ -1209,17 +1258,28 @@ message JoinClusterResponse {
   string message = 2;
 }
 
-// Build deduplication messages
+// Build subscription messages
 
 message SubscribeToBuildRequest {
-  string derivation_hash = 1;  // Job identifier
+  string derivation_hash = 1;
 }
 
 message GetCompletedBuildRequest {
-  string derivation_hash = 1;  // Job identifier
+  string derivation_hash = 1;
 }
 
-// Note: Both return stream BuildUpdate (logs + outputs)
+// Agent-to-agent communication
+
+message FetchPendingBuildRequest {
+  string derivation_hash = 1;
+}
+
+message FetchPendingBuildResponse {
+  bytes derivation = 1;
+  repeated string dependency_hashes = 2;
+}
+
+// Note: SubscribeToBuild and GetCompletedBuild return stream BuildUpdate
 ```
 
 ## Technology Stack
@@ -1344,23 +1404,16 @@ Raft requires persistence for:
 
 ## Open Questions
 
-### 1. Should CLI be smart or dumb?
+### 1. Agent assignment model
 
-**Current design: Smart CLI**
+**Decision: Raft state machine assigns builds deterministically**
 
-- CLI gets full cluster state
-- CLI selects agent locally
-- Pros: No bottleneck, fast selection
-- Cons: CLI needs more logic
-
-**Alternative: Dumb CLI, smart leader**
-
-- CLI always connects to leader
-- Leader assigns job to agent
-- Pros: Simpler CLI
-- Cons: Leader becomes bottleneck
-
-**Decision: Keep smart CLI.** Bottlenecks are what we're trying to avoid.
+- CLI submits to leader via QueueBuild RPC
+- Leader proposes BuildQueued to Raft
+- State machine on ALL agents runs same selection logic
+- Deterministic assignment (affinity + tie-breaker)
+- No races, no stale cluster state issues
+- Simpler CLI, more robust
 
 ### 2. How long to cache cluster membership in CLI?
 
@@ -1379,20 +1432,30 @@ Future: Export all outputs as separate NARs
 
 ### 4. How to handle concurrent builds on same agent?
 
-**Proposal: Configurable concurrency per agent**
+**Decision: One build at a time per agent (MVP)**
 
-- Agent config: `--max-concurrent-builds=4`
-- Agent tracks active build count
-- Agent rejects new builds if at capacity
-- CLI selects different agent
+- Agent status: Available or Busy (binary)
+- Simple execution model
+- Future: Add configurable concurrency with build slots
 
 ### 5. Should we persist build history?
 
-**MVP: No persistent history**
+**Decision: Short-term cache in Raft only (MVP)**
 
-- Raft state machine keeps recent completed jobs (LRU cache, ~1000 entries)
-- Enough for short-term status queries
+- Raft state machine keeps recent completed builds (5 minute LRU cache)
+- Enough for build deduplication and status queries
 - Future: External database for long-term history/analytics
+
+### 6. Leader stores pending derivations - what if leader changes?
+
+When leader election happens:
+- Old leader's /tmp/rio-pending/ data is lost
+- Builds in `builds_in_progress` but not yet started have no derivation bytes
+- CLI will timeout waiting for assignment response
+- CLI retries (has derivation bytes)
+- New leader receives, queues, assigns
+
+Acceptable for MVP - leader elections are rare
 
 ## Success Metrics
 
