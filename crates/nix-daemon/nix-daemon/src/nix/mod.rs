@@ -1858,14 +1858,20 @@ where
                     )
                     .await?;
 
-                    // Write BuildResult (status=0 for success)
-                    wire::write_u64(&mut self.w, 0)
+                    // Create BuildResult with success status
+                    let result = crate::BuildResult {
+                        status: crate::BuildResultStatus::Built,
+                        error_msg: String::new(),
+                        times_built: 1,
+                        is_non_deterministic: false,
+                        start_time: chrono::Utc::now(),
+                        stop_time: chrono::Utc::now(),
+                        built_outputs: HashMap::new(), // TODO: Fill with actual outputs
+                    };
+
+                    wire::write_build_result(&mut self.w, &result, self.proto)
                         .await
-                        .with_field("BuildDerivation.result.status")?;
-                    // Empty error message
-                    wire::write_string(&mut self.w, "")
-                        .await
-                        .with_field("BuildDerivation.result.errorMsg")?;
+                        .with_field("BuildDerivation.result")?;
 
                     info!("BuildDerivation: completed for {}", drv_path);
                 }
