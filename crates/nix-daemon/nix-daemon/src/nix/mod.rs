@@ -1699,66 +1699,66 @@ where
                     }
                 }
                 Ok(wire::Op::AddMultipleToStore) => {
-                    // Read the repair flag and check signatures flag
+                    // Read flags
                     let repair = wire::read_bool(&mut self.r)
                         .await
                         .with_field("AddMultipleToStore.repair")?;
-                    let check_sigs = wire::read_bool(&mut self.r)
+                    let _dont_check_sigs = wire::read_bool(&mut self.r)
                         .await
-                        .with_field("AddMultipleToStore.checkSigs")?;
+                        .with_field("AddMultipleToStore.dontCheckSigs")?;
 
-                    info!(
-                        "AddMultipleToStore: repair={}, check_sigs={}",
-                        repair, check_sigs
-                    );
+                    info!("AddMultipleToStore: repair={}", repair);
 
-                    // Read and process each store path
-                    loop {
-                        // Read the source type (0 = end, 1 = NAR)
-                        let source_type = wire::read_u64(&mut self.r)
+                    // Read count of paths
+                    let count = wire::read_u64(&mut self.r)
+                        .await
+                        .with_field("AddMultipleToStore.count")?;
+
+                    info!("AddMultipleToStore: processing {} paths", count);
+
+                    // Process each path
+                    for i in 0..count {
+                        // Read ValidPathInfo (using protocol version 16 as per Nix implementation)
+                        let path_info = wire::read_pathinfo(&mut self.r, Proto(1, 16))
                             .await
-                            .with_field("AddMultipleToStore.source_type")?;
+                            .with_field("AddMultipleToStore.pathInfo")?;
 
-                        if source_type == 0 {
-                            // End of stream
-                            break;
-                        }
+                        info!(
+                            "AddMultipleToStore[{}]: processing path with {} references",
+                            i,
+                            path_info.references.len()
+                        );
 
-                        // Read the NAR data
-                        let name = wire::read_string(&mut self.r)
-                            .await
-                            .with_field("AddMultipleToStore.name")?;
-                        let cam_str = wire::read_string(&mut self.r)
-                            .await
-                            .with_field("AddMultipleToStore.camStr")?;
-                        let refs = wire::read_strings(&mut self.r)
-                            .collect::<Result<Vec<_>>>()
-                            .await
-                            .with_field("AddMultipleToStore.refs")?;
-
+                        // Read the framed NAR data for this path
                         let mut source = wire::FramedReader::new(&mut self.r);
 
-                        // Add to store
-                        let (path, _pi) = forward_stderr(
+                        // Extract store path name from the last component
+                        // PathInfo doesn't have the store path itself, but we can generate a name
+                        let name = format!("path-{}", i);
+
+                        // Call add_to_store
+                        let (added_path, _pi) = forward_stderr(
                             &mut self.w,
-                            self.store
-                                .add_to_store(name, cam_str, refs, repair, &mut source),
+                            self.store.add_to_store(
+                                name,
+                                path_info.nar_hash.clone(),
+                                path_info.references.clone(),
+                                repair,
+                                &mut source,
+                            ),
                         )
                         .await?;
 
-                        info!("AddMultipleToStore: added path {}", path);
+                        info!("AddMultipleToStore[{}]: added path {}", i, added_path);
 
-                        // Ensure source is drained
+                        // Ensure source is fully drained
                         let mut sink = tokio::io::sink();
                         tokio::io::copy(&mut source, &mut sink)
                             .await
                             .map_err(|e| Error::IO(e))?;
                     }
 
-                    // Send completion acknowledgment
-                    wire::write_stderr(&mut self.w, None)
-                        .await
-                        .with_field("AddMultipleToStore.stderr")?;
+                    info!("AddMultipleToStore: completed {} paths", count);
                 }
                 Ok(v) => todo!("{:#?}", v),
 
