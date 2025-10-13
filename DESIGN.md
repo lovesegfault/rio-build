@@ -92,9 +92,9 @@ struct AgentInfo {
 }
 
 enum AgentStatus {
-    Available,  // Idle, can accept builds
-    Busy,       // Currently executing one build
-    Down,       // Failed heartbeats
+    Available = 0,  // Idle, can accept builds (default)
+    Busy = 1,       // Currently executing one build
+    Down = 2,       // Failed heartbeats
 }
 
 // Note: JobAssignment removed - redundant with BuildTracker
@@ -1327,10 +1327,9 @@ message AgentInfo {
 }
 
 enum AgentStatus {
-  AGENT_STATUS_UNSPECIFIED = 0;
-  AGENT_STATUS_AVAILABLE = 1;  // Idle, can accept builds
-  AGENT_STATUS_BUSY = 2;       // Executing one build (or has queued builds)
-  AGENT_STATUS_DOWN = 3;       // Failed heartbeats
+  AGENT_STATUS_AVAILABLE = 0;  // Idle, can accept builds (default)
+  AGENT_STATUS_BUSY = 1;       // Executing one build (or has queued builds)
+  AGENT_STATUS_DOWN = 2;       // Failed heartbeats
 }
 
 message BuilderCapacity {
@@ -1399,9 +1398,8 @@ message OutputChunk {
 }
 
 enum CompressionType {
-  COMPRESSION_TYPE_UNSPECIFIED = 0;
-  COMPRESSION_TYPE_NONE = 1;
-  COMPRESSION_TYPE_ZSTD = 2;
+  COMPRESSION_TYPE_ZSTD = 0;   // Default compression (zstd level 3)
+  COMPRESSION_TYPE_NONE = 1;   // No compression (for debugging)
 }
 
 message BuildCompleted {
@@ -1426,12 +1424,11 @@ message BuildStatus {
 }
 
 enum BuildState {
-  BUILD_STATE_UNSPECIFIED = 0;
+  BUILD_STATE_NOT_FOUND = 0;   // Build not known to cluster (default)
   BUILD_STATE_QUEUED = 1;
   BUILD_STATE_BUILDING = 2;
   BUILD_STATE_COMPLETED = 3;
   BUILD_STATE_FAILED = 4;
-  BUILD_STATE_NOT_FOUND = 5;
 }
 
 message JoinClusterRequest {

@@ -1,106 +1,20 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::str::FromStr;
+use camino::Utf8PathBuf;
 use uuid::Uuid;
 
-/// Unique identifier for a builder
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BuilderId(String);
+/// Unique identifier for an agent (UUID)
+pub type AgentId = Uuid;
 
-impl BuilderId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
-    }
-
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for BuilderId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Default for BuilderId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Unique identifier for a build job
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct JobId(String);
-
-impl JobId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
-    }
-
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for JobId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Default for JobId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Platform/system type
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Platform {
-    X86_64Linux,
-    Aarch64Linux,
-    X86_64Darwin,
-    Aarch64Darwin,
-    Other(String),
-}
-
-impl Platform {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Platform::X86_64Linux => "x86_64-linux",
-            Platform::Aarch64Linux => "aarch64-linux",
-            Platform::X86_64Darwin => "x86_64-darwin",
-            Platform::Aarch64Darwin => "aarch64-darwin",
-            Platform::Other(s) => s,
-        }
-    }
-}
-
-impl FromStr for Platform {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "x86_64-linux" => Platform::X86_64Linux,
-            "aarch64-linux" => Platform::Aarch64Linux,
-            "x86_64-darwin" => Platform::X86_64Darwin,
-            "aarch64-darwin" => Platform::Aarch64Darwin,
-            other => Platform::Other(other.to_string()),
-        })
-    }
-}
-
-impl fmt::Display for Platform {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
+/// Derivation store path (serves as the job identifier)
+///
+/// This is the full Nix store path to a derivation, e.g.,
+/// `/nix/store/abc123xyz-foo.drv`.
+///
+/// This is the primary identifier for builds in the cluster.
+/// Multiple users submitting the same derivation will have the same path,
+/// enabling automatic build deduplication.
+///
+/// We use the full path (not just the hash) because:
+/// - It's already unique (guaranteed by Nix)
+/// - It's more debuggable (includes the package name)
+/// - We don't need to parse or extract anything
+pub type DerivationPath = Utf8PathBuf;

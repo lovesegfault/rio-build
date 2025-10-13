@@ -9,5 +9,4 @@ pub mod derivation;
 pub mod types;
 
 // Re-export commonly used types
-pub use derivation::{DerivationInfo, DerivationOutput};
-pub use types::{BuilderId, JobId, Platform};
+pub use types::{AgentId, DerivationPath};

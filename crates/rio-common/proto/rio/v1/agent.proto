@@ -1,0 +1,221 @@
+syntax = "proto3";
+
+package rio.v1;
+
+// Service exposed by agents to CLI clients and other agents
+// Each agent implements this service for:
+// - CLI -> Agent: Build submission and subscription
+// - Agent -> Agent: Pending build fetching, cluster coordination
+service RioAgent {
+  // Cluster discovery - returns list of agents and current leader
+  rpc GetClusterMembers(GetClusterMembersRequest)
+      returns (ClusterMembers);
+
+  // Build submission (leader only - queues work for Raft assignment)
+  // Leader stores derivation temporarily and proposes to Raft
+  rpc QueueBuild(QueueBuildRequest)
+      returns (QueueBuildResponse);
+
+  // Subscribe to an in-progress build (for deduplication and redirects)
+  // Agent streams logs and outputs to subscriber
+  rpc SubscribeToBuild(SubscribeToBuildRequest)
+      returns (stream BuildUpdate);
+
+  // Get outputs from a recently completed build
+  // Returns cached outputs from agent's /nix/store
+  rpc GetCompletedBuild(GetCompletedBuildRequest)
+      returns (stream BuildUpdate);
+
+  // Build status queries (for failure recovery)
+  // Check if a build is queued, building, completed, or not found
+  rpc GetBuildStatus(GetBuildStatusRequest)
+      returns (BuildStatusResponse);
+
+  // Agent management (for joining cluster)
+  // New agent calls this on seed agent to join Raft cluster
+  rpc JoinCluster(JoinClusterRequest)
+      returns (JoinClusterResponse);
+
+  // Agent-to-agent: Fetch pending derivation (non-leader needs drv_bytes)
+  // Assigned agent fetches derivation from leader after Raft assignment
+  rpc FetchPendingBuild(FetchPendingBuildRequest)
+      returns (FetchPendingBuildResponse);
+}
+
+// ============================================================================
+// Cluster Discovery
+// ============================================================================
+
+message GetClusterMembersRequest {}
+
+message ClusterMembers {
+  repeated AgentInfo agents = 1;
+  string leader_id = 2;  // Current Raft leader's agent ID
+}
+
+message AgentInfo {
+  string id = 1;                        // UUID
+  string address = 2;                   // gRPC endpoint (host:port)
+  repeated string platforms = 3;        // ["x86_64-linux", "i686-linux"]
+  repeated string features = 4;         // ["kvm", "big-parallel"]
+  AgentStatus status = 5;               // Available, Busy, or Down
+  BuilderCapacity capacity = 6;         // Hardware specs
+}
+
+enum AgentStatus {
+  AGENT_STATUS_AVAILABLE = 0;  // Idle, can accept builds (default)
+  AGENT_STATUS_BUSY = 1;       // Executing one build (or has queued builds)
+  AGENT_STATUS_DOWN = 2;       // Failed heartbeats
+}
+
+message BuilderCapacity {
+  int32 cpu_cores = 1;
+  int64 memory_mb = 2;
+  int64 disk_gb = 3;
+}
+
+// ============================================================================
+// Build Submission
+// ============================================================================
+
+// Build submission to leader
+// CLI sends derivation bytes and dependency list to leader
+message QueueBuildRequest {
+  bytes derivation = 1;                       // Raw .drv file bytes
+  repeated string dependency_hashes = 2;      // SHA256 hashes of dependencies from neededBuilds
+  string platform = 3;                        // e.g., "x86_64-linux"
+  repeated string required_features = 4;      // e.g., ["kvm", "big-parallel"]
+  optional int32 timeout_seconds = 5;         // Optional build timeout
+}
+
+message QueueBuildResponse {
+  oneof result {
+    BuildAssigned assigned = 1;               // Build assigned to agent
+    AlreadyBuilding already_building = 2;     // Build already in progress
+    AlreadyCompleted already_completed = 3;   // Build recently completed (in cache)
+    NoEligibleAgents no_agents = 4;           // No agents match requirements
+  }
+}
+
+message BuildAssigned {
+  string agent_id = 1;        // Which agent was assigned this build
+  string derivation_hash = 2; // SHA256 hash of derivation (job identifier)
+}
+
+message AlreadyBuilding {
+  string agent_id = 1;        // Which agent is currently building
+  string derivation_hash = 2; // SHA256 hash of derivation
+}
+
+message AlreadyCompleted {
+  string agent_id = 1;        // Where outputs are stored
+  string derivation_hash = 2; // SHA256 hash of derivation
+}
+
+message NoEligibleAgents {
+  string reason = 1;  // "No agents with platform x86_64-linux and features [kvm]"
+}
+
+// ============================================================================
+// Build Updates (streaming)
+// ============================================================================
+
+message BuildUpdate {
+  string derivation_hash = 1;  // Job identifier (SHA256 of derivation)
+  oneof update {
+    LogLine log = 2;             // Build log line
+    OutputChunk output_chunk = 3; // Compressed NAR chunk
+    BuildCompleted completed = 4; // Build succeeded
+    BuildFailed failed = 5;       // Build failed
+  }
+}
+
+message LogLine {
+  int64 timestamp = 1;  // Unix timestamp (milliseconds)
+  string line = 2;      // Log line content (with newline)
+}
+
+message OutputChunk {
+  bytes data = 1;              // Compressed NAR data (zstd by default)
+  int32 chunk_index = 2;       // Sequence number for ordering
+  bool last_chunk = 3;         // True if this is the final chunk
+  CompressionType compression = 4;  // Compression algorithm used
+}
+
+enum CompressionType {
+  COMPRESSION_TYPE_ZSTD = 0;   // Default compression (zstd level 3)
+  COMPRESSION_TYPE_NONE = 1;   // No compression (for debugging)
+}
+
+message BuildCompleted {
+  repeated string output_paths = 1;  // /nix/store paths (all outputs)
+  int64 duration_ms = 2;             // Build duration in milliseconds
+}
+
+message BuildFailed {
+  string error = 1;        // Error message
+  optional string stderr = 2;  // Optional stderr capture
+}
+
+// ============================================================================
+// Build Status Query
+// ============================================================================
+
+message GetBuildStatusRequest {
+  string derivation_hash = 1;  // SHA256 hash of derivation
+}
+
+message BuildStatusResponse {
+  string derivation_hash = 1;
+  BuildState state = 2;
+  optional string agent_id = 3;  // Set if queued, building, or completed
+  optional string error = 4;     // Set if failed
+}
+
+enum BuildState {
+  BUILD_STATE_NOT_FOUND = 0;   // Build not known to cluster (default)
+  BUILD_STATE_QUEUED = 1;      // Waiting for dependencies
+  BUILD_STATE_BUILDING = 2;    // Currently executing
+  BUILD_STATE_COMPLETED = 3;   // Successfully completed (in cache)
+  BUILD_STATE_FAILED = 4;      // Build failed
+}
+
+// ============================================================================
+// Cluster Membership
+// ============================================================================
+
+message JoinClusterRequest {
+  AgentInfo agent_info = 1;  // New agent's info
+}
+
+message JoinClusterResponse {
+  bool success = 1;
+  string message = 2;  // Error message if success = false
+}
+
+// ============================================================================
+// Build Subscription
+// ============================================================================
+
+message SubscribeToBuildRequest {
+  string derivation_hash = 1;  // Which build to subscribe to
+}
+
+message GetCompletedBuildRequest {
+  string derivation_hash = 1;  // Which completed build to fetch
+}
+
+// Note: Both SubscribeToBuild and GetCompletedBuild return stream BuildUpdate
+
+// ============================================================================
+// Agent-to-Agent Communication
+// ============================================================================
+
+message FetchPendingBuildRequest {
+  string derivation_hash = 1;  // Which pending build to fetch
+}
+
+message FetchPendingBuildResponse {
+  bytes derivation = 1;                  // Raw .drv file bytes
+  repeated string dependency_hashes = 2; // Dependency list
+}

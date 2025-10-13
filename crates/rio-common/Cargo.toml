@@ -16,6 +16,7 @@ tonic-prost = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+camino = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
