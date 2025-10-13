@@ -428,12 +428,8 @@ impl<C: AsyncReadExt + AsyncWriteExt + Unpin + Send> Store for DaemonStore<C> {
             repair: bool,
             source: R,
         }
-        impl<
-                SN: AsRef<str> + Send + Sync + Debug,
-                SC: AsRef<str> + Send + Sync + Debug,
-                Refs,
-                R,
-            > DaemonProgressCaller for Caller<SN, SC, Refs, R>
+        impl<SN: AsRef<str> + Send + Sync + Debug, SC: AsRef<str> + Send + Sync + Debug, Refs, R>
+            DaemonProgressCaller for Caller<SN, SC, Refs, R>
         where
             Refs: IntoIterator + Send + Debug,
             Refs::IntoIter: ExactSizeIterator + Send,
@@ -1483,7 +1479,7 @@ where
                             "AddToStore is not implemented for Protocol {}",
                             self.proto
                         ))
-                        .into())
+                        .into());
                     }
                 },
                 Ok(wire::Op::BuildPaths) => {
@@ -1599,7 +1595,7 @@ where
                             "QueryValidPaths is not implemented for Protocol {}",
                             self.proto
                         ))
-                        .into())
+                        .into());
                     }
                 },
                 Ok(wire::Op::QuerySubstitutablePaths) => {
@@ -1701,6 +1697,68 @@ where
                             .await
                             .with_field("BuildPathsWithResults.results[].result")?;
                     }
+                }
+                Ok(wire::Op::AddMultipleToStore) => {
+                    // Read the repair flag and check signatures flag
+                    let repair = wire::read_bool(&mut self.r)
+                        .await
+                        .with_field("AddMultipleToStore.repair")?;
+                    let check_sigs = wire::read_bool(&mut self.r)
+                        .await
+                        .with_field("AddMultipleToStore.checkSigs")?;
+
+                    info!(
+                        "AddMultipleToStore: repair={}, check_sigs={}",
+                        repair, check_sigs
+                    );
+
+                    // Read and process each store path
+                    loop {
+                        // Read the source type (0 = end, 1 = NAR)
+                        let source_type = wire::read_u64(&mut self.r)
+                            .await
+                            .with_field("AddMultipleToStore.source_type")?;
+
+                        if source_type == 0 {
+                            // End of stream
+                            break;
+                        }
+
+                        // Read the NAR data
+                        let name = wire::read_string(&mut self.r)
+                            .await
+                            .with_field("AddMultipleToStore.name")?;
+                        let cam_str = wire::read_string(&mut self.r)
+                            .await
+                            .with_field("AddMultipleToStore.camStr")?;
+                        let refs = wire::read_strings(&mut self.r)
+                            .collect::<Result<Vec<_>>>()
+                            .await
+                            .with_field("AddMultipleToStore.refs")?;
+
+                        let mut source = wire::FramedReader::new(&mut self.r);
+
+                        // Add to store
+                        let (path, _pi) = forward_stderr(
+                            &mut self.w,
+                            self.store
+                                .add_to_store(name, cam_str, refs, repair, &mut source),
+                        )
+                        .await?;
+
+                        info!("AddMultipleToStore: added path {}", path);
+
+                        // Ensure source is drained
+                        let mut sink = tokio::io::sink();
+                        tokio::io::copy(&mut source, &mut sink)
+                            .await
+                            .map_err(|e| Error::IO(e))?;
+                    }
+
+                    // Send completion acknowledgment
+                    wire::write_stderr(&mut self.w, None)
+                        .await
+                        .with_field("AddMultipleToStore.stderr")?;
                 }
                 Ok(v) => todo!("{:#?}", v),
 
