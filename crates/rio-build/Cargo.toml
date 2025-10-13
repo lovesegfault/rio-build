@@ -7,3 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rio-common = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+camino = { workspace = true }
+tonic = { workspace = true }
+zstd = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
