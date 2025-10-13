@@ -192,15 +192,23 @@ Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implem
 
 **Goal:** Prove Raft coordination works. Agents form cluster, elect leader, track membership. No builds yet - just cluster mechanics.
 
-### 2.1 Raft Storage Setup (rio-agent)
+### 2.1 Raft Storage Setup (rio-agent) ✅ COMPLETED
 
-- [ ] Add `rocksdb` dependency to `rio-agent/Cargo.toml`
-- [ ] Create `rio-agent/src/storage.rs`
-  - [ ] Struct: `RaftStorage` - wrapper around RocksDB
-  - [ ] Column families: `raft_log`, `raft_state`
-  - [ ] Implement `openraft::RaftLogStorage` trait
-  - [ ] Implement `openraft::RaftStateMachineStorage` trait
-  - [ ] Methods for log compaction and snapshotting
+- [x] Add `rocksdb` dependency to `rio-agent/Cargo.toml`
+- [x] Create `rio-agent/src/storage.rs`
+  - [x] Separate stores: `LogStore` (RaftLogStorage) and `StateMachineStore` (RaftStateMachine)
+  - [x] Column families: `logs`, `store`
+  - [x] Implement `openraft::RaftLogStorage` trait with vote, committed, append, truncate, purge
+  - [x] Implement `openraft::RaftStateMachine` trait with apply, snapshots
+  - [x] Use `declare_raft_types!` macro for TypeConfig (Request/Response/Node)
+  - [x] Tests: storage creation and vote persistence
+
+**Implementation notes:**
+- Added openraft 0.9 with `storage-v2` feature (unsealed traits)
+- Added rocksdb 0.24 with `bindgen-runtime` and `zstd` features
+- Updated flake.nix with clang/cmake dependencies and commonEnvVars
+- Storage layout: `data_dir/raft.rocksdb` with two column families
+- All 9 tests passing (7 from Phase 1 + 2 new storage tests)
 
 ### 2.2 Raft State Machine (rio-agent)
 
