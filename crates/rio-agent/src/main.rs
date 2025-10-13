@@ -6,11 +6,7 @@
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
-
-mod agent;
-mod builder;
-mod grpc_server;
-mod nar_exporter;
+use rio_agent::{agent, grpc_server};
 
 /// Rio Agent - Distributed Nix build agent
 #[derive(Parser, Debug)]

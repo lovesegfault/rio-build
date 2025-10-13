@@ -65,13 +65,10 @@ impl Agent {
     }
 }
 
-/// Active build job
+/// Active build job (metadata only, process managed by background task)
 pub struct BuildJob {
     /// Derivation path (serves as identifier)
     pub drv_path: DerivationPath,
-
-    /// Build process handle
-    pub process: tokio::process::Child,
 
     /// Subscribers receiving build updates
     pub subscribers: Vec<mpsc::Sender<Result<BuildUpdate, Status>>>,
