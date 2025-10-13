@@ -241,15 +241,16 @@ Implement the NAR streaming pattern from DESIGN.md section "NAR Streaming Implem
 Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment".
 
 - [x] In `state_machine.rs`, enhance BuildQueued handler
-  - [x] Step 1: Filter eligible agents (platform + features + Available status)
-  - [x] Step 2: Score agents by affinity
+  - [x] Step 1: Filter eligible agents (platform + features, not Down) - **Status-blind!**
+  - [x] Step 2: Score agents by pure affinity
     - [x] Count matching deps in `builds_in_progress`
     - [x] Count matching deps in `completed_builds`
-  - [x] Step 3: Select highest affinity agent
+  - [x] Step 3: Select highest affinity agent (Available and Busy compete equally)
   - [x] Step 4: Tie-break by smallest agent_id (lexicographic)
   - [x] Step 5: Update state:
     - [x] Insert top-level build in `builds_in_progress`
     - [x] Insert all dependencies with parent_build pointer
+    - [x] Store derivation NAR in pending_derivations
     - [x] Set agent status to Busy
   - [x] Return selected agent_id
 
@@ -261,6 +262,12 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - test_assignment_marks_agent_busy: Verify agent status update
 
 **All 16 tests passing** (11 state_machine + 2 common + 1 integration + 2 storage)
+
+**Design improvements after Phase 2.3:**
+- Derivations now stored in Raft (not /tmp)
+- Status-blind assignment (Busy agents can receive builds)
+- BuildStatus has 3 variants: Building, QueuedDependency, QueuedCapacity
+- FetchPendingBuild RPC removed (derivations in Raft storage)
 
 ### 2.4 Cluster Membership (rio-agent)
 
@@ -339,14 +346,12 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 ### 3.1 Build Submission via Leader (rio-agent)
 
 - [ ] Enhance `grpc_server.rs`, implement `QueueBuild` RPC:
-  - [ ] Leader receives QueueBuildRequest
-  - [ ] Extract derivation_path from request
+  - [ ] Leader receives QueueBuildRequest with derivation NAR
   - [ ] Check if build already in progress or completed:
     - [ ] Query Raft state: `cluster_state.builds_in_progress.get(derivation_path)`
     - [ ] If found: Return `AlreadyBuilding` or `AlreadyCompleted` response
-  - [ ] Store derivation temporarily: `/tmp/rio-pending/{derivation_path}.nar`
-  - [ ] Propose RaftCommand::BuildQueued to cluster
-  - [ ] Wait for commit
+  - [ ] Propose RaftCommand::BuildQueued to cluster (includes derivation_nar)
+  - [ ] Wait for Raft commit
   - [ ] Read assignment from state machine result
   - [ ] Return `BuildAssigned { agent_id, derivation_path }`
 
@@ -356,11 +361,11 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [ ] Function: `on_raft_committed(agent, raft_cmd)`
     - [ ] Pattern match on RaftCommand
     - [ ] If `BuildQueued` and `selected_agent == self.id`:
-      - [ ] Fetch derivation from leader via `FetchPendingBuild` RPC (if not leader)
-      - [ ] Check dependencies: any building on self?
-        - [ ] If yes: Queue build with `Queued { blocked_on }` status
-        - [ ] If no: Start build immediately with `Building` status
-      - [ ] Propose BuildStatusChanged to Raft
+      - [ ] Read derivation NAR from Raft storage (pending_derivations)
+      - [ ] Check if currently building:
+        - [ ] If yes and has deps in queue: Propose QueuedDependency status
+        - [ ] If yes and no deps: Propose QueuedCapacity status
+        - [ ] If no: Start build immediately with Building status
 
 ### 3.3 Multi-User Subscriptions (rio-agent)
 
@@ -383,13 +388,17 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - [ ] In `builder.rs`, enhance `wait_for_completion()`:
   - [ ] After build succeeds, call `stream_outputs()` (from Phase 1)
   - [ ] After outputs streamed, propose RaftCommand::BuildCompleted
+    - [ ] State machine removes from builds_in_progress
+    - [ ] State machine removes from pending_derivations
+    - [ ] State machine moves to completed_builds
   - [ ] Send BuildUpdate::Completed to all subscribers
-  - [ ] Clean up temp files: `/tmp/rio-agent/{derivation_path}.nar`
   - [ ] Check if any pending builds waiting on this one
   - [ ] If yes: Start next build from pending queue
   - [ ] If no: Mark agent as Available
 - [ ] In `builder.rs`, handle build failure:
   - [ ] If build fails, propose RaftCommand::BuildFailed
+    - [ ] State machine removes from builds_in_progress
+    - [ ] State machine removes from pending_derivations
   - [ ] Send BuildUpdate::Failed to all subscribers
   - [ ] Find dependent builds in pending queue
   - [ ] Cascade failure to dependents (see section 3.6)
@@ -477,16 +486,21 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 
 - [ ] Enhance agent to track pending builds:
   - [ ] Field: `pending_builds: HashMap<DerivationPath, PendingBuild>`
-  - [ ] Struct PendingBuild: `{ drv_nar_bytes, blocked_on: Vec<DerivationPath>, subscribers }`
+  - [ ] Struct PendingBuild: `{ blocked_on: Vec<DerivationPath>, subscribers }`
+    - [ ] Note: derivation NAR read from Raft storage when starting
 - [ ] When assigned build has dependencies building on self:
   - [ ] Don't start immediately
   - [ ] Add to pending_builds
   - [ ] Send status to subscribers: "Waiting for dependencies..."
-  - [ ] Propose BuildStatusChanged with Queued status
+  - [ ] Propose BuildStatusChanged with QueuedDependency status
+- [ ] When assigned build but agent is busy (no deps):
+  - [ ] Add to pending_builds with empty blocked_on
+  - [ ] Propose BuildStatusChanged with QueuedCapacity status
 - [ ] On build completion:
   - [ ] Iterate pending_builds
   - [ ] Remove completed derivation_path from all blocked_on lists
   - [ ] If any pending build now has empty blocked_on:
+    - [ ] Read derivation NAR from Raft storage
     - [ ] Start that build
     - [ ] Send status: "Dependencies ready, building..."
 
@@ -503,24 +517,16 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 
 ### 4.5 Platform and Feature Matching (rio-agent)
 
-- [ ] In state machine, enhance `apply_build_queued()` filter:
+- [ ] In state machine, `apply_build_queued()` already filters correctly:
   - [ ] Only consider agents where `agent.platforms.contains(cmd.platform)`
   - [ ] Only consider agents where `cmd.features.iter().all(|f| agent.features.contains(f))`
-  - [ ] Only consider agents with status Available
-- [ ] If no eligible agents:
-  - [ ] State machine returns error response
+  - [ ] Only exclude Down agents (Available and Busy both eligible)
+- [ ] Add NoEligibleAgents response variant:
+  - [ ] If no eligible agents: Return error response
   - [ ] Leader returns `NoEligibleAgents { reason }` to CLI
 - [ ] CLI displays helpful error with agent capabilities
 
-### 4.6 Agent-to-Agent Communication (rio-agent)
-
-- [ ] Implement `FetchPendingBuild` RPC:
-  - [ ] Non-leader agent requests derivation from leader
-  - [ ] Leader reads from `/tmp/rio-pending/{derivation_path}.nar`
-  - [ ] Returns drv_nar_bytes and dependency list
-  - [ ] Non-leader writes to `/tmp/rio-agent/{derivation_path}.nar`
-
-### 4.7 Graceful Shutdown (rio-agent)
+### 4.6 Graceful Shutdown (rio-agent)
 
 - [ ] Add signal handler (SIGTERM, SIGINT):
   - [ ] Set `shutting_down` flag
@@ -533,7 +539,7 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
   - [ ] Close Raft storage
   - [ ] Exit
 
-### 4.8 Phase 4 Testing
+### 4.7 Phase 4 Testing
 
 - [ ] Test: Multi-derivation build with dependencies
   - [ ] Build expression with 5 derivations (linear dependency chain)
