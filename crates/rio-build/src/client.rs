@@ -37,7 +37,7 @@ impl RioClient {
         // Submit the build to the agent
         let request = QueueBuildRequest {
             derivation_path: build_info.drv_path.as_str().to_string(),
-            derivation: build_info.drv_bytes,
+            derivation: build_info.drv_nar_bytes,
             dependency_paths,
             platform: build_info.platform,
             required_features: build_info.required_features,

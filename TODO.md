@@ -83,19 +83,9 @@ Detailed implementation plan for the brokerless Rio architecture.
 **Design decisions:**
 - Use `&Utf8Path` for all path parameters (never `&str`)
 - BTreeMap uses `i32` for chunk indices (matches protobuf type, no casting)
-- BuildInfo reads derivation bytes in evaluator (not a separate helper)
-
-**TODO - Fix derivation transfer:**
-- Currently reads raw .drv bytes with `tokio::fs::read()`
-- MUST use `nix-store --export` to create NAR (see DESIGN.md section 8)
-- Agent needs `nix-store --import` to place derivation in /nix/store
-- Fix before end-to-end testing
-
-**TODO - Fix derivation import:**
-- Currently expects raw .drv bytes
-- MUST use `nix-store --import` to import NAR and get canonical path
-- Then build from that path: `nix-build /nix/store/hash-foo.drv`
-- Fix before end-to-end testing
+- BuildInfo exports derivation as NAR using `nix-store --export`
+- Agent imports derivation NAR using `nix-store --import` to get canonical path
+- Consistent NAR-based transfer for both derivations and outputs
 
 ### 1.4 Agent Basic Structure (rio-agent) ✅ COMPLETED
 
