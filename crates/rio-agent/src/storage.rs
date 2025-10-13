@@ -17,35 +17,17 @@ use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
+use crate::state_machine::{ClusterState, Node, RaftCommand, RaftResponse};
+
 pub type NodeId = u64;
 
 // Define our Raft type configuration using the macro
 openraft::declare_raft_types!(
     pub TypeConfig:
-        D = Request,
-        R = Response,
+        D = RaftCommand,
+        R = RaftResponse,
         Node = Node,
 );
-
-/// Node information (will be populated in Phase 2.4)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Node {
-    pub rpc_addr: String,
-}
-
-/// Raft request type (will be populated with actual commands in Phase 2.2)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Request {
-    /// Placeholder for Phase 2
-    Noop,
-}
-
-/// Raft response type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Response {
-    /// Placeholder for Phase 2
-    pub success: bool,
-}
 
 /// Snapshot data stored in RocksDB
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +288,8 @@ pub struct StateMachineStore {
 pub struct StateMachineData {
     pub last_applied_log_id: Option<LogId<NodeId>>,
     pub last_membership: StoredMembership<NodeId, Node>,
+    /// Cluster state managed by Raft
+    pub cluster: ClusterState,
 }
 
 impl StateMachineStore {
@@ -314,6 +298,7 @@ impl StateMachineStore {
             data: StateMachineData {
                 last_applied_log_id: None,
                 last_membership: Default::default(),
+                cluster: ClusterState::default(),
             },
             snapshot_idx: 0,
             db,
@@ -426,7 +411,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         ))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Response>, StorageError<NodeId>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
@@ -438,9 +423,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
             match entry.payload {
                 EntryPayload::Blank => {}
-                EntryPayload::Normal(_req) => {
-                    // Phase 2.2: Will apply actual state machine commands
-                    replies.push(Response { success: true });
+                EntryPayload::Normal(cmd) => {
+                    // Apply command to cluster state
+                    let response = self.data.cluster.apply(cmd);
+                    replies.push(response);
                 }
                 EntryPayload::Membership(mem) => {
                     self.data.last_membership = StoredMembership::new(Some(entry.log_id), mem);
@@ -556,5 +542,26 @@ mod tests {
         assert_eq!(read_vote, Some(vote));
     }
 
-    // TODO: Add test_log_append_and_read in Phase 2.2 when we integrate with actual Raft node
+    #[tokio::test]
+    async fn test_get_log_state_empty() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+
+        let (mut log_store, _sm_store) = new_storage(temp_path)
+            .await
+            .expect("Failed to create storage");
+
+        // Get log state on empty database
+        let log_state = log_store
+            .get_log_state()
+            .await
+            .expect("Failed to get log state");
+
+        assert_eq!(log_state.last_log_id, None);
+        assert_eq!(log_state.last_purged_log_id, None);
+    }
+
+    // Note: test_log_append_and_read requires LogFlushed which is pub(crate) to openraft
+    // Log append functionality will be tested when we integrate the actual Raft instance
+    // in Phase 2.4, where openraft creates the LogFlushed callback internally
 }
