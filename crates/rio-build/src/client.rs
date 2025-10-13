@@ -28,7 +28,7 @@ impl RioClient {
     /// Phase 1: Simplified - only handles BuildAssigned response
     pub async fn submit_build(&mut self, build_info: BuildInfo) -> Result<Streaming<BuildUpdate>> {
         // Convert dependency paths to strings for the protocol
-        let dependency_hashes: Vec<String> = build_info
+        let dependency_paths: Vec<String> = build_info
             .dependency_paths
             .iter()
             .map(|p| p.as_str().to_string())
@@ -36,8 +36,9 @@ impl RioClient {
 
         // Submit the build to the agent
         let request = QueueBuildRequest {
+            derivation_path: build_info.drv_path.as_str().to_string(),
             derivation: build_info.drv_bytes,
-            dependency_hashes,
+            dependency_paths,
             platform: build_info.platform,
             required_features: build_info.required_features,
             timeout_seconds: None,
@@ -65,12 +66,12 @@ impl RioClient {
         tracing::info!(
             "Build assigned to agent: {} for derivation: {}",
             assigned.agent_id,
-            assigned.derivation_hash
+            assigned.derivation_path
         );
 
         // Subscribe to the build to get logs and outputs
         let subscribe_request = SubscribeToBuildRequest {
-            derivation_hash: assigned.derivation_hash,
+            derivation_path: assigned.derivation_path,
         };
 
         let stream = self
