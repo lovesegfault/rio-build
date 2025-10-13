@@ -6,6 +6,7 @@ pub mod proto {
 }
 
 pub mod derivation;
+pub mod nix_utils;
 pub mod types;
 
 // Re-export commonly used types

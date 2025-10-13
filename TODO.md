@@ -29,21 +29,27 @@ Detailed implementation plan for the brokerless Rio architecture.
   - Already unique (guaranteed by Nix)
   - No parsing needed
 
-### 1.2 Nix Integration Utilities (rio-common)
+### 1.2 Nix Integration Utilities (rio-common) ✅ COMPLETED
 
-- [ ] Create `rio-common/src/nix_utils.rs` module
-- [ ] Implement `parse_nix_config()` - runs `nix config show`, parses output
-  - [ ] Extract `system` field
-  - [ ] Extract `extra-platforms` (space-separated)
-  - [ ] Extract `system-features` (space-separated)
-  - [ ] Return structured `NixConfig` type
-- [ ] Implement `run_nix_eval_jobs()` - wrapper for nix-eval-jobs command
-  - [ ] Takes Nix expression path
-  - [ ] Runs with flags: `--check-cache-status --show-required-system-features --show-input-drvs`
-  - [ ] Parses JSON output line-by-line
-  - [ ] Returns `EvalResult` with `drvPath`, `system`, `cacheStatus`, `neededBuilds`, etc.
-- [ ] Implement `read_derivation_bytes(path: &Path) -> Result<Vec<u8>>`
-- [ ] Implement `compute_derivation_hash(bytes: &[u8]) -> DerivationHash`
+- [x] Create `rio-common/src/nix_utils.rs` module
+- [x] Implement `NixConfig::parse()` - runs `nix config show`, parses output
+  - [x] Extract `system` field
+  - [x] Extract `extra-platforms` (space-separated)
+  - [x] Extract `system-features` (space-separated)
+  - [x] Return structured `NixConfig` type
+  - [x] Add `all_platforms()` helper method
+- [x] Implement `EvalResult::from_file()` - wrapper for nix-eval-jobs command
+  - [x] Takes Nix file path (&Utf8Path)
+  - [x] Runs with flags: `--check-cache-status --show-required-system-features --show-input-drvs`
+  - [x] Parses JSON output line-by-line
+  - [x] Returns `EvalResult` with `drvPath`, `system`, `cacheStatus`, `neededBuilds`, etc.
+- [x] All tests pass (including Nix integration tests)
+
+**Design decisions:**
+- Removed `read_derivation_bytes()` helper - can use `tokio::fs::read()` directly where needed
+- Made functions methods on their respective types (`NixConfig::parse()`, `EvalResult::from_file()`)
+- Use `&Utf8Path` for all path parameters (never `&str`)
+- No `#[ignore]` on tests - Nix always available in development environment
 
 ### 1.3 CLI Basic Flow (rio-build)
 
@@ -1014,7 +1020,7 @@ Already implemented in Phase 3 (deterministic assignment scores by affinity). Ad
 
 **Next Milestones:**
 1. ~~Complete protocol definitions (1.1)~~ ✅ DONE
-2. Complete Nix integration utilities (1.2) - IN PROGRESS
-3. Implement basic CLI flow (1.3)
+2. ~~Complete Nix integration utilities (1.2)~~ ✅ DONE
+3. Implement basic CLI flow (1.3) - NEXT
 4. Implement basic agent build execution (1.4-1.5)
 5. End-to-end test (1.8)
