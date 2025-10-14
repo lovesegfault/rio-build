@@ -194,9 +194,10 @@
               packages = with pkgs; [
                 # Cargo tools
                 cargo-edit
-                cargo-watch
                 cargo-expand
+                cargo-nextest
                 cargo-outdated
+                cargo-watch
 
                 # Debugging tools
                 lldb
