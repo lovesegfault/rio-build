@@ -23,10 +23,6 @@ struct Args {
     /// Data directory for agent state
     #[arg(short, long, default_value = "/var/lib/rio")]
     data_dir: Utf8PathBuf,
-
-    /// Bootstrap a new single-node Raft cluster (Phase 2+)
-    #[arg(long)]
-    bootstrap: bool,
 }
 
 #[tokio::main]
@@ -39,16 +35,11 @@ async fn main() -> Result<()> {
     tracing::info!("Starting Rio agent on {}", args.listen);
     tracing::info!("Data directory: {}", args.data_dir);
 
-    let agent = if args.bootstrap {
-        tracing::info!("Bootstrapping single-node Raft cluster with heartbeat system");
-        let (agent, _heartbeat_handle, _failure_detector_handle, _coordinator_handle) =
-            agent::Agent::bootstrap(args.data_dir, args.listen.clone(), None, None, None).await?;
-        // Handles run in background, will be cleaned up on process exit
-        agent
-    } else {
-        tracing::info!("Running in Phase 1 mode (no Raft coordination)");
-        agent::Agent::new(args.data_dir).await?
-    };
+    // Bootstrap single-node Raft cluster (all agents use Raft)
+    tracing::info!("Bootstrapping single-node Raft cluster");
+    let (agent, _heartbeat_handle, _failure_detector_handle, _coordinator_handle) =
+        agent::Agent::bootstrap(args.data_dir, args.listen.clone(), None, None, None).await?;
+    // Handles run in background, will be cleaned up on process exit
 
     // Start gRPC server
     grpc_server::serve(args.listen, agent).await?;
