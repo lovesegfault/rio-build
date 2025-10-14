@@ -122,16 +122,6 @@ impl RioAgent for RioAgentService {
     ) -> Result<Response<JoinClusterResponse>, Status> {
         Err(Status::unimplemented("Phase 1: No cluster support yet"))
     }
-
-    /// Fetch pending build (Phase 1: unimplemented)
-    async fn fetch_pending_build(
-        &self,
-        _request: Request<FetchPendingBuildRequest>,
-    ) -> Result<Response<FetchPendingBuildResponse>, Status> {
-        Err(Status::unimplemented(
-            "Phase 1: No agent-to-agent communication yet",
-        ))
-    }
 }
 
 /// Start the gRPC server

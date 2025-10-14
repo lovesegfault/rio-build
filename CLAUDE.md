@@ -13,39 +13,42 @@ direnv allow
 # Or manually enter the Nix development shell
 nix develop
 
+# IMPORTANT: All cargo commands should be run within nix develop environment
+# This ensures proper dependencies (protoc, libclang, etc.) are available
+
 # Build all workspace members
-cargo build
+nix develop -c cargo build
 
 # Build specific binary
-cargo build -p rio-build
-cargo build -p rio-agent
+nix develop -c cargo build -p rio-build
+nix develop -c cargo build -p rio-agent
 
 # Run tests
-cargo test
+nix develop -c cargo test
 
 # Run a specific test
-cargo test test_name
+nix develop -c cargo test test_name
 
 # Check code without building
-cargo check
+nix develop -c cargo check
 
 # Run clippy linter
-cargo clippy
+nix develop -c cargo clippy
 
 # Format code (all files in project)
 nix fmt
 
 # Or format just Rust code
-cargo fmt
+nix develop -c cargo fmt
 
 # Watch for changes and rebuild
-cargo watch -x check
+nix develop -c cargo watch -x check
 
 # Run the CLI client
-cargo run -p rio-build
+nix develop -c cargo run -p rio-build
 
 # Run an agent node
-cargo run -p rio-agent
+nix develop -c cargo run -p rio-agent
 ```
 
 ## Architecture Overview
@@ -78,7 +81,7 @@ cargo run -p rio-agent
 **Dependencies**:
 - `tonic`: gRPC framework
 - `tokio`: Async runtime
-- Raft library (TBD: `tikv/raft-rs` or `async-raft`)
+- `openraft`: Raft consensus (v0.9 with storage-v2 feature)
 
 ## Development Best Practices
 
