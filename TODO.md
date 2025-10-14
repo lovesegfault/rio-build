@@ -295,7 +295,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
     - [ ] Propose RaftCommand::AgentLeft
     - [ ] Clean up builds assigned to that agent
 - [x] Implement gRPC RPCs for membership:
-  - [x] `GetClusterMembers` - returns current leader (partial, agent list placeholder)
+  - [x] `GetClusterMembers` - returns current leader and agent list
   - [ ] `JoinCluster` - leader receives request, proposes AgentJoined
 
 **Progress:**

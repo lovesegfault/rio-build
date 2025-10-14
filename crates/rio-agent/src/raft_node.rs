@@ -8,18 +8,23 @@ use std::sync::Arc;
 
 use crate::raft_network::NetworkFactory;
 use crate::state_machine::Node;
-use crate::storage::{NodeId, TypeConfig, new_storage};
+use crate::storage::{NodeId, StateMachineStore, TypeConfig, new_storage};
 
 /// Create and bootstrap a single-node Raft cluster
+///
+/// Returns the Raft instance and a cloneable state machine store for querying.
 pub async fn bootstrap_single_node(
     node_id: NodeId,
     rpc_addr: String,
     data_dir: &Utf8Path,
-) -> Result<Arc<Raft<TypeConfig>>> {
+) -> Result<(Arc<Raft<TypeConfig>>, StateMachineStore)> {
     // Create storage
     let (log_store, sm_store) = new_storage(data_dir)
         .await
         .context("Failed to create Raft storage")?;
+
+    // Clone state machine store for returning (it's cloneable)
+    let sm_store_clone = sm_store.clone();
 
     // Create network
     let mut network = NetworkFactory::new();
@@ -59,7 +64,7 @@ pub async fn bootstrap_single_node(
 
     tracing::info!(node_id, rpc_addr, "Bootstrapped single-node Raft cluster");
 
-    Ok(Arc::new(raft))
+    Ok((Arc::new(raft), sm_store_clone))
 }
 
 #[cfg(test)]
@@ -74,7 +79,7 @@ mod tests {
         let node_id = 1;
         let rpc_addr = "localhost:50051".to_string();
 
-        let raft = bootstrap_single_node(node_id, rpc_addr, temp_path)
+        let (raft, _sm_store) = bootstrap_single_node(node_id, rpc_addr, temp_path)
             .await
             .expect("Failed to bootstrap");
 
