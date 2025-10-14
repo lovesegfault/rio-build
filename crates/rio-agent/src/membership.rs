@@ -6,7 +6,7 @@ use openraft::Raft;
 use std::sync::Arc;
 
 use crate::state_machine::{AgentInfo, AgentStatus, RaftCommand};
-use crate::storage::{NodeId, TypeConfig};
+use crate::storage::TypeConfig;
 use rio_common::AgentId;
 
 /// Register this agent in the cluster

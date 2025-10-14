@@ -27,7 +27,7 @@ pub async fn bootstrap_single_node(
     let sm_store_clone = sm_store.clone();
 
     // Create network
-    let mut network = NetworkFactory::new();
+    let network = NetworkFactory::new();
 
     // Add self to network
     network
