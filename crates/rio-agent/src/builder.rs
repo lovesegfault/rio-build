@@ -4,17 +4,23 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rio_common::DerivationPath;
 use rio_common::proto::{BuildCompleted, BuildFailed, BuildUpdate, LogLine, build_update};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
-use crate::agent::{Agent, BuildJob};
+use crate::agent::BuildJob;
 use crate::nar_exporter;
 
 /// Start a build
 ///
 /// Imports the derivation NAR to /nix/store, spawns nix-build, and manages the build lifecycle.
-pub async fn start_build(agent: &Agent, drv_path: String, drv_nar_bytes: Vec<u8>) -> Result<()> {
+pub async fn start_build(
+    current_build: &Arc<Mutex<Option<BuildJob>>>,
+    drv_path: String,
+    drv_nar_bytes: Vec<u8>,
+) -> Result<()> {
     let expected_drv_path = Utf8PathBuf::from(drv_path);
     let start_time = Instant::now();
 
@@ -49,19 +55,19 @@ pub async fn start_build(agent: &Agent, drv_path: String, drv_nar_bytes: Vec<u8>
         subscribers: Vec::new(),
     };
 
-    // Store in agent's current_build
+    // Store in current_build
     {
-        let mut current = agent.current_build.lock().await;
+        let mut current = current_build.lock().await;
         *current = Some(build_job);
     }
 
     // Spawn task to handle build completion (owns the process)
-    let agent_clone = agent.current_build.clone();
+    let current_clone = current_build.clone();
     let drv_path_clone = actual_drv_path.clone();
 
     tokio::spawn(async move {
         if let Err(e) =
-            handle_build_completion(agent_clone, drv_path_clone, child, start_time).await
+            handle_build_completion(current_clone, drv_path_clone, child, start_time).await
         {
             tracing::error!("Build completion error: {}", e);
         }

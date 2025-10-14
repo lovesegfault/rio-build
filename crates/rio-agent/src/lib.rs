@@ -3,6 +3,7 @@
 //! Core modules for the Rio build agent, exposed for testing.
 
 pub mod agent;
+pub mod build_coordinator;
 pub mod builder;
 pub mod grpc_server;
 pub mod heartbeat;
