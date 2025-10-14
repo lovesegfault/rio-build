@@ -69,6 +69,10 @@ impl RioClient {
             assigned.derivation_path
         );
 
+        // Wait briefly for coordinator to notice assignment and start build
+        // The coordinator polls every 100ms, so 200ms should be enough
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         // Subscribe to the build to get logs and outputs
         let subscribe_request = SubscribeToBuildRequest {
             derivation_path: assigned.derivation_path,
