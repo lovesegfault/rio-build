@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 openraft = { workspace = true }
 rocksdb = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

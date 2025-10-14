@@ -78,7 +78,24 @@ impl Agent {
     /// Create a new agent with Raft cluster (bootstrap single-node)
     ///
     /// Phase 2+: Creates agent and bootstraps a single-node Raft cluster.
-    pub async fn bootstrap(data_dir: Utf8PathBuf, rpc_addr: String) -> Result<Self> {
+    /// Returns (Agent, heartbeat_handle, failure_detector_handle).
+    /// The handles run in background and will be cleaned up on process exit.
+    ///
+    /// # Arguments
+    /// * `heartbeat_interval` - How often to send heartbeats (None = 10 seconds default)
+    /// * `check_interval` - How often to check for failed agents (None = 15 seconds default)
+    /// * `timeout` - Heartbeat timeout before marking agent Down (None = 30 seconds default)
+    pub async fn bootstrap(
+        data_dir: Utf8PathBuf,
+        rpc_addr: String,
+        heartbeat_interval: Option<std::time::Duration>,
+        check_interval: Option<std::time::Duration>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(
+        Self,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
         // Generate unique agent ID
         let id = uuid::Uuid::new_v4();
 
@@ -111,15 +128,35 @@ impl Agent {
             .await
             .context("Failed to register agent")?;
 
-        Ok(Self {
-            id,
-            platforms,
-            features,
-            current_build: Arc::new(Mutex::new(None)),
-            data_dir,
-            raft: Some(raft),
-            state_machine: Some(sm_store),
-        })
+        // Start heartbeat tasks (Phase 2.5) with configurable intervals
+        let heartbeat_interval = heartbeat_interval.unwrap_or(std::time::Duration::from_secs(10));
+        let check_interval = check_interval.unwrap_or(std::time::Duration::from_secs(15));
+        let timeout = timeout.unwrap_or(std::time::Duration::from_secs(30));
+
+        let heartbeat_handle =
+            crate::heartbeat::start_heartbeat_task(id, raft.clone(), heartbeat_interval);
+        let failure_detector_handle = crate::heartbeat::start_failure_detector_task(
+            raft.clone(),
+            sm_store.clone(),
+            check_interval,
+            timeout,
+        );
+
+        tracing::info!("Heartbeat tasks started");
+
+        Ok((
+            Self {
+                id,
+                platforms,
+                features,
+                current_build: Arc::new(Mutex::new(None)),
+                data_dir,
+                raft: Some(raft),
+                state_machine: Some(sm_store),
+            },
+            heartbeat_handle,
+            failure_detector_handle,
+        ))
     }
 }
 

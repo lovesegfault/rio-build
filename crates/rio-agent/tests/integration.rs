@@ -245,3 +245,57 @@ async fn test_derivation_nar_roundtrip() {
 
     assert_eq!(drv_path, imported_path);
 }
+
+/// Test heartbeat lifecycle with bootstrapped Raft cluster
+#[tokio::test]
+async fn test_heartbeat_lifecycle() {
+    use chrono::Utc;
+    use std::time::Duration;
+
+    // Bootstrap agent with Raft
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path =
+        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+
+    let listen_addr = "127.0.0.1:50999".to_string();
+    // Use fast intervals for testing: 1s heartbeat, 0.5s check, 3s timeout
+    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+        temp_path.to_path_buf(),
+        listen_addr,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_millis(500)),
+        Some(Duration::from_secs(3)),
+    )
+    .await
+    .expect("Failed to bootstrap agent");
+
+    let agent_id = agent.id;
+    let sm_store = agent
+        .state_machine
+        .as_ref()
+        .expect("No state machine")
+        .clone();
+
+    // Wait for initial heartbeat (should happen within 1-2 seconds with fast interval)
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Verify agent's heartbeat is recent
+    let data = sm_store.data.read();
+    let agent_info = data
+        .cluster
+        .agents
+        .get(&agent_id)
+        .expect("Agent not found in cluster");
+    let age = Utc::now().signed_duration_since(agent_info.last_heartbeat);
+
+    assert!(
+        age.num_milliseconds() < 1500,
+        "Heartbeat should be recent, but was {} milliseconds old",
+        age.num_milliseconds()
+    );
+
+    println!(
+        "✓ Heartbeat test passed: heartbeat age = {}ms",
+        age.num_milliseconds()
+    );
+}

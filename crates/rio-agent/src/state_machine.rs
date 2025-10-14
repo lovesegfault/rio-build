@@ -139,6 +139,10 @@ pub enum RaftResponse {
 
     /// Build failed
     BuildFailedAck,
+
+    /// Internal Raft operation (Blank entry, Membership change)
+    /// These operations don't correspond to client commands
+    InternalOp,
 }
 
 impl ClusterState {
@@ -152,7 +156,33 @@ impl ClusterState {
 
             RaftCommand::AgentLeft { id } => {
                 self.agents.remove(&id);
-                // TODO: Clean up builds assigned to this agent in Phase 2.5
+
+                // Clean up all builds assigned to this agent
+                // When an agent fails, all its builds are lost (process died)
+                // CLIs will detect stream disconnect and retry elsewhere
+                let mut removed_builds = Vec::new();
+
+                // Remove all builds where this agent was assigned
+                self.builds_in_progress.retain(|drv_path, tracker| {
+                    if tracker.agent_id == id {
+                        removed_builds.push(drv_path.clone());
+                        false // Remove this build
+                    } else {
+                        true // Keep this build
+                    }
+                });
+
+                // Remove pending derivations for removed builds
+                for drv_path in &removed_builds {
+                    self.pending_derivations.remove(drv_path);
+                }
+
+                tracing::info!(
+                    agent_id = %id,
+                    builds_removed = removed_builds.len(),
+                    "Agent removed from cluster, builds cleaned up"
+                );
+
                 RaftResponse::AgentLeft { agent_id: id }
             }
 
@@ -774,5 +804,133 @@ mod tests {
 
         // Derivation should be removed
         assert!(!state.pending_derivations.contains_key(&drv_path));
+    }
+
+    #[test]
+    fn test_agent_left_cleans_up_builds() {
+        let mut state = ClusterState::default();
+
+        let agent1 = AgentId::new_v4();
+        let agent2 = AgentId::new_v4();
+
+        // Add two agents
+        state.agents.insert(
+            agent1,
+            AgentInfo {
+                id: agent1,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        state.agents.insert(
+            agent2,
+            AgentInfo {
+                id: agent2,
+                address: "localhost:50052".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Add builds to both agents
+        let drv1 = Utf8PathBuf::from("/nix/store/foo.drv");
+        let drv2 = Utf8PathBuf::from("/nix/store/bar.drv");
+
+        state.builds_in_progress.insert(
+            drv1.clone(),
+            BuildTracker {
+                agent_id: agent1,
+                started_at: Utc::now(),
+                parent_build: None,
+                status: BuildStatus::Building,
+            },
+        );
+
+        state.builds_in_progress.insert(
+            drv2.clone(),
+            BuildTracker {
+                agent_id: agent2,
+                started_at: Utc::now(),
+                parent_build: None,
+                status: BuildStatus::Building,
+            },
+        );
+
+        state
+            .pending_derivations
+            .insert(drv1.clone(), vec![1, 2, 3]);
+        state
+            .pending_derivations
+            .insert(drv2.clone(), vec![4, 5, 6]);
+
+        // Agent1 fails
+        state.apply(RaftCommand::AgentLeft { id: agent1 });
+
+        // Agent1's builds should be removed
+        assert!(!state.builds_in_progress.contains_key(&drv1));
+        assert!(!state.pending_derivations.contains_key(&drv1));
+
+        // Agent2's builds should remain
+        assert!(state.builds_in_progress.contains_key(&drv2));
+        assert!(state.pending_derivations.contains_key(&drv2));
+
+        // Agent1 should be removed
+        assert!(!state.agents.contains_key(&agent1));
+        assert!(state.agents.contains_key(&agent2));
+    }
+
+    #[test]
+    fn test_agent_left_cleans_up_multiple_builds() {
+        let mut state = ClusterState::default();
+        let agent_id = AgentId::new_v4();
+
+        state.agents.insert(
+            agent_id,
+            AgentInfo {
+                id: agent_id,
+                address: "localhost:50051".to_string(),
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Available,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Add 3 builds to the agent
+        let builds = vec![
+            Utf8PathBuf::from("/nix/store/foo.drv"),
+            Utf8PathBuf::from("/nix/store/bar.drv"),
+            Utf8PathBuf::from("/nix/store/baz.drv"),
+        ];
+
+        for drv in &builds {
+            state.builds_in_progress.insert(
+                drv.clone(),
+                BuildTracker {
+                    agent_id,
+                    started_at: Utc::now(),
+                    parent_build: None,
+                    status: BuildStatus::Building,
+                },
+            );
+            state.pending_derivations.insert(drv.clone(), vec![1, 2, 3]);
+        }
+
+        assert_eq!(state.builds_in_progress.len(), 3);
+        assert_eq!(state.pending_derivations.len(), 3);
+
+        // Agent fails
+        state.apply(RaftCommand::AgentLeft { id: agent_id });
+
+        // All builds should be cleaned up
+        assert_eq!(state.builds_in_progress.len(), 0);
+        assert_eq!(state.pending_derivations.len(), 0);
+        assert!(!state.agents.contains_key(&agent_id));
     }
 }

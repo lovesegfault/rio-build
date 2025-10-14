@@ -10,6 +10,7 @@ use openraft::{
     AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftLogReader,
     RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
+use parking_lot::RwLock;
 use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -297,14 +298,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 }
 
-/// Raft state machine store backed by RocksDB
-#[derive(Debug, Clone)]
-pub struct StateMachineStore {
-    pub data: StateMachineData,
-    snapshot_idx: u64,
-    db: Arc<DB>,
-}
-
+/// State machine data
 #[derive(Debug, Clone)]
 pub struct StateMachineData {
     pub last_applied_log_id: Option<LogId<NodeId>>,
@@ -313,17 +307,29 @@ pub struct StateMachineData {
     pub cluster: ClusterState,
 }
 
-impl StateMachineStore {
-    async fn new(db: Arc<DB>) -> Result<Self, StorageError<NodeId>> {
-        let mut sm = Self {
-            data: StateMachineData {
+/// Inner state machine store structure
+#[derive(Debug)]
+pub struct StateMachineStoreInner {
+    pub data: RwLock<StateMachineData>,
+    snapshot_idx: RwLock<u64>,
+    db: Arc<DB>,
+}
+
+/// Raft state machine store backed by RocksDB
+/// Wrapped in Arc so all clones share the same underlying data
+pub type StateMachineStore = Arc<StateMachineStoreInner>;
+
+impl StateMachineStoreInner {
+    async fn new(db: Arc<DB>) -> Result<StateMachineStore, StorageError<NodeId>> {
+        let sm = Arc::new(Self {
+            data: RwLock::new(StateMachineData {
                 last_applied_log_id: None,
                 last_membership: Default::default(),
                 cluster: ClusterState::default(),
-            },
-            snapshot_idx: 0,
+            }),
+            snapshot_idx: RwLock::new(0),
             db,
-        };
+        });
 
         let snapshot = sm.get_current_snapshot_().map_err(|e| *e)?;
         if let Some(snap) = snapshot {
@@ -381,28 +387,33 @@ impl StateMachineStore {
     }
 
     async fn update_state_machine_(
-        &mut self,
+        &self,
         snapshot: StoredSnapshot,
     ) -> Result<(), StorageError<NodeId>> {
         // Phase 2: Will deserialize actual state machine data
-        self.data.last_applied_log_id = snapshot.meta.last_log_id;
-        self.data.last_membership = snapshot.meta.last_membership.clone();
+        let mut data = self.data.write();
+        data.last_applied_log_id = snapshot.meta.last_log_id;
+        data.last_membership = snapshot.meta.last_membership.clone();
         Ok(())
     }
 }
 
-impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
+// Implement traits on Arc<StateMachineStoreInner> so Raft can use it
+impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStoreInner> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let last_applied_log = self.data.last_applied_log_id;
-        let last_membership = self.data.last_membership.clone();
+        let data_read = self.data.read();
+        let last_applied_log = data_read.last_applied_log_id;
+        let last_membership = data_read.last_membership.clone();
+        drop(data_read);
 
         // Phase 2: Will serialize actual state machine data
         let data = vec![];
 
+        let snapshot_idx = self.snapshot_idx.write();
         let snapshot_id = if let Some(last) = last_applied_log {
-            format!("{}-{}-{}", last.leader_id, last.index, self.snapshot_idx)
+            format!("{}-{}-{}", last.leader_id, last.index, *snapshot_idx)
         } else {
-            format!("--{}", self.snapshot_idx)
+            format!("--{}", *snapshot_idx)
         };
 
         let meta = SnapshotMeta {
@@ -425,16 +436,14 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     }
 }
 
-impl RaftStateMachine<TypeConfig> for StateMachineStore {
-    type SnapshotBuilder = Self;
+impl RaftStateMachine<TypeConfig> for Arc<StateMachineStoreInner> {
+    type SnapshotBuilder = Arc<StateMachineStoreInner>;
 
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, Node>), StorageError<NodeId>> {
-        Ok((
-            self.data.last_applied_log_id,
-            self.data.last_membership.clone(),
-        ))
+        let data = self.data.read();
+        Ok((data.last_applied_log_id, data.last_membership.clone()))
     }
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<NodeId>>
@@ -443,28 +452,32 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         I::IntoIter: Send,
     {
         let mut replies = vec![];
+        let mut data = self.data.write();
 
         for entry in entries {
-            self.data.last_applied_log_id = Some(entry.log_id);
+            data.last_applied_log_id = Some(entry.log_id);
 
-            match entry.payload {
-                EntryPayload::Blank => {}
+            let response = match entry.payload {
+                EntryPayload::Blank => RaftResponse::InternalOp,
                 EntryPayload::Normal(cmd) => {
                     // Apply command to cluster state
-                    let response = self.data.cluster.apply(cmd);
-                    replies.push(response);
+                    data.cluster.apply(cmd)
                 }
                 EntryPayload::Membership(mem) => {
-                    self.data.last_membership = StoredMembership::new(Some(entry.log_id), mem);
+                    data.last_membership = StoredMembership::new(Some(entry.log_id), mem);
+                    RaftResponse::InternalOp
                 }
-            }
+            };
+
+            replies.push(response);
         }
 
         Ok(replies)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.snapshot_idx += 1;
+        *self.snapshot_idx.write() += 1;
+        // Return a clone of the Arc (shares the same underlying data)
         self.clone()
     }
 
@@ -526,7 +539,7 @@ pub async fn new_storage(data_dir: &Utf8Path) -> Result<(LogStore, StateMachineS
     tracing::info!("Opened Raft storage at: {}", db_path);
 
     let log_store = LogStore { db: db.clone() };
-    let sm_store = StateMachineStore::new(db)
+    let sm_store = StateMachineStoreInner::new(db)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create state machine store: {}", e))?;
 

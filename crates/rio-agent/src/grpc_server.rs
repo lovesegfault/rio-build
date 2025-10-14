@@ -114,7 +114,7 @@ impl RioAgent for RioAgentService {
             .unwrap_or_default();
 
         // Query state machine for agent list
-        let cluster_state = &sm_store.data.cluster;
+        let cluster_state = &sm_store.data.read().cluster;
         let agents: Vec<AgentInfo> = cluster_state
             .agents
             .values()

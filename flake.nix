@@ -119,6 +119,12 @@
                 darwin.apple_sdk.frameworks.Security
                 libiconv
               ];
+
+            # Runtime dependencies (available when running rio-build and rio-agent)
+            propagatedBuildInputs = with pkgs; [
+              nix # Required by both rio-build and rio-agent for nix-store, nix-build, etc.
+              inputs'.nix-eval-jobs.packages.default # Required by rio-build for evaluation
+            ];
           }
           // commonEnvVars;
 
@@ -247,6 +253,11 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
+                # Integration tests need nix commands available
+                nativeCheckInputs = with pkgs; [
+                  nix
+                  inputs'.nix-eval-jobs.packages.default
+                ];
               }
             );
 
@@ -263,6 +274,11 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
+                # Coverage tests also need nix commands available
+                nativeCheckInputs = with pkgs; [
+                  nix
+                  inputs'.nix-eval-jobs.packages.default
+                ];
               }
             );
           };
