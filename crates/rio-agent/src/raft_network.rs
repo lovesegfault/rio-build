@@ -2,7 +2,7 @@
 //!
 //! Implements openraft's RaftNetwork trait to enable Raft nodes to communicate.
 
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -20,6 +20,12 @@ use crate::storage::{NodeId, TypeConfig};
 pub struct NetworkFactory {
     /// Map of node_id → Node info (for looking up addresses)
     nodes: Arc<RwLock<HashMap<NodeId, Node>>>,
+}
+
+impl Default for NetworkFactory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NetworkFactory {
@@ -50,6 +56,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
 /// Network connection to a specific Raft node
 pub struct RaftNetworkConnection {
     target: NodeId,
+    #[allow(dead_code)] // Will be used for gRPC calls in Phase 3
     addr: String,
 }
 
@@ -62,10 +69,9 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
         // Phase 2.4: Single-node cluster doesn't need network communication
         // Phase 3+: Will implement gRPC call to target agent
         tracing::debug!(target = self.target, "append_entries (not implemented)");
-        Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Multi-node not implemented yet",
-        ))))
+        Err(RPCError::Network(NetworkError::new(
+            &std::io::Error::other("Multi-node not implemented yet"),
+        )))
     }
 
     async fn install_snapshot(
@@ -78,10 +84,9 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
     > {
         // Phase 2.4: Not needed for single-node
         tracing::debug!(target = self.target, "install_snapshot (not implemented)");
-        Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Multi-node not implemented yet",
-        ))))
+        Err(RPCError::Network(NetworkError::new(
+            &std::io::Error::other("Multi-node not implemented yet"),
+        )))
     }
 
     async fn vote(
@@ -91,9 +96,8 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         // Phase 2.4: Single-node doesn't need voting
         tracing::debug!(target = self.target, "vote (not implemented)");
-        Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Multi-node not implemented yet",
-        ))))
+        Err(RPCError::Network(NetworkError::new(
+            &std::io::Error::other("Multi-node not implemented yet"),
+        )))
     }
 }
