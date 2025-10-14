@@ -39,16 +39,9 @@ impl RioAgent for RioAgentService {
             req.required_features
         );
 
-        // Get Raft instance (required)
-        let raft = self.agent.raft.as_ref().ok_or_else(|| {
-            Status::failed_precondition("Agent not in Raft mode - use --bootstrap")
-        })?;
-
-        let sm_store = self
-            .agent
-            .state_machine
-            .as_ref()
-            .ok_or_else(|| Status::internal("State machine not initialized"))?;
+        // Get Raft instance and state machine
+        let raft = &self.agent.raft;
+        let sm_store = &self.agent.state_machine;
 
         // Check if build already in progress or completed
         let drv_path: camino::Utf8PathBuf = req.derivation_path.clone().into();
@@ -155,18 +148,8 @@ impl RioAgent for RioAgentService {
         &self,
         _request: Request<GetClusterMembersRequest>,
     ) -> Result<Response<ClusterMembers>, Status> {
-        // Check if Raft is enabled
-        let raft = self
-            .agent
-            .raft
-            .as_ref()
-            .ok_or_else(|| Status::unimplemented("Raft not enabled (Phase 1 mode)"))?;
-
-        let sm_store = self
-            .agent
-            .state_machine
-            .as_ref()
-            .ok_or_else(|| Status::internal("State machine not initialized"))?;
+        let raft = &self.agent.raft;
+        let sm_store = &self.agent.state_machine;
 
         // Get current metrics to determine leader
         // NodeId is now Uuid, so we can convert directly to String
@@ -219,12 +202,104 @@ impl RioAgent for RioAgentService {
         Err(Status::unimplemented("Phase 1: No status queries yet"))
     }
 
-    /// Join cluster (Phase 1: unimplemented)
+    /// Join cluster (Phase 3.3: Multi-node support)
     async fn join_cluster(
         &self,
-        _request: Request<JoinClusterRequest>,
+        request: Request<JoinClusterRequest>,
     ) -> Result<Response<JoinClusterResponse>, Status> {
-        Err(Status::unimplemented("Phase 1: No cluster support yet"))
+        let req = request.into_inner();
+
+        let joining_agent = req
+            .agent_info
+            .ok_or_else(|| Status::invalid_argument("agent_info is required"))?;
+
+        tracing::info!(
+            "Agent {} requesting to join cluster at {}",
+            joining_agent.id,
+            joining_agent.address
+        );
+
+        let raft = &self.agent.raft;
+        let sm_store = &self.agent.state_machine;
+
+        // Check if this agent is the leader
+        let metrics = raft.metrics().borrow().clone();
+        let current_leader = metrics.current_leader;
+
+        if current_leader != Some(self.agent.id) {
+            // Not leader - return error with leader info
+            let leader_id = current_leader
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            return Ok(Response::new(JoinClusterResponse {
+                success: false,
+                message: format!("Not leader. Current leader: {}", leader_id),
+            }));
+        }
+
+        // Parse joining agent info
+        let joining_id = uuid::Uuid::parse_str(&joining_agent.id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid agent ID: {}", e)))?;
+
+        let joining_addr = url::Url::parse(&joining_agent.address)
+            .map_err(|e| Status::invalid_argument(format!("Invalid agent address: {}", e)))?;
+
+        // Check if agent ID already exists
+        {
+            let cluster_state = &sm_store.data.read().cluster;
+            if cluster_state.agents.contains_key(&joining_id) {
+                return Ok(Response::new(JoinClusterResponse {
+                    success: false,
+                    message: format!("Agent ID {} already exists in cluster", joining_id),
+                }));
+            }
+        }
+
+        // Add node to Raft as learner first (safe addition)
+        tracing::info!("Adding agent {} as learner to Raft", joining_id);
+
+        let node = crate::state_machine::Node {
+            rpc_addr: joining_addr.to_string(),
+        };
+
+        raft.add_learner(joining_id, node, true)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to add learner: {}", e)))?;
+
+        // Propose AgentJoined to register in cluster state
+        let agent_info = crate::state_machine::AgentInfo {
+            id: joining_id,
+            address: joining_addr,
+            platforms: joining_agent.platforms,
+            features: joining_agent.features,
+            status: crate::state_machine::AgentStatus::Available,
+            last_heartbeat: chrono::Utc::now(),
+        };
+
+        let cmd = crate::state_machine::RaftCommand::AgentJoined {
+            id: joining_id,
+            info: agent_info,
+        };
+
+        raft.client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to propose AgentJoined: {}", e)))?;
+
+        // Promote learner to voting member
+        tracing::info!("Promoting agent {} to voting member", joining_id);
+
+        // Note: change_membership adds members, second arg is retain (not remove)
+        raft.change_membership([joining_id], false)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to change membership: {}", e)))?;
+
+        tracing::info!("Agent {} successfully joined cluster", joining_id);
+
+        Ok(Response::new(JoinClusterResponse {
+            success: true,
+            message: format!("Successfully joined cluster as {}", joining_id),
+        }))
     }
 }
 

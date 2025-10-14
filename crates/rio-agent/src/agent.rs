@@ -14,8 +14,7 @@ use crate::storage::{StateMachineStore, TypeConfig};
 
 /// Build agent
 ///
-/// Phase 1: Single agent with no Raft coordination.
-/// Phase 2+: Includes Raft for cluster coordination.
+/// All agents use Raft for cluster coordination.
 pub struct Agent {
     /// Agent unique identifier
     pub id: AgentId,
@@ -32,49 +31,14 @@ pub struct Agent {
     /// Data directory for agent state and temporary builds
     pub data_dir: Utf8PathBuf,
 
-    /// Raft instance (None for Phase 1, Some for Phase 2+)
-    pub raft: Option<Arc<Raft<TypeConfig>>>,
+    /// Raft instance
+    pub raft: Arc<Raft<TypeConfig>>,
 
-    /// State machine store for querying cluster state (None for Phase 1)
-    pub state_machine: Option<StateMachineStore>,
+    /// State machine store for querying cluster state
+    pub state_machine: StateMachineStore,
 }
 
 impl Agent {
-    /// Create a new agent
-    ///
-    /// Queries Nix configuration and sets up data directory.
-    pub async fn new(data_dir: Utf8PathBuf) -> Result<Self> {
-        // Generate unique agent ID
-        let id = uuid::Uuid::new_v4();
-
-        // Query Nix configuration
-        let nix_config = NixConfig::parse()
-            .await
-            .context("Failed to query Nix configuration")?;
-
-        let platforms = nix_config.all_platforms();
-        let features = nix_config.system_features;
-
-        tracing::info!("Agent ID: {}", id);
-        tracing::info!("Platforms: {:?}", platforms);
-        tracing::info!("Features: {:?}", features);
-
-        // Create data directory
-        tokio::fs::create_dir_all(&data_dir)
-            .await
-            .with_context(|| format!("Failed to create data directory: {}", data_dir))?;
-
-        Ok(Self {
-            id,
-            platforms,
-            features,
-            current_build: Arc::new(Mutex::new(None)),
-            data_dir,
-            raft: None,          // Phase 1: No Raft
-            state_machine: None, // Phase 1: No state machine
-        })
-    }
-
     /// Create a new agent with Raft cluster (bootstrap single-node)
     ///
     /// Phase 2+: Creates agent and bootstraps a single-node Raft cluster.
@@ -151,8 +115,8 @@ impl Agent {
             features,
             current_build: Arc::new(Mutex::new(None)),
             data_dir,
-            raft: Some(raft.clone()),
-            state_machine: Some(sm_store.clone()),
+            raft: raft.clone(),
+            state_machine: sm_store.clone(),
         };
 
         // Start build coordinator (Phase 3.2) - watches for builds assigned to this agent
@@ -171,6 +135,132 @@ impl Agent {
             failure_detector_handle,
             coordinator_handle,
         ))
+    }
+
+    /// Join an existing Raft cluster
+    ///
+    /// Connects to a seed agent and requests to join its cluster.
+    /// Returns agent with background tasks started.
+    pub async fn join(
+        data_dir: Utf8PathBuf,
+        rpc_addr: String,
+        seed_url: String,
+        heartbeat_interval: Option<std::time::Duration>,
+        check_interval: Option<std::time::Duration>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(
+        Self,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        // Generate unique agent ID
+        let id = uuid::Uuid::new_v4();
+
+        // Query Nix configuration
+        let nix_config = NixConfig::parse()
+            .await
+            .context("Failed to query Nix configuration")?;
+
+        let platforms = nix_config.all_platforms();
+        let features = nix_config.system_features;
+
+        tracing::info!("Agent ID: {}", id);
+        tracing::info!("Platforms: {:?}", platforms);
+        tracing::info!("Features: {:?}", features);
+
+        // Create data directory
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .with_context(|| format!("Failed to create data directory: {}", data_dir))?;
+
+        // TODO Phase 3.3: Implement cluster joining
+        // 1. Connect to seed agent
+        // 2. Call JoinCluster RPC
+        // 3. Receive cluster member list
+        // 4. Initialize Raft with existing members
+        // 5. Start background tasks
+
+        anyhow::bail!("Agent::join() not yet implemented (Phase 3.3)")
+    }
+
+    /// Auto-discovery: Try to join seeds, bootstrap if all fail
+    ///
+    /// Implements jitter-based race resolution for concurrent bootstraps.
+    pub async fn auto_join_or_bootstrap(
+        data_dir: Utf8PathBuf,
+        rpc_addr: String,
+        seed_urls: Vec<String>,
+        heartbeat_interval: Option<std::time::Duration>,
+        check_interval: Option<std::time::Duration>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(
+        Self,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        tracing::info!("Attempting to join cluster from {} seeds", seed_urls.len());
+
+        // Try each seed
+        for seed_url in &seed_urls {
+            tracing::debug!("Trying to join via seed: {}", seed_url);
+
+            match Self::join(
+                data_dir.clone(),
+                rpc_addr.clone(),
+                seed_url.clone(),
+                heartbeat_interval,
+                check_interval,
+                timeout,
+            )
+            .await
+            {
+                Ok(result) => {
+                    tracing::info!("Successfully joined cluster via {}", seed_url);
+                    return Ok(result);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to join via {}: {}", seed_url, e);
+                }
+            }
+        }
+
+        // All seeds failed - bootstrap new cluster with jitter
+        tracing::info!("Could not join any seed, will bootstrap new cluster");
+
+        // Add random jitter (0-1000ms) to avoid simultaneous bootstrap
+        let jitter_ms = rand::random::<u64>() % 1000;
+        tracing::debug!("Waiting {}ms jitter before bootstrap", jitter_ms);
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+
+        // Try join one more time (maybe someone else bootstrapped during jitter)
+        for seed_url in &seed_urls {
+            if let Ok(result) = Self::join(
+                data_dir.clone(),
+                rpc_addr.clone(),
+                seed_url.clone(),
+                heartbeat_interval,
+                check_interval,
+                timeout,
+            )
+            .await
+            {
+                tracing::info!("Joined cluster via {} after jitter wait", seed_url);
+                return Ok(result);
+            }
+        }
+
+        // Still no cluster - bootstrap
+        tracing::info!("Bootstrapping new single-node cluster");
+        Self::bootstrap(
+            data_dir,
+            rpc_addr,
+            heartbeat_interval,
+            check_interval,
+            timeout,
+        )
+        .await
     }
 }
 

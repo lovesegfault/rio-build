@@ -483,43 +483,50 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - Manual verification successful
 - Ready for multi-node clusters
 
-### 3.3 Multi-Node Cluster Support (rio-agent)
+### 3.3 Multi-Node Cluster Support (rio-agent) - IN PROGRESS
 
 **Goal:** Enable multiple agents to join together into a Raft cluster
 
 **Deployment modes:**
-1. **Auto mode** (default): Try join seeds, bootstrap if all fail (with jitter)
-2. **Explicit bootstrap**: Force bootstrap new cluster
-3. **Explicit join**: Force join existing cluster
+1. **Auto mode** (--seeds): Try join seeds, bootstrap if all fail (with jitter)
+2. **Explicit bootstrap** (default, no flags): Force bootstrap new cluster
+3. **Explicit join** (--join): Force join existing cluster
 
 **Implementation:**
 
-- [ ] Add cluster formation flags to rio-agent
-  - [ ] Flag: `--seeds <urls>` - Comma-separated seed agent URLs for discovery
-  - [ ] Flag: `--join <seed_url>` - Explicitly join cluster (skip auto-discovery)
-  - [ ] Default (no flags): Bootstrap single-node cluster (current behavior)
-- [ ] Implement auto-discovery mode: `Agent::auto_join_or_bootstrap(seeds)`
-  - [ ] Try to join each seed agent via JoinCluster RPC
-  - [ ] If any succeed: Join that cluster
-  - [ ] If all fail: Add random jitter (0-1000ms)
-  - [ ] Retry join once more (maybe someone else bootstrapped during jitter)
-  - [ ] If still fails: Bootstrap new single-node cluster
-  - [ ] Log clearly which mode was chosen
+- [x] Add cluster formation flags to rio-agent
+  - [x] Flag: `--seeds <urls>` - Comma-separated seed agent URLs for discovery
+  - [x] Flag: `--join <seed_url>` - Explicitly join cluster (skip auto-discovery)
+  - [x] Default (no flags): Bootstrap single-node cluster (current behavior)
+  - [x] Flags are mutually exclusive (clap conflicts_with)
+- [x] Implement auto-discovery mode: `Agent::auto_join_or_bootstrap(seeds)`
+  - [x] Try to join each seed agent via Agent::join()
+  - [x] If any succeed: Return joined agent
+  - [x] If all fail: Add random jitter (0-1000ms)
+  - [x] Retry join once more (maybe someone else bootstrapped during jitter)
+  - [x] If still fails: Bootstrap new single-node cluster
+  - [x] Log clearly which mode was chosen
 - [ ] Implement `Agent::join(seed_url)` in agent.rs
-  - [ ] Connect to seed agent via gRPC
-  - [ ] Call JoinCluster RPC with this agent's info (id, address, platforms, features)
-  - [ ] Receive Raft node list and initial state
-  - [ ] Initialize Raft with existing member list
-  - [ ] Wait for membership change to complete
-  - [ ] Start heartbeat, coordinator, and failure detector tasks
-- [ ] Implement JoinCluster RPC in grpc_server.rs
-  - [ ] Check if this agent is leader (only leader accepts joins)
-  - [ ] If not leader: Return error with leader address (redirect)
-  - [ ] Validate joining agent info (unique ID, valid address)
-  - [ ] Add node to Raft network via raft.add_learner()
-  - [ ] Propose RaftCommand::AgentJoined with agent info
-  - [ ] Wait for Raft commit
-  - [ ] Return success with cluster member list
+  - [x] Created stub that returns "not yet implemented"
+  - [ ] TODO: Connect to seed agent via gRPC
+  - [ ] TODO: Call JoinCluster RPC with this agent's info (id, address, platforms, features)
+  - [ ] TODO: Initialize Raft with existing member list (via raft_node::join_cluster helper)
+  - [ ] TODO: Wait for membership change to complete
+  - [ ] TODO: Start heartbeat, coordinator, and failure detector tasks
+- [x] Implement JoinCluster RPC in grpc_server.rs
+  - [x] Check if this agent is leader (only leader accepts joins)
+  - [x] If not leader: Return error with leader ID
+  - [x] Validate joining agent info (parse UUID and URL)
+  - [x] Check for duplicate agent ID
+  - [x] Add node to Raft network via raft.add_learner()
+  - [x] Propose RaftCommand::AgentJoined with agent info
+  - [x] Wait for Raft commit
+  - [x] Promote learner to voting member via raft.change_membership()
+  - [x] Return success message
+- [x] Refactored Agent struct: Removed Option from raft and state_machine fields
+  - [x] All agents always have Raft (no Phase 1 mode)
+  - [x] Removed Agent::new() - only bootstrap() and join() remain
+  - [x] Updated all RPCs to remove Option checks
 - [ ] Implement RaftNetwork gRPC in raft_network.rs
   - [ ] Implement append_entries() - Create gRPC client, forward to target agent's AppendEntries RPC
   - [ ] Implement vote() - Create gRPC client, forward to target agent's Vote RPC
