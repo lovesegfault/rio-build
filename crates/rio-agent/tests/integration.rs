@@ -56,7 +56,6 @@ runCommandNoCC "rio-test-{}" {{}} ''
 }
 
 #[tokio::test]
-#[ignore = "Requires Phase 3.2 (agent watching Raft commits). Run with: cargo test --ignored"]
 async fn test_end_to_end_build_flow() {
     // Start the actual rio-agent server with Raft
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -71,7 +70,7 @@ async fn test_end_to_end_build_flow() {
     let url = format!("http://{}", listen_addr);
 
     // Bootstrap agent with Raft (fast intervals for testing)
-    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr,
         Some(std::time::Duration::from_secs(1)),
@@ -132,7 +131,10 @@ async fn test_end_to_end_build_flow() {
         "Should receive BuildAssigned"
     );
 
-    // Subscribe to build - THIS IS THE CRITICAL PART that triggers the deadlock!
+    // Wait for coordinator to notice assignment and start build (polls every 100ms)
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Subscribe to build
     let mut stream = client
         .subscribe_to_build(SubscribeToBuildRequest {
             derivation_path: drv_path.clone(),
@@ -273,7 +275,7 @@ async fn test_queue_build_via_raft() {
     let listen_addr = format!("127.0.0.1:{}", addr.port());
     let url = format!("http://{}", listen_addr);
 
-    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr,
         Some(Duration::from_secs(1)),
@@ -372,7 +374,7 @@ async fn test_heartbeat_lifecycle() {
 
     let listen_addr = "127.0.0.1:50999".to_string();
     // Use fast intervals for testing: 1s heartbeat, 0.5s check, 3s timeout
-    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr,
         Some(Duration::from_secs(1)),

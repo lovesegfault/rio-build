@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
 
     let agent = if args.bootstrap {
         tracing::info!("Bootstrapping single-node Raft cluster with heartbeat system");
-        let (agent, _heartbeat_handle, _failure_detector_handle) =
+        let (agent, _heartbeat_handle, _failure_detector_handle, _coordinator_handle) =
             agent::Agent::bootstrap(args.data_dir, args.listen.clone(), None, None, None).await?;
         // Handles run in background, will be cleaned up on process exit
         agent

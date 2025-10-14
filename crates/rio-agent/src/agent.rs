@@ -95,6 +95,7 @@ impl Agent {
         Self,
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
     )> {
         // Generate unique agent ID
         let id = uuid::Uuid::new_v4();
@@ -143,18 +144,32 @@ impl Agent {
 
         tracing::info!("Heartbeat tasks started");
 
+        // Create agent instance
+        let agent = Self {
+            id,
+            platforms,
+            features,
+            current_build: Arc::new(Mutex::new(None)),
+            data_dir,
+            raft: Some(raft.clone()),
+            state_machine: Some(sm_store.clone()),
+        };
+
+        // Start build coordinator (Phase 3.2) - watches for builds assigned to this agent
+        let coordinator_handle = crate::build_coordinator::start_build_coordinator(
+            id,
+            agent.current_build.clone(),
+            raft,
+            sm_store,
+        );
+
+        tracing::info!("Build coordinator started");
+
         Ok((
-            Self {
-                id,
-                platforms,
-                features,
-                current_build: Arc::new(Mutex::new(None)),
-                data_dir,
-                raft: Some(raft),
-                state_machine: Some(sm_store),
-            },
+            agent,
             heartbeat_handle,
             failure_detector_handle,
+            coordinator_handle,
         ))
     }
 }

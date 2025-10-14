@@ -75,7 +75,7 @@ async fn test_phase2_single_node_cluster_end_to_end() {
     println!("Starting agent at: {}", agent_url);
 
     // Bootstrap agent with fast heartbeat intervals for testing
-    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr.clone(),
         Some(Duration::from_secs(1)),     // Fast heartbeat
