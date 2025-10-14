@@ -269,7 +269,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - BuildStatus has 3 variants: Building, QueuedDependency, QueuedCapacity
 - FetchPendingBuild RPC removed (derivations in Raft storage)
 
-### 2.4 Cluster Membership (rio-agent) 🚧 IN PROGRESS
+### 2.4 Cluster Membership (rio-agent) ✅ COMPLETED (single-node)
 
 - [x] Create `rio-agent/src/raft_network.rs`
   - [x] Struct: `NetworkFactory` implements RaftNetworkFactory
@@ -280,27 +280,36 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [x] Function: `bootstrap_single_node()` - creates and initializes Raft
   - [x] Configures Raft (heartbeat 500ms, election timeout 1.5-3s)
   - [x] Calls `raft.initialize()` with single-node set
-  - [x] Returns `Arc<Raft<TypeConfig>>`
+  - [x] Returns `(Arc<Raft<TypeConfig>>, StateMachineStore)` tuple
   - [x] Test: Verifies node becomes leader immediately
 - [x] Create internal Raft proto (rio-common/proto/rio/v1/raft.proto)
   - [x] Service: RaftInternal (AppendEntries, Vote, InstallSnapshot)
   - [x] Will implement handlers in Phase 3
 - [x] Enhance `rio-agent/src/agent.rs`
-  - [x] Add field: `raft: Option<Arc<Raft<TypeConfig>>>`
+  - [x] Add fields: `raft: Option<Arc<Raft<TypeConfig>>>`, `state_machine: Option<StateMachineStore>`
   - [x] Method: `bootstrap() -> Agent` - creates single-node cluster
-  - [ ] Method: `join(seed_url) -> Agent` - joins existing cluster via JoinCluster RPC
+  - [x] Calls register_agent() to add self to cluster
 - [x] Create `rio-agent/src/membership.rs`
   - [x] Function: `register_agent()` - propose AgentJoined to cluster
-  - [ ] Function: `handle_agent_left(raft, agent_id)`
-    - [ ] Propose RaftCommand::AgentLeft
-    - [ ] Clean up builds assigned to that agent
 - [x] Implement gRPC RPCs for membership:
-  - [x] `GetClusterMembers` - returns current leader and agent list
-  - [ ] `JoinCluster` - leader receives request, proposes AgentJoined
+  - [x] `GetClusterMembers` - returns current leader and agent list from state machine
 
-**Progress:**
-- Bootstrap working, single-node cluster test passing
-- All 19 tests passing (18 previous + 1 raft_node test)
+**Deferred to Phase 3 (multi-node clusters):**
+- `Agent::join(seed_url)` - Not needed for single-node testing
+- `JoinCluster` RPC - Not needed until we test multi-node clusters
+- `handle_agent_left()` - Graceful shutdown can wait until Phase 4
+
+**Rationale for deferring:**
+- Phase 2 focuses on proving Raft works with single node
+- Multi-node complexity (network, leader election) comes in Phase 3
+- Enables faster iteration on build submission integration
+- JoinCluster requires implementing RaftNetwork gRPC calls
+
+**Status:**
+- Single-node Raft cluster fully working
+- Agent bootstraps, becomes leader, registers itself
+- GetClusterMembers returns correct leader and agent list
+- All 19 tests passing, zero clippy warnings
 
 ### 2.5 Heartbeat System (rio-agent)
 
