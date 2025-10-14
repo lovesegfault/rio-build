@@ -311,18 +311,47 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - GetClusterMembers returns correct leader and agent list
 - All 19 tests passing, zero clippy warnings
 
-### 2.5 Heartbeat System (rio-agent)
+### 2.5 Heartbeat System (rio-agent) ✅ COMPLETED
 
-- [ ] Create `rio-agent/src/heartbeat.rs`
-  - [ ] Function: `start_heartbeat_task(agent_id, raft)`
-    - [ ] Loop every 10 seconds
-    - [ ] Propose RaftCommand::AgentHeartbeat
-  - [ ] Function: `check_failed_agents(cluster_state) -> Vec<AgentId>`
-    - [ ] Iterate agents
-    - [ ] Find agents where `last_heartbeat` > 30 seconds old
-    - [ ] Return list of failed agent IDs
-  - [ ] In state machine: Update `last_heartbeat` on AgentHeartbeat command
-  - [ ] In state machine: On agent marked Down, remove all its builds
+- [x] Create `rio-agent/src/heartbeat.rs`
+  - [x] Function: `start_heartbeat_task(agent_id, raft, interval)`
+    - [x] Configurable interval (default: 10 seconds, tests: 1 second)
+    - [x] Propose RaftCommand::AgentHeartbeat
+    - [x] Log warnings on failure (transient network issues)
+  - [x] Function: `start_failure_detector_task(raft, state_machine, check_interval, timeout)`
+    - [x] Configurable check interval (default: 15s, tests: 0.5s)
+    - [x] Configurable timeout (default: 30s, tests: 3s)
+    - [x] Proposes AgentLeft for failed agents
+  - [x] Function: `check_failed_agents(state_machine, timeout) -> Vec<AgentId>`
+    - [x] Iterate agents, find stale heartbeats
+    - [x] Ignore already-Down agents
+- [x] Enhanced state machine: Update `last_heartbeat` on AgentHeartbeat command
+- [x] Enhanced AgentLeft handler: Remove all builds assigned to failed agent
+  - [x] Clean up `builds_in_progress`
+  - [x] Clean up `pending_derivations`
+  - [x] CLIs detect disconnect and retry, affinity re-groups builds naturally
+- [x] Updated `Agent::bootstrap()` to accept optional heartbeat intervals
+  - [x] Returns (Agent, heartbeat_handle, failure_detector_handle)
+  - [x] Production defaults: 10s heartbeat, 15s check, 30s timeout
+  - [x] Tests use fast intervals: 1s heartbeat, 0.5s check, 3s timeout
+- [x] Added `--bootstrap` flag to main.rs
+
+**Critical bug fixes during Phase 2.5:**
+- Fixed storage: `StateMachineStore = Arc<StateMachineStoreInner>` pattern ensures all clones share data
+- Fixed apply(): Must return response for **every** entry (added `RaftResponse::InternalOp`)
+- Added `parking_lot` dependency for RwLock
+
+**Tests added:**
+- test_heartbeat_task_sends_periodic_heartbeats (6 heartbeat tests total)
+- test_failure_detector_marks_stale_agents_as_down
+- test_agent_left_cleans_up_builds (2 cleanup tests in state_machine)
+- test_heartbeat_lifecycle (integration test)
+
+**Status:**
+- All 25 tests passing (22 unit + 3 integration)
+- Zero clippy warnings
+- Test suite: 15.6 seconds (was 64s before optimization)
+- Heartbeat system ready for multi-node clusters in Phase 3
 
 ### 2.6 CLI Cluster Discovery (rio-build)
 
@@ -732,4 +761,19 @@ All Phase 1 milestones achieved:
 
 Single-agent MVP proven - data plane works end-to-end!
 
-**Next: Phase 2 - Raft Cluster (Control Plane)**
+**Phase 2: In Progress - Raft Cluster (Control Plane)**
+
+Completed:
+1. ~~Raft Storage Setup (2.1)~~ ✅
+2. ~~Raft State Machine (2.2)~~ ✅
+3. ~~Deterministic Agent Assignment (2.3)~~ ✅
+4. ~~Cluster Membership (2.4)~~ ✅ - Single-node
+5. ~~Heartbeat System (2.5)~~ ✅
+
+**Next: Phase 2.6 - CLI Cluster Discovery**
+
+Single-node Raft cluster with heartbeat system fully working!
+- Agent bootstraps, registers itself, sends periodic heartbeats
+- Failure detection removes stale agents after 30s
+- All 25 tests passing in 15.6 seconds
+- Ready for CLI integration and multi-node testing

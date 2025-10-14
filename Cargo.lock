@@ -1340,6 +1340,7 @@ dependencies = [
  "chrono",
  "clap",
  "openraft",
+ "parking_lot",
  "rio-common",
  "rocksdb",
  "serde",
