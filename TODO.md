@@ -483,7 +483,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - Manual verification successful
 - Ready for multi-node clusters
 
-### 3.3 Multi-Node Cluster Support (rio-agent) - IN PROGRESS
+### 3.3 Multi-Node Cluster Support (rio-agent) - IN PROGRESS (50% complete)
 
 **Goal:** Enable multiple agents to join together into a Raft cluster
 
@@ -527,6 +527,15 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [x] All agents always have Raft (no Phase 1 mode)
   - [x] Removed Agent::new() - only bootstrap() and join() remain
   - [x] Updated all RPCs to remove Option checks
+- [x] Updated raft.proto with proper protobuf message definitions
+  - [x] Defined Vote, LogId, LeaderId, Node, Membership, Entry messages
+  - [x] AppendEntries/Vote/InstallSnapshot with structured messages (not bytes)
+  - [x] Based on openraft example (raft-kv-memstore-grpc)
+- [ ] Implement protobuf conversions (rio-agent/src/raft_proto_conv.rs)
+  - [ ] Implement From<openraft::Vote> for proto::Vote
+  - [ ] Implement From<proto::Vote> for openraft::Vote
+  - [ ] Implement conversions for LogId, Entry, Membership, etc.
+  - [ ] Follow openraft example pattern (pb_impl modules)
 - [ ] Implement RaftNetwork gRPC in raft_network.rs
   - [ ] Implement append_entries() - Create gRPC client, forward to target agent's AppendEntries RPC
   - [ ] Implement vote() - Create gRPC client, forward to target agent's Vote RPC
