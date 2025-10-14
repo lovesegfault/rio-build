@@ -19,9 +19,16 @@ pub async fn register_agent(
     platforms: Vec<String>,
     features: Vec<String>,
 ) -> Result<()> {
+    // Parse address as URL (add http:// if missing)
+    let address = if rpc_addr.starts_with("http://") || rpc_addr.starts_with("https://") {
+        url::Url::parse(&rpc_addr).context("Invalid URL")?
+    } else {
+        url::Url::parse(&format!("http://{}", rpc_addr)).context("Invalid address")?
+    };
+
     let info = AgentInfo {
         id: agent_id,
-        address: rpc_addr,
+        address,
         platforms,
         features,
         status: AgentStatus::Available,

@@ -116,10 +116,9 @@ impl Agent {
             .await
             .with_context(|| format!("Failed to create data directory: {}", data_dir))?;
 
-        // Bootstrap Raft cluster
-        let node_id = id.as_u128() as u64; // Convert UUID to u64 for Raft NodeId
+        // Bootstrap Raft cluster (NodeId = AgentId = Uuid)
         let (raft, sm_store) =
-            crate::raft_node::bootstrap_single_node(node_id, rpc_addr.clone(), &data_dir)
+            crate::raft_node::bootstrap_single_node(id, rpc_addr.clone(), &data_dir)
                 .await
                 .context("Failed to bootstrap Raft cluster")?;
 

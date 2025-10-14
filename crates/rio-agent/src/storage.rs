@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use crate::state_machine::{ClusterState, Node, RaftCommand, RaftResponse};
 
-pub type NodeId = u64;
+// NodeId is now the agent's UUID (not truncated to u64)
+pub type NodeId = uuid::Uuid;
 
 // Define our Raft type configuration using the macro
 openraft::declare_raft_types!(
@@ -28,6 +29,7 @@ openraft::declare_raft_types!(
         D = RaftCommand,
         R = RaftResponse,
         Node = Node,
+        NodeId = NodeId,
 );
 
 /// Snapshot data stored in RocksDB
@@ -41,12 +43,12 @@ pub struct StoredSnapshot {
 const CF_LOGS: &str = "logs";
 const CF_STORE: &str = "store";
 
-/// Convert log index to big-endian bytes for RocksDB key
+/// Convert log index to bytes for RocksDB key
 fn id_to_bin(id: u64) -> Vec<u8> {
     id.to_be_bytes().to_vec()
 }
 
-/// Convert big-endian bytes back to log index
+/// Convert bytes back to log index
 fn bin_to_id(buf: &[u8]) -> u64 {
     u64::from_be_bytes(buf.try_into().unwrap())
 }
@@ -569,7 +571,8 @@ mod tests {
             .expect("Failed to create storage");
 
         // Save a vote
-        let vote = Vote::new(5, 123);
+        let node_id = uuid::Uuid::new_v4();
+        let vote = Vote::new(5, node_id);
 
         log_store
             .save_vote(&vote)

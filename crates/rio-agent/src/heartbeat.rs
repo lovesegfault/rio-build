@@ -151,7 +151,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
-        let node_id = 1;
+        let node_id = AgentId::new_v4();
         let agent_id = AgentId::new_v4();
         let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
             node_id,
@@ -201,7 +201,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
-        let node_id = 1;
+        let node_id = AgentId::new_v4();
         let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
             node_id,
             "localhost:50051".to_string(),
@@ -283,7 +283,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
-        let node_id = 1;
+        let node_id = AgentId::new_v4();
         let (raft, _sm_store) = crate::raft_node::bootstrap_single_node(
             node_id,
             "localhost:50051".to_string(),
@@ -319,7 +319,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
-        let node_id = 1;
+        let node_id = AgentId::new_v4();
         let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
             node_id,
             "localhost:50051".to_string(),
@@ -383,7 +383,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
-        let node_id = 1;
+        let node_id = AgentId::new_v4();
         let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
             node_id,
             "localhost:50051".to_string(),

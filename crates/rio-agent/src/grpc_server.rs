@@ -107,10 +107,11 @@ impl RioAgent for RioAgentService {
             .ok_or_else(|| Status::internal("State machine not initialized"))?;
 
         // Get current metrics to determine leader
+        // NodeId is now Uuid, so we can convert directly to String
         let metrics = raft.metrics().borrow().clone();
         let leader_id = metrics
             .current_leader
-            .map(|id| id.to_string())
+            .map(|uuid| uuid.to_string())
             .unwrap_or_default();
 
         // Query state machine for agent list
@@ -120,7 +121,7 @@ impl RioAgent for RioAgentService {
             .values()
             .map(|agent| AgentInfo {
                 id: agent.id.to_string(),
-                address: agent.address.clone(),
+                address: agent.address.to_string(), // Convert Url to String for protobuf
                 platforms: agent.platforms.clone(),
                 features: agent.features.clone(),
                 status: match agent.status {
