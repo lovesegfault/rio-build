@@ -1577,6 +1577,7 @@ dependencies = [
  "clap",
  "clap-serde-derive",
  "dirs",
+ "rio-agent",
  "rio-common",
  "serde",
  "tempfile",
@@ -1587,6 +1588,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "zstd",
 ]
 
