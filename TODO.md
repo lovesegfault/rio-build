@@ -285,9 +285,9 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - [x] Create internal Raft proto (rio-common/proto/rio/v1/raft.proto)
   - [x] Service: RaftInternal (AppendEntries, Vote, InstallSnapshot)
   - [x] Will implement handlers in Phase 3
-- [ ] Enhance `rio-agent/src/agent.rs`
-  - [ ] Add field: `raft: Option<Arc<Raft<TypeConfig>>>`
-  - [ ] Method: `bootstrap() -> Agent` - creates single-node cluster
+- [x] Enhance `rio-agent/src/agent.rs`
+  - [x] Add field: `raft: Option<Arc<Raft<TypeConfig>>>`
+  - [x] Method: `bootstrap() -> Agent` - creates single-node cluster
   - [ ] Method: `join(seed_url) -> Agent` - joins existing cluster via JoinCluster RPC
 - [ ] Create `rio-agent/src/membership.rs`
   - [ ] Function: `handle_agent_joined(raft, agent_info)`
