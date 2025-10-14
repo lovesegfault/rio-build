@@ -25,6 +25,7 @@ openraft = { workspace = true }
 rocksdb = { workspace = true }
 parking_lot = { workspace = true }
 url = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

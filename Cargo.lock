@@ -1553,6 +1553,7 @@ dependencies = [
  "clap",
  "openraft",
  "parking_lot",
+ "rand",
  "rio-common",
  "rocksdb",
  "serde",
