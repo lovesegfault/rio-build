@@ -269,10 +269,24 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - BuildStatus has 3 variants: Building, QueuedDependency, QueuedCapacity
 - FetchPendingBuild RPC removed (derivations in Raft storage)
 
-### 2.4 Cluster Membership (rio-agent)
+### 2.4 Cluster Membership (rio-agent) 🚧 IN PROGRESS
 
+- [x] Create `rio-agent/src/raft_network.rs`
+  - [x] Struct: `NetworkFactory` implements RaftNetworkFactory
+  - [x] Struct: `RaftNetworkConnection` implements RaftNetwork
+  - [x] Placeholder implementations (single-node doesn't need network)
+  - [x] Will add gRPC calls in Phase 3 for multi-node
+- [x] Create `rio-agent/src/raft_node.rs`
+  - [x] Function: `bootstrap_single_node()` - creates and initializes Raft
+  - [x] Configures Raft (heartbeat 500ms, election timeout 1.5-3s)
+  - [x] Calls `raft.initialize()` with single-node set
+  - [x] Returns `Arc<Raft<TypeConfig>>`
+  - [x] Test: Verifies node becomes leader immediately
+- [x] Create internal Raft proto (rio-common/proto/rio/v1/raft.proto)
+  - [x] Service: RaftInternal (AppendEntries, Vote, InstallSnapshot)
+  - [x] Will implement handlers in Phase 3
 - [ ] Enhance `rio-agent/src/agent.rs`
-  - [ ] Add field: `raft: Arc<Raft<...>>`
+  - [ ] Add field: `raft: Option<Arc<Raft<TypeConfig>>>`
   - [ ] Method: `bootstrap() -> Agent` - creates single-node cluster
   - [ ] Method: `join(seed_url) -> Agent` - joins existing cluster via JoinCluster RPC
 - [ ] Create `rio-agent/src/membership.rs`
@@ -285,6 +299,10 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - [ ] Implement gRPC RPCs for membership:
   - [ ] `JoinCluster` - leader receives request, proposes AgentJoined
   - [ ] `GetClusterMembers` - returns list of agents and current leader
+
+**Progress:**
+- Bootstrap working, single-node cluster test passing
+- All 19 tests passing (18 previous + 1 raft_node test)
 
 ### 2.5 Heartbeat System (rio-agent)
 

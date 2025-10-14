@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package rio.v1;
+
+// Internal Raft communication service
+// Used by openraft for log replication, voting, and snapshots
+// Not exposed to CLI - only agent-to-agent
+service RaftInternal {
+  // Append log entries (replication and heartbeats)
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // Request vote during leader election
+  rpc Vote(VoteRequest) returns (VoteResponse);
+
+  // Install snapshot on follower
+  rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// Append entries request (log replication)
+message AppendEntriesRequest {
+  bytes data = 1;  // Serialized openraft::AppendEntriesRequest
+}
+
+message AppendEntriesResponse {
+  bytes data = 1;  // Serialized openraft::AppendEntriesResponse
+}
+
+// Vote request (leader election)
+message VoteRequest {
+  bytes data = 1;  // Serialized openraft::VoteRequest
+}
+
+message VoteResponse {
+  bytes data = 1;  // Serialized openraft::VoteResponse
+}
+
+// Install snapshot request (snapshot transfer)
+message InstallSnapshotRequest {
+  bytes data = 1;  // Serialized openraft::InstallSnapshotRequest
+}
+
+message InstallSnapshotResponse {
+  bytes data = 1;  // Serialized openraft::InstallSnapshotResponse
+}
