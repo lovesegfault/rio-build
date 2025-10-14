@@ -8,7 +8,6 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use crate::agent::Agent;
-use crate::builder;
 
 /// gRPC service implementation
 pub struct RioAgentService {
@@ -26,7 +25,7 @@ impl RioAgentService {
 
 #[tonic::async_trait]
 impl RioAgent for RioAgentService {
-    /// Queue a build (Phase 1: stores drv, starts build, returns BuildAssigned)
+    /// Queue a build (Phase 3: Raft-coordinated assignment)
     async fn queue_build(
         &self,
         request: Request<QueueBuildRequest>,
@@ -40,20 +39,83 @@ impl RioAgent for RioAgentService {
             req.required_features
         );
 
-        // Start the build
-        builder::start_build(&self.agent, req.derivation_path.clone(), req.derivation)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to start build: {}", e)))?;
+        // Get Raft instance (required)
+        let raft = self.agent.raft.as_ref().ok_or_else(|| {
+            Status::failed_precondition("Agent not in Raft mode - use --bootstrap")
+        })?;
 
-        // Return BuildAssigned response
-        let response = QueueBuildResponse {
-            result: Some(queue_build_response::Result::Assigned(BuildAssigned {
-                agent_id: self.agent.id.to_string(),
-                derivation_path: req.derivation_path,
-            })),
+        let sm_store = self
+            .agent
+            .state_machine
+            .as_ref()
+            .ok_or_else(|| Status::internal("State machine not initialized"))?;
+
+        // Check if build already in progress or completed
+        let drv_path: camino::Utf8PathBuf = req.derivation_path.clone().into();
+
+        let check_result = {
+            let cluster_state = &sm_store.data.read().cluster;
+
+            if let Some(tracker) = cluster_state.builds_in_progress.get(&drv_path) {
+                Some(queue_build_response::Result::AlreadyBuilding(
+                    AlreadyBuilding {
+                        agent_id: tracker.agent_id.to_string(),
+                        derivation_path: req.derivation_path.clone(),
+                    },
+                ))
+            } else if let Some(completed) = cluster_state.completed_builds.get(&drv_path) {
+                Some(queue_build_response::Result::AlreadyCompleted(
+                    AlreadyCompleted {
+                        agent_id: completed.agent_id.to_string(),
+                        derivation_path: req.derivation_path.clone(),
+                    },
+                ))
+            } else {
+                None
+            }
+        }; // Read lock released here
+
+        // Return early if build already exists
+        if let Some(result) = check_result {
+            let response = QueueBuildResponse {
+                result: Some(result),
+            };
+            return Ok(Response::new(response));
+        }
+
+        // Propose BuildQueued to Raft
+        let cmd = crate::state_machine::RaftCommand::BuildQueued {
+            top_level: req.derivation_path.clone().into(),
+            derivation_nar: req.derivation,
+            dependencies: req.dependency_paths.iter().map(|s| s.into()).collect(),
+            platform: req.platform,
+            features: req.required_features,
         };
 
-        Ok(Response::new(response))
+        let raft_response = raft
+            .client_write(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("Raft proposal failed: {}", e)))?;
+
+        // Extract assignment from Raft response
+        match raft_response.data {
+            crate::state_machine::RaftResponse::BuildAssigned {
+                agent_id,
+                derivation_path,
+            } => {
+                tracing::info!("Build {} assigned to agent {}", derivation_path, agent_id);
+
+                let response = QueueBuildResponse {
+                    result: Some(queue_build_response::Result::Assigned(BuildAssigned {
+                        agent_id: agent_id.to_string(),
+                        derivation_path: derivation_path.to_string(),
+                    })),
+                };
+
+                Ok(Response::new(response))
+            }
+            _ => Err(Status::internal("Unexpected Raft response type")),
+        }
     }
 
     type SubscribeToBuildStream =
