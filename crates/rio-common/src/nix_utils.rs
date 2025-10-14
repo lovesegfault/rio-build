@@ -30,7 +30,7 @@ impl NixConfig {
     /// - `system-features` - Available features for build matching
     pub async fn parse() -> Result<Self> {
         let output = tokio::process::Command::new("nix")
-            .args(&["config", "show"])
+            .args(["config", "show"])
             .output()
             .await
             .context("Failed to run 'nix config show'")?;
@@ -128,7 +128,7 @@ impl EvalResult {
     /// Returns evaluation results with cache status and build requirements.
     pub async fn from_file(nix_file: &Utf8Path) -> Result<Self> {
         let output = tokio::process::Command::new("nix-eval-jobs")
-            .args(&[
+            .args([
                 "--check-cache-status",
                 "--show-required-system-features",
                 "--show-input-drvs",

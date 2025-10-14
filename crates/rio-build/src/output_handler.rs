@@ -113,7 +113,7 @@ impl NarAssembler {
 
         // Concatenate all compressed chunks in order
         let mut compressed_nar = Vec::new();
-        for (_index, chunk_data) in &self.chunks {
+        for chunk_data in self.chunks.values() {
             compressed_nar.extend_from_slice(chunk_data);
         }
 
