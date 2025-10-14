@@ -100,6 +100,12 @@ impl RioAgent for RioAgentService {
             .as_ref()
             .ok_or_else(|| Status::unimplemented("Raft not enabled (Phase 1 mode)"))?;
 
+        let sm_store = self
+            .agent
+            .state_machine
+            .as_ref()
+            .ok_or_else(|| Status::internal("State machine not initialized"))?;
+
         // Get current metrics to determine leader
         let metrics = raft.metrics().borrow().clone();
         let leader_id = metrics
@@ -108,8 +114,23 @@ impl RioAgent for RioAgentService {
             .unwrap_or_default();
 
         // Query state machine for agent list
-        // For now, return empty list - will implement state machine query in next commit
-        let agents = vec![];
+        let cluster_state = &sm_store.data.cluster;
+        let agents: Vec<AgentInfo> = cluster_state
+            .agents
+            .values()
+            .map(|agent| AgentInfo {
+                id: agent.id.to_string(),
+                address: agent.address.clone(),
+                platforms: agent.platforms.clone(),
+                features: agent.features.clone(),
+                status: match agent.status {
+                    crate::state_machine::AgentStatus::Available => AgentStatus::Available as i32,
+                    crate::state_machine::AgentStatus::Busy => AgentStatus::Busy as i32,
+                    crate::state_machine::AgentStatus::Down => AgentStatus::Down as i32,
+                },
+                capacity: None, // TODO: Add BuilderCapacity in Phase 3
+            })
+            .collect();
 
         let response = ClusterMembers { agents, leader_id };
 

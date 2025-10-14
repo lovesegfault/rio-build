@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tonic::Status;
 
-use crate::storage::TypeConfig;
+use crate::storage::{StateMachineStore, TypeConfig};
 
 /// Build agent
 ///
@@ -34,6 +34,9 @@ pub struct Agent {
 
     /// Raft instance (None for Phase 1, Some for Phase 2+)
     pub raft: Option<Arc<Raft<TypeConfig>>>,
+
+    /// State machine store for querying cluster state (None for Phase 1)
+    pub state_machine: Option<StateMachineStore>,
 }
 
 impl Agent {
@@ -67,7 +70,8 @@ impl Agent {
             features,
             current_build: Arc::new(Mutex::new(None)),
             data_dir,
-            raft: None, // Phase 1: No Raft
+            raft: None,          // Phase 1: No Raft
+            state_machine: None, // Phase 1: No state machine
         })
     }
 
@@ -97,9 +101,10 @@ impl Agent {
 
         // Bootstrap Raft cluster
         let node_id = id.as_u128() as u64; // Convert UUID to u64 for Raft NodeId
-        let raft = crate::raft_node::bootstrap_single_node(node_id, rpc_addr.clone(), &data_dir)
-            .await
-            .context("Failed to bootstrap Raft cluster")?;
+        let (raft, sm_store) =
+            crate::raft_node::bootstrap_single_node(node_id, rpc_addr.clone(), &data_dir)
+                .await
+                .context("Failed to bootstrap Raft cluster")?;
 
         // Register this agent in the cluster
         crate::membership::register_agent(&raft, id, rpc_addr, platforms.clone(), features.clone())
@@ -113,6 +118,7 @@ impl Agent {
             current_build: Arc::new(Mutex::new(None)),
             data_dir,
             raft: Some(raft),
+            state_machine: Some(sm_store),
         })
     }
 }
