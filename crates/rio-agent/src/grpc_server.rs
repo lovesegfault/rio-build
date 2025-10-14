@@ -88,12 +88,32 @@ impl RioAgent for RioAgentService {
         )))
     }
 
-    /// Get cluster members (Phase 1: unimplemented)
+    /// Get cluster members
     async fn get_cluster_members(
         &self,
         _request: Request<GetClusterMembersRequest>,
     ) -> Result<Response<ClusterMembers>, Status> {
-        Err(Status::unimplemented("Phase 1: No cluster support yet"))
+        // Check if Raft is enabled
+        let raft = self
+            .agent
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("Raft not enabled (Phase 1 mode)"))?;
+
+        // Get current metrics to determine leader
+        let metrics = raft.metrics().borrow().clone();
+        let leader_id = metrics
+            .current_leader
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+
+        // Query state machine for agent list
+        // For now, return empty list - will implement state machine query in next commit
+        let agents = vec![];
+
+        let response = ClusterMembers { agents, leader_id };
+
+        Ok(Response::new(response))
     }
 
     type GetCompletedBuildStream =

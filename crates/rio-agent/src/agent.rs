@@ -97,9 +97,14 @@ impl Agent {
 
         // Bootstrap Raft cluster
         let node_id = id.as_u128() as u64; // Convert UUID to u64 for Raft NodeId
-        let raft = crate::raft_node::bootstrap_single_node(node_id, rpc_addr, &data_dir)
+        let raft = crate::raft_node::bootstrap_single_node(node_id, rpc_addr.clone(), &data_dir)
             .await
             .context("Failed to bootstrap Raft cluster")?;
+
+        // Register this agent in the cluster
+        crate::membership::register_agent(&raft, id, rpc_addr, platforms.clone(), features.clone())
+            .await
+            .context("Failed to register agent")?;
 
         Ok(Self {
             id,

@@ -289,16 +289,14 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [x] Add field: `raft: Option<Arc<Raft<TypeConfig>>>`
   - [x] Method: `bootstrap() -> Agent` - creates single-node cluster
   - [ ] Method: `join(seed_url) -> Agent` - joins existing cluster via JoinCluster RPC
-- [ ] Create `rio-agent/src/membership.rs`
-  - [ ] Function: `handle_agent_joined(raft, agent_info)`
-    - [ ] Propose RaftCommand::AgentJoined to cluster
-    - [ ] Wait for commit
+- [x] Create `rio-agent/src/membership.rs`
+  - [x] Function: `register_agent()` - propose AgentJoined to cluster
   - [ ] Function: `handle_agent_left(raft, agent_id)`
     - [ ] Propose RaftCommand::AgentLeft
     - [ ] Clean up builds assigned to that agent
-- [ ] Implement gRPC RPCs for membership:
+- [x] Implement gRPC RPCs for membership:
+  - [x] `GetClusterMembers` - returns current leader (partial, agent list placeholder)
   - [ ] `JoinCluster` - leader receives request, proposes AgentJoined
-  - [ ] `GetClusterMembers` - returns list of agents and current leader
 
 **Progress:**
 - Bootstrap working, single-node cluster test passing
