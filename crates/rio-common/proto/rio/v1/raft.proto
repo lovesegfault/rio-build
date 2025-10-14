@@ -12,33 +12,119 @@ service RaftInternal {
   // Request vote during leader election
   rpc Vote(VoteRequest) returns (VoteResponse);
 
-  // Install snapshot on follower
+  // Install snapshot on follower (streamed)
   rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
-// Append entries request (log replication)
+// ============================================================================
+// Core Raft Types
+// ============================================================================
+
+// NodeId is a UUID string
+message NodeId {
+  string id = 1;  // UUID string
+}
+
+// LogId represents position in the log
+message LogId {
+  uint64 term = 1;
+  uint64 index = 2;
+}
+
+// LeaderId represents the leader (term + node)
+message LeaderId {
+  uint64 term = 1;
+  string node_id = 2;  // UUID string
+}
+
+// Vote represents voting state
+message Vote {
+  LeaderId leader_id = 1;
+  bool committed = 2;
+}
+
+// Node represents a cluster member
+message Node {
+  string rpc_addr = 1;  // gRPC endpoint
+}
+
+// Membership configuration
+message Membership {
+  repeated NodeIdSet configs = 1;
+  map<string, Node> nodes = 2;  // node_id (UUID string) -> Node
+}
+
+message NodeIdSet {
+  repeated string node_ids = 1;  // List of UUID strings
+}
+
+// ============================================================================
+// Log Entry
+// ============================================================================
+
+message Entry {
+  LogId log_id = 1;
+
+  oneof payload {
+    EmptyPayload blank = 2;
+    bytes normal = 3;  // Serialized RaftCommand
+    Membership membership = 4;
+  }
+}
+
+message EmptyPayload {}
+
+// ============================================================================
+// AppendEntries RPC
+// ============================================================================
+
 message AppendEntriesRequest {
-  bytes data = 1;  // Serialized openraft::AppendEntriesRequest
+  Vote vote = 1;
+  LogId prev_log_id = 2;
+  repeated Entry entries = 3;
+  LogId leader_commit = 4;
 }
 
 message AppendEntriesResponse {
-  bytes data = 1;  // Serialized openraft::AppendEntriesResponse
+  Vote vote = 1;
+  bool success = 2;
+  LogId match_log_id = 3;
+  bool conflict = 4;
 }
 
-// Vote request (leader election)
+// ============================================================================
+// Vote RPC
+// ============================================================================
+
 message VoteRequest {
-  bytes data = 1;  // Serialized openraft::VoteRequest
+  Vote vote = 1;
+  LogId last_log_id = 2;
 }
 
 message VoteResponse {
-  bytes data = 1;  // Serialized openraft::VoteResponse
+  Vote vote = 1;
+  bool vote_granted = 2;
+  LogId last_log_id = 3;
 }
 
-// Install snapshot request (snapshot transfer)
+// ============================================================================
+// InstallSnapshot RPC
+// ============================================================================
+
 message InstallSnapshotRequest {
-  bytes data = 1;  // Serialized openraft::InstallSnapshotRequest
+  oneof payload {
+    SnapshotMeta meta = 1;
+    bytes chunk = 2;
+  }
+}
+
+message SnapshotMeta {
+  Vote vote = 1;
+  LogId last_log_id = 2;
+  Membership last_membership = 3;
+  string snapshot_id = 4;
 }
 
 message InstallSnapshotResponse {
-  bytes data = 1;  // Serialized openraft::InstallSnapshotResponse
+  Vote vote = 1;
 }
