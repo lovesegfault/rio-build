@@ -69,72 +69,93 @@ impl LogStore {
         &self,
         subject: ErrorSubject<NodeId>,
         verb: ErrorVerb,
-    ) -> Result<(), StorageIOError<NodeId>> {
+    ) -> Result<(), Box<StorageIOError<NodeId>>> {
         self.db
             .flush_wal(true)
-            .map_err(|e| StorageIOError::new(subject, verb, AnyError::new(&e)))?;
+            .map_err(|e| Box::new(StorageIOError::new(subject, verb, AnyError::new(&e))))?;
         Ok(())
     }
 
-    fn get_last_purged_(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+    fn get_last_purged_(&self) -> Result<Option<LogId<NodeId>>, Box<StorageError<NodeId>>> {
         Ok(self
             .db
             .get_cf(self.store(), b"last_purged_log_id")
-            .map_err(|e| StorageIOError::read(&e))?
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::read(&e),
+                })
+            })?
             .and_then(|v| serde_json::from_slice(&v).ok()))
     }
 
-    fn set_last_purged_(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+    fn set_last_purged_(&self, log_id: LogId<NodeId>) -> Result<(), Box<StorageError<NodeId>>> {
         self.db
             .put_cf(
                 self.store(),
                 b"last_purged_log_id",
                 serde_json::to_vec(&log_id).unwrap().as_slice(),
             )
-            .map_err(|e| StorageIOError::write(&e))?;
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::write(&e),
+                })
+            })?;
 
-        self.flush(ErrorSubject::Store, ErrorVerb::Write)?;
+        self.flush(ErrorSubject::Store, ErrorVerb::Write)
+            .map_err(|e| Box::new(StorageError::IO { source: *e }))?;
         Ok(())
     }
 
     fn set_committed_(
         &self,
         committed: &Option<LogId<NodeId>>,
-    ) -> Result<(), StorageIOError<NodeId>> {
+    ) -> Result<(), Box<StorageError<NodeId>>> {
         let json = serde_json::to_vec(committed).unwrap();
         self.db
             .put_cf(self.store(), b"committed", json)
-            .map_err(|e| StorageIOError::write(&e))?;
-        self.flush(ErrorSubject::Store, ErrorVerb::Write)?;
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::write(&e),
+                })
+            })?;
+        self.flush(ErrorSubject::Store, ErrorVerb::Write)
+            .map_err(|e| Box::new(StorageError::IO { source: *e }))?;
         Ok(())
     }
 
-    fn get_committed_(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+    fn get_committed_(&self) -> Result<Option<LogId<NodeId>>, Box<StorageError<NodeId>>> {
         Ok(self
             .db
             .get_cf(self.store(), b"committed")
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read(&e),
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::read(&e),
+                })
             })?
             .and_then(|v| serde_json::from_slice(&v).ok()))
     }
 
-    fn set_vote_(&self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+    fn set_vote_(&self, vote: &Vote<NodeId>) -> Result<(), Box<StorageError<NodeId>>> {
         self.db
             .put_cf(self.store(), b"vote", serde_json::to_vec(vote).unwrap())
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::write_vote(&e),
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::write_vote(&e),
+                })
             })?;
-        self.flush(ErrorSubject::Vote, ErrorVerb::Write)?;
+        self.flush(ErrorSubject::Vote, ErrorVerb::Write)
+            .map_err(|e| Box::new(StorageError::IO { source: *e }))?;
         Ok(())
     }
 
-    fn get_vote_(&self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+    fn get_vote_(&self) -> Result<Option<Vote<NodeId>>, Box<StorageError<NodeId>>> {
         Ok(self
             .db
             .get_cf(self.store(), b"vote")
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read_vote(&e),
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::read_vote(&e),
+                })
             })?
             .and_then(|v| serde_json::from_slice(&v).ok()))
     }
@@ -189,7 +210,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 )
             });
 
-        let last_purged_log_id = self.get_last_purged_()?;
+        let last_purged_log_id = self.get_last_purged_().map_err(|e| *e)?;
 
         let last_log_id = match last {
             None => last_purged_log_id,
@@ -206,21 +227,21 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.set_committed_(&committed)?;
+        self.set_committed_(&committed).map_err(|e| *e)?;
         Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        self.get_committed_()
+        self.get_committed_().map_err(|e| *e)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.set_vote_(vote)
+        self.set_vote_(vote).map_err(|e| *e)
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        self.get_vote_()
+        self.get_vote_().map_err(|e| *e)
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -263,7 +284,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         tracing::debug!("purge logs <= {:?}", log_id);
 
-        self.set_last_purged_(log_id)?;
+        self.set_last_purged_(log_id).map_err(|e| *e)?;
         let from = id_to_bin(0);
         let to = id_to_bin(log_id.index + 1);
         self.db
@@ -304,7 +325,7 @@ impl StateMachineStore {
             db,
         };
 
-        let snapshot = sm.get_current_snapshot_()?;
+        let snapshot = sm.get_current_snapshot_().map_err(|e| *e)?;
         if let Some(snap) = snapshot {
             sm.update_state_machine_(snap).await?;
         }
@@ -320,37 +341,42 @@ impl StateMachineStore {
         &self,
         subject: ErrorSubject<NodeId>,
         verb: ErrorVerb,
-    ) -> Result<(), StorageIOError<NodeId>> {
+    ) -> Result<(), Box<StorageIOError<NodeId>>> {
         self.db
             .flush_wal(true)
-            .map_err(|e| StorageIOError::new(subject, verb, AnyError::new(&e)))?;
+            .map_err(|e| Box::new(StorageIOError::new(subject, verb, AnyError::new(&e))))?;
         Ok(())
     }
 
-    fn get_current_snapshot_(&self) -> Result<Option<StoredSnapshot>, StorageError<NodeId>> {
+    fn get_current_snapshot_(&self) -> Result<Option<StoredSnapshot>, Box<StorageError<NodeId>>> {
         Ok(self
             .db
             .get_cf(self.store(), b"snapshot")
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read(&e),
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::read(&e),
+                })
             })?
             .and_then(|v| serde_json::from_slice(&v).ok()))
     }
 
-    fn set_current_snapshot_(&self, snap: StoredSnapshot) -> Result<(), StorageError<NodeId>> {
+    fn set_current_snapshot_(&self, snap: StoredSnapshot) -> Result<(), Box<StorageError<NodeId>>> {
         self.db
             .put_cf(
                 self.store(),
                 b"snapshot",
                 serde_json::to_vec(&snap).unwrap().as_slice(),
             )
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::write_snapshot(Some(snap.meta.signature()), &e),
+            .map_err(|e| {
+                Box::new(StorageError::IO {
+                    source: StorageIOError::write_snapshot(Some(snap.meta.signature()), &e),
+                })
             })?;
         self.flush(
             ErrorSubject::Snapshot(Some(snap.meta.signature())),
             ErrorVerb::Write,
-        )?;
+        )
+        .map_err(|e| Box::new(StorageError::IO { source: *e }))?;
         Ok(())
     }
 
@@ -390,7 +416,7 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
             data: data.clone(),
         };
 
-        self.set_current_snapshot_(snapshot)?;
+        self.set_current_snapshot_(snapshot).map_err(|e| *e)?;
 
         Ok(Snapshot {
             meta,
@@ -459,7 +485,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         };
 
         self.update_state_machine_(new_snapshot.clone()).await?;
-        self.set_current_snapshot_(new_snapshot)?;
+        self.set_current_snapshot_(new_snapshot).map_err(|e| *e)?;
 
         Ok(())
     }
@@ -467,7 +493,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        let snap = self.get_current_snapshot_()?;
+        let snap = self.get_current_snapshot_().map_err(|e| *e)?;
         Ok(snap.map(|s| Snapshot {
             meta: s.meta.clone(),
             snapshot: Box::new(Cursor::new(s.data.clone())),
