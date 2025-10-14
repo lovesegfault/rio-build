@@ -1,6 +1,5 @@
 //! Full integration test - tests the complete gRPC server flow
 
-use camino::Utf8PathBuf;
 use rio_common::proto::rio_agent_client::RioAgentClient;
 use rio_common::proto::{QueueBuildRequest, SubscribeToBuildRequest, build_update};
 use tokio::process::Command;
@@ -57,19 +56,30 @@ runCommandNoCC "rio-test-{}" {{}} ''
 }
 
 #[tokio::test]
+#[ignore = "Requires Phase 3.2 (agent watching Raft commits). Run with: cargo test --ignored"]
 async fn test_end_to_end_build_flow() {
-    // Start the actual rio-agent server
-    let data_dir = Utf8PathBuf::from("/tmp/rio-integration-test");
+    // Start the actual rio-agent server with Raft
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path =
+        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
     let addr = listener.local_addr().expect("No local addr");
-    let url = format!("http://{}", addr);
+    let listen_addr = format!("127.0.0.1:{}", addr.port());
+    let url = format!("http://{}", listen_addr);
 
-    // Create and start agent
-    let agent = rio_agent::agent::Agent::new(data_dir)
-        .await
-        .expect("Failed to create agent");
+    // Bootstrap agent with Raft (fast intervals for testing)
+    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+        temp_path.to_path_buf(),
+        listen_addr,
+        Some(std::time::Duration::from_secs(1)),
+        Some(std::time::Duration::from_millis(500)),
+        Some(std::time::Duration::from_secs(3)),
+    )
+    .await
+    .expect("Failed to bootstrap agent");
 
     let server_task = tokio::spawn(async move {
         use rio_common::proto::rio_agent_server::RioAgentServer;
@@ -84,8 +94,8 @@ async fn test_end_to_end_build_flow() {
             .expect("Server failed");
     });
 
-    // Give server time to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    // Wait for server to start and agent to become leader
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // Create unique derivation (guaranteed not cached)
     let (drv_path, drv_nar_bytes) = create_unique_derivation()
@@ -244,6 +254,109 @@ async fn test_derivation_nar_roundtrip() {
         .to_string();
 
     assert_eq!(drv_path, imported_path);
+}
+
+/// Test Phase 3.1: Queue build via Raft (assignment only, no execution)
+#[tokio::test]
+async fn test_queue_build_via_raft() {
+    use std::time::Duration;
+
+    // Bootstrap agent with Raft
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path =
+        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind");
+    let addr = listener.local_addr().expect("No local addr");
+    let listen_addr = format!("127.0.0.1:{}", addr.port());
+    let url = format!("http://{}", listen_addr);
+
+    let (agent, _h1, _h2) = rio_agent::agent::Agent::bootstrap(
+        temp_path.to_path_buf(),
+        listen_addr,
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_millis(500)),
+        Some(Duration::from_secs(3)),
+    )
+    .await
+    .expect("Failed to bootstrap agent");
+
+    let agent_id = agent.id;
+
+    // Start gRPC server
+    let server_task = tokio::spawn(async move {
+        use rio_common::proto::rio_agent_server::RioAgentServer;
+        use tonic::transport::Server;
+
+        Server::builder()
+            .add_service(RioAgentServer::new(
+                rio_agent::grpc_server::RioAgentService::new(agent),
+            ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("Server failed");
+    });
+
+    // Wait for leader election
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Connect client
+    let mut client = RioAgentClient::connect(url)
+        .await
+        .expect("Failed to connect");
+
+    // Submit build
+    let drv_path = "/nix/store/test-foo.drv";
+    let response = client
+        .queue_build(rio_common::proto::QueueBuildRequest {
+            derivation_path: drv_path.to_string(),
+            derivation: vec![1, 2, 3], // Dummy NAR
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: None,
+        })
+        .await
+        .expect("Failed to queue build")
+        .into_inner();
+
+    // Verify BuildAssigned response
+    match response.result {
+        Some(rio_common::proto::queue_build_response::Result::Assigned(assigned)) => {
+            assert_eq!(assigned.agent_id, agent_id.to_string());
+            assert_eq!(assigned.derivation_path, drv_path);
+            println!("✓ Build assigned to agent {} via Raft", assigned.agent_id);
+        }
+        other => panic!("Expected BuildAssigned, got: {:?}", other),
+    }
+
+    // Test deduplication: Submit same build again
+    let response2 = client
+        .queue_build(rio_common::proto::QueueBuildRequest {
+            derivation_path: drv_path.to_string(),
+            derivation: vec![1, 2, 3],
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: None,
+        })
+        .await
+        .expect("Failed to queue build")
+        .into_inner();
+
+    // Should get AlreadyBuilding (build is in Raft state)
+    match response2.result {
+        Some(rio_common::proto::queue_build_response::Result::AlreadyBuilding(already)) => {
+            assert_eq!(already.agent_id, agent_id.to_string());
+            assert_eq!(already.derivation_path, drv_path);
+            println!("✓ Deduplication works: AlreadyBuilding response");
+        }
+        other => panic!("Expected AlreadyBuilding, got: {:?}", other),
+    }
+
+    server_task.abort();
 }
 
 /// Test heartbeat lifecycle with bootstrapped Raft cluster

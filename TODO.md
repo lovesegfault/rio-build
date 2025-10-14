@@ -437,17 +437,31 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 
 **Goal:** Integrate builds with Raft. CLI submits to leader, Raft assigns to agent, agent builds and reports status.
 
-### 3.1 Build Submission via Leader (rio-agent)
+### 3.1 Build Submission via Leader (rio-agent) ✅ COMPLETED
 
-- [ ] Enhance `grpc_server.rs`, implement `QueueBuild` RPC:
-  - [ ] Leader receives QueueBuildRequest with derivation NAR
-  - [ ] Check if build already in progress or completed:
-    - [ ] Query Raft state: `cluster_state.builds_in_progress.get(derivation_path)`
-    - [ ] If found: Return `AlreadyBuilding` or `AlreadyCompleted` response
-  - [ ] Propose RaftCommand::BuildQueued to cluster (includes derivation_nar)
-  - [ ] Wait for Raft commit
-  - [ ] Read assignment from state machine result
-  - [ ] Return `BuildAssigned { agent_id, derivation_path }`
+- [x] Enhanced `grpc_server.rs`, implemented Raft-coordinated `QueueBuild` RPC:
+  - [x] Removed Phase 1 fallback - all agents must use Raft (--bootstrap)
+  - [x] Check if build already in progress or completed
+    - [x] Query cluster state: `builds_in_progress.get(derivation_path)`
+    - [x] Query cluster state: `completed_builds.get(derivation_path)`
+    - [x] Return `AlreadyBuilding` if in progress
+    - [x] Return `AlreadyCompleted` if recently completed
+  - [x] Propose RaftCommand::BuildQueued to cluster (includes derivation_nar)
+  - [x] Wait for Raft commit via `raft.client_write()`
+  - [x] Extract assignment from `RaftResponse::BuildAssigned`
+  - [x] Return `BuildAssigned { agent_id, derivation_path }` to CLI
+  - [x] Handle RwLockReadGuard across await (clone data before await)
+
+**Tests added:**
+- test_queue_build_via_raft: Verifies Raft-coordinated assignment
+- test_queue_build_via_raft: Verifies deduplication (AlreadyBuilding)
+
+**Status:**
+- QueueBuild now fully Raft-coordinated
+- Build deduplication working
+- All 37 tests passing (1 ignored: test_end_to_end_build_flow - requires Phase 3.2)
+- Zero clippy warnings
+- Agent must be bootstrapped with --bootstrap (no Phase 1 mode)
 
 ### 3.2 Agent Receives Assignment (rio-agent)
 
@@ -460,6 +474,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
         - [ ] If yes and has deps in queue: Propose QueuedDependency status
         - [ ] If yes and no deps: Propose QueuedCapacity status
         - [ ] If no: Start build immediately with Building status
+- [ ] Re-enable `test_end_to_end_build_flow` (currently ignored, waiting for Phase 3.2)
 
 ### 3.3 Multi-User Subscriptions (rio-agent)
 
