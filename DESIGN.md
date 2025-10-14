@@ -87,8 +87,8 @@ struct CompletedBuild {
 }
 
 struct AgentInfo {
-    id: AgentId,
-    address: String,           // gRPC endpoint
+    id: AgentId,               // UUID (also serves as Raft NodeId)
+    address: Url,              // gRPC endpoint (e.g., "http://agent1:50051")
     platforms: Vec<String>,    // ["x86_64-linux", "i686-linux"] (from system + extra-platforms)
     features: Vec<String>,     // ["kvm", "big-parallel"] (from system-features)
     capacity: BuilderCapacity,
@@ -420,11 +420,12 @@ User runs: rio-build ./my-package.nix
 ┌─────────────────────────────────────────────────────┐
 │ 2. CLI: Connect to cluster leader                   │
 └─────────────────────────────────────────────────────┘
-   - Read seed agents from ~/.config/rio/config.toml
-   - Connect to first available seed agent
-   - Call GetClusterMembers() RPC
-   - Identify current leader from cluster state
-   - Connect to leader (or stay if already connected)
+   - Read seed agents from ~/.config/rio/config.toml (or --seed-agents flag)
+   - Try each seed agent URL with 5s timeout
+   - Call GetClusterMembers() RPC on first responsive agent
+   - Parse response: leader_id (UUID string) and agents list
+   - Find leader's address from agents list
+   - Connect to leader at discovered address
 
 ┌─────────────────────────────────────────────────────┐
 │ 3. CLI → Leader: Submit work to queue               │
@@ -1325,12 +1326,12 @@ message GetClusterMembersRequest {}
 
 message ClusterMembers {
   repeated AgentInfo agents = 1;
-  string leader_id = 2;  // Current Raft leader's agent ID
+  string leader_id = 2;  // Current Raft leader's agent ID (UUID string)
 }
 
 message AgentInfo {
-  string id = 1;                        // UUID
-  string address = 2;                   // gRPC endpoint (host:port)
+  string id = 1;                        // UUID string (also Raft NodeId)
+  string address = 2;                   // gRPC endpoint URL (e.g., "http://agent1:50051")
   repeated string platforms = 3;        // ["x86_64-linux", "i686-linux"]
   repeated string features = 4;         // ["kvm", "big-parallel"]
   AgentStatus status = 5;               // Available, Busy, or Down
