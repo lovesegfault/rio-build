@@ -487,31 +487,72 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 
 **Goal:** Enable multiple agents to join together into a Raft cluster
 
-- [ ] Add `--join` flag to rio-agent
-  - [ ] Flag: `--join <seed_url>` - Join existing cluster instead of bootstrapping
-  - [ ] If provided, call Agent::join() instead of Agent::bootstrap()
+**Deployment modes:**
+1. **Auto mode** (default): Try join seeds, bootstrap if all fail (with jitter)
+2. **Explicit bootstrap**: Force bootstrap new cluster
+3. **Explicit join**: Force join existing cluster
+
+**Implementation:**
+
+- [ ] Add cluster formation flags to rio-agent
+  - [ ] Flag: `--seeds <urls>` - Comma-separated seed agent URLs for discovery
+  - [ ] Flag: `--join <seed_url>` - Explicitly join cluster (skip auto-discovery)
+  - [ ] Default (no flags): Bootstrap single-node cluster (current behavior)
+- [ ] Implement auto-discovery mode: `Agent::auto_join_or_bootstrap(seeds)`
+  - [ ] Try to join each seed agent via JoinCluster RPC
+  - [ ] If any succeed: Join that cluster
+  - [ ] If all fail: Add random jitter (0-1000ms)
+  - [ ] Retry join once more (maybe someone else bootstrapped during jitter)
+  - [ ] If still fails: Bootstrap new single-node cluster
+  - [ ] Log clearly which mode was chosen
 - [ ] Implement `Agent::join(seed_url)` in agent.rs
   - [ ] Connect to seed agent via gRPC
-  - [ ] Call JoinCluster RPC with this agent's info
-  - [ ] Wait for Raft membership change to complete
-  - [ ] Start heartbeat and coordinator tasks
+  - [ ] Call JoinCluster RPC with this agent's info (id, address, platforms, features)
+  - [ ] Receive Raft node list and initial state
+  - [ ] Initialize Raft with existing member list
+  - [ ] Wait for membership change to complete
+  - [ ] Start heartbeat, coordinator, and failure detector tasks
 - [ ] Implement JoinCluster RPC in grpc_server.rs
-  - [ ] Verify leader (only leader can accept joins)
-  - [ ] Propose membership change to Raft
-  - [ ] Wait for commit
-  - [ ] Return success to joining agent
+  - [ ] Check if this agent is leader (only leader accepts joins)
+  - [ ] If not leader: Return error with leader address (redirect)
+  - [ ] Validate joining agent info (unique ID, valid address)
+  - [ ] Add node to Raft network via raft.add_learner()
+  - [ ] Propose RaftCommand::AgentJoined with agent info
+  - [ ] Wait for Raft commit
+  - [ ] Return success with cluster member list
 - [ ] Implement RaftNetwork gRPC in raft_network.rs
-  - [ ] Implement append_entries() - Forward to target agent's AppendEntries RPC
-  - [ ] Implement vote() - Forward to target agent's Vote RPC
-  - [ ] Implement install_snapshot() - Forward to target agent's InstallSnapshot RPC
-- [ ] Create rio-common/proto/rio/v1/raft.proto handlers
-  - [ ] Implement AppendEntries RPC handler
-  - [ ] Implement Vote RPC handler
-  - [ ] Implement InstallSnapshot RPC handler
+  - [ ] Implement append_entries() - Create gRPC client, forward to target agent's AppendEntries RPC
+  - [ ] Implement vote() - Create gRPC client, forward to target agent's Vote RPC
+  - [ ] Implement install_snapshot() - Create gRPC client, forward to target agent's InstallSnapshot RPC
+  - [ ] Add connection pooling/caching for target agents
+- [ ] Implement Raft RPC handlers (new gRPC service)
+  - [ ] Implement AppendEntries RPC handler - calls raft.append_entries()
+  - [ ] Implement Vote RPC handler - calls raft.vote()
+  - [ ] Implement InstallSnapshot RPC handler - calls raft.install_snapshot()
+  - [ ] Add to gRPC server alongside RioAgent service
 - [ ] Add tests for multi-node clusters
-  - [ ] Test: Bootstrap + 2 joins → 3-node cluster
+  - [ ] Test: Explicit join (agent A bootstrap, agent B --join A)
+  - [ ] Test: Auto-discovery (3 agents with same --seeds)
   - [ ] Test: Leader election after leader dies
-  - [ ] Test: Heartbeat across nodes
+  - [ ] Test: Heartbeat failure detection across nodes
+  - [ ] Test: Build assignment across multi-node cluster
+
+**Deployment examples:**
+
+```bash
+# Simple: Explicit (production-ready)
+node1$ rio-agent --listen node1:50051                    # Bootstraps
+node2$ rio-agent --listen node2:50051 --join http://node1:50051
+node3$ rio-agent --listen node3:50051 --join http://node1:50051
+
+# Auto-discovery (development/testing)
+all$ rio-agent --listen 0.0.0.0:50051 --seeds node1:50051,node2:50051,node3:50051
+# First one to start bootstraps, others join
+
+# Kubernetes (StatefulSet)
+# Pod 0: rio-agent --listen 0.0.0.0:50051
+# Pod 1+: rio-agent --listen 0.0.0.0:50051 --join http://rio-0:50051
+```
 
 ### 3.4 Multi-User Subscriptions (rio-agent)
 
