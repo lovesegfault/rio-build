@@ -13,6 +13,7 @@ use crate::storage::{NodeId, StateMachineStore, TypeConfig, new_storage};
 /// Create and bootstrap a single-node Raft cluster
 ///
 /// Returns the Raft instance and a cloneable state machine store for querying.
+/// NodeId is the agent's UUID (not truncated).
 pub async fn bootstrap_single_node(
     node_id: NodeId,
     rpc_addr: String,
@@ -62,7 +63,7 @@ pub async fn bootstrap_single_node(
         .await
         .context("Failed to initialize single-node cluster")?;
 
-    tracing::info!(node_id, rpc_addr, "Bootstrapped single-node Raft cluster");
+    tracing::info!(node_id = %node_id, rpc_addr, "Bootstrapped single-node Raft cluster");
 
     Ok((Arc::new(raft), sm_store_clone))
 }
@@ -76,7 +77,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
 
-        let node_id = 1;
+        let node_id = uuid::Uuid::new_v4();
         let rpc_addr = "localhost:50051".to_string();
 
         let (raft, _sm_store) = bootstrap_single_node(node_id, rpc_addr, temp_path)

@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use rio_common::types::{AgentId, DerivationPath};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use url::Url;
 
 /// Node information for Raft (will be enhanced in Phase 2.4)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -17,7 +18,7 @@ pub struct Node {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentInfo {
     pub id: AgentId,
-    pub address: String,
+    pub address: Url, // gRPC endpoint (e.g., "http://agent1:50051")
     pub platforms: Vec<String>,
     pub features: Vec<String>,
     pub status: AgentStatus,
@@ -369,7 +370,7 @@ mod tests {
 
         let info = AgentInfo {
             id: agent_id,
-            address: "localhost:50051".to_string(),
+            address: Url::parse("http://localhost:50051").unwrap(),
             platforms: vec!["x86_64-linux".to_string()],
             features: vec!["kvm".to_string()],
             status: AgentStatus::Available,
@@ -384,8 +385,8 @@ mod tests {
         assert!(matches!(response, RaftResponse::AgentJoined { .. }));
         assert_eq!(state.agents.len(), 1);
         assert_eq!(
-            state.agents.get(&agent_id).unwrap().address,
-            "localhost:50051"
+            state.agents.get(&agent_id).unwrap().address.as_str(),
+            "http://localhost:50051/"
         );
     }
 
@@ -397,7 +398,7 @@ mod tests {
         // Add agent first
         let info = AgentInfo {
             id: agent_id,
-            address: "localhost:50051".to_string(),
+            address: Url::parse("http://localhost:50051").unwrap(),
             platforms: vec!["x86_64-linux".to_string()],
             features: vec![],
             status: AgentStatus::Available,
@@ -438,7 +439,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -485,7 +486,7 @@ mod tests {
             agent_x86,
             AgentInfo {
                 id: agent_x86,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -497,7 +498,7 @@ mod tests {
             agent_arm,
             AgentInfo {
                 id: agent_arm,
-                address: "localhost:50052".to_string(),
+                address: Url::parse("http://localhost:50052").unwrap(),
                 platforms: vec!["aarch64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -534,7 +535,7 @@ mod tests {
             agent_with_kvm,
             AgentInfo {
                 id: agent_with_kvm,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec!["kvm".to_string()],
                 status: AgentStatus::Available,
@@ -546,7 +547,7 @@ mod tests {
             agent_without_kvm,
             AgentInfo {
                 id: agent_without_kvm,
-                address: "localhost:50052".to_string(),
+                address: Url::parse("http://localhost:50052").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -584,7 +585,7 @@ mod tests {
             agent_a,
             AgentInfo {
                 id: agent_a,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -596,7 +597,7 @@ mod tests {
             agent_b,
             AgentInfo {
                 id: agent_b,
-                address: "localhost:50052".to_string(),
+                address: Url::parse("http://localhost:50052").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -646,7 +647,7 @@ mod tests {
             agent_a,
             AgentInfo {
                 id: agent_a,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -658,7 +659,7 @@ mod tests {
             agent_b,
             AgentInfo {
                 id: agent_b,
-                address: "localhost:50052".to_string(),
+                address: Url::parse("http://localhost:50052").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -693,7 +694,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -727,7 +728,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Busy, // Already busy!
@@ -774,7 +775,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -818,7 +819,7 @@ mod tests {
             agent1,
             AgentInfo {
                 id: agent1,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -830,7 +831,7 @@ mod tests {
             agent2,
             AgentInfo {
                 id: agent2,
-                address: "localhost:50052".to_string(),
+                address: Url::parse("http://localhost:50052").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -894,7 +895,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: "localhost:50051".to_string(),
+                address: Url::parse("http://localhost:50051").unwrap(),
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,

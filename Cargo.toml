@@ -41,6 +41,10 @@ bytes = "1.9"
 camino = { version = "1.1", features = ["serde1"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
+dirs = "5.0"
+url = { version = "2.5", features = ["serde"] }
+clap-serde-derive = "0.2"
+toml = "0.8"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

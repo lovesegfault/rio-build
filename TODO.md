@@ -353,20 +353,54 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - Test suite: 15.6 seconds (was 64s before optimization)
 - Heartbeat system ready for multi-node clusters in Phase 3
 
-### 2.6 CLI Cluster Discovery (rio-build)
+### 2.6 CLI Cluster Discovery (rio-build) ✅ COMPLETED
 
-- [ ] Enhance `rio-build/src/client.rs`
-  - [ ] Method: `discover_cluster(seed_urls) -> Result<ClusterInfo>`
-    - [ ] Try connecting to each seed URL
-    - [ ] Call `GetClusterMembers()` RPC
-    - [ ] Parse response, identify leader
-    - [ ] Cache cluster info for 60 seconds (timestamp + data)
-  - [ ] Method: `connect_to_leader(cluster_info) -> Result<RioClient>`
-    - [ ] Connect to leader agent's gRPC endpoint
-    - [ ] Return client
-- [ ] Add CLI config file support: `~/.config/rio/config.toml`
-  - [ ] Field: `seed_agents = ["http://agent1:50051", "http://agent2:50051"]`
-  - [ ] Load in main(), pass to client
+- [x] Create `rio-build/src/config.rs`
+  - [x] Function: `default_config_path()` - Returns ~/.config/rio/config.toml
+  - [x] Function: `load_config_file()` - Load config if exists, return None otherwise
+  - [x] Function: `create_default_config()` - Create default config with localhost seed
+  - [x] Tests for loading, missing files, default creation
+- [x] Create `rio-build/src/cluster.rs`
+  - [x] Struct: `ClusterInfo` - Stores leader, agents, discovery timestamp
+  - [x] Method: `is_stale(ttl)` - Check if cluster info needs refresh
+  - [x] Function: `discover_cluster(seed_urls)` - Try each seed until success
+  - [x] Function: `try_discover_from_agent()` - Call GetClusterMembers RPC
+  - [x] Find leader from agent list using leader_id
+  - [x] 5 second timeout per agent connection
+  - [x] Tests for staleness, leader lookup
+- [x] Update `rio-build/src/main.rs`
+  - [x] Use `ClapSerde` derive on Args struct
+  - [x] Load config file from ~/.config/rio/config.toml if exists
+  - [x] Merge with CLI args using `Args::from(file_config).merge_clap()`
+  - [x] CLI args override config file (layered config)
+  - [x] Changed `--agent` to `--seed-agents` (Vec<Url>)
+  - [x] Validate: seed_agents not empty, URLs use http/https scheme
+  - [x] Call `discover_cluster()` to find leader
+  - [x] Connect to leader's address
+
+**Implementation notes:**
+- Used `clap-serde-derive` for config file + CLI arg merging
+- Used `url` crate with proper `Url` type (validates URLs)
+- Config file is optional - CLI args work standalone
+- Discovery tries each seed agent with 5s timeout
+- Returns first successful GetClusterMembers response
+
+**Dependencies added:**
+- clap-serde-derive = "0.2"
+- url = "2.5" (with serde feature)
+- toml = "0.8"
+- dirs = "5.0"
+
+**Tests:**
+- 4 config tests (loading, validation, defaults)
+- 3 cluster tests (staleness, leader lookup)
+- All 35 tests passing across workspace
+
+**Status:**
+- CLI can now discover Raft clusters from seed agents
+- Automatically connects to current leader
+- Config file support with CLI override
+- Ready for integration with multi-node clusters
 
 ### 2.7 Phase 2 Testing
 

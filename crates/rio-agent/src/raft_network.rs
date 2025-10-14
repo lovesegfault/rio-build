@@ -68,7 +68,7 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         // Phase 2.4: Single-node cluster doesn't need network communication
         // Phase 3+: Will implement gRPC call to target agent
-        tracing::debug!(target = self.target, "append_entries (not implemented)");
+        tracing::debug!(target = %self.target, "append_entries (not implemented)");
         Err(RPCError::Network(NetworkError::new(
             &std::io::Error::other("Multi-node not implemented yet"),
         )))
@@ -83,7 +83,7 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
         RPCError<NodeId, Node, RaftError<NodeId, InstallSnapshotError>>,
     > {
         // Phase 2.4: Not needed for single-node
-        tracing::debug!(target = self.target, "install_snapshot (not implemented)");
+        tracing::debug!(target = %self.target, "install_snapshot (not implemented)");
         Err(RPCError::Network(NetworkError::new(
             &std::io::Error::other("Multi-node not implemented yet"),
         )))
@@ -95,7 +95,7 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         // Phase 2.4: Single-node doesn't need voting
-        tracing::debug!(target = self.target, "vote (not implemented)");
+        tracing::debug!(target = %self.target, "vote (not implemented)");
         Err(RPCError::Network(NetworkError::new(
             &std::io::Error::other("Multi-node not implemented yet"),
         )))
