@@ -463,23 +463,59 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
 - Zero clippy warnings
 - Agent must be bootstrapped with --bootstrap (no Phase 1 mode)
 
-### 3.2 Agent Receives Assignment (rio-agent)
+### 3.2 Agent Receives Assignment (rio-agent) ✅ COMPLETED
 
-- [ ] Create `rio-agent/src/build_coordinator.rs`
-  - [ ] Function: `on_raft_committed(agent, raft_cmd)`
-    - [ ] Pattern match on RaftCommand
-    - [ ] If `BuildQueued` and `selected_agent == self.id`:
-      - [ ] Read derivation NAR from Raft storage (pending_derivations)
-      - [ ] Check if currently building:
-        - [ ] If yes and has deps in queue: Propose QueuedDependency status
-        - [ ] If yes and no deps: Propose QueuedCapacity status
-        - [ ] If no: Start build immediately with Building status
-- [ ] Re-enable `test_end_to_end_build_flow` (currently ignored, waiting for Phase 3.2)
+- [x] Create `rio-agent/src/build_coordinator.rs`
+  - [x] Polls cluster state every 100ms for builds assigned to this agent
+  - [x] Tracks started builds to avoid duplicates
+  - [x] Reads derivation NAR from Raft storage (pending_derivations)
+  - [x] Calls builder::start_build() to spawn nix-build
+  - [x] Runs as background task alongside heartbeat system
+- [x] Refactored builder::start_build() to take current_build instead of full Agent
+- [x] Started coordinator in Agent::bootstrap(), returns 4th handle
+- [x] Re-enabled test_end_to_end_build_flow (now passing)
+- [x] Removed --bootstrap flag (Raft is now the only mode)
+- [x] Added 200ms wait in CLI after BuildAssigned before subscribing
 
-### 3.3 Multi-User Subscriptions (rio-agent)
+**Status:**
+- Full Raft-coordinated build flow working end-to-end
+- All 38 tests passing
+- Manual verification successful
+- Ready for multi-node clusters
+
+### 3.3 Multi-Node Cluster Support (rio-agent)
+
+**Goal:** Enable multiple agents to join together into a Raft cluster
+
+- [ ] Add `--join` flag to rio-agent
+  - [ ] Flag: `--join <seed_url>` - Join existing cluster instead of bootstrapping
+  - [ ] If provided, call Agent::join() instead of Agent::bootstrap()
+- [ ] Implement `Agent::join(seed_url)` in agent.rs
+  - [ ] Connect to seed agent via gRPC
+  - [ ] Call JoinCluster RPC with this agent's info
+  - [ ] Wait for Raft membership change to complete
+  - [ ] Start heartbeat and coordinator tasks
+- [ ] Implement JoinCluster RPC in grpc_server.rs
+  - [ ] Verify leader (only leader can accept joins)
+  - [ ] Propose membership change to Raft
+  - [ ] Wait for commit
+  - [ ] Return success to joining agent
+- [ ] Implement RaftNetwork gRPC in raft_network.rs
+  - [ ] Implement append_entries() - Forward to target agent's AppendEntries RPC
+  - [ ] Implement vote() - Forward to target agent's Vote RPC
+  - [ ] Implement install_snapshot() - Forward to target agent's InstallSnapshot RPC
+- [ ] Create rio-common/proto/rio/v1/raft.proto handlers
+  - [ ] Implement AppendEntries RPC handler
+  - [ ] Implement Vote RPC handler
+  - [ ] Implement InstallSnapshot RPC handler
+- [ ] Add tests for multi-node clusters
+  - [ ] Test: Bootstrap + 2 joins → 3-node cluster
+  - [ ] Test: Leader election after leader dies
+  - [ ] Test: Heartbeat across nodes
+
+### 3.4 Multi-User Subscriptions (rio-agent)
 
 - [ ] Enhance `BuildJob` struct in `agent.rs`:
-  - [ ] Change: `subscribers: Vec<mpsc::Sender<BuildUpdate>>`
   - [ ] Add: `log_history: VecDeque<LogLine>` (cap at 10,000 lines)
 - [ ] Enhance `SubscribeToBuild` RPC:
   - [ ] Find existing `BuildJob` by derivation_path
@@ -492,7 +528,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [ ] When log line arrives, append to log_history
   - [ ] Broadcast to all active subscribers
 
-### 3.4 Build Completion Flow (rio-agent)
+### 3.5 Build Completion Flow (rio-agent)
 
 - [ ] In `builder.rs`, enhance `wait_for_completion()`:
   - [ ] After build succeeds, call `stream_outputs()` (from Phase 1)
@@ -512,7 +548,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [ ] Find dependent builds in pending queue
   - [ ] Cascade failure to dependents (see section 3.6)
 
-### 3.5 Completed Build Cache (rio-agent)
+### 3.6 Completed Build Cache (rio-agent)
 
 - [ ] Enhance `ClusterState` in `state_machine.rs`:
   - [ ] Initialize `completed_builds: LruCache::new(100)` (cap at 100 entries)
@@ -526,7 +562,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
     - [ ] Stream to CLI
   - [ ] If not found: Return NOT_FOUND status
 
-### 3.6 Build Deduplication (rio-agent + rio-build)
+### 3.7 Build Deduplication (rio-agent + rio-build)
 
 - [ ] CLI enhancement in `client.rs`:
   - [ ] On `AlreadyBuilding` response:
@@ -539,7 +575,7 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
     - [ ] Call `GetCompletedBuild(derivation_path)`
     - [ ] Receive and import outputs
 
-### 3.7 Phase 3 Testing
+### 3.8 Phase 3 Testing
 
 - [ ] Test: Single build, single user
   - [ ] Form 3-agent cluster
