@@ -1105,23 +1105,28 @@ Result: Both builds naturally migrate to Agent J via independent retry + affinit
 **Bootstrap (first agent):**
 
 ```bash
-rio-agent --bootstrap --listen=0.0.0.0:50051 --data-dir=/var/lib/rio
+rio-agent --listen=0.0.0.0:50051 --data-dir=/var/lib/rio
 ```
 
-- Creates single-node Raft cluster
+- Creates single-node Raft cluster automatically
 - Agent ID: generated UUID
 - Raft state: { agents: { self }, active_jobs: {} }
 
 **Join existing cluster:**
 
 ```bash
-rio-agent --join=https://agent1.example.com:50051 --listen=0.0.0.0:50051
+# Explicit join (production)
+rio-agent --join=http://agent1.example.com:50051 --listen=0.0.0.0:50051
+
+# Auto-discovery (development)
+rio-agent --seeds=agent1:50051,agent2:50051 --listen=0.0.0.0:50051
 ```
 
-- Connects to agent1 via gRPC
+- Connects to seed agent(s) via gRPC
 - Sends JoinCluster RPC
-- agent1 (or leader) proposes RaftCommand::AgentJoined
+- Seed agent (or leader) proposes RaftCommand::AgentJoined
 - Once committed, new agent becomes voting member
+- Auto-discovery tries each seed, bootstraps if all fail (with jitter)
 
 **Heartbeats and Failure Detection:**
 
