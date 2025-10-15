@@ -469,21 +469,26 @@ async fn test_late_joiner_receives_catch_up_logs() {
         .expect("SubscribeToBuild failed for late joiner")
         .into_inner();
 
-    // Late joiner should receive catch-up logs first
-    let mut late_joiner_catch_up_logs = Vec::new();
-    while let Some(Ok(update)) = stream2.message().await.transpose() {
-        if matches!(update.update, Some(build_update::Update::Log(_))) {
-            late_joiner_catch_up_logs.push(update.clone());
-        }
+    // Late joiner should receive catch-up logs first (with timeout)
+    let late_joiner_catch_up_logs = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut logs = Vec::new();
+        while let Some(Ok(update)) = stream2.message().await.transpose() {
+            if matches!(update.update, Some(build_update::Update::Log(_))) {
+                logs.push(update.clone());
+            }
 
-        // Stop collecting after we get some logs or hit completion
-        if late_joiner_catch_up_logs.len() >= first_subscriber_logs.len()
-            || matches!(update.update, Some(build_update::Update::Completed(_)))
-            || matches!(update.update, Some(build_update::Update::Failed(_)))
-        {
-            break;
+            // Stop collecting after we get some logs or hit completion
+            if logs.len() >= first_subscriber_logs.len()
+                || matches!(update.update, Some(build_update::Update::Completed(_)))
+                || matches!(update.update, Some(build_update::Update::Failed(_)))
+            {
+                break;
+            }
         }
-    }
+        logs
+    })
+    .await
+    .expect("Test timeout: late joiner did not receive logs within 30 seconds");
 
     println!(
         "Late joiner received {} catch-up log messages",
@@ -601,21 +606,60 @@ async fn test_build_completion_updates_raft_state() {
         .expect("SubscribeToBuild failed")
         .into_inner();
 
-    let mut completed = false;
-    while let Some(Ok(update)) = stream.message().await.transpose() {
-        if matches!(update.update, Some(build_update::Update::Completed(_))) {
-            completed = true;
-            break;
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(result) = stream.message().await.transpose() {
+            match result {
+                Ok(update) => {
+                    if matches!(update.update, Some(build_update::Update::Completed(_))) {
+                        return true;
+                    }
+                    if matches!(update.update, Some(build_update::Update::Failed(_))) {
+                        panic!("Build failed unexpectedly");
+                    }
+                }
+                Err(e) => {
+                    panic!("Stream error: {}", e);
+                }
+            }
         }
-        if matches!(update.update, Some(build_update::Update::Failed(_))) {
-            panic!("Build failed unexpectedly");
+        // Stream ended without completion message
+        false
+    })
+    .await;
+
+    match completed {
+        Ok(true) => {
+            // Build completed successfully
+        }
+        Ok(false) => {
+            panic!("Stream ended without receiving completion message");
+        }
+        Err(_) => {
+            panic!("Test timeout: build did not complete within 30 seconds");
         }
     }
 
-    assert!(completed, "Build should complete successfully");
+    // Poll for Raft state to update (with timeout)
+    let mut raft_updated = false;
+    for _attempt in 0..50 {
+        let has_completed = {
+            let state = state_machine.data.read();
+            let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+            state.cluster.completed_builds.contains_key(&drv_path_key)
+        }; // Lock dropped here
 
-    // Give Raft time to process BuildCompleted command
-    tokio::time::sleep(Duration::from_millis(500)).await;
+        if has_completed {
+            raft_updated = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        raft_updated,
+        "Raft should process BuildCompleted within 5 seconds"
+    );
 
     // Verify build moved from in_progress to completed_builds
     {
@@ -666,7 +710,7 @@ async fn test_get_completed_build_serves_cache() {
     let listen_addr = "127.0.0.1:50894".to_string();
     let url = format!("http://{}", listen_addr);
 
-    let _agent = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr.clone(),
         Some(Duration::from_secs(1)),
@@ -675,6 +719,8 @@ async fn test_get_completed_build_serves_cache() {
     )
     .await
     .expect("Failed to bootstrap agent");
+
+    let state_machine = agent.state_machine.clone();
 
     // Wait for agent to become leader (server is already running)
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -714,21 +760,49 @@ async fn test_get_completed_build_serves_cache() {
         .expect("SubscribeToBuild failed")
         .into_inner();
 
-    let mut completed = false;
-    while let Some(Ok(update)) = stream.message().await.transpose() {
-        if matches!(update.update, Some(build_update::Update::Completed(_))) {
-            completed = true;
-            break;
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(Ok(update)) = stream.message().await.transpose() {
+            if matches!(update.update, Some(build_update::Update::Completed(_))) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+
+    match completed {
+        Ok(true) => {
+            // Build completed successfully
+        }
+        Ok(false) => {
+            panic!("Stream ended without receiving completion message");
+        }
+        Err(_) => {
+            panic!("Test timeout: build did not complete within 30 seconds");
         }
     }
 
-    assert!(
-        completed,
-        "Build should complete before testing GetCompletedBuild"
-    );
+    // Poll for Raft state to update (instead of fixed sleep)
+    let mut raft_updated = false;
+    for _attempt in 0..50 {
+        let has_completed = {
+            let state = state_machine.data.read();
+            let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+            state.cluster.completed_builds.contains_key(&drv_path_key)
+        }; // Lock dropped here
 
-    // Give Raft time to process BuildCompleted
-    tokio::time::sleep(Duration::from_millis(500)).await;
+        if has_completed {
+            raft_updated = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        raft_updated,
+        "Raft should process BuildCompleted within 5 seconds"
+    );
 
     println!("Build completed, now testing GetCompletedBuild...");
 

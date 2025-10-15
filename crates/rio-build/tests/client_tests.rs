@@ -4,8 +4,9 @@ mod mock_agent;
 
 use camino::Utf8PathBuf;
 use rio_build::client::RioClient;
+use rio_build::cluster::ClusterInfo;
 use rio_build::evaluator::BuildInfo;
-use rio_common::proto::{BuildCompleted, BuildUpdate, LogLine, build_update};
+use rio_common::proto::{AgentInfo, BuildCompleted, BuildUpdate, LogLine, build_update};
 
 #[tokio::test]
 async fn test_client_submit_and_subscribe() {
@@ -47,9 +48,24 @@ async fn test_client_submit_and_subscribe() {
         dependency_paths: vec![],
     };
 
+    // Create mock cluster info
+    let cluster_info = ClusterInfo {
+        leader_id: "test-agent".to_string(),
+        leader_address: url.clone(),
+        agents: vec![AgentInfo {
+            id: "test-agent".to_string(),
+            address: url.clone(),
+            platforms: vec!["x86_64-linux".to_string()],
+            features: vec![],
+            status: 0, // Available
+            capacity: None,
+        }],
+        discovered_at: std::time::Instant::now(),
+    };
+
     // Submit build
     let mut stream = client
-        .submit_build(build_info)
+        .submit_build(build_info, &cluster_info)
         .await
         .expect("Failed to submit build");
 
