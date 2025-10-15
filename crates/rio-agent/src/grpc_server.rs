@@ -289,8 +289,16 @@ impl RioAgent for RioAgentService {
         // Promote learner to voting member
         tracing::info!("Promoting agent {} to voting member", joining_id);
 
-        // Note: change_membership adds members, second arg is retain (not remove)
-        raft.change_membership([joining_id], false)
+        // Get current voters and add the new one
+        let metrics = raft.metrics().borrow().clone();
+        let current_membership = metrics.membership_config.membership();
+        let mut new_voters: Vec<uuid::Uuid> = current_membership.voter_ids().collect();
+        if !new_voters.contains(&joining_id) {
+            new_voters.push(joining_id);
+        }
+
+        // change_membership with retain=true adds these as voters, keeping existing learners
+        raft.change_membership(new_voters, true)
             .await
             .map_err(|e| Status::internal(format!("Failed to change membership: {}", e)))?;
 
@@ -330,6 +338,41 @@ pub async fn serve(listen_addr: String, agent: Agent) -> Result<()> {
             rio_common::proto::raft_internal_server::RaftInternalServer::new(raft_internal_service),
         )
         .serve(addr)
+        .await
+        .context("gRPC server error")?;
+
+    Ok(())
+}
+
+/// Start the gRPC server with a pre-bound listener
+///
+/// Used internally by Agent::bootstrap() to ensure server is ready before Raft initializes.
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener,
+    agent: Arc<Agent>,
+) -> Result<()> {
+    // Create RioAgent service (CLI-facing)
+    let rio_agent_service = RioAgentService {
+        agent: agent.clone(),
+    };
+
+    // Create RaftInternal service (agent-to-agent Raft communication)
+    let raft_internal_service = crate::raft_grpc::RaftInternalService::new(agent.raft.clone());
+
+    let addr = listener
+        .local_addr()
+        .context("Failed to get local address")?;
+    tracing::info!(
+        "gRPC server listening on {} (RioAgent + RaftInternal services)",
+        addr
+    );
+
+    Server::builder()
+        .add_service(RioAgentServer::new(rio_agent_service))
+        .add_service(
+            rio_common::proto::raft_internal_server::RaftInternalServer::new(raft_internal_service),
+        )
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
         .context("gRPC server error")?;
 

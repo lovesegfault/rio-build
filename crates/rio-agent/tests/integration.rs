@@ -62,17 +62,15 @@ async fn test_end_to_end_build_flow() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().expect("No local addr");
-    let listen_addr = format!("127.0.0.1:{}", addr.port());
+    // Use a fixed port for testing
+    let listen_addr = "127.0.0.1:50888".to_string();
     let url = format!("http://{}", listen_addr);
 
     // Bootstrap agent with Raft (fast intervals for testing)
-    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
+    // Note: bootstrap() now starts the gRPC server automatically
+    let _agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr,
+        listen_addr.clone(),
         Some(std::time::Duration::from_secs(1)),
         Some(std::time::Duration::from_millis(500)),
         Some(std::time::Duration::from_secs(3)),
@@ -80,20 +78,7 @@ async fn test_end_to_end_build_flow() {
     .await
     .expect("Failed to bootstrap agent");
 
-    let server_task = tokio::spawn(async move {
-        use rio_common::proto::rio_agent_server::RioAgentServer;
-        use tonic::transport::Server;
-
-        Server::builder()
-            .add_service(RioAgentServer::new(
-                rio_agent::grpc_server::RioAgentService::new(agent),
-            ))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("Server failed");
-    });
-
-    // Wait for server to start and agent to become leader
+    // Wait for agent to become leader (server is already running)
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // Create unique derivation (guaranteed not cached)
@@ -199,9 +184,6 @@ async fn test_end_to_end_build_flow() {
     assert!(got_completion, "Should receive completion message");
 
     println!("Test passed! Received {} updates total", update_count);
-
-    // Clean up
-    server_task.abort();
 }
 
 /// Test that we can export and import a derivation via NAR
@@ -268,14 +250,10 @@ async fn test_queue_build_via_raft() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().expect("No local addr");
-    let listen_addr = format!("127.0.0.1:{}", addr.port());
+    let listen_addr = "127.0.0.1:50889".to_string();
     let url = format!("http://{}", listen_addr);
 
-    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr,
         Some(Duration::from_secs(1)),
@@ -287,21 +265,7 @@ async fn test_queue_build_via_raft() {
 
     let agent_id = agent.id;
 
-    // Start gRPC server
-    let server_task = tokio::spawn(async move {
-        use rio_common::proto::rio_agent_server::RioAgentServer;
-        use tonic::transport::Server;
-
-        Server::builder()
-            .add_service(RioAgentServer::new(
-                rio_agent::grpc_server::RioAgentService::new(agent),
-            ))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("Server failed");
-    });
-
-    // Wait for leader election
+    // Wait for leader election (server already running)
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Connect client
@@ -357,8 +321,6 @@ async fn test_queue_build_via_raft() {
         }
         other => panic!("Expected AlreadyBuilding, got: {:?}", other),
     }
-
-    server_task.abort();
 }
 
 /// Test heartbeat lifecycle with bootstrapped Raft cluster
@@ -374,7 +336,7 @@ async fn test_heartbeat_lifecycle() {
 
     let listen_addr = "127.0.0.1:50999".to_string();
     // Use fast intervals for testing: 1s heartbeat, 0.5s check, 3s timeout
-    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr,
         Some(Duration::from_secs(1)),
