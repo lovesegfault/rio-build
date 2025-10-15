@@ -225,7 +225,7 @@ impl FromProto<proto::AppendEntriesRequest> for RaftAppendEntriesRequest<TypeCon
             .collect();
 
         RaftAppendEntriesRequest {
-            vote: vote.clone(),
+            vote,
             prev_log_id: pb
                 .prev_log_id
                 .as_ref()
@@ -279,7 +279,7 @@ impl FromProto<proto::AppendEntriesResponse> for RaftAppendEntriesResponse<NodeI
                 let vote = pb
                     .vote
                     .as_ref()
-                    .map(|v| Vote::from_proto(v))
+                    .map(Vote::from_proto)
                     .unwrap_or_else(|| Vote::new(match_log_id.term, NodeId::nil()));
                 RaftAppendEntriesResponse::PartialSuccess(Some(LogId::from_proto_with_vote(
                     match_log_id,
@@ -318,7 +318,7 @@ impl FromProto<proto::VoteRequest> for RaftVoteRequest<NodeId> {
         let vote = Vote::from_proto(pb.vote.as_ref().expect("VoteRequest missing vote"));
 
         RaftVoteRequest {
-            vote: vote.clone(),
+            vote,
             last_log_id: pb
                 .last_log_id
                 .as_ref()
@@ -342,7 +342,7 @@ impl FromProto<proto::VoteResponse> for RaftVoteResponse<NodeId> {
         let vote = Vote::from_proto(pb.vote.as_ref().expect("VoteResponse missing vote"));
 
         RaftVoteResponse {
-            vote: vote.clone(),
+            vote,
             vote_granted: pb.vote_granted,
             last_log_id: pb
                 .last_log_id

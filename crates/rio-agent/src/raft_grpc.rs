@@ -117,7 +117,7 @@ impl RaftInternal for RaftInternalService {
                 }),
                 meta.last_membership
                     .as_ref()
-                    .map(|m| crate::raft_proto_conv::FromProto::from_proto(m))
+                    .map(crate::raft_proto_conv::FromProto::from_proto)
                     .expect("Snapshot missing membership"),
             ),
             snapshot_id: meta.snapshot_id.clone(),
