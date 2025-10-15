@@ -63,41 +63,154 @@ pub struct RaftNetworkConnection {
 impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
     async fn append_entries(
         &mut self,
-        _req: AppendEntriesRequest<TypeConfig>,
+        req: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
-        // Phase 2.4: Single-node cluster doesn't need network communication
-        // Phase 3+: Will implement gRPC call to target agent
-        tracing::debug!(target = %self.target, "append_entries (not implemented)");
-        Err(RPCError::Network(NetworkError::new(
-            &std::io::Error::other("Multi-node not implemented yet"),
-        )))
+        use crate::raft_proto_conv::{FromProto, ToProto};
+        use rio_common::proto::raft_internal_client::RaftInternalClient;
+
+        tracing::debug!(target = %self.target, addr = %self.addr, "Forwarding append_entries to target");
+
+        // Connect to target agent
+        let url = if self.addr.starts_with("http://") || self.addr.starts_with("https://") {
+            self.addr.clone()
+        } else {
+            format!("http://{}", self.addr)
+        };
+
+        let mut client = RaftInternalClient::connect(url.clone())
+            .await
+            .map_err(|e| {
+                tracing::warn!("Failed to connect to {}: {}", url, e);
+                RPCError::Network(NetworkError::new(&e))
+            })?;
+
+        // Convert to proto
+        let pb_req = req.to_proto();
+
+        // Send RPC
+        let pb_resp = client
+            .append_entries(pb_req)
+            .await
+            .map_err(|e| {
+                tracing::warn!("append_entries RPC failed to {}: {}", url, e);
+                RPCError::Network(NetworkError::new(&e))
+            })?
+            .into_inner();
+
+        // Convert response back
+        let raft_resp = AppendEntriesResponse::from_proto(&pb_resp);
+
+        Ok(raft_resp)
     }
 
     async fn install_snapshot(
         &mut self,
-        _req: InstallSnapshotRequest<TypeConfig>,
+        req: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, Node, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        // Phase 2.4: Not needed for single-node
-        tracing::debug!(target = %self.target, "install_snapshot (not implemented)");
-        Err(RPCError::Network(NetworkError::new(
-            &std::io::Error::other("Multi-node not implemented yet"),
-        )))
+        use crate::raft_proto_conv::{FromProto, ToProto};
+        use rio_common::proto::raft_internal_client::RaftInternalClient;
+        use rio_common::proto::{InstallSnapshotRequest as PbRequest, install_snapshot_request};
+
+        tracing::debug!(target = %self.target, addr = %self.addr, "Forwarding install_snapshot to target");
+
+        // Connect to target agent
+        let url = if self.addr.starts_with("http://") || self.addr.starts_with("https://") {
+            self.addr.clone()
+        } else {
+            format!("http://{}", self.addr)
+        };
+
+        let mut client = RaftInternalClient::connect(url.clone())
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+
+        // Create streaming request
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+        // Send meta chunk
+        let meta_chunk = PbRequest {
+            payload: Some(install_snapshot_request::Payload::Meta(
+                rio_common::proto::SnapshotMeta {
+                    vote: Some(req.vote.to_proto()),
+                    last_log_id: req.meta.last_log_id.as_ref().map(|id| id.to_proto()),
+                    last_membership: Some(req.meta.last_membership.membership().to_proto()),
+                    snapshot_id: req.meta.snapshot_id.clone(),
+                },
+            )),
+        };
+
+        tx.send(meta_chunk)
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+
+        // Send data chunks (1MB chunks)
+        let chunk_size = 1024 * 1024;
+        for chunk in req.data.chunks(chunk_size) {
+            let data_chunk = PbRequest {
+                payload: Some(install_snapshot_request::Payload::Chunk(chunk.to_vec())),
+            };
+            tx.send(data_chunk)
+                .await
+                .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        }
+
+        drop(tx); // Close stream
+
+        // Send RPC
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let pb_resp = client
+            .install_snapshot(stream)
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
+            .into_inner();
+
+        // Convert response
+        let raft_resp = InstallSnapshotResponse {
+            vote: FromProto::from_proto(pb_resp.vote.as_ref().expect("Response missing vote")),
+        };
+
+        Ok(raft_resp)
     }
 
     async fn vote(
         &mut self,
-        _req: VoteRequest<NodeId>,
+        req: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
-        // Phase 2.4: Single-node doesn't need voting
-        tracing::debug!(target = %self.target, "vote (not implemented)");
-        Err(RPCError::Network(NetworkError::new(
-            &std::io::Error::other("Multi-node not implemented yet"),
-        )))
+        use crate::raft_proto_conv::{FromProto, ToProto};
+        use rio_common::proto::raft_internal_client::RaftInternalClient;
+
+        tracing::debug!(target = %self.target, addr = %self.addr, "Forwarding vote to target");
+
+        // Connect to target agent
+        let url = if self.addr.starts_with("http://") || self.addr.starts_with("https://") {
+            self.addr.clone()
+        } else {
+            format!("http://{}", self.addr)
+        };
+
+        let mut client = RaftInternalClient::connect(url.clone())
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+
+        // Convert to proto
+        let pb_req = req.to_proto();
+
+        // Send RPC
+        let pb_resp = client
+            .vote(pb_req)
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
+            .into_inner();
+
+        // Convert response back
+        let raft_resp = VoteResponse::from_proto(&pb_resp);
+
+        Ok(raft_resp)
     }
 }

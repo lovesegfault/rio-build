@@ -531,21 +531,26 @@ Implement the algorithm from DESIGN.md section 1 "Deterministic Agent Assignment
   - [x] Defined Vote, LogId, LeaderId, Node, Membership, Entry messages
   - [x] AppendEntries/Vote/InstallSnapshot with structured messages (not bytes)
   - [x] Based on openraft example (raft-kv-memstore-grpc)
-- [ ] Implement protobuf conversions (rio-agent/src/raft_proto_conv.rs)
-  - [ ] Implement From<openraft::Vote> for proto::Vote
-  - [ ] Implement From<proto::Vote> for openraft::Vote
-  - [ ] Implement conversions for LogId, Entry, Membership, etc.
-  - [ ] Follow openraft example pattern (pb_impl modules)
-- [ ] Implement RaftNetwork gRPC in raft_network.rs
-  - [ ] Implement append_entries() - Create gRPC client, forward to target agent's AppendEntries RPC
-  - [ ] Implement vote() - Create gRPC client, forward to target agent's Vote RPC
-  - [ ] Implement install_snapshot() - Create gRPC client, forward to target agent's InstallSnapshot RPC
-  - [ ] Add connection pooling/caching for target agents
-- [ ] Implement Raft RPC handlers (new gRPC service)
-  - [ ] Implement AppendEntries RPC handler - calls raft.append_entries()
-  - [ ] Implement Vote RPC handler - calls raft.vote()
-  - [ ] Implement InstallSnapshot RPC handler - calls raft.install_snapshot()
-  - [ ] Add to gRPC server alongside RioAgent service
+  - [x] Updated build.rs to compile raft.proto
+- [x] Implement protobuf conversions (rio-agent/src/raft_proto_conv.rs)
+  - [x] Extension traits ToProto<T> and FromProto<T> (avoids orphan rule)
+  - [x] Special FromProtoWithVote<T> trait for LogId (needs Vote context for node_id)
+  - [x] Conversions for Vote, LogId, Node, Membership, Entry
+  - [x] Conversions for AppendEntries, Vote RPC request/response types
+  - [x] Handles AppendEntriesResponse enum (Success/PartialSuccess/HigherVote/Conflict)
+  - [x] Handles openraft 0.9 API (get_joint_config, nodes iterator, etc.)
+- [x] Implement Raft RPC handlers (rio-agent/src/raft_grpc.rs)
+  - [x] Created RaftInternalService with raft instance
+  - [x] Implemented AppendEntries RPC - converts proto, forwards to raft.append_entries()
+  - [x] Implemented Vote RPC - converts proto, forwards to raft.vote()
+  - [x] Implemented InstallSnapshot RPC - handles streaming chunks, forwards to raft.install_snapshot()
+  - [x] Added RaftInternal service to gRPC server alongside RioAgent service
+- [x] Implement RaftNetwork gRPC in raft_network.rs
+  - [x] Implemented append_entries() - Connects to target, converts req, sends RPC, converts resp
+  - [x] Implemented vote() - Same pattern for vote requests
+  - [x] Implemented install_snapshot() - Streams meta + data chunks (1MB) to target
+  - [x] Adds http:// scheme if missing from addresses
+  - [ ] TODO: Add connection pooling/caching (optimization for later)
 - [ ] Add tests for multi-node clusters
   - [ ] Test: Explicit join (agent A bootstrap, agent B --join A)
   - [ ] Test: Auto-discovery (3 agents with same --seeds)
