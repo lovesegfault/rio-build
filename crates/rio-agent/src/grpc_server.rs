@@ -310,14 +310,25 @@ pub async fn serve(listen_addr: String, agent: Agent) -> Result<()> {
         .with_context(|| format!("Invalid listen address: {}", listen_addr))?;
 
     let agent = Arc::new(agent);
-    let service = RioAgentService {
+
+    // Create RioAgent service (CLI-facing)
+    let rio_agent_service = RioAgentService {
         agent: agent.clone(),
     };
 
-    tracing::info!("gRPC server listening on {}", addr);
+    // Create RaftInternal service (agent-to-agent Raft communication)
+    let raft_internal_service = crate::raft_grpc::RaftInternalService::new(agent.raft.clone());
+
+    tracing::info!(
+        "gRPC server listening on {} (RioAgent + RaftInternal services)",
+        addr
+    );
 
     Server::builder()
-        .add_service(RioAgentServer::new(service))
+        .add_service(RioAgentServer::new(rio_agent_service))
+        .add_service(
+            rio_common::proto::raft_internal_server::RaftInternalServer::new(raft_internal_service),
+        )
         .serve(addr)
         .await
         .context("gRPC server error")?;
