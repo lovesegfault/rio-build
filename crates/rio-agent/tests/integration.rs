@@ -385,11 +385,7 @@ async fn test_heartbeat_lifecycle() {
     .expect("Failed to bootstrap agent");
 
     let agent_id = agent.id;
-    let sm_store = agent
-        .state_machine
-        .as_ref()
-        .expect("No state machine")
-        .clone();
+    let sm_store = agent.state_machine.clone();
 
     // Wait for initial heartbeat (should happen within 1-2 seconds with fast interval)
     tokio::time::sleep(Duration::from_millis(2500)).await;

@@ -68,6 +68,62 @@ pub async fn bootstrap_single_node(
     Ok((Arc::new(raft), sm_store_clone))
 }
 
+/// Join an existing Raft cluster
+///
+/// Initializes Raft as a learner joining an existing cluster.
+/// The leader has already added us via add_learner() and change_membership().
+/// We just need to initialize our Raft instance and it will sync from the cluster.
+pub async fn join_cluster(
+    node_id: NodeId,
+    rpc_addr: String,
+    data_dir: &Utf8Path,
+) -> Result<(Arc<Raft<TypeConfig>>, StateMachineStore)> {
+    // Create storage
+    let (log_store, sm_store) = new_storage(data_dir)
+        .await
+        .context("Failed to create Raft storage")?;
+
+    let sm_store_clone = sm_store.clone();
+
+    // Create network
+    let network = NetworkFactory::new();
+
+    // Add self to network
+    network
+        .add_node(
+            node_id,
+            Node {
+                rpc_addr: rpc_addr.clone(),
+            },
+        )
+        .await;
+
+    // Configure Raft (same as bootstrap)
+    let config = Config {
+        heartbeat_interval: 500,
+        election_timeout_min: 1500,
+        election_timeout_max: 3000,
+        ..Default::default()
+    };
+
+    let config = Arc::new(config.validate().context("Invalid Raft config")?);
+
+    // Create Raft instance
+    // Note: We don't call initialize() - the leader has already added us
+    // Raft will sync state from the cluster automatically
+    let raft = Raft::new(node_id, config, network, log_store, sm_store)
+        .await
+        .context("Failed to create Raft instance")?;
+
+    tracing::info!(
+        node_id = %node_id,
+        rpc_addr,
+        "Initialized Raft instance (joined existing cluster)"
+    );
+
+    Ok((Arc::new(raft), sm_store_clone))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

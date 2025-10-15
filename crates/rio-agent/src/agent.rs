@@ -154,6 +154,9 @@ impl Agent {
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     )> {
+        use rio_common::proto::rio_agent_client::RioAgentClient;
+        use rio_common::proto::{AgentInfo as ProtoAgentInfo, JoinClusterRequest};
+
         // Generate unique agent ID
         let id = uuid::Uuid::new_v4();
 
@@ -166,6 +169,7 @@ impl Agent {
         let features = nix_config.system_features;
 
         tracing::info!("Agent ID: {}", id);
+        tracing::info!("Joining cluster via seed: {}", seed_url);
         tracing::info!("Platforms: {:?}", platforms);
         tracing::info!("Features: {:?}", features);
 
@@ -174,14 +178,89 @@ impl Agent {
             .await
             .with_context(|| format!("Failed to create data directory: {}", data_dir))?;
 
-        // TODO Phase 3.3: Implement cluster joining
-        // 1. Connect to seed agent
-        // 2. Call JoinCluster RPC
-        // 3. Receive cluster member list
-        // 4. Initialize Raft with existing members
-        // 5. Start background tasks
+        // Prepare our agent info for joining
+        let our_address = if rpc_addr.starts_with("http://") || rpc_addr.starts_with("https://") {
+            rpc_addr.clone()
+        } else {
+            format!("http://{}", rpc_addr)
+        };
 
-        anyhow::bail!("Agent::join() not yet implemented (Phase 3.3)")
+        let agent_info = ProtoAgentInfo {
+            id: id.to_string(),
+            address: our_address.clone(),
+            platforms: platforms.clone(),
+            features: features.clone(),
+            status: 0, // Will be set to Available by leader
+            capacity: None,
+        };
+
+        // Connect to seed agent and request to join
+        tracing::info!("Connecting to seed agent at: {}", seed_url);
+        let mut client = RioAgentClient::connect(seed_url.clone())
+            .await
+            .with_context(|| format!("Failed to connect to seed agent: {}", seed_url))?;
+
+        let join_response = client
+            .join_cluster(JoinClusterRequest {
+                agent_info: Some(agent_info),
+            })
+            .await
+            .context("JoinCluster RPC failed")?
+            .into_inner();
+
+        if !join_response.success {
+            anyhow::bail!("Failed to join cluster: {}", join_response.message);
+        }
+
+        tracing::info!("Successfully joined cluster: {}", join_response.message);
+
+        // Initialize Raft as a learner/member (not bootstrap)
+        // The leader has already added us to the cluster
+        let (raft, sm_store) = crate::raft_node::join_cluster(id, our_address.clone(), &data_dir)
+            .await
+            .context("Failed to initialize Raft after joining")?;
+
+        // Start heartbeat, failure detector, and coordinator tasks
+        let heartbeat_interval = heartbeat_interval.unwrap_or(std::time::Duration::from_secs(10));
+        let check_interval = check_interval.unwrap_or(std::time::Duration::from_secs(15));
+        let timeout = timeout.unwrap_or(std::time::Duration::from_secs(30));
+
+        let heartbeat_handle =
+            crate::heartbeat::start_heartbeat_task(id, raft.clone(), heartbeat_interval);
+        let failure_detector_handle = crate::heartbeat::start_failure_detector_task(
+            raft.clone(),
+            sm_store.clone(),
+            check_interval,
+            timeout,
+        );
+
+        // Create agent instance
+        let agent = Self {
+            id,
+            platforms,
+            features,
+            current_build: Arc::new(Mutex::new(None)),
+            data_dir,
+            raft: raft.clone(),
+            state_machine: sm_store.clone(),
+        };
+
+        // Start build coordinator
+        let coordinator_handle = crate::build_coordinator::start_build_coordinator(
+            id,
+            agent.current_build.clone(),
+            raft,
+            sm_store,
+        );
+
+        tracing::info!("Background tasks started");
+
+        Ok((
+            agent,
+            heartbeat_handle,
+            failure_detector_handle,
+            coordinator_handle,
+        ))
     }
 
     /// Auto-discovery: Try to join seeds, bootstrap if all fail
