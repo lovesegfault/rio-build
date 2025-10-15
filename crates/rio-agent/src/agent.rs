@@ -3,11 +3,12 @@
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use openraft::Raft;
+use parking_lot::Mutex;
 use rio_common::nix_utils::NixConfig;
 use rio_common::proto::BuildUpdate;
 use rio_common::{AgentId, DerivationPath};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tonic::Status;
 
 use crate::storage::{StateMachineStore, TypeConfig};
@@ -15,6 +16,11 @@ use crate::storage::{StateMachineStore, TypeConfig};
 /// Build agent
 ///
 /// All agents use Raft for cluster coordination.
+///
+/// When an Agent is dropped, it will:
+/// - Abort all background tasks (heartbeat, failure detector, coordinator, server)
+/// - Propose AgentLeft to remove itself from the cluster (best-effort)
+/// - Clean up resources
 pub struct Agent {
     /// Agent unique identifier
     pub id: AgentId,
@@ -26,7 +32,7 @@ pub struct Agent {
     pub features: Vec<String>,
 
     /// Currently executing build (None = available)
-    pub current_build: Arc<Mutex<Option<BuildJob>>>,
+    pub current_build: Arc<AsyncMutex<Option<BuildJob>>>,
 
     /// Data directory for agent state and temporary builds
     pub data_dir: Utf8PathBuf,
@@ -36,31 +42,72 @@ pub struct Agent {
 
     /// State machine store for querying cluster state
     pub state_machine: StateMachineStore,
+
+    /// Background task handles (None during initialization, set once tasks start)
+    handles: Mutex<Option<TaskHandles>>,
+}
+
+struct TaskHandles {
+    heartbeat: tokio::task::JoinHandle<()>,
+    failure_detector: tokio::task::JoinHandle<()>,
+    coordinator: tokio::task::JoinHandle<()>,
+    server: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        tracing::info!(agent_id = %self.id, "Agent dropping - cleaning up background tasks");
+
+        // Abort all background tasks if they exist
+        if let Some(handles) = self.handles.lock().take() {
+            handles.heartbeat.abort();
+            handles.failure_detector.abort();
+            handles.coordinator.abort();
+            handles.server.abort();
+
+            // Propose AgentLeft to remove from cluster (best-effort, may fail)
+            // Note: We can't await in Drop, so we spawn a task
+            let raft = self.raft.clone();
+            let agent_id = self.id;
+            tokio::spawn(async move {
+                let cmd = crate::state_machine::RaftCommand::AgentLeft { id: agent_id };
+                if let Err(e) = raft.client_write(cmd).await {
+                    tracing::debug!(agent_id = %agent_id, error = %e, "Failed to propose AgentLeft on drop (expected in tests)");
+                } else {
+                    tracing::info!(agent_id = %agent_id, "Proposed AgentLeft on drop");
+                }
+            });
+        }
+
+        tracing::info!(agent_id = %self.id, "Agent cleanup complete");
+    }
 }
 
 impl Agent {
-    /// Create a new agent with Raft cluster (bootstrap single-node)
+    /// Bootstrap a new single-node Raft cluster
     ///
-    /// Phase 2+: Creates agent and bootstraps a single-node Raft cluster.
-    /// Returns (Agent, heartbeat_handle, failure_detector_handle).
-    /// The handles run in background and will be cleaned up on process exit.
+    /// Creates a new agent and initializes it as a single-node Raft cluster leader.
+    /// The gRPC server starts automatically and runs in the background.
+    ///
+    /// This is an atomic operation - the returned agent is fully initialized
+    /// and ready to accept builds.
     ///
     /// # Arguments
+    /// * `data_dir` - Directory for Raft storage and build data
+    /// * `rpc_addr` - Address to bind gRPC server (e.g., "0.0.0.0:50051")
     /// * `heartbeat_interval` - How often to send heartbeats (None = 10 seconds default)
     /// * `check_interval` - How often to check for failed agents (None = 15 seconds default)
     /// * `timeout` - Heartbeat timeout before marking agent Down (None = 30 seconds default)
+    ///
+    /// # Returns
+    /// Arc<Agent> with gRPC server and background tasks running
     pub async fn bootstrap(
         data_dir: Utf8PathBuf,
         rpc_addr: String,
         heartbeat_interval: Option<std::time::Duration>,
         check_interval: Option<std::time::Duration>,
         timeout: Option<std::time::Duration>,
-    ) -> Result<(
-        Self,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-    )> {
+    ) -> Result<Arc<Self>> {
         // Generate unique agent ID
         let id = uuid::Uuid::new_v4();
 
@@ -81,18 +128,58 @@ impl Agent {
             .await
             .with_context(|| format!("Failed to create data directory: {}", data_dir))?;
 
-        // Bootstrap Raft cluster (NodeId = AgentId = Uuid)
+        // Bind listener FIRST (reserves port before Raft needs it)
+        let listener = tokio::net::TcpListener::bind(&rpc_addr)
+            .await
+            .with_context(|| format!("Failed to bind to {}", rpc_addr))?;
+
+        let actual_addr = listener
+            .local_addr()
+            .context("Failed to get local address")?;
+        let actual_addr_str = actual_addr.to_string();
+
+        tracing::info!("Bound gRPC listener on {}", actual_addr_str);
+
+        // Create uninitialized Raft instance
         let (raft, sm_store) =
-            crate::raft_node::bootstrap_single_node(id, rpc_addr.clone(), &data_dir)
+            crate::raft_node::create_uninitialized_raft(id, actual_addr_str.clone(), &data_dir)
                 .await
-                .context("Failed to bootstrap Raft cluster")?;
+                .context("Failed to create Raft instance")?;
+
+        let current_build = Arc::new(AsyncMutex::new(None));
+
+        // Create agent without handles yet
+        let agent = Arc::new(Self {
+            id,
+            platforms: platforms.clone(),
+            features: features.clone(),
+            current_build: current_build.clone(),
+            data_dir: data_dir.clone(),
+            raft: raft.clone(),
+            state_machine: sm_store.clone(),
+            handles: Mutex::new(None),
+        });
+
+        // Start gRPC server (must run BEFORE Raft initialization)
+        let server_handle = tokio::spawn({
+            let agent = agent.clone();
+            async move { crate::grpc_server::serve_with_listener(listener, agent).await }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tracing::info!("gRPC server started");
+
+        // Initialize Raft as single-node leader (server is now ready)
+        crate::raft_node::initialize_single_node_leader(&raft, id, actual_addr_str.clone())
+            .await
+            .context("Failed to initialize Raft as leader")?;
 
         // Register this agent in the cluster
-        crate::membership::register_agent(&raft, id, rpc_addr, platforms.clone(), features.clone())
+        crate::membership::register_agent(&raft, id, actual_addr_str, platforms, features)
             .await
             .context("Failed to register agent")?;
 
-        // Start heartbeat tasks (Phase 2.5) with configurable intervals
+        // Start heartbeat tasks AFTER becoming leader and registering
         let heartbeat_interval = heartbeat_interval.unwrap_or(std::time::Duration::from_secs(10));
         let check_interval = check_interval.unwrap_or(std::time::Duration::from_secs(15));
         let timeout = timeout.unwrap_or(std::time::Duration::from_secs(30));
@@ -108,39 +195,45 @@ impl Agent {
 
         tracing::info!("Heartbeat tasks started");
 
-        // Create agent instance
-        let agent = Self {
-            id,
-            platforms,
-            features,
-            current_build: Arc::new(Mutex::new(None)),
-            data_dir,
-            raft: raft.clone(),
-            state_machine: sm_store.clone(),
-        };
-
         // Start build coordinator (Phase 3.2) - watches for builds assigned to this agent
         let coordinator_handle = crate::build_coordinator::start_build_coordinator(
             id,
-            agent.current_build.clone(),
-            raft,
-            sm_store,
+            current_build.clone(),
+            raft.clone(),
+            sm_store.clone(),
         );
 
         tracing::info!("Build coordinator started");
 
-        Ok((
-            agent,
-            heartbeat_handle,
-            failure_detector_handle,
-            coordinator_handle,
-        ))
+        // Store all task handles (now that they're all started)
+        *agent.handles.lock() = Some(TaskHandles {
+            heartbeat: heartbeat_handle,
+            failure_detector: failure_detector_handle,
+            coordinator: coordinator_handle,
+            server: server_handle,
+        });
+
+        Ok(agent)
     }
 
     /// Join an existing Raft cluster
     ///
     /// Connects to a seed agent and requests to join its cluster.
-    /// Returns agent with background tasks started.
+    /// The gRPC server starts automatically and runs in the background.
+    ///
+    /// This is an atomic operation - the returned agent is fully joined
+    /// and synced with the cluster.
+    ///
+    /// # Arguments
+    /// * `data_dir` - Directory for Raft storage and build data
+    /// * `rpc_addr` - Address to bind gRPC server (e.g., "0.0.0.0:50051")
+    /// * `seed_url` - URL of a seed agent to join (e.g., "http://node1:50051")
+    /// * `heartbeat_interval` - How often to send heartbeats (None = 10 seconds default)
+    /// * `check_interval` - How often to check for failed agents (None = 15 seconds default)
+    /// * `timeout` - Heartbeat timeout before marking agent Down (None = 30 seconds default)
+    ///
+    /// # Returns
+    /// Arc<Agent> with gRPC server and background tasks running
     pub async fn join(
         data_dir: Utf8PathBuf,
         rpc_addr: String,
@@ -148,12 +241,7 @@ impl Agent {
         heartbeat_interval: Option<std::time::Duration>,
         check_interval: Option<std::time::Duration>,
         timeout: Option<std::time::Duration>,
-    ) -> Result<(
-        Self,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-    )> {
+    ) -> Result<Arc<Self>> {
         use rio_common::proto::rio_agent_client::RioAgentClient;
         use rio_common::proto::{AgentInfo as ProtoAgentInfo, JoinClusterRequest};
 
@@ -178,23 +266,68 @@ impl Agent {
             .await
             .with_context(|| format!("Failed to create data directory: {}", data_dir))?;
 
-        // Prepare our agent info for joining
-        let our_address = if rpc_addr.starts_with("http://") || rpc_addr.starts_with("https://") {
-            rpc_addr.clone()
-        } else {
-            format!("http://{}", rpc_addr)
-        };
+        // Bind listener FIRST
+        let listener = tokio::net::TcpListener::bind(&rpc_addr)
+            .await
+            .with_context(|| format!("Failed to bind to {}", rpc_addr))?;
 
+        let actual_addr = listener
+            .local_addr()
+            .context("Failed to get local address")?;
+        let actual_addr_str = actual_addr.to_string();
+
+        tracing::info!("Bound gRPC listener on {}", actual_addr_str);
+
+        // Prepare our address for joining
+        let our_address =
+            if actual_addr_str.starts_with("http://") || actual_addr_str.starts_with("https://") {
+                actual_addr_str.clone()
+            } else {
+                format!("http://{}", actual_addr_str)
+            };
+
+        // Initialize Raft FIRST (before JoinCluster RPC)
+        // This allows us to receive replication from leader during join
+        let (raft, sm_store) = crate::raft_node::join_cluster(id, our_address.clone(), &data_dir)
+            .await
+            .context("Failed to initialize Raft")?;
+
+        let current_build = Arc::new(AsyncMutex::new(None));
+
+        // Create agent without handles yet
+        let agent = Arc::new(Self {
+            id,
+            platforms: platforms.clone(),
+            features: features.clone(),
+            current_build: current_build.clone(),
+            data_dir: data_dir.clone(),
+            raft: raft.clone(),
+            state_machine: sm_store.clone(),
+            handles: Mutex::new(None),
+        });
+
+        // Start gRPC server BEFORE calling JoinCluster RPC
+        // This ensures we can receive Raft replication during the join process
+        let server_handle = tokio::spawn({
+            let agent = agent.clone();
+            async move { crate::grpc_server::serve_with_listener(listener, agent).await }
+        });
+
+        // Give server time to start
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        tracing::info!("gRPC server started on {}", actual_addr_str);
+
+        // NOW call JoinCluster RPC (server is ready to handle Raft replication)
         let agent_info = ProtoAgentInfo {
             id: id.to_string(),
             address: our_address.clone(),
-            platforms: platforms.clone(),
-            features: features.clone(),
+            platforms,
+            features,
             status: 0, // Will be set to Available by leader
             capacity: None,
         };
 
-        // Connect to seed agent and request to join
         tracing::info!("Connecting to seed agent at: {}", seed_url);
         let mut client = RioAgentClient::connect(seed_url.clone())
             .await
@@ -214,13 +347,7 @@ impl Agent {
 
         tracing::info!("Successfully joined cluster: {}", join_response.message);
 
-        // Initialize Raft as a learner/member (not bootstrap)
-        // The leader has already added us to the cluster
-        let (raft, sm_store) = crate::raft_node::join_cluster(id, our_address.clone(), &data_dir)
-            .await
-            .context("Failed to initialize Raft after joining")?;
-
-        // Start heartbeat, failure detector, and coordinator tasks
+        // NOW start heartbeat and failure detector (after successfully joining)
         let heartbeat_interval = heartbeat_interval.unwrap_or(std::time::Duration::from_secs(10));
         let check_interval = check_interval.unwrap_or(std::time::Duration::from_secs(15));
         let timeout = timeout.unwrap_or(std::time::Duration::from_secs(30));
@@ -234,17 +361,6 @@ impl Agent {
             timeout,
         );
 
-        // Create agent instance
-        let agent = Self {
-            id,
-            platforms,
-            features,
-            current_build: Arc::new(Mutex::new(None)),
-            data_dir,
-            raft: raft.clone(),
-            state_machine: sm_store.clone(),
-        };
-
         // Start build coordinator
         let coordinator_handle = crate::build_coordinator::start_build_coordinator(
             id,
@@ -255,17 +371,21 @@ impl Agent {
 
         tracing::info!("Background tasks started");
 
-        Ok((
-            agent,
-            heartbeat_handle,
-            failure_detector_handle,
-            coordinator_handle,
-        ))
+        // Store all task handles
+        *agent.handles.lock() = Some(TaskHandles {
+            heartbeat: heartbeat_handle,
+            failure_detector: failure_detector_handle,
+            coordinator: coordinator_handle,
+            server: server_handle,
+        });
+
+        Ok(agent)
     }
 
     /// Auto-discovery: Try to join seeds, bootstrap if all fail
     ///
     /// Implements jitter-based race resolution for concurrent bootstraps.
+    /// Returns Arc<Agent> with gRPC server running.
     pub async fn auto_join_or_bootstrap(
         data_dir: Utf8PathBuf,
         rpc_addr: String,
@@ -273,12 +393,7 @@ impl Agent {
         heartbeat_interval: Option<std::time::Duration>,
         check_interval: Option<std::time::Duration>,
         timeout: Option<std::time::Duration>,
-    ) -> Result<(
-        Self,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-        tokio::task::JoinHandle<()>,
-    )> {
+    ) -> Result<Arc<Self>> {
         tracing::info!("Attempting to join cluster from {} seeds", seed_urls.len());
 
         // Try each seed

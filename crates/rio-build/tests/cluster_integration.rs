@@ -9,9 +9,7 @@
 use anyhow::Result;
 use camino::Utf8Path;
 use rio_build::{cluster, evaluator};
-use rio_common::proto::rio_agent_server::RioAgentServer;
 use std::time::Duration;
-use tonic::transport::Server;
 use uuid::Uuid;
 
 /// Create a unique Nix derivation that won't be cached
@@ -64,18 +62,15 @@ async fn test_phase2_single_node_cluster_end_to_end() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
 
-    // Bind to random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().expect("No local addr");
-    let listen_addr = format!("127.0.0.1:{}", addr.port());
+    // Use a fixed port for testing
+    let listen_addr = "127.0.0.1:50997".to_string();
     let agent_url = format!("http://{}", listen_addr);
 
     println!("Starting agent at: {}", agent_url);
 
     // Bootstrap agent with fast heartbeat intervals for testing
-    let (agent, _h1, _h2, _h3) = rio_agent::agent::Agent::bootstrap(
+    // Note: Agent::bootstrap() starts the gRPC server automatically
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
         listen_addr.clone(),
         Some(Duration::from_secs(1)),     // Fast heartbeat
@@ -88,18 +83,7 @@ async fn test_phase2_single_node_cluster_end_to_end() {
     let agent_id = agent.id;
     println!("Agent ID: {}", agent_id);
 
-    // Start gRPC server in background
-    let server_task = tokio::spawn(async move {
-        Server::builder()
-            .add_service(RioAgentServer::new(
-                rio_agent::grpc_server::RioAgentService::new(agent),
-            ))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("Server failed");
-    });
-
-    // Wait for server to start and agent to become leader
+    // Wait for agent to become leader (server is already running)
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // 2. CLI discovers cluster
@@ -174,5 +158,5 @@ async fn test_phase2_single_node_cluster_end_to_end() {
     println!("  - Build submitted and completed via cluster discovery");
 
     // Cleanup
-    server_task.abort();
+    // Server runs in background and will be cleaned up when test ends
 }

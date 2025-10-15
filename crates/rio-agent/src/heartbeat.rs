@@ -48,7 +48,7 @@ pub fn start_heartbeat_task(
                     tracing::trace!(agent_id = %agent_id, "Heartbeat sent");
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         agent_id = %agent_id,
                         error = %e,
                         "Failed to send heartbeat (may be transient)"
@@ -153,16 +153,18 @@ mod tests {
 
         let node_id = AgentId::new_v4();
         let agent_id = AgentId::new_v4();
-        let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
-            node_id,
-            "localhost:50051".to_string(),
-            temp_path,
-        )
-        .await
-        .unwrap();
+        let rpc_addr = "localhost:50051".to_string();
+        let (raft, sm_store) =
+            crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
+                .await
+                .unwrap();
+
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
+            .await
+            .unwrap();
 
         // Wait for node to become leader
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Register agent
         crate::membership::register_agent(
@@ -202,16 +204,18 @@ mod tests {
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
         let node_id = AgentId::new_v4();
-        let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
-            node_id,
-            "localhost:50051".to_string(),
-            temp_path,
-        )
-        .await
-        .unwrap();
+        let rpc_addr = "localhost:50051".to_string();
+        let (raft, sm_store) =
+            crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
+                .await
+                .unwrap();
+
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
+            .await
+            .unwrap();
 
         // Wait for node to become leader
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Register two agents
         let agent1 = AgentId::new_v4();
@@ -284,16 +288,18 @@ mod tests {
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
         let node_id = AgentId::new_v4();
-        let (raft, _sm_store) = crate::raft_node::bootstrap_single_node(
-            node_id,
-            "localhost:50051".to_string(),
-            temp_path,
-        )
-        .await
-        .expect("Failed to bootstrap");
+        let rpc_addr = "localhost:50051".to_string();
+        let (raft, _sm_store) =
+            crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
+                .await
+                .expect("Failed to create Raft");
 
-        // Wait for leader election
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
+            .await
+            .expect("Failed to initialize");
+
+        // Wait for leader to be ready
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify node is leader
         let metrics = raft.metrics().borrow().clone();
@@ -320,18 +326,20 @@ mod tests {
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
         let node_id = AgentId::new_v4();
-        let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
-            node_id,
-            "localhost:50051".to_string(),
-            temp_path,
-        )
-        .await
-        .unwrap();
+        let rpc_addr = "localhost:50051".to_string();
+        let (raft, sm_store) =
+            crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
+                .await
+                .unwrap();
 
-        // Wait for node to become leader and stabilize
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
+            .await
+            .unwrap();
 
-        // Verify node is actually leader
+        // Wait for node to be ready
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify node is leader
         let metrics = raft.metrics().borrow().clone();
         assert_eq!(
             metrics.current_leader,
@@ -384,16 +392,18 @@ mod tests {
         let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
 
         let node_id = AgentId::new_v4();
-        let (raft, sm_store) = crate::raft_node::bootstrap_single_node(
-            node_id,
-            "localhost:50051".to_string(),
-            temp_path,
-        )
-        .await
-        .unwrap();
+        let rpc_addr = "localhost:50051".to_string();
+        let (raft, sm_store) =
+            crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
+                .await
+                .unwrap();
 
-        // Wait for node to become leader (longer wait for test stability)
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
+            .await
+            .unwrap();
+
+        // Wait for node to be ready
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let agent1 = AgentId::new_v4();
 

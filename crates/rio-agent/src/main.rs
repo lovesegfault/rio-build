@@ -5,7 +5,7 @@
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::Parser;
-use rio_agent::{agent, grpc_server};
+use rio_agent::agent;
 
 /// Rio Agent - Distributed Nix build agent
 #[derive(Parser, Debug)]
@@ -46,7 +46,8 @@ async fn main() -> Result<()> {
     tracing::info!("Data directory: {}", args.data_dir);
 
     // Determine cluster mode
-    let (agent, _h1, _h2, _h3) = if let Some(join_url) = args.join {
+    // Note: Agent::bootstrap() and join() now return Arc<Agent> with server already running
+    let _agent = if let Some(join_url) = args.join {
         // Explicit join mode
         tracing::info!("Joining cluster at: {}", join_url);
         agent::Agent::join(
@@ -75,10 +76,12 @@ async fn main() -> Result<()> {
         tracing::info!("Bootstrapping single-node Raft cluster");
         agent::Agent::bootstrap(args.data_dir, args.listen.clone(), None, None, None).await?
     };
-    // Handles run in background, will be cleaned up on process exit
 
-    // Start gRPC server
-    grpc_server::serve(args.listen, agent).await?;
+    // gRPC server is already running in background
+    // Keep main thread alive forever
+    tracing::info!("Agent running. Press Ctrl+C to stop.");
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("Received shutdown signal");
 
     Ok(())
 }

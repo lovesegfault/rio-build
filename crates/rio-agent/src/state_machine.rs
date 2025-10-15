@@ -152,6 +152,7 @@ impl ClusterState {
         match command {
             RaftCommand::AgentJoined { id, info } => {
                 self.agents.insert(id, info);
+                tracing::debug!(agent_id = %id, total_agents = self.agents.len(), "Agent joined cluster");
                 RaftResponse::AgentJoined { agent_id: id }
             }
 
