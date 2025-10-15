@@ -7,6 +7,7 @@ use rio_build::client::RioClient;
 use rio_build::cluster::ClusterInfo;
 use rio_build::evaluator::BuildInfo;
 use rio_common::proto::{AgentInfo, BuildCompleted, BuildUpdate, LogLine, build_update};
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn test_client_submit_and_subscribe() {
@@ -49,17 +50,23 @@ async fn test_client_submit_and_subscribe() {
     };
 
     // Create mock cluster info
-    let cluster_info = ClusterInfo {
-        leader_id: "test-agent".to_string(),
-        leader_address: url.clone(),
-        agents: vec![AgentInfo {
+    let mut agents = HashMap::new();
+    agents.insert(
+        "test-agent".to_string(),
+        AgentInfo {
             id: "test-agent".to_string(),
             address: url.clone(),
             platforms: vec!["x86_64-linux".to_string()],
             features: vec![],
             status: 0, // Available
             capacity: None,
-        }],
+        },
+    );
+
+    let cluster_info = ClusterInfo {
+        leader_id: "test-agent".to_string(),
+        leader_address: url.clone(),
+        agents,
         discovered_at: std::time::Instant::now(),
     };
 

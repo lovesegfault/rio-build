@@ -44,7 +44,7 @@ service RioAgent {
 message GetClusterMembersRequest {}
 
 message ClusterMembers {
-  repeated AgentInfo agents = 1;
+  map<string, AgentInfo> agents = 1;  // agent_id -> AgentInfo (O(1) lookup)
   string leader_id = 2;  // Current Raft leader's agent ID
 }
 

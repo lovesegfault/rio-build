@@ -154,12 +154,10 @@ impl RioClient {
 
 /// Connect to a specific agent by ID
 ///
-/// Looks up the agent in the cluster info and connects to its address.
+/// Looks up the agent in the cluster info (O(1)) and connects to its address.
 pub async fn connect_to_agent(agent_id: &str, cluster_info: &ClusterInfo) -> Result<RioClient> {
     let agent = cluster_info
-        .agents
-        .iter()
-        .find(|a| a.id == agent_id)
+        .get_agent(agent_id)
         .with_context(|| format!("Agent {} not found in cluster", agent_id))?;
 
     tracing::debug!("Connecting to agent {} at {}", agent_id, agent.address);
