@@ -219,20 +219,25 @@ impl RioAgent for RioAgentService {
 
         // Query state machine for agent list
         let cluster_state = &sm_store.data.read().cluster;
-        let agents: Vec<AgentInfo> = cluster_state
+        let agents = cluster_state
             .agents
-            .values()
-            .map(|agent| AgentInfo {
-                id: agent.id.to_string(),
-                address: agent.address.to_string(), // Convert Url to String for protobuf
-                platforms: agent.platforms.clone(),
-                features: agent.features.clone(),
-                status: match agent.status {
-                    crate::state_machine::AgentStatus::Available => AgentStatus::Available as i32,
-                    crate::state_machine::AgentStatus::Busy => AgentStatus::Busy as i32,
-                    crate::state_machine::AgentStatus::Down => AgentStatus::Down as i32,
-                },
-                capacity: None, // TODO: Add BuilderCapacity in Phase 3
+            .iter()
+            .map(|(agent_id, agent)| {
+                let agent_info = AgentInfo {
+                    id: agent.id.to_string(),
+                    address: agent.address.to_string(), // Convert Url to String for protobuf
+                    platforms: agent.platforms.clone(),
+                    features: agent.features.clone(),
+                    status: match agent.status {
+                        crate::state_machine::AgentStatus::Available => {
+                            AgentStatus::Available as i32
+                        }
+                        crate::state_machine::AgentStatus::Busy => AgentStatus::Busy as i32,
+                        crate::state_machine::AgentStatus::Down => AgentStatus::Down as i32,
+                    },
+                    capacity: None, // TODO: Add BuilderCapacity in Phase 3
+                };
+                (agent_id.to_string(), agent_info)
             })
             .collect();
 

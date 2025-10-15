@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use rio_common::proto::rio_agent_client::RioAgentClient;
 use rio_common::proto::{AgentInfo, GetClusterMembersRequest};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -17,8 +18,8 @@ pub struct ClusterInfo {
     /// Leader's gRPC address
     pub leader_address: String,
 
-    /// All agents in the cluster
-    pub agents: Vec<AgentInfo>,
+    /// All agents in the cluster (keyed by agent ID for O(1) lookup)
+    pub agents: HashMap<String, AgentInfo>,
 
     /// When this cluster info was discovered
     pub discovered_at: Instant,
@@ -30,13 +31,22 @@ impl ClusterInfo {
         self.discovered_at.elapsed() > ttl
     }
 
-    /// Find the leader agent from the agent list
-    fn find_leader(leader_id: &str, agents: &[AgentInfo]) -> Result<String> {
+    /// Get an agent by ID (O(1) lookup)
+    pub fn get_agent(&self, agent_id: &str) -> Option<&AgentInfo> {
+        self.agents.get(agent_id)
+    }
+
+    /// Find the leader agent from the agent map (O(1) lookup)
+    fn find_leader(leader_id: &str, agents: &HashMap<String, AgentInfo>) -> Result<String> {
         agents
-            .iter()
-            .find(|agent| agent.id == leader_id)
+            .get(leader_id)
             .map(|agent| agent.address.clone())
-            .with_context(|| format!("Leader {} not found in agent list", leader_id))
+            .with_context(|| format!("Leader {} not found in cluster", leader_id))
+    }
+
+    /// Get the number of agents in the cluster
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
     }
 }
 
@@ -126,7 +136,7 @@ mod tests {
         let info = ClusterInfo {
             leader_id: "leader-1".to_string(),
             leader_address: "http://localhost:50051".to_string(),
-            agents: vec![],
+            agents: HashMap::new(),
             discovered_at: Instant::now() - Duration::from_secs(70),
         };
 
@@ -136,7 +146,9 @@ mod tests {
 
     #[test]
     fn test_find_leader() {
-        let agents = vec![
+        let mut agents = HashMap::new();
+        agents.insert(
+            "agent-1".to_string(),
             AgentInfo {
                 id: "agent-1".to_string(),
                 address: "http://agent1:50051".to_string(),
@@ -145,6 +157,9 @@ mod tests {
                 status: 0,
                 capacity: None,
             },
+        );
+        agents.insert(
+            "leader-1".to_string(),
             AgentInfo {
                 id: "leader-1".to_string(),
                 address: "http://leader:50051".to_string(),
@@ -153,7 +168,7 @@ mod tests {
                 status: 0,
                 capacity: None,
             },
-        ];
+        );
 
         let leader_addr = ClusterInfo::find_leader("leader-1", &agents).unwrap();
         assert_eq!(leader_addr, "http://leader:50051");
@@ -161,14 +176,18 @@ mod tests {
 
     #[test]
     fn test_find_leader_not_found() {
-        let agents = vec![AgentInfo {
-            id: "agent-1".to_string(),
-            address: "http://agent1:50051".to_string(),
-            platforms: vec![],
-            features: vec![],
-            status: 0,
-            capacity: None,
-        }];
+        let mut agents = HashMap::new();
+        agents.insert(
+            "agent-1".to_string(),
+            AgentInfo {
+                id: "agent-1".to_string(),
+                address: "http://agent1:50051".to_string(),
+                platforms: vec![],
+                features: vec![],
+                status: 0,
+                capacity: None,
+            },
+        );
 
         let result = ClusterInfo::find_leader("missing-leader", &agents);
         assert!(result.is_err());
@@ -176,7 +195,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("not found in agent list")
+                .contains("not found in cluster")
         );
     }
 }
