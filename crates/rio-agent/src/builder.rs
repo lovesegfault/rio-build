@@ -1,7 +1,9 @@
 //! Build execution logic
 
 use anyhow::{Context, Result};
+use backon::{ExponentialBuilder, Retryable};
 use camino::Utf8PathBuf;
+use openraft::Raft;
 use rio_common::DerivationPath;
 use rio_common::proto::{BuildCompleted, BuildFailed, BuildUpdate, LogLine, build_update};
 use std::sync::Arc;
@@ -12,12 +14,15 @@ use tokio::sync::Mutex;
 
 use crate::agent::BuildJob;
 use crate::nar_exporter;
+use crate::state_machine::RaftCommand;
+use crate::storage::TypeConfig;
 
 /// Start a build
 ///
 /// Imports the derivation NAR to /nix/store, spawns nix-build, and manages the build lifecycle.
 pub async fn start_build(
     current_build: &Arc<Mutex<Option<BuildJob>>>,
+    raft: Arc<Raft<TypeConfig>>,
     drv_path: String,
     drv_nar_bytes: Vec<u8>,
 ) -> Result<()> {
@@ -50,10 +55,7 @@ pub async fn start_build(
         .context("Failed to spawn nix-build")?;
 
     // Create BuildJob (metadata only, process owned by background task)
-    let build_job = BuildJob {
-        drv_path: actual_drv_path.clone(),
-        subscribers: Vec::new(),
-    };
+    let build_job = BuildJob::new(actual_drv_path.clone());
 
     // Store in current_build
     {
@@ -64,10 +66,12 @@ pub async fn start_build(
     // Spawn task to handle build completion (owns the process)
     let current_clone = current_build.clone();
     let drv_path_clone = actual_drv_path.clone();
+    let raft_clone = raft.clone();
 
     tokio::spawn(async move {
         if let Err(e) =
-            handle_build_completion(current_clone, drv_path_clone, child, start_time).await
+            handle_build_completion(current_clone, raft_clone, drv_path_clone, child, start_time)
+                .await
         {
             tracing::error!("Build completion error: {}", e);
         }
@@ -122,6 +126,7 @@ async fn import_derivation_nar(nar_bytes: &[u8]) -> Result<Utf8PathBuf> {
 /// Handle build completion (runs in background task, owns the process)
 async fn handle_build_completion(
     current_build: std::sync::Arc<tokio::sync::Mutex<Option<BuildJob>>>,
+    raft: Arc<Raft<TypeConfig>>,
     drv_path: DerivationPath,
     mut process: tokio::process::Child,
     start_time: Instant,
@@ -194,6 +199,39 @@ async fn handle_build_completion(
 
         nar_exporter::stream_outputs(&output_paths, drv_path.clone(), subscribers.clone()).await?;
 
+        // Propose BuildCompleted to Raft (Phase 3.5)
+        // Use retry with exponential backoff for transient failures
+        let output_paths_for_raft: Vec<DerivationPath> = output_paths
+            .iter()
+            .map(|p| Utf8PathBuf::from(p.as_str()))
+            .collect();
+
+        let command = RaftCommand::BuildCompleted {
+            derivation_path: drv_path.clone(),
+            output_paths: output_paths_for_raft,
+        };
+
+        let raft_for_retry = raft.clone();
+        let cmd_clone = command.clone();
+        let propose = || async { raft_for_retry.client_write(cmd_clone.clone()).await };
+
+        let retry_policy = ExponentialBuilder::default()
+            .with_max_times(3)
+            .with_max_delay(std::time::Duration::from_millis(100));
+
+        match propose.retry(retry_policy).await {
+            Ok(_) => {
+                tracing::info!("BuildCompleted proposal committed to Raft");
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to propose BuildCompleted to Raft after 3 retries: {}",
+                    e
+                );
+                // Continue anyway - build succeeded, just Raft coordination failed
+            }
+        }
+
         // Send completion message
         let completion = BuildUpdate {
             derivation_path: drv_path.as_str().to_string(),
@@ -209,11 +247,41 @@ async fn handle_build_completion(
     } else {
         tracing::error!("Build failed with exit code: {:?}", exit_status.code());
 
+        let error_msg = format!("nix-build exited with code: {:?}", exit_status.code());
+
+        // Propose BuildFailed to Raft (Phase 3.5)
+        // Use retry with exponential backoff for transient failures
+        let command = RaftCommand::BuildFailed {
+            derivation_path: drv_path.clone(),
+            error: error_msg.clone(),
+        };
+
+        let raft_for_retry = raft.clone();
+        let cmd_clone = command.clone();
+        let propose = || async { raft_for_retry.client_write(cmd_clone.clone()).await };
+
+        let retry_policy = ExponentialBuilder::default()
+            .with_max_times(3)
+            .with_max_delay(std::time::Duration::from_millis(100));
+
+        match propose.retry(retry_policy).await {
+            Ok(_) => {
+                tracing::info!("BuildFailed proposal committed to Raft");
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to propose BuildFailed to Raft after 3 retries: {}",
+                    e
+                );
+                // Continue anyway - build failed, just Raft coordination failed
+            }
+        }
+
         // Send failure message
         let failure = BuildUpdate {
             derivation_path: drv_path.as_str().to_string(),
             update: Some(build_update::Update::Failed(BuildFailed {
-                error: format!("nix-build exited with code: {:?}", exit_status.code()),
+                error: error_msg,
                 stderr: None,
             })),
         };
@@ -252,17 +320,10 @@ async fn stream_logs(
             })),
         };
 
-        // Get current subscribers (refreshed on each line to catch late joiners)
-        let subscribers = {
-            let current = current_build.lock().await;
-            current
-                .as_ref()
-                .map(|b| b.subscribers.clone())
-                .unwrap_or_default()
-        };
-
-        for sub in &subscribers {
-            let _ = sub.send(Ok(update.clone())).await;
+        // Use BuildJob helper to add log to history and broadcast to subscribers
+        let mut current = current_build.lock().await;
+        if let Some(ref mut build) = *current {
+            build.add_log(update).await;
         }
     }
 }

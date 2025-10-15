@@ -19,11 +19,11 @@ use crate::storage::{StateMachineStore, TypeConfig};
 ///
 /// Watches Raft state for builds assigned to this agent and starts them.
 /// Runs indefinitely until agent shuts down.
-#[tracing::instrument(skip(current_build, _raft, sm_store), fields(agent_id = %agent_id))]
+#[tracing::instrument(skip(current_build, raft, sm_store), fields(agent_id = %agent_id))]
 pub fn start_build_coordinator(
     agent_id: AgentId,
     current_build: Arc<Mutex<Option<BuildJob>>>,
-    _raft: Arc<Raft<TypeConfig>>,
+    raft: Arc<Raft<TypeConfig>>,
     sm_store: StateMachineStore,
 ) -> JoinHandle<()> {
     tracing::info!("Starting build coordinator");
@@ -74,9 +74,13 @@ pub fn start_build_coordinator(
                         started_builds.lock().await.insert(drv_path.clone());
 
                         // Start the build (this spawns background task)
-                        if let Err(e) =
-                            builder::start_build(&current_build, drv_path.to_string(), nar_bytes)
-                                .await
+                        if let Err(e) = builder::start_build(
+                            &current_build,
+                            raft.clone(),
+                            drv_path.to_string(),
+                            nar_bytes,
+                        )
+                        .await
                         {
                             tracing::error!("Failed to start build {}: {}", drv_path, e);
                             // TODO Phase 3.4: Propose BuildFailed to Raft
