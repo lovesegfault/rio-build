@@ -372,3 +372,413 @@ async fn test_heartbeat_lifecycle() {
         age.num_milliseconds()
     );
 }
+
+/// Test that late joiners receive catch-up logs from history
+#[tokio::test]
+async fn test_late_joiner_receives_catch_up_logs() {
+    use std::time::Duration;
+
+    // Start agent with Raft (bootstrap starts gRPC server automatically)
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path =
+        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+
+    let listen_addr = "127.0.0.1:50892".to_string();
+    let url = format!("http://{}", listen_addr);
+
+    let _agent = rio_agent::agent::Agent::bootstrap(
+        temp_path.to_path_buf(),
+        listen_addr.clone(),
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_millis(500)),
+        Some(Duration::from_secs(3)),
+    )
+    .await
+    .expect("Failed to bootstrap agent");
+
+    // Wait for agent to become leader (server is already running)
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Create client
+    let mut client = RioAgentClient::connect(url.clone())
+        .await
+        .expect("Failed to connect");
+
+    // Create unique build
+    let (drv_path, drv_nar) = create_unique_derivation()
+        .await
+        .expect("Failed to create derivation");
+
+    // Submit build
+    let response = client
+        .queue_build(QueueBuildRequest {
+            derivation_path: drv_path.clone(),
+            derivation: drv_nar,
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: Some(60),
+        })
+        .await
+        .expect("QueueBuild failed");
+
+    let result = response.into_inner().result.expect("No result");
+    assert!(
+        matches!(
+            result,
+            rio_common::proto::queue_build_response::Result::Assigned(_)
+        ),
+        "Expected BuildAssigned"
+    );
+
+    // Wait for build coordinator to pick up the assignment (polls every 100ms)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Subscribe immediately (first subscriber)
+    let mut stream1 = client
+        .subscribe_to_build(SubscribeToBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await
+        .expect("SubscribeToBuild failed")
+        .into_inner();
+
+    // Collect a few log messages from first subscriber
+    let mut first_subscriber_logs = Vec::new();
+    for _ in 0..3 {
+        if let Some(Ok(update)) = stream1.message().await.transpose() {
+            if matches!(update.update, Some(build_update::Update::Log(_))) {
+                first_subscriber_logs.push(update);
+            }
+        } else {
+            break;
+        }
+    }
+
+    println!(
+        "First subscriber received {} log messages",
+        first_subscriber_logs.len()
+    );
+
+    // Now subscribe as a late joiner (after some logs have been generated)
+    let mut stream2 = client
+        .subscribe_to_build(SubscribeToBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await
+        .expect("SubscribeToBuild failed for late joiner")
+        .into_inner();
+
+    // Late joiner should receive catch-up logs first
+    let mut late_joiner_catch_up_logs = Vec::new();
+    while let Some(Ok(update)) = stream2.message().await.transpose() {
+        if matches!(update.update, Some(build_update::Update::Log(_))) {
+            late_joiner_catch_up_logs.push(update.clone());
+        }
+
+        // Stop collecting after we get some logs or hit completion
+        if late_joiner_catch_up_logs.len() >= first_subscriber_logs.len()
+            || matches!(update.update, Some(build_update::Update::Completed(_)))
+            || matches!(update.update, Some(build_update::Update::Failed(_)))
+        {
+            break;
+        }
+    }
+
+    println!(
+        "Late joiner received {} catch-up log messages",
+        late_joiner_catch_up_logs.len()
+    );
+
+    // Verify late joiner got catch-up logs (should have at least some logs)
+    assert!(
+        !late_joiner_catch_up_logs.is_empty(),
+        "Late joiner should receive catch-up logs from history"
+    );
+
+    println!("✓ Late joiner test passed: received catch-up logs");
+}
+
+/// Test that build completion updates Raft state correctly
+#[tokio::test]
+async fn test_build_completion_updates_raft_state() {
+    use std::time::Duration;
+
+    // Start agent with Raft (bootstrap starts gRPC server automatically)
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path =
+        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+
+    let listen_addr = "127.0.0.1:50893".to_string();
+    let url = format!("http://{}", listen_addr);
+
+    let agent = rio_agent::agent::Agent::bootstrap(
+        temp_path.to_path_buf(),
+        listen_addr.clone(),
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_millis(500)),
+        Some(Duration::from_secs(3)),
+    )
+    .await
+    .expect("Failed to bootstrap agent");
+
+    let agent_id = agent.id;
+    let state_machine = agent.state_machine.clone();
+
+    // Wait for agent to become leader (server is already running)
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Create client
+    let mut client = RioAgentClient::connect(url.clone())
+        .await
+        .expect("Failed to connect");
+
+    // Create unique build
+    let (drv_path, drv_nar) = create_unique_derivation()
+        .await
+        .expect("Failed to create derivation");
+
+    // Verify build is NOT in state before submission
+    {
+        let state = state_machine.data.read();
+        let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+        assert!(
+            !state.cluster.builds_in_progress.contains_key(&drv_path_key),
+            "Build should not be in progress before submission"
+        );
+        assert!(
+            !state.cluster.completed_builds.contains_key(&drv_path_key),
+            "Build should not be in completed before submission"
+        );
+    }
+
+    // Submit build
+    let response = client
+        .queue_build(QueueBuildRequest {
+            derivation_path: drv_path.clone(),
+            derivation: drv_nar,
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: Some(60),
+        })
+        .await
+        .expect("QueueBuild failed");
+
+    let result = response.into_inner().result.expect("No result");
+    assert!(
+        matches!(
+            result,
+            rio_common::proto::queue_build_response::Result::Assigned(_)
+        ),
+        "Expected BuildAssigned"
+    );
+
+    // Verify build is in builds_in_progress after submission
+    // Wait for build coordinator to pick up assignment (polls every 100ms)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        let state = state_machine.data.read();
+        let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+        let tracker = state.cluster.builds_in_progress.get(&drv_path_key);
+        assert!(
+            tracker.is_some(),
+            "Build should be in progress after submission"
+        );
+        assert_eq!(
+            tracker.unwrap().agent_id,
+            agent_id,
+            "Build should be assigned to this agent"
+        );
+    }
+
+    // Subscribe and wait for completion
+    let mut stream = client
+        .subscribe_to_build(SubscribeToBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await
+        .expect("SubscribeToBuild failed")
+        .into_inner();
+
+    let mut completed = false;
+    while let Some(Ok(update)) = stream.message().await.transpose() {
+        if matches!(update.update, Some(build_update::Update::Completed(_))) {
+            completed = true;
+            break;
+        }
+        if matches!(update.update, Some(build_update::Update::Failed(_))) {
+            panic!("Build failed unexpectedly");
+        }
+    }
+
+    assert!(completed, "Build should complete successfully");
+
+    // Give Raft time to process BuildCompleted command
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify build moved from in_progress to completed_builds
+    {
+        let state = state_machine.data.read();
+        let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+
+        assert!(
+            !state.cluster.builds_in_progress.contains_key(&drv_path_key),
+            "Build should be removed from in_progress after completion"
+        );
+
+        let completed = state.cluster.completed_builds.get(&drv_path_key);
+        assert!(
+            completed.is_some(),
+            "Build should be in completed_builds after completion"
+        );
+
+        let completed_build = completed.unwrap();
+        assert_eq!(
+            completed_build.agent_id, agent_id,
+            "Completed build should track which agent built it"
+        );
+        assert!(
+            !completed_build.output_paths.is_empty(),
+            "Completed build should have output paths"
+        );
+
+        println!(
+            "✓ Completed build in cache with {} outputs",
+            completed_build.output_paths.len()
+        );
+    }
+
+    println!("✓ Build completion Raft state test passed");
+}
+
+/// Test GetCompletedBuild RPC serves cached outputs
+#[tokio::test]
+async fn test_get_completed_build_serves_cache() {
+    use rio_common::proto::GetCompletedBuildRequest;
+    use std::time::Duration;
+
+    // Start agent with Raft (bootstrap starts gRPC server automatically)
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path =
+        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+
+    let listen_addr = "127.0.0.1:50894".to_string();
+    let url = format!("http://{}", listen_addr);
+
+    let _agent = rio_agent::agent::Agent::bootstrap(
+        temp_path.to_path_buf(),
+        listen_addr.clone(),
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_millis(500)),
+        Some(Duration::from_secs(3)),
+    )
+    .await
+    .expect("Failed to bootstrap agent");
+
+    // Wait for agent to become leader (server is already running)
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Create client
+    let mut client = RioAgentClient::connect(url.clone())
+        .await
+        .expect("Failed to connect");
+
+    // Create and complete a build first
+    let (drv_path, drv_nar) = create_unique_derivation()
+        .await
+        .expect("Failed to create derivation");
+
+    // Submit build
+    client
+        .queue_build(QueueBuildRequest {
+            derivation_path: drv_path.clone(),
+            derivation: drv_nar,
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: Some(60),
+        })
+        .await
+        .expect("QueueBuild failed");
+
+    // Wait for build coordinator to pick up assignment (polls every 100ms)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Subscribe and wait for completion
+    let mut stream = client
+        .subscribe_to_build(SubscribeToBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await
+        .expect("SubscribeToBuild failed")
+        .into_inner();
+
+    let mut completed = false;
+    while let Some(Ok(update)) = stream.message().await.transpose() {
+        if matches!(update.update, Some(build_update::Update::Completed(_))) {
+            completed = true;
+            break;
+        }
+    }
+
+    assert!(
+        completed,
+        "Build should complete before testing GetCompletedBuild"
+    );
+
+    // Give Raft time to process BuildCompleted
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    println!("Build completed, now testing GetCompletedBuild...");
+
+    // Now try to get the completed build from cache
+    let mut cache_stream = client
+        .get_completed_build(GetCompletedBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await
+        .expect("GetCompletedBuild should succeed for cached build")
+        .into_inner();
+
+    // Verify we receive output chunks and completion message
+    let mut received_outputs = false;
+    let mut received_completion = false;
+
+    while let Some(Ok(update)) = cache_stream.message().await.transpose() {
+        match update.update {
+            Some(build_update::Update::OutputChunk(_)) => {
+                received_outputs = true;
+                println!("Received output chunk from cache");
+            }
+            Some(build_update::Update::Completed(_)) => {
+                received_completion = true;
+                println!("Received completion message from cache");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(received_outputs, "Should receive output chunks from cache");
+    assert!(
+        received_completion,
+        "Should receive completion message from cache"
+    );
+
+    println!("✓ GetCompletedBuild test passed: served outputs from cache");
+
+    // Test that requesting non-existent build returns error
+    let non_existent_result = client
+        .get_completed_build(GetCompletedBuildRequest {
+            derivation_path: "/nix/store/nonexistent-foo.drv".to_string(),
+        })
+        .await;
+
+    assert!(
+        non_existent_result.is_err(),
+        "GetCompletedBuild should fail for non-existent build"
+    );
+
+    println!("✓ GetCompletedBuild correctly rejects non-existent build");
+}

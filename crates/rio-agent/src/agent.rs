@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use rio_common::nix_utils::NixConfig;
 use rio_common::proto::BuildUpdate;
 use rio_common::{AgentId, DerivationPath};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tonic::Status;
 
@@ -465,4 +467,55 @@ pub struct BuildJob {
 
     /// Subscribers receiving build updates
     pub subscribers: Vec<mpsc::Sender<Result<BuildUpdate, Status>>>,
+
+    /// Historical logs for late joiners (capped at 10,000 entries)
+    /// Only stores LogLine updates (not OutputChunk - too large)
+    log_history: VecDeque<BuildUpdate>,
+
+    /// When the build started (for duration tracking)
+    started_at: Instant,
+}
+
+impl BuildJob {
+    /// Create a new build job
+    pub fn new(drv_path: DerivationPath) -> Self {
+        Self {
+            drv_path,
+            subscribers: Vec::new(),
+            log_history: VecDeque::with_capacity(100), // Pre-allocate some space
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Add a log line to history and broadcast to all subscribers
+    /// Caps history at 10,000 entries to prevent memory exhaustion
+    pub async fn add_log(&mut self, update: BuildUpdate) {
+        // Only store LogLine updates in history (skip OutputChunk - too large)
+        if matches!(
+            update.update,
+            Some(rio_common::proto::build_update::Update::Log(_))
+        ) {
+            self.log_history.push_back(update.clone());
+
+            // Cap at 10,000 entries
+            if self.log_history.len() > 10_000 {
+                self.log_history.pop_front();
+            }
+        }
+
+        // Broadcast to all active subscribers
+        // Remove failed subscribers (disconnected clients)
+        self.subscribers
+            .retain(|sub| sub.try_send(Ok(update.clone())).is_ok());
+    }
+
+    /// Get all historical logs for catch-up (returns a clone)
+    pub fn get_catch_up_logs(&self) -> Vec<BuildUpdate> {
+        self.log_history.iter().cloned().collect()
+    }
+
+    /// Get build duration since start
+    pub fn duration(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
 }

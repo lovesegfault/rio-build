@@ -115,32 +115,90 @@ impl RioAgent for RioAgentService {
         tokio_stream::wrappers::ReceiverStream<Result<BuildUpdate, Status>>;
 
     /// Subscribe to build updates
+    ///
+    /// Supports late joiners: sends catch-up logs before streaming live updates.
     async fn subscribe_to_build(
         &self,
         request: Request<SubscribeToBuildRequest>,
     ) -> Result<Response<Self::SubscribeToBuildStream>, Status> {
         let req = request.into_inner();
+        let drv_path = req.derivation_path.clone();
 
-        tracing::info!("Client subscribing to build: {}", req.derivation_path);
+        tracing::info!("Client subscribing to build: {}", drv_path);
 
         // Create a channel for this subscriber
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-        // Add subscriber to current build
+        // Check if build is currently running on this agent
         let mut current = self.agent.current_build.lock().await;
-        if let Some(ref mut build) = *current {
-            if build.drv_path.as_str() == req.derivation_path {
-                build.subscribers.push(tx);
-            } else {
-                return Err(Status::not_found("Different build in progress"));
+        if let Some(ref mut build) = *current
+            && build.drv_path.as_str() == drv_path
+        {
+            // Send catch-up logs first (for late joiners)
+            let catch_up_logs = build.get_catch_up_logs();
+            tracing::info!(
+                "Sending {} catch-up log lines to late joiner",
+                catch_up_logs.len()
+            );
+
+            for log in catch_up_logs {
+                if tx.send(Ok(log)).await.is_err() {
+                    return Err(Status::internal("Failed to send catch-up logs"));
+                }
             }
-        } else {
-            return Err(Status::not_found("No build in progress"));
+
+            // Add subscriber for live updates
+            build.subscribers.push(tx);
+            drop(current); // Release lock
+
+            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )));
+        }
+        drop(current); // Release lock before querying state machine
+
+        // Not currently building on this agent - check Raft state
+        let state = self.agent.state_machine.data.read();
+        let cluster = &state.cluster;
+
+        // Convert string to DerivationPath for hashmap lookups
+        let drv_path_key: rio_common::DerivationPath = drv_path.clone().into();
+
+        // Check if build recently completed (serve from cache)
+        if let Some(completed) = cluster.completed_builds.get(&drv_path_key) {
+            tracing::info!(
+                "Build {} already completed on agent {}, client should use GetCompletedBuild",
+                drv_path,
+                completed.agent_id
+            );
+            return Err(Status::already_exists(format!(
+                "Build completed on agent {}, use GetCompletedBuild",
+                completed.agent_id
+            )));
         }
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
+        // Check if build is in progress on different agent
+        if let Some(tracker) = cluster.builds_in_progress.get(&drv_path_key) {
+            if tracker.agent_id != self.agent.id {
+                tracing::info!(
+                    "Build {} is on agent {}, not this agent ({})",
+                    drv_path,
+                    tracker.agent_id,
+                    self.agent.id
+                );
+                return Err(Status::failed_precondition(format!(
+                    "Build is running on agent {}, not this agent",
+                    tracker.agent_id
+                )));
+            }
+            // Build assigned to us but not started yet (coordinator hasn't picked it up)
+            return Err(Status::not_found(
+                "Build assigned to this agent but not yet started",
+            ));
+        }
+
+        // Build not found anywhere
+        Err(Status::not_found("Build not found in cluster"))
     }
 
     /// Get cluster members
@@ -186,12 +244,100 @@ impl RioAgent for RioAgentService {
     type GetCompletedBuildStream =
         tokio_stream::wrappers::ReceiverStream<Result<BuildUpdate, Status>>;
 
-    /// Get completed build outputs (Phase 1: unimplemented)
+    /// Get completed build outputs from cache
+    ///
+    /// Serves outputs from recently completed builds (5 minute cache).
     async fn get_completed_build(
         &self,
-        _request: Request<GetCompletedBuildRequest>,
+        request: Request<GetCompletedBuildRequest>,
     ) -> Result<Response<Self::GetCompletedBuildStream>, Status> {
-        Err(Status::unimplemented("Phase 1: No build caching yet"))
+        let req = request.into_inner();
+        let drv_path = req.derivation_path.clone();
+
+        tracing::info!("Client requesting completed build: {}", drv_path);
+
+        // Query state machine for completed build
+        let (output_paths, agent_id) = {
+            let state = self.agent.state_machine.data.read();
+            let drv_path_key: rio_common::DerivationPath = drv_path.clone().into();
+
+            let completed = state
+                .cluster
+                .completed_builds
+                .get(&drv_path_key)
+                .ok_or_else(|| {
+                    Status::not_found(format!(
+                        "Build {} not in cache (may have expired)",
+                        drv_path
+                    ))
+                })?;
+
+            (completed.output_paths.clone(), completed.agent_id)
+        }; // Lock released here
+
+        // Verify this agent has the outputs
+        if agent_id != self.agent.id {
+            return Err(Status::failed_precondition(format!(
+                "Build outputs are on agent {}, not this agent",
+                agent_id
+            )));
+        }
+
+        // Verify outputs still exist in /nix/store (not garbage collected)
+        for path in &output_paths {
+            if tokio::fs::metadata(path).await.is_err() {
+                return Err(Status::not_found(format!(
+                    "Build outputs no longer in store (garbage collected): {}",
+                    path
+                )));
+            }
+        }
+
+        tracing::info!("Streaming {} output paths from cache", output_paths.len());
+
+        // Create channel for streaming
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        // Convert output paths to strings for nar_exporter
+        let output_paths_str: Vec<String> = output_paths
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+
+        // Spawn task to stream outputs
+        let drv_path_clone: rio_common::DerivationPath = drv_path.clone().into();
+        let output_paths_for_msg = output_paths_str.clone();
+        tokio::spawn(async move {
+            // Stream NAR outputs
+            if let Err(e) = crate::nar_exporter::stream_outputs(
+                &output_paths_str,
+                drv_path_clone.clone(),
+                vec![tx.clone()],
+            )
+            .await
+            {
+                tracing::error!("Failed to stream completed build outputs: {}", e);
+                return;
+            }
+
+            // Send completion message after outputs
+            use rio_common::proto::{BuildCompleted, BuildUpdate, build_update};
+            let completion = BuildUpdate {
+                derivation_path: drv_path_clone.as_str().to_string(),
+                update: Some(build_update::Update::Completed(BuildCompleted {
+                    output_paths: output_paths_for_msg,
+                    duration_ms: 0, // Not tracked for cached builds
+                })),
+            };
+
+            if let Err(e) = tx.send(Ok(completion)).await {
+                tracing::error!("Failed to send completion message: {}", e);
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     /// Get build status (Phase 1: unimplemented)

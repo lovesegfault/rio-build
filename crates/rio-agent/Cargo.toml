@@ -26,6 +26,7 @@ rocksdb = { workspace = true }
 parking_lot = { workspace = true }
 url = { workspace = true }
 rand = { workspace = true }
+backon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
