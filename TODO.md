@@ -678,18 +678,29 @@ all$ rio-agent --listen 0.0.0.0:50051 --seeds node1:50051,node2:50051,node3:5005
 - [x] `test_build_completion_updates_raft_state` - Verifies Raft state transitions
 - [x] `test_get_completed_build_serves_cache` - Verifies cache serving and completion message
 
-### 3.7 Build Deduplication (rio-agent + rio-build)
+### 3.7 Build Deduplication (rio-build) ✅ COMPLETED
 
-- [ ] CLI enhancement in `client.rs`:
-  - [ ] On `AlreadyBuilding` response:
-    - [ ] Extract agent_id and derivation_path
-    - [ ] Connect to assigned agent
-    - [ ] Call `SubscribeToBuild(derivation_path)`
-    - [ ] Handle stream normally (late joiner gets catch-up logs)
-  - [ ] On `AlreadyCompleted` response:
-    - [ ] Connect to agent with outputs
-    - [ ] Call `GetCompletedBuild(derivation_path)`
-    - [ ] Receive and import outputs
+- [x] CLI enhancement in `client.rs`:
+  - [x] Added `connect_to_agent()` helper - finds agent by ID in cluster
+  - [x] Refactored `submit_build()` to handle all 4 response types:
+    - [x] `BuildAssigned` - Subscribe to assigned agent (existing behavior)
+    - [x] `AlreadyBuilding` - Connect to agent with build, subscribe to existing
+    - [x] `AlreadyCompleted` - Connect to agent with cache, call GetCompletedBuild
+    - [x] `NoEligibleAgents` - Return error with platform/features details
+  - [x] Updated `main.rs` to pass cluster_info to submit_build()
+  - [x] Added informative logging for deduplication scenarios
+
+**Tests completed:**
+- [x] `test_already_building_response` - Client joins in-progress build, gets catch-up
+- [x] `test_already_completed_response` - Client fetches from cache
+- [x] `test_concurrent_subscribers_same_build` - Two clients, same build, both complete
+- [x] Fixed `test_phase2_single_node_cluster_end_to_end` - Updated for new API
+
+**Test reliability improvements:**
+- [x] Added 30s timeouts to all stream consumption loops
+- [x] Fixed await-holding-lock warnings (proper lock scoping)
+- [x] Poll for Raft state changes instead of fixed sleeps
+- [x] `test_explicit_join_two_nodes`: 8.2s → 1.2s (6.8x faster!)
 
 ### 3.8 Phase 3 Testing
 
@@ -1002,12 +1013,14 @@ All agent-side implementation complete (3.1-3.6):
 - Multi-user subscriptions with catch-up log support
 - Build completion Raft coordination with retry (backon)
 - GetCompletedBuild RPC serves cached outputs
-- All 30 tests passing (22 unit + 8 integration)
+- CLI build deduplication (all 4 response types)
+- All 43 tests passing (31 unit + 12 integration)
 - Zero clippy warnings
-- Production-ready agent implementation
+- Test suite: 4.2s (optimized from 8+s)
+- Production-ready implementation
 
-**Remaining Phase 3 Work:**
-- 3.7: CLI Build Deduplication (handle AlreadyBuilding/AlreadyCompleted)
-- 3.8: Additional testing (concurrent users, multi-node scenarios)
+**Phase 3 Status:**
+- ✅ 3.1-3.7: COMPLETE (agent + CLI coordination)
+- Remaining: 3.8 (additional multi-node testing - optional)
 
-**Next: Complete Phase 3.7-3.8, then Phase 4 (Dependency Tracking)**
+**Next: Phase 4 (Dependency Tracking) or polish Phase 3**

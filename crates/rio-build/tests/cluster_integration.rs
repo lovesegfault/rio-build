@@ -138,7 +138,7 @@ async fn test_phase2_single_node_cluster_end_to_end() {
 
     println!("Submitting build...");
     let stream = client
-        .submit_build(build_info)
+        .submit_build(build_info, &cluster_info)
         .await
         .expect("Failed to submit build");
 

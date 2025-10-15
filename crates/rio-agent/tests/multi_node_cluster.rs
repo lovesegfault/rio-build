@@ -44,12 +44,20 @@ async fn test_explicit_join_two_nodes() -> Result<()> {
     let agent1_raft = agent1.raft.clone();
     let agent1_sm = agent1.state_machine.clone();
 
-    // Give agent1 time to become leader
-    sleep(Duration::from_secs(2)).await;
+    // Poll for agent1 to become leader (usually happens in <500ms)
+    let mut attempts = 0;
+    while attempts < 20 {
+        let metrics1 = agent1_raft.metrics().borrow().clone();
+        if metrics1.current_leader == Some(agent1_id) {
+            eprintln!("TEST: Agent 1 became leader after {}ms", attempts * 100);
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+        attempts += 1;
+    }
 
     // Verify agent1 is leader
     let metrics1 = agent1_raft.metrics().borrow().clone();
-    eprintln!("TEST: Agent 1 leader status: {:?}", metrics1.current_leader);
     assert_eq!(
         metrics1.current_leader,
         Some(agent1_id),
@@ -72,10 +80,32 @@ async fn test_explicit_join_two_nodes() -> Result<()> {
     let agent2_id = agent2.id;
     let agent2_sm = agent2.state_machine.clone();
 
-    // Wait for cluster to stabilize (agent2 needs time to sync state from leader)
-    sleep(Duration::from_secs(5)).await;
+    // Poll for cluster to stabilize (both agents see each other)
+    // Usually happens in <1s, but allow up to 3s for slow systems
+    let mut stabilized = false;
+    for attempt in 0..30 {
+        let is_stable = {
+            let state1 = agent1_sm.data.read();
+            let state2 = agent2_sm.data.read();
 
-    // Check leader status and cluster membership before assertions
+            state1.cluster.agents.len() == 2
+                && state2.cluster.agents.len() == 2
+                && state1.cluster.agents.contains_key(&agent2_id)
+                && state2.cluster.agents.contains_key(&agent1_id)
+        }; // Locks dropped here
+
+        if is_stable {
+            eprintln!("TEST: Cluster stabilized after {}ms", attempt * 100);
+            stabilized = true;
+            break;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(stabilized, "Cluster should stabilize within 3 seconds");
+
+    // Check leader status
     let metrics1 = agent1_raft.metrics().borrow().clone();
     let metrics2 = agent2.raft.metrics().borrow().clone();
     eprintln!(

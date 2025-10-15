@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     let mut client = client::RioClient::connect(&cluster_info.leader_address).await?;
 
     // 3. Submit the build and get a stream of updates
-    let stream = client.submit_build(build_info).await?;
+    let stream = client.submit_build(build_info, &cluster_info).await?;
 
     // 4. Handle the build stream (logs, outputs, completion)
     output_handler::handle_build_stream(stream).await?;
