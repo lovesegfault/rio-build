@@ -68,16 +68,17 @@ struct ClusterState {
 }
 
 struct BuildTracker {
-    agent_id: AgentId,
+    agent_id: Option<AgentId>,  // None when queued, Some when claimed
+    suggested_agents: Vec<AgentId>,  // Ranked by affinity (best first)
     started_at: Timestamp,
     parent_build: Option<DerivationPath>,  // None = top-level, Some(path) = dependency
     status: BuildStatus,
 }
 
 enum BuildStatus {
-    Building,                                    // Currently executing on agent
-    QueuedDependency { blocked_on: Vec<DerivationPath> },  // Waiting for dependencies
-    QueuedCapacity,                              // Waiting for agent capacity (agent is busy)
+    Queued,    // Waiting for agent to claim
+    Claimed,   // Agent claimed, preparing to start
+    Building,  // Currently executing on agent
 }
 
 struct CompletedBuild {
@@ -117,7 +118,7 @@ enum RaftCommand {
 
     // Build lifecycle (derivation path is the job identifier)
     // Leader proposes this when CLI submits work
-    // State machine deterministically assigns to best agent
+    // State machine creates ranked list of suggested agents
     BuildQueued {
         top_level: DerivationPath,
         derivation_nar: Vec<u8>,  // NAR bytes, replicated to all agents
@@ -125,10 +126,15 @@ enum RaftCommand {
         platform: String,
         features: Vec<String>,
     },
-    // Agent updates status when starting/queuing
-    BuildStatusChanged {
+    // Agent proposes this to claim a queued build
+    BuildClaimed {
         derivation_path: DerivationPath,
-        status: BuildStatus,  // Building, QueuedDependency, or QueuedCapacity
+        agent_id: AgentId,
+        affinity_score: usize,  // Agent's self-calculated affinity
+    },
+    // Agent proposes this when starting execution
+    BuildStarted {
+        derivation_path: DerivationPath,
     },
     BuildCompleted {
         derivation_path: DerivationPath,
@@ -151,63 +157,66 @@ enum RaftCommand {
 - Build logs (streamed to subscribers in real-time via gRPC)
 - Build outputs (stored in agent's /nix/store, exported on demand via gRPC)
 
-**Deterministic Agent Assignment:**
+**Build Claiming Model:**
 
-When a build is queued, the Raft state machine (running on ALL agents) deterministically selects which agent should execute it:
+When a build is queued, the Raft state machine creates a ranked list of suggested agents based on affinity. Agents then self-select and claim builds:
 
 ```rust
-fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
-    // 1. Filter eligible agents (platform + features, status-blind)
+fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> Vec<AgentId> {
+    // 1. Filter eligible agents (platform + features, not Down)
     let eligible: Vec<_> = state.agents.values()
         .filter(|a| {
             a.platforms.contains(&cmd.platform) &&
             cmd.features.iter().all(|f| a.features.contains(f)) &&
-            a.status != AgentStatus::Down  // Only exclude Down agents
+            a.status != AgentStatus::Down
         })
         .collect();
 
-    if eligible.is_empty() {
-        panic!("No eligible agents for platform {} with features {:?}",
-               cmd.platform, cmd.features);
-    }
-
-    // 2. Score by affinity (count matching dependencies)
-    let mut scores: HashMap<AgentId, usize> = HashMap::new();
-    for dep_path in &cmd.dependencies {
-        if let Some(tracker) = state.builds_in_progress.get(dep_path) {
-            *scores.entry(tracker.agent_id).or_insert(0) += 1;
-        }
-        if let Some(completed) = state.completed_builds.get(dep_path) {
-            *scores.entry(completed.agent_id).or_insert(0) += 1;
-        }
-    }
-
-    // 3. Select highest affinity, tie-break by smallest agent_id
-    let selected = scores.iter()
-        .filter(|(id, _)| eligible.iter().any(|a| &a.id == *id))
-        .max_by(|(id_a, score_a), (id_b, score_b)| {
-            match score_a.cmp(score_b) {
-                std::cmp::Ordering::Equal => id_b.cmp(id_a),  // Smaller ID wins
-                other => other,
+    // 2. Score ALL eligible agents by affinity (count matching dependencies)
+    let mut agent_scores: Vec<(AgentId, usize)> = eligible.iter()
+        .map(|agent| {
+            let mut score = 0;
+            for dep_path in &cmd.dependencies {
+                if let Some(tracker) = state.builds_in_progress.get(dep_path) {
+                    if tracker.agent_id == Some(agent.id) {
+                        score += 1;
+                    }
+                }
+                if let Some(completed) = state.completed_builds.get(dep_path) {
+                    if completed.agent_id == agent.id {
+                        score += 1;
+                    }
+                }
             }
+            (agent.id, score)
         })
-        .map(|(id, _)| *id)
-        .or_else(|| eligible.iter().min_by_key(|a| &a.id).map(|a| a.id))
-        .expect("Should have at least one eligible agent");
+        .collect();
 
-    // 4. Update state (all agents do this identically)
+    // 3. Sort by score (descending), then by agent_id (ascending) for determinism
+    agent_scores.sort_by(|(id_a, score_a), (id_b, score_b)| {
+        match score_b.cmp(score_a) {  // Higher score better
+            std::cmp::Ordering::Equal => id_a.cmp(id_b),  // Smaller ID wins tie
+            other => other,
+        }
+    });
+
+    let suggested_agents: Vec<AgentId> = agent_scores.iter().map(|(id, _)| *id).collect();
+
+    // 4. Create build in Queued state (no agent assigned yet)
     state.builds_in_progress.insert(cmd.top_level, BuildTracker {
-        agent_id: selected,
-        status: BuildStatus::Building,  // Agent will queue if busy
+        agent_id: None,  // Will be set when agent claims
+        suggested_agents: suggested_agents.clone(),
+        status: BuildStatus::Queued,
         parent_build: None,
         started_at: now(),
     });
 
-    // Register dependencies
+    // Register dependencies as queued too
     for dep_path in cmd.dependencies {
-        state.builds_in_progress.entry(dep_path).or_insert(BuildTracker {
-            agent_id: selected,
-            status: BuildStatus::Building,
+        state.builds_in_progress.insert(dep_path, BuildTracker {
+            agent_id: None,
+            suggested_agents: suggested_agents.clone(),
+            status: BuildStatus::Queued,
             parent_build: Some(cmd.top_level),
             started_at: now(),
         });
@@ -216,132 +225,178 @@ fn apply_build_queued(state: &mut ClusterState, cmd: BuildQueued) -> AgentId {
     // Store derivation NAR (all agents have it now)
     state.pending_derivations.insert(cmd.top_level, cmd.derivation_nar);
 
-    // Mark agent as Busy (may already be Busy, that's fine)
-    if let Some(agent) = state.agents.get_mut(&selected) {
-        agent.status = AgentStatus::Busy;
-    }
+    // Do NOT mark any agent as Busy (they haven't claimed yet)
 
-    selected  // All agents compute the same result!
+    suggested_agents  // Return ranked list to CLI
+}
+
+fn apply_build_claimed(state: &mut ClusterState, cmd: BuildClaimed) -> Result<()> {
+    if let Some(tracker) = state.builds_in_progress.get_mut(&cmd.derivation_path) {
+        // Verify build is still Queued
+        if tracker.status != BuildStatus::Queued {
+            return Err("Build already claimed");
+        }
+
+        // Check suggested agents or timeout
+        let elapsed = now() - tracker.started_at;
+        if !tracker.suggested_agents.contains(&cmd.agent_id) && elapsed < 2s {
+            return Err("Wait for suggested agents");
+        }
+
+        // Accept claim
+        tracker.agent_id = Some(cmd.agent_id);
+        tracker.status = BuildStatus::Claimed;
+
+        // Mark agent as Busy
+        if let Some(agent) = state.agents.get_mut(&cmd.agent_id) {
+            agent.status = AgentStatus::Busy;
+        }
+
+        Ok(())
+    } else {
+        Err("Build not found")
+    }
 }
 ```
 
 **Why this works:**
-- ✅ Deterministic - Same cluster state + same BuildQueued command = same agent selected
-- ✅ No races - Assignment happens in state machine, not via distributed claiming
-- ✅ Best agent wins - Affinity scoring selects optimal agent
-- ✅ Consistent - All agents agree on who was assigned
-- ✅ Status-blind - Available and Busy agents compete equally (simpler!)
-- ✅ Automatic queueing - Busy agents queue builds in `pending_builds`
+- ✅ Truthful status - Queued means not claimed yet, Building means actually executing
+- ✅ Distributed claiming - Agents self-select based on local state
+- ✅ Affinity optimization - State machine creates ranked suggestions
+- ✅ No races - Raft linearizability ensures first claim wins
+- ✅ Fallback mechanism - Non-suggested agents can claim after timeout
+- ✅ Capacity awareness - Busy agents don't claim new builds
+- ✅ Dependency awareness - Agents calculate affinity before claiming
 - ✅ Durable - Derivations in Raft survive leader election
 
-**Simplification: Pure Affinity Assignment (Status-Blind)**
+**Hybrid Claiming Model: Centralized Ranking + Distributed Selection**
 
-Unlike traditional schedulers that prefer "Available" agents, Rio's assignment uses **pure affinity scoring**:
+Rio combines centralized affinity optimization with distributed agent claiming:
 
-1. **Filter by capabilities only** (platform, features, not Down)
-2. **Score by affinity alone** (count matching dependencies)
-3. **Highest affinity wins** (tie-break by smallest agent_id)
+1. **State machine creates ranked suggestions** (centralized, deterministic)
+   - Filter eligible agents by platform/features
+   - Score all agents by affinity (count matching dependencies)
+   - Sort by score (high→low), tie-break by agent_id (deterministic)
+   - Return ranked list: [best_agent, second_best, ...]
 
-**Why queue depth doesn't matter:**
+2. **Agents self-select builds to claim** (distributed, responsive)
+   - Skip if busy (current_build is Some)
+   - Skip if dependencies still building
+   - Claim immediately if in suggested list and have affinity
+   - Claim after 2s timeout if not suggested but have affinity
 
-Deep queues only occur with dependency chains. In that case, affinity is exactly right:
-- Agent K building d1→d2→...→d100 (100-deep queue)
-- New build d101 depends on d100
-- Affinity assigns to K (score=1 vs others' score=0)
-- d101 queues behind d100, but gets instant cache hit when d100 completes
-- Alternative would be: Assign to idle agent, must fetch/wait for d100 (slower!)
+3. **Raft ensures atomicity** (first claim wins, others rejected)
 
-**Independent builds distribute naturally:**
-- No dependencies → affinity scores are all 0
-- Deterministic tie-break by agent_id
-- Due to UUID randomness, builds spread across agents
-- No artificial queueing on one agent
+**Why claiming instead of assignment:**
 
-**BuildStatus tracks queue reasons (for visibility):**
-- `Building`: Currently executing
-- `QueuedDependency { blocked_on }`: Waiting for specific dependencies
-- `QueuedCapacity`: Waiting for agent capacity (agent is busy)
+Traditional assignment has semantic issues:
+- ❌ State says "Building" but agent hasn't started yet
+- ❌ Agent might be busy and unable to accept
+- ❌ No way to represent "assigned but not acknowledged"
 
-Agents report status changes via BuildStatusChanged, allowing:
-- CLI to show meaningful status ("Queued - waiting for dep foo")
-- Monitoring/debugging (see why builds are queued)
-- Future optimizations if needed
+Claiming model fixes this:
+- ✅ `Queued` means no agent committed yet
+- ✅ `Claimed` means agent explicitly accepted
+- ✅ `Building` means actually executing
+- ✅ Status always matches reality
+
+**How agents decide to claim:**
+- **Capacity:** Only claim if not currently busy
+- **Dependencies:** Only claim if dependencies available
+- **Affinity:** Prefer builds with dependencies on us
+- **Priority:** Suggested agents claim first, others wait for timeout
 
 **Benefits:**
-- Simplest possible algorithm (pure affinity)
-- Optimal for dependency chains (which is the common case)
-- Natural load distribution (independent builds spread)
-- No tunable parameters (no affinity vs queue weight to configure)
+- Truthful state transitions (status matches reality)
+- Affinity optimization preserved (ranked suggestions)
+- Distributed decision-making (agents know local state)
+- Automatic load balancing (busy agents don't claim)
+- Dependency awareness (agents check before claiming)
+- No tunable parameters needed
 
-**How BuildStatus is determined:**
+**How agents decide when to claim builds:**
 
-When an agent receives a build assignment from Raft, it proposes the appropriate status:
+Agents watch Raft state for queued builds and actively claim them based on their local state:
 
 ```rust
-async fn on_build_assigned(drv_path, dependencies) {
-    let nar = read_from_raft(drv_path);
-
-    if self.current_build.is_some() {
-        // Agent is currently building - must queue
-
-        // Check if any dependencies are in our local queue
-        let blocked_on: Vec<_> = dependencies.iter()
-            .filter(|dep| self.pending_builds.contains_key(dep) ||
-                         self.current_build.as_ref() == Some(dep))
-            .cloned()
-            .collect();
-
-        if blocked_on.is_empty() {
-            // No dependencies in our queue - waiting for capacity only
-            self.pending_builds.insert(drv_path, ...);
-            raft.propose(BuildStatusChanged {
-                derivation_path: drv_path,
-                status: QueuedCapacity,
-            });
-        } else {
-            // Dependencies in our queue - waiting for them
-            self.pending_builds.insert(drv_path, PendingBuild {
-                blocked_on: blocked_on.clone(),
-                ...
-            });
-            raft.propose(BuildStatusChanged {
-                derivation_path: drv_path,
-                status: QueuedDependency { blocked_on },
-            });
+async fn build_coordinator_loop() {
+    loop every 100ms {
+        // Skip if we're busy
+        if current_build.is_some() {
+            continue;
         }
-    } else {
-        // Agent is available - start immediately
-        self.start_build(drv_path, nar);
-        raft.propose(BuildStatusChanged {
-            derivation_path: drv_path,
-            status: Building,
-        });
+
+        // Find queued builds we could claim
+        for (drv_path, tracker) in builds_in_progress {
+            if tracker.status != Queued {
+                continue;
+            }
+
+            // Check if we match requirements
+            if !matches_platform_and_features(tracker) {
+                continue;
+            }
+
+            // Calculate our affinity score
+            let our_score = count_dependencies_on_us(tracker.dependencies);
+
+            // Check if dependencies are ready
+            if any_dependency_still_building(tracker.dependencies) {
+                continue;  // Wait for dependencies
+            }
+
+            // Decide whether to claim
+            let elapsed = now() - tracker.started_at;
+            let should_claim = if tracker.suggested_agents.contains(us) {
+                // We're suggested - claim if we have affinity
+                our_score > 0 || elapsed > 200ms
+            } else if elapsed > 2s {
+                // Timeout passed - any agent with affinity can claim
+                our_score > 0
+            } else {
+                false  // Not our turn yet
+            };
+
+            if should_claim {
+                // Try to claim the build
+                raft.propose(BuildClaimed {
+                    derivation_path: drv_path,
+                    agent_id: us,
+                    affinity_score: our_score,
+                });
+                // If claim accepted, start build and propose BuildStarted
+                // If claim rejected (race - another agent claimed), try next build
+                break;  // Only claim one build per iteration
+            }
+        }
     }
 }
 ```
 
-**Example scenario:**
+**Example claiming scenario:**
 ```
-Agent K state:
-- current_build: foo.drv (Building)
-- pending_builds: { drv-1 → QueuedCapacity }
+Cluster state:
+- Agent A: Building foo.drv, has completed bar.drv recently
+- Agent B: Available
+- Agent C: Available
 
-New assignment: drv-2 (depends on drv-1)
+New build: baz.drv depends on bar.drv
 
-Agent K logic:
-1. Is agent busy? Yes (foo is building)
-2. Check dependencies: drv-1 is in pending_builds
-3. Status: QueuedDependency { blocked_on: [drv-1] }
+State machine creates suggestions:
+1. Score Agent A: 1 (has bar.drv completed)
+2. Score Agent B: 0 (no affinity)
+3. Score Agent C: 0 (no affinity)
+4. Ranked list: [A, B, C]
+
+Build claiming:
+1. Agent A (suggested, score=1): Claims immediately
+2. Agents B,C (suggested, score=0): Wait, don't claim (no affinity)
+3. After 2s timeout: B or C could claim if A is down
 
 Result:
-- foo: Building
-- drv-1: QueuedCapacity (waiting for foo)
-- drv-2: QueuedDependency { blocked_on: [drv-1] } (waiting for drv-1)
+- baz.drv builds on Agent A (optimal - bar.drv already in /nix/store)
+- Instant cache hit for bar.drv dependency
 ```
-
-The distinction allows meaningful user messaging:
-- QueuedCapacity: "Agent is busy, build will start when current build completes"
-- QueuedDependency: "Waiting for dependencies: /nix/store/drv-1.drv"
 
 **Build Deduplication:**
 
