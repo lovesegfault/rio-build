@@ -10,7 +10,7 @@ use rio_build::evaluator::BuildInfo;
 use rio_common::proto::{AgentInfo, BuildCompleted, BuildUpdate, LogLine, build_update};
 use std::collections::HashMap;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_client_submit_and_subscribe() -> anyhow::Result<()> {
     // Create mock agent with test response
     let drv_path = "/nix/store/test123-hello.drv";

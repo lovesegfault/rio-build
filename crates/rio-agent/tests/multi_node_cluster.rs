@@ -15,7 +15,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 /// Test: Explicit join - agent A bootstraps, agent B explicitly joins A
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_explicit_join_two_nodes() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -323,7 +323,7 @@ runCommandNoCC "rio-multinode-{}" {{}} ''
 }
 
 /// Test: Distributed build on 3-node cluster
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multi_node_distributed_build() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -442,7 +442,7 @@ async fn test_multi_node_distributed_build() -> Result<()> {
 }
 
 /// Test: Concurrent deduplication on multi-node cluster
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multi_node_concurrent_deduplication() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -679,7 +679,7 @@ async fn test_multi_node_concurrent_deduplication() -> Result<()> {
 }
 
 /// Test: Multi-node cache serving (AlreadyCompleted across nodes)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multi_node_cache_serving() -> Result<()> {
     use rio_common::proto::GetCompletedBuildRequest;
 

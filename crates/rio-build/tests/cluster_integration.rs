@@ -55,7 +55,7 @@ runCommandNoCC "rio-phase2-test-{}" {{}} ''
     Ok((drv_path, export_output.stdout))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "Integration test - requires nix commands. Run with: cargo test --ignored"]
 async fn test_phase2_single_node_cluster_end_to_end() -> anyhow::Result<()> {
     use anyhow::Context;
