@@ -64,8 +64,8 @@ pub fn start_build_coordinator(
                         .collect::<Vec<_>>()
                 };
 
-                // Start claimed builds
-                for drv_path in builds_to_start {
+                // Start one claimed build (if any)
+                if let Some(drv_path) = builds_to_start.into_iter().next() {
                     tracing::info!("Starting claimed build {} (agent now free)", drv_path);
 
                     // Get derivation NAR from Raft storage
@@ -88,11 +88,10 @@ pub fn start_build_coordinator(
                             tracing::error!("Failed to start claimed build {}: {}", drv_path, e);
                             // TODO: Propose BuildFailed to Raft
                         } else {
-                            // Propose BuildStarted
-                            let start_cmd = RaftCommand::BuildStarted {
-                                derivation_path: drv_path.clone(),
-                            };
-                            if let Err(e) = raft.client_write(start_cmd).await {
+                            // Propose BuildStarted (with leader forwarding)
+                            if let Err(e) =
+                                forward_build_started(&raft, &sm_store, drv_path.clone()).await
+                            {
                                 tracing::warn!(
                                     "Failed to propose BuildStarted for {}: {}",
                                     drv_path,
@@ -101,9 +100,6 @@ pub fn start_build_coordinator(
                             }
                         }
                     }
-
-                    // Only start one build per iteration
-                    break;
                 }
             }
 
@@ -164,82 +160,68 @@ pub fn start_build_coordinator(
                 // Mark as claimed to avoid retrying
                 claimed_builds.lock().await.insert(drv_path.clone());
 
-                // Propose BuildClaimed to Raft
-                let claim_cmd = RaftCommand::BuildClaimed {
-                    derivation_path: drv_path.clone(),
+                // Try to claim via Raft (with leader forwarding)
+                match claim_build_via_leader(
+                    &raft,
+                    &sm_store,
+                    drv_path.clone(),
                     agent_id,
                     affinity_score,
-                };
+                )
+                .await
+                {
+                    Ok(ClaimResult::Claimed) => {
+                        tracing::info!("Successfully claimed build {}", drv_path);
 
-                match raft.client_write(claim_cmd).await {
-                    Ok(response) => {
-                        match response.data {
-                            RaftResponse::BuildClaimedAck { .. } => {
-                                tracing::info!("Successfully claimed build {}", drv_path);
+                        // Get derivation NAR from Raft storage
+                        let drv_nar = {
+                            let cluster_state = &sm_store.data.read().cluster;
+                            cluster_state.pending_derivations.get(&drv_path).cloned()
+                        };
 
-                                // Get derivation NAR from Raft storage
-                                let drv_nar = {
-                                    let cluster_state = &sm_store.data.read().cluster;
-                                    cluster_state.pending_derivations.get(&drv_path).cloned()
-                                };
-
-                                if let Some(nar_bytes) = drv_nar {
-                                    // Start the build
-                                    if let Err(e) = builder::start_build(
-                                        &current_build,
-                                        raft.clone(),
-                                        sm_store.clone(),
-                                        drv_path.to_string(),
-                                        nar_bytes,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(
-                                            "Failed to start build {}: {}",
-                                            drv_path,
-                                            e
-                                        );
-                                        // TODO: Propose BuildFailed to Raft
-                                        claimed_builds.lock().await.remove(&drv_path);
-                                    } else {
-                                        // Propose BuildStarted
-                                        let start_cmd = RaftCommand::BuildStarted {
-                                            derivation_path: drv_path.clone(),
-                                        };
-                                        if let Err(e) = raft.client_write(start_cmd).await {
-                                            tracing::warn!(
-                                                "Failed to propose BuildStarted for {}: {}",
-                                                drv_path,
-                                                e
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    tracing::error!(
-                                        "Build {} claimed but no derivation NAR in storage",
-                                        drv_path
+                        if let Some(nar_bytes) = drv_nar {
+                            // Start the build
+                            if let Err(e) = builder::start_build(
+                                &current_build,
+                                raft.clone(),
+                                sm_store.clone(),
+                                drv_path.to_string(),
+                                nar_bytes,
+                            )
+                            .await
+                            {
+                                tracing::error!("Failed to start build {}: {}", drv_path, e);
+                                // TODO: Propose BuildFailed to Raft
+                                claimed_builds.lock().await.remove(&drv_path);
+                            } else {
+                                // Propose BuildStarted (with leader forwarding)
+                                if let Err(e) =
+                                    forward_build_started(&raft, &sm_store, drv_path.clone()).await
+                                {
+                                    tracing::warn!(
+                                        "Failed to propose BuildStarted for {}: {}",
+                                        drv_path,
+                                        e
                                     );
-                                    claimed_builds.lock().await.remove(&drv_path);
                                 }
-
-                                // Only claim one build per iteration
-                                break;
                             }
-                            RaftResponse::BuildClaimRejected { reason, .. } => {
-                                tracing::debug!(
-                                    "Claim rejected for build {}: {}",
-                                    drv_path,
-                                    reason
-                                );
-                                // Another agent claimed it or timeout not passed - that's fine
-                            }
-                            _ => {
-                                tracing::warn!("Unexpected response to BuildClaimed");
-                            }
+                        } else {
+                            tracing::error!(
+                                "Build {} claimed but no derivation NAR in storage",
+                                drv_path
+                            );
+                            claimed_builds.lock().await.remove(&drv_path);
                         }
+
+                        // Only claim one build per iteration
+                        break;
+                    }
+                    Ok(ClaimResult::Rejected(reason)) => {
+                        tracing::debug!("Claim rejected for build {}: {}", drv_path, reason);
+                        // Another agent claimed it or timeout not passed - that's fine
                     }
                     Err(e) => {
-                        tracing::error!("Failed to propose BuildClaimed: {}", e);
+                        tracing::error!("Failed to claim build {}: {}", drv_path, e);
                         claimed_builds.lock().await.remove(&drv_path);
                     }
                 }
@@ -276,4 +258,161 @@ fn calculate_affinity(
     }
 
     score
+}
+
+/// Result of a claim attempt
+enum ClaimResult {
+    Claimed,
+    Rejected(String),
+}
+
+/// Forward BuildStarted to leader if necessary
+async fn forward_build_started(
+    raft: &Arc<Raft<TypeConfig>>,
+    sm_store: &StateMachineStore,
+    drv_path: DerivationPath,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use rio_common::proto::rio_agent_client::RioAgentClient;
+    use rio_common::proto::{BuildStartedReport, ReportBuildResultRequest};
+
+    // Try direct Raft proposal first
+    let cmd = RaftCommand::BuildStarted {
+        derivation_path: drv_path.clone(),
+    };
+
+    match raft.client_write(cmd).await {
+        Ok(_) => {
+            tracing::debug!("BuildStarted committed to Raft (this agent is leader)");
+            Ok(())
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            if !error_msg.contains("has to forward request to") {
+                anyhow::bail!("Raft proposal failed: {}", e);
+            }
+
+            // We're not the leader - forward via RPC
+            tracing::debug!("Not leader, forwarding BuildStarted to leader");
+
+            // Get leader info
+            let leader_id = raft
+                .metrics()
+                .borrow()
+                .current_leader
+                .context("No current leader")?;
+
+            let leader_addr = {
+                let state = sm_store.data.read();
+                state
+                    .cluster
+                    .agents
+                    .get(&leader_id)
+                    .map(|info| info.address.clone())
+                    .context("Leader not found in cluster state")?
+            };
+
+            // Connect and forward
+            let leader_url = leader_addr.to_string();
+            let mut client = RioAgentClient::connect(leader_url)
+                .await
+                .context("Failed to connect to leader")?;
+
+            client
+                .report_build_result(ReportBuildResultRequest {
+                    derivation_path: drv_path.to_string(),
+                    result: Some(
+                        rio_common::proto::report_build_result_request::Result::Started(
+                            BuildStartedReport {},
+                        ),
+                    ),
+                })
+                .await
+                .context("ReportBuildResult RPC failed")?;
+
+            Ok(())
+        }
+    }
+}
+
+/// Claim a build, forwarding to leader if necessary
+///
+/// Try to propose BuildClaimed directly. If we're not the leader, forward to leader via RPC.
+async fn claim_build_via_leader(
+    raft: &Arc<Raft<TypeConfig>>,
+    sm_store: &StateMachineStore,
+    drv_path: DerivationPath,
+    agent_id: AgentId,
+    affinity_score: usize,
+) -> anyhow::Result<ClaimResult> {
+    use anyhow::Context;
+    use rio_common::proto::ClaimBuildRequest;
+    use rio_common::proto::rio_agent_client::RioAgentClient;
+
+    // Try direct Raft proposal first (works if we're the leader)
+    let claim_cmd = RaftCommand::BuildClaimed {
+        derivation_path: drv_path.clone(),
+        agent_id,
+        affinity_score,
+    };
+
+    match raft.client_write(claim_cmd).await {
+        Ok(response) => match response.data {
+            RaftResponse::BuildClaimedAck { .. } => Ok(ClaimResult::Claimed),
+            RaftResponse::BuildClaimRejected { reason, .. } => Ok(ClaimResult::Rejected(reason)),
+            _ => anyhow::bail!("Unexpected response to BuildClaimed"),
+        },
+        Err(e) => {
+            let error_msg = e.to_string();
+            if !error_msg.contains("has to forward request to") {
+                // Some other error
+                anyhow::bail!("Raft proposal failed: {}", e);
+            }
+
+            // We're not the leader - find leader and forward via RPC
+            tracing::debug!("Not leader, forwarding claim to leader");
+
+            // Get leader ID from Raft metrics
+            let leader_id = raft
+                .metrics()
+                .borrow()
+                .current_leader
+                .context("No current leader")?;
+
+            // Get leader address from cluster state
+            let leader_addr = {
+                let state = sm_store.data.read();
+                state
+                    .cluster
+                    .agents
+                    .get(&leader_id)
+                    .map(|info| info.address.clone())
+                    .context("Leader not found in cluster state")?
+            };
+
+            // Connect to leader (Url already has scheme)
+            let leader_url = leader_addr.to_string();
+
+            let mut client = RioAgentClient::connect(leader_url)
+                .await
+                .context("Failed to connect to leader")?;
+
+            // Call ClaimBuild RPC
+            let response = client
+                .claim_build(ClaimBuildRequest {
+                    derivation_path: drv_path.to_string(),
+                    agent_id: agent_id.to_string(),
+                    affinity_score: affinity_score as u32,
+                })
+                .await
+                .context("ClaimBuild RPC failed")?
+                .into_inner();
+
+            if response.success {
+                Ok(ClaimResult::Claimed)
+            } else {
+                Ok(ClaimResult::Rejected(response.message))
+            }
+        }
+    }
 }

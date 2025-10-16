@@ -568,29 +568,41 @@ async fn test_multi_node_concurrent_deduplication() -> Result<()> {
         .await?
         .into_inner();
 
-    // Should get BuildInfo (build already exists)
-    let build_info = match response2.result {
-        Some(rio_common::proto::queue_build_response::Result::BuildInfo(info)) => info,
-        other => anyhow::bail!("Client 2 expected BuildInfo, got {:?}", other),
+    // Should get either BuildInfo or AlreadyCompleted (build finishes very fast)
+    let (_client2_agent_id, client2_addr) = match response2.result {
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(info)) => {
+            eprintln!(
+                "TEST: Client 2 got BuildInfo (in-progress deduplication), status={:?}",
+                info.status
+            );
+            // Verify same agent as Client 1
+            let agent_id_str = info.agent_id.context("BuildInfo should have agent_id")?;
+            let agent_id = uuid::Uuid::parse_str(&agent_id_str)?;
+            assert_eq!(
+                agent_id, assigned_agent_id,
+                "Client 2 should see same agent as Client 1"
+            );
+            (agent_id, assigned_addr.clone())
+        }
+        Some(rio_common::proto::queue_build_response::Result::AlreadyCompleted(c)) => {
+            eprintln!(
+                "TEST: Client 2 got AlreadyCompleted (build finished before Client 2 submitted)"
+            );
+            let agent_id = uuid::Uuid::parse_str(&c.agent_id)?;
+            let addr = addresses
+                .get(&agent_id)
+                .context("Completed agent not found")?;
+            (agent_id, addr.clone())
+        }
+        other => anyhow::bail!(
+            "Client 2 expected BuildInfo or AlreadyCompleted, got {:?}",
+            other
+        ),
     };
 
-    eprintln!(
-        "TEST: Client 2 got BuildInfo response, status={:?}, agent_id={:?}",
-        build_info.status, build_info.agent_id
-    );
-
-    // If build has been claimed, verify it's the same agent as Client 1 saw
-    if let Some(agent_id_str) = &build_info.agent_id {
-        let build_info_agent_id = uuid::Uuid::parse_str(agent_id_str)?;
-        assert_eq!(
-            build_info_agent_id, assigned_agent_id,
-            "Client 2 should see same agent as Client 1"
-        );
-    }
-
-    // Client 2: Connect to the assigned agent and subscribe
-    eprintln!("TEST: Client 2 connecting to agent at {}", assigned_addr);
-    let mut client2 = RioAgentClient::connect(assigned_addr).await?;
+    // Client 2: Connect to the agent and subscribe (or get completed build)
+    eprintln!("TEST: Client 2 connecting to agent at {}", client2_addr);
+    let mut client2 = RioAgentClient::connect(client2_addr).await?;
     let mut stream2 = client2
         .subscribe_to_build(SubscribeToBuildRequest {
             derivation_path: drv_path.clone(),
@@ -751,15 +763,33 @@ async fn test_multi_node_cache_serving() -> Result<()> {
         other => anyhow::bail!("Client 1 expected BuildInfo, got {:?}", other),
     };
 
+    // Poll for build to be claimed (status = Claimed or Building)
+    // Note: Build might complete very quickly, so we just need agent_id to be set
     let assigned_agent_id = {
         let drv_path_key: Utf8PathBuf = drv_path.clone().into();
-        let state = agents[0].state_machine.data.read();
-        state
-            .cluster
-            .builds_in_progress
-            .get(&drv_path_key)
-            .and_then(|t| t.agent_id)
-            .context("Build should be claimed by now")?
+        let mut claimed_agent = None;
+        for _attempt in 0..50 {
+            {
+                let state = agents[0].state_machine.data.read();
+                if let Some(tracker) = state.cluster.builds_in_progress.get(&drv_path_key)
+                    && let Some(agent_id) = tracker.agent_id
+                {
+                    claimed_agent = Some(agent_id);
+                    break;
+                }
+            } // Release lock before sleeping
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // If not in builds_in_progress, check completed_builds
+        if claimed_agent.is_none() {
+            let state = agents[0].state_machine.data.read();
+            if let Some(completed) = state.cluster.completed_builds.get(&drv_path_key) {
+                claimed_agent = Some(completed.agent_id);
+            }
+        }
+
+        claimed_agent.context("Build should be claimed by now")?
     };
 
     let assigned_addr = addresses

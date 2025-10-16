@@ -40,6 +40,11 @@ service RioAgent {
   // Non-leader agents call this on leader after builds complete/fail
   rpc ReportBuildResult(ReportBuildResultRequest)
       returns (ReportBuildResultResponse);
+
+  // Internal: Request leader to propose BuildClaimed (for Raft coordination)
+  // Non-leader agents call this on leader to claim builds
+  rpc ClaimBuild(ClaimBuildRequest)
+      returns (ClaimBuildResponse);
 }
 
 // ============================================================================
@@ -217,9 +222,14 @@ message GetCompletedBuildRequest {
 message ReportBuildResultRequest {
   string derivation_path = 1;
   oneof result {
-    BuildCompletedReport completed = 2;
-    BuildFailedReport failed = 3;
+    BuildStartedReport started = 2;
+    BuildCompletedReport completed = 3;
+    BuildFailedReport failed = 4;
   }
+}
+
+message BuildStartedReport {
+  // No additional fields needed - just a notification
 }
 
 message BuildCompletedReport {
@@ -233,4 +243,19 @@ message BuildFailedReport {
 message ReportBuildResultResponse {
   bool success = 1;
   string message = 2;  // Error message if success = false
+}
+
+// ============================================================================
+// Build Claiming (Internal - Agent to Leader)
+// ============================================================================
+
+message ClaimBuildRequest {
+  string derivation_path = 1;
+  string agent_id = 2;           // Agent requesting to claim
+  uint32 affinity_score = 3;     // Agent's self-calculated affinity
+}
+
+message ClaimBuildResponse {
+  bool success = 1;
+  string message = 2;  // Error message if success = false (e.g., "already claimed")
 }

@@ -550,6 +550,9 @@ impl RioAgent for RioAgentService {
 
         // Build the appropriate Raft command based on result
         let cmd = match req.result {
+            Some(BuildResult::Started(_)) => {
+                crate::state_machine::RaftCommand::BuildStarted { derivation_path }
+            }
             Some(BuildResult::Completed(completed)) => {
                 let output_paths: Vec<rio_common::DerivationPath> =
                     completed.output_paths.iter().map(|p| p.into()).collect();
@@ -591,6 +594,64 @@ impl RioAgent for RioAgentService {
                 } else {
                     Err(Status::internal(format!("Raft proposal failed: {}", e)))
                 }
+            }
+        }
+    }
+
+    /// Claim build (internal - called by non-leader agents)
+    ///
+    /// Non-leader agents call this on the leader to propose BuildClaimed.
+    /// Any agent can receive this call, but only the leader can commit to Raft.
+    async fn claim_build(
+        &self,
+        request: Request<ClaimBuildRequest>,
+    ) -> Result<Response<ClaimBuildResponse>, Status> {
+        let req = request.into_inner();
+        let derivation_path: rio_common::DerivationPath = req.derivation_path.clone().into();
+        let agent_id: rio_common::AgentId = req
+            .agent_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("Invalid agent_id UUID"))?;
+
+        tracing::info!(
+            "Received claim request for {} from agent {}",
+            req.derivation_path,
+            req.agent_id
+        );
+
+        // Build Raft command
+        let cmd = crate::state_machine::RaftCommand::BuildClaimed {
+            derivation_path,
+            agent_id,
+            affinity_score: req.affinity_score as usize,
+        };
+
+        // Propose to Raft (this agent might be leader or follower)
+        let raft = &self.agent.raft;
+        match raft.client_write(cmd).await {
+            Ok(response) => match response.data {
+                crate::state_machine::RaftResponse::BuildClaimedAck { .. } => {
+                    tracing::info!("Build claim committed to Raft");
+                    Ok(Response::new(ClaimBuildResponse {
+                        success: true,
+                        message: "Build claimed".to_string(),
+                    }))
+                }
+                crate::state_machine::RaftResponse::BuildClaimRejected { reason, .. } => {
+                    tracing::info!("Build claim rejected: {}", reason);
+                    Ok(Response::new(ClaimBuildResponse {
+                        success: false,
+                        message: reason,
+                    }))
+                }
+                _ => {
+                    tracing::warn!("Unexpected response to BuildClaimed");
+                    Err(Status::internal("Unexpected response"))
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Build claim proposal failed: {}", e);
+                Err(Status::internal(format!("Failed to commit: {}", e)))
             }
         }
     }

@@ -1,6 +1,7 @@
 //! Full integration test - tests the complete gRPC server flow
 
 use anyhow::Context;
+use rio_agent::state_machine::BuildStatus;
 use rio_common::proto::rio_agent_client::RioAgentClient;
 use rio_common::proto::{QueueBuildRequest, SubscribeToBuildRequest, build_update};
 use tokio::process::Command;
@@ -131,8 +132,30 @@ async fn test_end_to_end_build_flow() -> anyhow::Result<()> {
         "Should receive BuildInfo"
     );
 
-    // Wait for coordinator to notice assignment and start build (polls every 100ms)
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    // Wait for build to be claimed and started
+    let mut build_claimed = false;
+    for _attempt in 0..30 {
+        {
+            let state = agent.state_machine.data.read();
+            let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+            if let Some(tracker) = state.cluster.builds_in_progress.get(&drv_path_key)
+                && tracker.agent_id.is_some()
+                && tracker.status == BuildStatus::Building
+            {
+                build_claimed = true;
+                break;
+            }
+        } // Release lock before sleeping!
+        if build_claimed {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    anyhow::ensure!(
+        build_claimed,
+        "Build should be claimed and started within 3 seconds"
+    );
 
     // Subscribe to build
     let mut stream = client
@@ -484,10 +507,29 @@ async fn test_late_joiner_receives_catch_up_logs() -> anyhow::Result<()> {
         "Should receive BuildQueued"
     );
 
-    // Wait for build coordinator to pick up the assignment (polls every 100ms)
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for build coordinator to claim and start the build
+    // Poll until build has been claimed (agent_id is set)
+    let mut build_claimed = false;
+    for _attempt in 0..30 {
+        {
+            let state = agent.state_machine.data.read();
+            let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+            if let Some(tracker) = state.cluster.builds_in_progress.get(&drv_path_key)
+                && tracker.agent_id.is_some()
+            {
+                build_claimed = true;
+                break;
+            }
+        } // Release lock before sleeping!
+        if build_claimed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    // Subscribe immediately (first subscriber)
+    anyhow::ensure!(build_claimed, "Build should be claimed within 3 seconds");
+
+    // Subscribe (first subscriber)
     let mut stream1 = client
         .subscribe_to_build(SubscribeToBuildRequest {
             derivation_path: drv_path.clone(),
@@ -645,21 +687,26 @@ async fn test_build_completion_updates_raft_state() -> anyhow::Result<()> {
     );
 
     // Verify build is in builds_in_progress after submission
-    // Wait for build coordinator to pick up assignment (polls every 100ms)
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    {
-        let state = state_machine.data.read();
-        let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
-        let tracker = state
-            .cluster
-            .builds_in_progress
-            .get(&drv_path_key)
-            .context("Build should be in progress after submission")?;
-        anyhow::ensure!(
-            tracker.agent_id == Some(agent_id),
-            "Build should be claimed by this agent"
-        );
+    // Wait for build coordinator to claim the build
+    let mut build_claimed = false;
+    for _attempt in 0..30 {
+        {
+            let state = state_machine.data.read();
+            let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+            if let Some(tracker) = state.cluster.builds_in_progress.get(&drv_path_key)
+                && tracker.agent_id == Some(agent_id)
+            {
+                build_claimed = true;
+                break;
+            }
+        } // Release lock before sleeping
+        if build_claimed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    anyhow::ensure!(build_claimed, "Build should be claimed within 3 seconds");
 
     // Subscribe and wait for completion
     let mut stream = client
@@ -823,8 +870,26 @@ async fn test_get_completed_build_serves_cache() -> anyhow::Result<()> {
         .await
         .context("QueueBuild failed")?;
 
-    // Wait for build coordinator to pick up assignment (polls every 100ms)
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for build to be claimed and started
+    let mut build_started = false;
+    for _attempt in 0..30 {
+        {
+            let state = state_machine.data.read();
+            let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+            if let Some(tracker) = state.cluster.builds_in_progress.get(&drv_path_key)
+                && tracker.status == BuildStatus::Building
+            {
+                build_started = true;
+                break;
+            }
+        } // Release lock before sleeping!
+        if build_started {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::ensure!(build_started, "Build should start within 3 seconds");
 
     // Subscribe and wait for completion
     let mut stream = client
