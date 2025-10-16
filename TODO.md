@@ -740,11 +740,24 @@ all$ rio-agent --listen 0.0.0.0:50051 --seeds node1:50051,node2:50051,node3:5005
 - [x] Tests can run in parallel without port conflicts
 - [x] Address tracking via HashMap (O(1) lookups)
 
-**Priority 2 Tests (Deferred):**
-- [ ] Test: Multi-node cache serving across agents (Phase 4 or 5)
-- [ ] Test: Leader failover during build (Phase 5 - requires CLI retry logic)
+**Priority 2 Tests:**
 
-**Note:** Priority 1 tests prove multi-node coordination works correctly. Priority 2 tests are nice-to-have polish for Phase 5.
+- [x] Test: Multi-node cache serving (`test_multi_node_cache_serving`)
+  - [x] Form 3-node cluster
+  - [x] Client 1 completes build on agent-X
+  - [x] BuildCompleted propagates to all agents via Raft
+  - [x] Client 2 submits same build to leader (gets AlreadyCompleted)
+  - [x] Verify AlreadyCompleted points to agent-X
+  - [x] Client 2 connects to agent-X and calls GetCompletedBuild
+  - [x] Verify outputs served from cache
+
+**Priority 3 Tests (Deferred to Phase 5):**
+- [ ] Test: Leader failover during build (requires CLI retry/reconnect logic)
+
+**Status:** Priority 1-2 tests complete! Multi-node coordination fully proven.
+- 4 multi-node integration tests (cluster formation, distributed build, deduplication, cache serving)
+- All scenarios tested: BuildAssigned, AlreadyBuilding, AlreadyCompleted
+- Leader failover test deferred to Phase 5 (requires CLI retry enhancements)
 
 ---
 
@@ -1045,7 +1058,7 @@ All Phase 3 implementation complete (3.1-3.8 Priority 1):
 - Production-ready distributed build system
 
 **Phase 3 Status:**
-- ✅ 3.1-3.8 Priority 1: COMPLETE
-- Remaining: 3.8 Priority 2 (cache serving, leader failover - optional polish for Phase 5)
+- ✅ 3.1-3.8: COMPLETE (including Priority 2 cache serving test)
+- Remaining: 3.8 Priority 3 (leader failover - deferred to Phase 5)
 
 **Next: Phase 4 (Dependency Tracking, Build Affinity, Cascading Failures)**
