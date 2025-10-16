@@ -58,18 +58,28 @@ async fn test_already_building_response() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
 
-    let listen_addr = "127.0.0.1:50895".to_string();
-    let agent_url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
-    let _agent = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),
         Some(Duration::from_millis(500)),
         Some(Duration::from_secs(3)),
     )
     .await
     .expect("Failed to bootstrap agent");
+
+    // Get actual bound address
+    let agent_url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent.id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -181,18 +191,28 @@ async fn test_already_completed_response() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
 
-    let listen_addr = "127.0.0.1:50896".to_string();
-    let agent_url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
-    let _agent = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),
         Some(Duration::from_millis(500)),
         Some(Duration::from_secs(3)),
     )
     .await
     .expect("Failed to bootstrap agent");
+
+    // Get actual bound address
+    let agent_url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent.id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -301,18 +321,28 @@ async fn test_concurrent_subscribers_same_build() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
 
-    let listen_addr = "127.0.0.1:50897".to_string();
-    let agent_url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
-    let _agent = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),
         Some(Duration::from_millis(500)),
         Some(Duration::from_secs(3)),
     )
     .await
     .expect("Failed to bootstrap agent");
+
+    // Get actual bound address
+    let agent_url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent.id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 

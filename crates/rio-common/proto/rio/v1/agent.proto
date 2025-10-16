@@ -35,6 +35,11 @@ service RioAgent {
   // New agent calls this on seed agent to join Raft cluster
   rpc JoinCluster(JoinClusterRequest)
       returns (JoinClusterResponse);
+
+  // Internal: Report build completion to leader (for Raft coordination)
+  // Non-leader agents call this on leader after builds complete/fail
+  rpc ReportBuildResult(ReportBuildResultRequest)
+      returns (ReportBuildResultResponse);
 }
 
 // ============================================================================
@@ -202,3 +207,28 @@ message GetCompletedBuildRequest {
 }
 
 // Note: Both SubscribeToBuild and GetCompletedBuild return stream BuildUpdate
+
+// ============================================================================
+// Build Result Reporting (Internal - Agent to Leader)
+// ============================================================================
+
+message ReportBuildResultRequest {
+  string derivation_path = 1;
+  oneof result {
+    BuildCompletedReport completed = 2;
+    BuildFailedReport failed = 3;
+  }
+}
+
+message BuildCompletedReport {
+  repeated string output_paths = 1;  // /nix/store paths
+}
+
+message BuildFailedReport {
+  string error = 1;  // Error message
+}
+
+message ReportBuildResultResponse {
+  bool success = 1;
+  string message = 2;  // Error message if success = false
+}

@@ -77,6 +77,7 @@ pub fn start_build_coordinator(
                         if let Err(e) = builder::start_build(
                             &current_build,
                             raft.clone(),
+                            sm_store.clone(),
                             drv_path.to_string(),
                             nar_bytes,
                         )

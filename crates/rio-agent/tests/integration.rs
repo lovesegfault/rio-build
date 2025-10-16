@@ -62,21 +62,33 @@ async fn test_end_to_end_build_flow() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    // Use a fixed port for testing
-    let listen_addr = "127.0.0.1:50888".to_string();
-    let url = format!("http://{}", listen_addr);
+    // Use port 0 for dynamic allocation
+    let listen_addr = "127.0.0.1:0".to_string();
 
     // Bootstrap agent with Raft (fast intervals for testing)
     // Note: bootstrap() now starts the gRPC server automatically
-    let _agent = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(std::time::Duration::from_secs(1)),
         Some(std::time::Duration::from_millis(500)),
         Some(std::time::Duration::from_secs(3)),
     )
     .await
     .expect("Failed to bootstrap agent");
+
+    // Get actual bound address from cluster state
+    let url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent.id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
+
+    println!("Agent bound to {}", url);
 
     // Wait for agent to become leader (server is already running)
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -250,8 +262,7 @@ async fn test_queue_build_via_raft() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listen_addr = "127.0.0.1:50889".to_string();
-    let url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
     let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
@@ -264,6 +275,17 @@ async fn test_queue_build_via_raft() {
     .expect("Failed to bootstrap agent");
 
     let agent_id = agent.id;
+
+    // Get actual bound address
+    let url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent_id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     // Wait for leader election (server already running)
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -334,7 +356,7 @@ async fn test_heartbeat_lifecycle() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listen_addr = "127.0.0.1:50999".to_string();
+    let listen_addr = "127.0.0.1:0".to_string();
     // Use fast intervals for testing: 1s heartbeat, 0.5s check, 3s timeout
     let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
@@ -383,18 +405,28 @@ async fn test_late_joiner_receives_catch_up_logs() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listen_addr = "127.0.0.1:50892".to_string();
-    let url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
-    let _agent = rio_agent::agent::Agent::bootstrap(
+    let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),
         Some(Duration::from_millis(500)),
         Some(Duration::from_secs(3)),
     )
     .await
     .expect("Failed to bootstrap agent");
+
+    // Get actual bound address
+    let url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent.id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     // Wait for agent to become leader (server is already running)
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -514,12 +546,11 @@ async fn test_build_completion_updates_raft_state() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listen_addr = "127.0.0.1:50893".to_string();
-    let url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
     let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),
         Some(Duration::from_millis(500)),
         Some(Duration::from_secs(3)),
@@ -529,6 +560,17 @@ async fn test_build_completion_updates_raft_state() {
 
     let agent_id = agent.id;
     let state_machine = agent.state_machine.clone();
+
+    // Get actual bound address
+    let url = {
+        let state = state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent_id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     // Wait for agent to become leader (server is already running)
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -707,12 +749,11 @@ async fn test_get_completed_build_serves_cache() {
     let temp_path =
         camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
 
-    let listen_addr = "127.0.0.1:50894".to_string();
-    let url = format!("http://{}", listen_addr);
+    let listen_addr = "127.0.0.1:0".to_string();
 
     let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),
         Some(Duration::from_millis(500)),
         Some(Duration::from_secs(3)),
@@ -721,6 +762,17 @@ async fn test_get_completed_build_serves_cache() {
     .expect("Failed to bootstrap agent");
 
     let state_machine = agent.state_machine.clone();
+
+    // Get actual bound address
+    let url = {
+        let state = state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent.id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
 
     // Wait for agent to become leader (server is already running)
     tokio::time::sleep(Duration::from_secs(2)).await;

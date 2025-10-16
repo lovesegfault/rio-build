@@ -62,17 +62,14 @@ async fn test_phase2_single_node_cluster_end_to_end() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
 
-    // Use a fixed port for testing
-    let listen_addr = "127.0.0.1:50997".to_string();
-    let agent_url = format!("http://{}", listen_addr);
-
-    println!("Starting agent at: {}", agent_url);
+    // Use port 0 for dynamic allocation
+    let listen_addr = "127.0.0.1:0".to_string();
 
     // Bootstrap agent with fast heartbeat intervals for testing
     // Note: Agent::bootstrap() starts the gRPC server automatically
     let agent = rio_agent::agent::Agent::bootstrap(
         temp_path.to_path_buf(),
-        listen_addr.clone(),
+        listen_addr,
         Some(Duration::from_secs(1)),     // Fast heartbeat
         Some(Duration::from_millis(500)), // Fast check
         Some(Duration::from_secs(3)),     // Fast timeout
@@ -81,6 +78,19 @@ async fn test_phase2_single_node_cluster_end_to_end() {
     .expect("Failed to bootstrap agent");
 
     let agent_id = agent.id;
+
+    // Get actual bound address from cluster state
+    let agent_url = {
+        let state = agent.state_machine.data.read();
+        state
+            .cluster
+            .agents
+            .get(&agent_id)
+            .map(|a| a.address.to_string())
+            .expect("Agent should be in cluster state")
+    };
+
+    println!("Agent bound to: {}", agent_url);
     println!("Agent ID: {}", agent_id);
 
     // Wait for agent to become leader (server is already running)
