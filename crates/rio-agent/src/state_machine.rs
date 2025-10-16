@@ -36,7 +36,8 @@ pub enum AgentStatus {
 /// Build tracker - tracks which agent is building a derivation
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildTracker {
-    pub agent_id: AgentId,
+    pub agent_id: Option<AgentId>, // None when queued, Some when claimed
+    pub suggested_agents: Vec<AgentId>, // Ranked by affinity (best first)
     pub started_at: DateTime<Utc>,
     pub parent_build: Option<DerivationPath>, // None = top-level, Some = dependency
     pub status: BuildStatus,
@@ -45,10 +46,9 @@ pub struct BuildTracker {
 /// Build status enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BuildStatus {
-    Building,                                             // Currently executing on agent
-    QueuedDependency { blocked_on: Vec<DerivationPath> }, // Waiting for dependencies
-    QueuedCapacity, // Waiting for agent capacity (agent is busy)
-    QueuedNoAgent,  // Waiting for matching agent to join cluster
+    Queued,   // Waiting for agent to claim
+    Claimed,  // Agent claimed, preparing to start
+    Building, // Currently executing on agent
 }
 
 /// Completed build information
@@ -101,9 +101,13 @@ pub enum RaftCommand {
         platform: String,
         features: Vec<String>,
     },
-    BuildStatusChanged {
+    BuildClaimed {
         derivation_path: DerivationPath,
-        status: BuildStatus,
+        agent_id: AgentId,
+        affinity_score: usize, // Agent's self-calculated affinity
+    },
+    BuildStarted {
+        derivation_path: DerivationPath,
     },
     BuildCompleted {
         derivation_path: DerivationPath,
@@ -127,14 +131,26 @@ pub enum RaftResponse {
     /// Heartbeat acknowledged
     HeartbeatAck,
 
-    /// Build queued and assigned to agent
-    BuildAssigned {
-        agent_id: AgentId,
+    /// Build queued with suggested agents
+    BuildQueued {
         derivation_path: DerivationPath,
+        suggested_agents: Vec<AgentId>,
     },
 
-    /// Build status changed
-    StatusChanged,
+    /// Build claimed by agent
+    BuildClaimedAck {
+        derivation_path: DerivationPath,
+        agent_id: AgentId,
+    },
+
+    /// Build claim rejected
+    BuildClaimRejected {
+        derivation_path: DerivationPath,
+        reason: String,
+    },
+
+    /// Build started
+    BuildStartedAck,
 
     /// Build completed
     BuildCompletedAck,
@@ -165,9 +181,9 @@ impl ClusterState {
                 // CLIs will detect stream disconnect and retry elsewhere
                 let mut removed_builds = Vec::new();
 
-                // Remove all builds where this agent was assigned
+                // Remove all builds where this agent claimed/was building
                 self.builds_in_progress.retain(|drv_path, tracker| {
-                    if tracker.agent_id == id {
+                    if tracker.agent_id == Some(id) {
                         removed_builds.push(drv_path.clone());
                         false // Remove this build
                     } else {
@@ -203,8 +219,8 @@ impl ClusterState {
                 platform,
                 features,
             } => {
-                // Deterministic agent assignment algorithm (DESIGN.md Section 1)
-                // Status-blind: Available and Busy agents compete equally
+                // Create ranked list of suggested agents based on affinity
+                // Agents will self-select and claim builds based on this ranking
 
                 // Step 1: Filter eligible agents (platform + features, not Down)
                 let eligible: Vec<&AgentInfo> = self
@@ -217,98 +233,66 @@ impl ClusterState {
                     })
                     .collect();
 
-                // If no eligible agents, queue build with QueuedNoAgent status
-                // An agent with matching capabilities may join the cluster later
-                if eligible.is_empty() {
-                    let now = Utc::now();
-
-                    // Register build as queued, waiting for matching agent
-                    self.builds_in_progress.insert(
-                        top_level.clone(),
-                        BuildTracker {
-                            agent_id: AgentId::nil(), // No agent assigned yet
-                            started_at: now,
-                            parent_build: None,
-                            status: BuildStatus::QueuedNoAgent,
-                        },
-                    );
-
-                    // Store derivation NAR so it's available when agent joins
-                    self.pending_derivations
-                        .insert(top_level.clone(), derivation_nar);
-
-                    tracing::warn!(
-                        "No eligible agents for platform {} with features {:?}, build queued",
-                        platform,
-                        features
-                    );
-
-                    return RaftResponse::BuildAssigned {
-                        agent_id: AgentId::nil(),
-                        derivation_path: top_level,
-                    };
-                }
-
-                // Step 2: Score agents by affinity (count matching dependencies)
-                let mut scores: HashMap<AgentId, usize> = HashMap::new();
-
-                for dep_path in &dependencies {
-                    // Count dependencies in builds_in_progress
-                    if let Some(tracker) = self.builds_in_progress.get(dep_path) {
-                        *scores.entry(tracker.agent_id).or_insert(0) += 1;
-                    }
-                    // Count dependencies in completed_builds
-                    if let Some(completed) = self.completed_builds.get(dep_path) {
-                        *scores.entry(completed.agent_id).or_insert(0) += 1;
-                    }
-                }
-
-                // Step 3: Select highest affinity agent
-                // Step 4: Tie-break by smallest agent_id (lexicographic)
-                // Note: eligible is guaranteed non-empty (checked above), so this always succeeds
-                let selected_agent_id = scores
+                // Step 2: Score ALL eligible agents by affinity (count matching dependencies)
+                let mut agent_scores: Vec<(AgentId, usize)> = eligible
                     .iter()
-                    .filter(|(id, _)| eligible.iter().any(|a| &a.id == *id))
-                    .max_by(|(id_a, score_a), (id_b, score_b)| {
-                        // First compare by score (higher is better)
-                        match score_a.cmp(score_b) {
-                            std::cmp::Ordering::Equal => {
-                                // Tie-break: smaller agent_id wins (deterministic)
-                                id_b.cmp(id_a)
+                    .map(|agent| {
+                        let mut score = 0;
+                        for dep_path in &dependencies {
+                            // Count dependencies in builds_in_progress
+                            if let Some(tracker) = self.builds_in_progress.get(dep_path)
+                                && tracker.agent_id == Some(agent.id)
+                            {
+                                score += 1;
                             }
-                            other => other,
+                            // Count dependencies in completed_builds
+                            if let Some(completed) = self.completed_builds.get(dep_path)
+                                && completed.agent_id == agent.id
+                            {
+                                score += 1;
+                            }
                         }
+                        (agent.id, score)
                     })
-                    .map(|(id, _)| *id)
-                    .or_else(|| {
-                        // No agents with affinity - select smallest agent_id among eligible
-                        eligible.iter().min_by_key(|a| &a.id).map(|a| a.id)
-                    })
-                    .expect("eligible is non-empty, so selection must succeed");
+                    .collect();
 
-                // Step 5: Update state
+                // Step 3: Sort by score (descending), then by agent_id (ascending) for determinism
+                agent_scores.sort_by(|(id_a, score_a), (id_b, score_b)| {
+                    match score_b.cmp(score_a) {
+                        // Higher score is better
+                        std::cmp::Ordering::Equal => id_a.cmp(id_b), // Smaller ID wins tie
+                        other => other,
+                    }
+                });
+
+                // Extract ranked list of agent IDs
+                let suggested_agents: Vec<AgentId> =
+                    agent_scores.iter().map(|(id, _)| *id).collect();
+
+                // Step 4: Create build tracker in Queued state
                 let now = Utc::now();
 
-                // Insert top-level build
                 self.builds_in_progress.insert(
                     top_level.clone(),
                     BuildTracker {
-                        agent_id: selected_agent_id,
+                        agent_id: None, // No agent claimed yet
+                        suggested_agents: suggested_agents.clone(),
                         started_at: now,
                         parent_build: None,
-                        status: BuildStatus::Building,
+                        status: BuildStatus::Queued,
                     },
                 );
 
-                // Insert all dependencies with parent_build pointer
+                // Insert all dependencies as queued too
                 for dep in &dependencies {
                     self.builds_in_progress.insert(
                         dep.clone(),
                         BuildTracker {
-                            agent_id: selected_agent_id,
+                            agent_id: None,
+                            suggested_agents: suggested_agents.clone(), // Same agents suggested
                             started_at: now,
                             parent_build: Some(top_level.clone()),
-                            status: BuildStatus::Building,
+                            status: BuildStatus::Queued,
                         },
                     );
                 }
@@ -317,25 +301,89 @@ impl ClusterState {
                 self.pending_derivations
                     .insert(top_level.clone(), derivation_nar);
 
-                // Mark agent as Busy
-                if let Some(agent) = self.agents.get_mut(&selected_agent_id) {
-                    agent.status = AgentStatus::Busy;
-                }
+                // Do NOT mark any agent as Busy yet (they haven't claimed)
 
-                RaftResponse::BuildAssigned {
-                    agent_id: selected_agent_id,
+                tracing::info!(
+                    "Build {} queued, {} eligible agents, suggested: {:?}",
+                    top_level,
+                    suggested_agents.len(),
+                    &suggested_agents[..suggested_agents.len().min(3)]
+                );
+
+                RaftResponse::BuildQueued {
                     derivation_path: top_level,
+                    suggested_agents,
                 }
             }
 
-            RaftCommand::BuildStatusChanged {
+            RaftCommand::BuildClaimed {
                 derivation_path,
-                status,
+                agent_id,
+                affinity_score: _,
             } => {
+                // Verify build exists and is claimable
                 if let Some(tracker) = self.builds_in_progress.get_mut(&derivation_path) {
-                    tracker.status = status;
+                    // Check if build is in Queued state
+                    if tracker.status != BuildStatus::Queued {
+                        return RaftResponse::BuildClaimRejected {
+                            derivation_path,
+                            reason: format!(
+                                "Build already claimed/started (status: {:?})",
+                                tracker.status
+                            ),
+                        };
+                    }
+
+                    // Check if agent is in suggested list OR timeout has passed
+                    let elapsed = Utc::now().signed_duration_since(tracker.started_at);
+                    let timeout_passed = elapsed.num_seconds() >= 2;
+
+                    if !tracker.suggested_agents.contains(&agent_id) && !timeout_passed {
+                        return RaftResponse::BuildClaimRejected {
+                            derivation_path,
+                            reason: "Wait for suggested agents (timeout not passed)".to_string(),
+                        };
+                    }
+
+                    // Accept the claim
+                    tracker.agent_id = Some(agent_id);
+                    tracker.status = BuildStatus::Claimed;
+
+                    // Mark agent as Busy
+                    if let Some(agent) = self.agents.get_mut(&agent_id) {
+                        agent.status = AgentStatus::Busy;
+                    }
+
+                    tracing::info!("Build {} claimed by agent {}", derivation_path, agent_id);
+
+                    RaftResponse::BuildClaimedAck {
+                        derivation_path,
+                        agent_id,
+                    }
+                } else {
+                    RaftResponse::BuildClaimRejected {
+                        derivation_path,
+                        reason: "Build not found".to_string(),
+                    }
                 }
-                RaftResponse::StatusChanged
+            }
+
+            RaftCommand::BuildStarted { derivation_path } => {
+                if let Some(tracker) = self.builds_in_progress.get_mut(&derivation_path) {
+                    // Verify build is in Claimed state
+                    if tracker.status != BuildStatus::Claimed {
+                        tracing::warn!(
+                            "BuildStarted for {} but status is {:?}, ignoring",
+                            derivation_path,
+                            tracker.status
+                        );
+                        return RaftResponse::BuildStartedAck;
+                    }
+
+                    tracker.status = BuildStatus::Building;
+                    tracing::info!("Build {} started", derivation_path);
+                }
+                RaftResponse::BuildStartedAck
             }
 
             RaftCommand::BuildCompleted {
@@ -344,15 +392,22 @@ impl ClusterState {
             } => {
                 // Remove from in-progress
                 if let Some(tracker) = self.builds_in_progress.remove(&derivation_path) {
-                    // Move to completed builds
-                    self.completed_builds.insert(
-                        derivation_path.clone(),
-                        CompletedBuild {
-                            agent_id: tracker.agent_id,
-                            output_paths,
-                            completed_at: Utc::now(),
-                        },
-                    );
+                    // Move to completed builds (only if we have an agent_id)
+                    if let Some(agent_id) = tracker.agent_id {
+                        self.completed_builds.insert(
+                            derivation_path.clone(),
+                            CompletedBuild {
+                                agent_id,
+                                output_paths,
+                                completed_at: Utc::now(),
+                            },
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Build {} completed but no agent_id set (never claimed?)",
+                            derivation_path
+                        );
+                    }
 
                     // Remove dependencies (where parent_build = this derivation_path)
                     self.builds_in_progress
@@ -449,8 +504,20 @@ mod tests {
             features: vec![],
         });
 
-        assert!(matches!(response, RaftResponse::BuildAssigned { .. }));
+        assert!(matches!(response, RaftResponse::BuildQueued { .. }));
         assert_eq!(state.builds_in_progress.len(), 1);
+
+        // Claim the build
+        state.apply(RaftCommand::BuildClaimed {
+            derivation_path: drv_path.clone(),
+            agent_id,
+            affinity_score: 0,
+        });
+
+        // Start the build
+        state.apply(RaftCommand::BuildStarted {
+            derivation_path: drv_path.clone(),
+        });
 
         // Complete the build
         state.apply(RaftCommand::BuildCompleted {
@@ -495,6 +562,17 @@ mod tests {
 
         // Should have 3 entries (top + 2 deps)
         assert_eq!(state.builds_in_progress.len(), 3);
+
+        // Claim and start the build
+        state.apply(RaftCommand::BuildClaimed {
+            derivation_path: top.clone(),
+            agent_id,
+            affinity_score: 0,
+        });
+
+        state.apply(RaftCommand::BuildStarted {
+            derivation_path: top.clone(),
+        });
 
         // Complete the build
         state.apply(RaftCommand::BuildCompleted {
@@ -549,12 +627,15 @@ mod tests {
             features: vec![],
         });
 
-        // Should assign to x86 agent only
+        // Should suggest x86 agent only
         match response {
-            RaftResponse::BuildAssigned { agent_id, .. } => {
-                assert_eq!(agent_id, agent_x86);
+            RaftResponse::BuildQueued {
+                suggested_agents, ..
+            } => {
+                assert_eq!(suggested_agents.len(), 1);
+                assert_eq!(suggested_agents[0], agent_x86);
             }
-            _ => anyhow::bail!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildQueued response"),
         }
         Ok(())
     }
@@ -599,12 +680,15 @@ mod tests {
             features: vec!["kvm".to_string()],
         });
 
-        // Should assign to agent with kvm only
+        // Should suggest agent with kvm only
         match response {
-            RaftResponse::BuildAssigned { agent_id, .. } => {
-                assert_eq!(agent_id, agent_with_kvm);
+            RaftResponse::BuildQueued {
+                suggested_agents, ..
+            } => {
+                assert_eq!(suggested_agents.len(), 1);
+                assert_eq!(suggested_agents[0], agent_with_kvm);
             }
-            _ => anyhow::bail!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildQueued response"),
         }
         Ok(())
     }
@@ -641,12 +725,13 @@ mod tests {
             },
         );
 
-        // Assign a dependency build to agent_a
+        // Claim a dependency build on agent_a
         let dep = Utf8PathBuf::from("/nix/store/dep.drv");
         state.builds_in_progress.insert(
             dep.clone(),
             BuildTracker {
-                agent_id: agent_a,
+                agent_id: Some(agent_a),
+                suggested_agents: vec![],
                 started_at: Utc::now(),
                 parent_build: None,
                 status: BuildStatus::Building,
@@ -662,12 +747,15 @@ mod tests {
             features: vec![],
         });
 
-        // Should assign to agent_a due to affinity
+        // Should suggest agent_a first due to affinity
         match response {
-            RaftResponse::BuildAssigned { agent_id, .. } => {
-                assert_eq!(agent_id, agent_a);
+            RaftResponse::BuildQueued {
+                suggested_agents, ..
+            } => {
+                assert_eq!(suggested_agents.len(), 2);
+                assert_eq!(suggested_agents[0], agent_a);
             }
-            _ => anyhow::bail!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildQueued response"),
         }
         Ok(())
     }
@@ -715,16 +803,19 @@ mod tests {
 
         // Should tie-break to smallest agent_id
         match response {
-            RaftResponse::BuildAssigned { agent_id, .. } => {
-                assert_eq!(agent_id, agent_a);
+            RaftResponse::BuildQueued {
+                suggested_agents, ..
+            } => {
+                assert_eq!(suggested_agents.len(), 2);
+                assert_eq!(suggested_agents[0], agent_a);
             }
-            _ => anyhow::bail!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildQueued response"),
         }
         Ok(())
     }
 
     #[test]
-    fn test_assignment_marks_agent_busy() -> anyhow::Result<()> {
+    fn test_claim_marks_agent_busy() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
@@ -749,7 +840,24 @@ mod tests {
             features: vec![],
         });
 
-        // Agent should now be Busy
+        // Agent should still be Available after queuing
+        assert_eq!(
+            state
+                .agents
+                .get(&agent_id)
+                .context("agent should exist")?
+                .status,
+            AgentStatus::Available
+        );
+
+        // Claim the build
+        state.apply(RaftCommand::BuildClaimed {
+            derivation_path: Utf8PathBuf::from("/nix/store/foo.drv"),
+            agent_id,
+            affinity_score: 0,
+        });
+
+        // Agent should now be Busy after claiming
         assert_eq!(
             state
                 .agents
@@ -762,24 +870,37 @@ mod tests {
     }
 
     #[test]
-    fn test_status_blind_assignment_to_busy_agent() -> anyhow::Result<()> {
+    fn test_queued_build_excludes_down_agents() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
-        let agent_id = AgentId::new_v4();
+        let agent_available = AgentId::new_v4();
+        let agent_down = AgentId::new_v4();
 
-        // Add one agent that is already Busy
+        // Add one Available agent and one Down agent
         state.agents.insert(
-            agent_id,
+            agent_available,
             AgentInfo {
-                id: agent_id,
+                id: agent_available,
                 address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
-                status: AgentStatus::Busy, // Already busy!
+                status: AgentStatus::Available,
                 last_heartbeat: Utc::now(),
             },
         );
 
-        // Queue a build - should still assign to Busy agent (status-blind)
+        state.agents.insert(
+            agent_down,
+            AgentInfo {
+                id: agent_down,
+                address: Url::parse("http://localhost:50052")?,
+                platforms: vec!["x86_64-linux".to_string()],
+                features: vec![],
+                status: AgentStatus::Down,
+                last_heartbeat: Utc::now(),
+            },
+        );
+
+        // Queue a build
         let response = state.apply(RaftCommand::BuildQueued {
             top_level: Utf8PathBuf::from("/nix/store/bar.drv"),
             derivation_nar: vec![4, 5, 6],
@@ -788,15 +909,15 @@ mod tests {
             features: vec![],
         });
 
-        // Should assign to the Busy agent (only eligible agent)
+        // Should only suggest the Available agent (Down agent excluded)
         match response {
-            RaftResponse::BuildAssigned {
-                agent_id: assigned_id,
-                ..
+            RaftResponse::BuildQueued {
+                suggested_agents, ..
             } => {
-                assert_eq!(assigned_id, agent_id);
+                assert_eq!(suggested_agents.len(), 1);
+                assert_eq!(suggested_agents[0], agent_available);
             }
-            _ => anyhow::bail!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildQueued response"),
         }
 
         // Build should be registered
@@ -840,6 +961,17 @@ mod tests {
 
         // Derivation should be stored
         assert!(state.pending_derivations.contains_key(&drv_path));
+
+        // Claim and start the build
+        state.apply(RaftCommand::BuildClaimed {
+            derivation_path: drv_path.clone(),
+            agent_id,
+            affinity_score: 0,
+        });
+
+        state.apply(RaftCommand::BuildStarted {
+            derivation_path: drv_path.clone(),
+        });
 
         // Complete build
         state.apply(RaftCommand::BuildCompleted {
@@ -891,7 +1023,8 @@ mod tests {
         state.builds_in_progress.insert(
             drv1.clone(),
             BuildTracker {
-                agent_id: agent1,
+                agent_id: Some(agent1),
+                suggested_agents: vec![],
                 started_at: Utc::now(),
                 parent_build: None,
                 status: BuildStatus::Building,
@@ -901,7 +1034,8 @@ mod tests {
         state.builds_in_progress.insert(
             drv2.clone(),
             BuildTracker {
-                agent_id: agent2,
+                agent_id: Some(agent2),
+                suggested_agents: vec![],
                 started_at: Utc::now(),
                 parent_build: None,
                 status: BuildStatus::Building,
@@ -960,7 +1094,8 @@ mod tests {
             state.builds_in_progress.insert(
                 drv.clone(),
                 BuildTracker {
-                    agent_id,
+                    agent_id: Some(agent_id),
+                    suggested_agents: vec![],
                     started_at: Utc::now(),
                     parent_build: None,
                     status: BuildStatus::Building,

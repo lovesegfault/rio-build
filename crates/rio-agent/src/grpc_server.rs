@@ -50,12 +50,27 @@ impl RioAgent for RioAgentService {
             let cluster_state = &sm_store.data.read().cluster;
 
             if let Some(tracker) = cluster_state.builds_in_progress.get(&drv_path) {
-                Some(queue_build_response::Result::AlreadyBuilding(
-                    AlreadyBuilding {
-                        agent_id: tracker.agent_id.to_string(),
-                        derivation_path: req.derivation_path.clone(),
-                    },
-                ))
+                // Return BuildInfo with current status
+                use rio_common::proto::BuildStatus as ProtoBuildStatus;
+
+                let proto_status = match tracker.status {
+                    crate::state_machine::BuildStatus::Queued => ProtoBuildStatus::Queued as i32,
+                    crate::state_machine::BuildStatus::Claimed => ProtoBuildStatus::Claimed as i32,
+                    crate::state_machine::BuildStatus::Building => {
+                        ProtoBuildStatus::Building as i32
+                    }
+                };
+
+                Some(queue_build_response::Result::BuildInfo(BuildInfo {
+                    derivation_path: req.derivation_path.clone(),
+                    status: proto_status,
+                    agent_id: tracker.agent_id.map(|id| id.to_string()),
+                    suggested_agents: tracker
+                        .suggested_agents
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect(),
+                }))
             } else if let Some(completed) = cluster_state.completed_builds.get(&drv_path) {
                 Some(queue_build_response::Result::AlreadyCompleted(
                     AlreadyCompleted {
@@ -90,18 +105,27 @@ impl RioAgent for RioAgentService {
             .await
             .map_err(|e| Status::internal(format!("Raft proposal failed: {}", e)))?;
 
-        // Extract assignment from Raft response
+        // Extract response from Raft
         match raft_response.data {
-            crate::state_machine::RaftResponse::BuildAssigned {
-                agent_id,
+            crate::state_machine::RaftResponse::BuildQueued {
                 derivation_path,
+                suggested_agents,
             } => {
-                tracing::info!("Build {} assigned to agent {}", derivation_path, agent_id);
+                tracing::info!(
+                    "Build {} queued, {} suggested agents",
+                    derivation_path,
+                    suggested_agents.len()
+                );
 
                 let response = QueueBuildResponse {
-                    result: Some(queue_build_response::Result::Assigned(BuildAssigned {
-                        agent_id: agent_id.to_string(),
+                    result: Some(queue_build_response::Result::BuildInfo(BuildInfo {
                         derivation_path: derivation_path.to_string(),
+                        status: rio_common::proto::BuildStatus::Queued as i32,
+                        agent_id: None,
+                        suggested_agents: suggested_agents
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect(),
                     })),
                 };
 
@@ -179,22 +203,31 @@ impl RioAgent for RioAgentService {
 
         // Check if build is in progress on different agent
         if let Some(tracker) = cluster.builds_in_progress.get(&drv_path_key) {
-            if tracker.agent_id != self.agent.id {
-                tracing::info!(
-                    "Build {} is on agent {}, not this agent ({})",
-                    drv_path,
-                    tracker.agent_id,
-                    self.agent.id
-                );
-                return Err(Status::failed_precondition(format!(
-                    "Build is running on agent {}, not this agent",
-                    tracker.agent_id
-                )));
+            match tracker.agent_id {
+                Some(agent_id) if agent_id != self.agent.id => {
+                    // Build is on a different agent
+                    tracing::info!(
+                        "Build {} is on agent {}, not this agent ({})",
+                        drv_path,
+                        agent_id,
+                        self.agent.id
+                    );
+                    return Err(Status::failed_precondition(format!(
+                        "Build is running on agent {}, not this agent",
+                        agent_id
+                    )));
+                }
+                None => {
+                    // Build queued but not claimed yet
+                    return Err(Status::not_found(format!(
+                        "Build {} is queued but not claimed yet",
+                        drv_path
+                    )));
+                }
+                _ => {
+                    // Build claimed by this agent, continue
+                }
             }
-            // Build assigned to us but not started yet (coordinator hasn't picked it up)
-            return Err(Status::not_found(
-                "Build assigned to this agent but not yet started",
-            ));
         }
 
         // Build not found anywhere

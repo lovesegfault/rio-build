@@ -120,13 +120,15 @@ async fn test_end_to_end_build_flow() -> anyhow::Result<()> {
         .context("Failed to queue build")?
         .into_inner();
 
-    // Verify we got BuildAssigned
+    // Verify we got BuildQueued
     anyhow::ensure!(
         matches!(
             queue_response.result,
-            Some(rio_common::proto::queue_build_response::Result::Assigned(_))
+            Some(rio_common::proto::queue_build_response::Result::BuildInfo(
+                _
+            ))
         ),
-        "Should receive BuildAssigned"
+        "Should receive BuildInfo"
     );
 
     // Wait for coordinator to notice assignment and start build (polls every 100ms)
@@ -318,17 +320,16 @@ async fn test_queue_build_via_raft() -> anyhow::Result<()> {
         .context("Failed to queue build")?
         .into_inner();
 
-    // Verify BuildAssigned response
+    // Verify BuildInfo response
     match response.result {
-        Some(rio_common::proto::queue_build_response::Result::Assigned(assigned)) => {
-            anyhow::ensure!(assigned.agent_id == agent_id.to_string(), "Wrong agent ID");
-            anyhow::ensure!(
-                assigned.derivation_path == drv_path,
-                "Wrong derivation path"
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(info)) => {
+            anyhow::ensure!(info.derivation_path == drv_path, "Wrong derivation path");
+            println!(
+                "✓ Build queued via Raft, {} suggested agents",
+                info.suggested_agents.len()
             );
-            println!("✓ Build assigned to agent {} via Raft", assigned.agent_id);
         }
-        other => anyhow::bail!("Expected BuildAssigned, got: {:?}", other),
+        other => anyhow::bail!("Expected BuildInfo, got: {:?}", other),
     }
 
     // Test deduplication: Submit same build again
@@ -345,14 +346,19 @@ async fn test_queue_build_via_raft() -> anyhow::Result<()> {
         .context("Failed to queue build")?
         .into_inner();
 
-    // Should get AlreadyBuilding (build is in Raft state)
+    // Should get BuildInfo (deduplication - same build already exists)
     match response2.result {
-        Some(rio_common::proto::queue_build_response::Result::AlreadyBuilding(already)) => {
-            anyhow::ensure!(already.agent_id == agent_id.to_string(), "Wrong agent ID");
-            anyhow::ensure!(already.derivation_path == drv_path, "Wrong derivation path");
-            println!("✓ Deduplication works: AlreadyBuilding response");
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(info)) => {
+            anyhow::ensure!(info.derivation_path == drv_path, "Wrong derivation path");
+            println!(
+                "✓ Deduplication works: BuildInfo response (status: {:?})",
+                info.status
+            );
         }
-        other => anyhow::bail!("Expected AlreadyBuilding, got: {:?}", other),
+        other => anyhow::bail!(
+            "Expected BuildInfo for duplicate submission, got: {:?}",
+            other
+        ),
     }
 
     Ok(())
@@ -473,9 +479,9 @@ async fn test_late_joiner_receives_catch_up_logs() -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(
             result,
-            rio_common::proto::queue_build_response::Result::Assigned(_)
+            rio_common::proto::queue_build_response::Result::BuildInfo(_)
         ),
-        "Expected BuildAssigned"
+        "Should receive BuildQueued"
     );
 
     // Wait for build coordinator to pick up the assignment (polls every 100ms)
@@ -633,9 +639,9 @@ async fn test_build_completion_updates_raft_state() -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(
             result,
-            rio_common::proto::queue_build_response::Result::Assigned(_)
+            rio_common::proto::queue_build_response::Result::BuildInfo(_)
         ),
-        "Expected BuildAssigned"
+        "Should receive BuildQueued"
     );
 
     // Verify build is in builds_in_progress after submission
@@ -650,8 +656,8 @@ async fn test_build_completion_updates_raft_state() -> anyhow::Result<()> {
             .get(&drv_path_key)
             .context("Build should be in progress after submission")?;
         anyhow::ensure!(
-            tracker.agent_id == agent_id,
-            "Build should be assigned to this agent"
+            tracker.agent_id == Some(agent_id),
+            "Build should be claimed by this agent"
         );
     }
 

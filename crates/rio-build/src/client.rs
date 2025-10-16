@@ -62,51 +62,44 @@ impl RioClient {
 
         // Handle all possible response types
         match response.result {
-            Some(rio_common::proto::queue_build_response::Result::Assigned(assigned)) => {
+            Some(rio_common::proto::queue_build_response::Result::BuildInfo(info)) => {
                 tracing::info!(
-                    "Build assigned to agent: {} for derivation: {}",
-                    assigned.agent_id,
-                    assigned.derivation_path
+                    "Build status: {:?}, agent: {:?}, {} suggested agents",
+                    info.status,
+                    info.agent_id,
+                    info.suggested_agents.len()
                 );
 
-                // Wait briefly for coordinator to notice assignment and start build
-                // The coordinator polls every 100ms, so 200ms should be enough
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                // Subscribe to the build on this agent (already connected to leader)
-                let subscribe_request = SubscribeToBuildRequest {
-                    derivation_path: assigned.derivation_path,
-                };
-
-                let stream = self
-                    .client
-                    .subscribe_to_build(subscribe_request)
+                // Check if build already has an agent (claimed or building)
+                let agent_id = if let Some(agent_id) = info.agent_id {
+                    // Build already claimed or building
+                    tracing::info!("Build already claimed/building on agent {}", agent_id);
+                    agent_id
+                } else {
+                    // Build queued, wait for claim
+                    tracing::info!("Build queued, waiting for agent to claim...");
+                    wait_for_claim(
+                        &mut self.client,
+                        &derivation_path,
+                        std::time::Duration::from_secs(30),
+                    )
                     .await
-                    .context("Failed to subscribe to build")?
-                    .into_inner();
-
-                Ok(stream)
-            }
-
-            Some(rio_common::proto::queue_build_response::Result::AlreadyBuilding(already)) => {
-                tracing::info!(
-                    "Build already in progress on agent {}, subscribing to existing build...",
-                    already.agent_id
-                );
-
-                // Connect to the agent that's currently building
-                let mut agent_client = connect_to_agent(&already.agent_id, cluster_info).await?;
-
-                // Subscribe to the in-progress build
-                let subscribe_request = SubscribeToBuildRequest {
-                    derivation_path: already.derivation_path,
+                    .context("Build was never claimed by any agent")?
                 };
+
+                tracing::info!("Connecting to agent: {}", agent_id);
+
+                // Connect to the agent
+                let mut agent_client = connect_to_agent(&agent_id, cluster_info).await?;
+
+                // Subscribe to the build
+                let subscribe_request = SubscribeToBuildRequest { derivation_path };
 
                 let stream = agent_client
                     .client
                     .subscribe_to_build(subscribe_request)
                     .await
-                    .context("Failed to subscribe to existing build")?
+                    .context("Failed to subscribe to build")?
                     .into_inner();
 
                 Ok(stream)
@@ -149,6 +142,55 @@ impl RioClient {
                 bail!("No result in QueueBuildResponse");
             }
         }
+    }
+}
+
+/// Wait for a build to be claimed by an agent
+///
+/// Polls GetBuildStatus until the build has agent_id set (Claimed or Building status).
+/// Returns the agent_id that claimed the build.
+async fn wait_for_claim(
+    client: &mut RioAgentClient<Channel>,
+    derivation_path: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    use rio_common::proto::{BuildState, GetBuildStatusRequest};
+
+    let start = std::time::Instant::now();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+
+    loop {
+        interval.tick().await;
+
+        if start.elapsed() > timeout {
+            bail!("Timeout waiting for build to be claimed");
+        }
+
+        let status_response = client
+            .get_build_status(GetBuildStatusRequest {
+                derivation_path: derivation_path.to_string(),
+            })
+            .await
+            .context("Failed to get build status")?
+            .into_inner();
+
+        // Check if build has been claimed (has agent_id)
+        if let Some(agent_id) = status_response.agent_id
+            && !agent_id.is_empty()
+        {
+            // Build has been claimed or is building
+            return Ok(agent_id);
+        }
+
+        // Check if build failed before being claimed
+        if status_response.state == BuildState::Failed as i32 {
+            bail!("Build failed before being claimed");
+        }
+
+        tracing::debug!(
+            "Build still queued (state: {}), waiting for claim...",
+            status_response.state
+        );
     }
 }
 
