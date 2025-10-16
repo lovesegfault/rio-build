@@ -669,3 +669,189 @@ async fn test_multi_node_concurrent_deduplication() -> Result<()> {
 
     Ok(())
 }
+
+/// Test: Multi-node cache serving (AlreadyCompleted across nodes)
+#[tokio::test]
+async fn test_multi_node_cache_serving() -> Result<()> {
+    use rio_common::proto::GetCompletedBuildRequest;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Form 3-node cluster
+    let (agents, addresses) = form_cluster(3).await?;
+    let leader_id = agents[0].id;
+    let leader_addr = addresses
+        .get(&leader_id)
+        .expect("Leader address should be in map")
+        .clone();
+
+    eprintln!("TEST: 3-node cluster formed for cache serving test");
+
+    // Create unique build
+    let (drv_path, drv_nar) = create_unique_derivation().await?;
+    eprintln!("TEST: Created derivation: {}", drv_path);
+
+    // Client 1: Submit and complete build
+    let mut client1 = RioAgentClient::connect(leader_addr.clone()).await?;
+
+    let response1 = client1
+        .queue_build(QueueBuildRequest {
+            derivation_path: drv_path.clone(),
+            derivation: drv_nar.clone(),
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: Some(60),
+        })
+        .await?
+        .into_inner();
+
+    // Should get BuildAssigned
+    let assigned = match response1.result {
+        Some(rio_common::proto::queue_build_response::Result::Assigned(a)) => a,
+        other => anyhow::bail!("Client 1 expected BuildAssigned, got {:?}", other),
+    };
+
+    let assigned_agent_id = uuid::Uuid::parse_str(&assigned.agent_id)?;
+    let assigned_addr = addresses
+        .get(&assigned_agent_id)
+        .ok_or_else(|| anyhow::anyhow!("Assigned agent not found"))?
+        .clone();
+
+    eprintln!(
+        "TEST: Client 1 - Build assigned to agent {} at {}",
+        assigned.agent_id, assigned_addr
+    );
+
+    // Wait for build to start
+    sleep(Duration::from_millis(300)).await;
+
+    // Client 1: Subscribe and wait for completion
+    let mut client1 = RioAgentClient::connect(assigned_addr.clone()).await?;
+    let mut stream1 = client1
+        .subscribe_to_build(SubscribeToBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await?
+        .into_inner();
+
+    let client1_completed = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(Ok(update)) = stream1.message().await.transpose() {
+            if matches!(update.update, Some(build_update::Update::Completed(_))) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+
+    match client1_completed {
+        Ok(true) => eprintln!("TEST: Client 1 build completed"),
+        Ok(false) => anyhow::bail!("Client 1: Stream ended without completion"),
+        Err(_) => anyhow::bail!("Client 1: Timeout"),
+    }
+
+    // Poll for BuildCompleted to propagate to all agents via Raft
+    eprintln!("TEST: Polling for BuildCompleted to propagate to all agents...");
+    let mut all_synced = false;
+    for attempt in 0..50 {
+        let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
+        let all_have_completed = agents.iter().all(|agent| {
+            let state = agent.state_machine.data.read();
+            state.cluster.completed_builds.contains_key(&drv_path_key)
+        });
+
+        if all_have_completed {
+            all_synced = true;
+            eprintln!("TEST: All agents synced after {}ms", attempt * 100);
+            break;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(all_synced, "All agents should see completed build in cache");
+
+    // Client 2: Submit same build to leader (should get AlreadyCompleted)
+    let mut client2 = RioAgentClient::connect(leader_addr.clone()).await?;
+
+    let response2 = client2
+        .queue_build(QueueBuildRequest {
+            derivation_path: drv_path.clone(),
+            derivation: drv_nar.clone(),
+            dependency_paths: vec![],
+            platform: "x86_64-linux".to_string(),
+            required_features: vec![],
+            timeout_seconds: Some(60),
+        })
+        .await?
+        .into_inner();
+
+    // Should get AlreadyCompleted
+    let already_completed = match response2.result {
+        Some(rio_common::proto::queue_build_response::Result::AlreadyCompleted(ac)) => ac,
+        other => anyhow::bail!("Client 2 expected AlreadyCompleted, got {:?}", other),
+    };
+
+    eprintln!(
+        "TEST: Client 2 got AlreadyCompleted response, agent_id={}",
+        already_completed.agent_id
+    );
+
+    // Verify it points to the agent that built it
+    assert_eq!(
+        already_completed.agent_id, assigned.agent_id,
+        "AlreadyCompleted should point to agent that built it"
+    );
+
+    // Client 2: Connect to agent with cached outputs and call GetCompletedBuild
+    let cache_agent_id = uuid::Uuid::parse_str(&already_completed.agent_id)?;
+    let cache_addr = addresses
+        .get(&cache_agent_id)
+        .ok_or_else(|| anyhow::anyhow!("Cache agent not found"))?
+        .clone();
+
+    eprintln!("TEST: Client 2 connecting to cache agent at {}", cache_addr);
+
+    let mut client2 = RioAgentClient::connect(cache_addr).await?;
+    let mut cache_stream = client2
+        .get_completed_build(GetCompletedBuildRequest {
+            derivation_path: drv_path.clone(),
+        })
+        .await?
+        .into_inner();
+
+    // Verify we receive outputs from cache
+    let mut received_outputs = false;
+    let mut received_completion = false;
+
+    while let Some(Ok(update)) = cache_stream.message().await.transpose() {
+        match update.update {
+            Some(build_update::Update::OutputChunk(_)) => {
+                received_outputs = true;
+            }
+            Some(build_update::Update::Completed(_)) => {
+                received_completion = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        received_outputs,
+        "Client 2 should receive output chunks from cache"
+    );
+    assert!(
+        received_completion,
+        "Client 2 should receive completion message"
+    );
+
+    eprintln!("✓ Multi-node cache serving test passed");
+    eprintln!("  - Client 1 completed build on agent-X");
+    eprintln!("  - BuildCompleted propagated to all 3 agents via Raft");
+    eprintln!("  - Client 2 got AlreadyCompleted pointing to agent-X");
+    eprintln!("  - Client 2 fetched outputs from agent-X's cache via GetCompletedBuild");
+
+    Ok(())
+}
