@@ -381,9 +381,48 @@ impl RioAgent for RioAgentService {
     /// Get build status (Phase 1: unimplemented)
     async fn get_build_status(
         &self,
-        _request: Request<GetBuildStatusRequest>,
+        request: Request<GetBuildStatusRequest>,
     ) -> Result<Response<BuildStatusResponse>, Status> {
-        Err(Status::unimplemented("Phase 1: No status queries yet"))
+        let req = request.into_inner();
+        let drv_path: camino::Utf8PathBuf = req.derivation_path.into();
+
+        let cluster_state = &self.agent.state_machine.data.read().cluster;
+
+        // Check if build is in progress
+        if let Some(tracker) = cluster_state.builds_in_progress.get(&drv_path) {
+            use rio_common::proto::BuildState;
+
+            let state = match tracker.status {
+                crate::state_machine::BuildStatus::Queued => BuildState::Queued,
+                crate::state_machine::BuildStatus::Claimed => BuildState::Queued, // Map Claimed to Queued for proto
+                crate::state_machine::BuildStatus::Building => BuildState::Building,
+            };
+
+            return Ok(Response::new(BuildStatusResponse {
+                derivation_path: drv_path.to_string(),
+                state: state as i32,
+                agent_id: tracker.agent_id.map(|id| id.to_string()),
+                error: None,
+            }));
+        }
+
+        // Check if build completed
+        if let Some(_completed) = cluster_state.completed_builds.get(&drv_path) {
+            return Ok(Response::new(BuildStatusResponse {
+                derivation_path: drv_path.to_string(),
+                state: rio_common::proto::BuildState::Completed as i32,
+                agent_id: None, // Client should use AlreadyCompleted from QueueBuild
+                error: None,
+            }));
+        }
+
+        // Build not found
+        Ok(Response::new(BuildStatusResponse {
+            derivation_path: drv_path.to_string(),
+            state: rio_common::proto::BuildState::NotFound as i32,
+            agent_id: None,
+            error: None,
+        }))
     }
 
     /// Join cluster (Phase 3.3: Multi-node support)

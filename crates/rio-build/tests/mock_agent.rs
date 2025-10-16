@@ -20,15 +20,15 @@ pub struct MockRioAgent {
 }
 
 impl MockRioAgent {
-    /// Create a mock agent that returns BuildInfo (queued status)
+    /// Create a mock agent that returns BuildInfo with a claimed agent
     pub fn new_queued(drv_path: &str, suggested_agents: Vec<String>) -> Self {
         Self {
             received_requests: Arc::new(Mutex::new(Vec::new())),
             queue_response: QueueBuildResponse {
                 result: Some(queue_build_response::Result::BuildInfo(BuildInfo {
                     derivation_path: drv_path.to_string(),
-                    status: rio_common::proto::BuildStatus::Queued as i32,
-                    agent_id: None,
+                    status: rio_common::proto::BuildStatus::Building as i32,
+                    agent_id: Some("test-agent".to_string()), // Mock returns already claimed
                     suggested_agents,
                 })),
             },
