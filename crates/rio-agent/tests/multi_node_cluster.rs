@@ -356,25 +356,38 @@ async fn test_multi_node_distributed_build() -> Result<()> {
         .await?
         .into_inner();
 
-    // Should get BuildAssigned
-    let assigned = match response.result {
-        Some(rio_common::proto::queue_build_response::Result::Assigned(a)) => a,
-        other => anyhow::bail!("Expected BuildAssigned, got {:?}", other),
+    // Should get BuildQueued
+    let _queued = match response.result {
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(i)) => i,
+        other => anyhow::bail!("Expected BuildQueued, got {:?}", other),
     };
 
-    eprintln!(
-        "TEST: Build assigned to agent {} (one of 3 in cluster)",
-        assigned.agent_id
-    );
+    eprintln!("TEST: Build queued, waiting for claim...");
 
-    // Find the assigned agent's address from the map
-    let assigned_agent_id = uuid::Uuid::parse_str(&assigned.agent_id)?;
+    // Wait for build to be claimed
+    sleep(Duration::from_millis(500)).await;
+
+    // Find which agent claimed it
+    let drv_path_key: Utf8PathBuf = drv_path.clone().into();
+    let assigned_agent_id = {
+        let state = agents[0].state_machine.data.read();
+        state
+            .cluster
+            .builds_in_progress
+            .get(&drv_path_key)
+            .and_then(|t| t.agent_id)
+            .context("Build should be claimed by now")?
+    };
+
     let assigned_addr = addresses
         .get(&assigned_agent_id)
-        .ok_or_else(|| anyhow::anyhow!("Assigned agent {} not in address map", assigned.agent_id))?
+        .context("Claiming agent not found")?
         .clone();
 
-    eprintln!("TEST: Connecting to assigned agent at {}", assigned_addr);
+    eprintln!(
+        "TEST: Build claimed by agent {} at {}",
+        assigned_agent_id, assigned_addr
+    );
 
     // Wait for coordinator to start build
     sleep(Duration::from_millis(300)).await;
@@ -475,23 +488,38 @@ async fn test_multi_node_concurrent_deduplication() -> Result<()> {
         .await?
         .into_inner();
 
-    // Should get BuildAssigned
-    let assigned = match response1.result {
-        Some(rio_common::proto::queue_build_response::Result::Assigned(a)) => a,
-        other => anyhow::bail!("Client 1 expected BuildAssigned, got {:?}", other),
+    // Should get BuildInfo
+    let _info = match response1.result {
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(i)) => i,
+        other => anyhow::bail!("Client 1 expected BuildInfo, got {:?}", other),
     };
 
-    eprintln!(
-        "TEST: Client 1 - Build assigned to agent {}",
-        assigned.agent_id
-    );
+    eprintln!("TEST: Client 1 - Build queued, waiting for claim...");
 
-    // Find assigned agent's address from map
-    let assigned_agent_id = uuid::Uuid::parse_str(&assigned.agent_id)?;
+    // Wait for build to be claimed (coordinator polls every 100ms)
+    sleep(Duration::from_millis(500)).await;
+
+    // Check which agent claimed it
+    let drv_path_key: Utf8PathBuf = drv_path.clone().into();
+    let assigned_agent_id = {
+        let state = agents[0].state_machine.data.read();
+        state
+            .cluster
+            .builds_in_progress
+            .get(&drv_path_key)
+            .and_then(|t| t.agent_id)
+            .context("Build should be claimed by now")?
+    };
+
     let assigned_addr = addresses
         .get(&assigned_agent_id)
-        .ok_or_else(|| anyhow::anyhow!("Assigned agent {} not in address map", assigned.agent_id))?
+        .context("Claiming agent not in address map")?
         .clone();
+
+    eprintln!(
+        "TEST: Client 1 - Build claimed by agent {} at {}",
+        assigned_agent_id, assigned_addr
+    );
 
     eprintln!(
         "TEST: Client 1 connecting to assigned agent at {}",
@@ -540,22 +568,25 @@ async fn test_multi_node_concurrent_deduplication() -> Result<()> {
         .await?
         .into_inner();
 
-    // Should get AlreadyBuilding
-    let already_building = match response2.result {
-        Some(rio_common::proto::queue_build_response::Result::AlreadyBuilding(ab)) => ab,
-        other => anyhow::bail!("Client 2 expected AlreadyBuilding, got {:?}", other),
+    // Should get BuildInfo (build already exists)
+    let build_info = match response2.result {
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(info)) => info,
+        other => anyhow::bail!("Client 2 expected BuildInfo, got {:?}", other),
     };
 
     eprintln!(
-        "TEST: Client 2 got AlreadyBuilding response, agent_id={}",
-        already_building.agent_id
+        "TEST: Client 2 got BuildInfo response, status={:?}, agent_id={:?}",
+        build_info.status, build_info.agent_id
     );
 
-    // Verify same agent
-    assert_eq!(
-        already_building.agent_id, assigned.agent_id,
-        "Client 2 should be directed to same agent as Client 1"
-    );
+    // If build has been claimed, verify it's the same agent as Client 1 saw
+    if let Some(agent_id_str) = &build_info.agent_id {
+        let build_info_agent_id = uuid::Uuid::parse_str(agent_id_str)?;
+        assert_eq!(
+            build_info_agent_id, assigned_agent_id,
+            "Client 2 should see same agent as Client 1"
+        );
+    }
 
     // Client 2: Connect to the assigned agent and subscribe
     eprintln!("TEST: Client 2 connecting to agent at {}", assigned_addr);
@@ -714,21 +745,31 @@ async fn test_multi_node_cache_serving() -> Result<()> {
         .await?
         .into_inner();
 
-    // Should get BuildAssigned
-    let assigned = match response1.result {
-        Some(rio_common::proto::queue_build_response::Result::Assigned(a)) => a,
-        other => anyhow::bail!("Client 1 expected BuildAssigned, got {:?}", other),
+    // Should get BuildInfo
+    let _info = match response1.result {
+        Some(rio_common::proto::queue_build_response::Result::BuildInfo(i)) => i,
+        other => anyhow::bail!("Client 1 expected BuildInfo, got {:?}", other),
     };
 
-    let assigned_agent_id = uuid::Uuid::parse_str(&assigned.agent_id)?;
+    let assigned_agent_id = {
+        let drv_path_key: Utf8PathBuf = drv_path.clone().into();
+        let state = agents[0].state_machine.data.read();
+        state
+            .cluster
+            .builds_in_progress
+            .get(&drv_path_key)
+            .and_then(|t| t.agent_id)
+            .context("Build should be claimed by now")?
+    };
+
     let assigned_addr = addresses
         .get(&assigned_agent_id)
-        .context("Assigned agent not found")?
+        .context("Claiming agent not found")?
         .clone();
 
     eprintln!(
-        "TEST: Client 1 - Build assigned to agent {} at {}",
-        assigned.agent_id, assigned_addr
+        "TEST: Client 1 - Build claimed by agent {} at {}",
+        assigned_agent_id, assigned_addr
     );
 
     // Wait for build to start
@@ -807,8 +848,9 @@ async fn test_multi_node_cache_serving() -> Result<()> {
     );
 
     // Verify it points to the agent that built it
+    let already_completed_agent_id = uuid::Uuid::parse_str(&already_completed.agent_id)?;
     assert_eq!(
-        already_completed.agent_id, assigned.agent_id,
+        already_completed_agent_id, assigned_agent_id,
         "AlreadyCompleted should point to agent that built it"
     );
 

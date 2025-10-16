@@ -91,21 +91,23 @@ message QueueBuildRequest {
 
 message QueueBuildResponse {
   oneof result {
-    BuildAssigned assigned = 1;               // Build assigned to agent
-    AlreadyBuilding already_building = 2;     // Build already in progress
-    AlreadyCompleted already_completed = 3;   // Build recently completed (in cache)
-    NoEligibleAgents no_agents = 4;           // No agents match requirements
+    BuildInfo build_info = 1;                 // Build queued or already exists
+    AlreadyCompleted already_completed = 2;   // Build recently completed (in cache)
+    NoEligibleAgents no_agents = 3;           // No agents match requirements
   }
 }
 
-message BuildAssigned {
-  string agent_id = 1;          // Which agent was assigned this build
-  string derivation_path = 2;   // Derivation store path (job identifier)
+enum BuildStatus {
+  BUILD_STATUS_QUEUED = 0;   // Waiting for agent to claim
+  BUILD_STATUS_CLAIMED = 1;  // Agent claimed, preparing to start
+  BUILD_STATUS_BUILDING = 2; // Currently executing
 }
 
-message AlreadyBuilding {
-  string agent_id = 1;          // Which agent is currently building
-  string derivation_path = 2;   // Derivation store path
+message BuildInfo {
+  string derivation_path = 1;                 // Derivation path
+  BuildStatus status = 2;                     // Current status
+  optional string agent_id = 3;               // Set when claimed or building
+  repeated string suggested_agents = 4;       // Ranked list (for queued builds)
 }
 
 message AlreadyCompleted {

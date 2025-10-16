@@ -14,22 +14,23 @@ use std::collections::HashMap;
 async fn test_client_submit_and_subscribe() -> anyhow::Result<()> {
     // Create mock agent with test response
     let drv_path = "/nix/store/test123-hello.drv";
-    let mock = mock_agent::MockRioAgent::new_assigned("test-agent", drv_path).with_updates(vec![
-        BuildUpdate {
-            derivation_path: drv_path.to_string(),
-            update: Some(build_update::Update::Log(LogLine {
-                timestamp: 1234567890,
-                line: "Building...\n".to_string(),
-            })),
-        },
-        BuildUpdate {
-            derivation_path: drv_path.to_string(),
-            update: Some(build_update::Update::Completed(BuildCompleted {
-                output_paths: vec!["/nix/store/test123-hello".to_string()],
-                duration_ms: 1000,
-            })),
-        },
-    ]);
+    let mock = mock_agent::MockRioAgent::new_queued(drv_path, vec!["test-agent".to_string()])
+        .with_updates(vec![
+            BuildUpdate {
+                derivation_path: drv_path.to_string(),
+                update: Some(build_update::Update::Log(LogLine {
+                    timestamp: 1234567890,
+                    line: "Building...\n".to_string(),
+                })),
+            },
+            BuildUpdate {
+                derivation_path: drv_path.to_string(),
+                update: Some(build_update::Update::Completed(BuildCompleted {
+                    output_paths: vec!["/nix/store/test123-hello".to_string()],
+                    duration_ms: 1000,
+                })),
+            },
+        ]);
 
     // Start mock server
     let (_server, url) = mock_agent::start_mock_server(mock).await?;
