@@ -1,5 +1,6 @@
 //! Full integration test - tests the complete gRPC server flow
 
+use anyhow::Context;
 use rio_common::proto::rio_agent_client::RioAgentClient;
 use rio_common::proto::{QueueBuildRequest, SubscribeToBuildRequest, build_update};
 use tokio::process::Command;
@@ -23,19 +24,19 @@ runCommandNoCC "rio-test-{}" {{}} ''
     let temp_file = format!("/tmp/rio-test-{}.nix", unique_id);
     tokio::fs::write(&temp_file, nix_expr)
         .await
-        .expect("Failed to write temp file");
+        .context("Failed to write temp file")?;
 
     // Instantiate to get derivation path
     let output = Command::new("nix-instantiate")
         .arg(&temp_file)
         .output()
         .await
-        .expect("Failed to run nix-instantiate");
+        .context("Failed to run nix-instantiate")?;
 
-    assert!(output.status.success(), "nix-instantiate failed");
+    anyhow::ensure!(output.status.success(), "nix-instantiate failed");
 
     let drv_path = String::from_utf8(output.stdout)
-        .expect("Invalid UTF-8")
+        .context("Invalid UTF-8")?
         .trim()
         .to_string();
 
@@ -45,9 +46,9 @@ runCommandNoCC "rio-test-{}" {{}} ''
         .arg(&drv_path)
         .output()
         .await
-        .expect("Failed to export");
+        .context("Failed to export")?;
 
-    assert!(export_output.status.success(), "nix-store --export failed");
+    anyhow::ensure!(export_output.status.success(), "nix-store --export failed");
 
     // Clean up temp file
     let _ = tokio::fs::remove_file(&temp_file).await;
@@ -56,11 +57,11 @@ runCommandNoCC "rio-test-{}" {{}} ''
 }
 
 #[tokio::test]
-async fn test_end_to_end_build_flow() {
+async fn test_end_to_end_build_flow() -> anyhow::Result<()> {
     // Start the actual rio-agent server with Raft
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let temp_path =
-        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+        camino::Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path for temp dir")?;
 
     // Use port 0 for dynamic allocation
     let listen_addr = "127.0.0.1:0".to_string();
@@ -75,7 +76,7 @@ async fn test_end_to_end_build_flow() {
         Some(std::time::Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     // Get actual bound address from cluster state
     let url = {
@@ -85,7 +86,7 @@ async fn test_end_to_end_build_flow() {
             .agents
             .get(&agent.id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     println!("Agent bound to {}", url);
@@ -96,14 +97,14 @@ async fn test_end_to_end_build_flow() {
     // Create unique derivation (guaranteed not cached)
     let (drv_path, drv_nar_bytes) = create_unique_derivation()
         .await
-        .expect("Failed to create unique derivation");
+        .context("Failed to create unique derivation")?;
 
     println!("Testing with derivation: {}", drv_path);
 
     // Connect client
     let mut client = RioAgentClient::connect(url.clone())
         .await
-        .expect("Failed to connect");
+        .context("Failed to connect")?;
 
     // Submit build (QueueBuild RPC)
     let queue_response = client
@@ -116,11 +117,11 @@ async fn test_end_to_end_build_flow() {
             timeout_seconds: None,
         })
         .await
-        .expect("Failed to queue build")
+        .context("Failed to queue build")?
         .into_inner();
 
     // Verify we got BuildAssigned
-    assert!(
+    anyhow::ensure!(
         matches!(
             queue_response.result,
             Some(rio_common::proto::queue_build_response::Result::Assigned(_))
@@ -137,7 +138,7 @@ async fn test_end_to_end_build_flow() {
             derivation_path: drv_path.clone(),
         })
         .await
-        .expect("Failed to subscribe")
+        .context("Failed to subscribe")?
         .into_inner();
 
     // Collect build updates
@@ -171,7 +172,7 @@ async fn test_end_to_end_build_flow() {
                                 break;
                             }
                             Some(build_update::Update::Failed(failed)) => {
-                                panic!("Build failed: {}", failed.error);
+                                anyhow::bail!("Build failed: {}", failed.error);
                             }
                             None => {}
                         }
@@ -181,36 +182,38 @@ async fn test_end_to_end_build_flow() {
                         break;
                     }
                     Err(e) => {
-                        panic!("Stream error: {}", e);
+                        anyhow::bail!("Stream error: {}", e);
                     }
                 }
             }
             _ = &mut timeout => {
-                panic!("Test timed out after 10s - likely deadlock!");
+                anyhow::bail!("Test timed out after 10s - likely deadlock!");
             }
         }
     }
 
-    assert!(got_log, "Should receive at least one log message");
-    assert!(got_output_chunk, "Should receive output chunks");
-    assert!(got_completion, "Should receive completion message");
+    anyhow::ensure!(got_log, "Should receive at least one log message");
+    anyhow::ensure!(got_output_chunk, "Should receive output chunks");
+    anyhow::ensure!(got_completion, "Should receive completion message");
 
     println!("Test passed! Received {} updates total", update_count);
+
+    Ok(())
 }
 
 /// Test that we can export and import a derivation via NAR
 #[tokio::test]
-async fn test_derivation_nar_roundtrip() {
+async fn test_derivation_nar_roundtrip() -> anyhow::Result<()> {
     let output = Command::new("nix-instantiate")
         .arg("../../tests/fixtures/trivial.nix")
         .output()
         .await
-        .expect("Failed to run nix-instantiate");
+        .context("Failed to run nix-instantiate")?;
 
-    assert!(output.status.success());
+    anyhow::ensure!(output.status.success(), "nix-instantiate failed");
 
     let drv_path = String::from_utf8(output.stdout)
-        .expect("Invalid UTF-8")
+        .context("Invalid UTF-8")?
         .trim()
         .to_string();
 
@@ -220,9 +223,9 @@ async fn test_derivation_nar_roundtrip() {
         .arg(&drv_path)
         .output()
         .await
-        .expect("Failed to export derivation");
+        .context("Failed to export derivation")?;
 
-    assert!(export_output.status.success());
+    anyhow::ensure!(export_output.status.success(), "nix-store --export failed");
     let nar_bytes = export_output.stdout;
 
     // Import back
@@ -231,36 +234,41 @@ async fn test_derivation_nar_roundtrip() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .expect("Failed to spawn nix-store --import");
+        .context("Failed to spawn nix-store --import")?;
 
     use tokio::io::AsyncWriteExt;
-    let mut stdin = import_child.stdin.take().expect("No stdin");
-    stdin.write_all(&nar_bytes).await.expect("Failed to write");
-    stdin.shutdown().await.expect("Failed to close stdin");
+    let mut stdin = import_child.stdin.take().context("No stdin")?;
+    stdin
+        .write_all(&nar_bytes)
+        .await
+        .context("Failed to write")?;
+    stdin.shutdown().await.context("Failed to close stdin")?;
 
     let import_output = import_child
         .wait_with_output()
         .await
-        .expect("Failed to wait");
-    assert!(import_output.status.success());
+        .context("Failed to wait")?;
+    anyhow::ensure!(import_output.status.success(), "nix-store --import failed");
 
     let imported_path = String::from_utf8(import_output.stdout)
-        .expect("Invalid UTF-8")
+        .context("Invalid UTF-8")?
         .trim()
         .to_string();
 
-    assert_eq!(drv_path, imported_path);
+    anyhow::ensure!(drv_path == imported_path, "Paths should match");
+
+    Ok(())
 }
 
 /// Test Phase 3.1: Queue build via Raft (assignment only, no execution)
 #[tokio::test]
-async fn test_queue_build_via_raft() {
+async fn test_queue_build_via_raft() -> anyhow::Result<()> {
     use std::time::Duration;
 
     // Bootstrap agent with Raft
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let temp_path =
-        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+        camino::Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path for temp dir")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -272,7 +280,7 @@ async fn test_queue_build_via_raft() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     let agent_id = agent.id;
 
@@ -284,7 +292,7 @@ async fn test_queue_build_via_raft() {
             .agents
             .get(&agent_id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     // Wait for leader election (server already running)
@@ -293,7 +301,7 @@ async fn test_queue_build_via_raft() {
     // Connect client
     let mut client = RioAgentClient::connect(url)
         .await
-        .expect("Failed to connect");
+        .context("Failed to connect")?;
 
     // Submit build
     let drv_path = "/nix/store/test-foo.drv";
@@ -307,17 +315,20 @@ async fn test_queue_build_via_raft() {
             timeout_seconds: None,
         })
         .await
-        .expect("Failed to queue build")
+        .context("Failed to queue build")?
         .into_inner();
 
     // Verify BuildAssigned response
     match response.result {
         Some(rio_common::proto::queue_build_response::Result::Assigned(assigned)) => {
-            assert_eq!(assigned.agent_id, agent_id.to_string());
-            assert_eq!(assigned.derivation_path, drv_path);
+            anyhow::ensure!(assigned.agent_id == agent_id.to_string(), "Wrong agent ID");
+            anyhow::ensure!(
+                assigned.derivation_path == drv_path,
+                "Wrong derivation path"
+            );
             println!("✓ Build assigned to agent {} via Raft", assigned.agent_id);
         }
-        other => panic!("Expected BuildAssigned, got: {:?}", other),
+        other => anyhow::bail!("Expected BuildAssigned, got: {:?}", other),
     }
 
     // Test deduplication: Submit same build again
@@ -331,30 +342,32 @@ async fn test_queue_build_via_raft() {
             timeout_seconds: None,
         })
         .await
-        .expect("Failed to queue build")
+        .context("Failed to queue build")?
         .into_inner();
 
     // Should get AlreadyBuilding (build is in Raft state)
     match response2.result {
         Some(rio_common::proto::queue_build_response::Result::AlreadyBuilding(already)) => {
-            assert_eq!(already.agent_id, agent_id.to_string());
-            assert_eq!(already.derivation_path, drv_path);
+            anyhow::ensure!(already.agent_id == agent_id.to_string(), "Wrong agent ID");
+            anyhow::ensure!(already.derivation_path == drv_path, "Wrong derivation path");
             println!("✓ Deduplication works: AlreadyBuilding response");
         }
-        other => panic!("Expected AlreadyBuilding, got: {:?}", other),
+        other => anyhow::bail!("Expected AlreadyBuilding, got: {:?}", other),
     }
+
+    Ok(())
 }
 
 /// Test heartbeat lifecycle with bootstrapped Raft cluster
 #[tokio::test]
-async fn test_heartbeat_lifecycle() {
+async fn test_heartbeat_lifecycle() -> anyhow::Result<()> {
     use chrono::Utc;
     use std::time::Duration;
 
     // Bootstrap agent with Raft
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let temp_path =
-        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+        camino::Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path for temp dir")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
     // Use fast intervals for testing: 1s heartbeat, 0.5s check, 3s timeout
@@ -366,7 +379,7 @@ async fn test_heartbeat_lifecycle() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     let agent_id = agent.id;
     let sm_store = agent.state_machine.clone();
@@ -380,10 +393,10 @@ async fn test_heartbeat_lifecycle() {
         .cluster
         .agents
         .get(&agent_id)
-        .expect("Agent not found in cluster");
+        .context("Agent not found in cluster")?;
     let age = Utc::now().signed_duration_since(agent_info.last_heartbeat);
 
-    assert!(
+    anyhow::ensure!(
         age.num_milliseconds() < 1500,
         "Heartbeat should be recent, but was {} milliseconds old",
         age.num_milliseconds()
@@ -393,17 +406,19 @@ async fn test_heartbeat_lifecycle() {
         "✓ Heartbeat test passed: heartbeat age = {}ms",
         age.num_milliseconds()
     );
+
+    Ok(())
 }
 
 /// Test that late joiners receive catch-up logs from history
 #[tokio::test]
-async fn test_late_joiner_receives_catch_up_logs() {
+async fn test_late_joiner_receives_catch_up_logs() -> anyhow::Result<()> {
     use std::time::Duration;
 
     // Start agent with Raft (bootstrap starts gRPC server automatically)
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let temp_path =
-        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+        camino::Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path for temp dir")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -415,7 +430,7 @@ async fn test_late_joiner_receives_catch_up_logs() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     // Get actual bound address
     let url = {
@@ -425,7 +440,7 @@ async fn test_late_joiner_receives_catch_up_logs() {
             .agents
             .get(&agent.id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     // Wait for agent to become leader (server is already running)
@@ -434,12 +449,12 @@ async fn test_late_joiner_receives_catch_up_logs() {
     // Create client
     let mut client = RioAgentClient::connect(url.clone())
         .await
-        .expect("Failed to connect");
+        .context("Failed to connect")?;
 
     // Create unique build
     let (drv_path, drv_nar) = create_unique_derivation()
         .await
-        .expect("Failed to create derivation");
+        .context("Failed to create derivation")?;
 
     // Submit build
     let response = client
@@ -452,10 +467,10 @@ async fn test_late_joiner_receives_catch_up_logs() {
             timeout_seconds: Some(60),
         })
         .await
-        .expect("QueueBuild failed");
+        .context("QueueBuild failed")?;
 
-    let result = response.into_inner().result.expect("No result");
-    assert!(
+    let result = response.into_inner().result.context("No result")?;
+    anyhow::ensure!(
         matches!(
             result,
             rio_common::proto::queue_build_response::Result::Assigned(_)
@@ -472,7 +487,7 @@ async fn test_late_joiner_receives_catch_up_logs() {
             derivation_path: drv_path.clone(),
         })
         .await
-        .expect("SubscribeToBuild failed")
+        .context("SubscribeToBuild failed")?
         .into_inner();
 
     // Collect a few log messages from first subscriber
@@ -498,7 +513,7 @@ async fn test_late_joiner_receives_catch_up_logs() {
             derivation_path: drv_path.clone(),
         })
         .await
-        .expect("SubscribeToBuild failed for late joiner")
+        .context("SubscribeToBuild failed for late joiner")?
         .into_inner();
 
     // Late joiner should receive catch-up logs first (with timeout)
@@ -520,7 +535,7 @@ async fn test_late_joiner_receives_catch_up_logs() {
         logs
     })
     .await
-    .expect("Test timeout: late joiner did not receive logs within 30 seconds");
+    .context("Test timeout: late joiner did not receive logs within 30 seconds")?;
 
     println!(
         "Late joiner received {} catch-up log messages",
@@ -528,23 +543,25 @@ async fn test_late_joiner_receives_catch_up_logs() {
     );
 
     // Verify late joiner got catch-up logs (should have at least some logs)
-    assert!(
+    anyhow::ensure!(
         !late_joiner_catch_up_logs.is_empty(),
         "Late joiner should receive catch-up logs from history"
     );
 
     println!("✓ Late joiner test passed: received catch-up logs");
+
+    Ok(())
 }
 
 /// Test that build completion updates Raft state correctly
 #[tokio::test]
-async fn test_build_completion_updates_raft_state() {
+async fn test_build_completion_updates_raft_state() -> anyhow::Result<()> {
     use std::time::Duration;
 
     // Start agent with Raft (bootstrap starts gRPC server automatically)
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let temp_path =
-        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+        camino::Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path for temp dir")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -556,7 +573,7 @@ async fn test_build_completion_updates_raft_state() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     let agent_id = agent.id;
     let state_machine = agent.state_machine.clone();
@@ -569,7 +586,7 @@ async fn test_build_completion_updates_raft_state() {
             .agents
             .get(&agent_id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     // Wait for agent to become leader (server is already running)
@@ -578,22 +595,22 @@ async fn test_build_completion_updates_raft_state() {
     // Create client
     let mut client = RioAgentClient::connect(url.clone())
         .await
-        .expect("Failed to connect");
+        .context("Failed to connect")?;
 
     // Create unique build
     let (drv_path, drv_nar) = create_unique_derivation()
         .await
-        .expect("Failed to create derivation");
+        .context("Failed to create derivation")?;
 
     // Verify build is NOT in state before submission
     {
         let state = state_machine.data.read();
         let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
-        assert!(
+        anyhow::ensure!(
             !state.cluster.builds_in_progress.contains_key(&drv_path_key),
             "Build should not be in progress before submission"
         );
-        assert!(
+        anyhow::ensure!(
             !state.cluster.completed_builds.contains_key(&drv_path_key),
             "Build should not be in completed before submission"
         );
@@ -610,10 +627,10 @@ async fn test_build_completion_updates_raft_state() {
             timeout_seconds: Some(60),
         })
         .await
-        .expect("QueueBuild failed");
+        .context("QueueBuild failed")?;
 
-    let result = response.into_inner().result.expect("No result");
-    assert!(
+    let result = response.into_inner().result.context("No result")?;
+    anyhow::ensure!(
         matches!(
             result,
             rio_common::proto::queue_build_response::Result::Assigned(_)
@@ -627,14 +644,13 @@ async fn test_build_completion_updates_raft_state() {
     {
         let state = state_machine.data.read();
         let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
-        let tracker = state.cluster.builds_in_progress.get(&drv_path_key);
-        assert!(
-            tracker.is_some(),
-            "Build should be in progress after submission"
-        );
-        assert_eq!(
-            tracker.unwrap().agent_id,
-            agent_id,
+        let tracker = state
+            .cluster
+            .builds_in_progress
+            .get(&drv_path_key)
+            .context("Build should be in progress after submission")?;
+        anyhow::ensure!(
+            tracker.agent_id == agent_id,
             "Build should be assigned to this agent"
         );
     }
@@ -645,7 +661,7 @@ async fn test_build_completion_updates_raft_state() {
             derivation_path: drv_path.clone(),
         })
         .await
-        .expect("SubscribeToBuild failed")
+        .context("SubscribeToBuild failed")?
         .into_inner();
 
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
@@ -656,11 +672,11 @@ async fn test_build_completion_updates_raft_state() {
                         return true;
                     }
                     if matches!(update.update, Some(build_update::Update::Failed(_))) {
-                        panic!("Build failed unexpectedly");
+                        return false;
                     }
                 }
-                Err(e) => {
-                    panic!("Stream error: {}", e);
+                Err(_) => {
+                    return false;
                 }
             }
         }
@@ -674,10 +690,10 @@ async fn test_build_completion_updates_raft_state() {
             // Build completed successfully
         }
         Ok(false) => {
-            panic!("Stream ended without receiving completion message");
+            anyhow::bail!("Build failed or stream ended without receiving completion message");
         }
         Err(_) => {
-            panic!("Test timeout: build did not complete within 30 seconds");
+            anyhow::bail!("Test timeout: build did not complete within 30 seconds");
         }
     }
 
@@ -698,7 +714,7 @@ async fn test_build_completion_updates_raft_state() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    assert!(
+    anyhow::ensure!(
         raft_updated,
         "Raft should process BuildCompleted within 5 seconds"
     );
@@ -708,23 +724,22 @@ async fn test_build_completion_updates_raft_state() {
         let state = state_machine.data.read();
         let drv_path_key: camino::Utf8PathBuf = drv_path.clone().into();
 
-        assert!(
+        anyhow::ensure!(
             !state.cluster.builds_in_progress.contains_key(&drv_path_key),
             "Build should be removed from in_progress after completion"
         );
 
-        let completed = state.cluster.completed_builds.get(&drv_path_key);
-        assert!(
-            completed.is_some(),
-            "Build should be in completed_builds after completion"
-        );
+        let completed_build = state
+            .cluster
+            .completed_builds
+            .get(&drv_path_key)
+            .context("Build should be in completed_builds after completion")?;
 
-        let completed_build = completed.unwrap();
-        assert_eq!(
-            completed_build.agent_id, agent_id,
+        anyhow::ensure!(
+            completed_build.agent_id == agent_id,
             "Completed build should track which agent built it"
         );
-        assert!(
+        anyhow::ensure!(
             !completed_build.output_paths.is_empty(),
             "Completed build should have output paths"
         );
@@ -736,18 +751,20 @@ async fn test_build_completion_updates_raft_state() {
     }
 
     println!("✓ Build completion Raft state test passed");
+
+    Ok(())
 }
 
 /// Test GetCompletedBuild RPC serves cached outputs
 #[tokio::test]
-async fn test_get_completed_build_serves_cache() {
+async fn test_get_completed_build_serves_cache() -> anyhow::Result<()> {
     use rio_common::proto::GetCompletedBuildRequest;
     use std::time::Duration;
 
     // Start agent with Raft (bootstrap starts gRPC server automatically)
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
     let temp_path =
-        camino::Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path for temp dir");
+        camino::Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path for temp dir")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -759,7 +776,7 @@ async fn test_get_completed_build_serves_cache() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     let state_machine = agent.state_machine.clone();
 
@@ -771,7 +788,7 @@ async fn test_get_completed_build_serves_cache() {
             .agents
             .get(&agent.id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     // Wait for agent to become leader (server is already running)
@@ -780,12 +797,12 @@ async fn test_get_completed_build_serves_cache() {
     // Create client
     let mut client = RioAgentClient::connect(url.clone())
         .await
-        .expect("Failed to connect");
+        .context("Failed to connect")?;
 
     // Create and complete a build first
     let (drv_path, drv_nar) = create_unique_derivation()
         .await
-        .expect("Failed to create derivation");
+        .context("Failed to create derivation")?;
 
     // Submit build
     client
@@ -798,7 +815,7 @@ async fn test_get_completed_build_serves_cache() {
             timeout_seconds: Some(60),
         })
         .await
-        .expect("QueueBuild failed");
+        .context("QueueBuild failed")?;
 
     // Wait for build coordinator to pick up assignment (polls every 100ms)
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -809,7 +826,7 @@ async fn test_get_completed_build_serves_cache() {
             derivation_path: drv_path.clone(),
         })
         .await
-        .expect("SubscribeToBuild failed")
+        .context("SubscribeToBuild failed")?
         .into_inner();
 
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
@@ -827,10 +844,10 @@ async fn test_get_completed_build_serves_cache() {
             // Build completed successfully
         }
         Ok(false) => {
-            panic!("Stream ended without receiving completion message");
+            anyhow::bail!("Stream ended without receiving completion message");
         }
         Err(_) => {
-            panic!("Test timeout: build did not complete within 30 seconds");
+            anyhow::bail!("Test timeout: build did not complete within 30 seconds");
         }
     }
 
@@ -851,7 +868,7 @@ async fn test_get_completed_build_serves_cache() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    assert!(
+    anyhow::ensure!(
         raft_updated,
         "Raft should process BuildCompleted within 5 seconds"
     );
@@ -864,7 +881,7 @@ async fn test_get_completed_build_serves_cache() {
             derivation_path: drv_path.clone(),
         })
         .await
-        .expect("GetCompletedBuild should succeed for cached build")
+        .context("GetCompletedBuild should succeed for cached build")?
         .into_inner();
 
     // Verify we receive output chunks and completion message
@@ -886,8 +903,8 @@ async fn test_get_completed_build_serves_cache() {
         }
     }
 
-    assert!(received_outputs, "Should receive output chunks from cache");
-    assert!(
+    anyhow::ensure!(received_outputs, "Should receive output chunks from cache");
+    anyhow::ensure!(
         received_completion,
         "Should receive completion message from cache"
     );
@@ -901,10 +918,12 @@ async fn test_get_completed_build_serves_cache() {
         })
         .await;
 
-    assert!(
+    anyhow::ensure!(
         non_existent_result.is_err(),
         "GetCompletedBuild should fail for non-existent build"
     );
 
     println!("✓ GetCompletedBuild correctly rejects non-existent build");
+
+    Ok(())
 }

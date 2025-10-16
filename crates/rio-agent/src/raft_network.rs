@@ -171,7 +171,12 @@ impl RaftNetwork<TypeConfig> for RaftNetworkConnection {
 
         // Convert response
         let raft_resp = InstallSnapshotResponse {
-            vote: FromProto::from_proto(pb_resp.vote.as_ref().expect("Response missing vote")),
+            vote: FromProto::from_proto(
+                pb_resp
+                    .vote
+                    .as_ref()
+                    .expect("protobuf InstallSnapshotResponse must have vote field"),
+            ),
         };
 
         Ok(raft_resp)

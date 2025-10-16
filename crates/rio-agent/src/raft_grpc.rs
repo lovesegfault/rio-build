@@ -103,7 +103,9 @@ impl RaftInternal for RaftInternalService {
 
         // Convert to openraft InstallSnapshotRequest
         let vote = crate::raft_proto_conv::FromProto::from_proto(
-            meta.vote.as_ref().expect("Snapshot missing vote"),
+            meta.vote
+                .as_ref()
+                .expect("protobuf Snapshot meta must have vote field"),
         );
 
         // Build openraft snapshot
@@ -118,7 +120,7 @@ impl RaftInternal for RaftInternalService {
                 meta.last_membership
                     .as_ref()
                     .map(crate::raft_proto_conv::FromProto::from_proto)
-                    .expect("Snapshot missing membership"),
+                    .expect("protobuf Snapshot meta must have membership field"),
             ),
             snapshot_id: meta.snapshot_id.clone(),
         };

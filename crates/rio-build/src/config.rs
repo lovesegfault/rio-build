@@ -58,49 +58,57 @@ seed_agents = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
-    fn test_load_existing_file() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    fn test_load_existing_file() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
         let config_file = temp_path.join("config.toml");
 
-        std::fs::write(&config_file, "test content").unwrap();
+        std::fs::write(&config_file, "test content")?;
 
-        let contents = load_config_file(&config_file).unwrap();
+        let contents = load_config_file(&config_file)?;
         assert_eq!(contents, Some("test content".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_load_missing_file_returns_none() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    fn test_load_missing_file_returns_none() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
         let nonexistent = temp_path.join("missing.toml");
 
-        let result = load_config_file(&nonexistent).unwrap();
+        let result = load_config_file(&nonexistent)?;
         assert_eq!(result, None);
+        Ok(())
     }
 
     #[test]
-    fn test_create_default_config() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    fn test_create_default_config() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         // set_var is unsafe in Rust 2024
         unsafe {
             std::env::set_var("HOME", temp_path.as_str());
         }
 
-        let config_path = create_default_config().expect("Failed to create");
+        let config_path = create_default_config()?;
         assert!(config_path.exists());
 
-        let contents = std::fs::read_to_string(&config_path).unwrap();
+        let contents = std::fs::read_to_string(&config_path)?;
         assert!(contents.contains("seed_agents"));
+        Ok(())
     }
 
     #[test]
-    fn test_default_config_path() {
-        let path = default_config_path().expect("Failed to get path");
+    fn test_default_config_path() -> anyhow::Result<()> {
+        let path = default_config_path()?;
         assert!(path.ends_with("rio/config.toml"));
+        Ok(())
     }
 }

@@ -48,6 +48,7 @@ pub enum BuildStatus {
     Building,                                             // Currently executing on agent
     QueuedDependency { blocked_on: Vec<DerivationPath> }, // Waiting for dependencies
     QueuedCapacity, // Waiting for agent capacity (agent is busy)
+    QueuedNoAgent,  // Waiting for matching agent to join cluster
 }
 
 /// Completed build information
@@ -216,10 +217,32 @@ impl ClusterState {
                     })
                     .collect();
 
-                // If no eligible agents, return error response
-                // TODO: Add NoEligibleAgents response variant in Phase 3
+                // If no eligible agents, queue build with QueuedNoAgent status
+                // An agent with matching capabilities may join the cluster later
                 if eligible.is_empty() {
-                    // For now, return with nil agent_id to signal error
+                    let now = Utc::now();
+
+                    // Register build as queued, waiting for matching agent
+                    self.builds_in_progress.insert(
+                        top_level.clone(),
+                        BuildTracker {
+                            agent_id: AgentId::nil(), // No agent assigned yet
+                            started_at: now,
+                            parent_build: None,
+                            status: BuildStatus::QueuedNoAgent,
+                        },
+                    );
+
+                    // Store derivation NAR so it's available when agent joins
+                    self.pending_derivations
+                        .insert(top_level.clone(), derivation_nar);
+
+                    tracing::warn!(
+                        "No eligible agents for platform {} with features {:?}, build queued",
+                        platform,
+                        features
+                    );
+
                     return RaftResponse::BuildAssigned {
                         agent_id: AgentId::nil(),
                         derivation_path: top_level,
@@ -242,6 +265,7 @@ impl ClusterState {
 
                 // Step 3: Select highest affinity agent
                 // Step 4: Tie-break by smallest agent_id (lexicographic)
+                // Note: eligible is guaranteed non-empty (checked above), so this always succeeds
                 let selected_agent_id = scores
                     .iter()
                     .filter(|(id, _)| eligible.iter().any(|a| &a.id == *id))
@@ -260,7 +284,7 @@ impl ClusterState {
                         // No agents with affinity - select smallest agent_id among eligible
                         eligible.iter().min_by_key(|a| &a.id).map(|a| a.id)
                     })
-                    .expect("Should have at least one eligible agent");
+                    .expect("eligible is non-empty, so selection must succeed");
 
                 // Step 5: Update state
                 let now = Utc::now();
@@ -362,16 +386,17 @@ impl ClusterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use camino::Utf8PathBuf;
 
     #[test]
-    fn test_agent_joined() {
+    fn test_agent_joined() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
         let info = AgentInfo {
             id: agent_id,
-            address: Url::parse("http://localhost:50051").unwrap(),
+            address: Url::parse("http://localhost:50051")?,
             platforms: vec!["x86_64-linux".to_string()],
             features: vec!["kvm".to_string()],
             status: AgentStatus::Available,
@@ -386,20 +411,26 @@ mod tests {
         assert!(matches!(response, RaftResponse::AgentJoined { .. }));
         assert_eq!(state.agents.len(), 1);
         assert_eq!(
-            state.agents.get(&agent_id).unwrap().address.as_str(),
+            state
+                .agents
+                .get(&agent_id)
+                .context("agent should exist")?
+                .address
+                .as_str(),
             "http://localhost:50051/"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_lifecycle() {
+    fn test_build_lifecycle() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
         // Add agent first
         let info = AgentInfo {
             id: agent_id,
-            address: Url::parse("http://localhost:50051").unwrap(),
+            address: Url::parse("http://localhost:50051")?,
             platforms: vec!["x86_64-linux".to_string()],
             features: vec![],
             status: AgentStatus::Available,
@@ -429,10 +460,11 @@ mod tests {
 
         assert_eq!(state.builds_in_progress.len(), 0);
         assert_eq!(state.completed_builds.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_dependency_cleanup_on_completion() {
+    fn test_dependency_cleanup_on_completion() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
@@ -440,7 +472,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -473,10 +505,11 @@ mod tests {
         // Should remove top-level AND all dependencies
         assert_eq!(state.builds_in_progress.len(), 0);
         assert_eq!(state.completed_builds.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_deterministic_assignment_platform_filter() {
+    fn test_deterministic_assignment_platform_filter() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
 
         // Add two agents with different platforms
@@ -487,7 +520,7 @@ mod tests {
             agent_x86,
             AgentInfo {
                 id: agent_x86,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -499,7 +532,7 @@ mod tests {
             agent_arm,
             AgentInfo {
                 id: agent_arm,
-                address: Url::parse("http://localhost:50052").unwrap(),
+                address: Url::parse("http://localhost:50052")?,
                 platforms: vec!["aarch64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -521,12 +554,13 @@ mod tests {
             RaftResponse::BuildAssigned { agent_id, .. } => {
                 assert_eq!(agent_id, agent_x86);
             }
-            _ => panic!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildAssigned response"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_deterministic_assignment_feature_filter() {
+    fn test_deterministic_assignment_feature_filter() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
 
         let agent_with_kvm = AgentId::new_v4();
@@ -536,7 +570,7 @@ mod tests {
             agent_with_kvm,
             AgentInfo {
                 id: agent_with_kvm,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec!["kvm".to_string()],
                 status: AgentStatus::Available,
@@ -548,7 +582,7 @@ mod tests {
             agent_without_kvm,
             AgentInfo {
                 id: agent_without_kvm,
-                address: Url::parse("http://localhost:50052").unwrap(),
+                address: Url::parse("http://localhost:50052")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -570,12 +604,13 @@ mod tests {
             RaftResponse::BuildAssigned { agent_id, .. } => {
                 assert_eq!(agent_id, agent_with_kvm);
             }
-            _ => panic!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildAssigned response"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_deterministic_assignment_affinity() {
+    fn test_deterministic_assignment_affinity() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
 
         let agent_a = AgentId::new_v4();
@@ -586,7 +621,7 @@ mod tests {
             agent_a,
             AgentInfo {
                 id: agent_a,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -598,7 +633,7 @@ mod tests {
             agent_b,
             AgentInfo {
                 id: agent_b,
-                address: Url::parse("http://localhost:50052").unwrap(),
+                address: Url::parse("http://localhost:50052")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -632,12 +667,13 @@ mod tests {
             RaftResponse::BuildAssigned { agent_id, .. } => {
                 assert_eq!(agent_id, agent_a);
             }
-            _ => panic!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildAssigned response"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_deterministic_assignment_tie_break() {
+    fn test_deterministic_assignment_tie_break() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
 
         // Create two agents with deterministic IDs for tie-breaking test
@@ -648,7 +684,7 @@ mod tests {
             agent_a,
             AgentInfo {
                 id: agent_a,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -660,7 +696,7 @@ mod tests {
             agent_b,
             AgentInfo {
                 id: agent_b,
-                address: Url::parse("http://localhost:50052").unwrap(),
+                address: Url::parse("http://localhost:50052")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -682,12 +718,13 @@ mod tests {
             RaftResponse::BuildAssigned { agent_id, .. } => {
                 assert_eq!(agent_id, agent_a);
             }
-            _ => panic!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildAssigned response"),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_assignment_marks_agent_busy() {
+    fn test_assignment_marks_agent_busy() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
@@ -695,7 +732,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -714,13 +751,18 @@ mod tests {
 
         // Agent should now be Busy
         assert_eq!(
-            state.agents.get(&agent_id).unwrap().status,
+            state
+                .agents
+                .get(&agent_id)
+                .context("agent should exist")?
+                .status,
             AgentStatus::Busy
         );
+        Ok(())
     }
 
     #[test]
-    fn test_status_blind_assignment_to_busy_agent() {
+    fn test_status_blind_assignment_to_busy_agent() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
@@ -729,7 +771,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Busy, // Already busy!
@@ -754,7 +796,7 @@ mod tests {
             } => {
                 assert_eq!(assigned_id, agent_id);
             }
-            _ => panic!("Expected BuildAssigned response"),
+            _ => anyhow::bail!("Expected BuildAssigned response"),
         }
 
         // Build should be registered
@@ -765,10 +807,11 @@ mod tests {
                 .pending_derivations
                 .contains_key(&Utf8PathBuf::from("/nix/store/bar.drv"))
         );
+        Ok(())
     }
 
     #[test]
-    fn test_pending_derivations_cleanup_on_completion() {
+    fn test_pending_derivations_cleanup_on_completion() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
@@ -776,7 +819,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -806,10 +849,11 @@ mod tests {
 
         // Derivation should be removed
         assert!(!state.pending_derivations.contains_key(&drv_path));
+        Ok(())
     }
 
     #[test]
-    fn test_agent_left_cleans_up_builds() {
+    fn test_agent_left_cleans_up_builds() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
 
         let agent1 = AgentId::new_v4();
@@ -820,7 +864,7 @@ mod tests {
             agent1,
             AgentInfo {
                 id: agent1,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -832,7 +876,7 @@ mod tests {
             agent2,
             AgentInfo {
                 id: agent2,
-                address: Url::parse("http://localhost:50052").unwrap(),
+                address: Url::parse("http://localhost:50052")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -885,10 +929,11 @@ mod tests {
         // Agent1 should be removed
         assert!(!state.agents.contains_key(&agent1));
         assert!(state.agents.contains_key(&agent2));
+        Ok(())
     }
 
     #[test]
-    fn test_agent_left_cleans_up_multiple_builds() {
+    fn test_agent_left_cleans_up_multiple_builds() -> anyhow::Result<()> {
         let mut state = ClusterState::default();
         let agent_id = AgentId::new_v4();
 
@@ -896,7 +941,7 @@ mod tests {
             agent_id,
             AgentInfo {
                 id: agent_id,
-                address: Url::parse("http://localhost:50051").unwrap(),
+                address: Url::parse("http://localhost:50051")?,
                 platforms: vec!["x86_64-linux".to_string()],
                 features: vec![],
                 status: AgentStatus::Available,
@@ -934,5 +979,6 @@ mod tests {
         assert_eq!(state.builds_in_progress.len(), 0);
         assert_eq!(state.pending_derivations.len(), 0);
         assert!(!state.agents.contains_key(&agent_id));
+        Ok(())
     }
 }

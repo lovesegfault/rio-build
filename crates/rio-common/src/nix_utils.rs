@@ -167,16 +167,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_parse_nix_config() {
-        let config = NixConfig::parse().await.unwrap();
+    async fn test_parse_nix_config() -> anyhow::Result<()> {
+        let config = NixConfig::parse().await?;
         assert!(!config.system.is_empty());
         println!("System: {}", config.system);
         println!("Extra platforms: {:?}", config.extra_platforms);
         println!("Features: {:?}", config.system_features);
+        Ok(())
     }
 
     #[test]
-    fn test_nix_config_all_platforms() {
+    fn test_nix_config_all_platforms() -> anyhow::Result<()> {
         let config = NixConfig {
             system: "x86_64-linux".to_string(),
             extra_platforms: vec!["i686-linux".to_string()],
@@ -185,5 +186,6 @@ mod tests {
 
         let platforms = config.all_platforms();
         assert_eq!(platforms, vec!["x86_64-linux", "i686-linux"]);
+        Ok(())
     }
 }

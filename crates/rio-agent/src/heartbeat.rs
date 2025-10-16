@@ -144,24 +144,23 @@ fn check_failed_agents(state_machine: &StateMachineStore, timeout: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use camino::Utf8Path;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_heartbeat_task_sends_periodic_heartbeats() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    async fn test_heartbeat_task_sends_periodic_heartbeats() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         let node_id = AgentId::new_v4();
         let agent_id = AgentId::new_v4();
         let rpc_addr = "localhost:50051".to_string();
         let (raft, sm_store) =
             crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
-                .await
-                .unwrap();
+                .await?;
 
-        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
-            .await
-            .unwrap();
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr).await?;
 
         // Wait for node to become leader
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -174,8 +173,7 @@ mod tests {
             vec!["x86_64-linux".to_string()],
             vec![],
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Start heartbeat task with 1 second interval (much faster for tests)
         let handle = start_heartbeat_task(agent_id, raft.clone(), Duration::from_secs(1));
@@ -185,7 +183,11 @@ mod tests {
 
         // Check that heartbeat was updated
         let data = sm_store.data.read();
-        let agent = data.cluster.agents.get(&agent_id).unwrap();
+        let agent = data
+            .cluster
+            .agents
+            .get(&agent_id)
+            .context("agent should exist")?;
 
         // Heartbeat should be recent (< 1.5 seconds old with 1s interval)
         let age = Utc::now().signed_duration_since(agent.last_heartbeat);
@@ -196,23 +198,22 @@ mod tests {
         );
 
         handle.abort();
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_failure_detector_marks_stale_agents_as_down() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    async fn test_failure_detector_marks_stale_agents_as_down() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         let node_id = AgentId::new_v4();
         let rpc_addr = "localhost:50051".to_string();
         let (raft, sm_store) =
             crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
-                .await
-                .unwrap();
+                .await?;
 
-        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
-            .await
-            .unwrap();
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr).await?;
 
         // Wait for node to become leader
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -228,8 +229,7 @@ mod tests {
             vec!["x86_64-linux".to_string()],
             vec![],
         )
-        .await
-        .unwrap();
+        .await?;
 
         crate::membership::register_agent(
             &raft,
@@ -238,8 +238,7 @@ mod tests {
             vec!["x86_64-linux".to_string()],
             vec![],
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Start heartbeat for agent1 only (agent2 will go stale)
         // Use 1 second interval for faster test
@@ -268,35 +267,36 @@ mod tests {
         );
 
         detector_handle.abort();
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_check_failed_agents_empty_on_fresh_cluster() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    async fn test_check_failed_agents_empty_on_fresh_cluster() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
-        let (_log_store, sm_store) = crate::storage::new_storage(temp_path).await.unwrap();
+        let (_log_store, sm_store) = crate::storage::new_storage(temp_path).await?;
 
         let failed = check_failed_agents(&sm_store, Duration::from_secs(30));
         assert!(failed.is_empty(), "Fresh cluster should have no failures");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_raft_write_works_after_bootstrap() {
+    async fn test_raft_write_works_after_bootstrap() -> anyhow::Result<()> {
         // Minimal test to verify Raft can accept writes after bootstrap
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         let node_id = AgentId::new_v4();
         let rpc_addr = "localhost:50051".to_string();
         let (raft, _sm_store) =
             crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
-                .await
-                .expect("Failed to create Raft");
+                .await?;
 
-        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
-            .await
-            .expect("Failed to initialize");
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr).await?;
 
         // Wait for leader to be ready
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -312,29 +312,23 @@ mod tests {
             timestamp: Utc::now(),
         };
 
-        let result = raft.client_write(cmd).await;
-        assert!(
-            result.is_ok(),
-            "client_write should succeed after bootstrap, but got: {:?}",
-            result.err()
-        );
+        let _result = raft.client_write(cmd).await?;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_check_failed_agents_detects_stale() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    async fn test_check_failed_agents_detects_stale() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         let node_id = AgentId::new_v4();
         let rpc_addr = "localhost:50051".to_string();
         let (raft, sm_store) =
             crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
-                .await
-                .unwrap();
+                .await?;
 
-        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
-            .await
-            .unwrap();
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr).await?;
 
         // Wait for node to be ready
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -358,8 +352,7 @@ mod tests {
             vec!["x86_64-linux".to_string()],
             vec![],
         )
-        .await
-        .expect("Failed to register agent1");
+        .await?;
 
         // Register agent2 and manually set stale heartbeat
         crate::membership::register_agent(
@@ -369,38 +362,34 @@ mod tests {
             vec!["x86_64-linux".to_string()],
             vec![],
         )
-        .await
-        .expect("Failed to register agent2");
+        .await?;
 
         // Manually update agent2's heartbeat to be stale (40 seconds ago)
         let stale_heartbeat_cmd = crate::state_machine::RaftCommand::AgentHeartbeat {
             id: agent2,
             timestamp: Utc::now() - chrono::Duration::seconds(40),
         };
-        raft.client_write(stale_heartbeat_cmd)
-            .await
-            .expect("Failed to write stale heartbeat");
+        raft.client_write(stale_heartbeat_cmd).await?;
 
         let failed = check_failed_agents(&sm_store, Duration::from_secs(30));
         assert_eq!(failed.len(), 1, "Should detect one failed agent");
         assert_eq!(failed[0], agent2, "Should detect agent2 as failed");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_check_failed_agents_ignores_already_down() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let temp_path = Utf8Path::from_path(temp_dir.path()).unwrap();
+    async fn test_check_failed_agents_ignores_already_down() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         let node_id = AgentId::new_v4();
         let rpc_addr = "localhost:50051".to_string();
         let (raft, sm_store) =
             crate::raft_node::create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
-                .await
-                .unwrap();
+                .await?;
 
-        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr)
-            .await
-            .unwrap();
+        crate::raft_node::initialize_single_node_leader(&raft, node_id, rpc_addr).await?;
 
         // Wait for node to be ready
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -415,19 +404,18 @@ mod tests {
             vec!["x86_64-linux".to_string()],
             vec![],
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Set stale heartbeat
         let stale_heartbeat_cmd = crate::state_machine::RaftCommand::AgentHeartbeat {
             id: agent1,
             timestamp: Utc::now() - chrono::Duration::seconds(100),
         };
-        raft.client_write(stale_heartbeat_cmd).await.unwrap();
+        raft.client_write(stale_heartbeat_cmd).await?;
 
         // Mark agent as Down (AgentLeft removes it entirely)
         let agent_left_cmd = crate::state_machine::RaftCommand::AgentLeft { id: agent1 };
-        raft.client_write(agent_left_cmd).await.unwrap();
+        raft.client_write(agent_left_cmd).await?;
 
         // After AgentLeft, the agent is removed entirely
         // check_failed_agents should return empty since the agent is gone
@@ -436,5 +424,6 @@ mod tests {
             failed.is_empty(),
             "Should not detect removed agents as failed"
         );
+        Ok(())
     }
 }

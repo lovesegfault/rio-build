@@ -51,8 +51,12 @@ impl ToProto<proto::Vote> for Vote<NodeId> {
 
 impl FromProto<proto::Vote> for Vote<NodeId> {
     fn from_proto(pb: &proto::Vote) -> Self {
-        let leader_id = pb.leader_id.as_ref().expect("Vote missing leader_id");
-        let node_id = uuid::Uuid::parse_str(&leader_id.node_id).expect("Invalid UUID");
+        let leader_id = pb
+            .leader_id
+            .as_ref()
+            .expect("protobuf Vote must have leader_id field");
+        let node_id = uuid::Uuid::parse_str(&leader_id.node_id)
+            .expect("protobuf LeaderId.node_id must be valid UUID");
 
         if pb.committed {
             Vote::new_committed(leader_id.term, node_id)
@@ -135,7 +139,10 @@ impl FromProto<proto::Membership> for Membership<NodeId, Node> {
             .map(|set| {
                 set.node_ids
                     .iter()
-                    .map(|id| uuid::Uuid::parse_str(id).expect("Invalid UUID"))
+                    .map(|id| {
+                        uuid::Uuid::parse_str(id)
+                            .expect("protobuf Membership.node_ids must contain valid UUIDs")
+                    })
                     .collect()
             })
             .collect();
@@ -145,7 +152,8 @@ impl FromProto<proto::Membership> for Membership<NodeId, Node> {
             .iter()
             .map(|(id, node)| {
                 (
-                    uuid::Uuid::parse_str(id).expect("Invalid UUID"),
+                    uuid::Uuid::parse_str(id)
+                        .expect("protobuf Membership.nodes key must be valid UUID"),
                     Node::from_proto(node),
                 )
             })
@@ -168,7 +176,8 @@ impl ToProto<proto::Entry> for Entry<TypeConfig> {
         let payload = match &self.payload {
             EntryPayload::Blank => Some(proto::entry::Payload::Blank(proto::EmptyPayload {})),
             EntryPayload::Normal(cmd) => {
-                let serialized = serde_json::to_vec(cmd).expect("Failed to serialize command");
+                let serialized = serde_json::to_vec(cmd)
+                    .expect("RaftCommand serialization cannot fail (all types are Serialize)");
                 Some(proto::entry::Payload::Normal(serialized))
             }
             EntryPayload::Membership(m) => Some(proto::entry::Payload::Membership(m.to_proto())),
@@ -180,14 +189,21 @@ impl ToProto<proto::Entry> for Entry<TypeConfig> {
 
 impl FromProtoWithVote<proto::Entry> for Entry<TypeConfig> {
     fn from_proto_with_vote(pb: &proto::Entry, vote: &Vote<NodeId>) -> Self {
-        let log_id_pb = pb.log_id.as_ref().expect("Entry missing log_id");
+        let log_id_pb = pb
+            .log_id
+            .as_ref()
+            .expect("protobuf Entry must have log_id field");
         let log_id = LogId::from_proto_with_vote(log_id_pb, vote);
 
-        let payload = match pb.payload.as_ref().expect("Entry missing payload") {
+        let payload = match pb
+            .payload
+            .as_ref()
+            .expect("protobuf Entry must have payload field")
+        {
             proto::entry::Payload::Blank(_) => EntryPayload::Blank,
             proto::entry::Payload::Normal(bytes) => {
-                let cmd: RaftCommand =
-                    serde_json::from_slice(bytes).expect("Failed to deserialize command");
+                let cmd: RaftCommand = serde_json::from_slice(bytes)
+                    .expect("protobuf Entry payload must contain valid RaftCommand JSON");
                 EntryPayload::Normal(cmd)
             }
             proto::entry::Payload::Membership(m) => {
@@ -216,7 +232,11 @@ impl ToProto<proto::AppendEntriesRequest> for RaftAppendEntriesRequest<TypeConfi
 
 impl FromProto<proto::AppendEntriesRequest> for RaftAppendEntriesRequest<TypeConfig> {
     fn from_proto(pb: &proto::AppendEntriesRequest) -> Self {
-        let vote = Vote::from_proto(pb.vote.as_ref().expect("AppendEntries missing vote"));
+        let vote = Vote::from_proto(
+            pb.vote
+                .as_ref()
+                .expect("protobuf AppendEntries must have vote field"),
+        );
 
         let entries: Vec<Entry<TypeConfig>> = pb
             .entries
@@ -291,7 +311,11 @@ impl FromProto<proto::AppendEntriesResponse> for RaftAppendEntriesResponse<NodeI
             }
         } else if pb.conflict {
             // HigherVote
-            let vote = Vote::from_proto(pb.vote.as_ref().expect("HigherVote missing vote"));
+            let vote = Vote::from_proto(
+                pb.vote
+                    .as_ref()
+                    .expect("protobuf HigherVote must have vote field"),
+            );
             RaftAppendEntriesResponse::HigherVote(vote)
         } else {
             // Conflict (old log doesn't match)
@@ -315,7 +339,11 @@ impl ToProto<proto::VoteRequest> for RaftVoteRequest<NodeId> {
 
 impl FromProto<proto::VoteRequest> for RaftVoteRequest<NodeId> {
     fn from_proto(pb: &proto::VoteRequest) -> Self {
-        let vote = Vote::from_proto(pb.vote.as_ref().expect("VoteRequest missing vote"));
+        let vote = Vote::from_proto(
+            pb.vote
+                .as_ref()
+                .expect("protobuf VoteRequest must have vote field"),
+        );
 
         RaftVoteRequest {
             vote,
@@ -339,7 +367,11 @@ impl ToProto<proto::VoteResponse> for RaftVoteResponse<NodeId> {
 
 impl FromProto<proto::VoteResponse> for RaftVoteResponse<NodeId> {
     fn from_proto(pb: &proto::VoteResponse) -> Self {
-        let vote = Vote::from_proto(pb.vote.as_ref().expect("VoteResponse missing vote"));
+        let vote = Vote::from_proto(
+            pb.vote
+                .as_ref()
+                .expect("protobuf VoteResponse must have vote field"),
+        );
 
         RaftVoteResponse {
             vote,

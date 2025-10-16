@@ -132,7 +132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cluster_info_is_stale() {
+    fn test_cluster_info_is_stale() -> anyhow::Result<()> {
         let info = ClusterInfo {
             leader_id: "leader-1".to_string(),
             leader_address: "http://localhost:50051".to_string(),
@@ -142,10 +142,11 @@ mod tests {
 
         assert!(info.is_stale(Duration::from_secs(60)));
         assert!(!info.is_stale(Duration::from_secs(120)));
+        Ok(())
     }
 
     #[test]
-    fn test_find_leader() {
+    fn test_find_leader() -> anyhow::Result<()> {
         let mut agents = HashMap::new();
         agents.insert(
             "agent-1".to_string(),
@@ -170,12 +171,13 @@ mod tests {
             },
         );
 
-        let leader_addr = ClusterInfo::find_leader("leader-1", &agents).unwrap();
+        let leader_addr = ClusterInfo::find_leader("leader-1", &agents)?;
         assert_eq!(leader_addr, "http://leader:50051");
+        Ok(())
     }
 
     #[test]
-    fn test_find_leader_not_found() {
+    fn test_find_leader_not_found() -> anyhow::Result<()> {
         let mut agents = HashMap::new();
         agents.insert(
             "agent-1".to_string(),
@@ -193,9 +195,11 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .err()
+                .context("should have error")?
                 .to_string()
                 .contains("not found in cluster")
         );
+        Ok(())
     }
 }

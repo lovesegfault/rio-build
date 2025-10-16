@@ -2,7 +2,7 @@
 //!
 //! Tests Raft cluster formation, leader election, and distributed coordination.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rio_agent::agent::Agent;
 use rio_common::proto::{
@@ -22,8 +22,10 @@ async fn test_explicit_join_two_nodes() -> Result<()> {
     // Create temp directories for agents
     let temp_dir1 = tempfile::tempdir()?;
     let temp_dir2 = tempfile::tempdir()?;
-    let data_dir1 = Utf8PathBuf::from_path_buf(temp_dir1.path().to_path_buf()).unwrap();
-    let data_dir2 = Utf8PathBuf::from_path_buf(temp_dir2.path().to_path_buf()).unwrap();
+    let data_dir1 = Utf8PathBuf::from_path_buf(temp_dir1.path().to_path_buf())
+        .map_err(|_| anyhow::anyhow!("Failed to convert temp_dir1 to UTF-8 path"))?;
+    let data_dir2 = Utf8PathBuf::from_path_buf(temp_dir2.path().to_path_buf())
+        .map_err(|_| anyhow::anyhow!("Failed to convert temp_dir2 to UTF-8 path"))?;
 
     // Use fixed ports for testing
     let listen_addr1 = "127.0.0.1:0".to_string();
@@ -78,7 +80,7 @@ async fn test_explicit_join_two_nodes() -> Result<()> {
             .agents
             .get(&agent1_id)
             .map(|a| a.address.to_string())
-            .expect("Agent 1 should be in cluster state")
+            .context("Agent 1 should be in cluster state")?
     };
 
     // Agent 2 joins via agent 1 (server starts automatically)
@@ -172,7 +174,8 @@ async fn form_cluster(n: usize) -> Result<(Vec<Arc<Agent>>, HashMap<uuid::Uuid, 
 
     // Bootstrap first agent (becomes leader) with port 0 for dynamic allocation
     let temp_dir1 = tempfile::tempdir()?;
-    let data_dir1 = Utf8PathBuf::from_path_buf(temp_dir1.path().to_path_buf()).unwrap();
+    let data_dir1 = Utf8PathBuf::from_path_buf(temp_dir1.path().to_path_buf())
+        .map_err(|_| anyhow::anyhow!("Failed to convert temp_dir1 to UTF-8 path"))?;
     let listen_addr1 = "127.0.0.1:0".to_string();
 
     eprintln!("TEST: Bootstrapping agent 1 with dynamic port");
@@ -193,7 +196,7 @@ async fn form_cluster(n: usize) -> Result<(Vec<Arc<Agent>>, HashMap<uuid::Uuid, 
             .agents
             .get(&agent1.id)
             .map(|a| a.address.to_string())
-            .expect("Agent 1 should be in cluster state")
+            .context("Agent 1 should be in cluster state")?
     };
 
     eprintln!("TEST: Agent 1 bound to {}", agent1_addr);
@@ -214,7 +217,12 @@ async fn form_cluster(n: usize) -> Result<(Vec<Arc<Agent>>, HashMap<uuid::Uuid, 
     // Join remaining agents with dynamic port allocation
     for i in 1..n {
         let temp_dir = tempfile::tempdir()?;
-        let data_dir = Utf8PathBuf::from_path_buf(temp_dir.path().to_path_buf()).unwrap();
+        let data_dir = Utf8PathBuf::from_path_buf(temp_dir.path().to_path_buf()).map_err(|_| {
+            anyhow::anyhow!(
+                "Failed to convert temp_dir to UTF-8 path for agent {}",
+                i + 1
+            )
+        })?;
         let listen_addr = "127.0.0.1:0".to_string(); // Dynamic port
 
         eprintln!("TEST: Agent {} joining cluster via {}", i + 1, agent1_addr);
@@ -236,7 +244,7 @@ async fn form_cluster(n: usize) -> Result<(Vec<Arc<Agent>>, HashMap<uuid::Uuid, 
                 .agents
                 .get(&agent.id)
                 .map(|a| a.address.to_string())
-                .expect("Agent should be in cluster state")
+                .with_context(|| format!("Agent {} should be in cluster state", i + 1))?
         };
 
         eprintln!("TEST: Agent {} bound to {}", i + 1, agent_addr);
@@ -324,7 +332,7 @@ async fn test_multi_node_distributed_build() -> Result<()> {
     let leader_id = agents[0].id;
     let leader_addr = addresses
         .get(&leader_id)
-        .expect("Leader address should be in map")
+        .context("Leader address should be in map")?
         .clone();
 
     eprintln!("TEST: 3-node cluster formed, leader at {}", leader_addr);
@@ -443,7 +451,7 @@ async fn test_multi_node_concurrent_deduplication() -> Result<()> {
     let leader_id = agents[0].id;
     let leader_addr = addresses
         .get(&leader_id)
-        .expect("Leader address should be in map")
+        .context("Leader address should be in map")?
         .clone();
 
     eprintln!("TEST: 3-node cluster formed for deduplication test");
@@ -682,7 +690,7 @@ async fn test_multi_node_cache_serving() -> Result<()> {
     let leader_id = agents[0].id;
     let leader_addr = addresses
         .get(&leader_id)
-        .expect("Leader address should be in map")
+        .context("Leader address should be in map")?
         .clone();
 
     eprintln!("TEST: 3-node cluster formed for cache serving test");
@@ -715,7 +723,7 @@ async fn test_multi_node_cache_serving() -> Result<()> {
     let assigned_agent_id = uuid::Uuid::parse_str(&assigned.agent_id)?;
     let assigned_addr = addresses
         .get(&assigned_agent_id)
-        .ok_or_else(|| anyhow::anyhow!("Assigned agent not found"))?
+        .context("Assigned agent not found")?
         .clone();
 
     eprintln!(
@@ -808,7 +816,7 @@ async fn test_multi_node_cache_serving() -> Result<()> {
     let cache_agent_id = uuid::Uuid::parse_str(&already_completed.agent_id)?;
     let cache_addr = addresses
         .get(&cache_agent_id)
-        .ok_or_else(|| anyhow::anyhow!("Cache agent not found"))?
+        .context("Cache agent not found")?
         .clone();
 
     eprintln!("TEST: Client 2 connecting to cache agent at {}", cache_addr);

@@ -5,7 +5,7 @@
 //! - AlreadyCompleted responses (cache hits)
 //! - Multiple subscribers to same build
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use camino::Utf8Path;
 use rio_build::{client, cluster, evaluator};
 use rio_common::proto::build_update;
@@ -53,10 +53,10 @@ runCommandNoCC "rio-dedup-test-{}" {{}} ''
 
 /// Test that AlreadyBuilding response correctly subscribes to existing build
 #[tokio::test]
-async fn test_already_building_response() {
+async fn test_already_building_response() -> anyhow::Result<()> {
     // Start agent
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let temp_path = Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -68,7 +68,7 @@ async fn test_already_building_response() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     // Get actual bound address
     let agent_url = {
@@ -78,26 +78,26 @@ async fn test_already_building_response() {
             .agents
             .get(&agent.id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Discover cluster
-    let seed_url = url::Url::parse(&agent_url).expect("Invalid URL");
+    let seed_url = url::Url::parse(&agent_url).context("Invalid URL")?;
     let cluster_info = cluster::discover_cluster(&[seed_url])
         .await
-        .expect("Failed to discover cluster");
+        .context("Failed to discover cluster")?;
 
     // Create unique derivation
     let (drv_path, drv_nar) = create_unique_derivation()
         .await
-        .expect("Failed to create derivation");
+        .context("Failed to create derivation")?;
 
     // First client: Submit build (will get BuildAssigned)
     let mut client1 = client::RioClient::connect(&cluster_info.leader_address)
         .await
-        .expect("Failed to connect client 1");
+        .context("Failed to connect client 1")?;
 
     let build_info1 = evaluator::BuildInfo {
         drv_path: drv_path.clone().into(),
@@ -111,7 +111,7 @@ async fn test_already_building_response() {
     let mut stream1 = client1
         .submit_build(build_info1, &cluster_info)
         .await
-        .expect("Client 1 failed to submit build");
+        .context("Client 1 failed to submit build")?;
 
     // Consume a few log messages to ensure build is running
     let mut log_count = 0;
@@ -133,7 +133,7 @@ async fn test_already_building_response() {
     // Second client: Submit same build (should get AlreadyBuilding)
     let mut client2 = client::RioClient::connect(&cluster_info.leader_address)
         .await
-        .expect("Failed to connect client 2");
+        .context("Failed to connect client 2")?;
 
     let build_info2 = evaluator::BuildInfo {
         drv_path: drv_path.clone().into(),
@@ -147,7 +147,7 @@ async fn test_already_building_response() {
     let mut stream2 = client2
         .submit_build(build_info2, &cluster_info)
         .await
-        .expect("Client 2 failed to submit build");
+        .context("Client 2 failed to submit build")?;
 
     // Client 2 should receive catch-up logs
     let mut client2_logs = 0;
@@ -163,7 +163,7 @@ async fn test_already_building_response() {
                 break;
             }
             Some(build_update::Update::Failed(_)) => {
-                panic!("Build failed unexpectedly");
+                anyhow::bail!("Build failed unexpectedly");
             }
             _ => {}
         }
@@ -182,14 +182,16 @@ async fn test_already_building_response() {
     assert!(client2_completed, "Client 2 should receive completion");
 
     println!("✓ AlreadyBuilding test passed: Client 2 successfully joined in-progress build");
+
+    Ok(())
 }
 
 /// Test that AlreadyCompleted response correctly fetches from cache
 #[tokio::test]
-async fn test_already_completed_response() {
+async fn test_already_completed_response() -> anyhow::Result<()> {
     // Start agent
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let temp_path = Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -201,7 +203,7 @@ async fn test_already_completed_response() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     // Get actual bound address
     let agent_url = {
@@ -211,26 +213,26 @@ async fn test_already_completed_response() {
             .agents
             .get(&agent.id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Discover cluster
-    let seed_url = url::Url::parse(&agent_url).expect("Invalid URL");
+    let seed_url = url::Url::parse(&agent_url).context("Invalid URL")?;
     let cluster_info = cluster::discover_cluster(&[seed_url])
         .await
-        .expect("Failed to discover cluster");
+        .context("Failed to discover cluster")?;
 
     // Create unique derivation
     let (drv_path, drv_nar) = create_unique_derivation()
         .await
-        .expect("Failed to create derivation");
+        .context("Failed to create derivation")?;
 
     // First client: Submit and complete build
     let mut client1 = client::RioClient::connect(&cluster_info.leader_address)
         .await
-        .expect("Failed to connect client 1");
+        .context("Failed to connect client 1")?;
 
     let build_info1 = evaluator::BuildInfo {
         drv_path: drv_path.clone().into(),
@@ -244,7 +246,7 @@ async fn test_already_completed_response() {
     let mut stream1 = client1
         .submit_build(build_info1, &cluster_info)
         .await
-        .expect("Client 1 failed to submit build");
+        .context("Client 1 failed to submit build")?;
 
     // Wait for build to complete
     let mut client1_completed = false;
@@ -264,7 +266,7 @@ async fn test_already_completed_response() {
     // Second client: Submit same build (should get AlreadyCompleted)
     let mut client2 = client::RioClient::connect(&cluster_info.leader_address)
         .await
-        .expect("Failed to connect client 2");
+        .context("Failed to connect client 2")?;
 
     let build_info2 = evaluator::BuildInfo {
         drv_path: drv_path.clone().into(),
@@ -278,7 +280,7 @@ async fn test_already_completed_response() {
     let mut stream2 = client2
         .submit_build(build_info2, &cluster_info)
         .await
-        .expect("Client 2 failed to get cached build");
+        .context("Client 2 failed to get cached build")?;
 
     // Client 2 should receive outputs from cache
     let mut client2_outputs = false;
@@ -294,7 +296,7 @@ async fn test_already_completed_response() {
                 break;
             }
             Some(build_update::Update::Failed(_)) => {
-                panic!("Cached build should not fail");
+                anyhow::bail!("Cached build should not fail");
             }
             _ => {}
         }
@@ -312,14 +314,16 @@ async fn test_already_completed_response() {
     assert!(client2_completed, "Client 2 should receive completion");
 
     println!("✓ AlreadyCompleted test passed: Client 2 successfully fetched from cache");
+
+    Ok(())
 }
 
 /// Test concurrent subscribers to the same build (both get all updates)
 #[tokio::test]
-async fn test_concurrent_subscribers_same_build() {
+async fn test_concurrent_subscribers_same_build() -> anyhow::Result<()> {
     // Start agent
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let temp_path = Utf8Path::from_path(temp_dir.path()).context("Invalid UTF-8 path")?;
 
     let listen_addr = "127.0.0.1:0".to_string();
 
@@ -331,7 +335,7 @@ async fn test_concurrent_subscribers_same_build() {
         Some(Duration::from_secs(3)),
     )
     .await
-    .expect("Failed to bootstrap agent");
+    .context("Failed to bootstrap agent")?;
 
     // Get actual bound address
     let agent_url = {
@@ -341,26 +345,26 @@ async fn test_concurrent_subscribers_same_build() {
             .agents
             .get(&agent.id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("Agent should be in cluster state")?
     };
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Discover cluster
-    let seed_url = url::Url::parse(&agent_url).expect("Invalid URL");
+    let seed_url = url::Url::parse(&agent_url).context("Invalid URL")?;
     let cluster_info = cluster::discover_cluster(&[seed_url])
         .await
-        .expect("Failed to discover cluster");
+        .context("Failed to discover cluster")?;
 
     // Create unique derivation
     let (drv_path, drv_nar) = create_unique_derivation()
         .await
-        .expect("Failed to create derivation");
+        .context("Failed to create derivation")?;
 
     // Client 1: Submit build
     let mut client1 = client::RioClient::connect(&cluster_info.leader_address)
         .await
-        .expect("Failed to connect client 1");
+        .context("Failed to connect client 1")?;
 
     let build_info1 = evaluator::BuildInfo {
         drv_path: drv_path.clone().into(),
@@ -374,12 +378,12 @@ async fn test_concurrent_subscribers_same_build() {
     let stream1 = client1
         .submit_build(build_info1, &cluster_info)
         .await
-        .expect("Client 1 failed to submit");
+        .context("Client 1 failed to submit")?;
 
     // Client 2: Submit same build concurrently (should get AlreadyBuilding)
     let mut client2 = client::RioClient::connect(&cluster_info.leader_address)
         .await
-        .expect("Failed to connect client 2");
+        .context("Failed to connect client 2")?;
 
     let build_info2 = evaluator::BuildInfo {
         drv_path: drv_path.clone().into(),
@@ -393,7 +397,7 @@ async fn test_concurrent_subscribers_same_build() {
     let stream2 = client2
         .submit_build(build_info2, &cluster_info)
         .await
-        .expect("Client 2 failed to subscribe to existing build");
+        .context("Client 2 failed to subscribe to existing build")?;
 
     // Spawn tasks to consume both streams concurrently
     let task1 = tokio::spawn(async move {
@@ -411,13 +415,13 @@ async fn test_concurrent_subscribers_same_build() {
                     break;
                 }
                 Some(build_update::Update::Failed(_)) => {
-                    panic!("Build failed");
+                    return Err(anyhow::anyhow!("Build failed"));
                 }
                 _ => {}
             }
         }
 
-        (logs, outputs, completed)
+        Ok((logs, outputs, completed))
     });
 
     let task2 = tokio::spawn(async move {
@@ -435,20 +439,20 @@ async fn test_concurrent_subscribers_same_build() {
                     break;
                 }
                 Some(build_update::Update::Failed(_)) => {
-                    panic!("Build failed");
+                    return Err(anyhow::anyhow!("Build failed"));
                 }
                 _ => {}
             }
         }
 
-        (logs, outputs, completed)
+        Ok((logs, outputs, completed))
     });
 
     // Wait for both to complete
     let (client1_logs, client1_outputs, client1_completed) =
-        task1.await.expect("Client 1 task panicked");
+        task1.await.context("Client 1 task panicked")??;
     let (client2_logs, client2_outputs, client2_completed) =
-        task2.await.expect("Client 2 task panicked");
+        task2.await.context("Client 2 task panicked")??;
 
     println!(
         "Client 1: logs={}, outputs={}, completed={}",
@@ -475,4 +479,6 @@ async fn test_concurrent_subscribers_same_build() {
     );
 
     println!("✓ Concurrent subscribers test passed: Both clients received complete build");
+
+    Ok(())
 }

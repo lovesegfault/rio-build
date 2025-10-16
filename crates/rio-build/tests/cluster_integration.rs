@@ -57,10 +57,13 @@ runCommandNoCC "rio-phase2-test-{}" {{}} ''
 
 #[tokio::test]
 #[ignore = "Integration test - requires nix commands. Run with: cargo test --ignored"]
-async fn test_phase2_single_node_cluster_end_to_end() {
+async fn test_phase2_single_node_cluster_end_to_end() -> anyhow::Result<()> {
+    use anyhow::Context;
+
     // 1. Setup: Create agent with Raft cluster
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path =
+        Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
     // Use port 0 for dynamic allocation
     let listen_addr = "127.0.0.1:0".to_string();
@@ -74,8 +77,7 @@ async fn test_phase2_single_node_cluster_end_to_end() {
         Some(Duration::from_millis(500)), // Fast check
         Some(Duration::from_secs(3)),     // Fast timeout
     )
-    .await
-    .expect("Failed to bootstrap agent");
+    .await?;
 
     let agent_id = agent.id;
 
@@ -87,7 +89,7 @@ async fn test_phase2_single_node_cluster_end_to_end() {
             .agents
             .get(&agent_id)
             .map(|a| a.address.to_string())
-            .expect("Agent should be in cluster state")
+            .context("agent should be in cluster state")?
     };
 
     println!("Agent bound to: {}", agent_url);
@@ -98,10 +100,8 @@ async fn test_phase2_single_node_cluster_end_to_end() {
 
     // 2. CLI discovers cluster
     println!("Discovering cluster from seed: {}", agent_url);
-    let seed_url = url::Url::parse(&agent_url).expect("Invalid URL");
-    let cluster_info = cluster::discover_cluster(&[seed_url])
-        .await
-        .expect("Failed to discover cluster");
+    let seed_url = url::Url::parse(&agent_url)?;
+    let cluster_info = cluster::discover_cluster(&[seed_url]).await?;
 
     println!("Cluster discovered:");
     println!("  Leader ID: {}", cluster_info.leader_id);
@@ -125,9 +125,7 @@ async fn test_phase2_single_node_cluster_end_to_end() {
 
     // 4. Create unique derivation (not cached)
     println!("Creating unique derivation...");
-    let (drv_path, drv_nar_bytes) = create_unique_derivation()
-        .await
-        .expect("Failed to create unique derivation");
+    let (drv_path, drv_nar_bytes) = create_unique_derivation().await?;
 
     println!("Derivation: {}", drv_path);
 
@@ -142,25 +140,14 @@ async fn test_phase2_single_node_cluster_end_to_end() {
 
     // 5. Connect to leader and submit build
     println!("Connecting to leader at: {}", cluster_info.leader_address);
-    let mut client = rio_build::client::RioClient::connect(&cluster_info.leader_address)
-        .await
-        .expect("Failed to connect to leader");
+    let mut client = rio_build::client::RioClient::connect(&cluster_info.leader_address).await?;
 
     println!("Submitting build...");
-    let stream = client
-        .submit_build(build_info, &cluster_info)
-        .await
-        .expect("Failed to submit build");
+    let stream = client.submit_build(build_info, &cluster_info).await?;
 
     // 6. Handle build stream and verify completion
     println!("Waiting for build to complete...");
-    let result = rio_build::output_handler::handle_build_stream(stream).await;
-
-    assert!(
-        result.is_ok(),
-        "Build should complete successfully: {:?}",
-        result.err()
-    );
+    rio_build::output_handler::handle_build_stream(stream).await?;
 
     println!("✓ Phase 2 integration test passed!");
     println!("  - Agent bootstrapped and became leader");
@@ -169,4 +156,5 @@ async fn test_phase2_single_node_cluster_end_to_end() {
 
     // Cleanup
     // Server runs in background and will be cleaned up when test ends
+    Ok(())
 }

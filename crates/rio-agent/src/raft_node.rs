@@ -139,28 +139,28 @@ pub async fn join_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[tokio::test]
-    async fn test_bootstrap_single_node() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    async fn test_bootstrap_single_node() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
         let node_id = uuid::Uuid::new_v4();
         let rpc_addr = "localhost:50051".to_string();
 
         // Create and initialize Raft
-        let (raft, _sm_store) = create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path)
-            .await
-            .expect("Failed to create Raft");
+        let (raft, _sm_store) =
+            create_uninitialized_raft(node_id, rpc_addr.clone(), temp_path).await?;
 
-        initialize_single_node_leader(&raft, node_id, rpc_addr)
-            .await
-            .expect("Failed to initialize");
+        initialize_single_node_leader(&raft, node_id, rpc_addr).await?;
 
         // Verify it's initialized as leader
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let metrics = raft.metrics().borrow().clone();
         assert_eq!(metrics.current_leader, Some(node_id));
+        Ok(())
     }
 }
