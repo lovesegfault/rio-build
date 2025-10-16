@@ -460,6 +460,68 @@ impl RioAgent for RioAgentService {
             message: format!("Successfully joined cluster as {}", joining_id),
         }))
     }
+
+    /// Report build result (internal - called by non-leader agents)
+    ///
+    /// Non-leader agents call this on the leader to propose BuildCompleted/BuildFailed.
+    /// Any agent can receive this call, but only the leader can commit to Raft.
+    async fn report_build_result(
+        &self,
+        request: Request<ReportBuildResultRequest>,
+    ) -> Result<Response<ReportBuildResultResponse>, Status> {
+        use rio_common::proto::report_build_result_request::Result as BuildResult;
+
+        let req = request.into_inner();
+        let derivation_path: rio_common::DerivationPath = req.derivation_path.clone().into();
+
+        tracing::info!("Received build result report for {}", req.derivation_path);
+
+        // Build the appropriate Raft command based on result
+        let cmd = match req.result {
+            Some(BuildResult::Completed(completed)) => {
+                let output_paths: Vec<rio_common::DerivationPath> =
+                    completed.output_paths.iter().map(|p| p.into()).collect();
+
+                crate::state_machine::RaftCommand::BuildCompleted {
+                    derivation_path,
+                    output_paths,
+                }
+            }
+            Some(BuildResult::Failed(failed)) => crate::state_machine::RaftCommand::BuildFailed {
+                derivation_path,
+                error: failed.error,
+            },
+            None => {
+                return Err(Status::invalid_argument("No result in request"));
+            }
+        };
+
+        // Propose to Raft (this agent might be leader or follower)
+        // If follower, client_write will fail with ForwardToLeader error
+        let raft = &self.agent.raft;
+        match raft.client_write(cmd).await {
+            Ok(_) => {
+                tracing::info!("Build result proposal committed to Raft");
+                Ok(Response::new(ReportBuildResultResponse {
+                    success: true,
+                    message: "Build result committed".to_string(),
+                }))
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                // Check if we need to forward to leader
+                if error_msg.contains("has to forward request to") {
+                    // This agent is not the leader, caller should retry with leader
+                    Err(Status::failed_precondition(format!(
+                        "Not leader, forward to leader: {}",
+                        error_msg
+                    )))
+                } else {
+                    Err(Status::internal(format!("Raft proposal failed: {}", e)))
+                }
+            }
+        }
+    }
 }
 
 /// Start the gRPC server

@@ -107,6 +107,13 @@ impl RioAgent for MockRioAgent {
     ) -> Result<Response<JoinClusterResponse>, Status> {
         Err(Status::unimplemented("Mock agent"))
     }
+
+    async fn report_build_result(
+        &self,
+        _request: Request<ReportBuildResultRequest>,
+    ) -> Result<Response<ReportBuildResultResponse>, Status> {
+        Err(Status::unimplemented("Mock agent"))
+    }
 }
 
 /// Start a mock agent server on a random port

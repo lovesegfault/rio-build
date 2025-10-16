@@ -5,7 +5,11 @@ use backon::{ExponentialBuilder, Retryable};
 use camino::Utf8PathBuf;
 use openraft::Raft;
 use rio_common::DerivationPath;
-use rio_common::proto::{BuildCompleted, BuildFailed, BuildUpdate, LogLine, build_update};
+use rio_common::proto::{
+    BuildCompleted, BuildCompletedReport, BuildFailed, BuildFailedReport, BuildUpdate, LogLine,
+    ReportBuildResultRequest, build_update, report_build_result_request,
+    rio_agent_client::RioAgentClient,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -15,7 +19,7 @@ use tokio::sync::Mutex;
 use crate::agent::BuildJob;
 use crate::nar_exporter;
 use crate::state_machine::RaftCommand;
-use crate::storage::TypeConfig;
+use crate::storage::{StateMachineStore, TypeConfig};
 
 /// Start a build
 ///
@@ -23,6 +27,7 @@ use crate::storage::TypeConfig;
 pub async fn start_build(
     current_build: &Arc<Mutex<Option<BuildJob>>>,
     raft: Arc<Raft<TypeConfig>>,
+    state_machine: StateMachineStore,
     drv_path: String,
     drv_nar_bytes: Vec<u8>,
 ) -> Result<()> {
@@ -67,11 +72,18 @@ pub async fn start_build(
     let current_clone = current_build.clone();
     let drv_path_clone = actual_drv_path.clone();
     let raft_clone = raft.clone();
+    let sm_clone = state_machine.clone();
 
     tokio::spawn(async move {
-        if let Err(e) =
-            handle_build_completion(current_clone, raft_clone, drv_path_clone, child, start_time)
-                .await
+        if let Err(e) = handle_build_completion(
+            current_clone,
+            raft_clone,
+            sm_clone,
+            drv_path_clone,
+            child,
+            start_time,
+        )
+        .await
         {
             tracing::error!("Build completion error: {}", e);
         }
@@ -123,10 +135,105 @@ async fn import_derivation_nar(nar_bytes: &[u8]) -> Result<Utf8PathBuf> {
     Ok(Utf8PathBuf::from(store_path))
 }
 
+/// Report build result to leader (via RPC if not leader, or direct Raft if leader)
+///
+/// Non-leader agents call the leader via ReportBuildResult RPC.
+/// Leader agents propose directly to their local Raft.
+async fn report_build_result_to_leader(
+    raft: &Arc<Raft<TypeConfig>>,
+    state_machine: &StateMachineStore,
+    request: ReportBuildResultRequest,
+) -> Result<()> {
+    // Try direct Raft proposal first (works if we're the leader)
+    let drv_path: DerivationPath = request.derivation_path.clone().into();
+
+    let cmd = match &request.result {
+        Some(report_build_result_request::Result::Completed(c)) => {
+            let output_paths: Vec<DerivationPath> =
+                c.output_paths.iter().map(|p| p.into()).collect();
+            RaftCommand::BuildCompleted {
+                derivation_path: drv_path.clone(),
+                output_paths,
+            }
+        }
+        Some(report_build_result_request::Result::Failed(f)) => RaftCommand::BuildFailed {
+            derivation_path: drv_path.clone(),
+            error: f.error.clone(),
+        },
+        None => anyhow::bail!("No result in ReportBuildResultRequest"),
+    };
+
+    // Try to propose directly (with retry)
+    let raft_clone = raft.clone();
+    let cmd_clone = cmd.clone();
+    let propose = || async { raft_clone.client_write(cmd_clone.clone()).await };
+
+    let retry_policy = ExponentialBuilder::default()
+        .with_max_times(3)
+        .with_max_delay(std::time::Duration::from_millis(100));
+
+    match propose.retry(retry_policy).await {
+        Ok(_) => {
+            tracing::info!("Build result committed to Raft (this agent is leader)");
+            return Ok(());
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            if !error_msg.contains("has to forward request to") {
+                // Real Raft error, not a forwarding issue
+                anyhow::bail!("Raft proposal failed: {}", e);
+            }
+            // Fall through to forwarding logic
+            tracing::debug!("Not leader, forwarding build result to leader via RPC");
+        }
+    }
+
+    // We're not the leader - find leader and call via RPC
+    let (leader_id, leader_addr) = {
+        let metrics = raft.metrics().borrow().clone();
+        let leader_id = metrics
+            .current_leader
+            .ok_or_else(|| anyhow::anyhow!("No current leader known"))?;
+
+        let state = state_machine.data.read();
+        let leader_agent =
+            state.cluster.agents.get(&leader_id).ok_or_else(|| {
+                anyhow::anyhow!("Leader {} not found in cluster state", leader_id)
+            })?;
+
+        (leader_id, leader_agent.address.clone())
+    };
+
+    tracing::info!(
+        "Forwarding build result to leader {} at {}",
+        leader_id,
+        leader_addr
+    );
+
+    // Connect to leader and call ReportBuildResult
+    let mut leader_client = RioAgentClient::connect(leader_addr.to_string())
+        .await
+        .context("Failed to connect to leader")?;
+
+    let response = leader_client
+        .report_build_result(request)
+        .await
+        .context("Failed to report build result to leader")?
+        .into_inner();
+
+    if !response.success {
+        anyhow::bail!("Leader rejected build result: {}", response.message);
+    }
+
+    tracing::info!("Build result forwarded to leader and committed");
+    Ok(())
+}
+
 /// Handle build completion (runs in background task, owns the process)
 async fn handle_build_completion(
     current_build: std::sync::Arc<tokio::sync::Mutex<Option<BuildJob>>>,
     raft: Arc<Raft<TypeConfig>>,
+    state_machine: StateMachineStore,
     drv_path: DerivationPath,
     mut process: tokio::process::Child,
     start_time: Instant,
@@ -199,37 +306,19 @@ async fn handle_build_completion(
 
         nar_exporter::stream_outputs(&output_paths, drv_path.clone(), subscribers.clone()).await?;
 
-        // Propose BuildCompleted to Raft (Phase 3.5)
-        // Use retry with exponential backoff for transient failures
-        let output_paths_for_raft: Vec<DerivationPath> = output_paths
-            .iter()
-            .map(|p| Utf8PathBuf::from(p.as_str()))
-            .collect();
-
-        let command = RaftCommand::BuildCompleted {
-            derivation_path: drv_path.clone(),
-            output_paths: output_paths_for_raft,
+        // Report BuildCompleted to leader (forwards via RPC if not leader)
+        let report_request = ReportBuildResultRequest {
+            derivation_path: drv_path.as_str().to_string(),
+            result: Some(report_build_result_request::Result::Completed(
+                BuildCompletedReport {
+                    output_paths: output_paths.clone(),
+                },
+            )),
         };
 
-        let raft_for_retry = raft.clone();
-        let cmd_clone = command.clone();
-        let propose = || async { raft_for_retry.client_write(cmd_clone.clone()).await };
-
-        let retry_policy = ExponentialBuilder::default()
-            .with_max_times(3)
-            .with_max_delay(std::time::Duration::from_millis(100));
-
-        match propose.retry(retry_policy).await {
-            Ok(_) => {
-                tracing::info!("BuildCompleted proposal committed to Raft");
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to propose BuildCompleted to Raft after 3 retries: {}",
-                    e
-                );
-                // Continue anyway - build succeeded, just Raft coordination failed
-            }
+        if let Err(e) = report_build_result_to_leader(&raft, &state_machine, report_request).await {
+            tracing::error!("Failed to report BuildCompleted to leader: {}", e);
+            // Continue anyway - build succeeded, just Raft coordination failed
         }
 
         // Send completion message
@@ -249,32 +338,19 @@ async fn handle_build_completion(
 
         let error_msg = format!("nix-build exited with code: {:?}", exit_status.code());
 
-        // Propose BuildFailed to Raft (Phase 3.5)
-        // Use retry with exponential backoff for transient failures
-        let command = RaftCommand::BuildFailed {
-            derivation_path: drv_path.clone(),
-            error: error_msg.clone(),
+        // Report BuildFailed to leader (forwards via RPC if not leader)
+        let report_request = ReportBuildResultRequest {
+            derivation_path: drv_path.as_str().to_string(),
+            result: Some(report_build_result_request::Result::Failed(
+                BuildFailedReport {
+                    error: error_msg.clone(),
+                },
+            )),
         };
 
-        let raft_for_retry = raft.clone();
-        let cmd_clone = command.clone();
-        let propose = || async { raft_for_retry.client_write(cmd_clone.clone()).await };
-
-        let retry_policy = ExponentialBuilder::default()
-            .with_max_times(3)
-            .with_max_delay(std::time::Duration::from_millis(100));
-
-        match propose.retry(retry_policy).await {
-            Ok(_) => {
-                tracing::info!("BuildFailed proposal committed to Raft");
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to propose BuildFailed to Raft after 3 retries: {}",
-                    e
-                );
-                // Continue anyway - build failed, just Raft coordination failed
-            }
+        if let Err(e) = report_build_result_to_leader(&raft, &state_machine, report_request).await {
+            tracing::error!("Failed to report BuildFailed to leader: {}", e);
+            // Continue anyway - build failed, just Raft coordination failed
         }
 
         // Send failure message
