@@ -52,7 +52,7 @@ runCommandNoCC "rio-dedup-test-{}" {{}} ''
 }
 
 /// Test that AlreadyBuilding response correctly subscribes to existing build
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_already_building_response() -> anyhow::Result<()> {
     // Start agent
     let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
@@ -187,7 +187,7 @@ async fn test_already_building_response() -> anyhow::Result<()> {
 }
 
 /// Test that AlreadyCompleted response correctly fetches from cache
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_already_completed_response() -> anyhow::Result<()> {
     // Start agent
     let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
@@ -319,7 +319,7 @@ async fn test_already_completed_response() -> anyhow::Result<()> {
 }
 
 /// Test concurrent subscribers to the same build (both get all updates)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_subscribers_same_build() -> anyhow::Result<()> {
     // Start agent
     let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;

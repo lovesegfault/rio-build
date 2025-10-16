@@ -56,7 +56,7 @@ runCommandNoCC "rio-test-{}" {{}} ''
     Ok((drv_path, export_output.stdout))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_end_to_end_build_flow() -> anyhow::Result<()> {
     // Start the actual rio-agent server with Raft
     let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
@@ -202,7 +202,7 @@ async fn test_end_to_end_build_flow() -> anyhow::Result<()> {
 }
 
 /// Test that we can export and import a derivation via NAR
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_derivation_nar_roundtrip() -> anyhow::Result<()> {
     let output = Command::new("nix-instantiate")
         .arg("../../tests/fixtures/trivial.nix")
@@ -261,7 +261,7 @@ async fn test_derivation_nar_roundtrip() -> anyhow::Result<()> {
 }
 
 /// Test Phase 3.1: Queue build via Raft (assignment only, no execution)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_queue_build_via_raft() -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -359,7 +359,7 @@ async fn test_queue_build_via_raft() -> anyhow::Result<()> {
 }
 
 /// Test heartbeat lifecycle with bootstrapped Raft cluster
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_heartbeat_lifecycle() -> anyhow::Result<()> {
     use chrono::Utc;
     use std::time::Duration;
@@ -411,7 +411,7 @@ async fn test_heartbeat_lifecycle() -> anyhow::Result<()> {
 }
 
 /// Test that late joiners receive catch-up logs from history
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_late_joiner_receives_catch_up_logs() -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -554,7 +554,7 @@ async fn test_late_joiner_receives_catch_up_logs() -> anyhow::Result<()> {
 }
 
 /// Test that build completion updates Raft state correctly
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_build_completion_updates_raft_state() -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -756,7 +756,7 @@ async fn test_build_completion_updates_raft_state() -> anyhow::Result<()> {
 }
 
 /// Test GetCompletedBuild RPC serves cached outputs
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_get_completed_build_serves_cache() -> anyhow::Result<()> {
     use rio_common::proto::GetCompletedBuildRequest;
     use std::time::Duration;
