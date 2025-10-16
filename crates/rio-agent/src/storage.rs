@@ -50,7 +50,10 @@ fn id_to_bin(id: u64) -> Vec<u8> {
 
 /// Convert bytes back to log index
 fn bin_to_id(buf: &[u8]) -> u64 {
-    u64::from_be_bytes(buf.try_into().unwrap())
+    u64::from_be_bytes(
+        buf.try_into()
+            .expect("log index must be 8 bytes (created by id_to_bin)"),
+    )
 }
 
 /// Raft log storage backed by RocksDB
@@ -61,11 +64,15 @@ pub struct LogStore {
 
 impl LogStore {
     fn store(&self) -> &rocksdb::ColumnFamily {
-        self.db.cf_handle(CF_STORE).unwrap()
+        self.db
+            .cf_handle(CF_STORE)
+            .expect("CF_STORE column family must exist (created at DB init)")
     }
 
     fn logs(&self) -> &rocksdb::ColumnFamily {
-        self.db.cf_handle(CF_LOGS).unwrap()
+        self.db
+            .cf_handle(CF_LOGS)
+            .expect("CF_LOGS column family must exist (created at DB init)")
     }
 
     fn flush(
@@ -96,7 +103,9 @@ impl LogStore {
             .put_cf(
                 self.store(),
                 b"last_purged_log_id",
-                serde_json::to_vec(&log_id).unwrap().as_slice(),
+                serde_json::to_vec(&log_id)
+                    .expect("LogId serialization cannot fail")
+                    .as_slice(),
             )
             .map_err(|e| {
                 Box::new(StorageError::IO {
@@ -113,7 +122,7 @@ impl LogStore {
         &self,
         committed: &Option<LogId<NodeId>>,
     ) -> Result<(), Box<StorageError<NodeId>>> {
-        let json = serde_json::to_vec(committed).unwrap();
+        let json = serde_json::to_vec(committed).expect("Option<LogId> serialization cannot fail");
         self.db
             .put_cf(self.store(), b"committed", json)
             .map_err(|e| {
@@ -140,7 +149,11 @@ impl LogStore {
 
     fn set_vote_(&self, vote: &Vote<NodeId>) -> Result<(), Box<StorageError<NodeId>>> {
         self.db
-            .put_cf(self.store(), b"vote", serde_json::to_vec(vote).unwrap())
+            .put_cf(
+                self.store(),
+                b"vote",
+                serde_json::to_vec(vote).expect("Vote serialization cannot fail"),
+            )
             .map_err(|e| {
                 Box::new(StorageError::IO {
                     source: StorageIOError::write_vote(&e),
@@ -181,7 +194,7 @@ impl RaftLogReader<TypeConfig> for LogStore {
                 rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
             )
             .map(|res| {
-                let (id, val) = res.unwrap();
+                let (id, val) = res.expect("RocksDB iterator should not fail");
                 let entry: Result<Entry<TypeConfig>, StorageError<NodeId>> =
                     serde_json::from_slice(&val).map_err(|e| StorageError::IO {
                         source: StorageIOError::read_logs(&e),
@@ -205,7 +218,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             .iterator_cf(self.logs(), rocksdb::IteratorMode::End)
             .next()
             .and_then(|res| {
-                let (_, ent) = res.unwrap();
+                let (_, ent) = res.expect("RocksDB iterator should not fail");
                 Some(
                     serde_json::from_slice::<Entry<TypeConfig>>(&ent)
                         .ok()?
@@ -342,7 +355,9 @@ impl StateMachineStoreInner {
     }
 
     fn store(&self) -> &rocksdb::ColumnFamily {
-        self.db.cf_handle(CF_STORE).unwrap()
+        self.db
+            .cf_handle(CF_STORE)
+            .expect("CF_STORE column family must exist (created at DB init)")
     }
 
     fn flush(
@@ -373,7 +388,9 @@ impl StateMachineStoreInner {
             .put_cf(
                 self.store(),
                 b"snapshot",
-                serde_json::to_vec(&snap).unwrap().as_slice(),
+                serde_json::to_vec(&snap)
+                    .expect("StoredSnapshot serialization cannot fail")
+                    .as_slice(),
             )
             .map_err(|e| {
                 Box::new(StorageError::IO {
@@ -551,56 +568,52 @@ pub async fn new_storage(data_dir: &Utf8Path) -> Result<(LogStore, StateMachineS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[tokio::test]
-    async fn test_storage_creation() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    async fn test_storage_creation() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
-        let result = new_storage(temp_path).await;
-        assert!(result.is_ok());
+        let _result = new_storage(temp_path).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_vote_persistence() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    async fn test_vote_persistence() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
-        let (mut log_store, _sm_store) = new_storage(temp_path)
-            .await
-            .expect("Failed to create storage");
+        let (mut log_store, _sm_store) = new_storage(temp_path).await?;
 
         // Save a vote
         let node_id = uuid::Uuid::new_v4();
         let vote = Vote::new(5, node_id);
 
-        log_store
-            .save_vote(&vote)
-            .await
-            .expect("Failed to save vote");
+        log_store.save_vote(&vote).await?;
 
         // Read it back
-        let read_vote = log_store.read_vote().await.expect("Failed to read vote");
+        let read_vote = log_store.read_vote().await?;
         assert_eq!(read_vote, Some(vote));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_log_state_empty() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let temp_path = Utf8Path::from_path(temp_dir.path()).expect("Invalid UTF-8 path");
+    async fn test_get_log_state_empty() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path =
+            Utf8Path::from_path(temp_dir.path()).context("temp dir path should be valid UTF-8")?;
 
-        let (mut log_store, _sm_store) = new_storage(temp_path)
-            .await
-            .expect("Failed to create storage");
+        let (mut log_store, _sm_store) = new_storage(temp_path).await?;
 
         // Get log state on empty database
-        let log_state = log_store
-            .get_log_state()
-            .await
-            .expect("Failed to get log state");
+        let log_state = log_store.get_log_state().await?;
 
         assert_eq!(log_state.last_log_id, None);
         assert_eq!(log_state.last_purged_log_id, None);
+        Ok(())
     }
 
     // Note: test_log_append_and_read requires LogFlushed which is pub(crate) to openraft

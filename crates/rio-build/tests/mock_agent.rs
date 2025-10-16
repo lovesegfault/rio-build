@@ -121,13 +121,10 @@ impl RioAgent for MockRioAgent {
 /// Returns the server task handle and the URL to connect to
 pub async fn start_mock_server(
     mock: MockRioAgent,
-) -> Result<
-    (
-        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
-        String,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    String,
+)> {
     // Use port 0 to get a random available port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

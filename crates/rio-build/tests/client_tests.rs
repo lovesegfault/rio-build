@@ -2,6 +2,7 @@
 
 mod mock_agent;
 
+use anyhow::Context;
 use camino::Utf8PathBuf;
 use rio_build::client::RioClient;
 use rio_build::cluster::ClusterInfo;
@@ -10,7 +11,7 @@ use rio_common::proto::{AgentInfo, BuildCompleted, BuildUpdate, LogLine, build_u
 use std::collections::HashMap;
 
 #[tokio::test]
-async fn test_client_submit_and_subscribe() {
+async fn test_client_submit_and_subscribe() -> anyhow::Result<()> {
     // Create mock agent with test response
     let drv_path = "/nix/store/test123-hello.drv";
     let mock = mock_agent::MockRioAgent::new_assigned("test-agent", drv_path).with_updates(vec![
@@ -31,14 +32,10 @@ async fn test_client_submit_and_subscribe() {
     ]);
 
     // Start mock server
-    let (_server, url) = mock_agent::start_mock_server(mock)
-        .await
-        .expect("Failed to start mock server");
+    let (_server, url) = mock_agent::start_mock_server(mock).await?;
 
     // Connect client
-    let mut client = RioClient::connect(&url)
-        .await
-        .expect("Failed to connect to mock agent");
+    let mut client = RioClient::connect(&url).await?;
 
     // Create test build info
     let build_info = BuildInfo {
@@ -71,16 +68,13 @@ async fn test_client_submit_and_subscribe() {
     };
 
     // Submit build
-    let mut stream = client
-        .submit_build(build_info, &cluster_info)
-        .await
-        .expect("Failed to submit build");
+    let mut stream = client.submit_build(build_info, &cluster_info).await?;
 
     // Verify we get updates
     let mut got_log = false;
     let mut got_completion = false;
 
-    while let Some(update) = stream.message().await.expect("Stream error") {
+    while let Some(update) = stream.message().await.context("stream should not error")? {
         match update.update {
             Some(build_update::Update::Log(_)) => {
                 got_log = true;
@@ -94,4 +88,5 @@ async fn test_client_submit_and_subscribe() {
 
     assert!(got_log, "Should receive log message");
     assert!(got_completion, "Should receive completion message");
+    Ok(())
 }

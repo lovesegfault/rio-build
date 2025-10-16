@@ -119,14 +119,59 @@ dependency-name = { workspace = true }
 
 ### Error Handling
 
-**Use `.with_context()` for file operations** to include file paths in error messages:
+**Never use `.unwrap()` in production code.** Use `.expect()` only when the invariant is clear and documented.
+
+**Use `.with_context()` for operations that can fail** to provide helpful error messages:
 ```rust
+use anyhow::Context;
 use camino::Utf8Path;  // Always use UTF-8 paths
 
+// File operations
 tokio::fs::read(path)
     .await
     .with_context(|| format!("Failed to read file: {}", path))?;
+
+// Option types in production code
+let agent = state.agents.get(&agent_id)
+    .context("agent should exist in cluster state")?;
 ```
+
+**Use `.expect()` with clear messages for invariants** (when failure indicates a bug):
+```rust
+// Column family handles (created at DB initialization)
+let store = self.db.cf_handle(CF_STORE)
+    .expect("CF_STORE column family must exist (created at DB init)");
+
+// Protobuf required fields (protocol violations)
+let vote = pb.vote.as_ref()
+    .expect("protobuf Vote must have leader_id field");
+
+// Serialization that cannot fail
+let json = serde_json::to_vec(&data)
+    .expect("RaftCommand serialization cannot fail (all types are Serialize)");
+```
+
+**Test functions should return `anyhow::Result<()>`**:
+```rust
+#[test]
+fn test_example() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let temp_dir = tempfile::tempdir()?;
+    let path = Utf8Path::from_path(temp_dir.path())
+        .context("temp dir path should be valid UTF-8")?;
+
+    let result = some_operation(path).await?;
+    assert_eq!(result, expected);
+    Ok(())
+}
+```
+
+**Benefits of this approach:**
+- Production code: Clear error messages when invariants are violated
+- Test code: Automatic error propagation with `?`, better failure diagnostics
+- No silent failures from `.unwrap()`
+- Better debugging with `.context()` providing error chains
 
 ### Observability
 
