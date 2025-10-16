@@ -148,6 +148,9 @@ async fn report_build_result_to_leader(
     let drv_path: DerivationPath = request.derivation_path.clone().into();
 
     let cmd = match &request.result {
+        Some(report_build_result_request::Result::Started(_)) => RaftCommand::BuildStarted {
+            derivation_path: drv_path.clone(),
+        },
         Some(report_build_result_request::Result::Completed(c)) => {
             let output_paths: Vec<DerivationPath> =
                 c.output_paths.iter().map(|p| p.into()).collect();
@@ -321,7 +324,7 @@ async fn handle_build_completion(
             // Continue anyway - build succeeded, just Raft coordination failed
         }
 
-        // Send completion message
+        // Send completion message (get fresh subscriber list in case new clients subscribed)
         let completion = BuildUpdate {
             derivation_path: drv_path.as_str().to_string(),
             update: Some(build_update::Update::Completed(BuildCompleted {
@@ -330,7 +333,15 @@ async fn handle_build_completion(
             })),
         };
 
-        for sub in &subscribers {
+        let current_subscribers = {
+            let current = current_build.lock().await;
+            current
+                .as_ref()
+                .map(|b| b.subscribers.clone())
+                .unwrap_or_default()
+        };
+
+        for sub in &current_subscribers {
             let _ = sub.send(Ok(completion.clone())).await;
         }
     } else {

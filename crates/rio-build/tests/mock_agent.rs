@@ -116,6 +116,13 @@ impl RioAgent for MockRioAgent {
     ) -> Result<Response<ReportBuildResultResponse>, Status> {
         Err(Status::unimplemented("Mock agent"))
     }
+
+    async fn claim_build(
+        &self,
+        _request: Request<ClaimBuildRequest>,
+    ) -> Result<Response<ClaimBuildResponse>, Status> {
+        Err(Status::unimplemented("Mock agent"))
+    }
 }
 
 /// Start a mock agent server on a random port
