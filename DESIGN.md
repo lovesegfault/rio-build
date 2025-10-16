@@ -77,7 +77,7 @@ struct BuildTracker {
 
 enum BuildStatus {
     Queued,    // Waiting for agent to claim
-    Claimed,   // Agent claimed, preparing to start
+    Claimed,   // Agent claimed (committed to build), may be busy with another build
     Building,  // Currently executing on agent
 }
 
@@ -316,17 +316,23 @@ Claiming model fixes this:
 
 **How agents decide when to claim builds:**
 
-Agents watch Raft state for queued builds and actively claim them based on their local state:
+Agents watch Raft state for queued builds and actively claim them. **Busy agents CAN claim builds** to preserve affinity - they'll start them when free:
 
 ```rust
 async fn build_coordinator_loop() {
     loop every 100ms {
-        // Skip if we're busy
-        if current_build.is_some() {
-            continue;
+        // If we're free, start any builds we've claimed
+        if current_build.is_none() {
+            for (drv_path, tracker) in builds_in_progress {
+                if tracker.status == Claimed && tracker.agent_id == us {
+                    start_build(drv_path);
+                    raft.propose(BuildStarted { drv_path });
+                    break;
+                }
+            }
         }
 
-        // Find queued builds we could claim
+        // Find queued builds we could claim (even if busy)
         for (drv_path, tracker) in builds_in_progress {
             if tracker.status != Queued {
                 continue;
@@ -373,7 +379,7 @@ async fn build_coordinator_loop() {
 }
 ```
 
-**Example claiming scenario:**
+**Example claiming scenario (affinity with busy agent):**
 ```
 Cluster state:
 - Agent A: Building foo.drv, has completed bar.drv recently
@@ -389,13 +395,20 @@ State machine creates suggestions:
 4. Ranked list: [A, B, C]
 
 Build claiming:
-1. Agent A (suggested, score=1): Claims immediately
-2. Agents B,C (suggested, score=0): Wait, don't claim (no affinity)
-3. After 2s timeout: B or C could claim if A is down
+1. Agent A (busy, but suggested with score=1): Claims immediately
+   - Build state: Claimed, agent_id: A, status: Claimed
+   - Agent A continues building foo.drv
+2. Agents B,C (suggested, score=0): Don't claim (no affinity)
+3. When foo.drv completes:
+   - Agent A sees baz.drv in Claimed state with agent_id=A
+   - Agent A starts baz.drv
+   - Proposes BuildStarted
+   - Status: Claimed → Building
 
 Result:
 - baz.drv builds on Agent A (optimal - bar.drv already in /nix/store)
 - Instant cache hit for bar.drv dependency
+- **Affinity preserved even though Agent A was busy!**
 ```
 
 **Build Deduplication:**

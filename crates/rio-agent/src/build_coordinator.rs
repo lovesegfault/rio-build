@@ -39,12 +39,75 @@ pub fn start_build_coordinator(
         loop {
             check_interval.tick().await;
 
-            // Skip if we're currently busy building something
-            if current_build.lock().await.is_some() {
-                continue;
+            // Check if we're currently busy
+            let is_busy = current_build.lock().await.is_some();
+
+            // If we're free, check for Claimed builds to start
+            if !is_busy {
+                let builds_to_start = {
+                    let cluster_state = sm_store.data.read();
+
+                    cluster_state
+                        .cluster
+                        .builds_in_progress
+                        .iter()
+                        .filter_map(|(drv_path, tracker)| {
+                            // Find builds claimed by us that are ready to start
+                            if tracker.status == BuildStatus::Claimed
+                                && tracker.agent_id == Some(agent_id)
+                            {
+                                Some(drv_path.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                // Start claimed builds
+                for drv_path in builds_to_start {
+                    tracing::info!("Starting claimed build {} (agent now free)", drv_path);
+
+                    // Get derivation NAR from Raft storage
+                    let drv_nar = {
+                        let cluster_state = &sm_store.data.read().cluster;
+                        cluster_state.pending_derivations.get(&drv_path).cloned()
+                    };
+
+                    if let Some(nar_bytes) = drv_nar {
+                        // Start the build
+                        if let Err(e) = builder::start_build(
+                            &current_build,
+                            raft.clone(),
+                            sm_store.clone(),
+                            drv_path.to_string(),
+                            nar_bytes,
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to start claimed build {}: {}", drv_path, e);
+                            // TODO: Propose BuildFailed to Raft
+                        } else {
+                            // Propose BuildStarted
+                            let start_cmd = RaftCommand::BuildStarted {
+                                derivation_path: drv_path.clone(),
+                            };
+                            if let Err(e) = raft.client_write(start_cmd).await {
+                                tracing::warn!(
+                                    "Failed to propose BuildStarted for {}: {}",
+                                    drv_path,
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    // Only start one build per iteration
+                    break;
+                }
             }
 
-            // Find queued builds that we could claim
+            // Find queued builds that we could claim (can claim even if busy for affinity)
             let claimable_builds = {
                 let claimed = claimed_builds.lock().await;
                 let cluster_state = sm_store.data.read();
