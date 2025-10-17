@@ -161,7 +161,7 @@ impl RioAgent for RioAgentService {
             // Send catch-up logs first (for late joiners)
             let catch_up_logs = build.get_catch_up_logs();
             tracing::info!(
-                "Sending {} catch-up log lines to late joiner",
+                "[PATH A] Build in current_build, sending {} catch-up logs and adding subscriber",
                 catch_up_logs.len()
             );
 
@@ -175,59 +175,130 @@ impl RioAgent for RioAgentService {
             build.subscribers.push(tx);
             drop(current); // Release lock
 
+            tracing::info!("[PATH A] Subscriber added successfully");
             return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
                 rx,
             )));
         }
         drop(current); // Release lock before querying state machine
 
-        // Not currently building on this agent - check Raft state
-        let state = self.agent.state_machine.data.read();
-        let cluster = &state.cluster;
+        tracing::debug!("[PATH B] Build not in current_build, checking Raft state");
 
-        // Convert string to DerivationPath for hashmap lookups
+        // Not currently building on this agent - check Raft state
         let drv_path_key: rio_common::DerivationPath = drv_path.clone().into();
 
-        // Check if build recently completed (serve from cache)
-        if let Some(completed) = cluster.completed_builds.get(&drv_path_key) {
-            tracing::info!(
-                "Build {} already completed on agent {}, client should use GetCompletedBuild",
-                drv_path,
-                completed.agent_id
-            );
-            return Err(Status::already_exists(format!(
-                "Build completed on agent {}, use GetCompletedBuild",
-                completed.agent_id
-            )));
+        // Check build status in Raft state (clone data before any async operations)
+        let (completed_info, in_progress_info) = {
+            let state = self.agent.state_machine.data.read();
+            let cluster = &state.cluster;
+            (
+                cluster.completed_builds.get(&drv_path_key).cloned(),
+                cluster.builds_in_progress.get(&drv_path_key).cloned(),
+            )
+        }; // Lock dropped here
+
+        // Handle completed builds
+        if let Some(completed) = completed_info {
+            if completed.agent_id == self.agent.id {
+                // Build completed on this agent - send completion message immediately
+                tracing::info!(
+                    "Build {} already completed, sending completion to late subscriber",
+                    drv_path
+                );
+
+                let completion = rio_common::proto::BuildUpdate {
+                    derivation_path: drv_path.clone(),
+                    update: Some(rio_common::proto::build_update::Update::Completed(
+                        rio_common::proto::BuildCompleted {
+                            output_paths: completed
+                                .output_paths
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect(),
+                            duration_ms: 0, // Duration not tracked in completed_builds
+                        },
+                    )),
+                };
+
+                if tx.send(Ok(completion)).await.is_err() {
+                    return Err(Status::internal("Failed to send completion"));
+                }
+
+                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                    rx,
+                )));
+            } else {
+                // Build completed on different agent
+                tracing::info!(
+                    "Build {} completed on agent {}, not this agent",
+                    drv_path,
+                    completed.agent_id
+                );
+                return Err(Status::failed_precondition(format!(
+                    "Build completed on agent {}, use GetCompletedBuild",
+                    completed.agent_id
+                )));
+            }
         }
 
-        // Check if build is in progress on different agent
-        if let Some(tracker) = cluster.builds_in_progress.get(&drv_path_key) {
-            match tracker.agent_id {
-                Some(agent_id) if agent_id != self.agent.id => {
-                    // Build is on a different agent
-                    tracing::info!(
-                        "Build {} is on agent {}, not this agent ({})",
-                        drv_path,
-                        agent_id,
-                        self.agent.id
-                    );
-                    return Err(Status::failed_precondition(format!(
-                        "Build is running on agent {}, not this agent",
-                        agent_id
-                    )));
-                }
-                None => {
-                    // Build queued but not claimed yet
-                    return Err(Status::not_found(format!(
-                        "Build {} is queued but not claimed yet",
-                        drv_path
-                    )));
-                }
-                _ => {
-                    // Build claimed by this agent, continue
-                }
+        // Handle in-progress builds
+        if let Some(tracker) = in_progress_info {
+            // Check if on different agent
+            if let Some(agent_id) = tracker.agent_id
+                && agent_id != self.agent.id
+            {
+                tracing::info!(
+                    "Build {} is on agent {}, not this agent",
+                    drv_path,
+                    agent_id
+                );
+                return Err(Status::failed_precondition(format!(
+                    "Build is running on agent {}, not this agent",
+                    agent_id
+                )));
             }
+
+            // Check if queued (not claimed yet)
+            if tracker.agent_id.is_none() {
+                return Err(Status::not_found(format!(
+                    "Build {} is queued but not claimed yet",
+                    drv_path
+                )));
+            }
+
+            // Build claimed by this agent - poll for current_build to be set
+            tracing::debug!(
+                "Build {} claimed by this agent, polling for current_build",
+                drv_path
+            );
+
+            for _attempt in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                let mut current = self.agent.current_build.lock().await;
+                if let Some(ref mut build) = *current
+                    && build.drv_path.as_str() == drv_path
+                {
+                    // Add subscriber with catch-up logs
+                    let catch_up_logs = build.get_catch_up_logs();
+                    for log in catch_up_logs {
+                        if tx.send(Ok(log)).await.is_err() {
+                            return Err(Status::internal("Failed to send logs"));
+                        }
+                    }
+                    build.subscribers.push(tx);
+                    drop(current);
+
+                    return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                        rx,
+                    )));
+                }
+                drop(current);
+            }
+
+            return Err(Status::internal(
+                "Build claimed but not started within 2 seconds",
+            ));
         }
 
         // Build not found anywhere
