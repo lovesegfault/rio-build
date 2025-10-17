@@ -364,19 +364,32 @@ async fn test_multi_node_distributed_build() -> Result<()> {
 
     eprintln!("TEST: Build queued, waiting for claim...");
 
-    // Wait for build to be claimed
-    sleep(Duration::from_millis(500)).await;
-
-    // Find which agent claimed it
+    // Poll for build to be claimed (same as other tests)
     let drv_path_key: Utf8PathBuf = drv_path.clone().into();
     let assigned_agent_id = {
-        let state = agents[0].state_machine.data.read();
-        state
-            .cluster
-            .builds_in_progress
-            .get(&drv_path_key)
-            .and_then(|t| t.agent_id)
-            .context("Build should be claimed by now")?
+        let mut claimed_agent = None;
+        for _attempt in 0..50 {
+            {
+                let state = agents[0].state_machine.data.read();
+                if let Some(tracker) = state.cluster.builds_in_progress.get(&drv_path_key)
+                    && let Some(agent_id) = tracker.agent_id
+                {
+                    claimed_agent = Some(agent_id);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // If not in builds_in_progress, check completed_builds
+        if claimed_agent.is_none() {
+            let state = agents[0].state_machine.data.read();
+            if let Some(completed) = state.cluster.completed_builds.get(&drv_path_key) {
+                claimed_agent = Some(completed.agent_id);
+            }
+        }
+
+        claimed_agent.context("Build should be claimed by now")?
     };
 
     let assigned_addr = addresses
@@ -389,10 +402,7 @@ async fn test_multi_node_distributed_build() -> Result<()> {
         assigned_agent_id, assigned_addr
     );
 
-    // Wait for coordinator to start build
-    sleep(Duration::from_millis(300)).await;
-
-    // Subscribe to build on assigned agent
+    // Subscribe to build immediately (don't wait)
     let mut client = RioAgentClient::connect(assigned_addr).await?;
     let mut stream = client
         .subscribe_to_build(SubscribeToBuildRequest {

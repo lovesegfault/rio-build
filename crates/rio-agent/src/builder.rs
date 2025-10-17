@@ -341,8 +341,29 @@ async fn handle_build_completion(
                 .unwrap_or_default()
         };
 
-        for sub in &current_subscribers {
-            let _ = sub.send(Ok(completion.clone())).await;
+        tracing::debug!(
+            "Sending completion to {} subscribers",
+            current_subscribers.len()
+        );
+
+        // Send to all subscribers (use blocking send with timeout to avoid hanging)
+        for (idx, sub) in current_subscribers.iter().enumerate() {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                sub.send(Ok(completion.clone())),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    tracing::debug!("Sent completion to subscriber {}", idx);
+                }
+                Ok(Err(_)) => {
+                    tracing::debug!("Subscriber {} channel closed", idx);
+                }
+                Err(_) => {
+                    tracing::warn!("Subscriber {} send timed out after 500ms", idx);
+                }
+            }
         }
     } else {
         tracing::error!("Build failed with exit code: {:?}", exit_status.code());
