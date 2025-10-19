@@ -1,6 +1,4 @@
 {
-  description = "Rio Build - Rust development environment";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -23,10 +21,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # Fork with PR #387 applied (--show-required-system-features support)
-    # TODO: Switch to upstream once PR is merged
     nix-eval-jobs = {
-      url = "github:lovesegfault/nix-eval-jobs/for-rio";
+      url = "github:nix-community/nix-eval-jobs";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
       inputs.treefmt-nix.follows = "treefmt-nix";
@@ -120,10 +116,9 @@
                 libiconv
               ];
 
-            # Runtime dependencies (available when running rio-build and rio-agent)
             propagatedBuildInputs = with pkgs; [
-              nix # Required by both rio-build and rio-agent for nix-store, nix-build, etc.
-              inputs'.nix-eval-jobs.packages.default # Required by rio-build for evaluation
+              nix
+              inputs'.nix-eval-jobs.packages.default
             ];
           }
           // commonEnvVars;
@@ -215,27 +210,6 @@
           # Packages
           packages = {
             default = rio-workspace;
-
-            # Individual packages built separately for better modularity
-            rio-build = craneLib.buildPackage (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                pname = "rio-build";
-                cargoExtraArgs = "-p rio-build";
-                doCheck = false;
-              }
-            );
-
-            rio-agent = craneLib.buildPackage (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                pname = "rio-agent";
-                cargoExtraArgs = "-p rio-agent";
-                doCheck = false;
-              }
-            );
           };
 
           # Checks (run with 'nix flake check')
@@ -286,51 +260,6 @@
 
           # Formatter for 'nix fmt'
           formatter = config.treefmt.build.wrapper;
-
-          # Apps
-          apps = {
-            build = {
-              type = "app";
-              program = "${self'.packages.rio-build}/bin/rio-build";
-              meta.description = "Rio build CLI - submit builds to distributed agent cluster";
-            };
-
-            agent = {
-              type = "app";
-              program = "${self'.packages.rio-agent}/bin/rio-agent";
-              meta.description = "Rio agent - cluster node that executes builds with Raft coordination";
-            };
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            # Interactive VM test runner (Linux only)
-            vm-test-interactive = {
-              type = "app";
-              program = toString (
-                pkgs.writeShellScript "vm-test-interactive" ''
-                  ${config.checks.vm-e2e.driverInteractive}/bin/nixos-test-driver
-                ''
-              );
-            };
-          };
         };
-
-      # Flake-level outputs (not perSystem)
-      flake = {
-        # Export NixOS modules for use in other flakes
-        nixosModules = {
-          rio-dispatcher = import ./modules/dispatcher.nix;
-          rio-builder = import ./modules/builder.nix;
-
-          # Combined module that imports both
-          default =
-            { ... }:
-            {
-              imports = [
-                (import ./modules/dispatcher.nix)
-                (import ./modules/builder.nix)
-              ];
-            };
-        };
-      };
     };
 }

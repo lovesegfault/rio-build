@@ -1,7 +1,0 @@
-# SPDX-FileCopyrightText: 2023 embr <git@liclac.eu>
-#
-# SPDX-License-Identifier: CC0-1.0
-
-[env]
-# Path to the nix binary.
-NIX_WEB_BUILD_NIX_CLI_PATH = "nix"
