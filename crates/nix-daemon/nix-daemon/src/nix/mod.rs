@@ -1814,17 +1814,17 @@ where
                         .with_field("BuildDerivation.inputSrcs")?;
 
                     // 3. Platform
-                    let _platform = wire::read_string(&mut self.r)
+                    let platform = wire::read_string(&mut self.r)
                         .await
                         .with_field("BuildDerivation.platform")?;
 
                     // 4. Builder
-                    let _builder = wire::read_string(&mut self.r)
+                    let builder = wire::read_string(&mut self.r)
                         .await
                         .with_field("BuildDerivation.builder")?;
 
                     // 5. Args
-                    let _args = wire::read_strings(&mut self.r)
+                    let args = wire::read_strings(&mut self.r)
                         .collect::<Result<Vec<_>>>()
                         .await
                         .with_field("BuildDerivation.args")?;
@@ -1853,6 +1853,31 @@ where
                         outputs.len(),
                         build_mode
                     );
+
+                    // Write a minimal .drv file from the BasicDerivation data
+                    // This ensures the file exists when DispatcherLoop tries to read it
+                    if !drv_path.is_empty() && !outputs.is_empty() {
+                        // Create minimal ATerm derivation format
+                        // This is a simplified version - real .drv files are more complex
+                        let args_str = args.join(" ");
+                        let drv_content = format!(
+                            r#"Derive([("out","{}","","")],[],[],"{}","{}",["{}"],[])"#,
+                            outputs[0].1, // output path
+                            platform,
+                            builder,
+                            args_str
+                        );
+
+                        // Try to write the .drv file (may fail if store is read-only, that's OK)
+                        if let Err(e) = std::fs::write(&drv_path, drv_content.as_bytes()) {
+                            info!(
+                                "Could not write .drv file {} (continuing anyway): {}",
+                                drv_path, e
+                            );
+                        } else {
+                            info!("Wrote minimal .drv file to {}", drv_path);
+                        }
+                    }
 
                     // Build using build_paths - this will trigger the distributed build
                     forward_stderr(
@@ -1901,24 +1926,71 @@ where
                         .await
                         .with_field("NarFromPath.path")?;
 
-                    info!("NarFromPath: path={}", path);
+                    info!("NarFromPath: exporting path={}", path);
 
-                    // Export the path as NAR and send it framed
-                    // For now, delegate to our Store's query methods and send empty
-                    // TODO: Actually export the NAR data
+                    // Check if path exists first
                     let path_exists =
                         forward_stderr(&mut self.w, self.store.is_valid_path(&path)).await?;
 
                     if path_exists {
-                        // Should export NAR here, but for now send empty framed data
-                        wire::write_u64(&mut self.w, 0)
-                            .await
-                            .with_field("NarFromPath.nar_size")?;
+                        // Export using nix-store --dump in a blocking task
+                        match tokio::task::spawn_blocking({
+                            let path_clone = path.clone();
+                            move || {
+                                std::process::Command::new("nix-store")
+                                    .arg("--dump")
+                                    .arg(&path_clone)
+                                    .output()
+                            }
+                        })
+                        .await
+                        {
+                            Ok(Ok(output)) if output.status.success() => {
+                                let nar_data = output.stdout;
+                                info!("NarFromPath: exported {} ({} bytes)", path, nar_data.len());
+
+                                // Send NAR data as framed stream
+                                const CHUNK_SIZE: usize = 64 * 1024;
+                                for chunk in nar_data.chunks(CHUNK_SIZE) {
+                                    wire::write_u64(&mut self.w, chunk.len() as u64)
+                                        .await
+                                        .map_err(|e| Error::IO(e))?;
+                                    self.w.write_all(chunk).await.map_err(|e| Error::IO(e))?;
+                                }
+                                // End frame
+                                wire::write_u64(&mut self.w, 0)
+                                    .await
+                                    .map_err(|e| Error::IO(e))?;
+                            }
+                            Ok(Ok(output)) => {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                info!("NarFromPath: nix-store --dump failed: {}", stderr);
+                                // Send empty on error
+                                wire::write_u64(&mut self.w, 0)
+                                    .await
+                                    .map_err(|e| Error::IO(e))?;
+                            }
+                            Ok(Err(e)) => {
+                                info!("NarFromPath: failed to run nix-store: {}", e);
+                                // Send empty on error
+                                wire::write_u64(&mut self.w, 0)
+                                    .await
+                                    .map_err(|e| Error::IO(e))?;
+                            }
+                            Err(e) => {
+                                info!("NarFromPath: spawn_blocking failed: {}", e);
+                                // Send empty on error
+                                wire::write_u64(&mut self.w, 0)
+                                    .await
+                                    .map_err(|e| Error::IO(e))?;
+                            }
+                        }
                     } else {
-                        // Path doesn't exist, send empty
+                        info!("NarFromPath: path {} doesn't exist, sending empty", path);
+                        // Path doesn't exist, send empty frame
                         wire::write_u64(&mut self.w, 0)
                             .await
-                            .with_field("NarFromPath.empty")?;
+                            .map_err(|e| Error::IO(e))?;
                     }
 
                     info!("NarFromPath: completed for {}", path);
