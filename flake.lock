@@ -95,16 +95,15 @@
     "nix": {
       "flake": false,
       "locked": {
-        "lastModified": 1756804961,
-        "narHash": "sha256-TUkkfeQnfI7569O7bWI/v01GJct0OPYydLwINC6ksRo=",
+        "lastModified": 1760472641,
+        "narHash": "sha256-BuKtM7Vr5EcxBXxUENBQPlOBwmNd5mkTRkSmlJi/iQ4=",
         "owner": "NixOS",
         "repo": "nix",
-        "rev": "e7540a269b3b711d67ae27b1bc2f93cc2d39eb21",
+        "rev": "4041bfdb401ad6d1c31a292fab90392254be506a",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "2.31-maintenance",
         "repo": "nix",
         "type": "github"
       }
@@ -123,16 +122,15 @@
         ]
       },
       "locked": {
-        "lastModified": 1759840730,
-        "narHash": "sha256-f51famzP/h5ShLmPZo9KHKgd21LO6xyPidgZn3MaGok=",
-        "owner": "lovesegfault",
+        "lastModified": 1760478325,
+        "narHash": "sha256-hA+NOH8KDcsuvH7vJqSwk74PyZP3MtvI/l+CggZcnTc=",
+        "owner": "nix-community",
         "repo": "nix-eval-jobs",
-        "rev": "2f0b442853ac3221dc5303ac7128846100e7972e",
+        "rev": "daa42f9e9c84aeff1e325dd50fda321f53dfd02c",
         "type": "github"
       },
       "original": {
-        "owner": "lovesegfault",
-        "ref": "for-rio",
+        "owner": "nix-community",
         "repo": "nix-eval-jobs",
         "type": "github"
       }
