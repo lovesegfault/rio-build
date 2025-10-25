@@ -75,16 +75,13 @@
           # Source root for filesets
           unfilteredRoot = ./.;
 
-          # Common environment variables for builds and dev shell
-          commonEnvVars = {
-            RUST_BACKTRACE = "1";
-            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-            PROTOC = "${pkgs.protobuf}/bin/protoc";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          };
-
           # Common arguments for all crane builds
           commonArgs = {
+            stdenv = p: p.llvmPackages.stdenv;
+
+            pname = "rio";
+            version = "0.1.0";
+
             src = pkgs.lib.fileset.toSource {
               root = unfilteredRoot;
               fileset = pkgs.lib.fileset.unions [
@@ -94,22 +91,21 @@
                 (pkgs.lib.fileset.fileFilter (file: file.hasExt "proto") unfilteredRoot)
               ];
             };
+
             strictDeps = true;
 
-            pname = "rio";
-            version = "0.1.0";
-
             nativeBuildInputs = with pkgs; [
+              rustPlatform.bindgenHook
+              llvmPackages.lld
               pkg-config
               protobuf
-              cmake
             ];
 
             buildInputs =
               with pkgs;
               [
                 openssl
-                llvmPackages.libclang.lib
+                zstd
               ]
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
@@ -120,8 +116,14 @@
               nix
               inputs'.nix-eval-jobs.packages.default
             ];
-          }
-          // commonEnvVars;
+
+            env = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              PROTOC = "${pkgs.protobuf}/bin/protoc";
+              RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+              NIX_OUTPATH_USED_AS_RANDOM_SEED = "aaaaaaaaaa";
+            };
+          };
 
           # Build dependencies only (for caching)
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -176,36 +178,35 @@
           };
 
           # Development shell
-          devShells.default = craneLib.devShell (
-            commonEnvVars
-            // {
-              # Inherit inputs from the package build
-              inputsFrom = [ rio-workspace ];
+          devShells.default = craneLib.devShell {
+            # Inherit inputs from the package build
+            inputsFrom = [ rio-workspace ];
 
-              # Inherit inputs from checks
-              checks = config.checks;
+            # Inherit inputs from checks
+            checks = config.checks;
 
-              # Additional development packages
-              packages = with pkgs; [
-                # Cargo tools
-                cargo-edit
-                cargo-expand
-                cargo-nextest
-                cargo-outdated
-                cargo-watch
+            inherit (commonArgs) env;
 
-                # Debugging tools
-                lldb
-                gdb
+            # Additional development packages
+            packages = with pkgs; [
+              # Cargo tools
+              cargo-edit
+              cargo-expand
+              cargo-nextest
+              cargo-outdated
+              cargo-watch
 
-                # Nix tooling (fork with system-features support)
-                inputs'.nix-eval-jobs.packages.default
-              ];
+              # Debugging tools
+              lldb
+              gdb
 
-              # Shell hook for pre-commit
-              shellHook = config.pre-commit.installationScript;
-            }
-          );
+              # Nix tooling (fork with system-features support)
+              inputs'.nix-eval-jobs.packages.default
+            ];
+
+            # Shell hook for pre-commit
+            shellHook = config.pre-commit.installationScript;
+          };
 
           # Packages
           packages = {
