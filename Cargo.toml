@@ -10,8 +10,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lovesegfault/rio-build"
 
 [workspace.dependencies]
-rocksdb = { version = "0.24", default-features = false, features = [
-  "bindgen-runtime",
-  "zstd",
-  "lto",
-] }
+
+[profile.release]
+lto = "thin"
