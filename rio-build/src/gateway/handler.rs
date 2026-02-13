@@ -51,8 +51,14 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut stderr = StderrWriter::new(writer);
+    let start = std::time::Instant::now();
 
-    match WorkerOp::from_u64(opcode) {
+    let op_name = WorkerOp::from_u64(opcode)
+        .map(|op| op.name())
+        .unwrap_or("unknown");
+    metrics::counter!("rio_opcodes_total", "opcode" => op_name).increment(1);
+
+    let result = match WorkerOp::from_u64(opcode) {
         Some(WorkerOp::IsValidPath) => handle_is_valid_path(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryPathInfo) => handle_query_path_info(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryValidPaths) => {
@@ -99,7 +105,17 @@ where
                 "unknown opcode {opcode}, closing connection to avoid stream desynchronization"
             ))
         }
+    };
+
+    let elapsed = start.elapsed();
+    metrics::histogram!("rio_opcode_duration_seconds", "opcode" => op_name)
+        .record(elapsed.as_secs_f64());
+
+    if result.is_err() {
+        metrics::counter!("rio_errors_total", "type" => "protocol").increment(1);
     }
+
+    result
 }
 
 /// wopIsValidPath (1): Check if a store path exists.
