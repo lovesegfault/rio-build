@@ -72,7 +72,7 @@ Good first contributions:
 
 - **Phase 1a tasks** in [phases/phase1a.md](./phases/phase1a.md) --- wire format primitives, store path parsing, hash types
 - **Fuzzing targets** described in [verification.md](./verification.md) --- wire format parsers are security-critical
-- **Golden tests** --- record protocol sessions from a real nix-daemon and add them as test fixtures
+- **Golden tests** --- add live-daemon conformance scenarios for new opcodes (see `tests/golden/`)
 - **Documentation** --- improvements to this design book (typos, clarifications, missing details)
 
 ## Architecture Overview

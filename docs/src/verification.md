@@ -2,8 +2,10 @@
 
 ## Protocol Conformance
 
-- Record bytes from real nix-daemon as golden tests (scripted for reproducibility across Nix versions)
-- Replay recorded sessions against rio-build, compare byte-for-byte
+- Live-daemon golden tests: each test starts an isolated nix-daemon, exchanges with it, and compares the response field-by-field against rio-build at the byte level
+- No stored fixtures — tests always run against the current nix-daemon version, eliminating fixture staleness
+- STDERR activity stripping handles daemon messages (START\_ACTIVITY/STOP\_ACTIVITY) that rio-build omits
+- Fields that legitimately differ (version\_string, trusted) are skipped via a configurable skip list
 - Nix version compatibility: test against Nix 2.20+ stable and unstable, and Lix
 - Run conformance tests against multiple pinned Nix versions in CI
 - Nightly job tests against latest Nix from nixpkgs-unstable and alerts on failures
@@ -77,7 +79,7 @@ Security-critical protocol parsers must be fuzz-tested:
 
 | Tier | Trigger | Tests | Time Budget |
 |------|---------|-------|-------------|
-| PR | Every push | Unit tests, clippy, treefmt, wire format golden tests, cargo-deny | < 5 min |
+| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny | < 5 min |
 | Merge | Every merge to main | + Integration tests with testcontainers (PostgreSQL, MinIO) | < 15 min |
 | Nightly | Scheduled | + Nix version compatibility, criterion benchmarks, fuzzing corpus refresh | < 60 min |
 | Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests, cargo-mutants on scheduler+store | Unbounded |
@@ -86,7 +88,7 @@ Security-critical protocol parsers must be fuzz-tested:
 
 | Dependency | Purpose |
 |------------|---------|
-| Nix daemon | Golden protocol conformance tests |
+| Nix daemon | Live-daemon golden conformance tests (auto-started per test) |
 | PostgreSQL | Build state storage (testcontainers, auto-started) |
 | MinIO | S3 backend tests (testcontainers, auto-started) |
 | kind / EKS cluster | Phase 3+ Kubernetes integration tests |
