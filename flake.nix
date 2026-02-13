@@ -181,6 +181,10 @@
               # Debugging tools
               lldb
               gdb
+
+              # Documentation
+              mdbook
+              mdbook-mermaid
             ];
 
             RUST_BACKTRACE = "1";
