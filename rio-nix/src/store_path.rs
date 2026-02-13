@@ -13,6 +13,9 @@ pub const HASH_CHARS: usize = 32;
 /// Length of the raw hash bytes in a store path.
 pub const HASH_BYTES: usize = 20;
 
+/// Maximum length of the name component (from Nix source).
+pub const MAX_NAME_LEN: usize = 211;
+
 #[derive(Debug, Error)]
 pub enum StorePathError {
     #[error("path does not start with {STORE_DIR}/")]
@@ -29,6 +32,9 @@ pub enum StorePathError {
 
     #[error("name starts with '.'")]
     NameStartsWithDot,
+
+    #[error("name too long: {0} chars (max {MAX_NAME_LEN})")]
+    NameTooLong(usize),
 
     #[error("name contains invalid character: {0:?}")]
     InvalidNameChar(char),
@@ -112,6 +118,9 @@ impl fmt::Display for StorePath {
 fn validate_name(name: &str) -> Result<(), StorePathError> {
     if name.is_empty() {
         return Err(StorePathError::EmptyName);
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(StorePathError::NameTooLong(name.len()));
     }
     if name.starts_with('.') {
         return Err(StorePathError::NameStartsWithDot);
@@ -297,5 +306,21 @@ mod tests {
         assert!(!is_valid_name_char(' '));
         assert!(!is_valid_name_char('/'));
         assert!(!is_valid_name_char('\0'));
+    }
+
+    #[test]
+    fn test_name_length_limit() {
+        // Name at exactly MAX_NAME_LEN should be accepted
+        let name = "a".repeat(MAX_NAME_LEN);
+        let path = format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}");
+        assert!(StorePath::parse(&path).is_ok());
+
+        // Name exceeding MAX_NAME_LEN should be rejected
+        let name = "a".repeat(MAX_NAME_LEN + 1);
+        let path = format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}");
+        assert!(matches!(
+            StorePath::parse(&path),
+            Err(StorePathError::NameTooLong(_))
+        ));
     }
 }

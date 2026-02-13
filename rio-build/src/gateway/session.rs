@@ -93,7 +93,10 @@ where
                             "protocol error: wopSetOptions must be the first opcode after handshake",
                         ))
                         .await?;
-                    continue;
+                    // Must close: the opcode's payload is unread in the stream
+                    return Err(anyhow::anyhow!(
+                        "protocol violation: expected wopSetOptions, got opcode {opcode}"
+                    ));
                 }
 
                 handler::handle_opcode(

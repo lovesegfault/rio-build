@@ -5,6 +5,7 @@
 //! BLAKE3 is used internally by rio-build for chunk storage but never exposed
 //! to Nix clients.
 
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 
@@ -157,12 +158,7 @@ impl NixHash {
         let digest = match algo {
             HashAlgo::SHA256 => Sha256::digest(data).to_vec(),
             HashAlgo::SHA512 => Sha512::digest(data).to_vec(),
-            HashAlgo::SHA1 => {
-                // SHA-1 is deprecated but needed for legacy derivation support
-                // Use sha2 crate's Sha1 is not available; we'll use sha1 crate if needed
-                // For now, placeholder — we can add sha1 crate dependency later
-                panic!("SHA-1 computation not yet implemented; add sha1 crate dependency");
-            }
+            HashAlgo::SHA1 => Sha1::digest(data).to_vec(),
         };
 
         NixHash { algo, digest }
@@ -216,6 +212,18 @@ mod tests {
         assert_eq!(
             hex::encode(&hash.digest),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_compute_sha1() {
+        let hash = NixHash::compute(HashAlgo::SHA1, b"");
+        assert_eq!(hash.algo, HashAlgo::SHA1);
+        assert_eq!(hash.digest.len(), 20);
+        // SHA-1 of empty string
+        assert_eq!(
+            hex::encode(&hash.digest),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         );
     }
 
