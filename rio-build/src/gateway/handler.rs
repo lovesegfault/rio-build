@@ -393,7 +393,10 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ///
 /// Receives a collection of `DerivedPath` strings (which may contain `!*` or
 /// `!out,dev` output specifiers). Checks the store for the base paths and
-/// returns those not present as `willBuild`.
+/// categorizes missing paths:
+/// - **willBuild**: `Built` derivation paths whose base `.drv` is missing
+/// - **unknown**: `Opaque` (non-derivation) paths that are missing
+/// - **willSubstitute**: always empty (rio-build has no substituters)
 #[instrument(skip_all)]
 async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -404,38 +407,42 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     debug!(count = raw_paths.len(), "wopQueryMissing");
 
     // Parse DerivedPath strings and extract base store paths for batch lookup.
-    // DerivedPath values like "/nix/store/...-foo.drv!*" need the "!*" stripped
-    // before we can check the store.
-    let parsed: Vec<StorePath> = raw_paths
-        .iter()
-        .filter_map(|s| DerivedPath::parse(s).ok().map(|dp| dp.store_path().clone()))
+    let derived: Vec<(String, DerivedPath)> = raw_paths
+        .into_iter()
+        .filter_map(|s| DerivedPath::parse(&s).ok().map(|dp| (s, dp)))
         .collect();
 
-    let valid_set: HashSet<String> = match store.query_valid_paths(&parsed).await {
+    let store_paths: Vec<StorePath> = derived
+        .iter()
+        .map(|(_, dp)| dp.store_path().clone())
+        .collect();
+
+    let valid_set: HashSet<String> = match store.query_valid_paths(&store_paths).await {
         Ok(v) => v.into_iter().map(|p| p.to_string()).collect(),
         Err(e) => return send_store_error(stderr, e).await,
     };
 
-    let will_build: Vec<String> = raw_paths
-        .into_iter()
-        .filter(|p| {
-            let base = DerivedPath::parse(p)
-                .ok()
-                .map(|dp| dp.store_path().to_string());
-            !base.is_some_and(|b| valid_set.contains(&b))
-        })
-        .collect();
+    let mut will_build = Vec::new();
+    let mut unknown = Vec::new();
+
+    for (raw, dp) in &derived {
+        if valid_set.contains(&dp.store_path().to_string()) {
+            continue;
+        }
+        match dp {
+            DerivedPath::Built { .. } => will_build.push(raw.clone()),
+            DerivedPath::Opaque(_) => unknown.push(raw.clone()),
+        }
+    }
 
     stderr.finish().await?;
     let w = stderr.inner_mut();
 
-    // willBuild: paths not already in the store
     wire::write_strings(w, &will_build).await?;
     // willSubstitute: always empty (rio-build doesn't use external substituters)
     let empty: Vec<String> = vec![];
     wire::write_strings(w, &empty).await?;
-    // unknown: empty
-    wire::write_strings(w, &empty).await?;
+    wire::write_strings(w, &unknown).await?;
     // downloadSize: 0
     wire::write_u64(w, 0).await?;
     // narSize: 0

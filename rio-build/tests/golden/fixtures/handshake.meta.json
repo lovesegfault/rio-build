@@ -1,8 +1,0 @@
-{
-  "nix_version": "nix (Nix) 2.31.3",
-  "description": "Handshake only (magic + version + features + post-handshake)",
-  "skip_fields": [
-    "version_string",
-    "trusted"
-  ]
-}

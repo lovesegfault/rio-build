@@ -387,7 +387,7 @@ async fn test_query_missing() {
             let mut s = s;
             do_handshake(&mut s).await;
 
-            // wopQueryMissing (40): send a string collection of paths
+            // wopQueryMissing (40): send opaque (non-derivation) paths
             wire::write_u64(&mut s, 40).await.unwrap();
             let paths = vec![
                 "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string(),
@@ -399,22 +399,24 @@ async fn test_query_missing() {
             let last = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(last, STDERR_LAST);
 
-            // willBuild: only the missing path
+            // willBuild: empty (opaque paths are never "buildable")
             let will_build = wire::read_strings(&mut s).await.unwrap();
-            assert_eq!(will_build.len(), 1);
             assert!(
-                will_build[0].contains("missing-1.0"),
-                "expected missing path in willBuild, got: {:?}",
-                will_build
+                will_build.is_empty(),
+                "opaque paths should not be in willBuild, got: {will_build:?}"
             );
 
             // willSubstitute: empty
             let will_substitute = wire::read_strings(&mut s).await.unwrap();
             assert!(will_substitute.is_empty(), "expected empty willSubstitute");
 
-            // unknown: empty
+            // unknown: the missing opaque path
             let unknown = wire::read_strings(&mut s).await.unwrap();
-            assert!(unknown.is_empty(), "expected empty unknown");
+            assert_eq!(unknown.len(), 1, "missing opaque path should be in unknown");
+            assert!(
+                unknown[0].contains("missing-1.0"),
+                "expected missing path in unknown, got: {unknown:?}"
+            );
 
             // downloadSize: 0
             let download_size = wire::read_u64(&mut s).await.unwrap();

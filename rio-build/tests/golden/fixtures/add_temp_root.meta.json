@@ -1,8 +1,0 @@
-{
-  "nix_version": "nix (Nix) 2.31.3",
-  "description": "Handshake + SetOptions + wopAddTempRoot",
-  "skip_fields": [
-    "version_string",
-    "trusted"
-  ]
-}

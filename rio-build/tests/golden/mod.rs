@@ -1,12 +1,11 @@
 //! Golden conformance test infrastructure.
 //!
-//! Provides field-level response parsing and masked byte comparison
-//! for verifying rio-build output against recorded nix-daemon responses.
+//! Provides field-level response parsing and byte comparison
+//! for verifying rio-build output against live nix-daemon responses.
 
-pub mod record;
+pub mod daemon;
 
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rio_build::store::MemoryStore;
@@ -21,15 +20,7 @@ pub struct ResponseField {
     pub bytes: Vec<u8>,
 }
 
-/// Metadata and binary fixtures for a single golden test scenario.
-pub struct GoldenFixture {
-    pub client_bytes: Vec<u8>,
-    pub server_bytes: Vec<u8>,
-    pub skip_fields: Vec<String>,
-    pub store_paths: Vec<StorePathEntry>,
-}
-
-/// A store path entry from the fixture metadata, used to populate MemoryStore.
+/// A store path entry used to populate MemoryStore for conformance tests.
 #[derive(serde::Deserialize)]
 pub struct StorePathEntry {
     pub path: String,
@@ -44,100 +35,40 @@ pub struct StorePathEntry {
     pub ca: Option<String>,
 }
 
-/// Fixture metadata deserialized from `<name>.meta.json`.
-#[derive(serde::Deserialize)]
-struct FixtureMeta {
-    #[allow(dead_code)]
-    nix_version: String,
-    #[allow(dead_code)]
-    description: String,
-    skip_fields: Vec<String>,
-    #[serde(default)]
-    store_paths: Vec<StorePathEntry>,
-}
+/// Build a MemoryStore populated with the given store path entries.
+pub fn build_memory_store_from(entries: &[StorePathEntry]) -> Arc<MemoryStore> {
+    let store = Arc::new(MemoryStore::new());
+    for entry in entries {
+        let path = StorePath::parse(&entry.path)
+            .unwrap_or_else(|e| panic!("invalid store path '{}': {e}", entry.path));
+        let deriver = entry
+            .deriver
+            .as_ref()
+            .map(|d| StorePath::parse(d).unwrap_or_else(|e| panic!("invalid deriver: {e}")));
+        let nar_hash =
+            NixHash::parse(&entry.nar_hash).unwrap_or_else(|e| panic!("invalid nar_hash: {e}"));
+        let references: Vec<StorePath> = entry
+            .references
+            .iter()
+            .map(|r| StorePath::parse(r).unwrap_or_else(|e| panic!("invalid reference: {e}")))
+            .collect();
 
-impl GoldenFixture {
-    /// Load a fixture by name from `tests/golden/fixtures/<name>.*`.
-    pub fn load(name: &str) -> Self {
-        let base = fixtures_dir();
-
-        let client_bytes =
-            std::fs::read(base.join(format!("{name}.client.bin"))).unwrap_or_else(|e| {
-                panic!("failed to read {name}.client.bin: {e}");
-            });
-        let server_bytes =
-            std::fs::read(base.join(format!("{name}.server.bin"))).unwrap_or_else(|e| {
-                panic!("failed to read {name}.server.bin: {e}");
-            });
-        let meta_bytes =
-            std::fs::read(base.join(format!("{name}.meta.json"))).unwrap_or_else(|e| {
-                panic!("failed to read {name}.meta.json: {e}");
-            });
-        let meta: FixtureMeta = serde_json::from_slice(&meta_bytes).unwrap_or_else(|e| {
-            panic!("failed to parse {name}.meta.json: {e}");
-        });
-
-        GoldenFixture {
-            client_bytes,
-            server_bytes,
-            skip_fields: meta.skip_fields,
-            store_paths: meta.store_paths,
-        }
+        store.insert(
+            rio_build::store::traits::PathInfo {
+                path,
+                deriver,
+                nar_hash,
+                references,
+                registration_time: entry.registration_time,
+                nar_size: entry.nar_size,
+                ultimate: entry.ultimate,
+                sigs: entry.sigs.clone(),
+                ca: entry.ca.clone(),
+            },
+            None,
+        );
     }
-
-    /// Build a MemoryStore populated with the fixture's store paths.
-    pub fn build_memory_store(&self) -> Arc<MemoryStore> {
-        let store = Arc::new(MemoryStore::new());
-        for entry in &self.store_paths {
-            let path = StorePath::parse(&entry.path)
-                .unwrap_or_else(|e| panic!("invalid store path '{}': {e}", entry.path));
-            let deriver = entry
-                .deriver
-                .as_ref()
-                .map(|d| StorePath::parse(d).unwrap_or_else(|e| panic!("invalid deriver: {e}")));
-            let nar_hash =
-                NixHash::parse(&entry.nar_hash).unwrap_or_else(|e| panic!("invalid nar_hash: {e}"));
-            let references: Vec<StorePath> = entry
-                .references
-                .iter()
-                .map(|r| StorePath::parse(r).unwrap_or_else(|e| panic!("invalid reference: {e}")))
-                .collect();
-            let sigs = entry.sigs.clone();
-            let ca = entry.ca.clone();
-
-            store.insert(
-                rio_build::store::traits::PathInfo {
-                    path,
-                    deriver,
-                    nar_hash,
-                    references,
-                    registration_time: entry.registration_time,
-                    nar_size: entry.nar_size,
-                    ultimate: entry.ultimate,
-                    sigs,
-                    ca,
-                },
-                None,
-            );
-        }
-        store
-    }
-}
-
-/// Return the path to the fixtures directory.
-pub fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("golden")
-        .join("fixtures")
-}
-
-/// Check whether any fixtures exist (to skip replay tests gracefully).
-pub fn fixtures_exist(name: &str) -> bool {
-    let base = fixtures_dir();
-    base.join(format!("{name}.client.bin")).exists()
-        && base.join(format!("{name}.server.bin")).exists()
-        && base.join(format!("{name}.meta.json")).exists()
+    store
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +286,59 @@ pub async fn parse_add_temp_root_fields(data: &[u8]) -> Vec<ResponseField> {
     ]
 }
 
+/// Parse a QueryMissing response (after handshake + SetOptions).
+pub async fn parse_query_missing_fields(data: &[u8]) -> Vec<ResponseField> {
+    let mut cursor = Cursor::new(data.to_vec());
+    vec![
+        ResponseField {
+            name: "stderr_last",
+            bytes: read_u64_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "will_build",
+            bytes: read_strings_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "will_substitute",
+            bytes: read_strings_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "unknown",
+            bytes: read_strings_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "download_size",
+            bytes: read_u64_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "nar_size",
+            bytes: read_u64_field(&mut cursor).await,
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// STDERR activity stripping
+// ---------------------------------------------------------------------------
+
+/// Strip STDERR activity messages from an opcode response.
+///
+/// The real nix-daemon may send STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY,
+/// and STDERR_RESULT messages before STDERR_LAST, while rio-build skips
+/// those. This function finds the STDERR_LAST marker and returns only the
+/// data from that point onward (STDERR_LAST + result fields).
+pub fn strip_stderr_activity(data: &[u8]) -> &[u8] {
+    let last_bytes = rio_nix::protocol::stderr::STDERR_LAST.to_le_bytes();
+    // Search for the 8-byte STDERR_LAST pattern
+    for i in 0..data.len().saturating_sub(7) {
+        if data[i..i + 8] == last_bytes {
+            return &data[i..];
+        }
+    }
+    // If STDERR_LAST not found, return the original data (let the parser handle the error)
+    data
+}
+
 // ---------------------------------------------------------------------------
 // Full-response parser: splits a complete response into handshake + opcode sections
 // ---------------------------------------------------------------------------
@@ -460,7 +444,7 @@ pub fn assert_field_conformance(
 }
 
 // ---------------------------------------------------------------------------
-// Client byte builders (shared between recorder and replay tests)
+// Client byte builders (shared between daemon exchange and replay tests)
 // ---------------------------------------------------------------------------
 
 /// Build wopIsValidPath client bytes for a given path.
@@ -494,5 +478,14 @@ pub async fn build_add_temp_root_bytes(path: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     wire::write_u64(&mut buf, 11).await.unwrap();
     wire::write_string(&mut buf, path).await.unwrap();
+    buf
+}
+
+/// Build wopQueryMissing client bytes.
+pub async fn build_query_missing_bytes(paths: &[&str]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    wire::write_u64(&mut buf, 40).await.unwrap();
+    let owned: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
+    wire::write_strings(&mut buf, &owned).await.unwrap();
     buf
 }
