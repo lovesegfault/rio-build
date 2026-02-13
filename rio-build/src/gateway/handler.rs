@@ -206,8 +206,8 @@ async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     .map_or(String::new(), |d| d.to_string()),
             )
             .await?;
-            // narHash
-            wire::write_string(w, &info.nar_hash.to_colon()).await?;
+            // narHash (nix-daemon sends raw hex digest, no algorithm prefix)
+            wire::write_string(w, &info.nar_hash.to_hex()).await?;
             // references
             let refs: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
             wire::write_strings(w, &refs).await?;
@@ -316,8 +316,8 @@ async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         overrides,
     });
 
+    // nix-daemon sends only STDERR_LAST for SetOptions — no result value.
     stderr.finish().await?;
-    wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())
 }
 

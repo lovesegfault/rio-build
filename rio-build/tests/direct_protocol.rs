@@ -45,8 +45,6 @@ async fn do_handshake(s: &mut DuplexStream) {
 
     let msg = wire::read_u64(s).await.unwrap();
     assert_eq!(msg, STDERR_LAST);
-    let result = wire::read_u64(s).await.unwrap();
-    assert_eq!(result, 1);
 }
 
 fn make_test_store() -> Arc<MemoryStore> {
@@ -181,9 +179,10 @@ async fn test_query_path_info() {
             assert!(deriver.is_empty());
 
             let nar_hash = wire::read_string(&mut s).await.unwrap();
-            assert!(
-                nar_hash.starts_with("sha256:"),
-                "expected sha256 hash, got: {nar_hash}"
+            assert_eq!(
+                nar_hash.len(),
+                64,
+                "expected 64-char hex hash, got: {nar_hash}"
             );
 
             let refs = wire::read_strings(&mut s).await.unwrap();
@@ -461,8 +460,6 @@ async fn test_set_options_with_overrides() {
 
             let last = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(last, STDERR_LAST);
-            let result = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(result, 1);
         })
     })
     .await;

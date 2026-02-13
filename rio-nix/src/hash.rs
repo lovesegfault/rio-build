@@ -159,6 +159,13 @@ impl NixHash {
         }
     }
 
+    /// Render as lowercase hex digest (no algorithm prefix).
+    ///
+    /// This is the format used by nix-daemon on the wire for `wopQueryPathInfo`.
+    pub fn to_hex(&self) -> String {
+        self.digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Render in Nix colon format: `sha256:aabb...` (nixbase32 digest).
     pub fn to_colon(&self) -> String {
         format!("{}:{}", self.algo, nixbase32::encode(&self.digest))
