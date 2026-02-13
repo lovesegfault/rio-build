@@ -13,6 +13,9 @@ const PADDING: usize = 8;
 /// Maximum allowed string length (64 MiB) to prevent OOM on malicious input.
 const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
 
+/// Maximum allowed collection count (1M items) to prevent OOM on malicious input.
+const MAX_COLLECTION_COUNT: u64 = 1_048_576;
+
 #[derive(Debug, Error)]
 pub enum WireError {
     #[error("I/O error: {0}")]
@@ -20,6 +23,9 @@ pub enum WireError {
 
     #[error("string length {0} exceeds maximum {MAX_STRING_LEN}")]
     StringTooLong(u64),
+
+    #[error("collection count {0} exceeds maximum {MAX_COLLECTION_COUNT}")]
+    CollectionTooLarge(u64),
 
     #[error("invalid UTF-8 in string")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
@@ -93,7 +99,11 @@ pub async fn read_string<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
 
 /// Read a collection of UTF-8 strings (`u64(count)` followed by `count` strings).
 pub async fn read_strings<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<String>> {
-    let count = read_u64(r).await? as usize;
+    let count = read_u64(r).await?;
+    if count > MAX_COLLECTION_COUNT {
+        return Err(WireError::CollectionTooLarge(count));
+    }
+    let count = count as usize;
     let mut result = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         result.push(read_string(r).await?);
@@ -103,7 +113,11 @@ pub async fn read_strings<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<String>
 
 /// Read a collection of key-value string pairs.
 pub async fn read_string_pairs<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<(String, String)>> {
-    let count = read_u64(r).await? as usize;
+    let count = read_u64(r).await?;
+    if count > MAX_COLLECTION_COUNT {
+        return Err(WireError::CollectionTooLarge(count));
+    }
+    let count = count as usize;
     let mut result = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         let key = read_string(r).await?;
@@ -319,5 +333,15 @@ mod tests {
         assert_eq!(padding_len(8), 0);
         assert_eq!(padding_len(9), 7);
         assert_eq!(padding_len(16), 0);
+    }
+
+    #[tokio::test]
+    async fn test_collection_too_large() {
+        // Craft a buffer with an enormous count
+        let mut buf = Vec::new();
+        write_u64(&mut buf, MAX_COLLECTION_COUNT + 1).await.unwrap();
+        let mut reader = Cursor::new(buf);
+        let result = read_strings(&mut reader).await;
+        assert!(matches!(result, Err(WireError::CollectionTooLarge(_))));
     }
 }

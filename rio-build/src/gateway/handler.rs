@@ -66,7 +66,11 @@ where
         }
         Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr).await,
         Some(op) => {
-            warn!(opcode = opcode, name = op.name(), "unimplemented opcode");
+            warn!(
+                opcode = opcode,
+                name = op.name(),
+                "unimplemented opcode, closing connection"
+            );
             stderr
                 .error(&StderrError::simple(format!(
                     "operation {} ({}) is not yet implemented",
@@ -74,16 +78,25 @@ where
                     opcode
                 )))
                 .await?;
-            Ok(())
+            // Must close the connection: the opcode's payload is still in the
+            // stream and we don't know its format, so we can't drain it.
+            // The client will reconnect automatically.
+            Err(anyhow::anyhow!(
+                "unimplemented opcode {} ({}), closing connection to avoid stream desynchronization",
+                op.name(),
+                opcode
+            ))
         }
         None => {
-            warn!(opcode = opcode, "unknown opcode");
+            warn!(opcode = opcode, "unknown opcode, closing connection");
             stderr
                 .error(&StderrError::simple(format!(
                     "unsupported operation {opcode}"
                 )))
                 .await?;
-            Ok(())
+            Err(anyhow::anyhow!(
+                "unknown opcode {opcode}, closing connection to avoid stream desynchronization"
+            ))
         }
     }
 }
