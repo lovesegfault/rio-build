@@ -86,6 +86,7 @@ impl WorkerOp {
                 | WorkerOp::QueryValidPaths
                 | WorkerOp::AddSignatures
                 | WorkerOp::NarFromPath
+                | WorkerOp::QueryMissing
         )
     }
 }

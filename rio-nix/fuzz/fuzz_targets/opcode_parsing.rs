@@ -55,8 +55,8 @@ fuzz_target!(|data: &[u8]| {
                 let _ = wire::read_bool(&mut cursor).await;
             }
             WorkerOp::SetOptions => {
-                // SetOptions reads many fields; try reading several u64s and strings
-                for _ in 0..8 {
+                // SetOptions reads 12 u64 fields then string pairs (overrides)
+                for _ in 0..12 {
                     let _ = wire::read_u64(&mut cursor).await;
                 }
                 let _ = wire::read_string_pairs(&mut cursor).await;

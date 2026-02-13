@@ -47,8 +47,16 @@ pub enum StorePathError {
 }
 
 /// The 20-byte hash part of a Nix store path.
+#[must_use]
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct StorePathHash(pub [u8; HASH_BYTES]);
+pub struct StorePathHash([u8; HASH_BYTES]);
+
+impl StorePathHash {
+    /// Access the raw hash bytes.
+    pub fn as_bytes(&self) -> &[u8; HASH_BYTES] {
+        &self.0
+    }
+}
 
 impl fmt::Debug for StorePathHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,10 +65,23 @@ impl fmt::Debug for StorePathHash {
 }
 
 /// A parsed Nix store path.
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StorePath {
-    pub hash: StorePathHash,
-    pub name: String,
+    hash: StorePathHash,
+    name: String,
+}
+
+impl StorePath {
+    /// The hash part of the store path.
+    pub fn hash(&self) -> &StorePathHash {
+        &self.hash
+    }
+
+    /// The name component of the store path.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl StorePath {

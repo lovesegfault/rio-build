@@ -16,10 +16,10 @@ use super::traits::{PathInfo, Store};
 /// Thread-safe via `RwLock`. Suitable for development and testing,
 /// not for production use (no persistence, bounded by memory).
 pub struct MemoryStore {
-    /// Path metadata indexed by store path string.
-    paths: RwLock<HashMap<String, PathInfo>>,
-    /// NAR content indexed by store path string.
-    nars: RwLock<HashMap<String, Vec<u8>>>,
+    /// Path metadata indexed by store path.
+    paths: RwLock<HashMap<StorePath, PathInfo>>,
+    /// NAR content indexed by store path.
+    nars: RwLock<HashMap<StorePath, Vec<u8>>>,
 }
 
 #[allow(dead_code)]
@@ -34,22 +34,31 @@ impl MemoryStore {
 
     /// Insert a path with its metadata (and optionally NAR content).
     pub fn insert(&self, info: PathInfo, nar: Option<Vec<u8>>) {
-        let key = info.path.to_string();
+        let key = info.path.clone();
         debug!(path = %key, "inserting path into memory store");
-        self.paths.write().unwrap().insert(key.clone(), info);
         if let Some(nar_data) = nar {
-            self.nars.write().unwrap().insert(key, nar_data);
+            self.nars
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.clone(), nar_data);
         }
+        self.paths
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, info);
     }
 
     /// Return the number of paths in the store.
     pub fn len(&self) -> usize {
-        self.paths.read().unwrap().len()
+        self.paths.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Check if the store is empty.
     pub fn is_empty(&self) -> bool {
-        self.paths.read().unwrap().is_empty()
+        self.paths
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 }
 
@@ -62,28 +71,40 @@ impl Default for MemoryStore {
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn is_valid_path(&self, path: &StorePath) -> anyhow::Result<bool> {
-        let key = path.to_string();
-        Ok(self.paths.read().unwrap().contains_key(&key))
+        let store = self
+            .paths
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        Ok(store.contains_key(path))
     }
 
     async fn query_path_info(&self, path: &StorePath) -> anyhow::Result<Option<PathInfo>> {
-        let key = path.to_string();
-        Ok(self.paths.read().unwrap().get(&key).cloned())
+        let store = self
+            .paths
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        Ok(store.get(path).cloned())
     }
 
     async fn query_valid_paths(&self, paths: &[StorePath]) -> anyhow::Result<Vec<StorePath>> {
-        let store = self.paths.read().unwrap();
+        let store = self
+            .paths
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let valid = paths
             .iter()
-            .filter(|p| store.contains_key(&p.to_string()))
+            .filter(|p| store.contains_key(*p))
             .cloned()
             .collect();
         Ok(valid)
     }
 
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>> {
-        let key = path.to_string();
-        Ok(self.nars.read().unwrap().get(&key).cloned())
+        let store = self
+            .nars
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        Ok(store.get(path).cloned())
     }
 }
 

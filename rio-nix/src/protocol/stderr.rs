@@ -51,11 +51,11 @@ pub struct Trace {
 
 impl StderrError {
     /// Create a simple error with no position and no traces.
-    pub fn simple(message: impl Into<String>) -> Self {
+    pub fn simple(name: impl Into<String>, message: impl Into<String>) -> Self {
         StderrError {
             error_type: "Error".to_string(),
             level: 0,
-            name: "rio-build".to_string(),
+            name: name.into(),
             message: message.into(),
             position: None,
             traces: Vec::new(),
@@ -285,7 +285,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = StderrWriter::new(&mut buf);
         writer
-            .error(&StderrError::simple("something broke"))
+            .error(&StderrError::simple("rio-build", "something broke"))
             .await
             .unwrap();
 
