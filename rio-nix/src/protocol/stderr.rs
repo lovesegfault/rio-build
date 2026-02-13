@@ -1,0 +1,298 @@
+//! STDERR streaming loop — the core I/O mechanism for the Nix worker protocol.
+//!
+//! Every opcode response is wrapped in an STDERR loop: the server sends log messages,
+//! progress updates, and errors via STDERR_* message types, and terminates with
+//! STDERR_LAST to signal that the operation result follows.
+
+use super::wire::{self, WireError};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+// STDERR message type constants
+pub const STDERR_NEXT: u64 = 0x6f6c6d67;
+pub const STDERR_READ: u64 = 0x64617461;
+pub const STDERR_WRITE: u64 = 0x64617416;
+pub const STDERR_LAST: u64 = 0x616c7473;
+pub const STDERR_ERROR: u64 = 0x63787470;
+pub const STDERR_START_ACTIVITY: u64 = 0x53545254;
+pub const STDERR_STOP_ACTIVITY: u64 = 0x53544f50;
+pub const STDERR_RESULT: u64 = 0x52534c54;
+
+/// Structured error for the STDERR_ERROR wire format.
+#[derive(Debug, Clone)]
+pub struct StderrError {
+    /// Error type string, e.g. `"Error"` or `"nix::Interrupted"`.
+    pub error_type: String,
+    /// Error level (verbosity).
+    pub level: u64,
+    /// Program name, e.g. `"rio-build"`.
+    pub name: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Optional source position.
+    pub position: Option<Position>,
+    /// Stack trace entries.
+    pub traces: Vec<Trace>,
+}
+
+/// A source code position.
+#[derive(Debug, Clone)]
+pub struct Position {
+    pub file: String,
+    pub line: u64,
+    pub column: u64,
+}
+
+/// A stack trace entry.
+#[derive(Debug, Clone)]
+pub struct Trace {
+    pub position: Option<Position>,
+    pub message: String,
+}
+
+impl StderrError {
+    /// Create a simple error with no position and no traces.
+    pub fn simple(message: impl Into<String>) -> Self {
+        StderrError {
+            error_type: "Error".to_string(),
+            level: 0,
+            name: "rio-build".to_string(),
+            message: message.into(),
+            position: None,
+            traces: Vec::new(),
+        }
+    }
+}
+
+/// Activity type enum for STDERR_START_ACTIVITY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum ActivityType {
+    Unknown = 0,
+    CopyPath = 101,
+    FileTransfer = 102,
+    Realise = 103,
+    CopyPaths = 104,
+    Builds = 105,
+    Build = 106,
+    OptimiseStore = 107,
+    VerifyPaths = 108,
+    Substitute = 109,
+    QueryPathInfo = 110,
+    PostBuildHook = 111,
+    BuildWaiting = 112,
+}
+
+/// Writes STDERR messages to the Nix client.
+pub struct StderrWriter<W> {
+    writer: W,
+    next_activity_id: u64,
+}
+
+impl<W: AsyncWrite + Unpin> StderrWriter<W> {
+    pub fn new(writer: W) -> Self {
+        StderrWriter {
+            writer,
+            next_activity_id: 1,
+        }
+    }
+
+    /// Get a mutable reference to the inner writer (for writing result data after STDERR_LAST).
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
+    /// Send a log message (STDERR_NEXT).
+    pub async fn log(&mut self, msg: &str) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_NEXT).await?;
+        wire::write_string(&mut self.writer, msg).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send STDERR_LAST to end the streaming loop.
+    /// After this, the caller should write the operation result directly.
+    pub async fn finish(&mut self) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_LAST).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send STDERR_ERROR with the full structured error format.
+    pub async fn error(&mut self, err: &StderrError) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_ERROR).await?;
+
+        // Error type
+        wire::write_string(&mut self.writer, &err.error_type).await?;
+        // Level
+        wire::write_u64(&mut self.writer, err.level).await?;
+        // Name
+        wire::write_string(&mut self.writer, &err.name).await?;
+        // Message
+        wire::write_string(&mut self.writer, &err.message).await?;
+
+        // Position
+        if let Some(pos) = &err.position {
+            wire::write_u64(&mut self.writer, 1).await?; // havePos = true
+            wire::write_string(&mut self.writer, &pos.file).await?;
+            wire::write_u64(&mut self.writer, pos.line).await?;
+            wire::write_u64(&mut self.writer, pos.column).await?;
+        } else {
+            wire::write_u64(&mut self.writer, 0).await?; // havePos = false
+        }
+
+        // Traces
+        wire::write_u64(&mut self.writer, err.traces.len() as u64).await?;
+        for trace in &err.traces {
+            if let Some(pos) = &trace.position {
+                wire::write_u64(&mut self.writer, 1).await?; // havePos = true
+                wire::write_string(&mut self.writer, &pos.file).await?;
+                wire::write_u64(&mut self.writer, pos.line).await?;
+                wire::write_u64(&mut self.writer, pos.column).await?;
+            } else {
+                wire::write_u64(&mut self.writer, 0).await?; // havePos = false
+            }
+            wire::write_string(&mut self.writer, &trace.message).await?;
+        }
+
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send STDERR_WRITE with data (used by `wopNarFromPath` to send NAR chunks).
+    pub async fn write_data(&mut self, data: &[u8]) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_WRITE).await?;
+        wire::write_bytes(&mut self.writer, data).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send STDERR_READ to request data from the client (used by `wopAddToStoreNar`).
+    pub async fn read_request(&mut self, count: u64) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_READ).await?;
+        wire::write_u64(&mut self.writer, count).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send STDERR_START_ACTIVITY. Returns the assigned activity ID.
+    pub async fn start_activity(
+        &mut self,
+        activity_type: ActivityType,
+        text: &str,
+        level: u64,
+        parent_id: u64,
+    ) -> Result<u64, WireError> {
+        let id = self.next_activity_id;
+        self.next_activity_id += 1;
+
+        wire::write_u64(&mut self.writer, STDERR_START_ACTIVITY).await?;
+        wire::write_u64(&mut self.writer, id).await?;
+        wire::write_u64(&mut self.writer, level).await?;
+        wire::write_u64(&mut self.writer, activity_type as u64).await?;
+        wire::write_string(&mut self.writer, text).await?;
+        wire::write_u64(&mut self.writer, 0).await?; // fieldsCount = 0
+        wire::write_u64(&mut self.writer, parent_id).await?;
+
+        self.writer.flush().await?;
+        Ok(id)
+    }
+
+    /// Send STDERR_STOP_ACTIVITY.
+    pub async fn stop_activity(&mut self, id: u64) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_STOP_ACTIVITY).await?;
+        wire::write_u64(&mut self.writer, id).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_stderr_log() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.log("hello world").await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_NEXT);
+        let msg = wire::read_string(&mut reader).await.unwrap();
+        assert_eq!(msg, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_stderr_last() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.finish().await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_LAST);
+    }
+
+    #[tokio::test]
+    async fn test_stderr_error_simple() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .error(&StderrError::simple("something broke"))
+            .await
+            .unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_ERROR);
+
+        let error_type = wire::read_string(&mut reader).await.unwrap();
+        assert_eq!(error_type, "Error");
+
+        let level = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(level, 0);
+
+        let name = wire::read_string(&mut reader).await.unwrap();
+        assert_eq!(name, "rio-build");
+
+        let message = wire::read_string(&mut reader).await.unwrap();
+        assert_eq!(message, "something broke");
+
+        let have_pos = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(have_pos, 0); // no position
+
+        let trace_count = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(trace_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_stderr_write_data() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.write_data(b"NAR data here").await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_WRITE);
+        let data = wire::read_string(&mut reader).await.unwrap();
+        assert_eq!(data, "NAR data here");
+    }
+
+    #[tokio::test]
+    async fn test_stderr_activity_ids() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        let id1 = writer
+            .start_activity(ActivityType::Build, "building foo", 0, 0)
+            .await
+            .unwrap();
+        let id2 = writer
+            .start_activity(ActivityType::CopyPath, "copying bar", 0, id1)
+            .await
+            .unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+    }
+}

@@ -1,5 +1,5 @@
 [workspace]
-members = ["rio-build"]
+members = ["rio-build", "rio-nix", "rio-proto"]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +10,45 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lovesegfault/rio-build"
 
 [workspace.dependencies]
+# Internal crates
+rio-nix = { path = "rio-nix" }
+rio-proto = { path = "rio-proto" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SSH server
+russh = "0.57"
+ssh-key = { version = "0.6", features = ["ed25519", "std"] }
+async-trait = "0.1"
+
+# Logging & metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# Crypto
+sha2 = "0.10"
+base64 = "0.22"
+
+# Encoding
+hex = "0.4"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.0"
+
+# Byte handling
+bytes = "1"
+
+# Testing
+proptest = "1"
 
 [profile.release]
 lto = "thin"
