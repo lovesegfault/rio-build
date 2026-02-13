@@ -1,0 +1,25 @@
+[package]
+name = "rio-nix-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rio-nix = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[[bin]]
+name = "wire_primitives"
+path = "fuzz_targets/wire_primitives.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "opcode_parsing"
+path = "fuzz_targets/opcode_parsing.rs"
+test = false
+doc = false

@@ -12,6 +12,7 @@ use super::handler::{self, ClientOptions};
 use crate::store::Store;
 
 /// Runs the Nix worker protocol on separate read/write streams.
+#[tracing::instrument(name = "session", skip_all)]
 pub async fn run_protocol<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -29,7 +30,7 @@ where
     match handshake::server_handshake_split(reader, writer, &version_string).await {
         Ok(result) => {
             let (major, minor) = handshake::decode_version(result.client_version);
-            metrics::counter!("rio_handshakes_total", "result" => "success").increment(1);
+            metrics::counter!("rio_gateway_handshakes_total", "result" => "success").increment(1);
             info!(
                 client_version = format!("{major}.{minor}"),
                 "handshake complete"
@@ -39,7 +40,7 @@ where
             client_major,
             client_minor,
         }) => {
-            metrics::counter!("rio_handshakes_total", "result" => "rejected").increment(1);
+            metrics::counter!("rio_gateway_handshakes_total", "result" => "rejected").increment(1);
             warn!(
                 client_version = format!("{client_major}.{client_minor}"),
                 "rejecting client: protocol version too old"
@@ -53,7 +54,7 @@ where
             return Ok(());
         }
         Err(e) => {
-            metrics::counter!("rio_handshakes_total", "result" => "failed").increment(1);
+            metrics::counter!("rio_gateway_handshakes_total", "result" => "failed").increment(1);
             warn!(error = %e, "handshake failed");
             return Ok(());
         }

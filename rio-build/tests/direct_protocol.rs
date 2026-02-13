@@ -325,6 +325,150 @@ async fn test_nar_from_path() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_query_path_from_hash_part() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopQueryPathFromHashPart (29): send a hash part string
+            wire::write_u64(&mut s, 29).await.unwrap();
+            wire::write_string(&mut s, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(path.is_empty(), "expected empty string (stub), got: {path}");
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_signatures() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddSignatures (37): send a path + string collection of sigs
+            wire::write_u64(&mut s, 37).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            let sigs = vec![
+                "cache.example.com:fakesig1".to_string(),
+                "cache.example.com:fakesig2".to_string(),
+            ];
+            wire::write_strings(&mut s, &sigs).await.unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1);
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_missing() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopQueryMissing (40): send a string collection of paths
+            wire::write_u64(&mut s, 40).await.unwrap();
+            let paths = vec![
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string(),
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0".to_string(),
+            ];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // willBuild: only the missing path
+            let will_build = wire::read_strings(&mut s).await.unwrap();
+            assert_eq!(will_build.len(), 1);
+            assert!(
+                will_build[0].contains("missing-1.0"),
+                "expected missing path in willBuild, got: {:?}",
+                will_build
+            );
+
+            // willSubstitute: empty
+            let will_substitute = wire::read_strings(&mut s).await.unwrap();
+            assert!(will_substitute.is_empty(), "expected empty willSubstitute");
+
+            // unknown: empty
+            let unknown = wire::read_strings(&mut s).await.unwrap();
+            assert!(unknown.is_empty(), "expected empty unknown");
+
+            // downloadSize: 0
+            let download_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(download_size, 0);
+
+            // narSize: 0
+            let nar_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(nar_size, 0);
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_set_options_with_overrides() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopSetOptions (19): send with non-zero values and 2 override pairs
+            wire::write_u64(&mut s, 19).await.unwrap();
+            wire::write_u64(&mut s, 1).await.unwrap(); // keepFailed = true
+            wire::write_u64(&mut s, 1).await.unwrap(); // keepGoing = true
+            wire::write_u64(&mut s, 0).await.unwrap(); // tryFallback = false
+            wire::write_u64(&mut s, 2).await.unwrap(); // verbosity = 2
+            wire::write_u64(&mut s, 4).await.unwrap(); // maxBuildJobs = 4
+            wire::write_u64(&mut s, 300).await.unwrap(); // maxSilentTime = 300
+            wire::write_u64(&mut s, 0).await.unwrap(); // obsolete useBuildHook
+            wire::write_u64(&mut s, 1).await.unwrap(); // verboseBuild = true
+            wire::write_u64(&mut s, 0).await.unwrap(); // obsolete logType
+            wire::write_u64(&mut s, 0).await.unwrap(); // obsolete printBuildTrace
+            wire::write_u64(&mut s, 8).await.unwrap(); // buildCores = 8
+            wire::write_u64(&mut s, 1).await.unwrap(); // useSubstitutes = true
+            // override pairs: count = 2
+            wire::write_u64(&mut s, 2).await.unwrap();
+            wire::write_string(&mut s, "max-jobs").await.unwrap();
+            wire::write_string(&mut s, "16").await.unwrap();
+            wire::write_string(&mut s, "cores").await.unwrap();
+            wire::write_string(&mut s, "8").await.unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1);
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_unknown_opcode_closes_connection() {
     let store = Arc::new(MemoryStore::new());
     run_test(store, |s| {

@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        protocol_version = "1.37",
+        protocol_version = "1.38",
         "starting rio-build"
     );
 

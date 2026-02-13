@@ -141,14 +141,24 @@ pub fn import_from_nix_store(store_path: &str) -> Option<(PathInfo, Vec<u8>)> {
 
     let ca = info.get("ca").and_then(|c| c.as_str()).map(String::from);
 
+    let registration_time = info
+        .get("registrationTime")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+
+    let ultimate = info
+        .get("ultimate")
+        .and_then(|u| u.as_bool())
+        .unwrap_or(false);
+
     let path_info = PathInfo {
         path,
         deriver,
         nar_hash,
         references,
-        registration_time: 0,
+        registration_time,
         nar_size,
-        ultimate: false,
+        ultimate,
         sigs,
         ca,
     };

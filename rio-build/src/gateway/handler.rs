@@ -10,7 +10,7 @@ use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::store::Store;
 
@@ -38,6 +38,7 @@ pub struct ClientOptions {
 /// Returns `Ok(())` on success. On protocol errors, sends STDERR_ERROR
 /// and returns `Ok(())` (the connection stays open). Returns `Err` only
 /// for I/O errors that prevent further communication.
+#[instrument(skip_all, fields(opcode))]
 pub async fn handle_opcode<R, W>(
     opcode: u64,
     reader: &mut R,
@@ -56,7 +57,8 @@ where
     let op_name = WorkerOp::from_u64(opcode)
         .map(|op| op.name())
         .unwrap_or("unknown");
-    metrics::counter!("rio_opcodes_total", "opcode" => op_name).increment(1);
+    tracing::Span::current().record("opcode", op_name);
+    metrics::counter!("rio_gateway_opcodes_total", "opcode" => op_name).increment(1);
 
     let result = match WorkerOp::from_u64(opcode) {
         Some(WorkerOp::IsValidPath) => handle_is_valid_path(reader, &mut stderr, store).await,
@@ -71,7 +73,7 @@ where
             handle_query_path_from_hash_part(reader, &mut stderr).await
         }
         Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr).await,
-        Some(WorkerOp::QueryMissing) => handle_query_missing(reader, &mut stderr).await,
+        Some(WorkerOp::QueryMissing) => handle_query_missing(reader, &mut stderr, store).await,
         Some(op) => {
             warn!(
                 opcode = opcode,
@@ -108,11 +110,11 @@ where
     };
 
     let elapsed = start.elapsed();
-    metrics::histogram!("rio_opcode_duration_seconds", "opcode" => op_name)
+    metrics::histogram!("rio_gateway_opcode_duration_seconds", "opcode" => op_name)
         .record(elapsed.as_secs_f64());
 
     if result.is_err() {
-        metrics::counter!("rio_errors_total", "type" => "protocol").increment(1);
+        metrics::counter!("rio_gateway_errors_total", "type" => "protocol").increment(1);
     }
 
     result
@@ -349,20 +351,33 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// wopQueryMissing (40): Report what needs building.
 ///
-/// For Phase 1a, returns everything as willBuild (nothing can be substituted,
-/// nothing is unknown since we know about all paths in our store).
+/// Checks the store for paths that already exist and excludes them from
+/// `willBuild`. Paths not in the store are returned as needing building.
 async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
 ) -> anyhow::Result<()> {
     let paths = wire::read_strings(reader).await?;
     debug!(count = paths.len(), "wopQueryMissing");
 
+    // Check which paths already exist in the store
+    let mut will_build = Vec::new();
+    for path_str in &paths {
+        let is_valid = match StorePath::parse(path_str) {
+            Ok(sp) => store.is_valid_path(&sp).await.unwrap_or(false),
+            Err(_) => false,
+        };
+        if !is_valid {
+            will_build.push(path_str.clone());
+        }
+    }
+
     stderr.finish().await?;
     let w = stderr.inner_mut();
 
-    // willBuild: return all requested paths (conservative: assume nothing is cached)
-    wire::write_strings(w, &paths).await?;
+    // willBuild: paths not already in the store
+    wire::write_strings(w, &will_build).await?;
     // willSubstitute: always empty (rio-build doesn't use external substituters)
     let empty: Vec<String> = vec![];
     wire::write_strings(w, &empty).await?;

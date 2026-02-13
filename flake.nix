@@ -152,6 +152,8 @@
           pre-commit = {
             check.enable = true;
 
+            settings.excludes = [ "docs/mermaid\\.min\\.js$" ];
+
             settings.hooks = {
               treefmt.enable = true;
               convco.enable = true;
@@ -222,6 +224,7 @@
                 cargoNextestExtraArgs = "--no-tests=warn";
                 nativeCheckInputs = with pkgs; [
                   nix
+                  openssh
                 ];
               }
             );
@@ -240,9 +243,14 @@
               // {
                 inherit cargoArtifacts;
                 dontFixup = true;
-                nativeCheckInputs = with pkgs; [
-                  nix
-                ];
+                # cargoLlvmCov runs tests during the build phase (not check phase),
+                # so nativeCheckInputs won't be available. Use nativeBuildInputs.
+                nativeBuildInputs =
+                  (commonArgs.nativeBuildInputs or [ ])
+                  ++ (with pkgs; [
+                    nix
+                    openssh
+                  ]);
               }
             );
           };

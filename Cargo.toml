@@ -1,5 +1,6 @@
 [workspace]
 members = ["rio-build", "rio-nix", "rio-proto"]
+exclude = ["rio-nix/fuzz"]
 resolver = "2"
 
 [workspace.package]
