@@ -20,13 +20,6 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-
-    nix-eval-jobs = {
-      url = "github:nix-community/nix-eval-jobs";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.flake-parts.follows = "flake-parts";
-      inputs.treefmt-nix.follows = "treefmt-nix";
-    };
   };
 
   outputs =
@@ -66,7 +59,7 @@
               "clippy"
               "rustfmt"
             ];
-            targets = [ pkgs.hostPlatform.rust.rustcTarget ];
+            targets = [ pkgs.stdenv.hostPlatform.rust.rustcTarget ];
           };
 
           # Crane library for building Rust packages
@@ -118,7 +111,6 @@
 
             propagatedBuildInputs = with pkgs; [
               nix
-              inputs'.nix-eval-jobs.packages.default
             ];
           }
           // commonEnvVars;
@@ -199,7 +191,6 @@
                 gdb
 
                 # Nix tooling (fork with system-features support)
-                inputs'.nix-eval-jobs.packages.default
               ];
 
               # Shell hook for pre-commit
@@ -231,7 +222,6 @@
                 # Integration tests need nix commands available
                 nativeCheckInputs = with pkgs; [
                   nix
-                  inputs'.nix-eval-jobs.packages.default
                 ];
               }
             );
@@ -252,7 +242,6 @@
                 # Coverage tests also need nix commands available
                 nativeCheckInputs = with pkgs; [
                   nix
-                  inputs'.nix-eval-jobs.packages.default
                 ];
               }
             );
