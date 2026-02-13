@@ -122,7 +122,7 @@ impl TestEnv {
 /// - exec_request handling for `nix-daemon --stdio`
 /// - Nix worker protocol handshake (magic bytes + version negotiation)
 /// - wopSetOptions parsing
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_nix_store_ping() {
     // Initialize logging for test debugging
     let _ = tracing_subscriber::fmt()
