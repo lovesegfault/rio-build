@@ -121,6 +121,7 @@ where
 }
 
 /// wopIsValidPath (1): Check if a store path exists.
+#[instrument(skip_all)]
 async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -140,6 +141,7 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopQueryPathInfo (26): Return full path metadata.
+#[instrument(skip_all)]
 async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -200,6 +202,7 @@ async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopQueryValidPaths (31): Batch validity check.
+#[instrument(skip_all)]
 async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -224,6 +227,7 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopAddTempRoot (11): Register a temporary GC root.
+#[instrument(skip_all)]
 async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -240,6 +244,7 @@ async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopSetOptions (19): Accept client build configuration.
+#[instrument(skip_all)]
 async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -288,6 +293,7 @@ async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopNarFromPath (38): Export path as NAR via STDERR_WRITE chunks.
+#[instrument(skip_all)]
 async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -323,6 +329,7 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopQueryPathFromHashPart (29): Stubbed — returns empty string (no match).
+#[instrument(skip_all)]
 async fn handle_query_path_from_hash_part<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -336,6 +343,7 @@ async fn handle_query_path_from_hash_part<R: AsyncRead + Unpin, W: AsyncWrite + 
 }
 
 /// wopAddSignatures (37): Stubbed — accepts and discards signatures.
+#[instrument(skip_all)]
 async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
@@ -353,6 +361,7 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ///
 /// Checks the store for paths that already exist and excludes them from
 /// `willBuild`. Paths not in the store are returned as needing building.
+#[instrument(skip_all)]
 async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,

@@ -35,15 +35,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let log_format = match std::env::var("RIO_LOG_FORMAT")
-        .unwrap_or_else(|_| "pretty".to_string())
+        .unwrap_or_else(|_| "json".to_string())
         .as_str()
     {
-        "json" => observability::LogFormat::Json,
-        _ => observability::LogFormat::Pretty,
+        "pretty" => observability::LogFormat::Pretty,
+        _ => observability::LogFormat::Json,
     };
 
     // Initialize logging
     observability::init_logging(log_format, None);
+
+    // Root span carries the `component` field required by the observability spec.
+    // All child spans (and their log events) inherit it automatically.
+    let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

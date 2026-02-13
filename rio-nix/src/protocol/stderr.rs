@@ -340,4 +340,196 @@ mod tests {
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
     }
+
+    #[tokio::test]
+    async fn test_stderr_read_request() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.read_request(8192).await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_READ);
+        let count = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(count, 8192);
+    }
+
+    #[tokio::test]
+    async fn test_stderr_stop_activity() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.stop_activity(42).await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_STOP_ACTIVITY);
+        let id = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(id, 42);
+    }
+
+    #[tokio::test]
+    async fn test_stderr_result_with_int_fields() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .result(
+                7,
+                105, // Progress
+                &[
+                    ResultField::Int(10),
+                    ResultField::Int(100),
+                    ResultField::Int(3),
+                    ResultField::Int(0),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), STDERR_RESULT);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 7); // activity_id
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 105); // result_type
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 4); // field count
+
+        // Field 0: Int(10)
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0); // type = int
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 10);
+        // Field 1: Int(100)
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 100);
+        // Field 2: Int(3)
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 3);
+        // Field 3: Int(0)
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stderr_result_with_string_field() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .result(
+                3,
+                101, // BuildLogLine
+                &[ResultField::String("building phase: configure".to_string())],
+            )
+            .await
+            .unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), STDERR_RESULT);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 3); // activity_id
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 101); // result_type
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 1); // field count
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 1); // type = string
+        assert_eq!(
+            wire::read_string(&mut reader).await.unwrap(),
+            "building phase: configure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stderr_start_activity_wire_format() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        let id = writer
+            .start_activity(ActivityType::Build, "building /nix/store/...-hello", 2, 5)
+            .await
+            .unwrap();
+        assert_eq!(id, 1);
+
+        let mut reader = Cursor::new(&buf);
+        assert_eq!(
+            wire::read_u64(&mut reader).await.unwrap(),
+            STDERR_START_ACTIVITY
+        );
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 1); // id
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 2); // level
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 106); // type = Build
+        assert_eq!(
+            wire::read_string(&mut reader).await.unwrap(),
+            "building /nix/store/...-hello"
+        );
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0); // fieldsCount
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 5); // parentId
+    }
+
+    #[tokio::test]
+    async fn test_stderr_error_with_position_and_traces() {
+        let err = StderrError {
+            error_type: "nix::EvalError".to_string(),
+            level: 1,
+            name: "rio-build".to_string(),
+            message: "undefined variable 'foo'".to_string(),
+            position: Some(Position {
+                file: "default.nix".to_string(),
+                line: 42,
+                column: 10,
+            }),
+            traces: vec![
+                Trace {
+                    position: Some(Position {
+                        file: "flake.nix".to_string(),
+                        line: 7,
+                        column: 3,
+                    }),
+                    message: "while evaluating the attribute 'packages'".to_string(),
+                },
+                Trace {
+                    position: None,
+                    message: "while calling the 'import' builtin".to_string(),
+                },
+            ],
+        };
+
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.error(&err).await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), STDERR_ERROR);
+
+        // Error type
+        assert_eq!(
+            wire::read_string(&mut reader).await.unwrap(),
+            "nix::EvalError"
+        );
+        // Level
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 1);
+        // Name
+        assert_eq!(wire::read_string(&mut reader).await.unwrap(), "rio-build");
+        // Message
+        assert_eq!(
+            wire::read_string(&mut reader).await.unwrap(),
+            "undefined variable 'foo'"
+        );
+
+        // Position: havePos = 1
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 1);
+        assert_eq!(wire::read_string(&mut reader).await.unwrap(), "default.nix");
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 42);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 10);
+
+        // Traces: count = 2
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 2);
+
+        // Trace 0: with position
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 1); // havePos
+        assert_eq!(wire::read_string(&mut reader).await.unwrap(), "flake.nix");
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 7);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 3);
+        assert_eq!(
+            wire::read_string(&mut reader).await.unwrap(),
+            "while evaluating the attribute 'packages'"
+        );
+
+        // Trace 1: no position
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0); // havePos
+        assert_eq!(
+            wire::read_string(&mut reader).await.unwrap(),
+            "while calling the 'import' builtin"
+        );
+    }
 }
