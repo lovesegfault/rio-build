@@ -87,6 +87,84 @@ impl Store for MemoryStore {
     }
 }
 
+/// Import a store path from the local Nix store by shelling out to `nix` CLI.
+///
+/// Calls `nix path-info --json <path>` for metadata and `nix-store --dump <path>`
+/// for NAR content. Requires `nix` in PATH. Returns `None` on any failure.
+#[allow(dead_code)]
+pub fn import_from_nix_store(store_path: &str) -> Option<(PathInfo, Vec<u8>)> {
+    use rio_nix::hash::NixHash;
+    use rio_nix::store_path::StorePath;
+    use std::process::Command;
+
+    // Get metadata via nix path-info --json
+    let output = Command::new("nix")
+        .args(["path-info", "--json", store_path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let info = json.as_object()?.get(store_path)?.as_object()?;
+
+    let path = StorePath::parse(store_path).ok()?;
+    let nar_hash_str = info.get("narHash")?.as_str()?;
+    let nar_hash = NixHash::parse(nar_hash_str).ok()?;
+    let nar_size = info.get("narSize")?.as_u64()?;
+
+    let references: Vec<StorePath> = info
+        .get("references")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| StorePath::parse(s).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let deriver = info
+        .get("deriver")
+        .and_then(|d| d.as_str())
+        .and_then(|s| StorePath::parse(s).ok());
+
+    let sigs: Vec<String> = info
+        .get("signatures")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let ca = info.get("ca").and_then(|c| c.as_str()).map(String::from);
+
+    let path_info = PathInfo {
+        path,
+        deriver,
+        nar_hash,
+        references,
+        registration_time: 0,
+        nar_size,
+        ultimate: false,
+        sigs,
+        ca,
+    };
+
+    // Get NAR content via nix-store --dump
+    let nar_output = Command::new("nix-store")
+        .args(["--dump", store_path])
+        .output()
+        .ok()?;
+    if !nar_output.status.success() {
+        return None;
+    }
+
+    Some((path_info, nar_output.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use rio_nix::hash::{HashAlgo, NixHash};
