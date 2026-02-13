@@ -50,15 +50,24 @@ pub enum HandshakeError {
 
 /// Perform the server-side handshake over an async stream.
 ///
-/// Steps:
-/// 1. Read `WORKER_MAGIC_1` (u32) from client
-/// 2. Write `WORKER_MAGIC_2` (u32) to client
-/// 3. Write our protocol version (u64)
-/// 4. Read client protocol version (u64)
-/// 5. Read obsolete CPU affinity (u64, discard)
-/// 6. Read `reserveSpace` (u64, discard)
-/// 7. Write version string (padded string)
-/// 8. Write trusted status: 1 (u64)
+/// All values are u64 LE on the wire (including magic bytes).
+///
+/// Phase 1 — Magic + version exchange:
+/// 1. Read `WORKER_MAGIC_1` (u64) from client
+/// 2. Write `WORKER_MAGIC_2` (u64) + protocol version (u64) to client; flush
+/// 3. Read client protocol version (u64)
+///
+/// Phase 2 — Feature exchange (protocol >= 1.38):
+/// 4. Read client features (string collection)
+/// 5. Write server features (string collection); flush
+///
+/// Phase 3 — Post-handshake:
+/// 6. Read obsolete CPU affinity (u64, if non-zero read mask u64)
+/// 7. Read `reserveSpace` (u64, discard)
+/// 8. Write version string (padded string) + trusted status (u64); flush
+///
+/// Phase 4 — Initial STDERR_LAST:
+/// 9. Write STDERR_LAST (u64); flush
 ///
 /// On error, the caller should send `STDERR_ERROR` and close the connection.
 pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(

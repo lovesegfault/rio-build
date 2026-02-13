@@ -1,6 +1,6 @@
 //! Nix worker protocol wire format primitives.
 //!
-//! All integers are 64-bit unsigned, little-endian (except handshake magic which is u32).
+//! All integers are 64-bit unsigned, little-endian — including handshake magic bytes.
 //! Strings are length-prefixed and padded to 8-byte boundaries.
 //! Collections are count-prefixed.
 
@@ -52,13 +52,6 @@ pub async fn read_u64<R: AsyncRead + Unpin>(r: &mut R) -> Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf).await?;
     Ok(u64::from_le_bytes(buf))
-}
-
-/// Read a little-endian u32 (only used for handshake magic bytes).
-pub async fn read_u32<R: AsyncRead + Unpin>(r: &mut R) -> Result<u32> {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf).await?;
-    Ok(u32::from_le_bytes(buf))
 }
 
 /// Read a u64-encoded boolean (0 = false, nonzero = true).
@@ -137,12 +130,6 @@ pub async fn write_u64<W: AsyncWrite + Unpin>(w: &mut W, val: u64) -> Result<()>
     Ok(())
 }
 
-/// Write a little-endian u32 (only used for handshake magic bytes).
-pub async fn write_u32<W: AsyncWrite + Unpin>(w: &mut W, val: u32) -> Result<()> {
-    w.write_all(&val.to_le_bytes()).await?;
-    Ok(())
-}
-
 /// Write a u64-encoded boolean.
 pub async fn write_bool<W: AsyncWrite + Unpin>(w: &mut W, val: bool) -> Result<()> {
     write_u64(w, u64::from(val)).await
@@ -215,17 +202,6 @@ mod tests {
             assert_eq!(buf.len(), 8);
             let mut reader = Cursor::new(buf);
             assert_eq!(read_u64(&mut reader).await.unwrap(), val);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_u32_roundtrip() {
-        for val in [0u32, 1, 0x6e697863, u32::MAX] {
-            let mut buf = Vec::new();
-            write_u32(&mut buf, val).await.unwrap();
-            assert_eq!(buf.len(), 4);
-            let mut reader = Cursor::new(buf);
-            assert_eq!(read_u32(&mut reader).await.unwrap(), val);
         }
     }
 
@@ -386,6 +362,59 @@ mod tests {
                     let mut reader = Cursor::new(buf);
                     let result = read_bool(&mut reader).await.unwrap();
                     prop_assert_eq!(result, val);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn roundtrip_string(s in "[a-zA-Z0-9 /._-]{0,200}") {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_string(&mut buf, &s).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_string(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, s);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn roundtrip_strings(items in proptest::collection::vec("[a-zA-Z0-9/_-]{0,50}", 0..20)) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let items: Vec<String> = items.into_iter().collect();
+                    let mut buf = Vec::new();
+                    write_strings(&mut buf, &items).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_strings(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, items);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn roundtrip_string_pairs(
+                pairs in proptest::collection::vec(
+                    ("[a-zA-Z_]{1,20}", "[a-zA-Z0-9 ]{0,50}"),
+                    0..10
+                )
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let pairs: Vec<(String, String)> = pairs.into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    let mut buf = Vec::new();
+                    // Write pairs manually (count + key/value)
+                    write_u64(&mut buf, pairs.len() as u64).await.unwrap();
+                    for (k, v) in &pairs {
+                        write_string(&mut buf, k).await.unwrap();
+                        write_string(&mut buf, v).await.unwrap();
+                    }
+                    let mut reader = Cursor::new(buf);
+                    let result = read_string_pairs(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, pairs);
                     Ok(())
                 })?;
             }

@@ -204,6 +204,51 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         self.writer.flush().await?;
         Ok(())
     }
+
+    /// Send STDERR_RESULT with structured result data for an activity.
+    ///
+    /// The result type determines the interpretation of the fields.
+    /// Common result types:
+    /// - 100 (FileLinked): [u64 fileSize, u64 blocksFreed]
+    /// - 101 (BuildLogLine): [string line]
+    /// - 102 (UntrustedPath): [string path]
+    /// - 103 (CorruptedPath): [string path]
+    /// - 104 (SetPhase): [string phase]
+    /// - 105 (Progress): [u64 done, u64 expected, u64 running, u64 failed]
+    /// - 106 (SetExpected): [u64 type, u64 expected]
+    /// - 107 (PostBuildLogLine): [string line]
+    pub async fn result(
+        &mut self,
+        activity_id: u64,
+        result_type: u64,
+        fields: &[ResultField],
+    ) -> Result<(), WireError> {
+        wire::write_u64(&mut self.writer, STDERR_RESULT).await?;
+        wire::write_u64(&mut self.writer, activity_id).await?;
+        wire::write_u64(&mut self.writer, result_type).await?;
+        wire::write_u64(&mut self.writer, fields.len() as u64).await?;
+        for field in fields {
+            match field {
+                ResultField::Int(v) => {
+                    wire::write_u64(&mut self.writer, 0).await?; // type 0 = int
+                    wire::write_u64(&mut self.writer, *v).await?;
+                }
+                ResultField::String(s) => {
+                    wire::write_u64(&mut self.writer, 1).await?; // type 1 = string
+                    wire::write_string(&mut self.writer, s).await?;
+                }
+            }
+        }
+        self.writer.flush().await?;
+        Ok(())
+    }
+}
+
+/// A typed field in a STDERR_RESULT message.
+#[derive(Debug, Clone)]
+pub enum ResultField {
+    Int(u64),
+    String(String),
 }
 
 #[cfg(test)]

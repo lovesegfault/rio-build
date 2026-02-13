@@ -111,8 +111,8 @@ impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
-        metrics::counter!("rio_connections_total", "result" => "new").increment(1);
-        metrics::gauge!("rio_connections_active").increment(1.0);
+        metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
+        metrics::gauge!("rio_gateway_connections_active").increment(1.0);
         info!(peer = ?peer_addr, "new SSH connection");
         ConnectionHandler {
             peer_addr,
@@ -152,6 +152,22 @@ pub struct ConnectionHandler {
     sessions: HashMap<ChannelId, ChannelSession>,
 }
 
+impl Drop for ConnectionHandler {
+    fn drop(&mut self) {
+        metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
+        // Also clean up any remaining channel gauges
+        let remaining_channels = self.sessions.len();
+        if remaining_channels > 0 {
+            metrics::gauge!("rio_gateway_channels_active").decrement(remaining_channels as f64);
+        }
+        debug!(
+            peer = ?self.peer_addr,
+            remaining_channels = remaining_channels,
+            "SSH connection handler dropped"
+        );
+    }
+}
+
 impl Handler for ConnectionHandler {
     type Error = anyhow::Error;
 
@@ -162,7 +178,7 @@ impl Handler for ConnectionHandler {
             .any(|authorized| authorized.key_data() == key.key_data());
 
         if key_matches {
-            metrics::counter!("rio_connections_total", "result" => "accepted").increment(1);
+            metrics::counter!("rio_gateway_connections_total", "result" => "accepted").increment(1);
             info!(
                 user = user,
                 peer = ?self.peer_addr,
@@ -170,7 +186,7 @@ impl Handler for ConnectionHandler {
             );
             Ok(Auth::Accept)
         } else {
-            metrics::counter!("rio_connections_total", "result" => "rejected").increment(1);
+            metrics::counter!("rio_gateway_connections_total", "result" => "rejected").increment(1);
             warn!(
                 user = user,
                 peer = ?self.peer_addr,
@@ -207,7 +223,7 @@ impl Handler for ConnectionHandler {
         }
 
         session.channel_success(channel_id)?;
-        metrics::gauge!("rio_channels_active").increment(1.0);
+        metrics::gauge!("rio_gateway_channels_active").increment(1.0);
 
         // Data pipeline using two independent DuplexStreams:
         //   client SSH data → mpsc → pump → inbound_writer ↔ inbound_reader → protocol reads
@@ -303,7 +319,7 @@ impl Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel EOF");
         if self.sessions.remove(&channel).is_some() {
-            metrics::gauge!("rio_channels_active").decrement(1.0);
+            metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
         }
         Ok(())
     }
@@ -315,7 +331,7 @@ impl Handler for ConnectionHandler {
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
         if self.sessions.remove(&channel).is_some() {
-            metrics::gauge!("rio_channels_active").decrement(1.0);
+            metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
         }
         Ok(())
     }
