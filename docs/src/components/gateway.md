@@ -286,22 +286,50 @@ Each **builtOutput** entry:
 - Collections: `u64(count) + elements`
 - Framed data (for NARs): sequence of `u64(chunk_len) + chunk_data` terminated by `u64(0)` --- chunk data is NOT padded (unlike strings)
 
-### Handshake Sequence (Protocol 1.37+)
+### Handshake Sequence (Protocol 1.38+)
 
-The handshake is the one place where the wire format deviates from the "all integers are u64" rule. The magic bytes are **u32**, the only exception in the entire protocol.
+> **Correction (discovered during implementation):** The original design stated that magic bytes are u32, the only exception to the u64 rule. This is incorrect. In the actual Nix C++ source, `readInt()` / `writeInt()` serialize all integers as u64 LE, **including the magic bytes**. The handshake uses u64 throughout, with no exceptions.
+
+The handshake has three phases: magic+version exchange (`BasicClientConnection::handshake`), feature exchange (protocol >= 1.38), and post-handshake (`postHandshake`).
+
+**Phase 1: Magic + Version Exchange**
 
 | Step | Direction | Data | Type |
 |------|-----------|------|------|
-| 1 | C -> S | `WORKER_MAGIC_1` (`0x6e697863`) | **u32** |
-| 2 | S -> C | `WORKER_MAGIC_2` (`0x6478696f`) | **u32** |
-| 3 | S -> C | Protocol version (encoded as `(major << 8) \| minor`, e.g. `0x125` = 1.37) | u64 |
+| 1 | C -> S | `WORKER_MAGIC_1` (`0x6e697863`) | u64 |
+| 2 | S -> C | `WORKER_MAGIC_2` (`0x6478696f`) | u64 |
+| 3 | S -> C | Protocol version (encoded as `(major << 8) \| minor`, e.g. `0x126` = 1.38) | u64 |
 | 4 | C -> S | Client protocol version | u64 |
-| 5 | C -> S | Obsolete CPU affinity (always 0) -- requires >= 1.14 | u64 |
-| 6 | C -> S | `reserveSpace` (always 0) -- requires >= 1.11 | u64 |
-| 7 | S -> C | Nix version string (e.g. `"rio-build 0.1.0"`) -- requires >= 1.33 | string |
-| 8 | S -> C | Trusted status: 0 = unknown, 1 = trusted, 2 = not-trusted -- requires >= 1.35 | u64 |
 
-Since we target 1.37+, all steps are always present. Note: steps 5 and 6 are both always present but have different minimum version requirements in the Nix source (1.14 and 1.11 respectively). The ordering is correct: CPU affinity first, then reserveSpace. If the client presents a version < 1.37 at step 4, the gateway should send `STDERR_ERROR` with a human-readable error message (e.g., "rio-build requires Nix protocol version 1.37+, client sent {version}") and close the connection. The server has already sent its version at step 3; rejection happens after receiving the client version at step 4.
+The negotiated version is `min(client_version, server_version)`. If the client version < 1.37, the server should send `STDERR_ERROR` and close the connection.
+
+**Phase 2: Feature Exchange (protocol >= 1.38)**
+
+| Step | Direction | Data | Type |
+|------|-----------|------|------|
+| 5 | C -> S | Client feature set | string collection |
+| 6 | S -> C | Server feature set | string collection |
+
+The feature sets are intersected to determine the negotiated features. rio-build currently advertises an empty feature set.
+
+**Phase 3: Post-Handshake (`postHandshake`)**
+
+| Step | Direction | Data | Type |
+|------|-----------|------|------|
+| 7 | C -> S | Obsolete CPU affinity (always 0; if non-zero, followed by a second u64 mask) | u64 |
+| 8 | C -> S | `reserveSpace` (always 0) | u64 |
+| 9 | S -> C | Nix version string (e.g. `"rio-build 0.1.0"`) | string |
+| 10 | S -> C | Trusted status: 0 = unknown, 1 = trusted, 2 = not-trusted | u64 |
+
+**Phase 4: Initial STDERR_LAST**
+
+| Step | Direction | Data | Type |
+|------|-----------|------|------|
+| 11 | S -> C | `STDERR_LAST` (`0x616c7473`) | u64 |
+
+The client calls `processStderrReturn()` after the handshake, which reads messages until `STDERR_LAST`. The server must send `STDERR_LAST` to complete the handshake before the client will send any opcodes.
+
+> **Note on flush points:** The server must flush after steps 2-3, after step 6, after steps 9-10, and after step 11. Without explicit flushes, data may remain buffered and the client will block waiting for the response.
 
 ## Protocol Multiplexing
 
@@ -323,19 +351,20 @@ When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it
 
 ## Connection Lifecycle
 
-Each SSH channel follows a strict lifecycle:
+Each SSH channel follows this lifecycle:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> handshake : SSH channel opened
-    handshake --> options : handshake complete (magic + version ok)
-    options --> ready : wopSetOptions received
-    ready --> ready : query/upload/build opcodes
+    [*] --> handshake : SSH channel opened + exec "nix-daemon --stdio"
+    handshake --> ready : handshake complete (magic + version + features + postHandshake + STDERR_LAST)
+    ready --> ready : any opcode (wopSetOptions, query, upload, build)
     ready --> [*] : SSH channel closed
     handshake --> [*] : version mismatch (STDERR_ERROR)
 ```
 
-**Enforcement:** The gateway MUST reject any opcode other than handshake bytes before the handshake completes. It MUST reject any opcode other than `wopSetOptions` before options are set. Violating clients receive `STDERR_ERROR` with type `"Error"` and message "protocol error: wopSetOptions must be the first opcode after handshake."
+> **Correction:** The original design required `wopSetOptions` as the mandatory first opcode after handshake. In practice, the real `nix-daemon` does not enforce this --- it accepts any opcode after the handshake completes. Nix clients conventionally send `wopSetOptions` first, but may send other opcodes (e.g., `wopQueryMissing`) first on multiplexed SSH channels. rio-build accepts any opcode after handshake.
+
+**SSH transport:** Nix connects via `ssh ... nix-daemon --stdio`. The gateway must handle `exec_request` for this command and start the protocol on the SSH channel data stream. The `channel_open_session` alone does not start the protocol.
 
 ## STDERR Message Types
 
@@ -403,9 +432,11 @@ Note: values 1--100 are unused. The enum starts at 0 (Unknown) then jumps to 101
 
 ## Protocol Compatibility
 
-Target: protocol version **1.37+** (Nix 2.20+). Older clients are rejected at handshake with a human-readable error.
+Target: protocol version **1.38+** (Nix 2.20+, advertised as `0x126`). Minimum accepted client version is 1.37. Older clients are rejected at handshake with a human-readable error.
 
-Unknown or unsupported opcodes return `STDERR_ERROR` with an appropriate message --- they never cause the connection to drop.
+> **Correction:** rio-build advertises protocol 1.38 (not 1.37) to support the feature exchange step added in that version. The minimum accepted client version remains 1.37 for backwards compatibility.
+
+Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection**. This is necessary because the opcode's payload remains unread in the stream and its format is unknown, making it impossible to skip to the next opcode without corrupting the protocol. The Nix client will reconnect automatically.
 
 | Category | Opcodes |
 |----------|---------|
