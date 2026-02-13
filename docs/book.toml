@@ -1,0 +1,18 @@
+[book]
+title = "rio-build"
+description = "Kubernetes-Native Distributed Build Backend for Nix"
+authors = ["Rio Contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+git-repository-url = "https://github.com/lovesegfault/rio-build"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
