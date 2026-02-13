@@ -11,7 +11,6 @@ use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
@@ -32,11 +31,9 @@ pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
         );
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
             .context("failed to generate host key")?;
-        // Try to save for reuse
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Write the key in OpenSSH format
         if let Err(e) = std::fs::write(path, key.to_openssh(ssh_key::LineEnding::LF)?) {
             warn!(error = %e, "could not save generated host key (continuing with ephemeral key)");
         }
@@ -118,28 +115,38 @@ impl russh::server::Server for GatewayServer {
             peer_addr,
             store: Arc::clone(&self.store),
             authorized_keys: Arc::clone(&self.authorized_keys),
-            channels: HashMap::new(),
+            pending_channels: HashMap::new(),
+            active_sessions: HashMap::new(),
         }
     }
 }
 
 /// Per-connection handler that manages SSH channels.
+///
+/// Lifecycle for each channel:
+/// 1. `channel_open_session` — accept channel, store it as pending
+/// 2. `exec_request("nix-daemon --stdio")` — start the protocol bridge
+/// 3. `data` — forward bytes to the protocol handler (only for channels
+///    where exec_request hasn't been received yet; after that the bridge task
+///    reads via `Channel::wait()`)
 pub struct ConnectionHandler {
     peer_addr: Option<SocketAddr>,
     store: Arc<dyn Store>,
     authorized_keys: Arc<Vec<PublicKey>>,
-    /// Active protocol sessions, indexed by channel ID.
-    channels: HashMap<ChannelId, tokio::task::JoinHandle<()>>,
+    /// Channels awaiting an exec request before starting the protocol.
+    pending_channels: HashMap<ChannelId, Channel<Msg>>,
+    /// Running protocol session tasks.
+    active_sessions: HashMap<ChannelId, tokio::task::JoinHandle<()>>,
 }
 
 impl Handler for ConnectionHandler {
     type Error = anyhow::Error;
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        let key_matches = self.authorized_keys.iter().any(|authorized| {
-            // Compare the key data (algorithm + public key bytes)
-            authorized.key_data() == key.key_data()
-        });
+        let key_matches = self
+            .authorized_keys
+            .iter()
+            .any(|authorized| authorized.key_data() == key.key_data());
 
         if key_matches {
             info!(
@@ -165,81 +172,43 @@ impl Handler for ConnectionHandler {
     ) -> Result<bool, Self::Error> {
         let channel_id = channel.id();
         info!(channel = ?channel_id, "SSH session channel opened");
+        // Store the channel; protocol starts when exec_request arrives
+        self.pending_channels.insert(channel_id, channel);
+        Ok(true)
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel_id: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(data);
+        info!(channel = ?channel_id, command = %command, "exec request");
+
+        // Nix sends "nix-daemon --stdio" for ssh-ng:// connections
+        if !command.contains("nix-daemon") || !command.contains("--stdio") {
+            warn!(command = %command, "rejecting non-nix-daemon exec request");
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        }
+
+        session.channel_success(channel_id)?;
+        session.flush()?;
+
+        // Take the pending channel and start the protocol bridge
+        let Some(channel) = self.pending_channels.remove(&channel_id) else {
+            warn!(channel = ?channel_id, "exec_request for unknown channel");
+            return Ok(());
+        };
 
         let store = Arc::clone(&self.store);
-
-        // Spawn a task bridging the SSH channel to the Nix protocol handler.
-        //
-        // Architecture: two duplex pipes connect the SSH channel to the protocol:
-        //   SSH channel (client data) → pipe_writer → [pipe_reader] → protocol reader
-        //   protocol writer → [resp_writer] → resp_reader → SSH channel (server data)
         let handle = tokio::spawn(async move {
-            let mut ch = channel;
-
-            // Pipe for client→server data
-            let (pipe_reader, mut pipe_writer) = tokio::io::duplex(256 * 1024);
-            // Pipe for server→client data
-            let (resp_reader, resp_writer) = tokio::io::duplex(256 * 1024);
-
-            // Protocol handler task: reads from pipe_reader, writes to resp_writer
-            let proto_handle = tokio::spawn(async move {
-                let (mut pr, mut rw) = (pipe_reader, resp_writer);
-                if let Err(e) = run_protocol(&mut pr, &mut rw, store.as_ref()).await {
-                    error!(error = %e, "protocol session error");
-                }
-            });
-
-            // Bridge task: shuttle bytes between SSH channel and the pipes
-            let mut resp_reader = resp_reader;
-            loop {
-                tokio::select! {
-                    // Data from SSH channel → protocol handler
-                    msg = ch.wait() => {
-                        match msg {
-                            Some(russh::ChannelMsg::Data { data }) => {
-                                if pipe_writer.write_all(&data).await.is_err() {
-                                    break;
-                                }
-                                if pipe_writer.flush().await.is_err() {
-                                    break;
-                                }
-                            }
-                            Some(russh::ChannelMsg::Eof) | None => {
-                                debug!("SSH channel EOF or closed");
-                                drop(pipe_writer);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Data from protocol handler → SSH channel
-                    n = async {
-                        let mut buf = vec![0u8; 64 * 1024];
-                        resp_reader.read(&mut buf).await.map(|n| (n, buf))
-                    } => {
-                        match n {
-                            Ok((0, _)) => break,
-                            Ok((n, buf)) => {
-                                if ch.data(&buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "error reading protocol response");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let _ = proto_handle.await;
-            debug!(channel = ?channel_id, "protocol session ended");
+            run_channel_protocol(channel, store, channel_id).await;
         });
 
-        self.channels.insert(channel_id, handle);
-        Ok(true)
+        self.active_sessions.insert(channel_id, handle);
+        Ok(())
     }
 
     async fn channel_close(
@@ -248,9 +217,34 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
-        if let Some(handle) = self.channels.remove(&channel) {
+        self.pending_channels.remove(&channel);
+        if let Some(handle) = self.active_sessions.remove(&channel) {
             handle.abort();
         }
         Ok(())
     }
+}
+
+/// Run the Nix worker protocol on an SSH channel.
+///
+/// Converts the channel into a `ChannelStream` (which implements
+/// `AsyncRead + AsyncWrite`) and runs the protocol directly on it.
+async fn run_channel_protocol(
+    mut channel: Channel<Msg>,
+    store: Arc<dyn Store>,
+    channel_id: ChannelId,
+) {
+    // Use make_reader + make_writer to get AsyncRead + AsyncWrite on the channel.
+    // make_writer() returns an owned writer, make_reader() borrows the channel.
+    let writer = channel.make_writer();
+    let reader = channel.make_reader();
+
+    // Combine into a single stream for the protocol handler
+    let mut stream = tokio::io::join(reader, writer);
+
+    if let Err(e) = run_protocol(&mut stream, store.as_ref()).await {
+        error!(error = %e, "protocol session error");
+    }
+
+    debug!(channel = ?channel_id, "protocol session ended");
 }
