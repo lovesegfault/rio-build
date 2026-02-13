@@ -1,43 +1,15 @@
-//! Golden fixture recorder.
+//! Live nix-daemon management for golden conformance tests.
 //!
-//! Connects to the real nix-daemon socket, sends constructed client bytes,
-//! and saves both client and server byte streams as binary fixtures.
-//!
-//! Gated behind `RECORD_GOLDEN=1` — skipped by default.
+//! Spins up an isolated nix-daemon on a temporary Unix socket,
+//! performs interactive protocol exchanges, and captures both
+//! client and server byte streams for comparison against rio-build.
 
 use std::path::Path;
 
-use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use super::{
-    build_add_temp_root_bytes, build_is_valid_path_bytes, build_query_path_info_bytes,
-    build_query_valid_paths_bytes, fixtures_dir,
-};
-
-/// Metadata written alongside binary fixtures.
-#[derive(Serialize)]
-struct FixtureMeta {
-    nix_version: String,
-    description: String,
-    skip_fields: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    store_paths: Vec<StorePathMeta>,
-}
-
-#[derive(Serialize)]
-struct StorePathMeta {
-    path: String,
-    deriver: Option<String>,
-    nar_hash: String,
-    references: Vec<String>,
-    registration_time: u64,
-    nar_size: u64,
-    ultimate: bool,
-    sigs: Vec<String>,
-    ca: Option<String>,
-}
+use super::StorePathEntry;
 
 /// Default nix-daemon socket path.
 const DEFAULT_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
@@ -49,7 +21,7 @@ const DEFAULT_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 /// and reads server responses between them.
 ///
 /// Returns (all_client_bytes, all_server_bytes) for the complete session.
-async fn exchange_with_daemon(
+pub async fn exchange_with_daemon(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
@@ -149,7 +121,7 @@ async fn exchange_with_daemon(
         let mut op_response = Vec::new();
         loop {
             let mut buf = vec![0u8; 8192];
-            match tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
                 .await
             {
                 Ok(Ok(0)) => break,
@@ -164,17 +136,8 @@ async fn exchange_with_daemon(
     Ok((all_client, all_server))
 }
 
-/// Get the installed nix version string.
-fn nix_version() -> String {
-    let output = std::process::Command::new("nix")
-        .arg("--version")
-        .output()
-        .expect("nix must be in PATH");
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
 /// Build a test store path and return its full path string.
-fn build_test_path() -> String {
+pub fn build_test_path() -> String {
     let output = std::process::Command::new("nix")
         .args([
             "build",
@@ -195,7 +158,7 @@ fn build_test_path() -> String {
 }
 
 /// Query path info from the real nix store via `nix path-info --json`.
-fn query_path_info_json(store_path: &str) -> StorePathMeta {
+pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
     let output = std::process::Command::new("nix")
         .args(["path-info", "--json", store_path])
         .output()
@@ -257,7 +220,7 @@ fn query_path_info_json(store_path: &str) -> StorePathMeta {
         .and_then(|u| u.as_bool())
         .unwrap_or(false);
 
-    StorePathMeta {
+    StorePathEntry {
         path: store_path.to_string(),
         deriver,
         nar_hash,
@@ -270,30 +233,8 @@ fn query_path_info_json(store_path: &str) -> StorePathMeta {
     }
 }
 
-/// Save a fixture set to disk.
-fn save_fixture(name: &str, client_bytes: &[u8], server_bytes: &[u8], meta: &FixtureMeta) {
-    let dir = fixtures_dir();
-    std::fs::create_dir_all(&dir).expect("create fixtures dir");
-
-    let write = |suffix: &str, data: &[u8]| {
-        let path = dir.join(format!("{name}.{suffix}"));
-        std::fs::write(&path, data)
-            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
-        eprintln!("  wrote {} ({} bytes)", path.display(), data.len());
-    };
-
-    write("client.bin", client_bytes);
-    write("server.bin", server_bytes);
-
-    let meta_json = serde_json::to_string_pretty(meta).expect("serialize meta");
-    let meta_path = dir.join(format!("{name}.meta.json"));
-    std::fs::write(&meta_path, meta_json)
-        .unwrap_or_else(|e| panic!("failed to write {}: {e}", meta_path.display()));
-    eprintln!("  wrote {}", meta_path.display());
-}
-
 /// RAII guard that stops a nix-daemon process and cleans up its temp dir.
-struct DaemonGuard {
+pub struct DaemonGuard {
     child: std::process::Child,
     _temp_dir: tempfile::TempDir,
 }
@@ -310,7 +251,7 @@ impl Drop for DaemonGuard {
 /// Uses the real store database by symlinking `/nix/var/nix/*` into a temp
 /// dir, then pointing `NIX_STATE_DIR` there. The daemon gets a fresh socket
 /// but can see all existing store paths.
-fn start_local_daemon() -> (String, DaemonGuard) {
+pub fn start_local_daemon() -> (String, DaemonGuard) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     // Symlink real store state into the temp dir (skip daemon-socket and gc-socket)
@@ -357,158 +298,21 @@ fn start_local_daemon() -> (String, DaemonGuard) {
     );
 }
 
-/// Record all golden fixtures from a real nix-daemon.
+/// Find or start a nix-daemon and return its socket path with an optional guard.
 ///
-/// This test is skipped unless `RECORD_GOLDEN=1` is set.
-/// It requires `nix` and `nix-daemon` in PATH. If no existing daemon
-/// socket is found, it starts a temporary one automatically.
-#[tokio::test]
-async fn record_golden_fixtures() {
-    if std::env::var("RECORD_GOLDEN").is_err() {
-        eprintln!("skipping: set RECORD_GOLDEN=1 to record golden fixtures");
-        return;
-    }
-
-    let (socket, _daemon_guard);
-
+/// Checks `NIX_DAEMON_SOCKET` env var, then the default socket path,
+/// and falls back to starting a local daemon.
+pub fn get_daemon_socket() -> (String, Option<DaemonGuard>) {
     if let Ok(s) = std::env::var("NIX_DAEMON_SOCKET") {
         if Path::new(&s).exists() {
-            socket = s;
-            _daemon_guard = None;
-        } else {
-            eprintln!("NIX_DAEMON_SOCKET={s} not found, starting local daemon");
-            let (s, g) = start_local_daemon();
-            socket = s;
-            _daemon_guard = Some(g);
+            return (s, None);
         }
+        eprintln!("NIX_DAEMON_SOCKET={s} not found, starting local daemon");
     } else if Path::new(DEFAULT_SOCKET).exists() {
-        socket = DEFAULT_SOCKET.to_string();
-        _daemon_guard = None;
+        return (DEFAULT_SOCKET.to_string(), None);
     } else {
         eprintln!("no nix-daemon socket found, starting local daemon");
-        let (s, g) = start_local_daemon();
-        socket = s;
-        _daemon_guard = Some(g);
     }
-
-    let version = nix_version();
-    eprintln!("recording golden fixtures with {version}");
-    eprintln!("using socket: {socket}");
-
-    // Build a test path we can query
-    eprintln!("building test store path...");
-    let test_path = build_test_path();
-    eprintln!("test path: {test_path}");
-
-    let _path_info = query_path_info_json(&test_path);
-
-    // Fields that legitimately differ between nix-daemon and rio-build:
-    // - version_string: different implementation names
-    // - trusted: nix-daemon may report 0 for non-root users
-    let skip_fields = vec!["version_string".to_string(), "trusted".to_string()];
-
-    // A path that definitely doesn't exist
-    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
-
-    // Helper to record a fixture with the interactive exchange
-    macro_rules! record {
-        ($name:expr, $desc:expr, $skip:expr, $store:expr, $opcode:expr) => {{
-            let (client, server) = exchange_with_daemon(&socket, $opcode)
-                .await
-                .expect(concat!($name, " exchange"));
-            save_fixture(
-                $name,
-                &client,
-                &server,
-                &FixtureMeta {
-                    nix_version: version.clone(),
-                    description: $desc.to_string(),
-                    skip_fields: $skip,
-                    store_paths: $store,
-                },
-            );
-        }};
-    }
-
-    // --- Record: handshake only ---
-    record!(
-        "handshake",
-        "Handshake only (magic + version + features + post-handshake)",
-        skip_fields.clone(),
-        vec![],
-        None
-    );
-
-    // --- Record: handshake + set_options (no extra opcode) ---
-    record!(
-        "set_options",
-        "Handshake + wopSetOptions with default values",
-        skip_fields.clone(),
-        vec![],
-        None
-    );
-
-    // --- Record: is_valid_path (found) ---
-    {
-        let op = build_is_valid_path_bytes(&test_path).await;
-        record!(
-            "is_valid_path_found",
-            "Handshake + SetOptions + wopIsValidPath for existing path",
-            skip_fields.clone(),
-            vec![query_path_info_json(&test_path)],
-            Some(op.as_slice())
-        );
-    }
-
-    // --- Record: is_valid_path (not found) ---
-    {
-        let op = build_is_valid_path_bytes(nonexistent).await;
-        record!(
-            "is_valid_path_not_found",
-            "Handshake + SetOptions + wopIsValidPath for nonexistent path",
-            skip_fields.clone(),
-            vec![],
-            Some(op.as_slice())
-        );
-    }
-
-    // --- Record: query_path_info ---
-    {
-        let mut skip_with_reg_time = skip_fields.clone();
-        skip_with_reg_time.push("reg_time".to_string());
-        let op = build_query_path_info_bytes(&test_path).await;
-        record!(
-            "query_path_info",
-            "Handshake + SetOptions + wopQueryPathInfo for existing path",
-            skip_with_reg_time,
-            vec![query_path_info_json(&test_path)],
-            Some(op.as_slice())
-        );
-    }
-
-    // --- Record: query_valid_paths ---
-    {
-        let op = build_query_valid_paths_bytes(&[&test_path, nonexistent], false).await;
-        record!(
-            "query_valid_paths",
-            "Handshake + SetOptions + wopQueryValidPaths with one existing and one missing path",
-            skip_fields.clone(),
-            vec![query_path_info_json(&test_path)],
-            Some(op.as_slice())
-        );
-    }
-
-    // --- Record: add_temp_root ---
-    {
-        let op = build_add_temp_root_bytes(&test_path).await;
-        record!(
-            "add_temp_root",
-            "Handshake + SetOptions + wopAddTempRoot",
-            skip_fields.clone(),
-            vec![],
-            Some(op.as_slice())
-        );
-    }
-
-    eprintln!("\nall golden fixtures recorded successfully");
+    let (s, g) = start_local_daemon();
+    (s, Some(g))
 }

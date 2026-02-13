@@ -2,14 +2,14 @@
 //!
 //! This file contains two layers of golden tests:
 //!
-//! 1. **Structural tests** (existing): construct client bytes, feed them to
-//!    rio-build, and verify the response has correct field values. These run
-//!    without any external dependencies.
+//! 1. **Structural tests**: construct client bytes, feed them to rio-build,
+//!    and verify the response has correct field values. These run without
+//!    any external dependencies.
 //!
-//! 2. **Byte-conformance tests** (new): load recorded binary fixtures from a
-//!    real nix-daemon and compare rio-build's response field-by-field against
-//!    the recorded bytes. These require fixtures in `tests/golden/fixtures/`
-//!    (recorded with `RECORD_GOLDEN=1`).
+//! 2. **Live-daemon conformance tests**: start an isolated nix-daemon per
+//!    test, exchange with it, then compare its response field-by-field against
+//!    rio-build's response using the same client bytes. This validates wire
+//!    format conformance against the real implementation.
 
 mod golden;
 
@@ -298,125 +298,189 @@ async fn test_golden_query_path_info_wire_format() {
 }
 
 // ============================================================================
-// Byte-conformance tests against recorded nix-daemon fixtures
+// Live-daemon conformance tests
 // ============================================================================
+//
+// Each test starts an isolated nix-daemon, exchanges with it, then compares
+// the daemon's response field-by-field against rio-build's response.
 
-/// Which opcode parser to use for a byte-conformance test.
-enum OpcodeParser {
-    None,
-    IsValidPath,
-    QueryPathInfo,
-    QueryValidPaths,
-    AddTempRoot,
-}
+/// Fields that legitimately differ between nix-daemon and rio-build.
+const SKIP_FIELDS: &[&str] = &["version_string", "trusted"];
 
-impl OpcodeParser {
-    async fn parse(&self, data: &[u8]) -> Vec<golden::ResponseField> {
-        match self {
-            OpcodeParser::None => vec![],
-            OpcodeParser::IsValidPath => golden::parse_is_valid_path_fields(data).await,
-            OpcodeParser::QueryPathInfo => golden::parse_query_path_info_fields(data).await,
-            OpcodeParser::QueryValidPaths => golden::parse_query_valid_paths_fields(data).await,
-            OpcodeParser::AddTempRoot => golden::parse_add_temp_root_fields(data).await,
-        }
-    }
-}
+/// Function pointer type for opcode response field parsers.
+type OpcodeFieldParser = fn(
+    &[u8],
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Vec<golden::ResponseField>> + '_>,
+>;
 
-/// Helper: load fixture, run rio-build, parse both responses, compare fields.
-async fn run_byte_conformance(fixture_name: &str, parser: OpcodeParser) {
-    if !golden::fixtures_exist(fixture_name) {
-        eprintln!(
-            "skipping byte conformance test '{fixture_name}': \
-             fixtures not found (run with RECORD_GOLDEN=1 to record)"
-        );
-        return;
-    }
+/// Helper: run a live-daemon conformance test.
+///
+/// 1. Starts an isolated nix-daemon
+/// 2. Exchanges with it using `opcode_bytes`
+/// 3. Feeds the same client bytes to rio-build with the given store
+/// 4. Parses both responses and compares field-by-field
+async fn run_live_conformance(
+    opcode_bytes: Option<&[u8]>,
+    store: Arc<MemoryStore>,
+    skip: &[&str],
+    parse_opcode: OpcodeFieldParser,
+) {
+    let (socket, _guard) = golden::daemon::get_daemon_socket();
 
-    let fixture = golden::GoldenFixture::load(fixture_name);
-    let store = fixture.build_memory_store();
+    // Exchange with real daemon
+    let (client_bytes, daemon_response) =
+        golden::daemon::exchange_with_daemon(&socket, opcode_bytes)
+            .await
+            .expect("daemon exchange failed");
 
-    // Run rio-build with the same client bytes
-    let actual_response = rio_build_response(&fixture.client_bytes, store).await;
+    // Exchange with rio-build using the same client bytes
+    let rio_response = rio_build_response(&client_bytes, store).await;
 
-    // Split into handshake + remainder for both
-    let (expected_hs, expected_rest) = golden::split_handshake(&fixture.server_bytes).await;
-    let (actual_hs, actual_rest) = golden::split_handshake(&actual_response).await;
+    // Build skip list
+    let skip_strings: Vec<String> = skip.iter().map(|s| (*s).to_string()).collect();
 
-    // Compare handshake fields
-    let expected_hs_fields = golden::parse_handshake_fields(&expected_hs).await;
-    let actual_hs_fields = golden::parse_handshake_fields(&actual_hs).await;
-    golden::assert_field_conformance(&expected_hs_fields, &actual_hs_fields, &fixture.skip_fields);
+    // Split and compare handshake
+    let (daemon_hs, daemon_rest) = golden::split_handshake(&daemon_response).await;
+    let (rio_hs, rio_rest) = golden::split_handshake(&rio_response).await;
 
-    // If there's more data after the handshake (SetOptions + opcode), compare those too
-    if !expected_rest.is_empty() {
-        let (expected_so, expected_op) = golden::split_set_options(&expected_rest);
-        let (actual_so, actual_op) = golden::split_set_options(&actual_rest);
+    let daemon_hs_fields = golden::parse_handshake_fields(&daemon_hs).await;
+    let rio_hs_fields = golden::parse_handshake_fields(&rio_hs).await;
+    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, &skip_strings);
 
-        // SetOptions response is always the same format
-        let expected_so_fields = golden::parse_set_options_fields(&expected_so).await;
-        let actual_so_fields = golden::parse_set_options_fields(&actual_so).await;
-        golden::assert_field_conformance(
-            &expected_so_fields,
-            &actual_so_fields,
-            &fixture.skip_fields,
-        );
+    // Compare SetOptions + opcode (if present)
+    if !daemon_rest.is_empty() {
+        let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
+        let (rio_so, rio_op) = golden::split_set_options(&rio_rest);
 
-        // Parse opcode-specific response
-        if !expected_op.is_empty() {
-            let expected_op_fields = parser.parse(&expected_op).await;
-            let actual_op_fields = parser.parse(&actual_op).await;
-            golden::assert_field_conformance(
-                &expected_op_fields,
-                &actual_op_fields,
-                &fixture.skip_fields,
-            );
+        let daemon_so_fields = golden::parse_set_options_fields(&daemon_so).await;
+        let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
+        golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, &skip_strings);
+
+        if !daemon_op.is_empty() {
+            // Strip STDERR activity messages from the daemon's response —
+            // the real daemon may send START_ACTIVITY/STOP_ACTIVITY before
+            // STDERR_LAST, while rio-build skips those.
+            let daemon_op_stripped = golden::strip_stderr_activity(&daemon_op);
+            let daemon_op_fields = parse_opcode(daemon_op_stripped).await;
+            let rio_op_fields = parse_opcode(&rio_op).await;
+            golden::assert_field_conformance(&daemon_op_fields, &rio_op_fields, &skip_strings);
         }
     }
 }
 
 #[tokio::test]
-async fn test_byte_conformance_handshake() {
-    // Handshake-only — no opcode response to parse
-    if !golden::fixtures_exist("handshake") {
-        eprintln!("skipping: fixtures not found (run with RECORD_GOLDEN=1 to record)");
-        return;
-    }
+async fn test_golden_live_handshake() {
+    let (socket, _guard) = golden::daemon::get_daemon_socket();
+    let store = Arc::new(MemoryStore::new());
 
-    let fixture = golden::GoldenFixture::load("handshake");
-    let store = fixture.build_memory_store();
-    let actual = rio_build_response(&fixture.client_bytes, store).await;
+    // Exchange with real daemon (handshake only, no opcode)
+    let (client_bytes, daemon_response) = golden::daemon::exchange_with_daemon(&socket, None)
+        .await
+        .expect("daemon exchange failed");
 
-    let expected_fields = golden::parse_handshake_fields(&fixture.server_bytes).await;
-    let actual_fields = golden::parse_handshake_fields(&actual).await;
-    golden::assert_field_conformance(&expected_fields, &actual_fields, &fixture.skip_fields);
+    // Exchange with rio-build
+    let rio_response = rio_build_response(&client_bytes, store).await;
+
+    // Compare only handshake fields (response includes SetOptions too, but we only parse handshake)
+    let daemon_fields = golden::parse_handshake_fields(&daemon_response).await;
+    let rio_fields = golden::parse_handshake_fields(&rio_response).await;
+    let skip: Vec<String> = SKIP_FIELDS.iter().map(|s| (*s).to_string()).collect();
+    golden::assert_field_conformance(&daemon_fields, &rio_fields, &skip);
 }
 
 #[tokio::test]
-async fn test_byte_conformance_set_options() {
-    run_byte_conformance("set_options", OpcodeParser::None).await;
+async fn test_golden_live_is_valid_path_found() {
+    let test_path = golden::daemon::build_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
+
+    let op = golden::build_is_valid_path_bytes(&test_path).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_is_valid_path_fields(data))
+    })
+    .await;
 }
 
 #[tokio::test]
-async fn test_byte_conformance_is_valid_path_found() {
-    run_byte_conformance("is_valid_path_found", OpcodeParser::IsValidPath).await;
+async fn test_golden_live_is_valid_path_not_found() {
+    let store = Arc::new(MemoryStore::new());
+    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
+
+    let op = golden::build_is_valid_path_bytes(nonexistent).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_is_valid_path_fields(data))
+    })
+    .await;
 }
 
 #[tokio::test]
-async fn test_byte_conformance_is_valid_path_not_found() {
-    run_byte_conformance("is_valid_path_not_found", OpcodeParser::IsValidPath).await;
+async fn test_golden_live_query_path_info() {
+    let test_path = golden::daemon::build_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
+
+    let op = golden::build_query_path_info_bytes(&test_path).await;
+
+    // Also skip reg_time — MemoryStore uses the JSON-queried time
+    let skip: &[&str] = &["version_string", "trusted", "reg_time"];
+    run_live_conformance(Some(&op), store, skip, |data| {
+        Box::pin(golden::parse_query_path_info_fields(data))
+    })
+    .await;
 }
 
 #[tokio::test]
-async fn test_byte_conformance_query_path_info() {
-    run_byte_conformance("query_path_info", OpcodeParser::QueryPathInfo).await;
+async fn test_golden_live_query_path_info_not_found() {
+    let store = Arc::new(MemoryStore::new());
+    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
+
+    let op = golden::build_query_path_info_bytes(nonexistent).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_query_path_info_fields(data))
+    })
+    .await;
 }
 
 #[tokio::test]
-async fn test_byte_conformance_query_valid_paths() {
-    run_byte_conformance("query_valid_paths", OpcodeParser::QueryValidPaths).await;
+async fn test_golden_live_query_valid_paths() {
+    let test_path = golden::daemon::build_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
+
+    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
+    let op = golden::build_query_valid_paths_bytes(&[&test_path, nonexistent], false).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_query_valid_paths_fields(data))
+    })
+    .await;
 }
 
 #[tokio::test]
-async fn test_byte_conformance_add_temp_root() {
-    run_byte_conformance("add_temp_root", OpcodeParser::AddTempRoot).await;
+async fn test_golden_live_add_temp_root() {
+    let test_path = golden::daemon::build_test_path();
+    let store = Arc::new(MemoryStore::new());
+
+    let op = golden::build_add_temp_root_bytes(&test_path).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_add_temp_root_fields(data))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_golden_live_query_missing() {
+    let test_path = golden::daemon::build_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
+
+    // Mix of existing and nonexistent paths: the existing path should not
+    // appear in any output list, and the nonexistent opaque path should
+    // appear in `unknown` (not `will_build`, since it's not a derivation).
+    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
+    let op = golden::build_query_missing_bytes(&[&test_path, nonexistent]).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_query_missing_fields(data))
+    })
+    .await;
 }
