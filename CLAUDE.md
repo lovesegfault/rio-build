@@ -67,3 +67,52 @@ Pre-commit hooks run treefmt automatically on commit.
 - Clippy is configured with `--deny warnings` — all warnings must be fixed.
 - The `target/` directory is gitignored; Nix builds go to `result`/`result-*` (also gitignored).
 - Integration tests may need `nix` available in PATH (it's provided in the dev shell).
+
+## Design Book
+
+This project has a comprehensive design book in `docs/src/`. When implementing any phase, cross-reference ALL relevant design docs — not just the phase plan:
+
+- **Phase plan** (`docs/src/phases/phaseXY.md`): Task list and milestones
+- **Component specs** (`docs/src/components/`): Protocol details, API contracts
+- **Observability spec** (`docs/src/observability.md`): Metric names, log format, tracing structure
+- **Crate structure** (`docs/src/crate-structure.md`): Expected modules and file layout
+- **Architecture** (`docs/src/architecture.md`): System-level design
+
+### Keeping docs and code in sync
+
+When implementation reveals that a design doc is wrong (e.g., the spec says u32 but the real protocol uses u64), update the design doc in the same commit that fixes the code. Don't let them drift.
+
+## Protocol Implementation Guidelines
+
+rio-build implements the Nix worker protocol. Protocol work has specific pitfalls:
+
+### Validate against the real implementation early
+
+Don't trust specs or design docs alone. Run integration tests against a real `nix` client (e.g., `nix store info --store ssh-ng://localhost`) as soon as the handshake compiles. Protocol bugs found through integration are cheaper than protocol bugs found in review.
+
+### Wire-level testing
+
+Every opcode and wire primitive needs a byte-level test that constructs raw bytes, feeds them through the parser, and asserts the result. High-level integration tests are not sufficient — they hide framing and encoding bugs.
+
+Include:
+- Proptest roundtrips for all wire primitives (u64, bytes, bool, strings, collections)
+- Golden conformance tests using bytes recorded from a real nix-daemon
+- Fuzz targets for wire parsing (`cargo-fuzz` in `rio-nix/fuzz/`)
+
+### Safety bounds
+
+Protocol parsers must enforce:
+- Maximum collection sizes (prevent DoS via unbounded allocation)
+- Maximum string/path lengths (Nix store paths are max 211 chars)
+- Graceful handling of unknown opcodes (close the connection after STDERR_ERROR; don't try to skip unknown payloads)
+
+## Observability Checklist
+
+When adding metrics or tracing, verify end-to-end — don't just initialize the exporter:
+
+- Metrics are actually **registered** (not just the exporter)
+- Metric names match `observability.md` naming conventions (`rio_{component}_`)
+- Gauges are decremented on cleanup (connection close, session end)
+- Default log format is JSON, not pretty-printed
+- Handlers have `#[instrument]` spans with meaningful fields
+- Root span includes `component` field per structured logging spec
