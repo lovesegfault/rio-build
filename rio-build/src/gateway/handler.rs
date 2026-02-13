@@ -322,6 +322,12 @@ async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// wopNarFromPath (38): Export path as NAR via STDERR_WRITE chunks.
+///
+/// Note: the canonical nix-daemon sends STDERR_LAST then streams raw NAR
+/// bytes without framing. rio-build intentionally uses STDERR_WRITE chunks
+/// instead, which the Nix client also understands. This simplifies gateway
+/// streaming when NAR data is reassembled from distributed storage.
+/// See `docs/src/components/gateway.md` for details.
 #[instrument(skip_all)]
 async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,

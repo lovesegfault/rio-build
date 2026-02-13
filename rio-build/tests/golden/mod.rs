@@ -73,7 +73,7 @@ pub fn build_memory_store_from(entries: &[StorePathEntry]) -> Arc<MemoryStore> {
 }
 
 // ---------------------------------------------------------------------------
-// Field-level response parsers
+// Low-level byte readers
 // ---------------------------------------------------------------------------
 
 /// Read exactly `n` bytes from the cursor, returning them as a Vec.
@@ -142,6 +142,79 @@ async fn read_strings_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
 
     result
 }
+
+// ---------------------------------------------------------------------------
+// STDERR activity message helpers
+// ---------------------------------------------------------------------------
+
+/// Skip a single STDERR activity message from the cursor.
+///
+/// Consumes the message payload (but NOT the initial message-type u64, which
+/// should already have been read by the caller). Handles:
+/// - `STDERR_START_ACTIVITY`: id + level + type + text + typed fields + parent
+/// - `STDERR_STOP_ACTIVITY`: id
+/// - `STDERR_RESULT`: activity_id + result_type + typed fields
+async fn skip_stderr_activity_message(cursor: &mut Cursor<Vec<u8>>, msg_type: u64) {
+    use rio_nix::protocol::stderr::{STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
+
+    match msg_type {
+        STDERR_START_ACTIVITY => {
+            // id + level + type + text
+            let _ = read_u64_field(cursor).await;
+            let _ = read_u64_field(cursor).await;
+            let _ = read_u64_field(cursor).await;
+            let _ = read_string_field(cursor).await;
+            // typed fields: count + (type + value) per field
+            let count_bytes = read_u64_field(cursor).await;
+            let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+            for _ in 0..count {
+                let type_bytes = read_u64_field(cursor).await;
+                let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
+                if field_type == 0 {
+                    let _ = read_u64_field(cursor).await;
+                } else {
+                    let _ = read_string_field(cursor).await;
+                }
+            }
+            // parent activity id
+            let _ = read_u64_field(cursor).await;
+        }
+        STDERR_STOP_ACTIVITY => {
+            let _ = read_u64_field(cursor).await;
+        }
+        STDERR_RESULT => {
+            // activity_id + result_type
+            let _ = read_u64_field(cursor).await;
+            let _ = read_u64_field(cursor).await;
+            // typed fields
+            let count_bytes = read_u64_field(cursor).await;
+            let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+            for _ in 0..count {
+                let type_bytes = read_u64_field(cursor).await;
+                let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
+                if field_type == 0 {
+                    let _ = read_u64_field(cursor).await;
+                } else {
+                    let _ = read_string_field(cursor).await;
+                }
+            }
+        }
+        other => panic!("unexpected STDERR message type {other:#x}"),
+    }
+}
+
+/// Returns true if `msg_type` is a STDERR activity message (START, STOP, or RESULT).
+fn is_stderr_activity(msg_type: u64) -> bool {
+    use rio_nix::protocol::stderr::{STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY};
+    matches!(
+        msg_type,
+        STDERR_START_ACTIVITY | STDERR_STOP_ACTIVITY | STDERR_RESULT
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Field-level response parsers
+// ---------------------------------------------------------------------------
 
 /// Parse a handshake response into named fields.
 pub async fn parse_handshake_fields(data: &[u8]) -> Vec<ResponseField> {
@@ -333,9 +406,7 @@ pub fn parse_nar_from_path_fields(
     data: &[u8],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ResponseField>> + '_>> {
     Box::pin(async move {
-        use rio_nix::protocol::stderr::{
-            STDERR_LAST, STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY,
-        };
+        use rio_nix::protocol::stderr::STDERR_LAST;
 
         let mut cursor = Cursor::new(data.to_vec());
         let mut nar_data = Vec::new();
@@ -344,66 +415,25 @@ pub fn parse_nar_from_path_fields(
             let msg_bytes = read_u64_field(&mut cursor).await;
             let msg = u64::from_le_bytes(msg_bytes.clone().try_into().unwrap());
 
-            match msg {
-                STDERR_LAST => {
-                    return vec![
-                        ResponseField {
-                            name: "nar_data",
-                            bytes: nar_data,
-                        },
-                        ResponseField {
-                            name: "stderr_last",
-                            bytes: msg_bytes,
-                        },
-                    ];
-                }
-                STDERR_WRITE => {
-                    let chunk_field = read_string_field(&mut cursor).await;
-                    let chunk_len =
-                        u64::from_le_bytes(chunk_field[..8].try_into().unwrap()) as usize;
-                    nar_data.extend_from_slice(&chunk_field[8..8 + chunk_len]);
-                }
-                STDERR_START_ACTIVITY => {
-                    // id + level + type + text + fields(count + typed) + parent
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_string_field(&mut cursor).await;
-                    let count_bytes = read_u64_field(&mut cursor).await;
-                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
-                    for _ in 0..count {
-                        let type_bytes = read_u64_field(&mut cursor).await;
-                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
-                        if field_type == 0 {
-                            let _ = read_u64_field(&mut cursor).await;
-                        } else {
-                            let _ = read_string_field(&mut cursor).await;
-                        }
-                    }
-                    let _ = read_u64_field(&mut cursor).await;
-                }
-                STDERR_STOP_ACTIVITY => {
-                    let _ = read_u64_field(&mut cursor).await;
-                }
-                STDERR_RESULT => {
-                    // activity_id + result_type + fields(count + typed)
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_u64_field(&mut cursor).await;
-                    let count_bytes = read_u64_field(&mut cursor).await;
-                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
-                    for _ in 0..count {
-                        let type_bytes = read_u64_field(&mut cursor).await;
-                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
-                        if field_type == 0 {
-                            let _ = read_u64_field(&mut cursor).await;
-                        } else {
-                            let _ = read_string_field(&mut cursor).await;
-                        }
-                    }
-                }
-                other => {
-                    panic!("unexpected STDERR message type {other:#x} in NarFromPath response")
-                }
+            if msg == STDERR_LAST {
+                return vec![
+                    ResponseField {
+                        name: "nar_data",
+                        bytes: nar_data,
+                    },
+                    ResponseField {
+                        name: "stderr_last",
+                        bytes: msg_bytes,
+                    },
+                ];
+            } else if msg == STDERR_WRITE {
+                let chunk_field = read_string_field(&mut cursor).await;
+                let chunk_len = u64::from_le_bytes(chunk_field[..8].try_into().unwrap()) as usize;
+                nar_data.extend_from_slice(&chunk_field[8..8 + chunk_len]);
+            } else if is_stderr_activity(msg) {
+                skip_stderr_activity_message(&mut cursor, msg).await;
+            } else {
+                panic!("unexpected STDERR message type {msg:#x} in NarFromPath response");
             }
         }
     })
@@ -419,9 +449,7 @@ pub fn parse_nar_from_path_daemon_fields(
     data: &[u8],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ResponseField>> + '_>> {
     Box::pin(async move {
-        use rio_nix::protocol::stderr::{
-            STDERR_LAST, STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY,
-        };
+        use rio_nix::protocol::stderr::STDERR_LAST;
 
         let mut cursor = Cursor::new(data.to_vec());
 
@@ -431,50 +459,13 @@ pub fn parse_nar_from_path_daemon_fields(
             let msg_bytes = read_u64_field(&mut cursor).await;
             let msg = u64::from_le_bytes(msg_bytes.clone().try_into().unwrap());
 
-            match msg {
-                STDERR_LAST => {
-                    last_bytes = msg_bytes;
-                    break;
-                }
-                STDERR_START_ACTIVITY => {
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_string_field(&mut cursor).await;
-                    let count_bytes = read_u64_field(&mut cursor).await;
-                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
-                    for _ in 0..count {
-                        let type_bytes = read_u64_field(&mut cursor).await;
-                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
-                        if field_type == 0 {
-                            let _ = read_u64_field(&mut cursor).await;
-                        } else {
-                            let _ = read_string_field(&mut cursor).await;
-                        }
-                    }
-                    let _ = read_u64_field(&mut cursor).await;
-                }
-                STDERR_STOP_ACTIVITY => {
-                    let _ = read_u64_field(&mut cursor).await;
-                }
-                STDERR_RESULT => {
-                    let _ = read_u64_field(&mut cursor).await;
-                    let _ = read_u64_field(&mut cursor).await;
-                    let count_bytes = read_u64_field(&mut cursor).await;
-                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
-                    for _ in 0..count {
-                        let type_bytes = read_u64_field(&mut cursor).await;
-                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
-                        if field_type == 0 {
-                            let _ = read_u64_field(&mut cursor).await;
-                        } else {
-                            let _ = read_string_field(&mut cursor).await;
-                        }
-                    }
-                }
-                other => panic!(
-                    "unexpected STDERR message type {other:#x} in NarFromPath daemon response"
-                ),
+            if msg == STDERR_LAST {
+                last_bytes = msg_bytes;
+                break;
+            } else if is_stderr_activity(msg) {
+                skip_stderr_activity_message(&mut cursor, msg).await;
+            } else {
+                panic!("unexpected STDERR message type {msg:#x} in NarFromPath daemon response");
             }
         }
 
@@ -530,22 +521,35 @@ pub async fn parse_add_signatures_fields(data: &[u8]) -> Vec<ResponseField> {
 // STDERR activity stripping
 // ---------------------------------------------------------------------------
 
-/// Strip STDERR activity messages from an opcode response.
+/// Strip STDERR activity messages from an opcode response, returning only
+/// the data from STDERR_LAST onward (STDERR_LAST + result fields).
 ///
-/// The real nix-daemon may send STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY,
-/// and STDERR_RESULT messages before STDERR_LAST, while rio-build skips
-/// those. This function finds the STDERR_LAST marker and returns only the
-/// data from that point onward (STDERR_LAST + result fields).
-pub fn strip_stderr_activity(data: &[u8]) -> &[u8] {
-    let last_bytes = rio_nix::protocol::stderr::STDERR_LAST.to_le_bytes();
-    // Search for the 8-byte STDERR_LAST pattern
-    for i in 0..data.len().saturating_sub(7) {
-        if data[i..i + 8] == last_bytes {
-            return &data[i..];
+/// Uses a structured parser to walk through activity messages rather than
+/// scanning for byte patterns, which avoids false positives if the
+/// STDERR_LAST byte pattern appears inside a string field.
+pub async fn strip_stderr_activity(data: &[u8]) -> Vec<u8> {
+    use rio_nix::protocol::stderr::STDERR_LAST;
+
+    let mut cursor = Cursor::new(data.to_vec());
+
+    loop {
+        let msg_bytes = read_u64_field(&mut cursor).await;
+        let msg = u64::from_le_bytes(msg_bytes.clone().try_into().unwrap());
+
+        if msg == STDERR_LAST {
+            // Return STDERR_LAST + everything after it
+            let pos = cursor.position() as usize;
+            let mut result = msg_bytes;
+            result.extend_from_slice(&data[pos..]);
+            return result;
+        } else if is_stderr_activity(msg) {
+            skip_stderr_activity_message(&mut cursor, msg).await;
+        } else {
+            // Not an activity and not STDERR_LAST — return the original data
+            // unchanged and let the downstream parser handle it.
+            return data.to_vec();
         }
     }
-    // If STDERR_LAST not found, return the original data (let the parser handle the error)
-    data
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +587,10 @@ pub fn split_set_options(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// Assert field-by-field byte equality between expected (nix-daemon) and actual
 /// (rio-build) responses, skipping fields in the skip list.
 ///
+/// Skipped fields are still validated for structural correctness (e.g.,
+/// `version_string` must be a non-empty UTF-8 string, `trusted` must be
+/// 0, 1, or 2) — they are only exempted from byte-equality comparison.
+///
 /// Fields present in one response but not the other are tolerated if the
 /// extra fields are all in the skip list.
 pub fn assert_field_conformance(
@@ -590,7 +598,14 @@ pub fn assert_field_conformance(
     actual: &[ResponseField],
     skip: &[String],
 ) {
-    // Filter to non-skipped fields for comparison
+    // Validate structural correctness of skipped fields in both responses
+    for fields in [expected, actual] {
+        for f in fields.iter().filter(|f| skip.iter().any(|s| s == f.name)) {
+            validate_skipped_field(f);
+        }
+    }
+
+    // Filter to non-skipped fields for byte-level comparison
     let exp_filtered: Vec<_> = expected
         .iter()
         .filter(|f| !skip.iter().any(|s| s == f.name))
@@ -655,6 +670,74 @@ pub fn assert_field_conformance(
             );
         }
     }
+}
+
+/// Validate structural correctness of a skipped field.
+///
+/// Fields that are skipped for byte-equality comparison (because they
+/// legitimately differ between nix-daemon and rio-build) should still
+/// have valid structure.
+fn validate_skipped_field(field: &ResponseField) {
+    match field.name {
+        "version_string" => {
+            // version_string is a wire string: u64(len) + content + padding
+            assert!(
+                field.bytes.len() >= 8,
+                "version_string field too short ({} bytes)",
+                field.bytes.len()
+            );
+            let len = u64::from_le_bytes(field.bytes[..8].try_into().unwrap()) as usize;
+            assert!(len > 0, "version_string should not be empty");
+            assert!(
+                field.bytes.len() >= 8 + len,
+                "version_string content truncated"
+            );
+            let content = &field.bytes[8..8 + len];
+            assert!(
+                std::str::from_utf8(content).is_ok(),
+                "version_string is not valid UTF-8"
+            );
+        }
+        "trusted" => {
+            // trusted is a u64: 0 (not trusted), 1 (trusted), or 2 (unknown)
+            assert_eq!(
+                field.bytes.len(),
+                8,
+                "trusted field should be exactly 8 bytes"
+            );
+            let val = u64::from_le_bytes(field.bytes.clone().try_into().unwrap());
+            assert!(val <= 2, "trusted field should be 0, 1, or 2, got {val}");
+        }
+        _ => {} // Unknown skipped fields — no specific validation
+    }
+}
+
+/// Total byte count across all response fields.
+pub fn fields_byte_len(fields: &[ResponseField]) -> usize {
+    fields.iter().map(|f| f.bytes.len()).sum()
+}
+
+/// Assert that all bytes have been consumed from a data slice.
+///
+/// This catches spurious trailing data in protocol responses (e.g.,
+/// a result value sent after STDERR_LAST when none is expected).
+pub fn assert_fully_consumed(data: &[u8], fields: &[ResponseField], context: &str) {
+    let consumed = fields_byte_len(fields);
+    assert_eq!(
+        consumed,
+        data.len(),
+        "{context}: expected all {expected} bytes consumed, but only {consumed} of {expected} consumed \
+         ({remaining} trailing bytes: [{hex}])",
+        expected = data.len(),
+        consumed = consumed,
+        remaining = data.len() - consumed,
+        hex = data[consumed..]
+            .iter()
+            .take(32)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
 }
 
 // ---------------------------------------------------------------------------

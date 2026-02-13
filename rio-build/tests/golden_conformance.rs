@@ -323,7 +323,7 @@ async fn run_live_conformance(
     skip: &[&str],
     parse_opcode: OpcodeFieldParser,
 ) {
-    let (socket, _guard) = golden::daemon::get_daemon_socket();
+    let socket = golden::daemon::shared_daemon_socket();
 
     // Exchange with real daemon
     let (client_bytes, daemon_response) =
@@ -343,6 +343,8 @@ async fn run_live_conformance(
 
     let daemon_hs_fields = golden::parse_handshake_fields(&daemon_hs).await;
     let rio_hs_fields = golden::parse_handshake_fields(&rio_hs).await;
+    golden::assert_fully_consumed(&daemon_hs, &daemon_hs_fields, "daemon handshake");
+    golden::assert_fully_consumed(&rio_hs, &rio_hs_fields, "rio-build handshake");
     golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, &skip_strings);
 
     // Compare SetOptions + opcode (if present)
@@ -352,15 +354,19 @@ async fn run_live_conformance(
 
         let daemon_so_fields = golden::parse_set_options_fields(&daemon_so).await;
         let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
+        golden::assert_fully_consumed(&daemon_so, &daemon_so_fields, "daemon SetOptions");
+        golden::assert_fully_consumed(&rio_so, &rio_so_fields, "rio-build SetOptions");
         golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, &skip_strings);
 
         if !daemon_op.is_empty() {
             // Strip STDERR activity messages from the daemon's response —
             // the real daemon may send START_ACTIVITY/STOP_ACTIVITY before
             // STDERR_LAST, while rio-build skips those.
-            let daemon_op_stripped = golden::strip_stderr_activity(&daemon_op);
-            let daemon_op_fields = parse_opcode(daemon_op_stripped).await;
+            let daemon_op_stripped = golden::strip_stderr_activity(&daemon_op).await;
+            let daemon_op_fields = parse_opcode(&daemon_op_stripped).await;
             let rio_op_fields = parse_opcode(&rio_op).await;
+            golden::assert_fully_consumed(&daemon_op_stripped, &daemon_op_fields, "daemon opcode");
+            golden::assert_fully_consumed(&rio_op, &rio_op_fields, "rio-build opcode");
             golden::assert_field_conformance(&daemon_op_fields, &rio_op_fields, &skip_strings);
         }
     }
@@ -368,7 +374,7 @@ async fn run_live_conformance(
 
 #[tokio::test]
 async fn test_golden_live_handshake() {
-    let (socket, _guard) = golden::daemon::get_daemon_socket();
+    let socket = golden::daemon::shared_daemon_socket();
     let store = Arc::new(MemoryStore::new());
 
     // Exchange with real daemon (handshake only, no opcode)
@@ -518,7 +524,7 @@ async fn test_golden_live_nar_from_path() {
         Some(nar_data),
     );
 
-    let (socket, _guard) = golden::daemon::get_daemon_socket();
+    let socket = golden::daemon::shared_daemon_socket();
 
     // NarFromPath streams larger payloads — use a longer timeout.
     let op = golden::build_nar_from_path_bytes(&test_path).await;
@@ -550,10 +556,11 @@ async fn test_golden_live_nar_from_path() {
 
     // Compare NarFromPath NAR content.
     //
-    // Wire format divergence: the nix-daemon sends STDERR_LAST followed by
-    // raw NAR bytes, while rio-build wraps the NAR in STDERR_WRITE chunks
-    // before STDERR_LAST. This is a known framing difference — the NAR
-    // content itself should be identical.
+    // Intentional wire format divergence: the nix-daemon sends STDERR_LAST
+    // followed by raw NAR bytes (confirmed in nix src/libstore/daemon.cc),
+    // while rio-build wraps the NAR in STDERR_WRITE chunks before
+    // STDERR_LAST. Both formats are understood by the Nix client. We use
+    // separate parsers but compare the extracted NAR content byte-for-byte.
     let daemon_op_fields = golden::parse_nar_from_path_daemon_fields(&daemon_op).await;
     let rio_op_fields = golden::parse_nar_from_path_fields(&rio_op).await;
 
@@ -574,6 +581,9 @@ async fn test_golden_live_nar_from_path() {
     );
 }
 
+// TODO(phase1b): QueryPathFromHashPart is currently stubbed (returns empty).
+// When implemented, add a "found" test case that populates the store with a
+// known path and verifies the correct path is returned for its hash part.
 #[tokio::test]
 async fn test_golden_live_query_path_from_hash_part() {
     let store = Arc::new(MemoryStore::new());
@@ -587,6 +597,9 @@ async fn test_golden_live_query_path_from_hash_part() {
     .await;
 }
 
+// TODO(phase1b): AddSignatures is currently stubbed (accepts and discards).
+// When implemented, add a test that verifies signatures are actually persisted
+// and visible via QueryPathInfo.
 #[tokio::test]
 async fn test_golden_live_add_signatures() {
     let test_path = golden::daemon::build_test_path();

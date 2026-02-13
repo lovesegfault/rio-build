@@ -55,19 +55,17 @@ The fields are sent in order, all as `u64` unless noted. `wopSetOptions` is **ma
 
 ### wopNarFromPath (38) Wire Format
 
-Exports a store path as a NAR archive. The NAR content is sent inside the STDERR streaming loop using `STDERR_WRITE` messages, **not** as a standalone byte stream.
+Exports a store path as a NAR archive.
 
 | Direction | Field | Type | Description |
 |-----------|-------|------|-------------|
 | C -> S | `path` | string | Store path to export |
 
-The server then enters the STDERR loop:
+**Canonical nix-daemon behavior:** The daemon sends `STDERR_LAST` to close the STDERR loop, then streams the raw NAR bytes directly on the connection (no STDERR_WRITE framing, no length prefix). The Nix client reads until EOF or the expected `narSize` bytes are received.
 
-1. Server sends one or more `STDERR_WRITE` (`0x64617416`) messages, each containing a chunk of NAR data as `string data` (length-prefixed with padding)
-2. Server may interleave `STDERR_NEXT` log messages
-3. Server sends `STDERR_LAST` (`0x616c7473`) to end the loop
+**rio-build behavior (intentional divergence):** rio-build sends the NAR data inside the STDERR loop using `STDERR_WRITE` (`0x64617416`) messages in 64 KB chunks, followed by `STDERR_LAST`. This is a valid approach because the Nix client handles both `STDERR_WRITE`-based streaming and post-`STDERR_LAST` raw streaming (confirmed by `test_nix_store_ls` integration test).
 
-The client must concatenate the data from all `STDERR_WRITE` messages to reconstruct the full NAR. There is no explicit result value after `STDERR_LAST` for this opcode --- the NAR data IS the result.
+The `STDERR_WRITE` approach has advantages for rio-build's architecture: it keeps all data within the STDERR framing protocol, which simplifies gateway-to-client streaming when the NAR data is being reassembled from distributed storage chunks. The tradeoff is a slight overhead from the per-chunk framing headers.
 
 ### wopAddToStoreNar (39) Wire Format
 
