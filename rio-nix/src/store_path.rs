@@ -310,17 +310,29 @@ mod tests {
 
     #[test]
     fn test_name_length_limit() {
-        // Name at exactly MAX_NAME_LEN should be accepted
         let name = "a".repeat(MAX_NAME_LEN);
         let path = format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}");
         assert!(StorePath::parse(&path).is_ok());
 
-        // Name exceeding MAX_NAME_LEN should be rejected
         let name = "a".repeat(MAX_NAME_LEN + 1);
         let path = format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{name}");
         assert!(matches!(
             StorePath::parse(&path),
             Err(StorePathError::NameTooLong(_))
         ));
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn nixbase32_roundtrip(data in proptest::collection::vec(any::<u8>(), 1..=32)) {
+                let encoded = nixbase32::encode(&data);
+                let decoded = nixbase32::decode(&encoded).unwrap();
+                prop_assert_eq!(decoded, data);
+            }
+        }
     }
 }
