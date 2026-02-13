@@ -210,6 +210,19 @@ If `valid == 1`, the following fields are sent in order:
 | `sigs` | string collection | Signatures |
 | `ca` | string | Content address (empty for input-addressed) |
 
+### wopQueryValidPaths (31) Wire Format
+
+| Direction | Field | Type | Description |
+|-----------|-------|------|-------------|
+| C -> S | `paths` | string collection | Store paths to check |
+| C -> S | `substitute` | u64 bool | Whether to attempt substitution for missing paths (ignored by rio-build) |
+
+Response (after STDERR loop):
+
+| Direction | Field | Type | Description |
+|-----------|-------|------|-------------|
+| S -> C | `validPaths` | string collection | Subset of input paths that exist in the store |
+
 ### wopBuildPaths (9) Wire Format
 
 | Direction | Field | Type | Description |

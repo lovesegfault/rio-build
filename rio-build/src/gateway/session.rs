@@ -29,7 +29,7 @@ where
     let version_string = format!("rio-build {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {
         Ok(result) => {
-            let (major, minor) = handshake::decode_version(result.client_version);
+            let (major, minor) = handshake::decode_version(result.negotiated_version);
             metrics::counter!("rio_gateway_handshakes_total", "result" => "success").increment(1);
             info!(
                 client_version = format!("{major}.{minor}"),

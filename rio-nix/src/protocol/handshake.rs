@@ -26,8 +26,8 @@ pub const MIN_CLIENT_VERSION: u64 = 0x125; // 1.37
 /// Result of a successful handshake.
 #[derive(Debug)]
 pub struct HandshakeResult {
-    /// The protocol version the client presented.
-    pub client_version: u64,
+    /// The negotiated protocol version: `min(client_version, server_version)`.
+    pub negotiated_version: u64,
 }
 
 /// Errors specific to the handshake.
@@ -116,9 +116,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     wire::write_u64(stream, super::stderr::STDERR_LAST).await?;
     stream.flush().await.map_err(wire::WireError::Io)?;
 
-    Ok(HandshakeResult {
-        client_version: negotiated_version,
-    })
+    Ok(HandshakeResult { negotiated_version })
 }
 
 /// Server-side handshake with separate reader and writer streams.
@@ -126,6 +124,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 /// Same as `server_handshake` but takes split read/write halves. This is
 /// needed when the reader and writer are independent streams (e.g., two
 /// ends of separate pipes bridging SSH channel I/O).
+#[tracing::instrument(name = "handshake", skip_all)]
 pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
@@ -182,9 +181,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
     wire::write_u64(writer, super::stderr::STDERR_LAST).await?;
     writer.flush().await.map_err(wire::WireError::Io)?;
 
-    Ok(HandshakeResult {
-        client_version: negotiated_version,
-    })
+    Ok(HandshakeResult { negotiated_version })
 }
 
 /// Decode a protocol version number into (major, minor).
@@ -255,7 +252,7 @@ mod tests {
 
         drop(writer);
         let result = server_handle.await.unwrap().unwrap();
-        assert_eq!(result.client_version, PROTOCOL_VERSION);
+        assert_eq!(result.negotiated_version, PROTOCOL_VERSION);
     }
 
     #[test]
@@ -263,5 +260,111 @@ mod tests {
         assert_eq!(encode_version(1, 37), 0x125);
         assert_eq!(decode_version(0x125), (1, 37));
         assert_eq!(decode_version(0x120), (1, 32));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_magic_rejected() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+
+        let server_handle = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(server_stream);
+            let mut stream = tokio::io::join(reader, writer);
+            server_handshake(&mut stream, "rio-build 0.1.0").await
+        });
+
+        let (_, mut writer) = tokio::io::split(client_stream);
+        // Send wrong magic
+        wire::write_u64(&mut writer, 0xDEADBEEF).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let result = server_handle.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(HandshakeError::InvalidMagic(0xDEADBEEF))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_version_too_old_rejected() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+
+        let server_handle = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(server_stream);
+            let mut stream = tokio::io::join(reader, writer);
+            server_handshake(&mut stream, "rio-build 0.1.0").await
+        });
+
+        let (reader, mut writer) = tokio::io::split(client_stream);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Send correct magic
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
+        // Send old version (1.32)
+        wire::write_u64(&mut writer, encode_version(1, 32))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // Read server's response (MAGIC_2 + version)
+        let _magic2 = wire::read_u64(&mut reader).await.unwrap();
+        let _server_version = wire::read_u64(&mut reader).await.unwrap();
+
+        drop(writer);
+        let result = server_handle.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(HandshakeError::VersionTooOld {
+                client_major: 1,
+                client_minor: 32,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handshake_with_nonzero_cpu_affinity() {
+        let (client_stream, server_stream) = tokio::io::duplex(4096);
+
+        let server_handle = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(server_stream);
+            let mut stream = tokio::io::join(reader, writer);
+            server_handshake(&mut stream, "rio-build 0.1.0").await
+        });
+
+        let (reader, mut writer) = tokio::io::split(client_stream);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Magic + version
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
+        wire::write_u64(&mut writer, PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // Read server magic + version
+        let _magic2 = wire::read_u64(&mut reader).await.unwrap();
+        let _server_version = wire::read_u64(&mut reader).await.unwrap();
+
+        // Feature exchange
+        let client_features: Vec<String> = vec![];
+        wire::write_strings(&mut writer, &client_features)
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let _server_features = wire::read_strings(&mut reader).await.unwrap();
+
+        // Post-handshake: send NON-ZERO CPU affinity + mask
+        wire::write_u64(&mut writer, 1).await.unwrap(); // cpu_affinity = 1 (non-zero)
+        wire::write_u64(&mut writer, 0xFF).await.unwrap(); // affinity mask
+        wire::write_u64(&mut writer, 0).await.unwrap(); // reserveSpace
+        writer.flush().await.unwrap();
+
+        // Read version string + trusted + STDERR_LAST
+        let _version_str = wire::read_string(&mut reader).await.unwrap();
+        let _trusted = wire::read_u64(&mut reader).await.unwrap();
+        let _stderr_last = wire::read_u64(&mut reader).await.unwrap();
+
+        drop(writer);
+        let result = server_handle.await.unwrap().unwrap();
+        assert_eq!(result.negotiated_version, PROTOCOL_VERSION);
     }
 }
