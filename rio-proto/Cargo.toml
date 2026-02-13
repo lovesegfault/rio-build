@@ -1,0 +1,10 @@
+[package]
+name = "rio-proto"
+description = "Protobuf/gRPC definitions for rio-build (stub, substantive in Phase 2)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
