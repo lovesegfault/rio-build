@@ -1,13 +1,89 @@
-//! Direct protocol test — feed raw bytes through a DuplexStream without SSH.
-//! This isolates the protocol handler from SSH transport issues.
+//! Direct protocol tests — feed raw bytes through a DuplexStream without SSH.
+//! Tests each Phase 1a opcode at the byte level.
 
 use std::sync::Arc;
 
 use rio_build::gateway::session::run_protocol;
 use rio_build::store::MemoryStore;
+use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
+use rio_nix::protocol::stderr::STDERR_LAST;
 use rio_nix::protocol::wire;
-use tokio::io::AsyncWriteExt;
+use rio_nix::store_path::StorePath;
+use tokio::io::{AsyncWriteExt, DuplexStream};
+
+/// Perform the full handshake + wopSetOptions on a client stream.
+async fn do_handshake(s: &mut DuplexStream) {
+    wire::write_u64(s, WORKER_MAGIC_1).await.unwrap();
+    wire::write_u64(s, PROTOCOL_VERSION).await.unwrap();
+    s.flush().await.unwrap();
+
+    let magic2 = wire::read_u64(s).await.unwrap();
+    assert_eq!(magic2, WORKER_MAGIC_2);
+    let _server_version = wire::read_u64(s).await.unwrap();
+
+    let features: Vec<String> = vec![];
+    wire::write_strings(s, &features).await.unwrap();
+    s.flush().await.unwrap();
+    let _server_features = wire::read_strings(s).await.unwrap();
+
+    wire::write_u64(s, 0).await.unwrap();
+    wire::write_u64(s, 0).await.unwrap();
+    s.flush().await.unwrap();
+
+    let _version = wire::read_string(s).await.unwrap();
+    let _trusted = wire::read_u64(s).await.unwrap();
+    let last = wire::read_u64(s).await.unwrap();
+    assert_eq!(last, STDERR_LAST);
+
+    wire::write_u64(s, 19).await.unwrap();
+    for _ in 0..12 {
+        wire::write_u64(s, 0).await.unwrap();
+    }
+    wire::write_u64(s, 0).await.unwrap();
+    s.flush().await.unwrap();
+
+    let msg = wire::read_u64(s).await.unwrap();
+    assert_eq!(msg, STDERR_LAST);
+    let result = wire::read_u64(s).await.unwrap();
+    assert_eq!(result, 1);
+}
+
+fn make_test_store() -> Arc<MemoryStore> {
+    let store = Arc::new(MemoryStore::new());
+    let path =
+        StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
+    store.insert(
+        rio_build::store::traits::PathInfo {
+            path,
+            deriver: None,
+            nar_hash: NixHash::compute(HashAlgo::SHA256, b"fake nar"),
+            references: vec![],
+            registration_time: 1700000000,
+            nar_size: 12345,
+            ultimate: true,
+            sigs: vec![],
+            ca: None,
+        },
+        Some(b"fake nar content".to_vec()),
+    );
+    store
+}
+
+async fn run_test(
+    store: Arc<MemoryStore>,
+    client_fn: impl FnOnce(DuplexStream) -> tokio::task::JoinHandle<()>,
+) {
+    let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let (mut r, mut w) = tokio::io::split(server_stream);
+        let _ = run_protocol(&mut r, &mut w, store.as_ref()).await;
+    });
+    let client = client_fn(client_stream);
+    let (c, s) = tokio::join!(client, server);
+    c.unwrap();
+    s.unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_handshake_direct() {
@@ -17,77 +93,265 @@ async fn test_handshake_direct() {
         .try_init();
 
     let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+        })
+    })
+    .await;
+}
 
-    let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+#[tokio::test(flavor = "multi_thread")]
+async fn test_is_valid_path_found() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
 
-    // Server task
-    let store_clone = store.clone();
-    let server = tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(server_stream);
-        match run_protocol(&mut reader, &mut writer, store_clone.as_ref()).await {
-            Ok(()) => eprintln!("SERVER: protocol completed OK"),
-            Err(e) => eprintln!("SERVER: protocol error: {e}"),
-        }
-    });
+            wire::write_u64(&mut s, 1).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
 
-    // Client task: simulate Nix handshake
-    let client = tokio::spawn(async move {
-        let mut s = client_stream;
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 1, "expected path to be valid");
+        })
+    })
+    .await;
+}
 
-        // 1. Send MAGIC_1 + VERSION
-        wire::write_u64(&mut s, WORKER_MAGIC_1).await.unwrap();
-        wire::write_u64(&mut s, PROTOCOL_VERSION).await.unwrap();
-        s.flush().await.unwrap();
+#[tokio::test(flavor = "multi_thread")]
+async fn test_is_valid_path_not_found() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
 
-        // 2. Read MAGIC_2 + server version
-        let magic2 = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(magic2, WORKER_MAGIC_2, "expected WORKER_MAGIC_2");
-        let server_version = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(server_version, PROTOCOL_VERSION);
+            wire::write_u64(&mut s, 1).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
 
-        // 3. Feature exchange (>= 1.38)
-        let features: Vec<String> = vec![];
-        wire::write_strings(&mut s, &features).await.unwrap();
-        s.flush().await.unwrap();
-        let server_features = wire::read_strings(&mut s).await.unwrap();
-        assert!(server_features.is_empty());
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 0, "expected path to be invalid");
+        })
+    })
+    .await;
+}
 
-        // 4. Post-handshake: send affinity + reserveSpace
-        wire::write_u64(&mut s, 0).await.unwrap(); // affinity
-        wire::write_u64(&mut s, 0).await.unwrap(); // reserveSpace
-        s.flush().await.unwrap();
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_path_info() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
 
-        // 5. Read version string + trusted + STDERR_LAST
-        let version = wire::read_string(&mut s).await.unwrap();
-        assert!(version.contains("rio-build"));
-        let trusted = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(trusted, 1);
-        let last = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(last, rio_nix::protocol::stderr::STDERR_LAST);
+            wire::write_u64(&mut s, 26).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
 
-        // 6. Send wopSetOptions (opcode 19)
-        wire::write_u64(&mut s, 19).await.unwrap(); // opcode
-        // 12 u64 fields (all zeros for defaults)
-        for _ in 0..12 {
-            wire::write_u64(&mut s, 0).await.unwrap();
-        }
-        // overrides count = 0
-        wire::write_u64(&mut s, 0).await.unwrap();
-        s.flush().await.unwrap();
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
 
-        // 7. Read STDERR_LAST + result
-        let msg = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(msg, rio_nix::protocol::stderr::STDERR_LAST);
-        let result = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(result, 1); // success
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 1);
 
-        eprintln!("CLIENT: handshake + options completed successfully!");
+            let deriver = wire::read_string(&mut s).await.unwrap();
+            assert!(deriver.is_empty());
 
-        // Close connection
-        drop(s);
-    });
+            let nar_hash = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                nar_hash.starts_with("sha256:"),
+                "expected sha256 hash, got: {nar_hash}"
+            );
 
-    let (c, s) = tokio::join!(client, server);
-    c.unwrap();
-    s.unwrap();
+            let refs = wire::read_strings(&mut s).await.unwrap();
+            assert!(refs.is_empty());
+
+            let reg_time = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(reg_time, 1700000000);
+
+            let nar_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(nar_size, 12345);
+
+            let ultimate = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(ultimate, 1);
+
+            let sigs = wire::read_strings(&mut s).await.unwrap();
+            assert!(sigs.is_empty());
+
+            let ca = wire::read_string(&mut s).await.unwrap();
+            assert!(ca.is_empty());
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_path_info_not_found() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            wire::write_u64(&mut s, 26).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 0, "expected path not found");
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_valid_paths() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            wire::write_u64(&mut s, 31).await.unwrap();
+            let paths = vec![
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string(),
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0".to_string(),
+            ];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // substitute flag
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            let valid = wire::read_strings(&mut s).await.unwrap();
+            assert_eq!(valid.len(), 1);
+            assert!(valid[0].contains("hello-2.12.1"));
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_temp_root() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            wire::write_u64(&mut s, 11).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1);
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nar_from_path() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            wire::write_u64(&mut s, 38).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            // Read STDERR_WRITE chunks until STDERR_LAST
+            let mut nar_data = Vec::new();
+            loop {
+                let msg = wire::read_u64(&mut s).await.unwrap();
+                if msg == STDERR_LAST {
+                    break;
+                }
+                assert_eq!(msg, rio_nix::protocol::stderr::STDERR_WRITE);
+                let chunk = wire::read_bytes(&mut s).await.unwrap();
+                nar_data.extend_from_slice(&chunk);
+            }
+
+            assert_eq!(nar_data, b"fake nar content");
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unknown_opcode_closes_connection() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // Send unknown opcode 999
+            wire::write_u64(&mut s, 999).await.unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_ERROR then connection closes
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, rio_nix::protocol::stderr::STDERR_ERROR);
+
+            // Read the error structure
+            let _type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let _message = wire::read_string(&mut s).await.unwrap();
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+
+            // Connection should be closed — next read should EOF
+            let result = wire::read_u64(&mut s).await;
+            assert!(result.is_err(), "expected EOF after unknown opcode");
+        })
+    })
+    .await;
 }

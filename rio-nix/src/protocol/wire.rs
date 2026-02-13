@@ -337,11 +337,58 @@ mod tests {
 
     #[tokio::test]
     async fn test_collection_too_large() {
-        // Craft a buffer with an enormous count
         let mut buf = Vec::new();
         write_u64(&mut buf, MAX_COLLECTION_COUNT + 1).await.unwrap();
         let mut reader = Cursor::new(buf);
         let result = read_strings(&mut reader).await;
         assert!(matches!(result, Err(WireError::CollectionTooLarge(_))));
+    }
+
+    // Property-based tests
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+        use std::io::Cursor;
+
+        proptest! {
+            #[test]
+            fn roundtrip_u64(val: u64) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_u64(&mut buf, val).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_u64(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, val);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn roundtrip_bytes(data: Vec<u8>) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_bytes(&mut buf, &data).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_bytes(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, data);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn roundtrip_bool(val: bool) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_bool(&mut buf, val).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_bool(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, val);
+                    Ok(())
+                })?;
+            }
+        }
     }
 }
