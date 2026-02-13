@@ -27,6 +27,9 @@ metrics-exporter-prometheus = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 
+# Serialization (used by store pre-population from local nix)
+serde_json = { workspace = true }
+
 # Byte handling
 bytes = { workspace = true }
 

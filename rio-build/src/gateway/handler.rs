@@ -65,6 +65,7 @@ where
             handle_query_path_from_hash_part(reader, &mut stderr).await
         }
         Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr).await,
+        Some(WorkerOp::QueryMissing) => handle_query_missing(reader, &mut stderr).await,
         Some(op) => {
             warn!(
                 opcode = opcode,
@@ -327,5 +328,33 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     stderr.finish().await?;
     wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// wopQueryMissing (40): Report what needs building.
+///
+/// For Phase 1a, returns everything as willBuild (nothing can be substituted,
+/// nothing is unknown since we know about all paths in our store).
+async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+) -> anyhow::Result<()> {
+    let paths = wire::read_strings(reader).await?;
+    debug!(count = paths.len(), "wopQueryMissing");
+
+    stderr.finish().await?;
+    let w = stderr.inner_mut();
+
+    // willBuild: return all requested paths (conservative: assume nothing is cached)
+    wire::write_strings(w, &paths).await?;
+    // willSubstitute: always empty (rio-build doesn't use external substituters)
+    let empty: Vec<String> = vec![];
+    wire::write_strings(w, &empty).await?;
+    // unknown: empty
+    wire::write_strings(w, &empty).await?;
+    // downloadSize: 0
+    wire::write_u64(w, 0).await?;
+    // narSize: 0
+    wire::write_u64(w, 0).await?;
     Ok(())
 }

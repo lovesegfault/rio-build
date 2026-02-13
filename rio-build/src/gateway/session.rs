@@ -11,12 +11,6 @@ use tracing::{debug, error, info, warn};
 use super::handler::{self, ClientOptions};
 use crate::store::Store;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
-    AwaitingOptions,
-    Ready,
-}
-
 /// Runs the Nix worker protocol on separate read/write streams.
 pub async fn run_protocol<R, W>(
     reader: &mut R,
@@ -63,8 +57,8 @@ where
     }
 
     // Step 2: Opcode loop
-    let mut state = State::AwaitingOptions;
-
+    // Note: wopSetOptions is conventionally the first opcode but not enforced.
+    // Real nix-daemon accepts any opcode after handshake.
     loop {
         let opcode = match wire::read_u64(reader).await {
             Ok(op) => op,
@@ -78,50 +72,10 @@ where
             }
         };
 
-        debug!(opcode = opcode, state = ?state, "received opcode");
+        debug!(opcode = opcode, "received opcode");
 
-        match state {
-            State::AwaitingOptions => {
-                if opcode != 19 {
-                    warn!(
-                        opcode = opcode,
-                        "protocol error: wopSetOptions must be the first opcode after handshake"
-                    );
-                    let mut stderr = StderrWriter::new(&mut *writer);
-                    stderr
-                        .error(&StderrError::simple(
-                            "protocol error: wopSetOptions must be the first opcode after handshake",
-                        ))
-                        .await?;
-                    // Must close: the opcode's payload is unread in the stream
-                    return Err(anyhow::anyhow!(
-                        "protocol violation: expected wopSetOptions, got opcode {opcode}"
-                    ));
-                }
-
-                handler::handle_opcode(
-                    opcode,
-                    reader,
-                    writer,
-                    store,
-                    &mut options,
-                    &mut temp_roots,
-                )
-                .await?;
-                state = State::Ready;
-            }
-            State::Ready => {
-                handler::handle_opcode(
-                    opcode,
-                    reader,
-                    writer,
-                    store,
-                    &mut options,
-                    &mut temp_roots,
-                )
-                .await?;
-            }
-        }
+        handler::handle_opcode(opcode, reader, writer, store, &mut options, &mut temp_roots)
+            .await?;
 
         writer.flush().await?;
     }

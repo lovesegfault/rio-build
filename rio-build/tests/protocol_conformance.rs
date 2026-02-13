@@ -181,3 +181,106 @@ async fn test_nix_store_ping() {
 
     server_handle.abort();
 }
+
+/// Test that `nix path-info` returns correct metadata for a pre-populated store path.
+///
+/// This validates the Week 6-8 milestone: wopQueryPathInfo returns correct info.
+/// Builds a tiny store path via `nix build` + `writeTextFile`, imports it into
+/// the MemoryStore, then queries it through rio-build's SSH protocol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_nix_path_info() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("rio_build=debug,rio_nix=debug")
+        .with_test_writer()
+        .try_init();
+
+    // Build a tiny store path using writeTextFile
+    let build_output = Command::new("nix")
+        .args([
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            "--impure",
+            "--expr",
+            r#"(import <nixpkgs> {}).writeTextFile { name = "rio-test"; text = "hello from rio-build test\n"; }"#,
+        ])
+        .output()
+        .expect("failed to run nix build");
+
+    if !build_output.status.success() {
+        eprintln!(
+            "SKIP: nix build failed: {}",
+            String::from_utf8_lossy(&build_output.stderr)
+        );
+        return;
+    }
+
+    let test_path = String::from_utf8_lossy(&build_output.stdout)
+        .trim()
+        .to_string();
+    eprintln!("Built test path: {test_path}");
+
+    // Import it from the local Nix store
+    let Some((path_info, nar_data)) = rio_build::store::memory::import_from_nix_store(&test_path)
+    else {
+        eprintln!("SKIP: failed to import path from local nix store");
+        return;
+    };
+
+    let store_path_str = path_info.path.to_string();
+
+    // Populate the MemoryStore
+    let store = Arc::new(MemoryStore::new());
+    store.insert(path_info, Some(nar_data));
+
+    let env = TestEnv::new();
+    let server_handle = env.start_server(store).await;
+    env.wait_for_server().await;
+
+    // Run nix path-info against our server
+    let output = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::task::spawn_blocking({
+            let store_url = env.store_url();
+            let ssh_opts = env.nix_ssh_opts();
+            let path = store_path_str.clone();
+            move || {
+                Command::new("nix")
+                    .args(["path-info", "--json", "--store", &store_url, &path])
+                    .env("NIX_SSHOPTS", &ssh_opts)
+                    .output()
+                    .expect("failed to run nix path-info")
+            }
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => {
+            server_handle.abort();
+            panic!("nix path-info timed out after 30 seconds");
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!("--- nix path-info stdout ---\n{stdout}");
+    eprintln!("--- nix path-info stderr ---\n{stderr}");
+
+    assert!(
+        output.status.success(),
+        "nix path-info failed with status {}: stderr: {stderr}",
+        output.status
+    );
+
+    // Verify the JSON output contains our path
+    assert!(
+        stdout.contains(&store_path_str),
+        "expected store path in JSON output"
+    );
+
+    server_handle.abort();
+}
