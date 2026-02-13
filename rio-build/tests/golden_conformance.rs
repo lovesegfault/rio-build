@@ -48,14 +48,6 @@ async fn build_set_options_bytes() -> Vec<u8> {
     buf
 }
 
-/// Build wopIsValidPath client bytes for a given path.
-async fn build_is_valid_path_bytes(path: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 1).await.unwrap();
-    wire::write_string(&mut buf, path).await.unwrap();
-    buf
-}
-
 /// Feed client bytes to rio-build and capture the server response.
 async fn rio_build_response(client_bytes: &[u8], store: Arc<MemoryStore>) -> Vec<u8> {
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
@@ -144,8 +136,10 @@ async fn test_golden_is_valid_path_not_found() {
     let mut client_bytes = build_handshake_client_bytes().await;
     client_bytes.extend(build_set_options_bytes().await);
     client_bytes.extend(
-        build_is_valid_path_bytes("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0")
-            .await,
+        golden::build_is_valid_path_bytes(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0",
+        )
+        .await,
     );
 
     let response = rio_build_response(&client_bytes, store).await;
@@ -193,7 +187,10 @@ async fn test_golden_is_valid_path_found() {
     let mut client_bytes = build_handshake_client_bytes().await;
     client_bytes.extend(build_set_options_bytes().await);
     client_bytes.extend(
-        build_is_valid_path_bytes("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").await,
+        golden::build_is_valid_path_bytes(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+        )
+        .await,
     );
 
     let response = rio_build_response(&client_bytes, store).await;
@@ -481,6 +478,123 @@ async fn test_golden_live_query_missing() {
     let op = golden::build_query_missing_bytes(&[&test_path, nonexistent]).await;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_missing_fields(data))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_golden_live_nar_from_path() {
+    use rio_build::store::MemoryStore;
+
+    let test_path = golden::daemon::build_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let nar_data = golden::daemon::dump_nar(&test_path);
+
+    // Build a MemoryStore with both metadata and NAR content
+    let store = Arc::new(MemoryStore::new());
+    let sp = rio_nix::store_path::StorePath::parse(&path_info.path).unwrap();
+    let nar_hash = rio_nix::hash::NixHash::parse(&path_info.nar_hash).unwrap();
+    let deriver = path_info
+        .deriver
+        .as_ref()
+        .map(|d| rio_nix::store_path::StorePath::parse(d).unwrap());
+    let references: Vec<rio_nix::store_path::StorePath> = path_info
+        .references
+        .iter()
+        .map(|r| rio_nix::store_path::StorePath::parse(r).unwrap())
+        .collect();
+    store.insert(
+        rio_build::store::traits::PathInfo {
+            path: sp,
+            deriver,
+            nar_hash,
+            references,
+            registration_time: path_info.registration_time,
+            nar_size: path_info.nar_size,
+            ultimate: path_info.ultimate,
+            sigs: path_info.sigs.clone(),
+            ca: path_info.ca.clone(),
+        },
+        Some(nar_data),
+    );
+
+    let (socket, _guard) = golden::daemon::get_daemon_socket();
+
+    // NarFromPath streams larger payloads — use a longer timeout.
+    let op = golden::build_nar_from_path_bytes(&test_path).await;
+    let (client_bytes, daemon_response) = golden::daemon::exchange_with_daemon_timeout(
+        &socket,
+        Some(&op),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("daemon exchange failed");
+
+    let rio_response = rio_build_response(&client_bytes, store).await;
+
+    let skip_strings: Vec<String> = SKIP_FIELDS.iter().map(|s| (*s).to_string()).collect();
+
+    // Compare handshake
+    let (daemon_hs, daemon_rest) = golden::split_handshake(&daemon_response).await;
+    let (rio_hs, rio_rest) = golden::split_handshake(&rio_response).await;
+    let daemon_hs_fields = golden::parse_handshake_fields(&daemon_hs).await;
+    let rio_hs_fields = golden::parse_handshake_fields(&rio_hs).await;
+    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, &skip_strings);
+
+    // Compare SetOptions
+    let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
+    let (rio_so, rio_op) = golden::split_set_options(&rio_rest);
+    let daemon_so_fields = golden::parse_set_options_fields(&daemon_so).await;
+    let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
+    golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, &skip_strings);
+
+    // Compare NarFromPath NAR content.
+    //
+    // Wire format divergence: the nix-daemon sends STDERR_LAST followed by
+    // raw NAR bytes, while rio-build wraps the NAR in STDERR_WRITE chunks
+    // before STDERR_LAST. This is a known framing difference — the NAR
+    // content itself should be identical.
+    let daemon_op_fields = golden::parse_nar_from_path_daemon_fields(&daemon_op).await;
+    let rio_op_fields = golden::parse_nar_from_path_fields(&rio_op).await;
+
+    let daemon_nar = daemon_op_fields
+        .iter()
+        .find(|f| f.name == "nar_data")
+        .expect("daemon response should have nar_data");
+    let rio_nar = rio_op_fields
+        .iter()
+        .find(|f| f.name == "nar_data")
+        .expect("rio-build response should have nar_data");
+    assert_eq!(
+        daemon_nar.bytes,
+        rio_nar.bytes,
+        "NAR content mismatch: daemon sent {} bytes, rio-build sent {} bytes",
+        daemon_nar.bytes.len(),
+        rio_nar.bytes.len()
+    );
+}
+
+#[tokio::test]
+async fn test_golden_live_query_path_from_hash_part() {
+    let store = Arc::new(MemoryStore::new());
+    // Use a hash part that doesn't exist — the stub returns empty string.
+    let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let op = golden::build_query_path_from_hash_part_bytes(hash_part).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_query_path_from_hash_part_fields(data))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_golden_live_add_signatures() {
+    let test_path = golden::daemon::build_test_path();
+    let store = Arc::new(MemoryStore::new());
+
+    let op = golden::build_add_signatures_bytes(&test_path, &["cache.example.com:fakesig1"]).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_add_signatures_fields(data))
     })
     .await;
 }

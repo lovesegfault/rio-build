@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use rio_build::store::MemoryStore;
 use rio_nix::hash::NixHash;
+use rio_nix::protocol::stderr::STDERR_WRITE;
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 
@@ -317,6 +318,214 @@ pub async fn parse_query_missing_fields(data: &[u8]) -> Vec<ResponseField> {
     ]
 }
 
+/// Parse a NarFromPath response (after handshake + SetOptions).
+///
+/// NarFromPath uses STDERR_WRITE streaming: zero or more STDERR_WRITE chunks
+/// followed by STDERR_LAST. The daemon may also interleave activity messages
+/// (STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY, STDERR_RESULT) before or
+/// between data chunks. This parser handles the full STDERR message stream,
+/// properly skipping activity messages and collecting only NAR data.
+///
+/// Returns two fields:
+/// - `nar_data`: concatenated NAR content from all STDERR_WRITE chunks
+/// - `stderr_last`: the final STDERR_LAST marker
+pub fn parse_nar_from_path_fields(
+    data: &[u8],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ResponseField>> + '_>> {
+    Box::pin(async move {
+        use rio_nix::protocol::stderr::{
+            STDERR_LAST, STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY,
+        };
+
+        let mut cursor = Cursor::new(data.to_vec());
+        let mut nar_data = Vec::new();
+
+        loop {
+            let msg_bytes = read_u64_field(&mut cursor).await;
+            let msg = u64::from_le_bytes(msg_bytes.clone().try_into().unwrap());
+
+            match msg {
+                STDERR_LAST => {
+                    return vec![
+                        ResponseField {
+                            name: "nar_data",
+                            bytes: nar_data,
+                        },
+                        ResponseField {
+                            name: "stderr_last",
+                            bytes: msg_bytes,
+                        },
+                    ];
+                }
+                STDERR_WRITE => {
+                    let chunk_field = read_string_field(&mut cursor).await;
+                    let chunk_len =
+                        u64::from_le_bytes(chunk_field[..8].try_into().unwrap()) as usize;
+                    nar_data.extend_from_slice(&chunk_field[8..8 + chunk_len]);
+                }
+                STDERR_START_ACTIVITY => {
+                    // id + level + type + text + fields(count + typed) + parent
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_string_field(&mut cursor).await;
+                    let count_bytes = read_u64_field(&mut cursor).await;
+                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+                    for _ in 0..count {
+                        let type_bytes = read_u64_field(&mut cursor).await;
+                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
+                        if field_type == 0 {
+                            let _ = read_u64_field(&mut cursor).await;
+                        } else {
+                            let _ = read_string_field(&mut cursor).await;
+                        }
+                    }
+                    let _ = read_u64_field(&mut cursor).await;
+                }
+                STDERR_STOP_ACTIVITY => {
+                    let _ = read_u64_field(&mut cursor).await;
+                }
+                STDERR_RESULT => {
+                    // activity_id + result_type + fields(count + typed)
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_u64_field(&mut cursor).await;
+                    let count_bytes = read_u64_field(&mut cursor).await;
+                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+                    for _ in 0..count {
+                        let type_bytes = read_u64_field(&mut cursor).await;
+                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
+                        if field_type == 0 {
+                            let _ = read_u64_field(&mut cursor).await;
+                        } else {
+                            let _ = read_string_field(&mut cursor).await;
+                        }
+                    }
+                }
+                other => {
+                    panic!("unexpected STDERR message type {other:#x} in NarFromPath response")
+                }
+            }
+        }
+    })
+}
+
+/// Parse a NarFromPath response as sent by the real nix-daemon.
+///
+/// The daemon sends: [activity messages...] STDERR_LAST <raw NAR bytes>
+/// This differs from rio-build which uses STDERR_WRITE framing.
+/// The function returns the raw NAR content (after STDERR_LAST) and the
+/// STDERR_LAST marker.
+pub fn parse_nar_from_path_daemon_fields(
+    data: &[u8],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ResponseField>> + '_>> {
+    Box::pin(async move {
+        use rio_nix::protocol::stderr::{
+            STDERR_LAST, STDERR_RESULT, STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY,
+        };
+
+        let mut cursor = Cursor::new(data.to_vec());
+
+        // Skip activity messages until STDERR_LAST
+        let last_bytes;
+        loop {
+            let msg_bytes = read_u64_field(&mut cursor).await;
+            let msg = u64::from_le_bytes(msg_bytes.clone().try_into().unwrap());
+
+            match msg {
+                STDERR_LAST => {
+                    last_bytes = msg_bytes;
+                    break;
+                }
+                STDERR_START_ACTIVITY => {
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_string_field(&mut cursor).await;
+                    let count_bytes = read_u64_field(&mut cursor).await;
+                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+                    for _ in 0..count {
+                        let type_bytes = read_u64_field(&mut cursor).await;
+                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
+                        if field_type == 0 {
+                            let _ = read_u64_field(&mut cursor).await;
+                        } else {
+                            let _ = read_string_field(&mut cursor).await;
+                        }
+                    }
+                    let _ = read_u64_field(&mut cursor).await;
+                }
+                STDERR_STOP_ACTIVITY => {
+                    let _ = read_u64_field(&mut cursor).await;
+                }
+                STDERR_RESULT => {
+                    let _ = read_u64_field(&mut cursor).await;
+                    let _ = read_u64_field(&mut cursor).await;
+                    let count_bytes = read_u64_field(&mut cursor).await;
+                    let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+                    for _ in 0..count {
+                        let type_bytes = read_u64_field(&mut cursor).await;
+                        let field_type = u64::from_le_bytes(type_bytes.try_into().unwrap());
+                        if field_type == 0 {
+                            let _ = read_u64_field(&mut cursor).await;
+                        } else {
+                            let _ = read_string_field(&mut cursor).await;
+                        }
+                    }
+                }
+                other => panic!(
+                    "unexpected STDERR message type {other:#x} in NarFromPath daemon response"
+                ),
+            }
+        }
+
+        // Everything after STDERR_LAST is raw NAR data
+        use tokio::io::AsyncReadExt;
+        let mut nar_data = Vec::new();
+        cursor.read_to_end(&mut nar_data).await.unwrap();
+
+        vec![
+            ResponseField {
+                name: "nar_data",
+                bytes: nar_data,
+            },
+            ResponseField {
+                name: "stderr_last",
+                bytes: last_bytes,
+            },
+        ]
+    })
+}
+
+/// Parse a QueryPathFromHashPart response (after handshake + SetOptions).
+pub async fn parse_query_path_from_hash_part_fields(data: &[u8]) -> Vec<ResponseField> {
+    let mut cursor = Cursor::new(data.to_vec());
+    vec![
+        ResponseField {
+            name: "stderr_last",
+            bytes: read_u64_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "path",
+            bytes: read_string_field(&mut cursor).await,
+        },
+    ]
+}
+
+/// Parse an AddSignatures response (after handshake + SetOptions).
+pub async fn parse_add_signatures_fields(data: &[u8]) -> Vec<ResponseField> {
+    let mut cursor = Cursor::new(data.to_vec());
+    vec![
+        ResponseField {
+            name: "stderr_last",
+            bytes: read_u64_field(&mut cursor).await,
+        },
+        ResponseField {
+            name: "result",
+            bytes: read_u64_field(&mut cursor).await,
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // STDERR activity stripping
 // ---------------------------------------------------------------------------
@@ -359,6 +568,11 @@ pub async fn split_handshake(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
 ///
 /// SetOptions response is exactly 8 bytes (STDERR_LAST, no result value).
 pub fn split_set_options(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    assert!(
+        data.len() >= 8,
+        "SetOptions response too short: {} bytes (expected >= 8)",
+        data.len()
+    );
     (data[..8].to_vec(), data[8..].to_vec())
 }
 
@@ -486,6 +700,32 @@ pub async fn build_query_missing_bytes(paths: &[&str]) -> Vec<u8> {
     let mut buf = Vec::new();
     wire::write_u64(&mut buf, 40).await.unwrap();
     let owned: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
+    wire::write_strings(&mut buf, &owned).await.unwrap();
+    buf
+}
+
+/// Build wopNarFromPath (38) client bytes for a given path.
+pub async fn build_nar_from_path_bytes(path: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    wire::write_u64(&mut buf, 38).await.unwrap();
+    wire::write_string(&mut buf, path).await.unwrap();
+    buf
+}
+
+/// Build wopQueryPathFromHashPart (29) client bytes.
+pub async fn build_query_path_from_hash_part_bytes(hash_part: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    wire::write_u64(&mut buf, 29).await.unwrap();
+    wire::write_string(&mut buf, hash_part).await.unwrap();
+    buf
+}
+
+/// Build wopAddSignatures (37) client bytes.
+pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    wire::write_u64(&mut buf, 37).await.unwrap();
+    wire::write_string(&mut buf, path).await.unwrap();
+    let owned: Vec<String> = sigs.iter().map(|s| (*s).to_string()).collect();
     wire::write_strings(&mut buf, &owned).await.unwrap();
     buf
 }
