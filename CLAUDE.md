@@ -96,7 +96,7 @@ Every opcode and wire primitive needs a byte-level test that constructs raw byte
 
 Include:
 - Proptest roundtrips for all wire primitives (u64, bytes, bool, strings, collections)
-- Golden conformance tests using bytes recorded from a real nix-daemon
+- Live-daemon golden conformance tests: each test starts an isolated nix-daemon and compares responses at the byte level (see `tests/golden/`)
 - Fuzz targets for wire parsing (`cargo-fuzz` in `rio-nix/fuzz/`)
 
 ### Safety bounds

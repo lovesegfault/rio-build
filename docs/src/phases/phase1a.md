@@ -32,7 +32,7 @@
 - [x] Unknown opcode handling (return STDERR_ERROR + close connection to prevent stream desync)
 - [x] `rio-store`: in-memory backend for path metadata. `StorePath`-keyed HashMaps (no String allocation per lookup). Poisoned lock recovery. `import_from_nix_store` helper for dev/test pre-population.
 - [x] Protocol conformance test suite: 104 tests total. Byte-level direct protocol tests for every implemented opcode. Integration tests against real `nix` CLI (`nix store info`, `nix path-info`, `nix store ls`). Structural golden tests for handshake and opcode response formats. Error path tests (missing NAR, invalid path format, multi-opcode sequences, DerivedPath format). Truncated/malformed wire input tests. Full UTF-8 proptest coverage.
-- [x] True golden conformance tests using recorded bytes from a real nix-daemon. 7 scenarios recorded via auto-started nix-daemon, replayed with field-level byte comparison. Also fixed two conformance bugs found during recording (SetOptions spurious result value, QueryPathInfo narHash wire format).
+- [x] Live-daemon golden conformance tests: each test starts an isolated nix-daemon, exchanges with it, and compares the response field-by-field against rio-build at the byte level. 8 scenarios (handshake, IsValidPath found/not-found, QueryPathInfo found/not-found, QueryValidPaths, AddTempRoot, QueryMissing) with STDERR activity stripping. Replaced stored binary fixtures to eliminate fixture staleness and silent-pass-on-missing-files. Also fixed three conformance bugs found through golden testing (SetOptions spurious result value, QueryPathInfo narHash wire format, QueryMissing opaque-path categorization).
 
 ## Milestones
 
