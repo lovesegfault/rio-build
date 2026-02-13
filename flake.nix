@@ -1,8 +1,13 @@
 {
+  description = "rio-build - Nix build orchestration";
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    flake-parts.url = "github:hercules-ci/flake-parts";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
 
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -44,37 +49,23 @@
       perSystem =
         {
           config,
-          self',
-          inputs',
           pkgs,
           system,
           ...
         }:
         let
-          # Rust toolchain configuration
-          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "rust-src"
-              "rust-analyzer"
-              "clippy"
-              "rustfmt"
-            ];
-            targets = [ pkgs.stdenv.hostPlatform.rust.rustcTarget ];
-          };
+          # Read version from Cargo.toml
+          cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+          inherit (cargoToml.workspace.package) version;
+
+          # Rust toolchain from rust-toolchain.toml (single source of truth)
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
           # Crane library for building Rust packages
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
           # Source root for filesets
           unfilteredRoot = ./.;
-
-          # Common environment variables for builds and dev shell
-          commonEnvVars = {
-            RUST_BACKTRACE = "1";
-            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-            PROTOC = "${pkgs.protobuf}/bin/protoc";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          };
 
           # Common arguments for all crane builds
           commonArgs = {
@@ -90,7 +81,7 @@
             strictDeps = true;
 
             pname = "rio";
-            version = "0.1.0";
+            inherit version;
 
             nativeBuildInputs = with pkgs; [
               pkg-config
@@ -112,8 +103,12 @@
             propagatedBuildInputs = with pkgs; [
               nix
             ];
-          }
-          // commonEnvVars;
+
+            RUST_BACKTRACE = "1";
+            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          };
 
           # Build dependencies only (for caching)
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -136,6 +131,7 @@
 
           # Configure treefmt
           treefmt.config = {
+            flakeCheck = false;
             projectRootFile = "flake.nix";
 
             programs = {
@@ -156,47 +152,44 @@
           pre-commit = {
             check.enable = true;
 
-            settings = {
-              hooks = {
-                # Run treefmt on all files
-                treefmt.enable = true;
-
-                # Note: cargo-check and clippy hooks disabled in favor of crane checks
-                # which run via 'nix flake check' and properly handle protoc dependency
-              };
+            settings.hooks = {
+              treefmt.enable = true;
+              convco.enable = true;
+              ripsecrets.enable = true;
+              check-added-large-files.enable = true;
+              check-merge-conflicts.enable = true;
+              end-of-file-fixer.enable = true;
+              trim-trailing-whitespace.enable = true;
+              deadnix.enable = true;
+              nil.enable = true;
+              statix.enable = true;
             };
           };
 
           # Development shell
-          devShells.default = craneLib.devShell (
-            commonEnvVars
-            // {
-              # Inherit inputs from the package build
-              inputsFrom = [ rio-workspace ];
+          devShells.default = craneLib.devShell {
+            inherit (config) checks;
 
-              # Inherit inputs from checks
-              checks = config.checks;
+            packages = with pkgs; [
+              # Cargo tools
+              cargo-edit
+              cargo-expand
+              cargo-nextest
+              cargo-outdated
+              cargo-watch
 
-              # Additional development packages
-              packages = with pkgs; [
-                # Cargo tools
-                cargo-edit
-                cargo-expand
-                cargo-nextest
-                cargo-outdated
-                cargo-watch
+              # Debugging tools
+              lldb
+              gdb
+            ];
 
-                # Debugging tools
-                lldb
-                gdb
+            RUST_BACKTRACE = "1";
+            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
-                # Nix tooling (fork with system-features support)
-              ];
-
-              # Shell hook for pre-commit
-              shellHook = config.pre-commit.installationScript;
-            }
-          );
+            shellHook = config.pre-commit.installationScript;
+          };
 
           # Packages
           packages = {
@@ -205,6 +198,9 @@
 
           # Checks (run with 'nix flake check')
           checks = {
+            # Build the workspace
+            inherit rio-workspace;
+
             # Clippy lints
             rio-clippy = craneLib.cargoClippy (
               commonArgs
@@ -214,12 +210,12 @@
               }
             );
 
-            # Run tests
-            rio-test = craneLib.cargoTest (
+            # Run tests with nextest
+            rio-nextest = craneLib.cargoNextest (
               commonArgs
               // {
                 inherit cargoArtifacts;
-                # Integration tests need nix commands available
+                cargoNextestExtraArgs = "--no-tests=warn";
                 nativeCheckInputs = with pkgs; [
                   nix
                 ];
@@ -234,12 +230,12 @@
               }
             );
 
-            # Test coverage with tarpaulin
-            rio-coverage = craneLib.cargoTarpaulin (
+            # Test coverage with llvm-cov
+            rio-coverage = craneLib.cargoLlvmCov (
               commonArgs
               // {
                 inherit cargoArtifacts;
-                # Coverage tests also need nix commands available
+                dontFixup = true;
                 nativeCheckInputs = with pkgs; [
                   nix
                 ];
