@@ -13,7 +13,7 @@ use russh::server::{Auth, Handler, Msg, Server as _, Session};
 use russh::{ChannelId, CryptoVec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use super::session::run_protocol;
 use crate::store::Store;
@@ -111,6 +111,8 @@ impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
+        metrics::counter!("rio_connections_total", "result" => "new").increment(1);
+        metrics::gauge!("rio_connections_active").increment(1.0);
         info!(peer = ?peer_addr, "new SSH connection");
         ConnectionHandler {
             peer_addr,
@@ -160,6 +162,7 @@ impl Handler for ConnectionHandler {
             .any(|authorized| authorized.key_data() == key.key_data());
 
         if key_matches {
+            metrics::counter!("rio_connections_total", "result" => "accepted").increment(1);
             info!(
                 user = user,
                 peer = ?self.peer_addr,
@@ -167,6 +170,7 @@ impl Handler for ConnectionHandler {
             );
             Ok(Auth::Accept)
         } else {
+            metrics::counter!("rio_connections_total", "result" => "rejected").increment(1);
             warn!(
                 user = user,
                 peer = ?self.peer_addr,
@@ -203,6 +207,7 @@ impl Handler for ConnectionHandler {
         }
 
         session.channel_success(channel_id)?;
+        metrics::gauge!("rio_channels_active").increment(1.0);
 
         // Data pipeline using two independent DuplexStreams:
         //   client SSH data → mpsc → pump → inbound_writer ↔ inbound_reader → protocol reads
@@ -227,14 +232,17 @@ impl Handler for ConnectionHandler {
 
         // Task: run the protocol handler with separate reader/writer
         let store = Arc::clone(&self.store);
-        let proto_task = tokio::spawn(async move {
-            let mut reader = inbound_reader;
-            let mut writer = outbound_writer;
-            if let Err(e) = run_protocol(&mut reader, &mut writer, store.as_ref()).await {
-                error!(error = %e, "protocol session error");
+        let proto_task = tokio::spawn(
+            async move {
+                let mut reader = inbound_reader;
+                let mut writer = outbound_writer;
+                if let Err(e) = run_protocol(&mut reader, &mut writer, store.as_ref()).await {
+                    error!(error = %e, "protocol session error");
+                }
+                debug!("protocol handler finished");
             }
-            debug!(channel = ?channel_id, "protocol handler finished");
-        });
+            .instrument(tracing::info_span!("channel", channel = ?channel_id)),
+        );
 
         // Task: pump protocol responses → SSH client via Handle::data()
         let handle = session.handle();
@@ -294,8 +302,9 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel EOF");
-        // Remove the session; dropping client_tx signals EOF to the protocol handler
-        self.sessions.remove(&channel);
+        if self.sessions.remove(&channel).is_some() {
+            metrics::gauge!("rio_channels_active").decrement(1.0);
+        }
         Ok(())
     }
 
@@ -305,7 +314,9 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
-        self.sessions.remove(&channel);
+        if self.sessions.remove(&channel).is_some() {
+            metrics::gauge!("rio_channels_active").decrement(1.0);
+        }
         Ok(())
     }
 }
