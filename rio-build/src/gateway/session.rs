@@ -23,28 +23,20 @@ enum State {
     Ready,
 }
 
-/// Runs the Nix worker protocol on split read/write streams.
+/// Runs the Nix worker protocol on a bidirectional stream.
 ///
-/// This is the main protocol loop for a single SSH channel. It handles
-/// handshake, option negotiation, and opcode dispatch.
-pub async fn run_protocol<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    store: &dyn Store,
-) -> anyhow::Result<()>
+/// The stream must implement both `AsyncRead` and `AsyncWrite` (e.g.,
+/// a `ChannelStream` from russh, or a `tokio::io::Join` of separate halves).
+pub async fn run_protocol<S>(stream: &mut S, store: &dyn Store) -> anyhow::Result<()>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut options: Option<ClientOptions> = None;
     let mut temp_roots: HashSet<String> = HashSet::new();
 
-    // Step 1: Handshake (reads from reader, writes to writer)
+    // Step 1: Handshake
     let version_string = format!("rio-build {}", env!("CARGO_PKG_VERSION"));
-
-    // Handshake needs a combined read+write stream. We use a join wrapper.
-    let mut combined = tokio::io::join(reader, writer);
-    match handshake::server_handshake(&mut combined, &version_string).await {
+    match handshake::server_handshake(stream, &version_string).await {
         Ok(result) => {
             let (major, minor) = handshake::decode_version(result.client_version);
             info!(
@@ -60,8 +52,7 @@ where
                 client_version = format!("{client_major}.{client_minor}"),
                 "rejecting client: protocol version too old"
             );
-            let (_, w) = combined.into_inner();
-            let mut stderr = StderrWriter::new(w);
+            let mut stderr = StderrWriter::new(&mut *stream);
             stderr
                 .error(&StderrError::simple(format!(
                     "rio-build requires Nix protocol version 1.37+, client sent {client_major}.{client_minor}"
@@ -74,14 +65,16 @@ where
             return Ok(());
         }
     }
-    let (reader, writer) = combined.into_inner();
 
     // Step 2: Opcode loop
     let mut state = State::AwaitingOptions;
 
+    // Split the stream for the opcode loop: we need to read opcodes while
+    // writing responses. The `tokio::io::split` adapter allows this safely.
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
     loop {
-        // Read the next opcode
-        let opcode = match wire::read_u64(reader).await {
+        let opcode = match wire::read_u64(&mut reader).await {
             Ok(op) => op,
             Err(wire::WireError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!("client disconnected (EOF)");
@@ -98,12 +91,11 @@ where
         match state {
             State::AwaitingOptions => {
                 if opcode != 19 {
-                    // wopSetOptions
                     warn!(
                         opcode = opcode,
                         "protocol error: wopSetOptions must be the first opcode after handshake"
                     );
-                    let mut stderr = StderrWriter::new(&mut *writer);
+                    let mut stderr = StderrWriter::new(&mut writer);
                     stderr
                         .error(&StderrError::simple(
                             "protocol error: wopSetOptions must be the first opcode after handshake",
@@ -114,8 +106,8 @@ where
 
                 handler::handle_opcode(
                     opcode,
-                    reader,
-                    writer,
+                    &mut reader,
+                    &mut writer,
                     store,
                     &mut options,
                     &mut temp_roots,
@@ -126,8 +118,8 @@ where
             State::Ready => {
                 handler::handle_opcode(
                     opcode,
-                    reader,
-                    writer,
+                    &mut reader,
+                    &mut writer,
                     store,
                     &mut options,
                     &mut temp_roots,

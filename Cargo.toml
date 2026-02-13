@@ -49,6 +49,7 @@ bytes = "1"
 
 # Testing
 proptest = "1"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
