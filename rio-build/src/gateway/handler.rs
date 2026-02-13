@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use rio_nix::protocol::derived_path::DerivedPath;
 use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
@@ -81,11 +82,14 @@ where
                 "unimplemented opcode, closing connection"
             );
             stderr
-                .error(&StderrError::simple(format!(
-                    "operation {} ({}) is not yet implemented",
-                    op.name(),
-                    opcode
-                )))
+                .error(&StderrError::simple(
+                    "rio-build",
+                    format!(
+                        "operation {} ({}) is not yet implemented",
+                        op.name(),
+                        opcode
+                    ),
+                ))
                 .await?;
             // Must close the connection: the opcode's payload is still in the
             // stream and we don't know its format, so we can't drain it.
@@ -99,9 +103,10 @@ where
         None => {
             warn!(opcode = opcode, "unknown opcode, closing connection");
             stderr
-                .error(&StderrError::simple(format!(
-                    "unsupported operation {opcode}"
-                )))
+                .error(&StderrError::simple(
+                    "rio-build",
+                    format!("unsupported operation {opcode}"),
+                ))
                 .await?;
             Err(anyhow::anyhow!(
                 "unknown opcode {opcode}, closing connection to avoid stream desynchronization"
@@ -120,6 +125,21 @@ where
     result
 }
 
+/// Send a store error as STDERR_ERROR to the client, then return the error.
+async fn send_store_error<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    err: anyhow::Error,
+) -> anyhow::Result<()> {
+    // Best-effort: if sending the error also fails, we still propagate the original.
+    let _ = stderr
+        .error(&StderrError::simple(
+            "rio-build",
+            format!("store error: {err}"),
+        ))
+        .await;
+    Err(err)
+}
+
 /// wopIsValidPath (1): Check if a store path exists.
 #[instrument(skip_all)]
 async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -131,7 +151,10 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     debug!(path = %path_str, "wopIsValidPath");
 
     let valid = match StorePath::parse(&path_str) {
-        Ok(path) => store.is_valid_path(&path).await?,
+        Ok(path) => match store.is_valid_path(&path).await {
+            Ok(v) => v,
+            Err(e) => return send_store_error(stderr, e).await,
+        },
         Err(_) => false,
     };
 
@@ -159,7 +182,10 @@ async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    let info = store.query_path_info(&path).await?;
+    let info = match store.query_path_info(&path).await {
+        Ok(info) => info,
+        Err(e) => return send_store_error(stderr, e).await,
+    };
 
     stderr.finish().await?;
     let w = stderr.inner_mut();
@@ -218,7 +244,10 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .filter_map(|s| StorePath::parse(s).ok())
         .collect();
 
-    let valid = store.query_valid_paths(&paths).await?;
+    let valid = match store.query_valid_paths(&paths).await {
+        Ok(v) => v,
+        Err(e) => return send_store_error(stderr, e).await,
+    };
     let valid_strs: Vec<String> = valid.iter().map(|p| p.to_string()).collect();
 
     stderr.finish().await?;
@@ -303,7 +332,10 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     debug!(path = %path_str, "wopNarFromPath");
 
     let path = StorePath::parse(&path_str)?;
-    let nar = store.nar_from_path(&path).await?;
+    let nar = match store.nar_from_path(&path).await {
+        Ok(nar) => nar,
+        Err(e) => return send_store_error(stderr, e).await,
+    };
 
     match nar {
         Some(nar_data) => {
@@ -317,10 +349,10 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         None => {
             stderr
-                .error(&StderrError::simple(format!(
-                    "path '{}' is not valid",
-                    path_str
-                )))
+                .error(&StderrError::simple(
+                    "rio-build",
+                    format!("path '{}' is not valid", path_str),
+                ))
                 .await?;
         }
     }
@@ -359,28 +391,40 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// wopQueryMissing (40): Report what needs building.
 ///
-/// Checks the store for paths that already exist and excludes them from
-/// `willBuild`. Paths not in the store are returned as needing building.
+/// Receives a collection of `DerivedPath` strings (which may contain `!*` or
+/// `!out,dev` output specifiers). Checks the store for the base paths and
+/// returns those not present as `willBuild`.
 #[instrument(skip_all)]
 async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store: &dyn Store,
 ) -> anyhow::Result<()> {
-    let paths = wire::read_strings(reader).await?;
-    debug!(count = paths.len(), "wopQueryMissing");
+    let raw_paths = wire::read_strings(reader).await?;
+    debug!(count = raw_paths.len(), "wopQueryMissing");
 
-    // Check which paths already exist in the store
-    let mut will_build = Vec::new();
-    for path_str in &paths {
-        let is_valid = match StorePath::parse(path_str) {
-            Ok(sp) => store.is_valid_path(&sp).await.unwrap_or(false),
-            Err(_) => false,
-        };
-        if !is_valid {
-            will_build.push(path_str.clone());
-        }
-    }
+    // Parse DerivedPath strings and extract base store paths for batch lookup.
+    // DerivedPath values like "/nix/store/...-foo.drv!*" need the "!*" stripped
+    // before we can check the store.
+    let parsed: Vec<StorePath> = raw_paths
+        .iter()
+        .filter_map(|s| DerivedPath::parse(s).ok().map(|dp| dp.store_path().clone()))
+        .collect();
+
+    let valid_set: HashSet<String> = match store.query_valid_paths(&parsed).await {
+        Ok(v) => v.into_iter().map(|p| p.to_string()).collect(),
+        Err(e) => return send_store_error(stderr, e).await,
+    };
+
+    let will_build: Vec<String> = raw_paths
+        .into_iter()
+        .filter(|p| {
+            let base = DerivedPath::parse(p)
+                .ok()
+                .map(|dp| dp.store_path().to_string());
+            !base.is_some_and(|b| valid_set.contains(&b))
+        })
+        .collect();
 
     stderr.finish().await?;
     let w = stderr.inner_mut();

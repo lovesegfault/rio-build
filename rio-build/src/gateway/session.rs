@@ -32,7 +32,8 @@ where
             let (major, minor) = handshake::decode_version(result.negotiated_version);
             metrics::counter!("rio_gateway_handshakes_total", "result" => "success").increment(1);
             info!(
-                client_version = format!("{major}.{minor}"),
+                client_version_major = major,
+                client_version_minor = minor,
                 "handshake complete"
             );
         }
@@ -42,14 +43,16 @@ where
         }) => {
             metrics::counter!("rio_gateway_handshakes_total", "result" => "rejected").increment(1);
             warn!(
-                client_version = format!("{client_major}.{client_minor}"),
+                client_version_major = client_major,
+                client_version_minor = client_minor,
                 "rejecting client: protocol version too old"
             );
             let mut stderr = StderrWriter::new(&mut *writer);
             stderr
-                .error(&StderrError::simple(format!(
-                    "rio-build requires Nix protocol version 1.37+, client sent {client_major}.{client_minor}"
-                )))
+                .error(&StderrError::simple(
+                    "rio-build",
+                    format!("rio-build requires Nix protocol version 1.37+, client sent {client_major}.{client_minor}"),
+                ))
                 .await?;
             return Ok(());
         }

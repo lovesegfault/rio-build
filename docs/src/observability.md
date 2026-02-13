@@ -60,6 +60,11 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_gateway_connections_active` | Gauge | Currently active connections |
 | `rio_gateway_opcodes_total` | Counter | Protocol opcodes handled (labeled by opcode) |
 | `rio_gateway_opcode_duration_seconds` | Histogram | Per-opcode latency |
+| `rio_gateway_handshakes_total` | Counter | Protocol handshakes completed (labeled by result: success/rejected/failed) |
+| `rio_gateway_channels_active` | Gauge | Currently active SSH channels |
+| `rio_gateway_errors_total` | Counter | Protocol errors (labeled by type) |
+
+> **Note on `rio_gateway_connections_total`:** Incremented on TCP connection (`result=new`), then again on auth outcome (`result=accepted` or `result=rejected`). A single successful connection generates two increments. Use `result=accepted` + `result=rejected` for connection success/failure rates.
 
 ### Scheduler Metrics
 

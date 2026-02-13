@@ -499,3 +499,187 @@ async fn test_unknown_opcode_closes_connection() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nar_from_path_missing() {
+    let store = Arc::new(MemoryStore::new()); // empty store
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopNarFromPath (38) for a path NOT in the store
+            wire::write_u64(&mut s, 38).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-missing-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_ERROR (path is not valid)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg,
+                rio_nix::protocol::stderr::STDERR_ERROR,
+                "expected STDERR_ERROR for missing path"
+            );
+
+            // Read and discard the error structure
+            let _type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let _message = wire::read_string(&mut s).await.unwrap();
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_path_info_invalid_path_format() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopQueryPathInfo (26) with a garbage (non-store-path) string
+            wire::write_u64(&mut s, 26).await.unwrap();
+            wire::write_string(&mut s, "this-is-not-a-store-path")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // Should return valid=false for unparseable paths
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 0, "expected invalid for garbage path");
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_opcode_sequence() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // Op 1: IsValidPath (found)
+            wire::write_u64(&mut s, 1).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), 1);
+
+            // Op 2: IsValidPath (not found)
+            wire::write_u64(&mut s, 1).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), 0);
+
+            // Op 3: AddTempRoot
+            wire::write_u64(&mut s, 11).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), 1);
+
+            // Op 4: QueryPathFromHashPart (stub)
+            wire::write_u64(&mut s, 29).await.unwrap();
+            wire::write_string(&mut s, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(path.is_empty());
+
+            // Op 5: QueryMissing
+            wire::write_u64(&mut s, 40).await.unwrap();
+            let paths =
+                vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            s.flush().await.unwrap();
+            assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
+            let will_build = wire::read_strings(&mut s).await.unwrap();
+            assert!(
+                will_build.is_empty(),
+                "existing path should not be in willBuild"
+            );
+            let _will_substitute = wire::read_strings(&mut s).await.unwrap();
+            let _unknown = wire::read_strings(&mut s).await.unwrap();
+            let _download_size = wire::read_u64(&mut s).await.unwrap();
+            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_missing_with_derived_path() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopQueryMissing (40) with DerivedPath format "path!*"
+            wire::write_u64(&mut s, 40).await.unwrap();
+            let paths = vec![
+                // Existing path with !* suffix (DerivedPath format)
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1!*".to_string(),
+                // Missing path with !out suffix
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0!out".to_string(),
+            ];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // willBuild: only the missing path (with its original DerivedPath form)
+            let will_build = wire::read_strings(&mut s).await.unwrap();
+            assert_eq!(
+                will_build.len(),
+                1,
+                "only the missing path should be in willBuild"
+            );
+            assert!(
+                will_build[0].contains("missing-1.0"),
+                "expected missing path, got: {:?}",
+                will_build
+            );
+
+            // willSubstitute, unknown, downloadSize, narSize
+            let _will_substitute = wire::read_strings(&mut s).await.unwrap();
+            let _unknown = wire::read_strings(&mut s).await.unwrap();
+            let _download_size = wire::read_u64(&mut s).await.unwrap();
+            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}

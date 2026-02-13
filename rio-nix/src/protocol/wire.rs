@@ -29,9 +29,6 @@ pub enum WireError {
 
     #[error("invalid UTF-8 in string")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
-
-    #[error("unexpected end of input")]
-    UnexpectedEof,
 }
 
 pub type Result<T> = std::result::Result<T, WireError>;
@@ -165,11 +162,15 @@ pub async fn write_strings<W: AsyncWrite + Unpin>(w: &mut W, items: &[String]) -
     Ok(())
 }
 
-/// Write a collection of string slices.
-pub async fn write_str_slice<W: AsyncWrite + Unpin>(w: &mut W, items: &[&str]) -> Result<()> {
-    write_u64(w, items.len() as u64).await?;
-    for item in items {
-        write_string(w, item).await?;
+/// Write a collection of key-value string pairs.
+pub async fn write_string_pairs<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    pairs: &[(String, String)],
+) -> Result<()> {
+    write_u64(w, pairs.len() as u64).await?;
+    for (key, value) in pairs {
+        write_string(w, key).await?;
+        write_string(w, value).await?;
     }
     Ok(())
 }
@@ -320,6 +321,66 @@ mod tests {
         assert!(matches!(result, Err(WireError::CollectionTooLarge(_))));
     }
 
+    #[tokio::test]
+    async fn test_read_u64_truncated() {
+        // Only 3 bytes available, need 8
+        let mut reader = Cursor::new(vec![0, 1, 2]);
+        let result = read_u64(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_u64_empty() {
+        let mut reader = Cursor::new(vec![]);
+        let result = read_u64(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_string_truncated_body() {
+        // Length says 10 bytes, but only 5 available
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 10).await.unwrap();
+        buf.extend_from_slice(b"hello"); // only 5 of 10 bytes
+        let mut reader = Cursor::new(buf);
+        let result = read_string(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_string_missing_padding() {
+        // 3-byte string needs 5 bytes padding, but we only provide the string
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 3).await.unwrap();
+        buf.extend_from_slice(b"abc"); // no padding
+        let mut reader = Cursor::new(buf);
+        let result = read_bytes(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_string_invalid_utf8() {
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 4).await.unwrap();
+        buf.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC]); // invalid UTF-8
+        buf.extend_from_slice(&[0, 0, 0, 0]); // padding
+        let mut reader = Cursor::new(buf);
+        let result = read_string(&mut reader).await;
+        assert!(matches!(result, Err(WireError::InvalidUtf8(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_strings_truncated_elements() {
+        // Says 3 elements, but only provides data for 1
+        let mut buf = Vec::new();
+        write_u64(&mut buf, 3).await.unwrap();
+        write_string(&mut buf, "first").await.unwrap();
+        // missing 2nd and 3rd elements
+        let mut reader = Cursor::new(buf);
+        let result = read_strings(&mut reader).await;
+        assert!(result.is_err());
+    }
+
     // Property-based tests
     mod proptests {
         use super::*;
@@ -380,6 +441,19 @@ mod tests {
             }
 
             #[test]
+            fn roundtrip_string_utf8(s in "\\PC{0,100}") {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_string(&mut buf, &s).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_string(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, s);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
             fn roundtrip_strings(items in proptest::collection::vec("[a-zA-Z0-9/_-]{0,50}", 0..20)) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
@@ -406,12 +480,7 @@ mod tests {
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect();
                     let mut buf = Vec::new();
-                    // Write pairs manually (count + key/value)
-                    write_u64(&mut buf, pairs.len() as u64).await.unwrap();
-                    for (k, v) in &pairs {
-                        write_string(&mut buf, k).await.unwrap();
-                        write_string(&mut buf, v).await.unwrap();
-                    }
+                    write_string_pairs(&mut buf, &pairs).await.unwrap();
                     let mut reader = Cursor::new(buf);
                     let result = read_string_pairs(&mut reader).await.unwrap();
                     prop_assert_eq!(result, pairs);

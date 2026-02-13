@@ -132,9 +132,16 @@ struct ChannelSession {
     /// Send client data to the protocol handler.
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     /// Protocol handler task.
-    _proto_task: tokio::task::JoinHandle<()>,
+    proto_task: tokio::task::JoinHandle<()>,
     /// Response pump task (reads protocol output, sends via Handle::data).
-    _response_task: tokio::task::JoinHandle<()>,
+    response_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ChannelSession {
+    fn drop(&mut self) {
+        self.proto_task.abort();
+        self.response_task.abort();
+    }
 }
 
 /// Per-connection handler that manages SSH channels.
@@ -171,6 +178,11 @@ impl Drop for ConnectionHandler {
 impl Handler for ConnectionHandler {
     type Error = anyhow::Error;
 
+    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+        warn!(peer = ?self.peer_addr, "rejecting password authentication");
+        Ok(Auth::reject())
+    }
+
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         let key_matches = self
             .authorized_keys
@@ -198,10 +210,10 @@ impl Handler for ConnectionHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: russh::Channel<Msg>,
+        channel: russh::Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let channel_id = _channel.id();
+        let channel_id = channel.id();
         info!(channel = ?channel_id, "SSH session channel opened");
         Ok(true)
     }
@@ -287,8 +299,8 @@ impl Handler for ConnectionHandler {
             channel_id,
             ChannelSession {
                 client_tx,
-                _proto_task: proto_task,
-                _response_task: response_task,
+                proto_task,
+                response_task,
             },
         );
 

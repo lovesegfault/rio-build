@@ -41,6 +41,19 @@ pub enum HashAlgo {
     SHA1,
 }
 
+impl std::str::FromStr for HashAlgo {
+    type Err = HashError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sha256" => Ok(HashAlgo::SHA256),
+            "sha512" => Ok(HashAlgo::SHA512),
+            "sha1" => Ok(HashAlgo::SHA1),
+            _ => Err(HashError::UnknownAlgorithm(s.to_string())),
+        }
+    }
+}
+
 impl HashAlgo {
     /// Expected digest length in bytes.
     pub fn digest_len(&self) -> usize {
@@ -53,12 +66,7 @@ impl HashAlgo {
 
     /// Parse an algorithm name string (case-insensitive).
     pub fn parse(s: &str) -> Result<Self, HashError> {
-        match s.to_lowercase().as_str() {
-            "sha256" => Ok(HashAlgo::SHA256),
-            "sha512" => Ok(HashAlgo::SHA512),
-            "sha1" => Ok(HashAlgo::SHA1),
-            _ => Err(HashError::UnknownAlgorithm(s.to_string())),
-        }
+        s.parse()
     }
 
     /// Return the algorithm name as a lowercase string.
@@ -78,10 +86,23 @@ impl std::fmt::Display for HashAlgo {
 }
 
 /// A Nix hash value (algorithm + digest bytes).
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NixHash {
-    pub algo: HashAlgo,
-    pub digest: Vec<u8>,
+    algo: HashAlgo,
+    digest: Vec<u8>,
+}
+
+impl NixHash {
+    /// The hash algorithm.
+    pub fn algo(&self) -> HashAlgo {
+        self.algo
+    }
+
+    /// The raw digest bytes.
+    pub fn digest(&self) -> &[u8] {
+        &self.digest
+    }
 }
 
 impl NixHash {
@@ -166,14 +187,20 @@ impl NixHash {
 
     /// Truncate to 20 bytes for store path hash computation.
     /// This is used for store path fingerprinting (compress-hash in Nix).
-    pub fn truncate_for_store_path(&self) -> [u8; 20] {
-        assert_eq!(self.algo, HashAlgo::SHA256, "only SHA-256 can be truncated");
+    ///
+    /// Only valid for SHA-256 hashes. Returns an error for other algorithms.
+    pub fn truncate_for_store_path(&self) -> Result<[u8; 20], HashError> {
+        if self.algo != HashAlgo::SHA256 {
+            return Err(HashError::InvalidFormat(
+                "only SHA-256 can be truncated for store paths".into(),
+            ));
+        }
         let mut out = [0u8; 20];
         // Nix compresses by XOR-folding: fold the 32-byte digest into 20 bytes
         for (i, &byte) in self.digest.iter().enumerate() {
             out[i % 20] ^= byte;
         }
-        out
+        Ok(out)
     }
 }
 
@@ -206,11 +233,11 @@ mod tests {
     #[test]
     fn test_compute_sha256() {
         let hash = NixHash::compute(HashAlgo::SHA256, b"");
-        assert_eq!(hash.algo, HashAlgo::SHA256);
-        assert_eq!(hash.digest.len(), 32);
+        assert_eq!(hash.algo(), HashAlgo::SHA256);
+        assert_eq!(hash.digest().len(), 32);
         // SHA-256 of empty string is well-known
         assert_eq!(
-            hex::encode(&hash.digest),
+            hex::encode(hash.digest()),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
@@ -218,11 +245,11 @@ mod tests {
     #[test]
     fn test_compute_sha1() {
         let hash = NixHash::compute(HashAlgo::SHA1, b"");
-        assert_eq!(hash.algo, HashAlgo::SHA1);
-        assert_eq!(hash.digest.len(), 20);
+        assert_eq!(hash.algo(), HashAlgo::SHA1);
+        assert_eq!(hash.digest().len(), 20);
         // SHA-1 of empty string
         assert_eq!(
-            hex::encode(&hash.digest),
+            hex::encode(hash.digest()),
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         );
     }
@@ -248,16 +275,26 @@ mod tests {
     #[test]
     fn test_truncate_for_store_path() {
         let hash = NixHash::compute(HashAlgo::SHA256, b"test");
-        let truncated = hash.truncate_for_store_path();
+        let truncated = hash.truncate_for_store_path().unwrap();
         assert_eq!(truncated.len(), 20);
         // Verify XOR fold: bytes[0] ^ bytes[20], bytes[1] ^ bytes[21], etc.
+        let digest = hash.digest();
         for (i, &actual) in truncated.iter().enumerate() {
             let mut expected = 0u8;
             for j in (0..32).filter(|j| j % 20 == i) {
-                expected ^= hash.digest[j];
+                expected ^= digest[j];
             }
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn test_truncate_rejects_non_sha256() {
+        let hash = NixHash::compute(HashAlgo::SHA512, b"test");
+        assert!(hash.truncate_for_store_path().is_err());
+
+        let hash = NixHash::compute(HashAlgo::SHA1, b"test");
+        assert!(hash.truncate_for_store_path().is_err());
     }
 
     #[test]
