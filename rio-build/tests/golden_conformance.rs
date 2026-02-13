@@ -1,16 +1,17 @@
 //! Golden protocol conformance tests.
 //!
-//! These tests record byte-level interactions from a real nix-daemon
-//! and verify that rio-build produces identical responses for the same
-//! client input.
+//! This file contains two layers of golden tests:
 //!
-//! The approach: construct known client byte sequences for each opcode,
-//! feed them to both the real nix-daemon (via unix socket) and to
-//! rio-build's protocol handler, and compare the server responses
-//! byte-for-byte (with masking for known-varying fields like timestamps
-//! and version strings).
+//! 1. **Structural tests** (existing): construct client bytes, feed them to
+//!    rio-build, and verify the response has correct field values. These run
+//!    without any external dependencies.
 //!
-//! Requirements: `nix-daemon` must be running (provided by the dev shell).
+//! 2. **Byte-conformance tests** (new): load recorded binary fixtures from a
+//!    real nix-daemon and compare rio-build's response field-by-field against
+//!    the recorded bytes. These require fixtures in `tests/golden/fixtures/`
+//!    (recorded with `RECORD_GOLDEN=1`).
+
+mod golden;
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -21,47 +22,36 @@ use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGI
 use rio_nix::protocol::stderr::STDERR_LAST;
 use rio_nix::protocol::wire;
 
+// ============================================================================
+// Helpers (used by structural tests below)
+// ============================================================================
+
 /// Build the client-side handshake bytes that a 1.38 client would send.
-///
-/// This is deterministic and doesn't require a real nix-daemon.
 async fn build_handshake_client_bytes() -> Vec<u8> {
     let mut buf = Vec::new();
-
-    // Phase 1: client magic + client version
     wire::write_u64(&mut buf, WORKER_MAGIC_1).await.unwrap();
     wire::write_u64(&mut buf, PROTOCOL_VERSION).await.unwrap();
-
-    // Phase 2: client features (empty)
     wire::write_strings(&mut buf, &[]).await.unwrap();
-
-    // Phase 3: post-handshake: CPU affinity (0) + reserveSpace (0)
     wire::write_u64(&mut buf, 0).await.unwrap();
     wire::write_u64(&mut buf, 0).await.unwrap();
-
     buf
 }
 
 /// Build wopSetOptions client bytes with default values.
 async fn build_set_options_bytes() -> Vec<u8> {
     let mut buf = Vec::new();
-
-    // Opcode 19 = wopSetOptions
     wire::write_u64(&mut buf, 19).await.unwrap();
-
-    // 12 fields: all zeros
     for _ in 0..12 {
         wire::write_u64(&mut buf, 0).await.unwrap();
     }
-    // Empty overrides
     wire::write_u64(&mut buf, 0).await.unwrap();
-
     buf
 }
 
 /// Build wopIsValidPath client bytes for a given path.
 async fn build_is_valid_path_bytes(path: &str) -> Vec<u8> {
     let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 1).await.unwrap(); // opcode 1
+    wire::write_u64(&mut buf, 1).await.unwrap();
     wire::write_string(&mut buf, path).await.unwrap();
     buf
 }
@@ -77,7 +67,6 @@ async fn rio_build_response(client_bytes: &[u8], store: Arc<MemoryStore>) -> Vec
         let _ = run_protocol(&mut reader, &mut writer, store.as_ref()).await;
     });
 
-    // Read all response bytes
     let mut response = Vec::new();
     let mut reader = tokio::io::BufReader::new(response_reader);
     tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut response)
@@ -88,11 +77,10 @@ async fn rio_build_response(client_bytes: &[u8], store: Arc<MemoryStore>) -> Vec
     response
 }
 
-/// Parse a handshake response: extract WORKER_MAGIC_2, server version,
-/// server features, version string, trusted status, and STDERR_LAST.
-///
-/// Returns a structured representation for comparison that masks the
-/// version string (which varies between rio-build and real nix-daemon).
+// ============================================================================
+// Structural golden tests (no external dependencies)
+// ============================================================================
+
 #[derive(Debug, PartialEq)]
 struct HandshakeResponse {
     magic2: u64,
@@ -108,7 +96,6 @@ async fn parse_handshake_response(data: &[u8]) -> HandshakeResponse {
     let magic2 = wire::read_u64(&mut reader).await.unwrap();
     let server_version = wire::read_u64(&mut reader).await.unwrap();
 
-    // Feature exchange (>= 1.38)
     let negotiated = server_version.min(PROTOCOL_VERSION);
     let features = if negotiated >= (1 << 8 | 38) {
         wire::read_strings(&mut reader).await.unwrap()
@@ -116,13 +103,8 @@ async fn parse_handshake_response(data: &[u8]) -> HandshakeResponse {
         vec![]
     };
 
-    // Version string (skip — varies between implementations)
     let _version_string = wire::read_string(&mut reader).await.unwrap();
-
-    // Trusted status
     let trusted_status = wire::read_u64(&mut reader).await.unwrap();
-
-    // STDERR_LAST
     let last = wire::read_u64(&mut reader).await.unwrap();
 
     HandshakeResponse {
@@ -134,14 +116,6 @@ async fn parse_handshake_response(data: &[u8]) -> HandshakeResponse {
     }
 }
 
-/// Test that rio-build's handshake response has the correct structure.
-///
-/// We verify:
-/// - WORKER_MAGIC_2 is correct
-/// - Server version is 1.38 (0x126)
-/// - Features are empty
-/// - Trusted status is 1
-/// - STDERR_LAST terminates the handshake
 #[tokio::test]
 async fn test_golden_handshake_structure() {
     let store = Arc::new(MemoryStore::new());
@@ -163,8 +137,6 @@ async fn test_golden_handshake_structure() {
     );
 }
 
-/// Test that the full handshake + wopIsValidPath response
-/// produces correct bytes for a non-existent path.
 #[tokio::test]
 async fn test_golden_is_valid_path_not_found() {
     let store = Arc::new(MemoryStore::new());
@@ -179,7 +151,6 @@ async fn test_golden_is_valid_path_not_found() {
     let response = rio_build_response(&client_bytes, store).await;
     let mut reader = Cursor::new(response);
 
-    // Skip handshake response
     let _magic2 = wire::read_u64(&mut reader).await.unwrap();
     let _version = wire::read_u64(&mut reader).await.unwrap();
     let _features = wire::read_strings(&mut reader).await.unwrap();
@@ -187,21 +158,15 @@ async fn test_golden_is_valid_path_not_found() {
     let _trusted = wire::read_u64(&mut reader).await.unwrap();
     let _last = wire::read_u64(&mut reader).await.unwrap();
 
-    // wopSetOptions response: STDERR_LAST + u64(1)
     let last = wire::read_u64(&mut reader).await.unwrap();
     assert_eq!(last, STDERR_LAST, "expected STDERR_LAST for SetOptions");
-    let result = wire::read_u64(&mut reader).await.unwrap();
-    assert_eq!(result, 1, "expected success for SetOptions");
 
-    // wopIsValidPath response: STDERR_LAST + u64(0) for not-found
     let last = wire::read_u64(&mut reader).await.unwrap();
     assert_eq!(last, STDERR_LAST, "expected STDERR_LAST for IsValidPath");
     let valid = wire::read_u64(&mut reader).await.unwrap();
     assert_eq!(valid, 0, "expected path to be invalid");
 }
 
-/// Test that wopIsValidPath returns 1 for an existing path,
-/// with correct byte-level format.
 #[tokio::test]
 async fn test_golden_is_valid_path_found() {
     use rio_nix::hash::{HashAlgo, NixHash};
@@ -234,7 +199,6 @@ async fn test_golden_is_valid_path_found() {
     let response = rio_build_response(&client_bytes, store).await;
     let mut reader = Cursor::new(response);
 
-    // Skip handshake + SetOptions response
     let _magic2 = wire::read_u64(&mut reader).await.unwrap();
     let _version = wire::read_u64(&mut reader).await.unwrap();
     let _features = wire::read_strings(&mut reader).await.unwrap();
@@ -242,17 +206,13 @@ async fn test_golden_is_valid_path_found() {
     let _trusted = wire::read_u64(&mut reader).await.unwrap();
     let _last = wire::read_u64(&mut reader).await.unwrap(); // handshake STDERR_LAST
     let _last = wire::read_u64(&mut reader).await.unwrap(); // SetOptions STDERR_LAST
-    let _result = wire::read_u64(&mut reader).await.unwrap(); // SetOptions result
 
-    // wopIsValidPath response
     let last = wire::read_u64(&mut reader).await.unwrap();
     assert_eq!(last, STDERR_LAST, "expected STDERR_LAST");
     let valid = wire::read_u64(&mut reader).await.unwrap();
     assert_eq!(valid, 1, "expected path to be valid");
 }
 
-/// Test that wopQueryPathInfo returns all fields in the correct order
-/// with the correct wire format for each field type.
 #[tokio::test]
 async fn test_golden_query_path_info_wire_format() {
     use rio_nix::hash::{HashAlgo, NixHash};
@@ -285,7 +245,6 @@ async fn test_golden_query_path_info_wire_format() {
     let mut client_bytes = build_handshake_client_bytes().await;
     client_bytes.extend(build_set_options_bytes().await);
 
-    // wopQueryPathInfo (opcode 26)
     let mut qpi_bytes = Vec::new();
     wire::write_u64(&mut qpi_bytes, 26).await.unwrap();
     wire::write_string(
@@ -299,17 +258,14 @@ async fn test_golden_query_path_info_wire_format() {
     let response = rio_build_response(&client_bytes, store).await;
     let mut reader = Cursor::new(response);
 
-    // Skip handshake + SetOptions response
     let _magic2 = wire::read_u64(&mut reader).await.unwrap();
     let _version = wire::read_u64(&mut reader).await.unwrap();
     let _features = wire::read_strings(&mut reader).await.unwrap();
     let _version_str = wire::read_string(&mut reader).await.unwrap();
     let _trusted = wire::read_u64(&mut reader).await.unwrap();
-    let _last = wire::read_u64(&mut reader).await.unwrap();
-    let _last = wire::read_u64(&mut reader).await.unwrap();
-    let _result = wire::read_u64(&mut reader).await.unwrap();
+    let _last = wire::read_u64(&mut reader).await.unwrap(); // handshake STDERR_LAST
+    let _last = wire::read_u64(&mut reader).await.unwrap(); // SetOptions STDERR_LAST
 
-    // wopQueryPathInfo response
     let last = wire::read_u64(&mut reader).await.unwrap();
     assert_eq!(last, STDERR_LAST);
 
@@ -320,7 +276,7 @@ async fn test_golden_query_path_info_wire_format() {
     assert_eq!(deriver, deriver_path.to_string());
 
     let hash_str = wire::read_string(&mut reader).await.unwrap();
-    assert_eq!(hash_str, nar_hash.to_colon());
+    assert_eq!(hash_str, nar_hash.to_hex());
 
     let refs = wire::read_strings(&mut reader).await.unwrap();
     assert_eq!(refs, vec![ref_path.to_string()]);
@@ -339,4 +295,128 @@ async fn test_golden_query_path_info_wire_format() {
 
     let ca = wire::read_string(&mut reader).await.unwrap();
     assert!(ca.is_empty(), "CA should be empty for input-addressed path");
+}
+
+// ============================================================================
+// Byte-conformance tests against recorded nix-daemon fixtures
+// ============================================================================
+
+/// Which opcode parser to use for a byte-conformance test.
+enum OpcodeParser {
+    None,
+    IsValidPath,
+    QueryPathInfo,
+    QueryValidPaths,
+    AddTempRoot,
+}
+
+impl OpcodeParser {
+    async fn parse(&self, data: &[u8]) -> Vec<golden::ResponseField> {
+        match self {
+            OpcodeParser::None => vec![],
+            OpcodeParser::IsValidPath => golden::parse_is_valid_path_fields(data).await,
+            OpcodeParser::QueryPathInfo => golden::parse_query_path_info_fields(data).await,
+            OpcodeParser::QueryValidPaths => golden::parse_query_valid_paths_fields(data).await,
+            OpcodeParser::AddTempRoot => golden::parse_add_temp_root_fields(data).await,
+        }
+    }
+}
+
+/// Helper: load fixture, run rio-build, parse both responses, compare fields.
+async fn run_byte_conformance(fixture_name: &str, parser: OpcodeParser) {
+    if !golden::fixtures_exist(fixture_name) {
+        eprintln!(
+            "skipping byte conformance test '{fixture_name}': \
+             fixtures not found (run with RECORD_GOLDEN=1 to record)"
+        );
+        return;
+    }
+
+    let fixture = golden::GoldenFixture::load(fixture_name);
+    let store = fixture.build_memory_store();
+
+    // Run rio-build with the same client bytes
+    let actual_response = rio_build_response(&fixture.client_bytes, store).await;
+
+    // Split into handshake + remainder for both
+    let (expected_hs, expected_rest) = golden::split_handshake(&fixture.server_bytes).await;
+    let (actual_hs, actual_rest) = golden::split_handshake(&actual_response).await;
+
+    // Compare handshake fields
+    let expected_hs_fields = golden::parse_handshake_fields(&expected_hs).await;
+    let actual_hs_fields = golden::parse_handshake_fields(&actual_hs).await;
+    golden::assert_field_conformance(&expected_hs_fields, &actual_hs_fields, &fixture.skip_fields);
+
+    // If there's more data after the handshake (SetOptions + opcode), compare those too
+    if !expected_rest.is_empty() {
+        let (expected_so, expected_op) = golden::split_set_options(&expected_rest);
+        let (actual_so, actual_op) = golden::split_set_options(&actual_rest);
+
+        // SetOptions response is always the same format
+        let expected_so_fields = golden::parse_set_options_fields(&expected_so).await;
+        let actual_so_fields = golden::parse_set_options_fields(&actual_so).await;
+        golden::assert_field_conformance(
+            &expected_so_fields,
+            &actual_so_fields,
+            &fixture.skip_fields,
+        );
+
+        // Parse opcode-specific response
+        if !expected_op.is_empty() {
+            let expected_op_fields = parser.parse(&expected_op).await;
+            let actual_op_fields = parser.parse(&actual_op).await;
+            golden::assert_field_conformance(
+                &expected_op_fields,
+                &actual_op_fields,
+                &fixture.skip_fields,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_byte_conformance_handshake() {
+    // Handshake-only — no opcode response to parse
+    if !golden::fixtures_exist("handshake") {
+        eprintln!("skipping: fixtures not found (run with RECORD_GOLDEN=1 to record)");
+        return;
+    }
+
+    let fixture = golden::GoldenFixture::load("handshake");
+    let store = fixture.build_memory_store();
+    let actual = rio_build_response(&fixture.client_bytes, store).await;
+
+    let expected_fields = golden::parse_handshake_fields(&fixture.server_bytes).await;
+    let actual_fields = golden::parse_handshake_fields(&actual).await;
+    golden::assert_field_conformance(&expected_fields, &actual_fields, &fixture.skip_fields);
+}
+
+#[tokio::test]
+async fn test_byte_conformance_set_options() {
+    run_byte_conformance("set_options", OpcodeParser::None).await;
+}
+
+#[tokio::test]
+async fn test_byte_conformance_is_valid_path_found() {
+    run_byte_conformance("is_valid_path_found", OpcodeParser::IsValidPath).await;
+}
+
+#[tokio::test]
+async fn test_byte_conformance_is_valid_path_not_found() {
+    run_byte_conformance("is_valid_path_not_found", OpcodeParser::IsValidPath).await;
+}
+
+#[tokio::test]
+async fn test_byte_conformance_query_path_info() {
+    run_byte_conformance("query_path_info", OpcodeParser::QueryPathInfo).await;
+}
+
+#[tokio::test]
+async fn test_byte_conformance_query_valid_paths() {
+    run_byte_conformance("query_valid_paths", OpcodeParser::QueryValidPaths).await;
+}
+
+#[tokio::test]
+async fn test_byte_conformance_add_temp_root() {
+    run_byte_conformance("add_temp_root", OpcodeParser::AddTempRoot).await;
 }

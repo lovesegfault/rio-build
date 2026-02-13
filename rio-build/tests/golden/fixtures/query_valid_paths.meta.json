@@ -1,0 +1,21 @@
+{
+  "nix_version": "nix (Nix) 2.31.3",
+  "description": "Handshake + SetOptions + wopQueryValidPaths with one existing and one missing path",
+  "skip_fields": [
+    "version_string",
+    "trusted"
+  ],
+  "store_paths": [
+    {
+      "path": "/nix/store/pdkrymc4kc56g4gqhis7sbrbbbvrqd7z-rio-golden-test",
+      "deriver": "/nix/store/qadr1vqj0wxm7v28driv00vlrsr3sh0x-rio-golden-test.drv",
+      "nar_hash": "sha256-RtrMAHtrj9xFr2Q5gZ47OyFPKMuR7ZQsb2BM/wKFnzc=",
+      "references": [],
+      "registration_time": 1771018537,
+      "nar_size": 136,
+      "ultimate": true,
+      "sigs": [],
+      "ca": null
+    }
+  ]
+}

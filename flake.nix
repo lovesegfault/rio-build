@@ -94,6 +94,7 @@
               [
                 openssl
                 llvmPackages.libclang.lib
+                fuse3
               ]
               ++ lib.optionals stdenv.isDarwin [
                 darwin.apple_sdk.frameworks.Security
