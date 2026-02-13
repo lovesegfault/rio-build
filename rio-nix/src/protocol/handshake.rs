@@ -65,27 +65,17 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     version_string: &str,
 ) -> Result<HandshakeResult, HandshakeError> {
-    // Step 1: Read client magic (u64 — Nix serializes all ints as u64)
-    tracing::debug!("handshake: waiting to read WORKER_MAGIC_1");
+    use tokio::io::AsyncWriteExt;
+
     let client_magic = wire::read_u64(stream).await?;
-    tracing::debug!(
-        client_magic = format!("{client_magic:#018x}"),
-        "handshake: read client magic"
-    );
     if client_magic != WORKER_MAGIC_1 {
         return Err(HandshakeError::InvalidMagic(client_magic));
     }
 
-    // Step 2: Write server magic + protocol version (u64 each)
-    // Must flush after writing so the client receives the response before
-    // sending its version. The Nix client reads MAGIC_2 + version in one go.
-    tracing::debug!("handshake: writing WORKER_MAGIC_2 + version");
     wire::write_u64(stream, WORKER_MAGIC_2).await?;
     wire::write_u64(stream, PROTOCOL_VERSION).await?;
-    use tokio::io::AsyncWriteExt;
     stream.flush().await.map_err(wire::WireError::Io)?;
 
-    // Step 4: Read client protocol version
     let client_version = wire::read_u64(stream).await?;
     if client_version < MIN_CLIENT_VERSION {
         let client_major = client_version >> 8;
@@ -96,33 +86,92 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         });
     }
 
-    // Step 5: Read obsolete CPU affinity (discard)
-    let _cpu_affinity = wire::read_u64(stream).await?;
-
-    // Step 6: Read reserveSpace (discard)
-    let _reserve_space = wire::read_u64(stream).await?;
-
-    // Step 7-8: Write version string + trusted status, then flush
-    wire::write_string(stream, version_string).await?;
-    wire::write_u64(stream, 1).await?; // trusted = 1
-    stream.flush().await.map_err(wire::WireError::Io)?;
-
-    // Step 9: Feature exchange (protocol >= 1.38)
-    // The negotiated version is min(client, server).
     let negotiated_version = client_version.min(PROTOCOL_VERSION);
-    if negotiated_version >= encode_version(1, 38) {
-        // Read client features (string set)
-        let client_features = wire::read_strings(stream).await?;
-        tracing::debug!(
-            features = ?client_features,
-            "handshake: client features"
-        );
 
-        // Write our features (empty set for now)
+    if negotiated_version >= encode_version(1, 38) {
+        let _client_features = wire::read_strings(stream).await?;
         let our_features: Vec<String> = vec![];
         wire::write_strings(stream, &our_features).await?;
         stream.flush().await.map_err(wire::WireError::Io)?;
     }
+
+    // Post-handshake: read affinity + reserveSpace, write version + trusted + STDERR_LAST
+    let cpu_affinity = wire::read_u64(stream).await?;
+    if cpu_affinity != 0 {
+        let _affinity_mask = wire::read_u64(stream).await?;
+    }
+    let _reserve_space = wire::read_u64(stream).await?;
+
+    wire::write_string(stream, version_string).await?;
+    wire::write_u64(stream, 1).await?;
+    wire::write_u64(stream, super::stderr::STDERR_LAST).await?;
+    stream.flush().await.map_err(wire::WireError::Io)?;
+
+    Ok(HandshakeResult {
+        client_version: negotiated_version,
+    })
+}
+
+/// Server-side handshake with separate reader and writer streams.
+///
+/// Same as `server_handshake` but takes split read/write halves. This is
+/// needed when the reader and writer are independent streams (e.g., two
+/// ends of separate pipes bridging SSH channel I/O).
+pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    version_string: &str,
+) -> Result<HandshakeResult, HandshakeError> {
+    use tokio::io::AsyncWriteExt;
+
+    // Phase 1: Magic + version exchange (BasicClientConnection::handshake)
+    let client_magic = wire::read_u64(reader).await?;
+    if client_magic != WORKER_MAGIC_1 {
+        return Err(HandshakeError::InvalidMagic(client_magic));
+    }
+
+    wire::write_u64(writer, WORKER_MAGIC_2).await?;
+    wire::write_u64(writer, PROTOCOL_VERSION).await?;
+    writer.flush().await.map_err(wire::WireError::Io)?;
+
+    let client_version = wire::read_u64(reader).await?;
+    if client_version < MIN_CLIENT_VERSION {
+        let client_major = client_version >> 8;
+        let client_minor = client_version & 0xFF;
+        return Err(HandshakeError::VersionTooOld {
+            client_major,
+            client_minor,
+        });
+    }
+
+    let negotiated_version = client_version.min(PROTOCOL_VERSION);
+
+    // Feature exchange (protocol >= 1.38)
+    if negotiated_version >= encode_version(1, 38) {
+        let _client_features = wire::read_strings(reader).await?;
+        let our_features: Vec<String> = vec![];
+        wire::write_strings(writer, &our_features).await?;
+        writer.flush().await.map_err(wire::WireError::Io)?;
+    }
+
+    // Phase 2: Post-handshake (BasicServerConnection::postHandshake)
+    // Client sends obsolete CPU affinity
+    let cpu_affinity = wire::read_u64(reader).await?;
+    if cpu_affinity != 0 {
+        // If non-zero, there's a second u64 (the actual affinity mask) — read and discard
+        let _affinity_mask = wire::read_u64(reader).await?;
+    }
+    // Client sends obsolete reserveSpace
+    let _reserve_space = wire::read_u64(reader).await?;
+
+    // Server sends ClientHandshakeInfo: version string + trusted status
+    wire::write_string(writer, version_string).await?;
+    wire::write_u64(writer, 1).await?; // trusted = 1
+    writer.flush().await.map_err(wire::WireError::Io)?;
+
+    // Phase 3: Client calls processStderrReturn — send STDERR_LAST
+    wire::write_u64(writer, super::stderr::STDERR_LAST).await?;
+    writer.flush().await.map_err(wire::WireError::Io)?;
 
     Ok(HandshakeResult {
         client_version: negotiated_version,
@@ -158,41 +207,42 @@ mod tests {
         let (reader, mut writer) = tokio::io::split(client_stream);
         let mut reader = tokio::io::BufReader::new(reader);
 
-        // Client sends: MAGIC_1 (u64) + version (u64)
+        // Step 1: Client sends MAGIC_1 + version
         wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
         wire::write_u64(&mut writer, PROTOCOL_VERSION)
             .await
             .unwrap();
         writer.flush().await.unwrap();
 
-        // Client reads: MAGIC_2 (u64) + server_version (u64)
+        // Step 2: Client reads MAGIC_2 + server_version
         let magic2 = wire::read_u64(&mut reader).await.unwrap();
         assert_eq!(magic2, WORKER_MAGIC_2);
         let server_version = wire::read_u64(&mut reader).await.unwrap();
         assert_eq!(server_version, PROTOCOL_VERSION);
 
-        // Client sends: affinity (u64) + reserveSpace (u64)
-        wire::write_u64(&mut writer, 0).await.unwrap(); // CPU affinity
-        wire::write_u64(&mut writer, 0).await.unwrap(); // reserveSpace
-        writer.flush().await.unwrap();
-
-        // Client reads: version_string + trusted status
-        let version_string = wire::read_string(&mut reader).await.unwrap();
-        assert_eq!(version_string, "rio-build 0.1.0");
-        let trusted = wire::read_u64(&mut reader).await.unwrap();
-        assert_eq!(trusted, 1);
-
-        // Protocol >= 1.38: feature exchange
-        // Client sends features (empty set)
+        // Step 3 (>= 1.38): Client sends features
         let client_features: Vec<String> = vec![];
         wire::write_strings(&mut writer, &client_features)
             .await
             .unwrap();
         writer.flush().await.unwrap();
 
-        // Client reads server features
+        // Step 4: Client reads server features
         let server_features = wire::read_strings(&mut reader).await.unwrap();
         assert!(server_features.is_empty());
+
+        // Post-handshake: client sends affinity + reserveSpace
+        wire::write_u64(&mut writer, 0).await.unwrap(); // CPU affinity = 0
+        wire::write_u64(&mut writer, 0).await.unwrap(); // reserveSpace = false
+        writer.flush().await.unwrap();
+
+        // Client reads version string + trusted + STDERR_LAST
+        let version_str = wire::read_string(&mut reader).await.unwrap();
+        assert!(version_str.contains("rio-build"));
+        let trusted = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(trusted, 1);
+        let stderr_last = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(stderr_last, crate::protocol::stderr::STDERR_LAST);
 
         drop(writer);
         let result = server_handle.await.unwrap().unwrap();

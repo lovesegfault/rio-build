@@ -10,7 +10,8 @@ use anyhow::Context;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
-use russh::{Channel, ChannelId};
+use russh::{ChannelId, CryptoVec};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
@@ -115,28 +116,38 @@ impl russh::server::Server for GatewayServer {
             peer_addr,
             store: Arc::clone(&self.store),
             authorized_keys: Arc::clone(&self.authorized_keys),
-            pending_channels: HashMap::new(),
-            active_sessions: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 }
 
+/// State for an active protocol session on one SSH channel.
+///
+/// Data flow:
+///   client SSH data → Handler::data() → `client_tx` → protocol reader
+///   protocol writer → `response_rx` → response pump task → Handle::data() → client
+struct ChannelSession {
+    /// Send client data to the protocol handler.
+    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Protocol handler task.
+    _proto_task: tokio::task::JoinHandle<()>,
+    /// Response pump task (reads protocol output, sends via Handle::data).
+    _response_task: tokio::task::JoinHandle<()>,
+}
+
 /// Per-connection handler that manages SSH channels.
 ///
-/// Lifecycle for each channel:
-/// 1. `channel_open_session` — accept channel, store it as pending
-/// 2. `exec_request("nix-daemon --stdio")` — start the protocol bridge
-/// 3. `data` — forward bytes to the protocol handler (only for channels
-///    where exec_request hasn't been received yet; after that the bridge task
-///    reads via `Channel::wait()`)
+/// Data flow for each channel:
+/// 1. `channel_open_session` — accept channel, store ID
+/// 2. `exec_request("nix-daemon --stdio")` — set up pipes + protocol handler
+/// 3. `data` callback — forward incoming bytes to the protocol handler
+/// 4. Response pump task — forward protocol output to client via Handle::data()
 pub struct ConnectionHandler {
     peer_addr: Option<SocketAddr>,
     store: Arc<dyn Store>,
     authorized_keys: Arc<Vec<PublicKey>>,
-    /// Channels awaiting an exec request before starting the protocol.
-    pending_channels: HashMap<ChannelId, Channel<Msg>>,
-    /// Running protocol session tasks.
-    active_sessions: HashMap<ChannelId, tokio::task::JoinHandle<()>>,
+    /// Active protocol sessions, indexed by channel ID.
+    sessions: HashMap<ChannelId, ChannelSession>,
 }
 
 impl Handler for ConnectionHandler {
@@ -167,13 +178,11 @@ impl Handler for ConnectionHandler {
 
     async fn channel_open_session(
         &mut self,
-        channel: Channel<Msg>,
+        _channel: russh::Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let channel_id = channel.id();
+        let channel_id = _channel.id();
         info!(channel = ?channel_id, "SSH session channel opened");
-        // Store the channel; protocol starts when exec_request arrives
-        self.pending_channels.insert(channel_id, channel);
         Ok(true)
     }
 
@@ -194,20 +203,99 @@ impl Handler for ConnectionHandler {
         }
 
         session.channel_success(channel_id)?;
-        session.flush()?;
 
-        // Take the pending channel and start the protocol bridge
-        let Some(channel) = self.pending_channels.remove(&channel_id) else {
-            warn!(channel = ?channel_id, "exec_request for unknown channel");
-            return Ok(());
-        };
+        // Data pipeline using two independent DuplexStreams:
+        //   client SSH data → mpsc → pump → inbound_writer ↔ inbound_reader → protocol reads
+        //   protocol writes → outbound_writer ↔ outbound_reader → pump → Handle::data()
 
-        let store = Arc::clone(&self.store);
-        let handle = tokio::spawn(async move {
-            run_channel_protocol(channel, store, channel_id).await;
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        // Inbound pipe: SSH client data → protocol handler
+        let (inbound_reader, mut inbound_writer) = tokio::io::duplex(256 * 1024);
+        // Outbound pipe: protocol handler → SSH client
+        let (mut outbound_reader, outbound_writer) = tokio::io::duplex(256 * 1024);
+
+        // Task: forward SSH client data → inbound pipe
+        let client_pump = tokio::spawn(async move {
+            while let Some(data) = client_rx.recv().await {
+                if inbound_writer.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+            let _ = inbound_writer.shutdown().await;
         });
 
-        self.active_sessions.insert(channel_id, handle);
+        // Task: run the protocol handler with separate reader/writer
+        let store = Arc::clone(&self.store);
+        let proto_task = tokio::spawn(async move {
+            let mut reader = inbound_reader;
+            let mut writer = outbound_writer;
+            if let Err(e) = run_protocol(&mut reader, &mut writer, store.as_ref()).await {
+                error!(error = %e, "protocol session error");
+            }
+            debug!(channel = ?channel_id, "protocol handler finished");
+        });
+
+        // Task: pump protocol responses → SSH client via Handle::data()
+        let handle = session.handle();
+        let response_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                match outbound_reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = CryptoVec::from_slice(&buf[..n]);
+                        if handle.data(channel_id, data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "error reading protocol response");
+                        break;
+                    }
+                }
+            }
+            let _ = handle.eof(channel_id).await;
+            let _ = client_pump.await;
+        });
+
+        self.sessions.insert(
+            channel_id,
+            ChannelSession {
+                client_tx,
+                _proto_task: proto_task,
+                _response_task: response_task,
+            },
+        );
+
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(session) = self.sessions.get(&channel) {
+            debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
+            if session.client_tx.send(data.to_vec()).await.is_err() {
+                debug!(channel = ?channel, "protocol session gone, dropping data");
+            }
+        } else {
+            debug!(channel = ?channel, len = data.len(), "data for channel with no session");
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        debug!(channel = ?channel, "SSH channel EOF");
+        // Remove the session; dropping client_tx signals EOF to the protocol handler
+        self.sessions.remove(&channel);
         Ok(())
     }
 
@@ -217,34 +305,7 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
-        self.pending_channels.remove(&channel);
-        if let Some(handle) = self.active_sessions.remove(&channel) {
-            handle.abort();
-        }
+        self.sessions.remove(&channel);
         Ok(())
     }
-}
-
-/// Run the Nix worker protocol on an SSH channel.
-///
-/// Converts the channel into a `ChannelStream` (which implements
-/// `AsyncRead + AsyncWrite`) and runs the protocol directly on it.
-async fn run_channel_protocol(
-    mut channel: Channel<Msg>,
-    store: Arc<dyn Store>,
-    channel_id: ChannelId,
-) {
-    // Use make_reader + make_writer to get AsyncRead + AsyncWrite on the channel.
-    // make_writer() returns an owned writer, make_reader() borrows the channel.
-    let writer = channel.make_writer();
-    let reader = channel.make_reader();
-
-    // Combine into a single stream for the protocol handler
-    let mut stream = tokio::io::join(reader, writer);
-
-    if let Err(e) = run_protocol(&mut stream, store.as_ref()).await {
-        error!(error = %e, "protocol session error");
-    }
-
-    debug!(channel = ?channel_id, "protocol session ended");
 }
