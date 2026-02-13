@@ -14,16 +14,35 @@ use super::StorePathEntry;
 /// Default nix-daemon socket path.
 const DEFAULT_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
+/// Default read timeout for opcode responses.
+const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Perform an interactive protocol exchange with the nix-daemon.
 ///
 /// The nix-daemon protocol is interactive — the handshake involves
 /// back-and-forth phases. This function sends client bytes in phases
 /// and reads server responses between them.
 ///
+/// The `read_timeout` controls how long to wait for additional data
+/// after the daemon stops sending. This uses a timeout-on-idle approach:
+/// we read in a loop until `read_timeout` elapses with no new data,
+/// which we interpret as the daemon being done. This strategy can miss
+/// data if the daemon pauses mid-response longer than the timeout.
+/// For streaming opcodes like NarFromPath, use a longer timeout.
+///
 /// Returns (all_client_bytes, all_server_bytes) for the complete session.
 pub async fn exchange_with_daemon(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    exchange_with_daemon_timeout(socket_path, opcode_bytes, DEFAULT_READ_TIMEOUT).await
+}
+
+/// Like [`exchange_with_daemon`] but with a configurable read timeout.
+pub async fn exchange_with_daemon_timeout(
+    socket_path: &str,
+    opcode_bytes: Option<&[u8]>,
+    read_timeout: std::time::Duration,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1};
     use rio_nix::protocol::wire;
@@ -96,6 +115,10 @@ pub async fn exchange_with_daemon(
     all_server.extend_from_slice(&post_hs);
 
     // --- SetOptions (opcode 19) ---
+    // All option values are zero (defaults) because rio-build ignores option
+    // values — it accepts and discards them. Testing non-default options would
+    // only validate the parsing/discarding path, which is already covered by
+    // direct protocol tests (test_set_options_with_overrides).
     let mut set_opts = Vec::new();
     wire::write_u64(&mut set_opts, 19).await.unwrap();
     for _ in 0..12 {
@@ -121,9 +144,7 @@ pub async fn exchange_with_daemon(
         let mut op_response = Vec::new();
         loop {
             let mut buf = vec![0u8; 8192];
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
-                .await
-            {
+            match tokio::time::timeout(read_timeout, stream.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => op_response.extend_from_slice(&buf[..n]),
                 Ok(Err(e)) => return Err(e),
@@ -231,6 +252,20 @@ pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
         sigs,
         ca,
     }
+}
+
+/// Dump the NAR content for a store path via `nix-store --dump`.
+pub fn dump_nar(store_path: &str) -> Vec<u8> {
+    let output = std::process::Command::new("nix-store")
+        .args(["--dump", store_path])
+        .output()
+        .expect("nix-store --dump must succeed");
+    assert!(
+        output.status.success(),
+        "nix-store --dump failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
 /// RAII guard that stops a nix-daemon process and cleans up its temp dir.

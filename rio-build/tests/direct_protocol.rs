@@ -682,3 +682,125 @@ async fn test_query_missing_with_derived_path() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nar_from_path_large() {
+    // Insert a NAR larger than 64KB to test multi-chunk STDERR_WRITE behavior.
+    // The handler chunks at 64KB boundaries (CHUNK_SIZE = 64 * 1024).
+    let large_nar = vec![0xAB_u8; 100 * 1024]; // 100KB
+    let store = Arc::new(MemoryStore::new());
+    let path =
+        StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-large-nar-1.0").unwrap();
+    store.insert(
+        rio_build::store::traits::PathInfo {
+            path,
+            deriver: None,
+            nar_hash: NixHash::compute(HashAlgo::SHA256, &large_nar),
+            references: vec![],
+            registration_time: 1700000000,
+            nar_size: large_nar.len() as u64,
+            ultimate: true,
+            sigs: vec![],
+            ca: None,
+        },
+        Some(large_nar.clone()),
+    );
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            wire::write_u64(&mut s, 38).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-large-nar-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            // Read STDERR_WRITE chunks until STDERR_LAST
+            let mut nar_data = Vec::new();
+            let mut chunk_count = 0_usize;
+            loop {
+                let msg = wire::read_u64(&mut s).await.unwrap();
+                if msg == STDERR_LAST {
+                    break;
+                }
+                assert_eq!(msg, rio_nix::protocol::stderr::STDERR_WRITE);
+                let chunk = wire::read_bytes(&mut s).await.unwrap();
+                nar_data.extend_from_slice(&chunk);
+                chunk_count += 1;
+            }
+
+            // 100KB / 64KB = 2 chunks (64KB + 36KB)
+            assert!(
+                chunk_count >= 2,
+                "expected at least 2 chunks for 100KB NAR, got {chunk_count}"
+            );
+            assert_eq!(nar_data.len(), 100 * 1024, "reassembled NAR size mismatch");
+            assert_eq!(nar_data, large_nar, "reassembled NAR data mismatch");
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nar_from_path_missing_connection_stays_open() {
+    // After NarFromPath sends STDERR_ERROR for a missing path, the connection
+    // should remain open for subsequent opcodes (unlike unknown-opcode which
+    // closes the connection).
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopNarFromPath (38) for a path NOT in the store
+            wire::write_u64(&mut s, 38).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_ERROR
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg,
+                rio_nix::protocol::stderr::STDERR_ERROR,
+                "expected STDERR_ERROR for missing path"
+            );
+
+            // Read and discard the error structure
+            let _type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let _message = wire::read_string(&mut s).await.unwrap();
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+
+            // Verify connection is still open by sending IsValidPath
+            wire::write_u64(&mut s, 1).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                last, STDERR_LAST,
+                "connection should remain open after NarFromPath STDERR_ERROR"
+            );
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 1, "expected existing path to be valid");
+        })
+    })
+    .await;
+}
