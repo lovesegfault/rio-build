@@ -221,7 +221,7 @@ async fn test_nix_path_info() {
     eprintln!("Built test path: {test_path}");
 
     // Import it from the local Nix store
-    let Some((path_info, nar_data)) = rio_build::store::memory::import_from_nix_store(&test_path)
+    let Ok((path_info, nar_data)) = rio_build::store::memory::import_from_nix_store(&test_path)
     else {
         eprintln!("SKIP: failed to import path from local nix store");
         return;
@@ -325,7 +325,7 @@ async fn test_nix_store_ls() {
     eprintln!("Built test path: {test_path}");
 
     // Import it from the local Nix store
-    let Some((path_info, nar_data)) = rio_build::store::memory::import_from_nix_store(&test_path)
+    let Ok((path_info, nar_data)) = rio_build::store::memory::import_from_nix_store(&test_path)
     else {
         eprintln!("SKIP: failed to import path from local nix store");
         return;

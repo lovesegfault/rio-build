@@ -1,7 +1,16 @@
 //! Store trait defining the interface for Nix store backends.
 
-use rio_nix::hash::NixHash;
+use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::store_path::StorePath;
+
+/// Errors from [`PathInfo::new`] validation.
+#[derive(Debug, thiserror::Error)]
+pub enum PathInfoError {
+    #[error("nar_hash must be SHA-256, got {0}")]
+    WrongHashAlgorithm(HashAlgo),
+    #[error("nar_size must be greater than zero")]
+    ZeroNarSize,
+}
 
 /// Metadata about a store path, corresponding to narinfo fields.
 ///
@@ -34,10 +43,10 @@ pub struct PathInfo {
 impl PathInfo {
     /// Create a new `PathInfo` with all fields.
     ///
-    /// Used by integration tests and [`super::memory::import_from_nix_store`].
+    /// Prefer [`PathInfoBuilder`] for public construction.
     #[allow(clippy::too_many_arguments)]
     #[allow(dead_code)] // used by integration tests (separate crate)
-    pub fn new(
+    pub(crate) fn new(
         path: StorePath,
         deriver: Option<StorePath>,
         nar_hash: NixHash,
@@ -47,8 +56,14 @@ impl PathInfo {
         ultimate: bool,
         sigs: Vec<String>,
         ca: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, PathInfoError> {
+        if nar_hash.algo() != HashAlgo::SHA256 {
+            return Err(PathInfoError::WrongHashAlgorithm(nar_hash.algo()));
+        }
+        if nar_size == 0 {
+            return Err(PathInfoError::ZeroNarSize);
+        }
+        Ok(Self {
             path,
             deriver,
             nar_hash,
@@ -58,7 +73,7 @@ impl PathInfo {
             ultimate,
             sigs,
             ca,
-        }
+        })
     }
 
     /// The store path this info describes.
@@ -105,6 +120,100 @@ impl PathInfo {
     /// Content address (empty for input-addressed paths).
     pub fn ca(&self) -> Option<&str> {
         self.ca.as_deref()
+    }
+}
+
+/// Builder for [`PathInfo`], the public API for constructing path metadata.
+///
+/// Required fields (`path`, `nar_hash`, `nar_size`) are set in the constructor.
+/// Optional fields default to sensible values and can be overridden with
+/// builder methods.
+///
+/// # Example
+///
+/// ```ignore
+/// let info = PathInfoBuilder::new(path, nar_hash, nar_size)
+///     .references(refs)
+///     .ultimate(true)
+///     .build()?;
+/// ```
+pub struct PathInfoBuilder {
+    path: StorePath,
+    nar_hash: NixHash,
+    nar_size: u64,
+    deriver: Option<StorePath>,
+    references: Vec<StorePath>,
+    registration_time: u64,
+    ultimate: bool,
+    sigs: Vec<String>,
+    ca: Option<String>,
+}
+
+impl PathInfoBuilder {
+    /// Create a new builder with the three required fields.
+    pub fn new(path: StorePath, nar_hash: NixHash, nar_size: u64) -> Self {
+        Self {
+            path,
+            nar_hash,
+            nar_size,
+            deriver: None,
+            references: vec![],
+            registration_time: 0,
+            ultimate: false,
+            sigs: vec![],
+            ca: None,
+        }
+    }
+
+    /// Set the derivation that produced this path.
+    pub fn deriver(mut self, deriver: Option<StorePath>) -> Self {
+        self.deriver = deriver;
+        self
+    }
+
+    /// Set the runtime dependency references.
+    pub fn references(mut self, references: Vec<StorePath>) -> Self {
+        self.references = references;
+        self
+    }
+
+    /// Set the Unix timestamp when this path was registered.
+    pub fn registration_time(mut self, registration_time: u64) -> Self {
+        self.registration_time = registration_time;
+        self
+    }
+
+    /// Set whether this is the ultimate trusted source of the path.
+    pub fn ultimate(mut self, ultimate: bool) -> Self {
+        self.ultimate = ultimate;
+        self
+    }
+
+    /// Set the cryptographic signatures over the path fingerprint.
+    pub fn sigs(mut self, sigs: Vec<String>) -> Self {
+        self.sigs = sigs;
+        self
+    }
+
+    /// Set the content address.
+    pub fn ca(mut self, ca: Option<String>) -> Self {
+        self.ca = ca;
+        self
+    }
+
+    /// Consume the builder and produce a validated [`PathInfo`].
+    pub fn build(self) -> Result<PathInfo, PathInfoError> {
+        PathInfo::new(
+            self.path,
+            self.deriver,
+            self.nar_hash,
+            self.references,
+            self.registration_time,
+            self.nar_size,
+            self.ultimate,
+            self.sigs,
+            self.ca,
+        )
     }
 }
 

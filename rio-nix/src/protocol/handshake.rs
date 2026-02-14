@@ -25,10 +25,23 @@ pub const MIN_CLIENT_VERSION: u64 = 0x125; // 1.37
 
 /// Result of a successful handshake.
 #[must_use]
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub struct HandshakeResult {
     /// The negotiated protocol version: `min(client_version, server_version)`.
-    pub negotiated_version: u64,
+    negotiated_version: u64,
+}
+
+impl HandshakeResult {
+    /// Create a new handshake result (crate-internal).
+    pub(crate) fn new(negotiated_version: u64) -> Self {
+        HandshakeResult { negotiated_version }
+    }
+
+    /// The negotiated protocol version: `min(client_version, server_version)`.
+    pub fn negotiated_version(&self) -> u64 {
+        self.negotiated_version
+    }
 }
 
 /// Errors specific to the handshake.
@@ -141,7 +154,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
     wire::write_u64(writer, super::stderr::STDERR_LAST).await?;
     writer.flush().await.map_err(wire::WireError::Io)?;
 
-    Ok(HandshakeResult { negotiated_version })
+    Ok(HandshakeResult::new(negotiated_version))
 }
 
 /// Decode a protocol version number into (major, minor).
@@ -212,7 +225,7 @@ mod tests {
 
         drop(writer);
         let result = server_handle.await.unwrap().unwrap();
-        assert_eq!(result.negotiated_version, PROTOCOL_VERSION);
+        assert_eq!(result.negotiated_version(), PROTOCOL_VERSION);
     }
 
     #[test]
@@ -325,7 +338,7 @@ mod tests {
 
         drop(writer);
         let result = server_handle.await.unwrap().unwrap();
-        assert_eq!(result.negotiated_version, PROTOCOL_VERSION);
+        assert_eq!(result.negotiated_version(), PROTOCOL_VERSION);
     }
 
     #[tokio::test]
@@ -366,6 +379,6 @@ mod tests {
 
         drop(writer);
         let result = server_handle.await.unwrap().unwrap();
-        assert_eq!(result.negotiated_version, encode_version(1, 37));
+        assert_eq!(result.negotiated_version(), encode_version(1, 37));
     }
 }

@@ -170,17 +170,15 @@ async fn test_golden_is_valid_path_found() {
     let path =
         StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
     store.insert(
-        rio_build::store::traits::PathInfo::new(
+        rio_build::store::PathInfoBuilder::new(
             path,
-            None,
             NixHash::compute(HashAlgo::SHA256, b"test"),
-            vec![],
-            1700000000,
             1000,
-            true,
-            vec![],
-            None,
-        ),
+        )
+        .registration_time(1700000000)
+        .ultimate(true)
+        .build()
+        .unwrap(),
         None,
     );
 
@@ -225,17 +223,14 @@ async fn test_golden_query_path_info_wire_format() {
     let nar_hash = NixHash::compute(HashAlgo::SHA256, b"test nar");
 
     store.insert(
-        rio_build::store::traits::PathInfo::new(
-            path,
-            Some(deriver_path.clone()),
-            nar_hash.clone(),
-            vec![ref_path.clone()],
-            1700000000,
-            42000,
-            true,
-            vec!["sig1:abc".to_string()],
-            None,
-        ),
+        rio_build::store::PathInfoBuilder::new(path, nar_hash.clone(), 42000)
+            .deriver(Some(deriver_path.clone()))
+            .references(vec![ref_path.clone()])
+            .registration_time(1700000000)
+            .ultimate(true)
+            .sigs(vec!["sig1:abc".to_string()])
+            .build()
+            .unwrap(),
         None,
     );
 
@@ -510,17 +505,15 @@ async fn test_golden_live_nar_from_path() {
         .map(|r| rio_nix::store_path::StorePath::parse(r).unwrap())
         .collect();
     store.insert(
-        rio_build::store::traits::PathInfo::new(
-            sp,
-            deriver,
-            nar_hash,
-            references,
-            path_info.registration_time,
-            path_info.nar_size,
-            path_info.ultimate,
-            path_info.sigs.clone(),
-            path_info.ca.clone(),
-        ),
+        rio_build::store::PathInfoBuilder::new(sp, nar_hash, path_info.nar_size)
+            .deriver(deriver)
+            .references(references)
+            .registration_time(path_info.registration_time)
+            .ultimate(path_info.ultimate)
+            .sigs(path_info.sigs.clone())
+            .ca(path_info.ca.clone())
+            .build()
+            .unwrap(),
         Some(nar_data),
     );
 

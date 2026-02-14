@@ -21,13 +21,37 @@ pub enum DerivedPathError {
     EmptyOutputName,
 }
 
+/// A validated, non-empty collection of output names, each guaranteed non-empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputNames {
+    names: Vec<String>,
+}
+
+impl OutputNames {
+    /// The output names.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+}
+
 /// Which outputs to build from a derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputSpec {
     /// Build all outputs (`!*`).
     All,
     /// Build specific named outputs (`!out,dev`).
-    Names(Vec<String>),
+    Names(OutputNames),
+}
+
+impl OutputSpec {
+    /// Create a `Names` variant after validating that the list is non-empty
+    /// and every name is non-empty.
+    pub fn names(names: Vec<String>) -> Result<Self, DerivedPathError> {
+        if names.is_empty() || names.iter().any(|n| n.is_empty()) {
+            return Err(DerivedPathError::EmptyOutputName);
+        }
+        Ok(OutputSpec::Names(OutputNames { names }))
+    }
 }
 
 /// A path specification sent by Nix clients indicating what to build or query.
@@ -51,10 +75,7 @@ impl DerivedPath {
                 OutputSpec::All
             } else {
                 let names: Vec<String> = output_part.split(',').map(String::from).collect();
-                if names.iter().any(|n| n.is_empty()) {
-                    return Err(DerivedPathError::EmptyOutputName);
-                }
-                OutputSpec::Names(names)
+                OutputSpec::names(names)?
             };
             Ok(DerivedPath::Built { drv, outputs })
         } else {
@@ -117,10 +138,15 @@ mod tests {
         match dp {
             DerivedPath::Built { drv, outputs } => {
                 assert!(drv.is_derivation());
-                assert_eq!(
-                    outputs,
-                    OutputSpec::Names(vec!["out".to_string(), "dev".to_string()])
-                );
+                match &outputs {
+                    OutputSpec::Names(output_names) => {
+                        assert_eq!(
+                            output_names.names(),
+                            &["out".to_string(), "dev".to_string()]
+                        );
+                    }
+                    _ => panic!("expected Names"),
+                }
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
@@ -131,9 +157,12 @@ mod tests {
         let path_str = format!("{}!out", make_path("hello-2.12.1.drv"));
         let dp = DerivedPath::parse(&path_str).unwrap();
         match dp {
-            DerivedPath::Built { outputs, .. } => {
-                assert_eq!(outputs, OutputSpec::Names(vec!["out".to_string()]));
-            }
+            DerivedPath::Built { outputs, .. } => match &outputs {
+                OutputSpec::Names(output_names) => {
+                    assert_eq!(output_names.names(), &["out".to_string()]);
+                }
+                _ => panic!("expected Names"),
+            },
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
     }
@@ -184,5 +213,52 @@ mod tests {
         let built_str = format!("{}!*", make_path("hello-2.12.1.drv"));
         let built = DerivedPath::parse(&built_str).unwrap();
         assert_eq!(built.store_path().name(), "hello-2.12.1.drv");
+    }
+
+    #[test]
+    fn parse_multiple_bang_separators() {
+        // split_once('!') means only the first '!' is the separator
+        let path_str = format!("{}!out!extra", make_path("hello.drv"));
+        let dp = DerivedPath::parse(&path_str).unwrap();
+        match dp {
+            DerivedPath::Built { outputs, .. } => {
+                // "out!extra" is treated as a single output name (with ! in it)
+                match &outputs {
+                    OutputSpec::Names(names) => assert_eq!(names.names(), &["out!extra"]),
+                    _ => panic!("expected Names"),
+                }
+            }
+            DerivedPath::Opaque(_) => panic!("expected Built"),
+        }
+    }
+
+    #[test]
+    fn output_spec_names_rejects_empty_vec() {
+        assert!(matches!(
+            OutputSpec::names(vec![]),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
+    }
+
+    #[test]
+    fn output_spec_names_rejects_empty_name() {
+        assert!(matches!(
+            OutputSpec::names(vec!["".to_string()]),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
+    }
+
+    #[test]
+    fn output_spec_names_accepts_valid() {
+        let spec = OutputSpec::names(vec!["out".to_string(), "dev".to_string()]).unwrap();
+        match &spec {
+            OutputSpec::Names(output_names) => {
+                assert_eq!(
+                    output_names.names(),
+                    &["out".to_string(), "dev".to_string()]
+                );
+            }
+            _ => panic!("expected Names"),
+        }
     }
 }

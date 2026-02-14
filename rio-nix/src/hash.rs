@@ -189,7 +189,7 @@ impl NixHash {
             HashAlgo::SHA1 => Sha1::digest(data).to_vec(),
         };
 
-        NixHash { algo, digest }
+        Self::new(algo, digest).expect("crypto library returned wrong digest length")
     }
 
     /// Truncate to 20 bytes for store path hash computation.

@@ -21,45 +21,133 @@ pub const STDERR_RESULT: u64 = 0x52534c54;
 #[derive(Debug, Clone)]
 pub struct StderrError {
     /// Error type string, e.g. `"Error"` or `"nix::Interrupted"`.
-    pub error_type: String,
+    error_type: String,
     /// Error level (verbosity).
-    pub level: u64,
+    level: u64,
     /// Program name, e.g. `"rio-build"`.
-    pub name: String,
+    name: String,
     /// Human-readable error message.
-    pub message: String,
+    message: String,
     /// Optional source position.
-    pub position: Option<Position>,
+    position: Option<Position>,
     /// Stack trace entries.
-    pub traces: Vec<Trace>,
+    traces: Vec<Trace>,
 }
 
 /// A source code position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
-    pub file: String,
-    pub line: u64,
-    pub column: u64,
+    file: String,
+    line: u64,
+    column: u64,
+}
+
+impl Position {
+    /// Create a new source position.
+    pub fn new(file: impl Into<String>, line: u64, column: u64) -> Self {
+        Position {
+            file: file.into(),
+            line,
+            column,
+        }
+    }
+
+    /// The source file path.
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+
+    /// The line number.
+    pub fn line(&self) -> u64 {
+        self.line
+    }
+
+    /// The column number.
+    pub fn column(&self) -> u64 {
+        self.column
+    }
 }
 
 /// A stack trace entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
-    pub position: Option<Position>,
-    pub message: String,
+    position: Option<Position>,
+    message: String,
+}
+
+impl Trace {
+    /// Create a new trace entry.
+    pub fn new(position: Option<Position>, message: impl Into<String>) -> Self {
+        Trace {
+            position,
+            message: message.into(),
+        }
+    }
+
+    /// The optional source position.
+    pub fn position(&self) -> Option<&Position> {
+        self.position.as_ref()
+    }
+
+    /// The trace message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl StderrError {
-    /// Create a simple error with no position and no traces.
-    pub fn simple(name: impl Into<String>, message: impl Into<String>) -> Self {
+    /// Create a new structured error with all fields.
+    pub fn new(
+        error_type: impl Into<String>,
+        level: u64,
+        name: impl Into<String>,
+        message: impl Into<String>,
+        position: Option<Position>,
+        traces: Vec<Trace>,
+    ) -> Self {
         StderrError {
-            error_type: "Error".to_string(),
-            level: 0,
+            error_type: error_type.into(),
+            level,
             name: name.into(),
             message: message.into(),
-            position: None,
-            traces: Vec::new(),
+            position,
+            traces,
         }
+    }
+
+    /// Create a simple error with no position and no traces.
+    pub fn simple(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new("Error", 0, name, message, None, Vec::new())
+    }
+
+    /// The error type string, e.g. `"Error"` or `"nix::Interrupted"`.
+    pub fn error_type(&self) -> &str {
+        &self.error_type
+    }
+
+    /// The error level (verbosity).
+    pub fn level(&self) -> u64 {
+        self.level
+    }
+
+    /// The program name, e.g. `"rio-build"`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The human-readable error message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The optional source position.
+    pub fn position(&self) -> Option<&Position> {
+        self.position.as_ref()
+    }
+
+    /// The stack trace entries.
+    pub fn traces(&self) -> &[Trace] {
+        &self.traces
     }
 }
 
@@ -86,6 +174,7 @@ pub enum ActivityType {
 pub struct StderrWriter<W> {
     writer: W,
     next_activity_id: u64,
+    finished: bool,
 }
 
 impl<W: AsyncWrite + Unpin> StderrWriter<W> {
@@ -93,7 +182,18 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         StderrWriter {
             writer,
             next_activity_id: 1,
+            finished: false,
         }
+    }
+
+    /// Check that the writer has not been finished; return an error if it has.
+    fn check_not_finished(&self) -> Result<(), WireError> {
+        if self.finished {
+            return Err(WireError::Io(std::io::Error::other(
+                "StderrWriter already finished",
+            )));
+        }
+        Ok(())
     }
 
     /// Get a mutable reference to the inner writer (for writing result data after STDERR_LAST).
@@ -103,6 +203,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
 
     /// Send a log message (STDERR_NEXT).
     pub async fn log(&mut self, msg: &str) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_NEXT).await?;
         wire::write_string(&mut self.writer, msg).await?;
         self.writer.flush().await?;
@@ -114,44 +215,46 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     pub async fn finish(&mut self) -> Result<(), WireError> {
         wire::write_u64(&mut self.writer, STDERR_LAST).await?;
         self.writer.flush().await?;
+        self.finished = true;
         Ok(())
     }
 
     /// Send STDERR_ERROR with the full structured error format.
     pub async fn error(&mut self, err: &StderrError) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_ERROR).await?;
 
         // Error type
-        wire::write_string(&mut self.writer, &err.error_type).await?;
+        wire::write_string(&mut self.writer, err.error_type()).await?;
         // Level
-        wire::write_u64(&mut self.writer, err.level).await?;
+        wire::write_u64(&mut self.writer, err.level()).await?;
         // Name
-        wire::write_string(&mut self.writer, &err.name).await?;
+        wire::write_string(&mut self.writer, err.name()).await?;
         // Message
-        wire::write_string(&mut self.writer, &err.message).await?;
+        wire::write_string(&mut self.writer, err.message()).await?;
 
         // Position
-        if let Some(pos) = &err.position {
+        if let Some(pos) = err.position() {
             wire::write_u64(&mut self.writer, 1).await?; // havePos = true
-            wire::write_string(&mut self.writer, &pos.file).await?;
-            wire::write_u64(&mut self.writer, pos.line).await?;
-            wire::write_u64(&mut self.writer, pos.column).await?;
+            wire::write_string(&mut self.writer, pos.file()).await?;
+            wire::write_u64(&mut self.writer, pos.line()).await?;
+            wire::write_u64(&mut self.writer, pos.column()).await?;
         } else {
             wire::write_u64(&mut self.writer, 0).await?; // havePos = false
         }
 
         // Traces
-        wire::write_u64(&mut self.writer, err.traces.len() as u64).await?;
-        for trace in &err.traces {
-            if let Some(pos) = &trace.position {
+        wire::write_u64(&mut self.writer, err.traces().len() as u64).await?;
+        for trace in err.traces() {
+            if let Some(pos) = trace.position() {
                 wire::write_u64(&mut self.writer, 1).await?; // havePos = true
-                wire::write_string(&mut self.writer, &pos.file).await?;
-                wire::write_u64(&mut self.writer, pos.line).await?;
-                wire::write_u64(&mut self.writer, pos.column).await?;
+                wire::write_string(&mut self.writer, pos.file()).await?;
+                wire::write_u64(&mut self.writer, pos.line()).await?;
+                wire::write_u64(&mut self.writer, pos.column()).await?;
             } else {
                 wire::write_u64(&mut self.writer, 0).await?; // havePos = false
             }
-            wire::write_string(&mut self.writer, &trace.message).await?;
+            wire::write_string(&mut self.writer, trace.message()).await?;
         }
 
         self.writer.flush().await?;
@@ -160,6 +263,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
 
     /// Send STDERR_WRITE with data (used by `wopNarFromPath` to send NAR chunks).
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_WRITE).await?;
         wire::write_bytes(&mut self.writer, data).await?;
         self.writer.flush().await?;
@@ -168,6 +272,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
 
     /// Send STDERR_READ to request data from the client (used by `wopAddToStoreNar`).
     pub async fn read_request(&mut self, count: u64) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_READ).await?;
         wire::write_u64(&mut self.writer, count).await?;
         self.writer.flush().await?;
@@ -182,6 +287,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         level: u64,
         parent_id: u64,
     ) -> Result<u64, WireError> {
+        self.check_not_finished()?;
         let id = self.next_activity_id;
         self.next_activity_id += 1;
 
@@ -199,6 +305,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
 
     /// Send STDERR_STOP_ACTIVITY.
     pub async fn stop_activity(&mut self, id: u64) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_STOP_ACTIVITY).await?;
         wire::write_u64(&mut self.writer, id).await?;
         self.writer.flush().await?;
@@ -223,6 +330,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         result_type: u64,
         fields: &[ResultField],
     ) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_RESULT).await?;
         wire::write_u64(&mut self.writer, activity_id).await?;
         wire::write_u64(&mut self.writer, result_type).await?;
@@ -323,6 +431,19 @@ mod tests {
         assert_eq!(msg_type, STDERR_WRITE);
         let data = wire::read_string(&mut reader).await.unwrap();
         assert_eq!(data, "NAR data here");
+    }
+
+    #[tokio::test]
+    async fn test_stderr_write_empty_data() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.write_data(b"").await.unwrap();
+
+        let mut reader = Cursor::new(&buf);
+        let msg_type = wire::read_u64(&mut reader).await.unwrap();
+        assert_eq!(msg_type, STDERR_WRITE);
+        let data = wire::read_string(&mut reader).await.unwrap();
+        assert_eq!(data, "");
     }
 
     #[tokio::test]
@@ -458,31 +579,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_stderr_error_with_position_and_traces() {
-        let err = StderrError {
-            error_type: "nix::EvalError".to_string(),
-            level: 1,
-            name: "rio-build".to_string(),
-            message: "undefined variable 'foo'".to_string(),
-            position: Some(Position {
-                file: "default.nix".to_string(),
-                line: 42,
-                column: 10,
-            }),
-            traces: vec![
-                Trace {
-                    position: Some(Position {
-                        file: "flake.nix".to_string(),
-                        line: 7,
-                        column: 3,
-                    }),
-                    message: "while evaluating the attribute 'packages'".to_string(),
-                },
-                Trace {
-                    position: None,
-                    message: "while calling the 'import' builtin".to_string(),
-                },
+        let err = StderrError::new(
+            "nix::EvalError",
+            1,
+            "rio-build",
+            "undefined variable 'foo'",
+            Some(Position::new("default.nix", 42, 10)),
+            vec![
+                Trace::new(
+                    Some(Position::new("flake.nix", 7, 3)),
+                    "while evaluating the attribute 'packages'",
+                ),
+                Trace::new(None, "while calling the 'import' builtin"),
             ],
-        };
+        );
 
         let mut buf = Vec::new();
         let mut writer = StderrWriter::new(&mut buf);
@@ -531,5 +641,14 @@ mod tests {
             wire::read_string(&mut reader).await.unwrap(),
             "while calling the 'import' builtin"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stderr_writer_rejects_after_finish() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.finish().await.unwrap();
+        let result = writer.log("x").await;
+        assert!(result.is_err());
     }
 }

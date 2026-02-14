@@ -34,10 +34,18 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "/tmp/rio_authorized_keys".to_string()),
     );
 
-    let log_format: observability::LogFormat = std::env::var("RIO_LOG_FORMAT")
-        .unwrap_or_else(|_| "json".to_string())
-        .parse()
-        .unwrap_or_default();
+    let log_format: observability::LogFormat = match std::env::var("RIO_LOG_FORMAT") {
+        Ok(val) => match val.parse() {
+            Ok(fmt) => fmt,
+            Err(_) => {
+                eprintln!(
+                    "warning: invalid RIO_LOG_FORMAT={val:?}, valid options are 'json' or 'pretty'; defaulting to json"
+                );
+                observability::LogFormat::default()
+            }
+        },
+        Err(_) => observability::LogFormat::default(),
+    };
 
     // Initialize logging
     observability::init_logging(log_format, None)?;

@@ -68,6 +68,12 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<PublicKey>> {
         }
     }
 
+    if keys.is_empty() {
+        error!(
+            "no valid authorized keys loaded; all SSH connections will be rejected. Check your authorized_keys file format."
+        );
+    }
+
     info!(count = keys.len(), "loaded authorized keys");
     Ok(keys)
 }
@@ -263,7 +269,9 @@ impl Handler for ConnectionHandler {
                     break;
                 }
             }
-            let _ = inbound_writer.shutdown().await;
+            if let Err(e) = inbound_writer.shutdown().await {
+                debug!(error = %e, "inbound writer shutdown failed");
+            }
         });
 
         // Task: run the protocol handler with separate reader/writer
@@ -290,7 +298,9 @@ impl Handler for ConnectionHandler {
                     Ok(n) => {
                         let data = CryptoVec::from_slice(&buf[..n]);
                         if handle.data(channel_id, data).await.is_err() {
-                            debug!("response pump: SSH send failed");
+                            warn!(channel = ?channel_id, "response pump: SSH send failed");
+                            metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send")
+                                .increment(1);
                             break;
                         }
                     }
@@ -300,8 +310,14 @@ impl Handler for ConnectionHandler {
                     }
                 }
             }
-            let _ = handle.eof(channel_id).await;
-            let _ = client_pump.await;
+            if let Err(e) = handle.eof(channel_id).await {
+                warn!(channel = ?channel_id, error = ?e, "failed to send EOF to SSH client");
+            }
+            if let Err(e) = client_pump.await
+                && e.is_panic()
+            {
+                error!(channel = ?channel_id, "client pump task panicked: {e}");
+            }
         });
 
         self.sessions.insert(
@@ -325,7 +341,10 @@ impl Handler for ConnectionHandler {
         if let Some(session) = self.sessions.get(&channel) {
             debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
             if session.client_tx.send(data.to_vec()).await.is_err() {
-                debug!(channel = ?channel, "protocol session gone, dropping data");
+                warn!(channel = ?channel, "protocol session dead, closing channel");
+                self.sessions.remove(&channel);
+                metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
+                return Ok(());
             }
         } else {
             debug!(channel = ?channel, len = data.len(), "data for channel with no session");
