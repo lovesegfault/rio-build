@@ -201,6 +201,48 @@
           # Packages
           packages = {
             default = rio-workspace;
+
+            # OCI image for the FUSE+overlay+sandbox spike
+            # Build: nix build .#spike-image
+            # Load: docker load < result
+            spike-image = pkgs.dockerTools.buildLayeredImage {
+              name = "rio-spike";
+              tag = "latest";
+              maxLayers = 50;
+
+              contents = with pkgs; [
+                # The rio-spike binary
+                rio-workspace
+
+                # Nix tooling (nix-store, nix-build, nix path-info)
+                nix
+
+                # Runtime essentials
+                coreutils
+                bashInteractive
+                fuse3
+
+                # Needed by overlay/sandbox validation
+                util-linux # mount, umount
+                gnugrep
+                findutils
+
+                # CA certificates for potential network access
+                cacert
+              ];
+
+              config = {
+                Cmd = [
+                  "rio-spike"
+                  "validate"
+                  "--all"
+                ];
+                Env = [
+                  "RUST_LOG=info"
+                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                ];
+              };
+            };
           };
 
           # Checks (run with 'nix flake check')

@@ -227,7 +227,7 @@ async fn test_nix_path_info() {
         return;
     };
 
-    let store_path_str = path_info.path.to_string();
+    let store_path_str = path_info.path().to_string();
 
     // Populate the MemoryStore
     let store = Arc::new(MemoryStore::new());
@@ -331,7 +331,7 @@ async fn test_nix_store_ls() {
         return;
     };
 
-    let store_path_str = path_info.path.to_string();
+    let store_path_str = path_info.path().to_string();
 
     // Populate the MemoryStore
     let store = Arc::new(MemoryStore::new());

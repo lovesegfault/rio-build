@@ -35,7 +35,7 @@ pub struct StderrError {
 }
 
 /// A source code position.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
     pub file: String,
     pub line: u64,
@@ -43,7 +43,7 @@ pub struct Position {
 }
 
 /// A stack trace entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
     pub position: Option<Position>,
     pub message: String,
@@ -245,7 +245,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
 }
 
 /// A typed field in a STDERR_RESULT message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultField {
     Int(u64),
     String(String),

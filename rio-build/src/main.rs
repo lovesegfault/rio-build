@@ -34,16 +34,13 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "/tmp/rio_authorized_keys".to_string()),
     );
 
-    let log_format = match std::env::var("RIO_LOG_FORMAT")
+    let log_format: observability::LogFormat = std::env::var("RIO_LOG_FORMAT")
         .unwrap_or_else(|_| "json".to_string())
-        .as_str()
-    {
-        "pretty" => observability::LogFormat::Pretty,
-        _ => observability::LogFormat::Json,
-    };
+        .parse()
+        .unwrap_or_default();
 
     // Initialize logging
-    observability::init_logging(log_format, None);
+    observability::init_logging(log_format, None)?;
 
     // Root span carries the `component` field required by the observability spec.
     // All child spans (and their log events) inherit it automatically.

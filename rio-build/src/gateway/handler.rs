@@ -15,23 +15,26 @@ use tracing::{debug, instrument, warn};
 
 use crate::store::Store;
 
+const PROGRAM_NAME: &str = "rio-build";
+
 /// Client build options received via wopSetOptions.
 ///
 /// Fields are populated during Phase 1a and propagated to the scheduler
-/// in Phase 2a via gRPC `SubmitBuildRequest`.
+/// in Phase 2a via gRPC `SubmitBuildRequest`. All fields are private;
+/// accessors will be added in Phase 2a when the scheduler consumes them.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields consumed in Phase 2a
 pub struct ClientOptions {
-    pub keep_failed: bool,
-    pub keep_going: bool,
-    pub try_fallback: bool,
-    pub verbosity: u64,
-    pub max_build_jobs: u64,
-    pub max_silent_time: u64,
-    pub verbose_build: bool,
-    pub build_cores: u64,
-    pub use_substitutes: bool,
-    pub overrides: Vec<(String, String)>,
+    keep_failed: bool,
+    keep_going: bool,
+    try_fallback: bool,
+    verbosity: u64,
+    max_build_jobs: u64,
+    max_silent_time: u64,
+    verbose_build: bool,
+    build_cores: u64,
+    use_substitutes: bool,
+    overrides: Vec<(String, String)>,
 }
 
 /// Dispatch an opcode to the appropriate handler.
@@ -83,7 +86,7 @@ where
             );
             stderr
                 .error(&StderrError::simple(
-                    "rio-build",
+                    PROGRAM_NAME,
                     format!(
                         "operation {} ({}) is not yet implemented",
                         op.name(),
@@ -104,7 +107,7 @@ where
             warn!(opcode = opcode, "unknown opcode, closing connection");
             stderr
                 .error(&StderrError::simple(
-                    "rio-build",
+                    PROGRAM_NAME,
                     format!("unsupported operation {opcode}"),
                 ))
                 .await?;
@@ -131,12 +134,15 @@ async fn send_store_error<W: AsyncWrite + Unpin>(
     err: anyhow::Error,
 ) -> anyhow::Result<()> {
     // Best-effort: if sending the error also fails, we still propagate the original.
-    let _ = stderr
+    if let Err(send_err) = stderr
         .error(&StderrError::simple(
-            "rio-build",
+            PROGRAM_NAME,
             format!("store error: {err}"),
         ))
-        .await;
+        .await
+    {
+        warn!(error = %send_err, "failed to send store error to client");
+    }
     Err(err)
 }
 
@@ -198,29 +204,22 @@ async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             wire::write_bool(w, true).await?;
 
             // deriver
-            wire::write_string(
-                w,
-                &info
-                    .deriver
-                    .as_ref()
-                    .map_or(String::new(), |d| d.to_string()),
-            )
-            .await?;
+            wire::write_string(w, &info.deriver().map_or(String::new(), |d| d.to_string())).await?;
             // narHash (nix-daemon sends raw hex digest, no algorithm prefix)
-            wire::write_string(w, &info.nar_hash.to_hex()).await?;
+            wire::write_string(w, &info.nar_hash().to_hex()).await?;
             // references
-            let refs: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+            let refs: Vec<String> = info.references().iter().map(|r| r.to_string()).collect();
             wire::write_strings(w, &refs).await?;
             // registrationTime
-            wire::write_u64(w, info.registration_time).await?;
+            wire::write_u64(w, info.registration_time()).await?;
             // narSize
-            wire::write_u64(w, info.nar_size).await?;
+            wire::write_u64(w, info.nar_size()).await?;
             // ultimate
-            wire::write_bool(w, info.ultimate).await?;
+            wire::write_bool(w, info.ultimate()).await?;
             // sigs
-            wire::write_strings(w, &info.sigs).await?;
+            wire::write_strings(w, info.sigs()).await?;
             // ca
-            wire::write_string(w, info.ca.as_deref().unwrap_or("")).await?;
+            wire::write_string(w, info.ca().unwrap_or("")).await?;
         }
     }
 
@@ -241,7 +240,13 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let paths: Vec<StorePath> = path_strs
         .iter()
-        .filter_map(|s| StorePath::parse(s).ok())
+        .filter_map(|s| match StorePath::parse(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                debug!(path = %s, error = %e, "dropping unparseable path in wopQueryValidPaths");
+                None
+            }
+        })
         .collect();
 
     let valid = match store.query_valid_paths(&paths).await {
@@ -337,7 +342,19 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let path_str = wire::read_string(reader).await?;
     debug!(path = %path_str, "wopNarFromPath");
 
-    let path = StorePath::parse(&path_str)?;
+    let path = match StorePath::parse(&path_str) {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(path = %path_str, error = %e, "invalid store path in wopNarFromPath");
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("invalid store path '{path_str}': {e}"),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
     let nar = match store.nar_from_path(&path).await {
         Ok(nar) => nar,
         Err(e) => return send_store_error(stderr, e).await,
@@ -356,10 +373,11 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         None => {
             stderr
                 .error(&StderrError::simple(
-                    "rio-build",
+                    PROGRAM_NAME,
                     format!("path '{}' is not valid", path_str),
                 ))
                 .await?;
+            return Err(anyhow::anyhow!("path '{}' has no NAR data", path_str));
         }
     }
 
@@ -415,7 +433,13 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // Parse DerivedPath strings and extract base store paths for batch lookup.
     let derived: Vec<(String, DerivedPath)> = raw_paths
         .into_iter()
-        .filter_map(|s| DerivedPath::parse(&s).ok().map(|dp| (s, dp)))
+        .filter_map(|s| match DerivedPath::parse(&s) {
+            Ok(dp) => Some((s, dp)),
+            Err(e) => {
+                debug!(path = %s, error = %e, "dropping unparseable DerivedPath in wopQueryMissing");
+                None
+            }
+        })
         .collect();
 
     let store_paths: Vec<StorePath> = derived
@@ -431,6 +455,12 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut will_build = Vec::new();
     let mut unknown = Vec::new();
 
+    // Categorize missing paths per nix-daemon semantics:
+    // - Built paths (e.g., /nix/store/...-foo.drv!out) go to willBuild — the
+    //   derivation needs to be built to produce the output.
+    // - Opaque paths (plain store paths without output spec) go to unknown —
+    //   they aren't derivations, so they can't be built, only substituted.
+    //   Since rio-build has no substituters, unknown is the correct bucket.
     for (raw, dp) in &derived {
         if valid_set.contains(&dp.store_path().to_string()) {
             continue;

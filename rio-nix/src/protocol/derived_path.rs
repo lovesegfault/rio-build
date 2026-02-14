@@ -11,6 +11,16 @@
 
 use crate::store_path::{StorePath, StorePathError};
 
+/// Errors from parsing a `DerivedPath` string.
+#[derive(Debug, thiserror::Error)]
+pub enum DerivedPathError {
+    #[error(transparent)]
+    StorePath(#[from] StorePathError),
+
+    #[error("output name must not be empty")]
+    EmptyOutputName,
+}
+
 /// Which outputs to build from a derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputSpec {
@@ -21,7 +31,7 @@ pub enum OutputSpec {
 }
 
 /// A path specification sent by Nix clients indicating what to build or query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DerivedPath {
     /// A plain store path (no output specifier).
     Opaque(StorePath),
@@ -34,13 +44,17 @@ impl DerivedPath {
     ///
     /// Splits on `!` to separate the store path from the output spec.
     /// If no `!` is present, the entire string is treated as an opaque store path.
-    pub fn parse(s: &str) -> Result<Self, StorePathError> {
+    pub fn parse(s: &str) -> Result<Self, DerivedPathError> {
         if let Some((drv_part, output_part)) = s.split_once('!') {
             let drv = StorePath::parse(drv_part)?;
             let outputs = if output_part == "*" {
                 OutputSpec::All
             } else {
-                OutputSpec::Names(output_part.split(',').map(String::from).collect())
+                let names: Vec<String> = output_part.split(',').map(String::from).collect();
+                if names.iter().any(|n| n.is_empty()) {
+                    return Err(DerivedPathError::EmptyOutputName);
+                }
+                OutputSpec::Names(names)
             };
             Ok(DerivedPath::Built { drv, outputs })
         } else {
@@ -128,6 +142,37 @@ mod tests {
     fn parse_invalid_base_path() {
         assert!(DerivedPath::parse("not-a-path!*").is_err());
         assert!(DerivedPath::parse("not-a-path").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_output_name() {
+        // Trailing comma: "out,"
+        let path_str = format!("{}!out,", make_path("hello-2.12.1.drv"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
+
+        // Leading comma: ",out"
+        let path_str = format!("{}!,out", make_path("hello-2.12.1.drv"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
+
+        // Adjacent commas: "out,,dev"
+        let path_str = format!("{}!out,,dev", make_path("hello-2.12.1.drv"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
+
+        // Bare bang with no output names
+        let path_str = format!("{}!", make_path("hello-2.12.1.drv"));
+        assert!(matches!(
+            DerivedPath::parse(&path_str),
+            Err(DerivedPathError::EmptyOutputName)
+        ));
     }
 
     #[test]

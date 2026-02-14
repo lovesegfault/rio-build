@@ -80,6 +80,9 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     pub fn new(store: Arc<dyn Store>, authorized_keys: Vec<PublicKey>) -> Self {
+        if authorized_keys.is_empty() {
+            warn!("no authorized keys configured; all SSH connections will be rejected");
+        }
         GatewayServer {
             store,
             authorized_keys: Arc::new(authorized_keys),
@@ -111,6 +114,10 @@ impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
+        // Every connection increments result="new" here, then result="accepted"
+        // or result="rejected" in auth_publickey. This double-increment is
+        // intentional: "new" tracks TCP-level arrivals while "accepted"/"rejected"
+        // tracks authentication outcomes (per observability.md).
         metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
         metrics::gauge!("rio_gateway_connections_active").increment(1.0);
         info!(peer = ?peer_addr, "new SSH connection");
@@ -251,7 +258,8 @@ impl Handler for ConnectionHandler {
         // Task: forward SSH client data → inbound pipe
         let client_pump = tokio::spawn(async move {
             while let Some(data) = client_rx.recv().await {
-                if inbound_writer.write_all(&data).await.is_err() {
+                if let Err(e) = inbound_writer.write_all(&data).await {
+                    debug!(error = %e, "client pump: inbound write failed");
                     break;
                 }
             }
@@ -282,6 +290,7 @@ impl Handler for ConnectionHandler {
                     Ok(n) => {
                         let data = CryptoVec::from_slice(&buf[..n]);
                         if handle.data(channel_id, data).await.is_err() {
+                            debug!("response pump: SSH send failed");
                             break;
                         }
                     }
