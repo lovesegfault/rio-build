@@ -52,17 +52,17 @@ fn make_test_store() -> Arc<MemoryStore> {
     let path =
         StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
     store.insert(
-        rio_build::store::traits::PathInfo {
+        rio_build::store::traits::PathInfo::new(
             path,
-            deriver: None,
-            nar_hash: NixHash::compute(HashAlgo::SHA256, b"fake nar"),
-            references: vec![],
-            registration_time: 1700000000,
-            nar_size: 12345,
-            ultimate: true,
-            sigs: vec![],
-            ca: None,
-        },
+            None,
+            NixHash::compute(HashAlgo::SHA256, b"fake nar"),
+            vec![],
+            1700000000,
+            12345,
+            true,
+            vec![],
+            None,
+        ),
         Some(b"fake nar content".to_vec()),
     );
     store
@@ -692,17 +692,17 @@ async fn test_nar_from_path_large() {
     let path =
         StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-large-nar-1.0").unwrap();
     store.insert(
-        rio_build::store::traits::PathInfo {
+        rio_build::store::traits::PathInfo::new(
             path,
-            deriver: None,
-            nar_hash: NixHash::compute(HashAlgo::SHA256, &large_nar),
-            references: vec![],
-            registration_time: 1700000000,
-            nar_size: large_nar.len() as u64,
-            ultimate: true,
-            sigs: vec![],
-            ca: None,
-        },
+            None,
+            NixHash::compute(HashAlgo::SHA256, &large_nar),
+            vec![],
+            1700000000,
+            large_nar.len() as u64,
+            true,
+            vec![],
+            None,
+        ),
         Some(large_nar.clone()),
     );
 
@@ -747,10 +747,10 @@ async fn test_nar_from_path_large() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_nar_from_path_missing_connection_stays_open() {
+async fn test_nar_from_path_missing_closes_connection() {
     // After NarFromPath sends STDERR_ERROR for a missing path, the connection
-    // should remain open for subsequent opcodes (unlike unknown-opcode which
-    // closes the connection).
+    // closes to prevent protocol desynchronization (the client expects NAR
+    // data but there is none to send).
     let store = make_test_store();
     run_test(store, |s| {
         tokio::spawn(async move {
@@ -783,23 +783,12 @@ async fn test_nar_from_path_missing_connection_stays_open() {
             let _have_pos = wire::read_u64(&mut s).await.unwrap();
             let _trace_count = wire::read_u64(&mut s).await.unwrap();
 
-            // Verify connection is still open by sending IsValidPath
-            wire::write_u64(&mut s, 1).await.unwrap();
-            wire::write_string(
-                &mut s,
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
-            )
-            .await
-            .unwrap();
-            s.flush().await.unwrap();
-
-            let last = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(
-                last, STDERR_LAST,
-                "connection should remain open after NarFromPath STDERR_ERROR"
+            // Connection should be closed — reading the next opcode should fail
+            let result = wire::read_u64(&mut s).await;
+            assert!(
+                result.is_err(),
+                "connection should close after NarFromPath STDERR_ERROR for missing path"
             );
-            let valid = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(valid, 1, "expected existing path to be valid");
         })
     })
     .await;

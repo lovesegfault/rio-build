@@ -74,6 +74,7 @@ where
                 return Ok(());
             }
             Err(e) => {
+                metrics::counter!("rio_gateway_errors_total", "type" => "wire_read").increment(1);
                 error!(error = %e, "error reading opcode");
                 return Err(e.into());
             }

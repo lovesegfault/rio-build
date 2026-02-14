@@ -25,7 +25,7 @@ pub const MIN_CLIENT_VERSION: u64 = 0x125; // 1.37
 
 /// Result of a successful handshake.
 #[must_use]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HandshakeResult {
     /// The negotiated protocol version: `min(client_version, server_version)`.
     pub negotiated_version: u64,
@@ -114,7 +114,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
 
     let negotiated_version = client_version.min(PROTOCOL_VERSION);
 
-    // Feature exchange (protocol >= 1.38)
+    // Phase 2: Feature exchange (protocol >= 1.38)
     if negotiated_version >= encode_version(1, 38) {
         let _client_features = wire::read_strings(reader).await?;
         let our_features: Vec<String> = vec![];
@@ -122,7 +122,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
         writer.flush().await.map_err(wire::WireError::Io)?;
     }
 
-    // Phase 2: Post-handshake (BasicServerConnection::postHandshake)
+    // Phase 3: Post-handshake (BasicServerConnection::postHandshake)
     // Client sends obsolete CPU affinity
     let cpu_affinity = wire::read_u64(reader).await?;
     if cpu_affinity != 0 {
@@ -137,7 +137,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
     wire::write_u64(writer, 1).await?; // trusted = 1
     writer.flush().await.map_err(wire::WireError::Io)?;
 
-    // Phase 3: Client calls processStderrReturn — send STDERR_LAST
+    // Phase 4: Client calls processStderrReturn — send STDERR_LAST
     wire::write_u64(writer, super::stderr::STDERR_LAST).await?;
     writer.flush().await.map_err(wire::WireError::Io)?;
 

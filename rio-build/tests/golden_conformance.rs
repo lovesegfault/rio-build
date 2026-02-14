@@ -170,17 +170,17 @@ async fn test_golden_is_valid_path_found() {
     let path =
         StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
     store.insert(
-        rio_build::store::traits::PathInfo {
+        rio_build::store::traits::PathInfo::new(
             path,
-            deriver: None,
-            nar_hash: NixHash::compute(HashAlgo::SHA256, b"test"),
-            references: vec![],
-            registration_time: 1700000000,
-            nar_size: 1000,
-            ultimate: true,
-            sigs: vec![],
-            ca: None,
-        },
+            None,
+            NixHash::compute(HashAlgo::SHA256, b"test"),
+            vec![],
+            1700000000,
+            1000,
+            true,
+            vec![],
+            None,
+        ),
         None,
     );
 
@@ -225,17 +225,17 @@ async fn test_golden_query_path_info_wire_format() {
     let nar_hash = NixHash::compute(HashAlgo::SHA256, b"test nar");
 
     store.insert(
-        rio_build::store::traits::PathInfo {
+        rio_build::store::traits::PathInfo::new(
             path,
-            deriver: Some(deriver_path.clone()),
-            nar_hash: nar_hash.clone(),
-            references: vec![ref_path.clone()],
-            registration_time: 1700000000,
-            nar_size: 42000,
-            ultimate: true,
-            sigs: vec!["sig1:abc".to_string()],
-            ca: None,
-        },
+            Some(deriver_path.clone()),
+            nar_hash.clone(),
+            vec![ref_path.clone()],
+            1700000000,
+            42000,
+            true,
+            vec!["sig1:abc".to_string()],
+            None,
+        ),
         None,
     );
 
@@ -510,17 +510,17 @@ async fn test_golden_live_nar_from_path() {
         .map(|r| rio_nix::store_path::StorePath::parse(r).unwrap())
         .collect();
     store.insert(
-        rio_build::store::traits::PathInfo {
-            path: sp,
+        rio_build::store::traits::PathInfo::new(
+            sp,
             deriver,
             nar_hash,
             references,
-            registration_time: path_info.registration_time,
-            nar_size: path_info.nar_size,
-            ultimate: path_info.ultimate,
-            sigs: path_info.sigs.clone(),
-            ca: path_info.ca.clone(),
-        },
+            path_info.registration_time,
+            path_info.nar_size,
+            path_info.ultimate,
+            path_info.sigs.clone(),
+            path_info.ca.clone(),
+        ),
         Some(nar_data),
     );
 

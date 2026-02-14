@@ -1,9 +1,12 @@
 //! Observability setup: structured logging and Prometheus metrics.
 
+use std::fmt;
+use std::str::FromStr;
+
 use tracing_subscriber::EnvFilter;
 
 /// Log output format.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LogFormat {
     /// JSON structured logs (production default).
     #[default]
@@ -12,15 +15,39 @@ pub enum LogFormat {
     Pretty,
 }
 
+impl fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogFormat::Json => write!(f, "json"),
+            LogFormat::Pretty => write!(f, "pretty"),
+        }
+    }
+}
+
+impl FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(LogFormat::Json),
+            "pretty" => Ok(LogFormat::Pretty),
+            other => Err(format!(
+                "unknown log format: {other:?} (expected \"json\" or \"pretty\")"
+            )),
+        }
+    }
+}
+
 /// Initialize the tracing subscriber with the given format and filter.
 ///
 /// If `RUST_LOG` is set, it takes precedence over the `filter` parameter.
-pub fn init_logging(format: LogFormat, filter: Option<&str>) {
+pub fn init_logging(format: LogFormat, filter: Option<&str>) -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         filter
             .unwrap_or("info")
             .parse()
-            .expect("invalid log filter")
+            .map_err(|e| anyhow::anyhow!("invalid log filter: {e}"))
+            .expect("default log filter 'info' must parse")
     });
 
     match format {
@@ -37,6 +64,7 @@ pub fn init_logging(format: LogFormat, filter: Option<&str>) {
                 .init();
         }
     }
+    Ok(())
 }
 
 /// Initialize Prometheus metrics exporter.
