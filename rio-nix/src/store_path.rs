@@ -129,6 +129,14 @@ impl StorePath {
     }
 }
 
+impl std::str::FromStr for StorePath {
+    type Err = StorePathError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 impl fmt::Display for StorePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}-{}", STORE_DIR, self.hash_part(), self.name)

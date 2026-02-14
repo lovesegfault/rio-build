@@ -32,8 +32,14 @@ pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
         );
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
             .context("failed to generate host key")?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            warn!(
+                error = %e,
+                path = %parent.display(),
+                "failed to create directory for host key; key will be ephemeral"
+            );
         }
         if let Err(e) = std::fs::write(path, key.to_openssh(ssh_key::LineEnding::LF)?) {
             warn!(error = %e, "could not save generated host key (continuing with ephemeral key)");
@@ -69,8 +75,9 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<PublicKey>> {
     }
 
     if keys.is_empty() {
-        error!(
-            "no valid authorized keys loaded; all SSH connections will be rejected. Check your authorized_keys file format."
+        anyhow::bail!(
+            "no valid authorized keys loaded from {}; server would reject all SSH connections",
+            path.display()
         );
     }
 
@@ -240,8 +247,14 @@ impl Handler for ConnectionHandler {
         let command = String::from_utf8_lossy(data);
         info!(channel = ?channel_id, command = %command, "exec request");
 
-        // Nix sends "nix-daemon --stdio" for ssh-ng:// connections
-        if !command.contains("nix-daemon") || !command.contains("--stdio") {
+        // Nix sends "nix-daemon --stdio" for ssh-ng:// connections.
+        // Validate that the command ends with "nix-daemon --stdio" to avoid
+        // matching unrelated commands that happen to contain those substrings.
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let is_nix_daemon = args.len() >= 2
+            && args[args.len() - 2].ends_with("nix-daemon")
+            && args[args.len() - 1] == "--stdio";
+        if !is_nix_daemon {
             warn!(command = %command, "rejecting non-nix-daemon exec request");
             session.channel_failure(channel_id)?;
             return Ok(());

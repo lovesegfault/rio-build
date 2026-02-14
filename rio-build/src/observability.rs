@@ -42,13 +42,12 @@ impl FromStr for LogFormat {
 ///
 /// If `RUST_LOG` is set, it takes precedence over the `filter` parameter.
 pub fn init_logging(format: LogFormat, filter: Option<&str>) -> anyhow::Result<()> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        filter
-            .unwrap_or("info")
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid log filter: {e}"))
-            .expect("default log filter 'info' must parse")
-    });
+    let env_filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => filter.unwrap_or("info").parse().map_err(|e| {
+            anyhow::anyhow!("invalid log filter {:?}: {e}", filter.unwrap_or("info"))
+        })?,
+    };
 
     match format {
         LogFormat::Json => {
