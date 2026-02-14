@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use rio_nix::protocol::handshake;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
+use rio_nix::store_path::StorePath;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
@@ -23,13 +24,13 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut options: Option<ClientOptions> = None;
-    let mut temp_roots: HashSet<String> = HashSet::new();
+    let mut temp_roots: HashSet<StorePath> = HashSet::new();
 
     // Step 1: Handshake — needs both reader and writer interleaved
     let version_string = format!("rio-build {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {
         Ok(result) => {
-            let (major, minor) = handshake::decode_version(result.negotiated_version);
+            let (major, minor) = handshake::decode_version(result.negotiated_version());
             metrics::counter!("rio_gateway_handshakes_total", "result" => "success").increment(1);
             info!(
                 client_version_major = major,
@@ -59,7 +60,7 @@ where
         Err(e) => {
             metrics::counter!("rio_gateway_handshakes_total", "result" => "failed").increment(1);
             warn!(error = %e, "handshake failed");
-            return Ok(());
+            return Err(anyhow::anyhow!("handshake failed: {e}"));
         }
     }
 

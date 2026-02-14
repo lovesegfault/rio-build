@@ -49,7 +49,7 @@ pub async fn handle_opcode<R, W>(
     writer: &mut W,
     store: &dyn Store,
     options: &mut Option<ClientOptions>,
-    temp_roots: &mut HashSet<String>,
+    temp_roots: &mut HashSet<StorePath>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -265,12 +265,14 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    temp_roots: &mut HashSet<String>,
+    temp_roots: &mut HashSet<StorePath>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     debug!(path = %path_str, "wopAddTempRoot");
 
-    temp_roots.insert(path_str);
+    if let Ok(path) = StorePath::parse(&path_str) {
+        temp_roots.insert(path);
+    }
 
     stderr.finish().await?;
     wire::write_u64(stderr.inner_mut(), 1).await?;

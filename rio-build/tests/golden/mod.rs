@@ -55,17 +55,15 @@ pub fn build_memory_store_from(entries: &[StorePathEntry]) -> Arc<MemoryStore> {
             .collect();
 
         store.insert(
-            rio_build::store::traits::PathInfo::new(
-                path,
-                deriver,
-                nar_hash,
-                references,
-                entry.registration_time,
-                entry.nar_size,
-                entry.ultimate,
-                entry.sigs.clone(),
-                entry.ca.clone(),
-            ),
+            rio_build::store::PathInfoBuilder::new(path, nar_hash, entry.nar_size)
+                .deriver(deriver)
+                .references(references)
+                .registration_time(entry.registration_time)
+                .ultimate(entry.ultimate)
+                .sigs(entry.sigs.clone())
+                .ca(entry.ca.clone())
+                .build()
+                .unwrap(),
             None,
         );
     }

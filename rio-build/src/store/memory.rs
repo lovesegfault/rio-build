@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use rio_nix::store_path::StorePath;
 use tracing::{debug, warn};
 
-use super::traits::{PathInfo, Store};
+use super::traits::{PathInfo, PathInfoBuilder, Store};
 
 /// Inner state protected by a single `RwLock`, ensuring atomicity of
 /// insert operations across both maps.
@@ -136,9 +136,10 @@ impl Store for MemoryStore {
 /// Import a store path from the local Nix store by shelling out to `nix` CLI.
 ///
 /// Calls `nix path-info --json <path>` for metadata and `nix-store --dump <path>`
-/// for NAR content. Requires `nix` in PATH. Returns `None` on any failure.
+/// for NAR content. Requires `nix` in PATH.
 #[allow(dead_code)] // used by integration tests (separate crate)
-pub fn import_from_nix_store(store_path: &str) -> Option<(PathInfo, Vec<u8>)> {
+pub fn import_from_nix_store(store_path: &str) -> anyhow::Result<(PathInfo, Vec<u8>)> {
+    use anyhow::Context;
     use rio_nix::hash::NixHash;
     use rio_nix::store_path::StorePath;
     use std::process::Command;
@@ -147,41 +148,33 @@ pub fn import_from_nix_store(store_path: &str) -> Option<(PathInfo, Vec<u8>)> {
     let output = Command::new("nix")
         .args(["path-info", "--json", store_path])
         .output()
-        .ok()
-        .or_else(|| {
-            debug!(store_path, "nix path-info command failed to execute");
-            None
-        })?;
+        .context("nix path-info command failed to execute")?;
     if !output.status.success() {
-        debug!(store_path, status = %output.status, "nix path-info returned non-zero exit");
-        return None;
+        anyhow::bail!(
+            "nix path-info returned non-zero exit status {} for {store_path}",
+            output.status
+        );
     }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok().or_else(|| {
-        debug!(store_path, "failed to parse nix path-info JSON output");
-        None
-    })?;
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("failed to parse nix path-info JSON output")?;
     let info = json
         .as_object()
         .and_then(|o| o.get(store_path))
         .and_then(|v| v.as_object())
-        .or_else(|| {
-            debug!(store_path, "nix path-info JSON missing expected structure");
-            None
+        .ok_or_else(|| {
+            anyhow::anyhow!("nix path-info JSON missing expected structure for {store_path}")
         })?;
 
-    let path = StorePath::parse(store_path).ok().or_else(|| {
-        debug!(store_path, "failed to parse store path");
-        None
-    })?;
-    let nar_hash_str = info.get("narHash")?.as_str()?;
-    let nar_hash = NixHash::parse(nar_hash_str).ok().or_else(|| {
-        debug!(store_path, nar_hash_str, "failed to parse narHash");
-        None
-    })?;
-    let nar_size = info.get("narSize").and_then(|v| v.as_u64()).or_else(|| {
-        debug!(store_path, "missing or invalid narSize");
-        None
-    })?;
+    let path = StorePath::parse(store_path).context("failed to parse store path")?;
+    let nar_hash_str = info
+        .get("narHash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing or non-string narHash field for {store_path}"))?;
+    let nar_hash = NixHash::parse(nar_hash_str).context("failed to parse narHash")?;
+    let nar_size = info
+        .get("narSize")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid narSize for {store_path}"))?;
 
     let references: Vec<StorePath> = info
         .get("references")
@@ -221,33 +214,29 @@ pub fn import_from_nix_store(store_path: &str) -> Option<(PathInfo, Vec<u8>)> {
         .and_then(|u| u.as_bool())
         .unwrap_or(false);
 
-    let path_info = PathInfo::new(
-        path,
-        deriver,
-        nar_hash,
-        references,
-        registration_time,
-        nar_size,
-        ultimate,
-        sigs,
-        ca,
-    );
+    let path_info = PathInfoBuilder::new(path, nar_hash, nar_size)
+        .deriver(deriver)
+        .references(references)
+        .registration_time(registration_time)
+        .ultimate(ultimate)
+        .sigs(sigs)
+        .ca(ca)
+        .build()
+        .context("failed to construct PathInfo")?;
 
     // Get NAR content via nix-store --dump
     let nar_output = Command::new("nix-store")
         .args(["--dump", store_path])
         .output()
-        .ok()
-        .or_else(|| {
-            debug!(store_path, "nix-store --dump command failed to execute");
-            None
-        })?;
+        .context("nix-store --dump command failed to execute")?;
     if !nar_output.status.success() {
-        debug!(store_path, status = %nar_output.status, "nix-store --dump returned non-zero exit");
-        return None;
+        anyhow::bail!(
+            "nix-store --dump returned non-zero exit status {} for {store_path}",
+            nar_output.status
+        );
     }
 
-    Some((path_info, nar_output.stdout))
+    Ok((path_info, nar_output.stdout))
 }
 
 #[cfg(test)]
@@ -259,17 +248,15 @@ mod tests {
     fn make_test_path_info() -> PathInfo {
         let path =
             StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
-        PathInfo::new(
+        PathInfoBuilder::new(
             path,
-            None,
             NixHash::compute(HashAlgo::SHA256, b"fake nar content"),
-            vec![],
-            1700000000,
             12345,
-            true,
-            vec![],
-            None,
         )
+        .registration_time(1700000000)
+        .ultimate(true)
+        .build()
+        .unwrap()
     }
 
     #[tokio::test]

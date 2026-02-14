@@ -7,7 +7,7 @@ use rio_build::gateway::session::run_protocol;
 use rio_build::store::MemoryStore;
 use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
-use rio_nix::protocol::stderr::STDERR_LAST;
+use rio_nix::protocol::stderr::{STDERR_ERROR, STDERR_LAST};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 use tokio::io::{AsyncWriteExt, DuplexStream};
@@ -52,17 +52,15 @@ fn make_test_store() -> Arc<MemoryStore> {
     let path =
         StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
     store.insert(
-        rio_build::store::traits::PathInfo::new(
+        rio_build::store::PathInfoBuilder::new(
             path,
-            None,
             NixHash::compute(HashAlgo::SHA256, b"fake nar"),
-            vec![],
-            1700000000,
             12345,
-            true,
-            vec![],
-            None,
-        ),
+        )
+        .registration_time(1700000000)
+        .ultimate(true)
+        .build()
+        .unwrap(),
         Some(b"fake nar content".to_vec()),
     );
     store
@@ -692,17 +690,15 @@ async fn test_nar_from_path_large() {
     let path =
         StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-large-nar-1.0").unwrap();
     store.insert(
-        rio_build::store::traits::PathInfo::new(
+        rio_build::store::PathInfoBuilder::new(
             path,
-            None,
             NixHash::compute(HashAlgo::SHA256, &large_nar),
-            vec![],
-            1700000000,
             large_nar.len() as u64,
-            true,
-            vec![],
-            None,
-        ),
+        )
+        .registration_time(1700000000)
+        .ultimate(true)
+        .build()
+        .unwrap(),
         Some(large_nar.clone()),
     );
 
@@ -792,4 +788,101 @@ async fn test_nar_from_path_missing_closes_connection() {
         })
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_known_unimplemented_opcode_closes_connection() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // Send opcode 36 (wopBuildDerivation) — known but not yet implemented
+            wire::write_u64(&mut s, 36).await.unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_ERROR (0x63787470)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_ERROR);
+
+            // Read the error structure
+            let error_type = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(error_type, "Error");
+            let level = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(level, 0);
+            let name = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(name, "rio-build");
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("wopBuildDerivation"),
+                "expected message to contain 'wopBuildDerivation', got: {message}"
+            );
+            assert!(
+                message.contains("not yet implemented"),
+                "expected message to contain 'not yet implemented', got: {message}"
+            );
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+
+            // Connection should be closed — next read returns EOF or error
+            let result = wire::read_u64(&mut s).await;
+            assert!(
+                result.is_err(),
+                "expected EOF after unimplemented opcode closes connection"
+            );
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_version_too_old_sends_stderr_error() {
+    let (mut client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+    let store: Arc<MemoryStore> = Arc::new(MemoryStore::new());
+
+    let server = tokio::spawn(async move {
+        let (mut r, mut w) = tokio::io::split(server_stream);
+        let _ = run_protocol(&mut r, &mut w, store.as_ref()).await;
+    });
+
+    let client = tokio::spawn(async move {
+        let s = &mut client_stream;
+
+        // Send WORKER_MAGIC_1
+        wire::write_u64(s, WORKER_MAGIC_1).await.unwrap();
+
+        // Read WORKER_MAGIC_2 + server version (consume them)
+        let magic2 = wire::read_u64(s).await.unwrap();
+        assert_eq!(magic2, WORKER_MAGIC_2);
+        let _server_version = wire::read_u64(s).await.unwrap();
+
+        // Send client version 1.32 (too old — minimum is 1.37)
+        // Encoded as (1 << 8) | 32 = 0x120
+        wire::write_u64(s, 0x120).await.unwrap();
+        s.flush().await.unwrap();
+
+        // The server should send STDERR_ERROR with message about version
+        let msg = wire::read_u64(s).await.unwrap();
+        assert_eq!(msg, STDERR_ERROR, "expected STDERR_ERROR for old version");
+
+        // Read the error structure
+        let error_type = wire::read_string(s).await.unwrap();
+        assert_eq!(error_type, "Error");
+        let level = wire::read_u64(s).await.unwrap();
+        assert_eq!(level, 0);
+        let name = wire::read_string(s).await.unwrap();
+        assert_eq!(name, "rio-build");
+        let message = wire::read_string(s).await.unwrap();
+        assert!(
+            message.contains("1.37+"),
+            "expected message to mention '1.37+', got: {message}"
+        );
+        let _have_pos = wire::read_u64(s).await.unwrap();
+        let _trace_count = wire::read_u64(s).await.unwrap();
+    });
+
+    let (c, s) = tokio::join!(client, server);
+    c.unwrap();
+    s.unwrap();
 }
