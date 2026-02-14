@@ -134,11 +134,11 @@ pub async fn write_bool<W: AsyncWrite + Unpin>(w: &mut W, val: bool) -> Result<(
 
 /// Write a length-prefixed, padded byte string.
 pub async fn write_bytes<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> Result<()> {
-    debug_assert!(
-        data.len() as u64 <= MAX_STRING_LEN,
-        "write_bytes: data exceeds MAX_STRING_LEN"
-    );
-    write_u64(w, data.len() as u64).await?;
+    let len = data.len() as u64;
+    if len > MAX_STRING_LEN {
+        return Err(WireError::StringTooLong(len));
+    }
+    write_u64(w, len).await?;
 
     if !data.is_empty() {
         w.write_all(data).await?;
@@ -159,11 +159,11 @@ pub async fn write_string<W: AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<(
 
 /// Write a collection of UTF-8 strings.
 pub async fn write_strings<W: AsyncWrite + Unpin>(w: &mut W, items: &[String]) -> Result<()> {
-    debug_assert!(
-        items.len() as u64 <= MAX_COLLECTION_COUNT,
-        "write_strings: count exceeds MAX_COLLECTION_COUNT"
-    );
-    write_u64(w, items.len() as u64).await?;
+    let count = items.len() as u64;
+    if count > MAX_COLLECTION_COUNT {
+        return Err(WireError::CollectionTooLarge(count));
+    }
+    write_u64(w, count).await?;
     for item in items {
         write_string(w, item).await?;
     }
@@ -175,11 +175,11 @@ pub async fn write_string_pairs<W: AsyncWrite + Unpin>(
     w: &mut W,
     pairs: &[(String, String)],
 ) -> Result<()> {
-    debug_assert!(
-        pairs.len() as u64 <= MAX_COLLECTION_COUNT,
-        "write_string_pairs: count exceeds MAX_COLLECTION_COUNT"
-    );
-    write_u64(w, pairs.len() as u64).await?;
+    let count = pairs.len() as u64;
+    if count > MAX_COLLECTION_COUNT {
+        return Err(WireError::CollectionTooLarge(count));
+    }
+    write_u64(w, count).await?;
     for (key, value) in pairs {
         write_string(w, key).await?;
         write_string(w, value).await?;

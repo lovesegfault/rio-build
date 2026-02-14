@@ -130,8 +130,7 @@ pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>
     // Phase 2: Feature exchange (protocol >= 1.38)
     if negotiated_version >= encode_version(1, 38) {
         let _client_features = wire::read_strings(reader).await?;
-        let our_features: Vec<String> = vec![];
-        wire::write_strings(writer, &our_features).await?;
+        wire::write_strings(writer, &[]).await?;
         writer.flush().await.map_err(wire::WireError::Io)?;
     }
 

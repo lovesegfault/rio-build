@@ -26,29 +26,37 @@ pub enum WorkerOp {
     BuildPathsWithResults = 46,
 }
 
+impl TryFrom<u64> for WorkerOp {
+    type Error = u64;
+
+    fn try_from(v: u64) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(WorkerOp::IsValidPath),
+            9 => Ok(WorkerOp::BuildPaths),
+            11 => Ok(WorkerOp::AddTempRoot),
+            19 => Ok(WorkerOp::SetOptions),
+            26 => Ok(WorkerOp::QueryPathInfo),
+            29 => Ok(WorkerOp::QueryPathFromHashPart),
+            31 => Ok(WorkerOp::QueryValidPaths),
+            36 => Ok(WorkerOp::BuildDerivation),
+            37 => Ok(WorkerOp::AddSignatures),
+            38 => Ok(WorkerOp::NarFromPath),
+            39 => Ok(WorkerOp::AddToStoreNar),
+            40 => Ok(WorkerOp::QueryMissing),
+            41 => Ok(WorkerOp::QueryDerivationOutputMap),
+            42 => Ok(WorkerOp::RegisterDrvOutput),
+            43 => Ok(WorkerOp::QueryRealisation),
+            44 => Ok(WorkerOp::AddMultipleToStore),
+            46 => Ok(WorkerOp::BuildPathsWithResults),
+            other => Err(other),
+        }
+    }
+}
+
 impl WorkerOp {
     /// Try to parse a u64 opcode number into a known `WorkerOp`.
     pub fn from_u64(v: u64) -> Option<Self> {
-        match v {
-            1 => Some(WorkerOp::IsValidPath),
-            9 => Some(WorkerOp::BuildPaths),
-            11 => Some(WorkerOp::AddTempRoot),
-            19 => Some(WorkerOp::SetOptions),
-            26 => Some(WorkerOp::QueryPathInfo),
-            29 => Some(WorkerOp::QueryPathFromHashPart),
-            31 => Some(WorkerOp::QueryValidPaths),
-            36 => Some(WorkerOp::BuildDerivation),
-            37 => Some(WorkerOp::AddSignatures),
-            38 => Some(WorkerOp::NarFromPath),
-            39 => Some(WorkerOp::AddToStoreNar),
-            40 => Some(WorkerOp::QueryMissing),
-            41 => Some(WorkerOp::QueryDerivationOutputMap),
-            42 => Some(WorkerOp::RegisterDrvOutput),
-            43 => Some(WorkerOp::QueryRealisation),
-            44 => Some(WorkerOp::AddMultipleToStore),
-            46 => Some(WorkerOp::BuildPathsWithResults),
-            _ => None,
-        }
+        Self::try_from(v).ok()
     }
 
     /// Return the human-readable name of this opcode.

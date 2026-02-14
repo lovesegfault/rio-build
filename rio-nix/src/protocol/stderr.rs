@@ -197,7 +197,17 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Get a mutable reference to the inner writer (for writing result data after STDERR_LAST).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before `finish()`. The STDERR streaming loop must be
+    /// terminated before writing result data to the underlying stream.
     pub fn inner_mut(&mut self) -> &mut W {
+        assert!(
+            self.finished,
+            "StderrWriter::inner_mut() called before finish() — \
+             this would corrupt the STDERR stream"
+        );
         &mut self.writer
     }
 
@@ -219,41 +229,33 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         Ok(())
     }
 
+    /// Write an optional position to the wire (havePos flag + fields).
+    async fn write_position(&mut self, pos: Option<&Position>) -> Result<(), WireError> {
+        if let Some(p) = pos {
+            wire::write_u64(&mut self.writer, 1).await?; // havePos = true
+            wire::write_string(&mut self.writer, p.file()).await?;
+            wire::write_u64(&mut self.writer, p.line()).await?;
+            wire::write_u64(&mut self.writer, p.column()).await?;
+        } else {
+            wire::write_u64(&mut self.writer, 0).await?; // havePos = false
+        }
+        Ok(())
+    }
+
     /// Send STDERR_ERROR with the full structured error format.
     pub async fn error(&mut self, err: &StderrError) -> Result<(), WireError> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_ERROR).await?;
 
-        // Error type
         wire::write_string(&mut self.writer, err.error_type()).await?;
-        // Level
         wire::write_u64(&mut self.writer, err.level()).await?;
-        // Name
         wire::write_string(&mut self.writer, err.name()).await?;
-        // Message
         wire::write_string(&mut self.writer, err.message()).await?;
+        self.write_position(err.position()).await?;
 
-        // Position
-        if let Some(pos) = err.position() {
-            wire::write_u64(&mut self.writer, 1).await?; // havePos = true
-            wire::write_string(&mut self.writer, pos.file()).await?;
-            wire::write_u64(&mut self.writer, pos.line()).await?;
-            wire::write_u64(&mut self.writer, pos.column()).await?;
-        } else {
-            wire::write_u64(&mut self.writer, 0).await?; // havePos = false
-        }
-
-        // Traces
         wire::write_u64(&mut self.writer, err.traces().len() as u64).await?;
         for trace in err.traces() {
-            if let Some(pos) = trace.position() {
-                wire::write_u64(&mut self.writer, 1).await?; // havePos = true
-                wire::write_string(&mut self.writer, pos.file()).await?;
-                wire::write_u64(&mut self.writer, pos.line()).await?;
-                wire::write_u64(&mut self.writer, pos.column()).await?;
-            } else {
-                wire::write_u64(&mut self.writer, 0).await?; // havePos = false
-            }
+            self.write_position(trace.position()).await?;
             wire::write_string(&mut self.writer, trace.message()).await?;
         }
 

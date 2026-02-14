@@ -242,3 +242,44 @@ pub trait Store: Send + Sync {
     // large NARs in memory. Phase 1b should introduce an `AsyncRead`-based API.
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_path() -> StorePath {
+        StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test-1.0").unwrap()
+    }
+
+    fn sha256_hash() -> NixHash {
+        NixHash::compute(HashAlgo::SHA256, b"test data")
+    }
+
+    #[test]
+    fn path_info_rejects_non_sha256_hash() {
+        let hash = NixHash::compute(HashAlgo::SHA512, b"test data");
+        let result = PathInfoBuilder::new(test_path(), hash, 100).build();
+        assert!(
+            matches!(
+                result,
+                Err(PathInfoError::WrongHashAlgorithm(HashAlgo::SHA512))
+            ),
+            "expected WrongHashAlgorithm(SHA512), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn path_info_rejects_zero_nar_size() {
+        let result = PathInfoBuilder::new(test_path(), sha256_hash(), 0).build();
+        assert!(
+            matches!(result, Err(PathInfoError::ZeroNarSize)),
+            "expected ZeroNarSize, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn path_info_accepts_valid_sha256() {
+        let result = PathInfoBuilder::new(test_path(), sha256_hash(), 100).build();
+        assert!(result.is_ok());
+    }
+}

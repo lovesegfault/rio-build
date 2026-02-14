@@ -254,7 +254,10 @@ async fn test_query_valid_paths() {
 
             let valid = wire::read_strings(&mut s).await.unwrap();
             assert_eq!(valid.len(), 1);
-            assert!(valid[0].contains("hello-2.12.1"));
+            assert_eq!(
+                valid[0],
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
+            );
         })
     })
     .await;
@@ -411,9 +414,9 @@ async fn test_query_missing() {
             // unknown: the missing opaque path
             let unknown = wire::read_strings(&mut s).await.unwrap();
             assert_eq!(unknown.len(), 1, "missing opaque path should be in unknown");
-            assert!(
-                unknown[0].contains("missing-1.0"),
-                "expected missing path in unknown, got: {unknown:?}"
+            assert_eq!(
+                unknown[0],
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0"
             );
 
             // downloadSize: 0
@@ -536,6 +539,45 @@ async fn test_nar_from_path_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_nar_from_path_invalid_path_format() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopNarFromPath (38) with a garbage (non-store-path) string
+            wire::write_u64(&mut s, 38).await.unwrap();
+            wire::write_string(&mut s, "this-is-not-a-store-path")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_ERROR for unparseable path
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg,
+                rio_nix::protocol::stderr::STDERR_ERROR,
+                "expected STDERR_ERROR for garbage path"
+            );
+
+            // Read and discard the error structure
+            let _type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("invalid store path"),
+                "error message should mention invalid store path, got: {message}"
+            );
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_query_path_info_invalid_path_format() {
     let store = Arc::new(MemoryStore::new());
     run_test(store, |s| {
@@ -627,10 +669,14 @@ async fn test_multi_opcode_sequence() {
                 will_build.is_empty(),
                 "existing path should not be in willBuild"
             );
-            let _will_substitute = wire::read_strings(&mut s).await.unwrap();
-            let _unknown = wire::read_strings(&mut s).await.unwrap();
-            let _download_size = wire::read_u64(&mut s).await.unwrap();
-            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+            let will_substitute = wire::read_strings(&mut s).await.unwrap();
+            assert!(will_substitute.is_empty(), "expected empty willSubstitute");
+            let unknown = wire::read_strings(&mut s).await.unwrap();
+            assert!(unknown.is_empty(), "existing path should not be in unknown");
+            let download_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(download_size, 0);
+            let nar_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(nar_size, 0);
         })
     })
     .await;
@@ -665,17 +711,21 @@ async fn test_query_missing_with_derived_path() {
                 1,
                 "only the missing path should be in willBuild"
             );
-            assert!(
-                will_build[0].contains("missing-1.0"),
-                "expected missing path, got: {:?}",
-                will_build
+            assert_eq!(
+                will_build[0],
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0!out"
             );
 
-            // willSubstitute, unknown, downloadSize, narSize
-            let _will_substitute = wire::read_strings(&mut s).await.unwrap();
-            let _unknown = wire::read_strings(&mut s).await.unwrap();
-            let _download_size = wire::read_u64(&mut s).await.unwrap();
-            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+            // willSubstitute: always empty (rio-build has no substituters)
+            let will_substitute = wire::read_strings(&mut s).await.unwrap();
+            assert!(will_substitute.is_empty(), "expected empty willSubstitute");
+            // unknown: empty (the missing path is a Built derivation, goes to willBuild)
+            let unknown = wire::read_strings(&mut s).await.unwrap();
+            assert!(unknown.is_empty(), "Built paths should not be in unknown");
+            let download_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(download_size, 0);
+            let nar_size = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(nar_size, 0);
         })
     })
     .await;

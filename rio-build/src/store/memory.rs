@@ -46,15 +46,26 @@ impl MemoryStore {
         }
     }
 
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, StoreInner> {
+        self.inner.read().unwrap_or_else(|e| {
+            warn!("MemoryStore: recovering from poisoned read lock");
+            e.into_inner()
+        })
+    }
+
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, StoreInner> {
+        self.inner.write().unwrap_or_else(|e| {
+            warn!("MemoryStore: recovering from poisoned write lock");
+            e.into_inner()
+        })
+    }
+
     /// Insert a path with its metadata (and optionally NAR content).
     #[allow(dead_code)] // used by integration tests (separate crate)
     pub fn insert(&self, info: PathInfo, nar: Option<Vec<u8>>) {
         let key = info.path().clone();
         debug!(path = %key, "inserting path into memory store");
-        let mut inner = self.inner.write().unwrap_or_else(|e| {
-            warn!("MemoryStore: recovering from poisoned write lock");
-            e.into_inner()
-        });
+        let mut inner = self.write_inner();
         if let Some(nar_data) = nar {
             inner.nars.insert(key.clone(), nar_data);
         }
@@ -63,27 +74,13 @@ impl MemoryStore {
 
     /// Return the number of paths in the store.
     pub fn len(&self) -> usize {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| {
-                warn!("MemoryStore: recovering from poisoned read lock");
-                e.into_inner()
-            })
-            .paths
-            .len()
+        self.read_inner().paths.len()
     }
 
     /// Check if the store is empty.
     #[allow(dead_code)] // used by unit tests
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| {
-                warn!("MemoryStore: recovering from poisoned read lock");
-                e.into_inner()
-            })
-            .paths
-            .is_empty()
+        self.read_inner().paths.is_empty()
     }
 }
 
@@ -96,26 +93,15 @@ impl Default for MemoryStore {
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     async fn is_valid_path(&self, path: &StorePath) -> anyhow::Result<bool> {
-        let inner = self.inner.read().unwrap_or_else(|e| {
-            warn!("MemoryStore: recovering from poisoned read lock");
-            e.into_inner()
-        });
-        Ok(inner.paths.contains_key(path))
+        Ok(self.read_inner().paths.contains_key(path))
     }
 
     async fn query_path_info(&self, path: &StorePath) -> anyhow::Result<Option<PathInfo>> {
-        let inner = self.inner.read().unwrap_or_else(|e| {
-            warn!("MemoryStore: recovering from poisoned read lock");
-            e.into_inner()
-        });
-        Ok(inner.paths.get(path).cloned())
+        Ok(self.read_inner().paths.get(path).cloned())
     }
 
     async fn query_valid_paths(&self, paths: &[StorePath]) -> anyhow::Result<Vec<StorePath>> {
-        let inner = self.inner.read().unwrap_or_else(|e| {
-            warn!("MemoryStore: recovering from poisoned read lock");
-            e.into_inner()
-        });
+        let inner = self.read_inner();
         let valid = paths
             .iter()
             .filter(|p| inner.paths.contains_key(*p))
@@ -125,11 +111,7 @@ impl Store for MemoryStore {
     }
 
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>> {
-        let inner = self.inner.read().unwrap_or_else(|e| {
-            warn!("MemoryStore: recovering from poisoned read lock");
-            e.into_inner()
-        });
-        Ok(inner.nars.get(path).cloned())
+        Ok(self.read_inner().nars.get(path).cloned())
     }
 }
 

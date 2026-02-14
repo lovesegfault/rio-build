@@ -58,13 +58,12 @@ where
     let mut stderr = StderrWriter::new(writer);
     let start = std::time::Instant::now();
 
-    let op_name = WorkerOp::from_u64(opcode)
-        .map(|op| op.name())
-        .unwrap_or("unknown");
+    let op = WorkerOp::from_u64(opcode);
+    let op_name = op.map(|o| o.name()).unwrap_or("unknown");
     tracing::Span::current().record("opcode", op_name);
     metrics::counter!("rio_gateway_opcodes_total", "opcode" => op_name).increment(1);
 
-    let result = match WorkerOp::from_u64(opcode) {
+    let result = match op {
         Some(WorkerOp::IsValidPath) => handle_is_valid_path(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryPathInfo) => handle_query_path_info(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryValidPaths) => {
@@ -181,7 +180,8 @@ async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let path = match StorePath::parse(&path_str) {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
+            warn!(path = %path_str, error = %e, "invalid store path in wopQueryPathInfo, returning not-found");
             stderr.finish().await?;
             wire::write_bool(stderr.inner_mut(), false).await?;
             return Ok(());
@@ -243,7 +243,7 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .filter_map(|s| match StorePath::parse(s) {
             Ok(p) => Some(p),
             Err(e) => {
-                debug!(path = %s, error = %e, "dropping unparseable path in wopQueryValidPaths");
+                warn!(path = %s, error = %e, "dropping unparseable path in wopQueryValidPaths");
                 None
             }
         })
@@ -270,8 +270,13 @@ async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let path_str = wire::read_string(reader).await?;
     debug!(path = %path_str, "wopAddTempRoot");
 
-    if let Ok(path) = StorePath::parse(&path_str) {
-        temp_roots.insert(path);
+    match StorePath::parse(&path_str) {
+        Ok(path) => {
+            temp_roots.insert(path);
+        }
+        Err(e) => {
+            warn!(path = %path_str, error = %e, "invalid store path in wopAddTempRoot, ignoring");
+        }
     }
 
     stderr.finish().await?;
@@ -438,7 +443,7 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .filter_map(|s| match DerivedPath::parse(&s) {
             Ok(dp) => Some((s, dp)),
             Err(e) => {
-                debug!(path = %s, error = %e, "dropping unparseable DerivedPath in wopQueryMissing");
+                warn!(path = %s, error = %e, "dropping unparseable DerivedPath in wopQueryMissing");
                 None
             }
         })
@@ -449,8 +454,8 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .map(|(_, dp)| dp.store_path().clone())
         .collect();
 
-    let valid_set: HashSet<String> = match store.query_valid_paths(&store_paths).await {
-        Ok(v) => v.into_iter().map(|p| p.to_string()).collect(),
+    let valid_set: HashSet<StorePath> = match store.query_valid_paths(&store_paths).await {
+        Ok(v) => v.into_iter().collect(),
         Err(e) => return send_store_error(stderr, e).await,
     };
 
@@ -464,7 +469,7 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     //   they aren't derivations, so they can't be built, only substituted.
     //   Since rio-build has no substituters, unknown is the correct bucket.
     for (raw, dp) in &derived {
-        if valid_set.contains(&dp.store_path().to_string()) {
+        if valid_set.contains(dp.store_path()) {
             continue;
         }
         match dp {
@@ -478,8 +483,7 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     wire::write_strings(w, &will_build).await?;
     // willSubstitute: always empty (rio-build doesn't use external substituters)
-    let empty: Vec<String> = vec![];
-    wire::write_strings(w, &empty).await?;
+    wire::write_strings(w, &[]).await?;
     wire::write_strings(w, &unknown).await?;
     // downloadSize: 0
     wire::write_u64(w, 0).await?;

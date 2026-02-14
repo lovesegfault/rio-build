@@ -95,6 +95,27 @@ impl DerivedPath {
     }
 }
 
+impl std::fmt::Display for DerivedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DerivedPath::Opaque(path) => write!(f, "{path}"),
+            DerivedPath::Built { drv, outputs } => match outputs {
+                OutputSpec::All => write!(f, "{drv}!*"),
+                OutputSpec::Names(names) => {
+                    write!(f, "{drv}!")?;
+                    for (i, name) in names.names().iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ",")?;
+                        }
+                        write!(f, "{name}")?;
+                    }
+                    Ok(())
+                }
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

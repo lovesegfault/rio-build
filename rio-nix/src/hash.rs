@@ -64,11 +64,6 @@ impl HashAlgo {
         }
     }
 
-    /// Parse an algorithm name string (case-insensitive).
-    pub fn parse(s: &str) -> Result<Self, HashError> {
-        s.parse()
-    }
-
     /// Return the algorithm name as a lowercase string.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -124,7 +119,7 @@ impl NixHash {
             .split_once(':')
             .ok_or_else(|| HashError::InvalidFormat(format!("missing ':' in {s:?}")))?;
 
-        let algo = HashAlgo::parse(algo_str)?;
+        let algo = algo_str.parse::<HashAlgo>()?;
         let digest = nixbase32::decode(digest_str)?;
 
         Self::new(algo, digest)
@@ -136,7 +131,7 @@ impl NixHash {
             .split_once('-')
             .ok_or_else(|| HashError::InvalidFormat(format!("missing '-' in {s:?}")))?;
 
-        let algo = HashAlgo::parse(algo_str)?;
+        let algo = algo_str.parse::<HashAlgo>()?;
 
         use base64::Engine;
         let digest = base64::engine::general_purpose::STANDARD
@@ -163,7 +158,7 @@ impl NixHash {
     ///
     /// This is the format used by nix-daemon on the wire for `wopQueryPathInfo`.
     pub fn to_hex(&self) -> String {
-        self.digest.iter().map(|b| format!("{b:02x}")).collect()
+        hex::encode(&self.digest)
     }
 
     /// Render in Nix colon format: `sha256:aabb...` (nixbase32 digest).
@@ -223,11 +218,11 @@ mod tests {
 
     #[test]
     fn test_algo_parse() {
-        assert_eq!(HashAlgo::parse("sha256").unwrap(), HashAlgo::SHA256);
-        assert_eq!(HashAlgo::parse("SHA256").unwrap(), HashAlgo::SHA256);
-        assert_eq!(HashAlgo::parse("sha512").unwrap(), HashAlgo::SHA512);
-        assert_eq!(HashAlgo::parse("sha1").unwrap(), HashAlgo::SHA1);
-        assert!(HashAlgo::parse("md5").is_err());
+        assert_eq!("sha256".parse::<HashAlgo>().unwrap(), HashAlgo::SHA256);
+        assert_eq!("SHA256".parse::<HashAlgo>().unwrap(), HashAlgo::SHA256);
+        assert_eq!("sha512".parse::<HashAlgo>().unwrap(), HashAlgo::SHA512);
+        assert_eq!("sha1".parse::<HashAlgo>().unwrap(), HashAlgo::SHA1);
+        assert!("md5".parse::<HashAlgo>().is_err());
     }
 
     #[test]
