@@ -3,8 +3,9 @@
 //! Each handler reads its opcode-specific payload from the stream, performs
 //! the operation, and writes the response via the STDERR streaming loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use rio_nix::derivation::Derivation;
 use rio_nix::protocol::derived_path::DerivedPath;
 use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
@@ -50,6 +51,7 @@ pub async fn handle_opcode<R, W>(
     store: &dyn Store,
     options: &mut Option<ClientOptions>,
     temp_roots: &mut HashSet<StorePath>,
+    _drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,

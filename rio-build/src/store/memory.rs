@@ -113,6 +113,20 @@ impl Store for MemoryStore {
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(self.read_inner().nars.get(path).cloned())
     }
+
+    async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()> {
+        let key = info.path().clone();
+        debug!(path = %key, "adding path to memory store");
+        let mut inner = self.write_inner();
+        // Idempotent: if already present, don't overwrite
+        if inner.paths.contains_key(&key) {
+            debug!(path = %key, "path already exists, skipping");
+            return Ok(());
+        }
+        inner.nars.insert(key.clone(), nar_data);
+        inner.paths.insert(key, info);
+        Ok(())
+    }
 }
 
 /// Import a store path from the local Nix store by shelling out to `nix` CLI.
@@ -295,5 +309,37 @@ mod tests {
         store.insert(make_test_path_info(), None);
         assert!(!store.is_empty());
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_path_via_trait() {
+        let store = MemoryStore::new();
+        let info = make_test_path_info();
+        let path = info.path().clone();
+
+        store.add_path(info, b"nar data".to_vec()).await.unwrap();
+
+        assert!(store.is_valid_path(&path).await.unwrap());
+        assert_eq!(
+            store.nar_from_path(&path).await.unwrap().unwrap(),
+            b"nar data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_path_idempotent() {
+        let store = MemoryStore::new();
+        let info = make_test_path_info();
+        let path = info.path().clone();
+
+        store
+            .add_path(info.clone(), b"first".to_vec())
+            .await
+            .unwrap();
+        // Second add with different data should not overwrite
+        store.add_path(info, b"second".to_vec()).await.unwrap();
+
+        // Original data should be preserved
+        assert_eq!(store.nar_from_path(&path).await.unwrap().unwrap(), b"first");
     }
 }

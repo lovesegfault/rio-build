@@ -223,8 +223,9 @@ impl PathInfoBuilder {
 /// `nar_hash` is the SHA-256 digest of the NAR bytes returned by [`Store::nar_from_path`]
 /// for the same path, and `nar_size` equals the byte length of that NAR.
 ///
-/// Phase 1a implements only read operations + temp roots.
-/// Phase 1b adds write operations (add_to_store_nar, etc).
+/// Read operations implemented in Phase 1a. Write operations (`add_path`)
+/// added in Phase 1b for receiving uploaded paths via `wopAddToStoreNar`
+/// and `wopAddMultipleToStore`.
 #[async_trait::async_trait]
 pub trait Store: Send + Sync {
     /// Check if a store path exists.
@@ -239,8 +240,18 @@ pub trait Store: Send + Sync {
     /// Retrieve the NAR content for a store path. Returns `None` if not found.
     ///
     // TODO: return a streaming type instead of `Vec<u8>` to avoid buffering
-    // large NARs in memory. Phase 1b should introduce an `AsyncRead`-based API.
+    // large NARs in memory.
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>>;
+
+    /// Store a path with its metadata and NAR content.
+    ///
+    /// If the path already exists, the call succeeds without overwriting
+    /// (idempotent). The caller is responsible for validating that the NAR
+    /// content matches `info.nar_hash()` and `info.nar_size()` before calling.
+    ///
+    /// Called by `wopAddToStoreNar` and `wopAddMultipleToStore` handlers.
+    #[allow(dead_code)] // used by opcode handlers added in next commits
+    async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]
