@@ -48,12 +48,14 @@ This fits in a 4-node cluster (1 control plane + 1 general workload + 2 worker n
 
 Workers require a dedicated node pool with:
 
-- **Taint:** `rio.build/worker=true:NoSchedule` (only worker pods scheduled here)
-- **Instance type:** Compute-optimized with local SSD (e.g., `m6id.xlarge` on AWS)
+- **Taint:** `rio.build/worker=true:NoSchedule` (only worker pods scheduled here). Note: system pods (coredns) need at least one untainted node — use a separate system node group.
+- **Instance type:** Compute-optimized (e.g., `c8a.xlarge` on AWS). Avoid instance types with instance store NVMe (`m6id`, `i3`) unless the EKS AMI supports them — AL2023 EKS AMIs may report `InvalidDiskCapacity` with instance store volumes.
 - **AMI:** Amazon Linux 2023 (AL2023) or custom AMI with kernel 6.1+. Amazon Linux 2 (AL2, kernel 5.10) does **NOT** support overlayfs-over-FUSE and is not compatible with rio-build workers.
-- **Kernel:** Linux 6.1+ (for overlayfs-over-FUSE support). Verify with `uname -r` on worker nodes.
+- **Kernel:** Linux 6.1+ (for overlayfs-over-FUSE support). Linux 6.9+ recommended for FUSE passthrough mode. Verify with `uname -r` on worker nodes.
 - **IMDSv2:** Hop limit = 1 (defense-in-depth against metadata access from containers)
-- **Pod spec:** `hostUsers: false` (required, enables user namespace isolation for CAP_SYS_ADMIN containment)
+- **Pod spec:** `hostUsers: false` is incompatible with `/dev/fuse` hostPath volumes (kernel rejects idmap mounts on device nodes). Use a FUSE device plugin (e.g., `smarter-device-manager`) in production instead of hostPath to enable user namespace isolation.
+- **`/dev/fuse` access:** Worker pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use a device plugin to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
+- **EKS addons:** `vpc-cni` and `kube-proxy` must be installed before node groups are created (they are daemonsets). `coredns` requires schedulable (untainted) nodes and should be installed after the system node group is ready.
 
 ## Key Configuration
 

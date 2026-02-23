@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fuse-overlay-spike
+  labels:
+    app: rio-spike
+    rio.build/component: spike
+spec:
+  # hostUsers: false is incompatible with hostPath /dev/fuse (no idmap support).
+  # User namespace isolation is a production defense-in-depth feature, not
+  # required for the spike. The spike validates FUSE+overlay+sandbox correctness.
+
+  tolerations:
+    - key: rio.build/spike
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+  nodeSelector:
+    rio.build/role: spike-worker
+
+  # Prevent access to the K8s API
+  automountServiceAccountToken: false
+
+  containers:
+    - name: spike
+      image: SPIKE_IMAGE_PLACEHOLDER
+      securityContext:
+        # privileged: true is required for the spike because /dev/fuse access
+        # needs the device cgroup allowance. Production workers will use
+        # a FUSE device plugin or smarter-device-manager instead.
+        privileged: true
+
+      env:
+        - name: RUST_LOG
+          value: info
+
+      volumeMounts:
+        - name: dev-fuse
+          mountPath: /dev/fuse
+        - name: scratch
+          mountPath: /var/rio
+
+      # Run full validation suite
+      command:
+        - rio-spike
+        - validate
+        - --all
+
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+        limits:
+          cpu: "4"
+          memory: 8Gi
+
+  volumes:
+    - name: dev-fuse
+      hostPath:
+        path: /dev/fuse
+        type: CharDevice
+    - name: scratch
+      emptyDir:
+        sizeLimit: 20Gi
+
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30

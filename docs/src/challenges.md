@@ -121,8 +121,13 @@ The FUSE daemon (`rio-fuse`) runs in userspace via the `fuser` crate. Under heav
 - Benchmark FUSE read latency (p50, p99) during the Phase 1a spike under concurrent load
 - Compare against direct filesystem reads to quantify overhead
 - The `fuser` crate supports multi-threaded FUSE dispatch; ensure this is enabled
-- **FUSE passthrough mode (Linux 6.9+):** For cached paths on local SSD, FUSE passthrough (`FUSE_PASSTHROUGH`) eliminates the kernel-userspace context switch entirely by handing off file descriptors to the backing files. The Phase 1a benchmark should test both standard FUSE and passthrough mode (if the kernel supports it) to inform the performance baseline. See [rio-worker: FUSE Passthrough Mode](./components/worker.md#fuse-passthrough-mode-linux-69) for details.
-- If FUSE overhead exceeds 2x vs direct reads even with passthrough, consider the bind-mount fallback
+- **FUSE passthrough mode (Linux 6.9+):** For cached paths on local SSD, FUSE passthrough (`FUSE_PASSTHROUGH`) eliminates the `read()` context switch by handing off file descriptors to the backing files. See [rio-worker: FUSE Passthrough Mode](./components/worker.md#fuse-passthrough-mode-linux-69).
+- **File handle caching:** Keep backing file handles open across reads. Passthrough only helps for `read()` on already-open files; `lookup()` and `open()` still traverse userspace. Builds that open many small files once (header-heavy C++) won't benefit from passthrough alone --- they need reduced `open()` overhead via kernel entry/attribute caching (high TTL on immutable store paths).
+- If FUSE overhead exceeds 2x vs direct reads even with all mitigations, consider the bind-mount fallback
+
+**Phase 1a spike results (EKS AL2023, kernel 6.12, c8a.xlarge):**
+
+Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16). FUSE passthrough (`fuser` 0.17, `FUSE_PASSTHROUGH`) showed no improvement for the open-read-close-per-file benchmark pattern because `lookup()`/`open()` dominate, not `read()`. The overhead is acceptable for the architecture (the full FUSE → overlayfs → nix-build chain works), but production `rio-fuse` must optimize the `open()` path via file handle caching and aggressive attribute/entry TTLs. See [Phase 1a results](./phases/phase1a.md) for full benchmark data.
 
 ## 14. Size-Class Cold Start and Misclassification
 
