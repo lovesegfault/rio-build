@@ -430,4 +430,118 @@ mod tests {
         assert_eq!(r_args, args);
         assert_eq!(r_env, env);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+        use std::io::Cursor;
+
+        fn arb_build_status() -> impl Strategy<Value = BuildStatus> {
+            (0u64..=12).prop_map(|v| BuildStatus::try_from(v).unwrap())
+        }
+
+        fn arb_built_output() -> impl Strategy<Value = BuiltOutput> {
+            (
+                "[a-z]{1,8}",
+                "/nix/store/[a-z0-9]{32}-[a-z]{1,10}",
+                prop_oneof![Just(String::new()), Just("sha256".to_string())],
+                prop_oneof![Just(String::new()), "[0-9a-f]{64}"],
+            )
+                .prop_map(|(name, path, hash_algo, hash)| BuiltOutput {
+                    name,
+                    path,
+                    hash_algo,
+                    hash,
+                })
+        }
+
+        fn arb_build_result() -> impl Strategy<Value = BuildResult> {
+            (
+                arb_build_status(),
+                "[a-zA-Z0-9 :]{0,50}",
+                0u64..100,
+                any::<bool>(),
+                any::<u64>(),
+                any::<u64>(),
+                proptest::collection::vec(arb_built_output(), 0..4),
+            )
+                .prop_map(
+                    |(
+                        status,
+                        error_msg,
+                        times_built,
+                        is_non_deterministic,
+                        start,
+                        stop,
+                        outputs,
+                    )| {
+                        BuildResult::new(
+                            status,
+                            error_msg,
+                            times_built,
+                            is_non_deterministic,
+                            start,
+                            stop,
+                            outputs,
+                        )
+                    },
+                )
+        }
+
+        fn arb_derivation_output() -> impl Strategy<Value = DerivationOutput> {
+            (
+                "[a-z]{1,8}",
+                "/nix/store/[a-z0-9]{32}-[a-z]{1,10}",
+                prop_oneof![Just(String::new()), Just("sha256".to_string())],
+                prop_oneof![Just(String::new()), "[0-9a-f]{64}"],
+            )
+                .prop_map(|(name, path, hash_algo, hash)| {
+                    DerivationOutput::new(name, path, hash_algo, hash)
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn build_result_roundtrip(result in arb_build_result()) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_build_result(&mut buf, &result).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let parsed = read_build_result(&mut reader).await.unwrap();
+                    prop_assert_eq!(parsed, result);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn basic_derivation_roundtrip(
+                outputs in proptest::collection::vec(arb_derivation_output(), 1..5),
+                input_srcs in proptest::collection::vec("/nix/store/[a-z0-9]{32}-[a-z]{1,8}", 0..3),
+                platform in "(x86_64|aarch64)-linux",
+                builder in "/nix/store/[a-z0-9]{32}-bash/bin/bash",
+                args in proptest::collection::vec("[a-zA-Z0-9 -]{0,10}", 0..4),
+                env in proptest::collection::vec(
+                    ("[a-zA-Z_]{1,10}", "[a-zA-Z0-9 /_.-]{0,20}"),
+                    0..5
+                ),
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_basic_derivation(&mut buf, &outputs, &input_srcs, &platform, &builder, &args, &env).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let (r_outputs, r_input_srcs, r_platform, r_builder, r_args, r_env) =
+                        read_basic_derivation(&mut reader).await.unwrap();
+                    prop_assert_eq!(r_outputs, outputs);
+                    prop_assert_eq!(r_input_srcs, input_srcs);
+                    prop_assert_eq!(r_platform, platform);
+                    prop_assert_eq!(r_builder, builder);
+                    prop_assert_eq!(r_args, args);
+                    prop_assert_eq!(r_env, env);
+                    Ok(())
+                })?;
+            }
+        }
+    }
 }

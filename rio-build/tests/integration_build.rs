@@ -185,21 +185,16 @@ async fn test_build_trivial_derivation() {
     eprintln!("--- nix build stdout ---\n{stdout}");
     eprintln!("--- nix build stderr ---\n{stderr_text}");
 
-    // For Phase 1b, we check that the build at least connects and
-    // attempts the protocol. A fully working build requires the local
-    // nix-daemon to have the inputs and build sandbox working.
-    // We log the result but don't assert success yet — the integration
-    // test validates the protocol path, not necessarily a complete build.
-    if output.status.success() {
-        eprintln!("BUILD SUCCEEDED — full end-to-end build works!");
-    } else {
-        eprintln!(
-            "Build exited with status {}. This may be expected if the local \
-             nix-daemon cannot build (e.g., sandbox restrictions). The protocol \
-             path was exercised successfully if we got past the handshake.",
-            output.status
-        );
-    }
+    // Assert the build succeeded — the full end-to-end protocol path
+    // (handshake → AddToStoreNar/AddMultipleToStore → QueryDerivationOutputMap
+    // → BuildDerivation → NarFromPath) must complete successfully.
+    assert!(
+        output.status.success(),
+        "nix build failed with status {}.\nstdout: {}\nstderr: {}",
+        output.status,
+        stdout,
+        stderr_text,
+    );
 
     server_handle.abort();
 }

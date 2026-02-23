@@ -45,5 +45,11 @@ fuzz_target!(|data: &[u8]| {
             let mut cursor = Cursor::new(data);
             let _ = wire::read_string_pairs(&mut cursor).await;
         }
+
+        // Try read_framed_stream
+        {
+            let mut cursor = Cursor::new(data);
+            let _ = wire::read_framed_stream(&mut cursor).await;
+        }
     });
 });
