@@ -24,6 +24,9 @@ use crate::store::Store;
 
 const PROGRAM_NAME: &str = "rio-build";
 
+/// Default timeout for local daemon build operations (1 hour).
+const DAEMON_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Client build options received via wopSetOptions.
 ///
 /// Fields are populated during Phase 1a and propagated to the scheduler
@@ -991,73 +994,13 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         env.into_iter().collect(),
     );
 
-    // Spawn local nix-daemon --stdio
-    let mut daemon = match tokio::process::Command::new("nix-daemon")
-        .arg("--stdio")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            error!(error = %e, "failed to spawn nix-daemon --stdio");
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("failed to spawn local nix-daemon: {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to spawn nix-daemon: {e}"));
-        }
-    };
-
-    let mut daemon_stdin = daemon.stdin.take().unwrap();
-    let mut daemon_stdout = daemon.stdout.take().unwrap();
-
-    // Client handshake with local daemon
-    if let Err(e) = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin).await {
-        error!(error = %e, "failed to handshake with local nix-daemon");
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("failed to handshake with local nix-daemon: {e}"),
-            ))
-            .await?;
-        let _ = daemon.kill().await;
-        return Err(anyhow::anyhow!("daemon handshake failed: {e}"));
-    }
-
-    // Send wopSetOptions to local daemon
-    if let Err(e) = client::client_set_options(&mut daemon_stdout, &mut daemon_stdin).await {
-        error!(error = %e, "failed to set options on local nix-daemon");
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("failed to set options on local nix-daemon: {e}"),
-            ))
-            .await?;
-        let _ = daemon.kill().await;
-        return Err(anyhow::anyhow!("daemon set_options failed: {e}"));
-    }
-
-    // Forward wopBuildDerivation to local daemon
-    let result = client::client_build_derivation(
-        &mut daemon_stdout,
-        &mut daemon_stdin,
-        &drv_path_str,
-        &basic_drv,
-        build_mode,
-    )
-    .await;
-
-    // Clean up daemon process
-    let _ = daemon.kill().await;
-
-    let build_result = match result {
+    // Build via local daemon (spawn → handshake → setOptions → build → kill)
+    let build_result = match build_via_local_daemon(&drv_path_str, &basic_drv, build_mode).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "local daemon build failed");
+            // Report daemon-level errors as BuildResult failures, not connection errors,
+            // so the remote client gets a proper result instead of a connection drop.
             BuildResult::failure(BuildStatus::MiscFailure, format!("local daemon error: {e}"))
         }
     };
@@ -1332,6 +1275,9 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
 
 /// Build a derivation by spawning a local `nix-daemon --stdio` and
 /// forwarding `wopBuildDerivation`.
+///
+/// Handles the full lifecycle: spawn → handshake → setOptions → build → kill.
+/// Applies `DAEMON_BUILD_TIMEOUT` to prevent indefinite hangs.
 async fn build_via_local_daemon(
     drv_path: &str,
     basic_drv: &rio_nix::derivation::BasicDerivation,
@@ -1344,28 +1290,53 @@ async fn build_via_local_daemon(
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    let mut daemon_stdin = daemon.stdin.take().unwrap();
-    let mut daemon_stdout = daemon.stdout.take().unwrap();
+    let mut daemon_stdin = daemon
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("nix-daemon stdin not available"))?;
+    let mut daemon_stdout = daemon
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("nix-daemon stdout not available"))?;
 
-    let _handshake = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin)
+    let build_fut = async {
+        let _ = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin)
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon handshake failed: {e}"))?;
+
+        client::client_set_options(&mut daemon_stdout, &mut daemon_stdin)
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon set_options failed: {e}"))?;
+
+        client::client_build_derivation(
+            &mut daemon_stdout,
+            &mut daemon_stdin,
+            drv_path,
+            basic_drv,
+            build_mode,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("daemon handshake failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("daemon build failed: {e}"))
+    };
 
-    client::client_set_options(&mut daemon_stdout, &mut daemon_stdin)
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon set_options failed: {e}"))?;
+    let timeout = std::env::var("RIO_DAEMON_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(DAEMON_BUILD_TIMEOUT, std::time::Duration::from_secs);
 
-    let result = client::client_build_derivation(
-        &mut daemon_stdout,
-        &mut daemon_stdin,
-        drv_path,
-        basic_drv,
-        build_mode,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("daemon build failed: {e}"))?;
+    let result = match tokio::time::timeout(timeout, build_fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            error!(drv_path = %drv_path, "local daemon build timed out");
+            let _ = daemon.kill().await;
+            return Err(anyhow::anyhow!(
+                "local daemon build timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+    };
 
     let _ = daemon.kill().await;
 
-    Ok(result)
+    result
 }
