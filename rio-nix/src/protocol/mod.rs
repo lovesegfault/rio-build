@@ -1,3 +1,4 @@
+pub mod build;
 pub mod derived_path;
 pub mod handshake;
 pub mod opcodes;
