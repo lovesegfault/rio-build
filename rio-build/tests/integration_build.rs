@@ -185,17 +185,12 @@ async fn test_build_trivial_derivation() {
     eprintln!("--- nix build stdout ---\n{stdout}");
     eprintln!("--- nix build stderr ---\n{stderr_text}");
 
-    // The protocol pipeline (AddToStore → QueryMissing → BuildPathsWithResults)
-    // is now fully exercised. The build itself may still fail if the local
-    // nix-daemon can't execute the derivation (sandbox restrictions, missing
-    // inputs, etc.). Assert when the full pipeline is validated.
     if output.status.success() {
         eprintln!("BUILD SUCCEEDED — full end-to-end build works!");
     } else {
         eprintln!(
-            "Build exited with status {}. Protocol path was exercised successfully. \
-             Check server logs for build execution errors.",
-            output.status
+            "Build exited with status {}.\nstdout: {}\nstderr: {}",
+            output.status, stdout, stderr_text,
         );
     }
 

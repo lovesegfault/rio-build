@@ -1450,6 +1450,8 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                         false,
                         0,
                         0,
+                        None,
+                        None,
                         Vec::new(),
                     ));
                 } else {
@@ -1507,11 +1509,37 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                     }
                 };
 
-                let result =
-                    build_via_local_daemon(&drv.to_string(), &drv_obj.to_basic(), build_mode).await;
-                results.push(result.unwrap_or_else(|e| {
-                    BuildResult::failure(BuildStatus::MiscFailure, format!("daemon error: {e}"))
-                }));
+                let mut result =
+                    build_via_local_daemon(&drv.to_string(), &drv_obj.to_basic(), build_mode)
+                        .await
+                        .unwrap_or_else(|e| {
+                            BuildResult::failure(
+                                BuildStatus::MiscFailure,
+                                format!("daemon error: {e}"),
+                            )
+                        });
+
+                debug!(
+                    status = ?result.status(),
+                    built_outputs = result.built_outputs().len(),
+                    "daemon build result for {}",
+                    drv
+                );
+
+                // If the daemon returned success but empty builtOutputs
+                // (common for AlreadyValid), populate from the derivation.
+                if result.status().is_success() && result.built_outputs().is_empty() {
+                    result = result.with_outputs_from_drv(&drv_obj, drv);
+                    for out in result.built_outputs() {
+                        debug!(
+                            drv_output_id = %out.drv_output_id,
+                            out_path = %out.out_path,
+                            "populated output from drv"
+                        );
+                    }
+                }
+
+                results.push(result);
             }
         }
     }
@@ -1519,9 +1547,12 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
     stderr.finish().await?;
     let w = stderr.inner_mut();
 
-    // Write count + per-path BuildResult
+    // Write count + per-path (DerivedPath, BuildResult) pairs
+    // The real daemon writes KeyedBuildResult = DerivedPath + BuildResult
     wire::write_u64(w, results.len() as u64).await?;
-    for result in &results {
+    for (raw, result) in raw_paths.iter().zip(results.iter()) {
+        // DerivedPath key (same string the client sent)
+        wire::write_string(w, raw).await?;
         write_build_result(w, result).await?;
     }
 
