@@ -838,4 +838,67 @@ mod tests {
         let reparsed = Derivation::parse(&serialized).unwrap();
         assert_eq!(drv, reparsed);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_output() -> impl Strategy<Value = DerivationOutput> {
+            (
+                "[a-z]{1,8}",                                                 // name
+                "/nix/store/[a-z0-9]{32}-[a-z]{1,10}",                        // path
+                prop_oneof![Just(String::new()), Just("sha256".to_string())], // hash_algo
+            )
+                .prop_map(|(name, path, hash_algo)| {
+                    let hash = if hash_algo.is_empty() {
+                        String::new()
+                    } else {
+                        "0".repeat(64) // 64-char hex digest
+                    };
+                    DerivationOutput::new(name, path, hash_algo, hash)
+                })
+        }
+
+        fn arb_derivation() -> impl Strategy<Value = Derivation> {
+            (
+                proptest::collection::vec(arb_output(), 1..4),
+                proptest::collection::vec(
+                    (
+                        "/nix/store/[a-z0-9]{32}-[a-z]{1,8}\\.drv",
+                        proptest::collection::btree_set("[a-z]{1,5}", 1..3),
+                    ),
+                    0..3,
+                ),
+                proptest::collection::btree_set("/nix/store/[a-z0-9]{32}-[a-z]{1,8}", 0..3),
+                "(x86_64|aarch64)-linux",
+                "/nix/store/[a-z0-9]{32}-bash/bin/bash",
+                proptest::collection::vec("[a-zA-Z0-9 ./-]{0,20}", 0..4),
+                proptest::collection::btree_map("[a-zA-Z_]{1,10}", "[a-zA-Z0-9 =/_.-]{0,30}", 0..5),
+            )
+                .prop_map(
+                    |(outputs, input_drvs_vec, input_srcs, platform, builder, args, env)| {
+                        let input_drvs: BTreeMap<String, BTreeSet<String>> =
+                            input_drvs_vec.into_iter().collect();
+                        Derivation {
+                            outputs,
+                            input_drvs,
+                            input_srcs,
+                            platform,
+                            builder,
+                            args,
+                            env,
+                        }
+                    },
+                )
+        }
+
+        proptest! {
+            #[test]
+            fn aterm_roundtrip(drv in arb_derivation()) {
+                let serialized = drv.to_aterm();
+                let reparsed = Derivation::parse(&serialized).unwrap();
+                prop_assert_eq!(drv, reparsed);
+            }
+        }
+    }
 }

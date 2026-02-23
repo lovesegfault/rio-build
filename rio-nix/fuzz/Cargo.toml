@@ -23,3 +23,21 @@ name = "opcode_parsing"
 path = "fuzz_targets/opcode_parsing.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "derivation_parsing"
+path = "fuzz_targets/derivation_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "nar_parsing"
+path = "fuzz_targets/nar_parsing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "derived_path_parsing"
+path = "fuzz_targets/derived_path_parsing.rs"
+test = false
+doc = false
