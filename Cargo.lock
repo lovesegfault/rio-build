@@ -2409,6 +2409,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "proptest",
+ "serde_json",
  "sha1 0.10.6",
  "sha2 0.10.9",
  "tempfile",
