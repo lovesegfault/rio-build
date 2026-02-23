@@ -185,14 +185,13 @@ async fn test_build_trivial_derivation() {
     eprintln!("--- nix build stdout ---\n{stdout}");
     eprintln!("--- nix build stderr ---\n{stderr_text}");
 
-    if output.status.success() {
-        eprintln!("BUILD SUCCEEDED — full end-to-end build works!");
-    } else {
-        eprintln!(
-            "Build exited with status {}.\nstdout: {}\nstderr: {}",
-            output.status, stdout, stderr_text,
-        );
-    }
+    assert!(
+        output.status.success(),
+        "nix build failed with status {}.\nstdout: {}\nstderr: {}",
+        output.status,
+        stdout,
+        stderr_text,
+    );
 
     server_handle.abort();
 }
