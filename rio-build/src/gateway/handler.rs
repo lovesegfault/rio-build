@@ -551,6 +551,20 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         "wopAddToStoreNar"
     );
 
+    // Validate nar_size before allocation (cap at 1 GiB to prevent OOM)
+    if nar_size > wire::MAX_FRAMED_TOTAL {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!(
+                    "nar_size {nar_size} exceeds maximum {} for {path_str}",
+                    wire::MAX_FRAMED_TOTAL
+                ),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("nar_size exceeds maximum"));
+    }
+
     // Pull NAR data via STDERR_READ loop
     let chunk_size: u64 = 64 * 1024; // 64 KiB chunks
     let mut nar_data = Vec::with_capacity(nar_size as usize);
@@ -562,6 +576,11 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
         // Client responds with u64(len) + data + padding (same as wire string format)
         let chunk = wire::read_bytes(reader).await?;
+        if chunk.is_empty() {
+            return Err(anyhow::anyhow!(
+                "client sent empty chunk in STDERR_READ loop for {path_str}"
+            ));
+        }
         nar_data.extend_from_slice(&chunk);
         remaining = remaining.saturating_sub(chunk.len() as u64);
     }
