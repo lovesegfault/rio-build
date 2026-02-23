@@ -23,6 +23,12 @@ tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
+# Crypto
+sha2 = { workspace = true }
+
+# Encoding
+hex = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
