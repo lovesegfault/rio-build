@@ -104,31 +104,8 @@ where
         Some(WorkerOp::BuildPathsWithResults) => {
             handle_build_paths_with_results(reader, &mut stderr, store, drv_cache).await
         }
-        Some(op) => {
-            warn!(
-                opcode = opcode,
-                name = op.name(),
-                "unimplemented opcode, closing connection"
-            );
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!(
-                        "operation {} ({}) is not yet implemented",
-                        op.name(),
-                        opcode
-                    ),
-                ))
-                .await?;
-            // Must close the connection: the opcode's payload is still in the
-            // stream and we don't know its format, so we can't drain it.
-            // The client will reconnect automatically.
-            Err(anyhow::anyhow!(
-                "unimplemented opcode {} ({}), closing connection to avoid stream desynchronization",
-                op.name(),
-                opcode
-            ))
-        }
+        Some(WorkerOp::RegisterDrvOutput) => handle_register_drv_output(reader, &mut stderr).await,
+        Some(WorkerOp::QueryRealisation) => handle_query_realisation(reader, &mut stderr).await,
         None => {
             warn!(opcode = opcode, "unknown opcode, closing connection");
             stderr
@@ -444,6 +421,45 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     stderr.finish().await?;
     wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// wopRegisterDrvOutput (42): Stubbed — accepts and discards CA derivation output registration.
+///
+/// Modern Nix clients may send this after a content-addressed build. Accepting
+/// it as a no-op prevents unexpected connection drops. Full CA support is
+/// planned for Phase 2c/5.
+#[instrument(skip_all)]
+async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+) -> anyhow::Result<()> {
+    // Read DrvOutput: outputId (hash!outputName as a single string)
+    let _output_id = wire::read_string(reader).await?;
+    // Read realisation output path
+    let _output_path = wire::read_string(reader).await?;
+    debug!("wopRegisterDrvOutput (stubbed, accepting)");
+
+    stderr.finish().await?;
+    wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// wopQueryRealisation (43): Stubbed — returns empty set of realisations.
+///
+/// Modern Nix clients may query this for CA derivation outputs. Returning
+/// an empty set is safe and prevents connection drops.
+#[instrument(skip_all)]
+async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+) -> anyhow::Result<()> {
+    let _output_id = wire::read_string(reader).await?;
+    debug!("wopQueryRealisation (stubbed, returning empty)");
+
+    stderr.finish().await?;
+    // Return count = 0 (no realisations)
+    wire::write_u64(stderr.inner_mut(), 0).await?;
     Ok(())
 }
 

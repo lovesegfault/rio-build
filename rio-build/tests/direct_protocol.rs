@@ -842,47 +842,48 @@ async fn test_nar_from_path_missing_closes_connection() {
     .await;
 }
 
+/// wopRegisterDrvOutput (42) and wopQueryRealisation (43) are stubbed as no-ops.
+/// Verify they accept their payload and return success without closing the connection.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_known_unimplemented_opcode_closes_connection() {
+async fn test_ca_opcodes_accepted_as_noop() {
     let store = Arc::new(MemoryStore::new());
     run_test(store, |s| {
         tokio::spawn(async move {
             let mut s = s;
             do_handshake(&mut s).await;
 
-            // Send opcode 42 (wopRegisterDrvOutput) — known but not yet implemented
+            // wopRegisterDrvOutput (42): send output_id + output_path
             wire::write_u64(&mut s, 42).await.unwrap();
+            wire::write_string(&mut s, "sha256:abc123!out")
+                .await
+                .unwrap();
+            wire::write_string(&mut s, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test")
+                .await
+                .unwrap();
             s.flush().await.unwrap();
 
-            // Should receive STDERR_ERROR (0x63787470)
             let msg = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(msg, STDERR_ERROR);
+            assert_eq!(
+                msg, STDERR_LAST,
+                "RegisterDrvOutput should return STDERR_LAST"
+            );
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1, "RegisterDrvOutput should return success");
 
-            // Read the error structure
-            let error_type = wire::read_string(&mut s).await.unwrap();
-            assert_eq!(error_type, "Error");
-            let level = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(level, 0);
-            let name = wire::read_string(&mut s).await.unwrap();
-            assert_eq!(name, "rio-build");
-            let message = wire::read_string(&mut s).await.unwrap();
-            assert!(
-                message.contains("wopRegisterDrvOutput"),
-                "expected message to contain 'wopRegisterDrvOutput', got: {message}"
-            );
-            assert!(
-                message.contains("not yet implemented"),
-                "expected message to contain 'not yet implemented', got: {message}"
-            );
-            let _have_pos = wire::read_u64(&mut s).await.unwrap();
-            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+            // wopQueryRealisation (43): send output_id
+            wire::write_u64(&mut s, 43).await.unwrap();
+            wire::write_string(&mut s, "sha256:abc123!out")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
 
-            // Connection should be closed — next read returns EOF or error
-            let result = wire::read_u64(&mut s).await;
-            assert!(
-                result.is_err(),
-                "expected EOF after unimplemented opcode closes connection"
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_LAST,
+                "QueryRealisation should return STDERR_LAST"
             );
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 0, "QueryRealisation should return empty set");
         })
     })
     .await;

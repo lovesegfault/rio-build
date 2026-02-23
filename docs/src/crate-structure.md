@@ -74,16 +74,21 @@ rio-build/
 │   │   ├── lib.rs
 │   │   ├── protocol/
 │   │   │   ├── mod.rs
-│   │   │   ├── worker_proto.rs    # Worker protocol opcodes + serialization
+│   │   │   ├── opcodes.rs         # Worker protocol opcode enum + dispatch
 │   │   │   ├── handshake.rs       # Version negotiation, magic bytes
-│   │   │   ├── framing.rs         # Length-prefix framing, padded strings
+│   │   │   ├── wire.rs            # Length-prefix framing, padded strings, framed streams
 │   │   │   ├── stderr.rs          # STDERR streaming loop
-│   │   │   └── ops.rs             # Individual opcode handlers
+│   │   │   ├── build.rs           # BasicDerivation + BuildResult wire types
+│   │   │   ├── client.rs          # Client-side protocol for local nix-daemon
+│   │   │   └── derived_path.rs    # DerivedPath string parser
 │   │   ├── derivation.rs          # .drv ATerm format parser
 │   │   ├── store_path.rs          # Store path types, nixbase32
 │   │   ├── nar.rs                 # NAR streaming read/write
 │   │   └── hash.rs                # Nix hash types
 │   └── Cargo.toml                 # No external Nix deps
+│
+├── rio-spike/                    # Phase 1a FUSE+overlay spike/prototype (not shipped)
+│   └── src/                      # Validation benchmarks for FUSE, overlay, sandbox chain
 │
 ├── rio-store/                     # Chunked content-addressable store
 │   ├── src/
