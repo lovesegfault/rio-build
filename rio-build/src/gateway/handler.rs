@@ -84,6 +84,9 @@ where
         Some(WorkerOp::AddToStoreNar) => {
             handle_add_to_store_nar(reader, &mut stderr, store, drv_cache).await
         }
+        Some(WorkerOp::AddMultipleToStore) => {
+            handle_add_multiple_to_store(reader, &mut stderr, store, drv_cache).await
+        }
         Some(WorkerOp::QueryDerivationOutputMap) => {
             handle_query_derivation_output_map(reader, &mut stderr, store, drv_cache).await
         }
@@ -637,24 +640,154 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     store.add_path(info, nar_data.clone()).await?;
 
     // If this is a .drv file, parse and cache it
-    if path.is_derivation() {
-        match rio_nix::nar::extract_single_file(&nar_data) {
-            Ok(drv_bytes) => {
-                let drv_text = String::from_utf8_lossy(&drv_bytes);
-                match Derivation::parse(&drv_text) {
-                    Ok(drv) => {
-                        debug!(path = %path, "cached parsed derivation");
-                        drv_cache.insert(path, drv);
-                    }
-                    Err(e) => {
-                        warn!(path = %path_str, error = %e, "failed to parse .drv ATerm, skipping cache");
-                    }
+    try_cache_drv(&path, &nar_data, drv_cache);
+
+    // Send success
+    stderr.finish().await?;
+    wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// If `path` is a `.drv`, extract from NAR, parse ATerm, and cache in drv_cache.
+fn try_cache_drv(
+    path: &StorePath,
+    nar_data: &[u8],
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) {
+    if !path.is_derivation() {
+        return;
+    }
+    match rio_nix::nar::extract_single_file(nar_data) {
+        Ok(drv_bytes) => {
+            let drv_text = String::from_utf8_lossy(&drv_bytes);
+            match Derivation::parse(&drv_text) {
+                Ok(drv) => {
+                    debug!(path = %path, "cached parsed derivation");
+                    drv_cache.insert(path.clone(), drv);
+                }
+                Err(e) => {
+                    warn!(path = %path, error = %e, "failed to parse .drv ATerm, skipping cache");
                 }
             }
-            Err(e) => {
-                warn!(path = %path_str, error = %e, "failed to extract .drv from NAR, skipping cache");
-            }
         }
+        Err(e) => {
+            warn!(path = %path, error = %e, "failed to extract .drv from NAR, skipping cache");
+        }
+    }
+}
+
+/// Parse a single entry from the wopAddMultipleToStore reassembled byte stream.
+///
+/// Each entry contains the same PathInfo metadata fields as wopAddToStoreNar,
+/// followed by an inner framed stream containing the NAR data.
+async fn parse_add_multiple_entry(
+    cursor: &mut std::io::Cursor<&[u8]>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    use crate::store::PathInfoBuilder;
+
+    let path_str = wire::read_string(cursor).await?;
+    let deriver_str = wire::read_string(cursor).await?;
+    let nar_hash_str = wire::read_string(cursor).await?;
+    let references = wire::read_strings(cursor).await?;
+    let registration_time = wire::read_u64(cursor).await?;
+    let nar_size = wire::read_u64(cursor).await?;
+    let ultimate = wire::read_bool(cursor).await?;
+    let sigs = wire::read_strings(cursor).await?;
+    let ca_str = wire::read_string(cursor).await?;
+
+    // Read inner framed NAR data
+    let nar_data = wire::read_framed_stream(cursor).await?;
+
+    debug!(
+        path = %path_str,
+        nar_size = nar_size,
+        nar_actual = nar_data.len(),
+        "wopAddMultipleToStore entry"
+    );
+
+    // Validate NAR hash
+    let computed_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&nar_data);
+        hex::encode(hasher.finalize())
+    };
+    if computed_hash != nar_hash_str {
+        warn!(
+            path = %path_str,
+            declared = %nar_hash_str,
+            computed = %computed_hash,
+            "NAR hash mismatch in wopAddMultipleToStore"
+        );
+        return Err(anyhow::anyhow!("NAR hash mismatch for {path_str}"));
+    }
+
+    // Build PathInfo
+    let path = StorePath::parse(&path_str)
+        .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
+
+    let nar_hash = NixHash::parse(&format!("sha256:{nar_hash_str}"))
+        .map_err(|e| anyhow::anyhow!("invalid narHash: {e}"))?;
+
+    let deriver = if deriver_str.is_empty() {
+        None
+    } else {
+        StorePath::parse(&deriver_str).ok()
+    };
+
+    let ref_paths: Vec<StorePath> = references
+        .iter()
+        .filter_map(|s| StorePath::parse(s).ok())
+        .collect();
+
+    let ca = if ca_str.is_empty() {
+        None
+    } else {
+        Some(ca_str)
+    };
+
+    let info = PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
+        .deriver(deriver)
+        .references(ref_paths)
+        .registration_time(registration_time)
+        .ultimate(ultimate)
+        .sigs(sigs)
+        .ca(ca)
+        .build()?;
+
+    store.add_path(info, nar_data.clone()).await?;
+    try_cache_drv(&path, &nar_data, drv_cache);
+
+    Ok(())
+}
+
+/// wopAddMultipleToStore (44): Receive multiple store paths via framed stream.
+///
+/// The primary upload path for modern Nix clients (protocol >= 1.32).
+/// Receives a framed byte stream containing concatenated entries,
+/// each with PathInfo metadata + an inner framed NAR.
+#[instrument(skip_all)]
+async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    let _repair = wire::read_bool(reader).await?;
+    let _dont_check_sigs = wire::read_bool(reader).await?; // always treated as false
+
+    debug!("wopAddMultipleToStore");
+
+    // Read the outer framed stream into a contiguous buffer
+    let stream_data = wire::read_framed_stream(reader).await?;
+
+    // Parse entries sequentially from the reassembled stream
+    let mut cursor = std::io::Cursor::new(stream_data.as_slice());
+    let total_len = stream_data.len() as u64;
+
+    while cursor.position() < total_len {
+        parse_add_multiple_entry(&mut cursor, store, drv_cache).await?;
     }
 
     // Send success
