@@ -136,6 +136,9 @@ async fn read_stderr_error<R: AsyncRead + Unpin>(r: &mut R) -> Result<StderrErro
 
     // Traces
     let trace_count = wire::read_u64(r).await?;
+    if trace_count > wire::MAX_COLLECTION_COUNT {
+        return Err(WireError::CollectionTooLarge(trace_count));
+    }
     let mut traces = Vec::with_capacity(trace_count.min(64) as usize);
     for _ in 0..trace_count {
         let trace_have_pos = wire::read_u64(r).await?;
@@ -161,6 +164,9 @@ async fn read_result_fields<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Vec<ResultField>, WireError> {
     let count = wire::read_u64(r).await?;
+    if count > wire::MAX_COLLECTION_COUNT {
+        return Err(WireError::CollectionTooLarge(count));
+    }
     let mut fields = Vec::with_capacity(count.min(64) as usize);
     for _ in 0..count {
         let field_type = wire::read_u64(r).await?;

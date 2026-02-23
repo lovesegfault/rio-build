@@ -11,10 +11,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const PADDING: usize = 8;
 
 /// Maximum allowed string length (64 MiB) to prevent OOM on malicious input.
-const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
+pub const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
 
 /// Maximum allowed collection count (1M items) to prevent OOM on malicious input.
-const MAX_COLLECTION_COUNT: u64 = 1_048_576;
+pub const MAX_COLLECTION_COUNT: u64 = 1_048_576;
 
 #[derive(Debug, Error)]
 pub enum WireError {
@@ -171,7 +171,7 @@ pub async fn write_strings<W: AsyncWrite + Unpin>(w: &mut W, items: &[String]) -
 }
 
 /// Maximum total size for framed stream reassembly (1 GiB).
-const MAX_FRAMED_TOTAL: u64 = 1024 * 1024 * 1024;
+pub const MAX_FRAMED_TOTAL: u64 = 1024 * 1024 * 1024;
 
 /// Maximum single frame size (64 MiB).
 const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
