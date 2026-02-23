@@ -6,7 +6,7 @@
 
 - [x] Derivation parser: `.drv` ATerm format (`rio-nix/src/derivation.rs`). `BasicDerivation` wire serialization deferred to Step 6.
 - [x] NAR format: streaming reader and writer (`rio-nix/src/nar.rs`). Synchronous `Read`/`Write`-based. Golden-tested against `nix-store --dump`.
-- [ ] Narinfo: parser and generator
+- [x] Narinfo: parser and generator (`rio-nix/src/narinfo.rs`)
 - [ ] Build opcodes: `wopBuildDerivation` (36), `wopBuildPathsWithResults` (46), `wopBuildPaths` (9), `wopAddToStoreNar` (39), `wopAddMultipleToStore` (44), `wopNarFromPath` (38), `wopQueryMissing` (40), `wopQueryDerivationOutputMap` (41)
 - [x] `DerivedPath` string parser (opaque, built with explicit outputs, built with `!*`) — completed in Phase 1a (`rio-nix/src/protocol/derived_path.rs`)
 - [ ] `rio-store`: filesystem backend (NAR files on disk)
