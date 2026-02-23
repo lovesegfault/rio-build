@@ -4,11 +4,11 @@
 
 ## Tasks
 
-- [ ] Derivation parser: `.drv` ATerm format, `BasicDerivation` wire serialization
+- [x] Derivation parser: `.drv` ATerm format (`rio-nix/src/derivation.rs`). `BasicDerivation` wire serialization deferred to Step 6.
 - [ ] NAR format: streaming reader and writer
 - [ ] Narinfo: parser and generator
 - [ ] Build opcodes: `wopBuildDerivation` (36), `wopBuildPathsWithResults` (46), `wopBuildPaths` (9), `wopAddToStoreNar` (39), `wopAddMultipleToStore` (44), `wopNarFromPath` (38), `wopQueryMissing` (40), `wopQueryDerivationOutputMap` (41)
-- [ ] `DerivedPath` string parser (opaque, built with explicit outputs, built with `!*`)
+- [x] `DerivedPath` string parser (opaque, built with explicit outputs, built with `!*`) — completed in Phase 1a (`rio-nix/src/protocol/derived_path.rs`)
 - [ ] `rio-store`: filesystem backend (NAR files on disk)
 - [ ] Single-threaded local execution for `wopBuildDerivation` (invoke local nix)
 - [ ] Integration test: `nix build --store ssh-ng://localhost .#hello` works end-to-end
