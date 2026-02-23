@@ -6,7 +6,8 @@
 use std::collections::{HashMap, HashSet};
 
 use rio_nix::derivation::Derivation;
-use rio_nix::hash::NixHash;
+use rio_nix::hash::{HashAlgo, NixHash};
+use rio_nix::nar::{self, NarNode};
 use rio_nix::protocol::build::{
     BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
 };
@@ -76,6 +77,12 @@ where
 
     let result = match op {
         Some(WorkerOp::IsValidPath) => handle_is_valid_path(reader, &mut stderr, store).await,
+        Some(WorkerOp::AddToStore) => {
+            handle_add_to_store(reader, &mut stderr, store, drv_cache).await
+        }
+        Some(WorkerOp::AddTextToStore) => {
+            handle_add_text_to_store(reader, &mut stderr, store, drv_cache).await
+        }
         Some(WorkerOp::EnsurePath) => handle_ensure_path(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryPathInfo) => handle_query_path_info(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryValidPaths) => {
@@ -195,8 +202,8 @@ async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
     }
 
-    // wopEnsurePath returns void — STDERR_LAST only, no result value.
     stderr.finish().await?;
+    wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())
 }
 
@@ -870,6 +877,197 @@ async fn parse_add_multiple_entry(
     try_cache_drv(&path, &nar_data, drv_cache);
 
     Ok(())
+}
+
+/// wopAddToStore (7): Legacy content-addressed store path import.
+///
+/// Protocol >= 1.25: reads name, content-address method string, references,
+/// repair flag, then a framed data stream (NAR or flat file content).
+/// Returns STDERR_LAST + full ValidPathInfo.
+#[instrument(skip_all)]
+async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    use crate::store::PathInfoBuilder;
+
+    let name = wire::read_string(reader).await?;
+    let cam_str = wire::read_string(reader).await?;
+    let references = wire::read_strings(reader).await?;
+    let _repair = wire::read_bool(reader).await?;
+
+    debug!(name = %name, cam_str = %cam_str, "wopAddToStore");
+
+    // Read the dump data via framed stream
+    let dump_data = wire::read_framed_stream(reader).await?;
+
+    // Parse content-address method string: "text:sha256", "fixed:sha256", "fixed:r:sha256"
+    let (is_text, is_recursive, hash_algo) = parse_cam_str(&cam_str)
+        .map_err(|e| anyhow::anyhow!("invalid content-address method '{cam_str}': {e}"))?;
+
+    // Hash the dump content
+    let content_hash = NixHash::compute(hash_algo, &dump_data);
+
+    // Compute the store path
+    let ref_paths: Vec<StorePath> = references
+        .iter()
+        .filter_map(|s| StorePath::parse(s).ok())
+        .collect();
+
+    let path = if is_text {
+        StorePath::make_text(&name, &content_hash, &ref_paths)
+            .map_err(|e| anyhow::anyhow!("failed to compute text store path: {e}"))?
+    } else {
+        StorePath::make_fixed_output(&name, &content_hash, is_recursive)
+            .map_err(|e| anyhow::anyhow!("failed to compute fixed-output store path: {e}"))?
+    };
+
+    // Build NAR: if the dump is flat content (text or non-recursive), wrap in NAR.
+    // If recursive, the dump IS the NAR.
+    let nar_data = if is_recursive {
+        dump_data
+    } else {
+        let node = NarNode::Regular {
+            executable: false,
+            contents: dump_data,
+        };
+        let mut buf = Vec::new();
+        nar::serialize(&mut buf, &node)
+            .map_err(|e| anyhow::anyhow!("failed to serialize NAR: {e}"))?;
+        buf
+    };
+
+    // Compute NAR hash for PathInfo
+    let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
+    let nar_size = nar_data.len() as u64;
+
+    // Build content address string for PathInfo
+    let ca = {
+        let r_prefix = if is_recursive { "r:" } else { "" };
+        let method = if is_text { "text" } else { "fixed" };
+        let nix32_hash = rio_nix::store_path::nixbase32::encode(content_hash.digest());
+        if is_text {
+            format!("{method}:{hash_algo}:{nix32_hash}")
+        } else {
+            format!("{method}:{r_prefix}{hash_algo}:{nix32_hash}")
+        }
+    };
+
+    let info = PathInfoBuilder::new(path.clone(), nar_hash.clone(), nar_size)
+        .references(ref_paths)
+        .ultimate(true)
+        .ca(Some(ca.clone()))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build PathInfo: {e}"))?;
+
+    store.add_path(info, nar_data.clone()).await?;
+    try_cache_drv(&path, &nar_data, drv_cache);
+
+    // Send STDERR_LAST + ValidPathInfo
+    stderr.finish().await?;
+    let w = stderr.inner_mut();
+
+    wire::write_string(w, &path.to_string()).await?; // path
+    wire::write_string(w, "").await?; // deriver (none)
+    wire::write_string(w, &nar_hash.to_hex()).await?; // narHash (hex, no prefix)
+    // references
+    let ref_strs: Vec<String> = references;
+    wire::write_strings(w, &ref_strs).await?;
+    wire::write_u64(w, 0).await?; // registrationTime
+    wire::write_u64(w, nar_size).await?; // narSize
+    wire::write_bool(w, true).await?; // ultimate
+    wire::write_strings(w, &[]).await?; // sigs (empty)
+    wire::write_string(w, &ca).await?; // ca
+
+    Ok(())
+}
+
+/// wopAddTextToStore (8): Legacy text file import (used by builtins.toFile).
+///
+/// Wire format: name (string), text content (string), references (string collection).
+/// Returns STDERR_LAST + StorePath.
+#[instrument(skip_all)]
+async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    use crate::store::PathInfoBuilder;
+
+    let name = wire::read_string(reader).await?;
+    let text = wire::read_string(reader).await?;
+    let references = wire::read_strings(reader).await?;
+
+    debug!(name = %name, text_len = text.len(), "wopAddTextToStore");
+
+    let content_hash = NixHash::compute(HashAlgo::SHA256, text.as_bytes());
+
+    let ref_paths: Vec<StorePath> = references
+        .iter()
+        .filter_map(|s| StorePath::parse(s).ok())
+        .collect();
+
+    let path = StorePath::make_text(&name, &content_hash, &ref_paths)
+        .map_err(|e| anyhow::anyhow!("failed to compute text store path: {e}"))?;
+
+    // Wrap text in NAR
+    let node = NarNode::Regular {
+        executable: false,
+        contents: text.into_bytes(),
+    };
+    let mut nar_data = Vec::new();
+    nar::serialize(&mut nar_data, &node)
+        .map_err(|e| anyhow::anyhow!("failed to serialize NAR: {e}"))?;
+
+    let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
+    let nar_size = nar_data.len() as u64;
+
+    let ca = format!(
+        "text:sha256:{}",
+        rio_nix::store_path::nixbase32::encode(content_hash.digest())
+    );
+
+    let info = PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
+        .references(ref_paths)
+        .ultimate(true)
+        .ca(Some(ca))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build PathInfo: {e}"))?;
+
+    store.add_path(info, nar_data.clone()).await?;
+    try_cache_drv(&path, &nar_data, drv_cache);
+
+    // wopAddTextToStore returns STDERR_LAST + store path string
+    stderr.finish().await?;
+    wire::write_string(stderr.inner_mut(), &path.to_string()).await?;
+
+    Ok(())
+}
+
+/// Parse a content-address method string like "text:sha256", "fixed:sha256", "fixed:r:sha256".
+///
+/// Returns (is_text, is_recursive, hash_algo).
+fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
+    if let Some(algo_str) = cam_str.strip_prefix("text:") {
+        let algo = algo_str.parse::<HashAlgo>().map_err(|e| e.to_string())?;
+        Ok((true, false, algo))
+    } else if let Some(rest) = cam_str.strip_prefix("fixed:") {
+        if let Some(algo_str) = rest.strip_prefix("r:") {
+            let algo = algo_str.parse::<HashAlgo>().map_err(|e| e.to_string())?;
+            Ok((false, true, algo))
+        } else if let Some(algo_str) = rest.strip_prefix("git:") {
+            let algo = algo_str.parse::<HashAlgo>().map_err(|e| e.to_string())?;
+            Ok((false, true, algo)) // git mode is treated as recursive
+        } else {
+            let algo = rest.parse::<HashAlgo>().map_err(|e| e.to_string())?;
+            Ok((false, false, algo))
+        }
+    } else {
+        Err(format!("unrecognized content-address method: {cam_str}"))
+    }
 }
 
 /// wopAddMultipleToStore (44): Receive multiple store paths via framed stream.
