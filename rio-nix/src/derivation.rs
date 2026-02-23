@@ -1,0 +1,841 @@
+//! Nix ATerm derivation (`.drv`) parser and serializer.
+//!
+//! A `.drv` file is an ATerm representation of a Nix derivation containing:
+//! - `outputs`: output name → (path, hashAlgo, hash) tuples
+//! - `inputDrvs`: derivation path → output names (DAG edges)
+//! - `inputSrcs`: source store paths
+//! - `platform`, `builder`, `args`, `env`
+//!
+//! Format: `Derive([outputs],[inputDrvs],[inputSrcs],"platform","builder",[args],[env])`
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use thiserror::Error;
+
+/// Errors from parsing an ATerm derivation.
+#[derive(Debug, Error)]
+pub enum DerivationError {
+    #[error("unexpected end of input")]
+    UnexpectedEof,
+
+    #[error("expected '{expected}', got '{got}'")]
+    Expected { expected: String, got: String },
+
+    #[error("invalid escape sequence: \\{0}")]
+    InvalidEscape(char),
+
+    #[error("expected '\"' to start string")]
+    ExpectedStringStart,
+
+    #[error("empty output name at index {0}")]
+    EmptyOutputName(usize),
+}
+
+/// A single derivation output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivationOutput {
+    /// Output name (e.g., "out", "dev", "lib").
+    name: String,
+    /// Store path for this output.
+    path: String,
+    /// Hash algorithm for fixed-output derivations (empty for input-addressed).
+    hash_algo: String,
+    /// Expected hash for fixed-output derivations (empty for input-addressed).
+    hash: String,
+}
+
+impl DerivationOutput {
+    /// Create a new derivation output.
+    pub fn new(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        hash_algo: impl Into<String>,
+        hash: impl Into<String>,
+    ) -> Self {
+        DerivationOutput {
+            name: name.into(),
+            path: path.into(),
+            hash_algo: hash_algo.into(),
+            hash: hash.into(),
+        }
+    }
+
+    /// The output name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The output store path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Hash algorithm (empty for input-addressed).
+    pub fn hash_algo(&self) -> &str {
+        &self.hash_algo
+    }
+
+    /// Expected hash (empty for input-addressed).
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    /// Whether this is a fixed-output derivation output.
+    pub fn is_fixed_output(&self) -> bool {
+        !self.hash_algo.is_empty()
+    }
+}
+
+/// A full Nix derivation parsed from a `.drv` file.
+///
+/// Contains `input_drvs` (dependency DAG edges) which are NOT present in the
+/// wire format's `BasicDerivation`. Use [`Derivation::to_basic`] to strip them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Derivation {
+    /// Output definitions.
+    outputs: Vec<DerivationOutput>,
+    /// Input derivation dependencies: drv_path → set of output names.
+    input_drvs: BTreeMap<String, BTreeSet<String>>,
+    /// Input source store paths.
+    input_srcs: BTreeSet<String>,
+    /// Build platform (e.g., "x86_64-linux").
+    platform: String,
+    /// Builder executable path.
+    builder: String,
+    /// Builder arguments.
+    args: Vec<String>,
+    /// Environment variables.
+    env: BTreeMap<String, String>,
+}
+
+impl Derivation {
+    /// Parse a `.drv` file's ATerm content.
+    pub fn parse(input: &str) -> Result<Self, DerivationError> {
+        let mut parser = ATermParser::new(input);
+        parser.parse_derivation()
+    }
+
+    /// Serialize back to ATerm format.
+    pub fn to_aterm(&self) -> String {
+        let mut out = String::new();
+        out.push_str("Derive(");
+
+        // outputs
+        out.push('[');
+        for (i, o) in self.outputs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('(');
+            write_aterm_string(&mut out, &o.name);
+            out.push(',');
+            write_aterm_string(&mut out, &o.path);
+            out.push(',');
+            write_aterm_string(&mut out, &o.hash_algo);
+            out.push(',');
+            write_aterm_string(&mut out, &o.hash);
+            out.push(')');
+        }
+        out.push(']');
+        out.push(',');
+
+        // inputDrvs
+        out.push('[');
+        for (i, (drv_path, output_names)) in self.input_drvs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('(');
+            write_aterm_string(&mut out, drv_path);
+            out.push(',');
+            out.push('[');
+            for (j, name) in output_names.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                write_aterm_string(&mut out, name);
+            }
+            out.push(']');
+            out.push(')');
+        }
+        out.push(']');
+        out.push(',');
+
+        // inputSrcs
+        out.push('[');
+        for (i, src) in self.input_srcs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_aterm_string(&mut out, src);
+        }
+        out.push(']');
+        out.push(',');
+
+        // platform, builder
+        write_aterm_string(&mut out, &self.platform);
+        out.push(',');
+        write_aterm_string(&mut out, &self.builder);
+        out.push(',');
+
+        // args
+        out.push('[');
+        for (i, arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_aterm_string(&mut out, arg);
+        }
+        out.push(']');
+        out.push(',');
+
+        // env
+        out.push('[');
+        for (i, (key, value)) in self.env.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('(');
+            write_aterm_string(&mut out, key);
+            out.push(',');
+            write_aterm_string(&mut out, value);
+            out.push(')');
+        }
+        out.push(']');
+
+        out.push(')');
+        out
+    }
+
+    /// Convert to a `BasicDerivation` by stripping `input_drvs`.
+    pub fn to_basic(&self) -> BasicDerivation {
+        BasicDerivation {
+            outputs: self.outputs.clone(),
+            input_srcs: self.input_srcs.clone(),
+            platform: self.platform.clone(),
+            builder: self.builder.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+        }
+    }
+
+    /// The derivation outputs.
+    pub fn outputs(&self) -> &[DerivationOutput] {
+        &self.outputs
+    }
+
+    /// Input derivation dependencies.
+    pub fn input_drvs(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.input_drvs
+    }
+
+    /// Input source store paths.
+    pub fn input_srcs(&self) -> &BTreeSet<String> {
+        &self.input_srcs
+    }
+
+    /// Build platform.
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    /// Builder executable path.
+    pub fn builder(&self) -> &str {
+        &self.builder
+    }
+
+    /// Builder arguments.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Environment variables.
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+}
+
+/// A derivation without `input_drvs` — the wire format for `wopBuildDerivation`.
+///
+/// This is the subset of a full [`Derivation`] that Nix sends inline in the
+/// `wopBuildDerivation` opcode. The `inputDrvs` field is omitted because
+/// the client uploads `.drv` files separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasicDerivation {
+    /// Output definitions.
+    outputs: Vec<DerivationOutput>,
+    /// Input source store paths.
+    input_srcs: BTreeSet<String>,
+    /// Build platform.
+    platform: String,
+    /// Builder executable path.
+    builder: String,
+    /// Builder arguments.
+    args: Vec<String>,
+    /// Environment variables.
+    env: BTreeMap<String, String>,
+}
+
+impl BasicDerivation {
+    /// Create a new basic derivation.
+    pub fn new(
+        outputs: Vec<DerivationOutput>,
+        input_srcs: BTreeSet<String>,
+        platform: String,
+        builder: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        BasicDerivation {
+            outputs,
+            input_srcs,
+            platform,
+            builder,
+            args,
+            env,
+        }
+    }
+
+    /// The derivation outputs.
+    pub fn outputs(&self) -> &[DerivationOutput] {
+        &self.outputs
+    }
+
+    /// Input source store paths.
+    pub fn input_srcs(&self) -> &BTreeSet<String> {
+        &self.input_srcs
+    }
+
+    /// Build platform.
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    /// Builder executable path.
+    pub fn builder(&self) -> &str {
+        &self.builder
+    }
+
+    /// Builder arguments.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Environment variables.
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ATerm serialization helper
+// ---------------------------------------------------------------------------
+
+/// Write an ATerm-escaped string (with surrounding quotes) to the output.
+fn write_aterm_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+// ---------------------------------------------------------------------------
+// ATerm parser
+// ---------------------------------------------------------------------------
+
+struct ATermParser<'a> {
+    input: &'a str,
+    pos: usize,
+}
+
+impl<'a> ATermParser<'a> {
+    fn new(input: &'a str) -> Self {
+        ATermParser { input, pos: 0 }
+    }
+
+    /// Peek at the current character without consuming.
+    fn peek(&self) -> Option<char> {
+        self.input[self.pos..].chars().next()
+    }
+
+    /// Advance past the current character.
+    fn advance(&mut self) {
+        if let Some(ch) = self.input[self.pos..].chars().next() {
+            self.pos += ch.len_utf8();
+        }
+    }
+
+    /// Consume the expected literal string, or return an error.
+    fn expect(&mut self, expected: &str) -> Result<(), DerivationError> {
+        if self.input[self.pos..].starts_with(expected) {
+            self.pos += expected.len();
+            Ok(())
+        } else {
+            let remaining = &self.input[self.pos..];
+            let got: String = remaining.chars().take(expected.len().max(10)).collect();
+            Err(DerivationError::Expected {
+                expected: expected.to_string(),
+                got,
+            })
+        }
+    }
+
+    /// Parse an ATerm-quoted string: `"..."` with escape handling.
+    fn parse_string(&mut self) -> Result<String, DerivationError> {
+        if self.peek() != Some('"') {
+            return Err(DerivationError::ExpectedStringStart);
+        }
+        self.advance(); // consume opening quote
+
+        let mut result = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(DerivationError::UnexpectedEof),
+                Some('"') => {
+                    self.advance(); // consume closing quote
+                    return Ok(result);
+                }
+                Some('\\') => {
+                    self.advance(); // consume backslash
+                    match self.peek() {
+                        None => return Err(DerivationError::UnexpectedEof),
+                        Some('n') => {
+                            result.push('\n');
+                            self.advance();
+                        }
+                        Some('r') => {
+                            result.push('\r');
+                            self.advance();
+                        }
+                        Some('t') => {
+                            result.push('\t');
+                            self.advance();
+                        }
+                        Some('\\') => {
+                            result.push('\\');
+                            self.advance();
+                        }
+                        Some('"') => {
+                            result.push('"');
+                            self.advance();
+                        }
+                        Some(c) => return Err(DerivationError::InvalidEscape(c)),
+                    }
+                }
+                Some(c) => {
+                    result.push(c);
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    /// Parse a comma-separated list of strings inside `[...]`.
+    fn parse_string_list(&mut self) -> Result<Vec<String>, DerivationError> {
+        self.expect("[")?;
+        let mut items = Vec::new();
+        if self.peek() == Some(']') {
+            self.advance();
+            return Ok(items);
+        }
+        loop {
+            items.push(self.parse_string()?);
+            match self.peek() {
+                Some(',') => self.advance(),
+                Some(']') => {
+                    self.advance();
+                    return Ok(items);
+                }
+                _ => return Err(DerivationError::UnexpectedEof),
+            }
+        }
+    }
+
+    /// Parse the outputs list: `[("name","path","hashAlgo","hash"), ...]`
+    fn parse_outputs(&mut self) -> Result<Vec<DerivationOutput>, DerivationError> {
+        self.expect("[")?;
+        let mut outputs = Vec::new();
+        if self.peek() == Some(']') {
+            self.advance();
+            return Ok(outputs);
+        }
+        loop {
+            self.expect("(")?;
+            let name = self.parse_string()?;
+            self.expect(",")?;
+            let path = self.parse_string()?;
+            self.expect(",")?;
+            let hash_algo = self.parse_string()?;
+            self.expect(",")?;
+            let hash = self.parse_string()?;
+            self.expect(")")?;
+
+            if name.is_empty() {
+                return Err(DerivationError::EmptyOutputName(outputs.len()));
+            }
+
+            outputs.push(DerivationOutput {
+                name,
+                path,
+                hash_algo,
+                hash,
+            });
+
+            match self.peek() {
+                Some(',') => self.advance(),
+                Some(']') => {
+                    self.advance();
+                    return Ok(outputs);
+                }
+                _ => return Err(DerivationError::UnexpectedEof),
+            }
+        }
+    }
+
+    /// Parse inputDrvs: `[("drvPath",["out1","out2"]), ...]`
+    fn parse_input_drvs(&mut self) -> Result<BTreeMap<String, BTreeSet<String>>, DerivationError> {
+        self.expect("[")?;
+        let mut drvs = BTreeMap::new();
+        if self.peek() == Some(']') {
+            self.advance();
+            return Ok(drvs);
+        }
+        loop {
+            self.expect("(")?;
+            let drv_path = self.parse_string()?;
+            self.expect(",")?;
+            let output_names: BTreeSet<String> = self.parse_string_list()?.into_iter().collect();
+            self.expect(")")?;
+
+            drvs.insert(drv_path, output_names);
+
+            match self.peek() {
+                Some(',') => self.advance(),
+                Some(']') => {
+                    self.advance();
+                    return Ok(drvs);
+                }
+                _ => return Err(DerivationError::UnexpectedEof),
+            }
+        }
+    }
+
+    /// Parse environment: `[("key","value"), ...]`
+    fn parse_env(&mut self) -> Result<BTreeMap<String, String>, DerivationError> {
+        self.expect("[")?;
+        let mut env = BTreeMap::new();
+        if self.peek() == Some(']') {
+            self.advance();
+            return Ok(env);
+        }
+        loop {
+            self.expect("(")?;
+            let key = self.parse_string()?;
+            self.expect(",")?;
+            let value = self.parse_string()?;
+            self.expect(")")?;
+
+            env.insert(key, value);
+
+            match self.peek() {
+                Some(',') => self.advance(),
+                Some(']') => {
+                    self.advance();
+                    return Ok(env);
+                }
+                _ => return Err(DerivationError::UnexpectedEof),
+            }
+        }
+    }
+
+    /// Parse a full `Derive(...)` expression.
+    fn parse_derivation(&mut self) -> Result<Derivation, DerivationError> {
+        self.expect("Derive(")?;
+
+        let outputs = self.parse_outputs()?;
+        self.expect(",")?;
+
+        let input_drvs = self.parse_input_drvs()?;
+        self.expect(",")?;
+
+        let input_srcs: BTreeSet<String> = self.parse_string_list()?.into_iter().collect();
+        self.expect(",")?;
+
+        let platform = self.parse_string()?;
+        self.expect(",")?;
+
+        let builder = self.parse_string()?;
+        self.expect(",")?;
+
+        let args = self.parse_string_list()?;
+        self.expect(",")?;
+
+        let env = self.parse_env()?;
+
+        self.expect(")")?;
+
+        Ok(Derivation {
+            outputs,
+            input_drvs,
+            input_srcs,
+            platform,
+            builder,
+            args,
+            env,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_derivation() {
+        let aterm = r#"Derive([("out","/nix/store/abc-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/abc-simple-test"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        assert_eq!(drv.outputs().len(), 1);
+        assert_eq!(drv.outputs()[0].name(), "out");
+        assert_eq!(drv.outputs()[0].path(), "/nix/store/abc-simple-test");
+        assert_eq!(drv.outputs()[0].hash_algo(), "");
+        assert_eq!(drv.outputs()[0].hash(), "");
+        assert!(!drv.outputs()[0].is_fixed_output());
+        assert!(drv.input_drvs().is_empty());
+        assert!(drv.input_srcs().is_empty());
+        assert_eq!(drv.platform(), "x86_64-linux");
+        assert_eq!(drv.builder(), "/bin/sh");
+        assert_eq!(drv.args(), &["-c", "echo hello > $out"]);
+        assert_eq!(drv.env().get("name").unwrap(), "simple-test");
+        assert_eq!(drv.env().get("system").unwrap(), "x86_64-linux");
+    }
+
+    #[test]
+    fn parse_multi_output_derivation() {
+        let aterm = r#"Derive([("dev","/nix/store/abc-dev","",""),("lib","/nix/store/abc-lib","",""),("out","/nix/store/abc-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","mkdir $out $dev $lib"],[("dev","/nix/store/abc-dev"),("lib","/nix/store/abc-lib"),("name","multi"),("out","/nix/store/abc-out"),("outputs","out dev lib"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        assert_eq!(drv.outputs().len(), 3);
+        assert_eq!(drv.outputs()[0].name(), "dev");
+        assert_eq!(drv.outputs()[1].name(), "lib");
+        assert_eq!(drv.outputs()[2].name(), "out");
+        assert_eq!(drv.env().get("outputs").unwrap(), "out dev lib");
+    }
+
+    #[test]
+    fn parse_fixed_output_derivation() {
+        let aterm = r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        assert_eq!(drv.outputs().len(), 1);
+        assert_eq!(drv.outputs()[0].hash_algo(), "sha256");
+        assert_eq!(drv.outputs()[0].hash(), "abcdef0123456789");
+        assert!(drv.outputs()[0].is_fixed_output());
+    }
+
+    #[test]
+    fn parse_with_input_drvs() {
+        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        assert_eq!(drv.input_drvs().len(), 2);
+        assert!(drv.input_drvs().contains_key("/nix/store/abc-bash.drv"));
+        assert!(drv.input_drvs().contains_key("/nix/store/abc-stdenv.drv"));
+        let bash_outputs = drv.input_drvs().get("/nix/store/abc-bash.drv").unwrap();
+        assert!(bash_outputs.contains("out"));
+        assert_eq!(drv.input_srcs().len(), 1);
+        assert!(drv.input_srcs().contains("/nix/store/abc-source.sh"));
+    }
+
+    #[test]
+    fn parse_with_escaped_strings() {
+        let aterm = r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\" > $out"],[("env_val","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        assert_eq!(drv.args(), &["-c", "echo \"hello\\nworld\" > $out"]);
+        assert_eq!(
+            drv.env().get("env_val").unwrap(),
+            "line1\nline2\ttab\nquote\"end"
+        );
+    }
+
+    #[test]
+    fn parse_empty_env_value() {
+        let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("empty",""),("name","test"),("out","/nix/store/abc-test"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        assert_eq!(drv.env().get("empty").unwrap(), "");
+    }
+
+    #[test]
+    fn roundtrip_simple() {
+        let aterm = r#"Derive([("out","/nix/store/abc-simple","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple"),("out","/nix/store/abc-simple"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        let serialized = drv.to_aterm();
+        assert_eq!(serialized, aterm);
+    }
+
+    #[test]
+    fn roundtrip_with_input_drvs() {
+        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        let serialized = drv.to_aterm();
+        assert_eq!(serialized, aterm);
+    }
+
+    #[test]
+    fn roundtrip_with_escapes() {
+        let aterm = r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\""],[("env","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        let serialized = drv.to_aterm();
+        assert_eq!(serialized, aterm);
+    }
+
+    #[test]
+    fn roundtrip_fixed_output() {
+        let aterm = r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        let serialized = drv.to_aterm();
+        assert_eq!(serialized, aterm);
+    }
+
+    #[test]
+    fn to_basic_strips_input_drvs() {
+        let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/bin/bash",["-e","script.sh"],[("name","hello"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        let basic = drv.to_basic();
+
+        assert_eq!(basic.outputs().len(), 1);
+        assert_eq!(basic.outputs()[0].name(), "out");
+        assert_eq!(basic.input_srcs().len(), 1);
+        assert_eq!(basic.platform(), "x86_64-linux");
+        assert_eq!(basic.builder(), "/bin/bash");
+        assert_eq!(basic.args(), &["-e", "script.sh"]);
+        assert_eq!(basic.env().get("name").unwrap(), "hello");
+    }
+
+    #[test]
+    fn parse_rejects_invalid_prefix() {
+        assert!(Derivation::parse("NotDerive([],...)").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_truncated_input() {
+        assert!(Derivation::parse("Derive(").is_err());
+        assert!(Derivation::parse("Derive([").is_err());
+        assert!(Derivation::parse(r#"Derive([("out")"#).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_output_name() {
+        let aterm = r#"Derive([("","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
+        assert!(matches!(
+            Derivation::parse(aterm),
+            Err(DerivationError::EmptyOutputName(0))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_escape() {
+        let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("name","tes\x")])"#;
+        assert!(matches!(
+            Derivation::parse(aterm),
+            Err(DerivationError::InvalidEscape('x'))
+        ));
+    }
+
+    #[test]
+    fn parse_input_drvs_with_multiple_outputs() {
+        let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[("/nix/store/abc-multi.drv",["dev","lib","out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
+
+        let drv = Derivation::parse(aterm).unwrap();
+        let multi_outputs = drv.input_drvs().get("/nix/store/abc-multi.drv").unwrap();
+        assert_eq!(multi_outputs.len(), 3);
+        assert!(multi_outputs.contains("dev"));
+        assert!(multi_outputs.contains("lib"));
+        assert!(multi_outputs.contains("out"));
+    }
+
+    /// Parse a real `.drv` file from the local Nix store.
+    #[test]
+    fn parse_real_drv_file() {
+        // Generate a simple derivation and parse it
+        let output = std::process::Command::new("nix-instantiate")
+            .args(["--expr", r#"derivation { name = "golden-test"; builder = "/bin/sh"; args = ["-c" "echo hello > $out"]; system = builtins.currentSystem; }"#])
+            .output();
+
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                eprintln!("skipping parse_real_drv_file: nix-instantiate not available");
+                return;
+            }
+        };
+
+        let drv_path = String::from_utf8(output.stdout).unwrap();
+        let drv_path = drv_path.trim();
+
+        let drv_content = std::fs::read_to_string(drv_path).unwrap();
+        let drv = Derivation::parse(&drv_content).unwrap();
+
+        assert_eq!(drv.outputs().len(), 1);
+        assert_eq!(drv.outputs()[0].name(), "out");
+        assert_eq!(drv.platform(), "x86_64-linux");
+        assert_eq!(drv.builder(), "/bin/sh");
+        assert_eq!(drv.env().get("name").unwrap(), "golden-test");
+
+        // Verify roundtrip: parse → serialize → parse
+        let serialized = drv.to_aterm();
+        let reparsed = Derivation::parse(&serialized).unwrap();
+        assert_eq!(drv, reparsed);
+    }
+
+    /// Parse the real hello .drv (complex, many deps).
+    #[test]
+    fn parse_hello_drv() {
+        let output = std::process::Command::new("nix-instantiate")
+            .args(["<nixpkgs>", "-A", "hello"])
+            .output();
+
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                eprintln!(
+                    "skipping parse_hello_drv: nix-instantiate not available or nixpkgs not found"
+                );
+                return;
+            }
+        };
+
+        let drv_path = String::from_utf8(output.stdout).unwrap();
+        let drv_path = drv_path.trim();
+
+        let drv_content = std::fs::read_to_string(drv_path).unwrap();
+        let drv = Derivation::parse(&drv_content).unwrap();
+
+        // hello has 1 output, multiple input drvs, and a rich env
+        assert_eq!(drv.outputs().len(), 1);
+        assert_eq!(drv.outputs()[0].name(), "out");
+        assert!(!drv.input_drvs().is_empty());
+        assert_eq!(drv.env().get("pname").unwrap(), "hello");
+        assert_eq!(drv.platform(), "x86_64-linux");
+
+        // Roundtrip
+        let serialized = drv.to_aterm();
+        let reparsed = Derivation::parse(&serialized).unwrap();
+        assert_eq!(drv, reparsed);
+    }
+}
