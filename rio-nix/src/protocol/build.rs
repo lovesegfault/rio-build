@@ -29,41 +29,47 @@ impl TryFrom<u64> for BuildMode {
 }
 
 /// Build result status codes.
+///
+/// Wire values match the Nix protocol (serialized as `u8`, not `u64`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
+#[repr(u8)]
 pub enum BuildStatus {
     Built = 0,
     Substituted = 1,
     AlreadyValid = 2,
     PermanentFailure = 3,
-    TransientFailure = 4,
-    CachedFailure = 5,
-    TimedOut = 6,
-    MiscFailure = 7,
-    DependencyFailed = 8,
-    LogLimitExceeded = 9,
-    NotDeterministic = 10,
-    ResolveFailed = 11,
-    NoSubstituters = 12,
+    InputRejected = 4,
+    OutputRejected = 5,
+    TransientFailure = 6,
+    CachedFailure = 7,
+    TimedOut = 8,
+    MiscFailure = 9,
+    DependencyFailed = 10,
+    LogLimitExceeded = 11,
+    NotDeterministic = 12,
+    ResolvesToAlreadyValid = 13,
+    NoSubstituters = 14,
 }
 
-impl TryFrom<u64> for BuildStatus {
-    type Error = u64;
-    fn try_from(v: u64) -> std::result::Result<Self, u64> {
+impl TryFrom<u8> for BuildStatus {
+    type Error = u8;
+    fn try_from(v: u8) -> std::result::Result<Self, u8> {
         match v {
             0 => Ok(BuildStatus::Built),
             1 => Ok(BuildStatus::Substituted),
             2 => Ok(BuildStatus::AlreadyValid),
             3 => Ok(BuildStatus::PermanentFailure),
-            4 => Ok(BuildStatus::TransientFailure),
-            5 => Ok(BuildStatus::CachedFailure),
-            6 => Ok(BuildStatus::TimedOut),
-            7 => Ok(BuildStatus::MiscFailure),
-            8 => Ok(BuildStatus::DependencyFailed),
-            9 => Ok(BuildStatus::LogLimitExceeded),
-            10 => Ok(BuildStatus::NotDeterministic),
-            11 => Ok(BuildStatus::ResolveFailed),
-            12 => Ok(BuildStatus::NoSubstituters),
+            4 => Ok(BuildStatus::InputRejected),
+            5 => Ok(BuildStatus::OutputRejected),
+            6 => Ok(BuildStatus::TransientFailure),
+            7 => Ok(BuildStatus::CachedFailure),
+            8 => Ok(BuildStatus::TimedOut),
+            9 => Ok(BuildStatus::MiscFailure),
+            10 => Ok(BuildStatus::DependencyFailed),
+            11 => Ok(BuildStatus::LogLimitExceeded),
+            12 => Ok(BuildStatus::NotDeterministic),
+            13 => Ok(BuildStatus::ResolvesToAlreadyValid),
+            14 => Ok(BuildStatus::NoSubstituters),
             other => Err(other),
         }
     }
@@ -74,22 +80,23 @@ impl BuildStatus {
     pub fn is_success(&self) -> bool {
         matches!(
             self,
-            BuildStatus::Built | BuildStatus::Substituted | BuildStatus::AlreadyValid
+            BuildStatus::Built
+                | BuildStatus::Substituted
+                | BuildStatus::AlreadyValid
+                | BuildStatus::ResolvesToAlreadyValid
         )
     }
 }
 
 /// A built output entry in a `BuildResult`.
+///
+/// On the wire, this is a `DrvOutput` key + `Realisation` JSON value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltOutput {
-    /// Output name (e.g., "out", "dev").
-    pub name: String,
-    /// Realized output store path.
-    pub path: String,
-    /// Hash algorithm (for CA outputs, empty for input-addressed).
-    pub hash_algo: String,
-    /// Output content hash (for CA outputs, empty for input-addressed).
-    pub hash: String,
+    /// DrvOutput ID string (e.g., "sha256:abcdef...!out").
+    pub drv_output_id: String,
+    /// Realized output store path (e.g., "/nix/store/...").
+    pub out_path: String,
 }
 
 /// Result of a derivation build, returned by `wopBuildDerivation` and
@@ -108,7 +115,11 @@ pub struct BuildResult {
     start_time: u64,
     /// Build stop time (Unix epoch).
     stop_time: u64,
-    /// Built output entries.
+    /// CPU user time in microseconds (protocol >= 1.37).
+    cpu_user: Option<i64>,
+    /// CPU system time in microseconds (protocol >= 1.37).
+    cpu_system: Option<i64>,
+    /// Built output entries (DrvOutput → Realisation).
     built_outputs: Vec<BuiltOutput>,
 }
 
@@ -122,6 +133,8 @@ impl BuildResult {
         is_non_deterministic: bool,
         start_time: u64,
         stop_time: u64,
+        cpu_user: Option<i64>,
+        cpu_system: Option<i64>,
         built_outputs: Vec<BuiltOutput>,
     ) -> Self {
         BuildResult {
@@ -131,6 +144,8 @@ impl BuildResult {
             is_non_deterministic,
             start_time,
             stop_time,
+            cpu_user,
+            cpu_system,
             built_outputs,
         }
     }
@@ -144,13 +159,25 @@ impl BuildResult {
             false,
             0,
             0,
+            None,
+            None,
             Vec::new(),
         )
     }
 
     /// Create a failure result.
     pub fn failure(status: BuildStatus, error_msg: impl Into<String>) -> Self {
-        Self::new(status, error_msg.into(), 0, false, 0, 0, Vec::new())
+        Self::new(
+            status,
+            error_msg.into(),
+            0,
+            false,
+            0,
+            0,
+            None,
+            None,
+            Vec::new(),
+        )
     }
 
     pub fn status(&self) -> BuildStatus {
@@ -173,6 +200,37 @@ impl BuildResult {
     }
     pub fn built_outputs(&self) -> &[BuiltOutput] {
         &self.built_outputs
+    }
+
+    /// Populate built_outputs from derivation output definitions.
+    ///
+    /// Used when the local daemon returns a success status (e.g., AlreadyValid)
+    /// but with empty builtOutputs — the remote client needs the output paths.
+    pub fn with_outputs_from_drv(
+        mut self,
+        drv: &crate::derivation::Derivation,
+        drv_path: &crate::store_path::StorePath,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+
+        // Compute the derivation hash (SHA-256 of the .drv ATerm content)
+        let drv_aterm = drv.to_aterm();
+        let drv_hash = hex::encode(Sha256::digest(drv_aterm.as_bytes()));
+
+        self.built_outputs = drv
+            .outputs()
+            .iter()
+            .map(|output| {
+                let drv_output_id = format!("sha256:{drv_hash}!{}", output.name());
+                BuiltOutput {
+                    drv_output_id,
+                    out_path: output.path().to_string(),
+                }
+            })
+            .collect();
+
+        let _ = drv_path; // used for tracing context in future
+        self
     }
 }
 
@@ -253,9 +311,34 @@ pub async fn write_basic_derivation<W: AsyncWrite + Unpin>(
 // Wire format: reading/writing BuildResult
 // ---------------------------------------------------------------------------
 
-/// Read a `BuildResult` from the wire (server → client).
+/// Read an optional i64 (u8 tag + i64 value) from the wire.
+async fn read_optional_i64<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<i64>> {
+    let tag = wire::read_u8(r).await?;
+    match tag {
+        0 => Ok(None),
+        1 => Ok(Some(wire::read_i64(r).await?)),
+        _ => Err(wire::WireError::Io(std::io::Error::other(format!(
+            "invalid optional tag: {tag}"
+        )))),
+    }
+}
+
+/// Write an optional i64 (u8 tag + i64 value) to the wire.
+async fn write_optional_i64<W: AsyncWrite + Unpin>(w: &mut W, val: Option<i64>) -> Result<()> {
+    match val {
+        None => wire::write_u8(w, 0).await?,
+        Some(v) => {
+            wire::write_u8(w, 1).await?;
+            wire::write_i64(w, v).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a `BuildResult` from the wire (server → client, protocol >= 1.37).
 pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildResult> {
-    let status_val = wire::read_u64(r).await?;
+    // Status is u8, not u64!
+    let status_val = wire::read_u8(r).await?;
     let status = BuildStatus::try_from(status_val).unwrap_or(BuildStatus::MiscFailure);
 
     let error_msg = wire::read_string(r).await?;
@@ -266,22 +349,28 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
     let start_time = wire::read_u64(r).await?;
     let stop_time = wire::read_u64(r).await?;
 
-    // Protocol 1.28+: builtOutputs
+    // Protocol 1.37+: CPU time
+    let cpu_user = read_optional_i64(r).await?;
+    let cpu_system = read_optional_i64(r).await?;
+
+    // Protocol 1.28+: builtOutputs (DrvOutputs map)
     let output_count = wire::read_u64(r).await?;
     if output_count > wire::MAX_COLLECTION_COUNT {
         return Err(wire::WireError::CollectionTooLarge(output_count));
     }
     let mut built_outputs = Vec::with_capacity(output_count.min(64) as usize);
     for _ in 0..output_count {
-        let name = wire::read_string(r).await?;
-        let path = wire::read_string(r).await?;
-        let hash_algo = wire::read_string(r).await?;
-        let hash = wire::read_string(r).await?;
+        // Key: DrvOutput as string ("sha256:<hex>!<outputname>")
+        let drv_output_id = wire::read_string(r).await?;
+        // Value: Realisation as JSON string
+        let json_str = wire::read_string(r).await?;
+        let out_path = serde_json::from_str::<serde_json::Value>(&json_str)
+            .ok()
+            .and_then(|v| v.get("outPath")?.as_str().map(String::from))
+            .unwrap_or_default();
         built_outputs.push(BuiltOutput {
-            name,
-            path,
-            hash_algo,
-            hash,
+            drv_output_id,
+            out_path,
         });
     }
 
@@ -292,16 +381,19 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         is_non_deterministic,
         start_time,
         stop_time,
+        cpu_user,
+        cpu_system,
         built_outputs,
     ))
 }
 
-/// Write a `BuildResult` to the wire (server → client).
+/// Write a `BuildResult` to the wire (server → client, protocol >= 1.37).
 pub async fn write_build_result<W: AsyncWrite + Unpin>(
     w: &mut W,
     result: &BuildResult,
 ) -> Result<()> {
-    wire::write_u64(w, result.status as u64).await?;
+    // Status is u8, not u64!
+    wire::write_u8(w, result.status as u8).await?;
     wire::write_string(w, &result.error_msg).await?;
 
     // Protocol 1.29+
@@ -310,13 +402,23 @@ pub async fn write_build_result<W: AsyncWrite + Unpin>(
     wire::write_u64(w, result.start_time).await?;
     wire::write_u64(w, result.stop_time).await?;
 
-    // Protocol 1.28+: builtOutputs
+    // Protocol 1.37+: CPU time
+    write_optional_i64(w, result.cpu_user).await?;
+    write_optional_i64(w, result.cpu_system).await?;
+
+    // Protocol 1.28+: builtOutputs (DrvOutputs map)
     wire::write_u64(w, result.built_outputs.len() as u64).await?;
     for output in &result.built_outputs {
-        wire::write_string(w, &output.name).await?;
-        wire::write_string(w, &output.path).await?;
-        wire::write_string(w, &output.hash_algo).await?;
-        wire::write_string(w, &output.hash).await?;
+        // Key: DrvOutput string
+        wire::write_string(w, &output.drv_output_id).await?;
+        // Value: Realisation as JSON
+        let json = serde_json::json!({
+            "id": output.drv_output_id,
+            "outPath": output.out_path,
+            "signatures": [],
+            "dependentRealisations": {}
+        });
+        wire::write_string(w, &json.to_string()).await?;
     }
 
     Ok(())
@@ -337,10 +439,10 @@ mod tests {
 
     #[test]
     fn build_status_roundtrip() {
-        for val in 0..=12u64 {
+        for val in 0..=14u8 {
             assert!(BuildStatus::try_from(val).is_ok());
         }
-        assert_eq!(BuildStatus::try_from(99), Err(99));
+        assert_eq!(BuildStatus::try_from(99u8), Err(99));
     }
 
     #[test]
@@ -348,6 +450,7 @@ mod tests {
         assert!(BuildStatus::Built.is_success());
         assert!(BuildStatus::Substituted.is_success());
         assert!(BuildStatus::AlreadyValid.is_success());
+        assert!(BuildStatus::ResolvesToAlreadyValid.is_success());
         assert!(!BuildStatus::PermanentFailure.is_success());
         assert!(!BuildStatus::TimedOut.is_success());
     }
@@ -361,11 +464,11 @@ mod tests {
             false,
             1700000000,
             1700000060,
+            Some(12345),
+            Some(6789),
             vec![BuiltOutput {
-                name: "out".to_string(),
-                path: "/nix/store/abc-hello".to_string(),
-                hash_algo: String::new(),
-                hash: String::new(),
+                drv_output_id: "sha256:abcdef0123456789!out".to_string(),
+                out_path: "/nix/store/abc-hello".to_string(),
             }],
         );
 
@@ -437,21 +540,18 @@ mod tests {
         use std::io::Cursor;
 
         fn arb_build_status() -> impl Strategy<Value = BuildStatus> {
-            (0u64..=12).prop_map(|v| BuildStatus::try_from(v).unwrap())
+            (0u8..=14).prop_map(|v| BuildStatus::try_from(v).unwrap())
         }
 
         fn arb_built_output() -> impl Strategy<Value = BuiltOutput> {
             (
+                "[0-9a-f]{64}",
                 "[a-z]{1,8}",
                 "/nix/store/[a-z0-9]{32}-[a-z]{1,10}",
-                prop_oneof![Just(String::new()), Just("sha256".to_string())],
-                prop_oneof![Just(String::new()), "[0-9a-f]{64}"],
             )
-                .prop_map(|(name, path, hash_algo, hash)| BuiltOutput {
-                    name,
-                    path,
-                    hash_algo,
-                    hash,
+                .prop_map(|(hash, name, path)| BuiltOutput {
+                    drv_output_id: format!("sha256:{hash}!{name}"),
+                    out_path: path,
                 })
         }
 
@@ -463,6 +563,8 @@ mod tests {
                 any::<bool>(),
                 any::<u64>(),
                 any::<u64>(),
+                proptest::option::of(any::<i64>()),
+                proptest::option::of(any::<i64>()),
                 proptest::collection::vec(arb_built_output(), 0..4),
             )
                 .prop_map(
@@ -473,6 +575,8 @@ mod tests {
                         is_non_deterministic,
                         start,
                         stop,
+                        cpu_user,
+                        cpu_system,
                         outputs,
                     )| {
                         BuildResult::new(
@@ -482,6 +586,8 @@ mod tests {
                             is_non_deterministic,
                             start,
                             stop,
+                            cpu_user,
+                            cpu_system,
                             outputs,
                         )
                     },
