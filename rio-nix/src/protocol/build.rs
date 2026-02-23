@@ -311,25 +311,27 @@ pub async fn write_basic_derivation<W: AsyncWrite + Unpin>(
 // Wire format: reading/writing BuildResult
 // ---------------------------------------------------------------------------
 
-/// Read an optional i64 (u8 tag + i64 value) from the wire.
+/// Read an optional i64 from the wire (u64 tag + u64 value).
+///
+/// All Nix wire integers are u64, even for u8/i64 logical types.
 async fn read_optional_i64<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<i64>> {
-    let tag = wire::read_u8(r).await?;
+    let tag = wire::read_u64(r).await?;
     match tag {
         0 => Ok(None),
-        1 => Ok(Some(wire::read_i64(r).await?)),
+        1 => Ok(Some(wire::read_u64(r).await? as i64)),
         _ => Err(wire::WireError::Io(std::io::Error::other(format!(
             "invalid optional tag: {tag}"
         )))),
     }
 }
 
-/// Write an optional i64 (u8 tag + i64 value) to the wire.
+/// Write an optional i64 to the wire (u64 tag + u64 value).
 async fn write_optional_i64<W: AsyncWrite + Unpin>(w: &mut W, val: Option<i64>) -> Result<()> {
     match val {
-        None => wire::write_u8(w, 0).await?,
+        None => wire::write_u64(w, 0).await?,
         Some(v) => {
-            wire::write_u8(w, 1).await?;
-            wire::write_i64(w, v).await?;
+            wire::write_u64(w, 1).await?;
+            wire::write_u64(w, v as u64).await?;
         }
     }
     Ok(())
@@ -337,8 +339,8 @@ async fn write_optional_i64<W: AsyncWrite + Unpin>(w: &mut W, val: Option<i64>) 
 
 /// Read a `BuildResult` from the wire (server → client, protocol >= 1.37).
 pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildResult> {
-    // Status is u8, not u64!
-    let status_val = wire::read_u8(r).await?;
+    // Status is logically u8 but serialized as u64 (all Nix wire ints are u64)
+    let status_val = wire::read_u64(r).await? as u8;
     let status = BuildStatus::try_from(status_val).unwrap_or(BuildStatus::MiscFailure);
 
     let error_msg = wire::read_string(r).await?;
@@ -392,8 +394,8 @@ pub async fn write_build_result<W: AsyncWrite + Unpin>(
     w: &mut W,
     result: &BuildResult,
 ) -> Result<()> {
-    // Status is u8, not u64!
-    wire::write_u8(w, result.status as u8).await?;
+    // Status is logically u8 but serialized as u64 (all Nix wire ints are u64)
+    wire::write_u64(w, result.status as u64).await?;
     wire::write_string(w, &result.error_msg).await?;
 
     // Protocol 1.29+
