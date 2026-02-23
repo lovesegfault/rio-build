@@ -657,17 +657,37 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Some(ca_str)
     };
 
-    let info = PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
+    let info = match PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
         .deriver(deriver)
         .references(ref_paths)
         .registration_time(registration_time)
         .ultimate(ultimate)
         .sigs(sigs)
         .ca(ca)
-        .build()?;
+        .build()
+    {
+        Ok(info) => info,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to build PathInfo for '{path_str}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("PathInfo build failed: {e}"));
+        }
+    };
 
     // Store the path
-    store.add_path(info, nar_data.clone()).await?;
+    if let Err(e) = store.add_path(info, nar_data.clone()).await {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("failed to store path '{path_str}': {e}"),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("store error: {e}"));
+    }
 
     // If this is a .drv file, parse and cache it
     try_cache_drv(&path, &nar_data, drv_cache);
@@ -817,7 +837,15 @@ async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpi
     let total_len = stream_data.len() as u64;
 
     while cursor.position() < total_len {
-        parse_add_multiple_entry(&mut cursor, store, drv_cache).await?;
+        if let Err(e) = parse_add_multiple_entry(&mut cursor, store, drv_cache).await {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("wopAddMultipleToStore entry failed: {e}"),
+                ))
+                .await?;
+            return Err(e);
+        }
     }
 
     // Send success
@@ -859,17 +887,9 @@ async fn handle_query_derivation_output_map<R: AsyncRead + Unpin, W: AsyncWrite 
         cached.clone()
     } else {
         // Try to fetch from store and parse
-        match store.nar_from_path(&drv_path).await? {
-            Some(nar_data) => {
-                let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
-                    .map_err(|e| anyhow::anyhow!("failed to extract .drv from NAR: {e}"))?;
-                let drv_text = String::from_utf8_lossy(&drv_bytes);
-                let drv = Derivation::parse(&drv_text)
-                    .map_err(|e| anyhow::anyhow!("failed to parse .drv: {e}"))?;
-                drv_cache.insert(drv_path.clone(), drv.clone());
-                drv
-            }
-            None => {
+        let nar_result = match store.nar_from_path(&drv_path).await {
+            Ok(Some(nar_data)) => Ok(nar_data),
+            Ok(None) => {
                 stderr
                     .error(&StderrError::simple(
                         PROGRAM_NAME,
@@ -878,7 +898,44 @@ async fn handle_query_derivation_output_map<R: AsyncRead + Unpin, W: AsyncWrite 
                     .await?;
                 return Err(anyhow::anyhow!("derivation not found: {drv_path_str}"));
             }
-        }
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("store error looking up '{drv_path_str}': {e}"),
+                    ))
+                    .await?;
+                Err(anyhow::anyhow!("store error: {e}"))
+            }
+        }?;
+
+        let drv_bytes = match rio_nix::nar::extract_single_file(&nar_result) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("failed to extract .drv from NAR for '{drv_path_str}': {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("failed to extract .drv from NAR: {e}"));
+            }
+        };
+        let drv_text = String::from_utf8_lossy(&drv_bytes);
+        let drv = match Derivation::parse(&drv_text) {
+            Ok(drv) => drv,
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("failed to parse .drv for '{drv_path_str}': {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("failed to parse .drv: {e}"));
+            }
+        };
+        drv_cache.insert(drv_path.clone(), drv.clone());
+        drv
     };
 
     // Build output map from derivation
@@ -974,6 +1031,12 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // Send wopSetOptions to local daemon
     if let Err(e) = client::client_set_options(&mut daemon_stdout, &mut daemon_stdin).await {
         error!(error = %e, "failed to set options on local nix-daemon");
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("failed to set options on local nix-daemon: {e}"),
+            ))
+            .await?;
         let _ = daemon.kill().await;
         return Err(anyhow::anyhow!("daemon set_options failed: {e}"));
     }
@@ -1035,8 +1098,13 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let dp = match DerivedPath::parse(raw) {
             Ok(dp) => dp,
             Err(e) => {
-                warn!(path = %raw, error = %e, "invalid DerivedPath in wopBuildPaths");
-                continue;
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("invalid DerivedPath '{raw}': {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("invalid DerivedPath: {e}"));
             }
         };
 
@@ -1059,17 +1127,9 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     Some(d) => d.clone(),
                     None => {
                         // Try store
-                        match store.nar_from_path(drv).await? {
-                            Some(nar) => {
-                                let bytes = rio_nix::nar::extract_single_file(&nar)
-                                    .map_err(|e| anyhow::anyhow!("NAR extract: {e}"))?;
-                                let text = String::from_utf8_lossy(&bytes);
-                                let parsed = Derivation::parse(&text)
-                                    .map_err(|e| anyhow::anyhow!("ATerm parse: {e}"))?;
-                                drv_cache.insert(drv.clone(), parsed.clone());
-                                parsed
-                            }
-                            None => {
+                        let nar = match store.nar_from_path(drv).await {
+                            Ok(Some(nar)) => nar,
+                            Ok(None) => {
                                 stderr
                                     .error(&StderrError::simple(
                                         PROGRAM_NAME,
@@ -1078,7 +1138,43 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     .await?;
                                 return Err(anyhow::anyhow!("derivation not found: {}", drv));
                             }
-                        }
+                            Err(e) => {
+                                stderr
+                                    .error(&StderrError::simple(
+                                        PROGRAM_NAME,
+                                        format!("store error looking up '{}': {}", drv, e),
+                                    ))
+                                    .await?;
+                                return Err(anyhow::anyhow!("store error: {e}"));
+                            }
+                        };
+                        let bytes = match rio_nix::nar::extract_single_file(&nar) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                stderr
+                                    .error(&StderrError::simple(
+                                        PROGRAM_NAME,
+                                        format!("failed to extract .drv '{}' from NAR: {}", drv, e),
+                                    ))
+                                    .await?;
+                                return Err(anyhow::anyhow!("NAR extract: {e}"));
+                            }
+                        };
+                        let text = String::from_utf8_lossy(&bytes);
+                        let parsed = match Derivation::parse(&text) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                stderr
+                                    .error(&StderrError::simple(
+                                        PROGRAM_NAME,
+                                        format!("failed to parse .drv '{}': {}", drv, e),
+                                    ))
+                                    .await?;
+                                return Err(anyhow::anyhow!("ATerm parse: {e}"));
+                            }
+                        };
+                        drv_cache.insert(drv.clone(), parsed.clone());
+                        parsed
                     }
                 };
 
@@ -1168,24 +1264,49 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
             DerivedPath::Built { drv, .. } => {
                 let drv_obj = match drv_cache.get(drv) {
                     Some(d) => d.clone(),
-                    None => match store.nar_from_path(drv).await? {
-                        Some(nar) => {
-                            let bytes = rio_nix::nar::extract_single_file(&nar)
-                                .map_err(|e| anyhow::anyhow!("NAR extract: {e}"))?;
-                            let text = String::from_utf8_lossy(&bytes);
-                            let parsed = Derivation::parse(&text)
-                                .map_err(|e| anyhow::anyhow!("ATerm parse: {e}"))?;
-                            drv_cache.insert(drv.clone(), parsed.clone());
-                            parsed
+                    None => {
+                        let nar = match store.nar_from_path(drv).await {
+                            Ok(Some(nar)) => nar,
+                            Ok(None) => {
+                                results.push(BuildResult::failure(
+                                    BuildStatus::MiscFailure,
+                                    format!("derivation '{}' not found", drv),
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                results.push(BuildResult::failure(
+                                    BuildStatus::MiscFailure,
+                                    format!("store error looking up '{}': {}", drv, e),
+                                ));
+                                continue;
+                            }
+                        };
+                        let bytes = match rio_nix::nar::extract_single_file(&nar) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                results.push(BuildResult::failure(
+                                    BuildStatus::MiscFailure,
+                                    format!("failed to extract .drv '{}': {}", drv, e),
+                                ));
+                                continue;
+                            }
+                        };
+                        let text = String::from_utf8_lossy(&bytes);
+                        match Derivation::parse(&text) {
+                            Ok(parsed) => {
+                                drv_cache.insert(drv.clone(), parsed.clone());
+                                parsed
+                            }
+                            Err(e) => {
+                                results.push(BuildResult::failure(
+                                    BuildStatus::MiscFailure,
+                                    format!("failed to parse .drv '{}': {}", drv, e),
+                                ));
+                                continue;
+                            }
                         }
-                        None => {
-                            results.push(BuildResult::failure(
-                                BuildStatus::MiscFailure,
-                                format!("derivation '{}' not found", drv),
-                            ));
-                            continue;
-                        }
-                    },
+                    }
                 };
 
                 let result =
