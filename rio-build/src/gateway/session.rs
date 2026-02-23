@@ -1,7 +1,8 @@
 //! Per-SSH-channel protocol session state machine.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use rio_nix::derivation::Derivation;
 use rio_nix::protocol::handshake;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
@@ -25,6 +26,7 @@ where
 {
     let mut options: Option<ClientOptions> = None;
     let mut temp_roots: HashSet<StorePath> = HashSet::new();
+    let mut drv_cache: HashMap<StorePath, Derivation> = HashMap::new();
 
     // Step 1: Handshake — needs both reader and writer interleaved
     let version_string = format!("rio-build {}", env!("CARGO_PKG_VERSION"));
@@ -83,8 +85,16 @@ where
 
         debug!(opcode = opcode, "received opcode");
 
-        handler::handle_opcode(opcode, reader, writer, store, &mut options, &mut temp_roots)
-            .await?;
+        handler::handle_opcode(
+            opcode,
+            reader,
+            writer,
+            store,
+            &mut options,
+            &mut temp_roots,
+            &mut drv_cache,
+        )
+        .await?;
 
         writer.flush().await?;
     }
