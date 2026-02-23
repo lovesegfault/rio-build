@@ -170,6 +170,12 @@ pub async fn write_strings<W: AsyncWrite + Unpin>(w: &mut W, items: &[String]) -
     Ok(())
 }
 
+/// Maximum total size for framed stream reassembly (1 GiB).
+const MAX_FRAMED_TOTAL: u64 = 1024 * 1024 * 1024;
+
+/// Maximum single frame size (64 MiB).
+const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
+
 /// Write a collection of key-value string pairs.
 pub async fn write_string_pairs<W: AsyncWrite + Unpin>(
     w: &mut W,
@@ -184,6 +190,57 @@ pub async fn write_string_pairs<W: AsyncWrite + Unpin>(
         write_string(w, key).await?;
         write_string(w, value).await?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Framed byte streams (used by wopAddMultipleToStore)
+// ---------------------------------------------------------------------------
+
+/// Read a framed byte stream: sequence of `u64(chunk_len) + chunk_data`
+/// terminated by `u64(0)`.
+///
+/// **Important:** Unlike string encoding, chunk data is NOT padded to 8 bytes.
+///
+/// Enforces a maximum total size to prevent OOM on malicious input.
+pub async fn read_framed_stream<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+
+    loop {
+        let frame_len = read_u64(r).await?;
+        if frame_len == 0 {
+            return Ok(result);
+        }
+        if frame_len > MAX_FRAME_SIZE {
+            return Err(WireError::StringTooLong(frame_len));
+        }
+        let total = result.len() as u64 + frame_len;
+        if total > MAX_FRAMED_TOTAL {
+            return Err(WireError::StringTooLong(total));
+        }
+
+        let frame_len = frame_len as usize;
+        let start = result.len();
+        result.resize(start + frame_len, 0);
+        r.read_exact(&mut result[start..]).await?;
+    }
+}
+
+/// Write data as a framed byte stream with a given chunk size.
+///
+/// Each frame: `u64(chunk_len) + chunk_data` (no padding).
+/// Terminated by `u64(0)`.
+pub async fn write_framed_stream<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    data: &[u8],
+    chunk_size: usize,
+) -> Result<()> {
+    for chunk in data.chunks(chunk_size) {
+        write_u64(w, chunk.len() as u64).await?;
+        w.write_all(chunk).await?;
+    }
+    // Sentinel
+    write_u64(w, 0).await?;
     Ok(())
 }
 
@@ -402,6 +459,72 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Framed stream tests
+
+    #[tokio::test]
+    async fn test_framed_stream_empty() {
+        let mut buf = Vec::new();
+        write_framed_stream(&mut buf, b"", 64).await.unwrap();
+
+        // Should just be u64(0) sentinel
+        assert_eq!(buf.len(), 8);
+
+        let mut reader = Cursor::new(buf);
+        let result = read_framed_stream(&mut reader).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_framed_stream_single_chunk() {
+        let data = b"hello framed world";
+        let mut buf = Vec::new();
+        write_framed_stream(&mut buf, data, 1024).await.unwrap();
+
+        let mut reader = Cursor::new(buf);
+        let result = read_framed_stream(&mut reader).await.unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn test_framed_stream_multiple_chunks() {
+        let data = b"abcdefghijklmnopqrstuvwxyz";
+        let mut buf = Vec::new();
+        write_framed_stream(&mut buf, data, 10).await.unwrap();
+
+        // Should have 3 frames: 10 + 10 + 6 + sentinel
+        let mut reader = Cursor::new(buf);
+        let result = read_framed_stream(&mut reader).await.unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn test_framed_stream_no_padding() {
+        // Verify that framed stream data is NOT padded (unlike string encoding)
+        let data = b"abc"; // 3 bytes, would need 5 bytes padding in string format
+        let mut buf = Vec::new();
+        write_framed_stream(&mut buf, data, 1024).await.unwrap();
+
+        // Expected: u64(3) + "abc" + u64(0) = 8 + 3 + 8 = 19 bytes
+        // If it were padded like strings, it would be 8 + 3 + 5 + 8 = 24 bytes
+        assert_eq!(buf.len(), 19, "framed stream should not pad chunk data");
+
+        let mut reader = Cursor::new(buf);
+        let result = read_framed_stream(&mut reader).await.unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn test_framed_stream_chunk_size_1() {
+        let data = b"test";
+        let mut buf = Vec::new();
+        write_framed_stream(&mut buf, data, 1).await.unwrap();
+
+        // 4 frames of 1 byte each + sentinel
+        let mut reader = Cursor::new(buf);
+        let result = read_framed_stream(&mut reader).await.unwrap();
+        assert_eq!(result, data);
+    }
+
     // Property-based tests
     mod proptests {
         use super::*;
@@ -505,6 +628,22 @@ mod tests {
                     let mut reader = Cursor::new(buf);
                     let result = read_string_pairs(&mut reader).await.unwrap();
                     prop_assert_eq!(result, pairs);
+                    Ok(())
+                })?;
+            }
+
+            #[test]
+            fn roundtrip_framed_stream(
+                data in proptest::collection::vec(any::<u8>(), 0..500),
+                chunk_size in 1usize..64,
+            ) {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let mut buf = Vec::new();
+                    write_framed_stream(&mut buf, &data, chunk_size).await.unwrap();
+                    let mut reader = Cursor::new(buf);
+                    let result = read_framed_stream(&mut reader).await.unwrap();
+                    prop_assert_eq!(result, data);
                     Ok(())
                 })?;
             }
