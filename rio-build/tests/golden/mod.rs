@@ -810,3 +810,58 @@ pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> Vec<u8> {
     wire::write_strings(&mut buf, &owned).await.unwrap();
     buf
 }
+
+/// Build wopQueryDerivationOutputMap (41) client bytes.
+pub async fn build_query_derivation_output_map_bytes(drv_path: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    wire::write_u64(&mut buf, 41).await.unwrap();
+    wire::write_string(&mut buf, drv_path).await.unwrap();
+    buf
+}
+
+/// Parse wopQueryDerivationOutputMap response fields.
+///
+/// Response: STDERR_LAST + u64(count) + (string name, string path) * count
+pub async fn parse_query_derivation_output_map_fields(data: &[u8]) -> Vec<ResponseField> {
+    let mut fields = Vec::new();
+    let mut cursor = Cursor::new(data.to_vec());
+
+    fields.push(ResponseField {
+        name: "stderr_last",
+        bytes: read_u64_field(&mut cursor).await,
+    });
+
+    // Output count
+    let count_bytes = read_u64_field(&mut cursor).await;
+    let count = u64::from_le_bytes(count_bytes.clone().try_into().unwrap()) as usize;
+    fields.push(ResponseField {
+        name: "output_count",
+        bytes: count_bytes,
+    });
+
+    // Per-output (name, path) pairs
+    for i in 0..count {
+        let name_label: &'static str = match i {
+            0 => "output_0_name",
+            1 => "output_1_name",
+            2 => "output_2_name",
+            _ => "output_n_name",
+        };
+        let path_label: &'static str = match i {
+            0 => "output_0_path",
+            1 => "output_1_path",
+            2 => "output_2_path",
+            _ => "output_n_path",
+        };
+        fields.push(ResponseField {
+            name: name_label,
+            bytes: read_string_field(&mut cursor).await,
+        });
+        fields.push(ResponseField {
+            name: path_label,
+            bytes: read_string_field(&mut cursor).await,
+        });
+    }
+
+    fields
+}
