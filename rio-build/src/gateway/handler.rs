@@ -7,6 +7,10 @@ use std::collections::{HashMap, HashSet};
 
 use rio_nix::derivation::Derivation;
 use rio_nix::hash::NixHash;
+use rio_nix::protocol::build::{
+    BuildMode, BuildResult, BuildStatus, read_basic_derivation, write_build_result,
+};
+use rio_nix::protocol::client;
 use rio_nix::protocol::derived_path::DerivedPath;
 use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
@@ -14,7 +18,7 @@ use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::store::Store;
 
@@ -89,6 +93,13 @@ where
         }
         Some(WorkerOp::QueryDerivationOutputMap) => {
             handle_query_derivation_output_map(reader, &mut stderr, store, drv_cache).await
+        }
+        Some(WorkerOp::BuildDerivation) => handle_build_derivation(reader, &mut stderr).await,
+        Some(WorkerOp::BuildPaths) => {
+            handle_build_paths(reader, &mut stderr, store, drv_cache).await
+        }
+        Some(WorkerOp::BuildPathsWithResults) => {
+            handle_build_paths_with_results(reader, &mut stderr, store, drv_cache).await
         }
         Some(op) => {
             warn!(
@@ -865,4 +876,356 @@ async fn handle_query_derivation_output_map<R: AsyncRead + Unpin, W: AsyncWrite 
     }
 
     Ok(())
+}
+
+/// wopBuildDerivation (36): Build a derivation via local nix-daemon --stdio.
+///
+/// 1. Read drvPath + BasicDerivation + buildMode from client
+/// 2. Spawn `nix-daemon --stdio` subprocess
+/// 3. Perform client handshake with local daemon
+/// 4. Forward wopBuildDerivation to local daemon
+/// 5. Relay STDERR messages from daemon to remote client
+/// 6. Return BuildResult to remote client
+#[instrument(skip_all)]
+async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+) -> anyhow::Result<()> {
+    // Read client's request
+    let drv_path_str = wire::read_string(reader).await?;
+    let (outputs, input_srcs, platform, builder, args, env) = read_basic_derivation(reader).await?;
+    let build_mode_val = wire::read_u64(reader).await?;
+    let build_mode = BuildMode::try_from(build_mode_val).unwrap_or(BuildMode::Normal);
+
+    debug!(
+        path = %drv_path_str,
+        platform = %platform,
+        builder = %builder,
+        build_mode = ?build_mode,
+        "wopBuildDerivation"
+    );
+
+    // Reconstruct BasicDerivation for forwarding
+    let basic_drv = rio_nix::derivation::BasicDerivation::new(
+        outputs,
+        input_srcs.iter().cloned().collect(),
+        platform,
+        builder,
+        args,
+        env.into_iter().collect(),
+    );
+
+    // Spawn local nix-daemon --stdio
+    let mut daemon = match tokio::process::Command::new("nix-daemon")
+        .arg("--stdio")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            error!(error = %e, "failed to spawn nix-daemon --stdio");
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to spawn local nix-daemon: {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("failed to spawn nix-daemon: {e}"));
+        }
+    };
+
+    let mut daemon_stdin = daemon.stdin.take().unwrap();
+    let mut daemon_stdout = daemon.stdout.take().unwrap();
+
+    // Client handshake with local daemon
+    if let Err(e) = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin).await {
+        error!(error = %e, "failed to handshake with local nix-daemon");
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("failed to handshake with local nix-daemon: {e}"),
+            ))
+            .await?;
+        let _ = daemon.kill().await;
+        return Err(anyhow::anyhow!("daemon handshake failed: {e}"));
+    }
+
+    // Send wopSetOptions to local daemon
+    if let Err(e) = client::client_set_options(&mut daemon_stdout, &mut daemon_stdin).await {
+        error!(error = %e, "failed to set options on local nix-daemon");
+        let _ = daemon.kill().await;
+        return Err(anyhow::anyhow!("daemon set_options failed: {e}"));
+    }
+
+    // Forward wopBuildDerivation to local daemon
+    let result = client::client_build_derivation(
+        &mut daemon_stdout,
+        &mut daemon_stdin,
+        &drv_path_str,
+        &basic_drv,
+        build_mode,
+    )
+    .await;
+
+    // Clean up daemon process
+    let _ = daemon.kill().await;
+
+    let build_result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "local daemon build failed");
+            BuildResult::failure(BuildStatus::MiscFailure, format!("local daemon error: {e}"))
+        }
+    };
+
+    debug!(
+        status = ?build_result.status(),
+        error_msg = %build_result.error_msg(),
+        "wopBuildDerivation result"
+    );
+
+    // Send result to remote client
+    stderr.finish().await?;
+    write_build_result(stderr.inner_mut(), &build_result).await?;
+    Ok(())
+}
+
+/// wopBuildPaths (9): Build a set of derivations.
+///
+/// For Phase 1b, delegates each derivation to the local nix-daemon sequentially.
+#[instrument(skip_all)]
+async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    let raw_paths = wire::read_strings(reader).await?;
+    let build_mode_val = wire::read_u64(reader).await?;
+    let build_mode = BuildMode::try_from(build_mode_val).unwrap_or(BuildMode::Normal);
+
+    debug!(
+        count = raw_paths.len(),
+        build_mode = ?build_mode,
+        "wopBuildPaths"
+    );
+
+    for raw in &raw_paths {
+        let dp = match DerivedPath::parse(raw) {
+            Ok(dp) => dp,
+            Err(e) => {
+                warn!(path = %raw, error = %e, "invalid DerivedPath in wopBuildPaths");
+                continue;
+            }
+        };
+
+        match &dp {
+            DerivedPath::Opaque(path) => {
+                // Check if the path exists — opaque paths can't be built
+                if !store.is_valid_path(path).await? {
+                    stderr
+                        .error(&StderrError::simple(
+                            PROGRAM_NAME,
+                            format!("path '{}' is not valid and cannot be built", path),
+                        ))
+                        .await?;
+                    return Err(anyhow::anyhow!("invalid opaque path: {}", path));
+                }
+            }
+            DerivedPath::Built { drv, .. } => {
+                // Look up the derivation and build it
+                let drv_obj = match drv_cache.get(drv) {
+                    Some(d) => d.clone(),
+                    None => {
+                        // Try store
+                        match store.nar_from_path(drv).await? {
+                            Some(nar) => {
+                                let bytes = rio_nix::nar::extract_single_file(&nar)
+                                    .map_err(|e| anyhow::anyhow!("NAR extract: {e}"))?;
+                                let text = String::from_utf8_lossy(&bytes);
+                                let parsed = Derivation::parse(&text)
+                                    .map_err(|e| anyhow::anyhow!("ATerm parse: {e}"))?;
+                                drv_cache.insert(drv.clone(), parsed.clone());
+                                parsed
+                            }
+                            None => {
+                                stderr
+                                    .error(&StderrError::simple(
+                                        PROGRAM_NAME,
+                                        format!("derivation '{}' not found", drv),
+                                    ))
+                                    .await?;
+                                return Err(anyhow::anyhow!("derivation not found: {}", drv));
+                            }
+                        }
+                    }
+                };
+
+                // Build via local daemon
+                let result =
+                    build_via_local_daemon(&drv.to_string(), &drv_obj.to_basic(), build_mode).await;
+                if let Ok(ref r) = result
+                    && !r.status().is_success()
+                {
+                    stderr
+                        .error(&StderrError::simple(
+                            PROGRAM_NAME,
+                            format!("build of '{}' failed: {}", drv, r.error_msg()),
+                        ))
+                        .await?;
+                    return Err(anyhow::anyhow!("build failed: {}", drv));
+                }
+                if let Err(e) = result {
+                    stderr
+                        .error(&StderrError::simple(
+                            PROGRAM_NAME,
+                            format!("build of '{}' failed: {}", drv, e),
+                        ))
+                        .await?;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    stderr.finish().await?;
+    wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
+#[instrument(skip_all)]
+async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    let raw_paths = wire::read_strings(reader).await?;
+    let build_mode_val = wire::read_u64(reader).await?;
+    let build_mode = BuildMode::try_from(build_mode_val).unwrap_or(BuildMode::Normal);
+
+    debug!(
+        count = raw_paths.len(),
+        build_mode = ?build_mode,
+        "wopBuildPathsWithResults"
+    );
+
+    let mut results = Vec::new();
+
+    for raw in &raw_paths {
+        let dp = match DerivedPath::parse(raw) {
+            Ok(dp) => dp,
+            Err(e) => {
+                results.push(BuildResult::failure(
+                    BuildStatus::MiscFailure,
+                    format!("invalid path '{raw}': {e}"),
+                ));
+                continue;
+            }
+        };
+
+        match &dp {
+            DerivedPath::Opaque(path) => {
+                if store.is_valid_path(path).await? {
+                    results.push(BuildResult::new(
+                        BuildStatus::AlreadyValid,
+                        String::new(),
+                        0,
+                        false,
+                        0,
+                        0,
+                        Vec::new(),
+                    ));
+                } else {
+                    results.push(BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!("path '{}' not valid", path),
+                    ));
+                }
+            }
+            DerivedPath::Built { drv, .. } => {
+                let drv_obj = match drv_cache.get(drv) {
+                    Some(d) => d.clone(),
+                    None => match store.nar_from_path(drv).await? {
+                        Some(nar) => {
+                            let bytes = rio_nix::nar::extract_single_file(&nar)
+                                .map_err(|e| anyhow::anyhow!("NAR extract: {e}"))?;
+                            let text = String::from_utf8_lossy(&bytes);
+                            let parsed = Derivation::parse(&text)
+                                .map_err(|e| anyhow::anyhow!("ATerm parse: {e}"))?;
+                            drv_cache.insert(drv.clone(), parsed.clone());
+                            parsed
+                        }
+                        None => {
+                            results.push(BuildResult::failure(
+                                BuildStatus::MiscFailure,
+                                format!("derivation '{}' not found", drv),
+                            ));
+                            continue;
+                        }
+                    },
+                };
+
+                let result =
+                    build_via_local_daemon(&drv.to_string(), &drv_obj.to_basic(), build_mode).await;
+                results.push(result.unwrap_or_else(|e| {
+                    BuildResult::failure(BuildStatus::MiscFailure, format!("daemon error: {e}"))
+                }));
+            }
+        }
+    }
+
+    stderr.finish().await?;
+    let w = stderr.inner_mut();
+
+    // Write count + per-path BuildResult
+    wire::write_u64(w, results.len() as u64).await?;
+    for result in &results {
+        write_build_result(w, result).await?;
+    }
+
+    Ok(())
+}
+
+/// Build a derivation by spawning a local `nix-daemon --stdio` and
+/// forwarding `wopBuildDerivation`.
+async fn build_via_local_daemon(
+    drv_path: &str,
+    basic_drv: &rio_nix::derivation::BasicDerivation,
+    build_mode: BuildMode,
+) -> anyhow::Result<BuildResult> {
+    let mut daemon = tokio::process::Command::new("nix-daemon")
+        .arg("--stdio")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let mut daemon_stdin = daemon.stdin.take().unwrap();
+    let mut daemon_stdout = daemon.stdout.take().unwrap();
+
+    let _handshake = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon handshake failed: {e}"))?;
+
+    client::client_set_options(&mut daemon_stdout, &mut daemon_stdin)
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon set_options failed: {e}"))?;
+
+    let result = client::client_build_derivation(
+        &mut daemon_stdout,
+        &mut daemon_stdin,
+        drv_path,
+        basic_drv,
+        build_mode,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("daemon build failed: {e}"))?;
+
+    let _ = daemon.kill().await;
+
+    Ok(result)
 }
