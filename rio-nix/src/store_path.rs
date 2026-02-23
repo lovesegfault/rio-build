@@ -127,6 +127,80 @@ impl StorePath {
     pub fn is_derivation(&self) -> bool {
         self.name.ends_with(".drv")
     }
+
+    /// Compute a store path from a content fingerprint.
+    ///
+    /// This is the core Nix store path computation: hash the fingerprint
+    /// with SHA-256, XOR-fold to 20 bytes, and nixbase32-encode.
+    fn from_fingerprint(name: &str, fingerprint: &str) -> Result<Self, StorePathError> {
+        validate_name(name)?;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(fingerprint.as_bytes());
+        let mut compressed = [0u8; HASH_BYTES];
+        for (i, &byte) in digest.iter().enumerate() {
+            compressed[i % HASH_BYTES] ^= byte;
+        }
+        Ok(StorePath {
+            hash: StorePathHash(compressed),
+            name: name.to_string(),
+        })
+    }
+
+    /// Compute the store path for a fixed-output (content-addressed) store object.
+    ///
+    /// `hash` is the content hash, `is_recursive` indicates NAR vs flat hashing.
+    /// For self-referencing paths, `references` should be empty.
+    pub fn make_fixed_output(
+        name: &str,
+        hash: &crate::hash::NixHash,
+        is_recursive: bool,
+    ) -> Result<Self, StorePathError> {
+        // For fixed output, the fingerprint is:
+        //   "output:out:sha256:{inner_digest}:/nix/store:{name}"
+        // where inner_digest is the hash of "fixed:out:{r:}{algo}:{nix32hash}"
+        let r_prefix = if is_recursive { "r:" } else { "" };
+        let inner = format!(
+            "fixed:out:{r_prefix}{}:{}:",
+            hash.algo(),
+            nixbase32::encode(hash.digest()),
+        );
+        use sha2::{Digest, Sha256};
+        let inner_digest = Sha256::digest(inner.as_bytes());
+
+        let fingerprint = format!(
+            "output:out:sha256:{}:{STORE_DIR}:{name}",
+            nixbase32::encode(&inner_digest),
+        );
+        Self::from_fingerprint(name, &fingerprint)
+    }
+
+    /// Compute the store path for a text file (used by `builtins.toFile`).
+    ///
+    /// `hash` is the SHA-256 of the text content.
+    /// `references` are the store paths referenced by the text.
+    pub fn make_text(
+        name: &str,
+        hash: &crate::hash::NixHash,
+        references: &[StorePath],
+    ) -> Result<Self, StorePathError> {
+        // For text, the fingerprint is:
+        //   "output:out:sha256:{inner_digest}:/nix/store:{name}"
+        // where inner_digest is the hash of "text:{nix32hash}:{ref1}:{ref2}:..."
+        let mut inner = format!("text:{}:", nixbase32::encode(hash.digest()));
+        for r in references {
+            inner.push_str(&r.to_string());
+            inner.push(':');
+        }
+
+        use sha2::{Digest, Sha256};
+        let inner_digest = Sha256::digest(inner.as_bytes());
+
+        let fingerprint = format!(
+            "output:out:sha256:{}:{STORE_DIR}:{name}",
+            nixbase32::encode(&inner_digest),
+        );
+        Self::from_fingerprint(name, &fingerprint)
+    }
 }
 
 impl std::str::FromStr for StorePath {
