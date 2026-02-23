@@ -6,11 +6,13 @@
 use std::collections::{HashMap, HashSet};
 
 use rio_nix::derivation::Derivation;
+use rio_nix::hash::NixHash;
 use rio_nix::protocol::derived_path::DerivedPath;
 use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, instrument, warn};
 
@@ -51,7 +53,7 @@ pub async fn handle_opcode<R, W>(
     store: &dyn Store,
     options: &mut Option<ClientOptions>,
     temp_roots: &mut HashSet<StorePath>,
-    _drv_cache: &mut HashMap<StorePath, Derivation>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -79,6 +81,12 @@ where
         }
         Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr).await,
         Some(WorkerOp::QueryMissing) => handle_query_missing(reader, &mut stderr, store).await,
+        Some(WorkerOp::AddToStoreNar) => {
+            handle_add_to_store_nar(reader, &mut stderr, store, drv_cache).await
+        }
+        Some(WorkerOp::QueryDerivationOutputMap) => {
+            handle_query_derivation_output_map(reader, &mut stderr, store, drv_cache).await
+        }
         Some(op) => {
             warn!(
                 opcode = opcode,
@@ -491,5 +499,237 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     wire::write_u64(w, 0).await?;
     // narSize: 0
     wire::write_u64(w, 0).await?;
+    Ok(())
+}
+
+/// wopAddToStoreNar (39): Receive a store path with NAR content via STDERR_READ pull loop.
+///
+/// Protocol >= 1.25 (always present for 1.37+):
+/// 1. Read metadata fields (path, deriver, narHash, references, registrationTime,
+///    narSize, ultimate, sigs, ca, repair)
+/// 2. Pull NAR data via STDERR_READ: send STDERR_READ(count) → client responds
+///    with u64(len) + data + padding → repeat until narSize bytes received
+/// 3. Validate NAR hash, store path, cache .drv if applicable
+#[instrument(skip_all)]
+async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    use crate::store::PathInfoBuilder;
+
+    // Read metadata fields (same order as wopAddToStoreNar wire format)
+    let path_str = wire::read_string(reader).await?;
+    let deriver_str = wire::read_string(reader).await?;
+    let nar_hash_str = wire::read_string(reader).await?;
+    let references = wire::read_strings(reader).await?;
+    let registration_time = wire::read_u64(reader).await?;
+    let nar_size = wire::read_u64(reader).await?;
+    let ultimate = wire::read_bool(reader).await?;
+    let sigs = wire::read_strings(reader).await?;
+    let ca_str = wire::read_string(reader).await?;
+    let _repair = wire::read_bool(reader).await?;
+
+    debug!(
+        path = %path_str,
+        nar_size = nar_size,
+        "wopAddToStoreNar"
+    );
+
+    // Pull NAR data via STDERR_READ loop
+    let chunk_size: u64 = 64 * 1024; // 64 KiB chunks
+    let mut nar_data = Vec::with_capacity(nar_size as usize);
+    let mut remaining = nar_size;
+
+    while remaining > 0 {
+        let request_size = remaining.min(chunk_size);
+        stderr.read_request(request_size).await?;
+
+        // Client responds with u64(len) + data + padding (same as wire string format)
+        let chunk = wire::read_bytes(reader).await?;
+        nar_data.extend_from_slice(&chunk);
+        remaining = remaining.saturating_sub(chunk.len() as u64);
+    }
+
+    // Validate NAR hash
+    let computed_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&nar_data);
+        let digest = hasher.finalize();
+        hex::encode(digest)
+    };
+
+    // Parse the declared hash — nix-daemon sends just the hex digest
+    let declared_hex = &nar_hash_str;
+    if computed_hash != *declared_hex {
+        warn!(
+            path = %path_str,
+            declared = %declared_hex,
+            computed = %computed_hash,
+            "NAR hash mismatch"
+        );
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!(
+                    "NAR hash mismatch for {path_str}: declared {declared_hex}, computed {computed_hash}"
+                ),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("NAR hash mismatch for {path_str}"));
+    }
+
+    // Build PathInfo
+    let path = match StorePath::parse(&path_str) {
+        Ok(p) => p,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("invalid store path '{path_str}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("invalid store path: {e}"));
+        }
+    };
+
+    let nar_hash = match NixHash::parse(&format!("sha256:{nar_hash_str}")) {
+        Ok(h) => h,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("invalid narHash '{nar_hash_str}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("invalid narHash: {e}"));
+        }
+    };
+
+    let deriver = if deriver_str.is_empty() {
+        None
+    } else {
+        StorePath::parse(&deriver_str).ok()
+    };
+
+    let ref_paths: Vec<StorePath> = references
+        .iter()
+        .filter_map(|s| StorePath::parse(s).ok())
+        .collect();
+
+    let ca = if ca_str.is_empty() {
+        None
+    } else {
+        Some(ca_str)
+    };
+
+    let info = PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
+        .deriver(deriver)
+        .references(ref_paths)
+        .registration_time(registration_time)
+        .ultimate(ultimate)
+        .sigs(sigs)
+        .ca(ca)
+        .build()?;
+
+    // Store the path
+    store.add_path(info, nar_data.clone()).await?;
+
+    // If this is a .drv file, parse and cache it
+    if path.is_derivation() {
+        match rio_nix::nar::extract_single_file(&nar_data) {
+            Ok(drv_bytes) => {
+                let drv_text = String::from_utf8_lossy(&drv_bytes);
+                match Derivation::parse(&drv_text) {
+                    Ok(drv) => {
+                        debug!(path = %path, "cached parsed derivation");
+                        drv_cache.insert(path, drv);
+                    }
+                    Err(e) => {
+                        warn!(path = %path_str, error = %e, "failed to parse .drv ATerm, skipping cache");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(path = %path_str, error = %e, "failed to extract .drv from NAR, skipping cache");
+            }
+        }
+    }
+
+    // Send success
+    stderr.finish().await?;
+    wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// wopQueryDerivationOutputMap (41): Return output name → path mappings for a derivation.
+///
+/// Looks up the parsed derivation from the session's drv_cache (populated
+/// during wopAddToStoreNar), or fetches and parses from the store.
+#[instrument(skip_all)]
+async fn handle_query_derivation_output_map<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    let drv_path_str = wire::read_string(reader).await?;
+    debug!(path = %drv_path_str, "wopQueryDerivationOutputMap");
+
+    let drv_path = match StorePath::parse(&drv_path_str) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(path = %drv_path_str, error = %e, "invalid store path in wopQueryDerivationOutputMap");
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("invalid store path '{drv_path_str}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("invalid store path: {e}"));
+        }
+    };
+
+    // Look up derivation: session cache first, then store
+    let drv = if let Some(cached) = drv_cache.get(&drv_path) {
+        cached.clone()
+    } else {
+        // Try to fetch from store and parse
+        match store.nar_from_path(&drv_path).await? {
+            Some(nar_data) => {
+                let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
+                    .map_err(|e| anyhow::anyhow!("failed to extract .drv from NAR: {e}"))?;
+                let drv_text = String::from_utf8_lossy(&drv_bytes);
+                let drv = Derivation::parse(&drv_text)
+                    .map_err(|e| anyhow::anyhow!("failed to parse .drv: {e}"))?;
+                drv_cache.insert(drv_path.clone(), drv.clone());
+                drv
+            }
+            None => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("derivation '{drv_path_str}' not found in store"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("derivation not found: {drv_path_str}"));
+            }
+        }
+    };
+
+    // Build output map from derivation
+    let outputs = drv.outputs();
+
+    stderr.finish().await?;
+    let w = stderr.inner_mut();
+
+    // Write count + (name, path) pairs
+    wire::write_u64(w, outputs.len() as u64).await?;
+    for output in outputs {
+        wire::write_string(w, output.name()).await?;
+        wire::write_string(w, output.path()).await?;
+    }
+
     Ok(())
 }
