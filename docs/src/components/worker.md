@@ -73,7 +73,15 @@ The FUSE daemon is implemented using the `fuser` crate and runs as part of the w
 
 The target architecture splits the FUSE daemon into submodules: `fuse/mod.rs` (daemon lifecycle, mount management), `fuse/lookup.rs` (path existence and metadata queries), `fuse/read.rs` (file content serving), and `fuse/cache.rs` (LRU cache management). The FUSE daemon handles concurrent access from multiple overlays via `Arc<Cache>` with a read-mostly access pattern --- store paths are immutable, so concurrent reads require no synchronization beyond the cache index.
 
-**Fallback architecture:** If the FUSE+overlay spike (Phase 1b) fails, the fallback is a bind-mount approach with `nix-store --realise` pre-materialization. All input store paths are fully materialized on the worker's local disk before the build starts and bind-mounted into the sandbox. This trades lazy loading for simplicity and eliminates the FUSE dependency, at the cost of higher pre-build latency (full closure materialization instead of on-demand fetching).
+**`fuser` 0.17 API (validated in Phase 1a spike):**
+
+The `fuser` 0.17 crate includes breaking API changes from 0.14/0.15 that affect the FUSE daemon implementation:
+- `Filesystem` trait data-path methods (e.g., `lookup`, `read`, `open`, `readdir`) changed from `&mut self` to `&self`, requiring interior mutability patterns (`RwLock`, `Atomic*`) for all mutable state. Lifecycle methods (`init`, `destroy`) retain `&mut self`.
+- Raw integer parameters replaced by newtypes: `INodeNo(u64)`, `FileHandle(u64)`, `Generation(u64)`, `LockOwner(u64)`, `Errno`, `FopenFlags`, `OpenFlags`, `AccessFlags`.
+- Mount configuration uses a `Config` struct with `mount_options: Vec<MountOption>`, `acl: SessionACL` (replaces `MountOption::AllowOther` with `SessionACL::All`), `n_threads`, and `clone_fd`.
+- Passthrough API: `KernelConfig::set_max_stack_depth(1)` in `init()`, `ReplyOpen::open_backing(impl AsFd) -> Result<BackingId>`, `ReplyOpen::opened_passthrough(FileHandle, FopenFlags, &BackingId)`. `BackingId` must be kept alive (via a map keyed by file handle) until `release()`.
+
+**Fallback architecture:** If the FUSE+overlay spike (Phase 1a) fails, the fallback is a bind-mount approach with `nix-store --realise` pre-materialization. All input store paths are fully materialized on the worker's local disk before the build starts and bind-mounted into the sandbox. This trades lazy loading for simplicity and eliminates the FUSE dependency, at the cost of higher pre-build latency (full closure materialization instead of on-demand fetching). **Phase 1a result: GO --- the FUSE+overlay approach works; fallback not activated.**
 
 ```mermaid
 graph TB
@@ -132,6 +140,8 @@ Workers invoke `nix-daemon --stdio` and must speak the Nix worker protocol as a 
 
 Each active build gets its own overlayfs mount with a separate upper directory and work directory. A synthetic Nix store SQLite database is placed in each overlay's upper layer so that Nix recognizes the input paths.
 
+> **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the worker's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/nix/store`.
+
 After build completes:
 
 1. Read new paths from upper layer
@@ -162,6 +172,8 @@ For each build, the worker synthesizes a minimal SQLite database in the overlay 
 3. The database must include the `ValidPaths`, `Refs`, and `DerivationOutputs` tables with proper indexes (`IndexValidPathsPath`, `IndexValidPathsHash`). The `SchemaVersion` in the `Config` table must match the Nix version running in the worker (target: Nix 2.20+ schema).
 4. The database contains only path registrations for that specific build's input closure --- not the entire store.
 5. After the build completes, the synthetic database is discarded along with the rest of the overlay upper layer.
+
+> **Critical (validated in Phase 1a spike):** The `Refs` table must accurately reflect each path's references. When `sandbox = true`, Nix resolves the derivation's input closure by walking the `Refs` table to determine which store paths to bind-mount into the sandbox chroot. If references are missing, the sandbox will not bind-mount transitive dependencies (e.g., `glibc` needed by `bash`), causing builds to fail with "No such file or directory" errors when the builder's dynamic linker cannot be found.
 
 Performance: direct SQLite writes handle 1000+ paths in <50ms. The bottleneck is the PostgreSQL metadata query, not the SQLite generation.
 
@@ -211,6 +223,8 @@ Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the N
 
 **Required capabilities:** `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT`. Do NOT use `privileged: true` --- it disables seccomp profiles entirely.
 
+> **Spike finding (Phase 1a):** `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` without `privileged: true` is not sufficient for `/dev/fuse` access because the container's device cgroup does not include the FUSE character device (major 10, minor 229) by default. Production deployments must use a FUSE device plugin (e.g., [`smarter-device-manager`](https://gitlab.com/arm-research/smarter/smarter-device-manager)) that adds `/dev/fuse` to the device cgroup allowlist, enabling the non-privileged security context described above.
+
 **Custom seccomp profile** (default-deny allowlist, extending the Docker default profile):
 - **Allow:** `mount`, `umount2` (overlayfs and FUSE), `unshare`, `clone` with namespace flags (Nix sandbox), `pivot_root` (Nix sandbox)
 - **Explicitly block** (in addition to Docker default blocks): `ptrace`, `bpf`, `kexec_load`, `reboot`, `syslog`, `setns` (prevent namespace entry/escape), `keyctl` (prevent kernel keyring manipulation)
@@ -251,9 +265,26 @@ This is relevant to rio-fuse because the warm-cache path (store paths already fe
 - Only cache-miss reads require the full FUSE round-trip to rio-store via gRPC
 - The performance concern from [Challenge #13](../challenges.md) ("FUSE overhead must be < 2x direct reads") may be reduced to near-native for warm builds
 
-**Status:** Phase 4+ optimization. The initial implementation (Phase 1a-3) uses standard FUSE without passthrough. The Phase 1a benchmark should measure both standard FUSE and passthrough (if the kernel supports it) to inform future optimization decisions.
+**Status:** Validated in Phase 1a spike. `fuser` 0.17 supports passthrough natively via `KernelConfig::set_max_stack_depth(1)` + `ReplyOpen::open_backing()` + `opened_passthrough()`.
 
-> **Note:** The `fuser` crate may need patches or a fork to support the `FUSE_PASSTHROUGH` flag. Check upstream support before planning this optimization.
+### Spike Findings
+
+The Phase 1a spike validated passthrough on EKS AL2023 (kernel 6.12). Key findings:
+
+1. **Passthrough works on ext4/xfs-backed files.** `open_backing()` succeeds and the kernel handles `read()` directly without entering userspace.
+
+2. **Passthrough does NOT work on overlay-backed files.** The kernel's `fuse_passthrough_open` checks the backing file's filesystem stack depth and returns `EPERM` if it's on a stacked filesystem (overlayfs, another FUSE mount). This means the backing files must be on a real filesystem (local SSD, emptyDir), not on a container's overlay rootfs. This is consistent with the production design where `rio-fuse` serves from local SSD cache.
+
+3. **Passthrough does not help for open-heavy workloads.** The spike benchmark (open+read+close per file, 74k files) showed identical latency with and without passthrough. The bottleneck is `lookup()` and `open()` calls which still traverse userspace even with passthrough enabled. Passthrough only bypasses `read()`.
+
+4. **Passthrough benefits sustained reads on open file handles.** For production `rio-fuse`, this means the cache should keep file handles open across multiple reads from the same store path. A build that reads a large `.so` or header file repeatedly will benefit; a build that opens thousands of small files once will not.
+
+**Implications for `rio-fuse` design:**
+- The FUSE cache (`fuse/cache.rs`) should maintain open file handles for cached paths, not just the path data. When a file is opened via `open()`, register a passthrough backing fd and keep it alive until eviction.
+- `max_stack_depth` must be set to 1 in `init()`. Setting it to 2 allows the FUSE mount itself to be used as the lower layer of an overlayfs (which is the production layout: FUSE lower + SSD upper).
+- The `fuser` crate (0.17+) supports passthrough without patches or forks.
+
+> **Constraint:** `max_stack_depth` has a kernel maximum of 2. With `max_stack_depth=1`, the FUSE mount can be stacked under one overlayfs layer. With `max_stack_depth=2`, the backing files themselves can be on a stacked filesystem. For production, `max_stack_depth=1` is correct: backing files are on ext4 (depth 0), FUSE adds depth 1, and overlayfs adds the final layer.
 
 ## Nix Version Pinning
 

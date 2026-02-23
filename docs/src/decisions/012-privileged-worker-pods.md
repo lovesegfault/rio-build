@@ -31,6 +31,14 @@ Kubernetes 1.33 (April 2025) enabled user namespace support by default. Worker p
 
 > **Note:** `hostUsers: false` does NOT eliminate the need for `CAP_SYS_ADMIN` or the custom seccomp profile. It adds a defense-in-depth layer on top of the existing mitigations.
 
+### Interaction with `/dev/fuse` Access (Phase 1a Spike Finding)
+
+The Phase 1a spike discovered two constraints:
+
+1. **`hostUsers: false` + hostPath `/dev/fuse` is incompatible.** The kernel rejects idmap mounts on device nodes, causing the container to fail at startup with `failed to set MOUNT_ATTR_IDMAP on /dev/fuse: invalid argument`. User namespace isolation requires a FUSE device plugin (e.g., `smarter-device-manager`) that injects `/dev/fuse` without the hostPath volume mechanism.
+
+2. **`CAP_SYS_ADMIN` alone is insufficient for `/dev/fuse` access.** The container's device cgroup does not include the FUSE character device (major 10, minor 229) by default. Without a device plugin, `privileged: true` is the only way to access `/dev/fuse`, which contradicts this ADR's recommendation. A FUSE device plugin resolves both constraints: it adds the device to the cgroup allowlist AND avoids the hostPath volume, enabling both `hostUsers: false` and the non-privileged security context.
+
 ## Consequences
 - **Positive**: Workers get exactly the capabilities they need without excessive privilege.
 - **Positive**: Custom seccomp profile limits syscall surface to what is actually required.

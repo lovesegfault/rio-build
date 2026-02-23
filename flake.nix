@@ -210,12 +210,28 @@
               tag = "latest";
               maxLayers = 50;
 
+              # Create /tmp and /nix/var directories (not included by default in Nix images)
+              extraCommands = ''
+                mkdir -p tmp var/rio nix/var/nix/db etc/nix
+                chmod 1777 tmp
+                cat > etc/nix/nix.conf <<NIXCONF
+                experimental-features = nix-command flakes
+                sandbox = true
+                sandbox-fallback = false
+                substitute = false
+                build-users-group = # empty: build as current user (no nixbld group in container)
+                NIXCONF
+              '';
+
               contents = with pkgs; [
                 # The rio-spike binary
                 rio-workspace
 
                 # Nix tooling (nix-store, nix-build, nix path-info)
                 nix
+
+                # Test data: hello and its closure (pre-populated in /nix/store)
+                hello
 
                 # Runtime essentials
                 coreutils
