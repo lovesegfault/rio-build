@@ -201,6 +201,9 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(
 )> {
     // outputs
     let output_count = wire::read_u64(r).await?;
+    if output_count > wire::MAX_COLLECTION_COUNT {
+        return Err(wire::WireError::CollectionTooLarge(output_count));
+    }
     let mut outputs = Vec::with_capacity(output_count.min(64) as usize);
     for _ in 0..output_count {
         let name = wire::read_string(r).await?;
@@ -265,6 +268,9 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
 
     // Protocol 1.28+: builtOutputs
     let output_count = wire::read_u64(r).await?;
+    if output_count > wire::MAX_COLLECTION_COUNT {
+        return Err(wire::WireError::CollectionTooLarge(output_count));
+    }
     let mut built_outputs = Vec::with_capacity(output_count.min(64) as usize);
     for _ in 0..output_count {
         let name = wire::read_string(r).await?;
