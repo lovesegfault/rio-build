@@ -7,15 +7,18 @@
 - [x] Derivation parser: `.drv` ATerm format (`rio-nix/src/derivation.rs`). `BasicDerivation` wire serialization deferred to Step 6.
 - [x] NAR format: streaming reader and writer (`rio-nix/src/nar.rs`). Synchronous `Read`/`Write`-based. Golden-tested against `nix-store --dump`.
 - [x] Narinfo: parser and generator (`rio-nix/src/narinfo.rs`)
-- [ ] Build opcodes: `wopBuildDerivation` (36), `wopBuildPathsWithResults` (46), `wopBuildPaths` (9)
+- [x] Build opcodes:
+  - [x] `wopBuildDerivation` (36): spawns local `nix-daemon --stdio`, forwards build via client protocol
+  - [x] `wopBuildPathsWithResults` (46): per-path BuildResult via local daemon
+  - [x] `wopBuildPaths` (9): delegates to local daemon per DerivedPath
   - [x] `wopAddMultipleToStore` (44): framed stream parsing with per-entry NAR hash validation
   - [x] `wopAddToStoreNar` (39): STDERR_READ pull loop with NAR hash validation and .drv cache
   - [x] `wopNarFromPath` (38): implemented in Phase 1a
   - [x] `wopQueryMissing` (40): implemented in Phase 1a
   - [x] `wopQueryDerivationOutputMap` (41): session .drv cache lookup with store fallback
 - [x] `DerivedPath` string parser (opaque, built with explicit outputs, built with `!*`) — completed in Phase 1a (`rio-nix/src/protocol/derived_path.rs`)
-- [ ] `rio-store`: filesystem backend (NAR files on disk)
-- [ ] Single-threaded local execution for `wopBuildDerivation` (invoke local nix)
+- [ ] ~~`rio-store`: filesystem backend (NAR files on disk)~~ — deferred; MemoryStore sufficient for Phase 1b single-node
+- [x] Single-threaded local execution for `wopBuildDerivation` (gateway speaks client protocol to local `nix-daemon --stdio`)
 - [ ] Integration test: `nix build --store ssh-ng://localhost .#hello` works end-to-end
 
 ## Milestones

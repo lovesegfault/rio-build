@@ -848,8 +848,8 @@ async fn test_known_unimplemented_opcode_closes_connection() {
             let mut s = s;
             do_handshake(&mut s).await;
 
-            // Send opcode 36 (wopBuildDerivation) — known but not yet implemented
-            wire::write_u64(&mut s, 36).await.unwrap();
+            // Send opcode 42 (wopRegisterDrvOutput) — known but not yet implemented
+            wire::write_u64(&mut s, 42).await.unwrap();
             s.flush().await.unwrap();
 
             // Should receive STDERR_ERROR (0x63787470)
@@ -865,8 +865,8 @@ async fn test_known_unimplemented_opcode_closes_connection() {
             assert_eq!(name, "rio-build");
             let message = wire::read_string(&mut s).await.unwrap();
             assert!(
-                message.contains("wopBuildDerivation"),
-                "expected message to contain 'wopBuildDerivation', got: {message}"
+                message.contains("wopRegisterDrvOutput"),
+                "expected message to contain 'wopRegisterDrvOutput', got: {message}"
             );
             assert!(
                 message.contains("not yet implemented"),
