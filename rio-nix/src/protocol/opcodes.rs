@@ -8,6 +8,7 @@
 #[repr(u64)]
 pub enum WorkerOp {
     IsValidPath = 1,
+    EnsurePath = 7,
     BuildPaths = 9,
     AddTempRoot = 11,
     SetOptions = 19,
@@ -32,6 +33,7 @@ impl TryFrom<u64> for WorkerOp {
     fn try_from(v: u64) -> Result<Self, Self::Error> {
         match v {
             1 => Ok(WorkerOp::IsValidPath),
+            7 => Ok(WorkerOp::EnsurePath),
             9 => Ok(WorkerOp::BuildPaths),
             11 => Ok(WorkerOp::AddTempRoot),
             19 => Ok(WorkerOp::SetOptions),
@@ -63,6 +65,7 @@ impl WorkerOp {
     pub fn name(&self) -> &'static str {
         match self {
             WorkerOp::IsValidPath => "wopIsValidPath",
+            WorkerOp::EnsurePath => "wopEnsurePath",
             WorkerOp::BuildPaths => "wopBuildPaths",
             WorkerOp::AddTempRoot => "wopAddTempRoot",
             WorkerOp::SetOptions => "wopSetOptions",
@@ -113,6 +116,7 @@ mod tests {
     fn test_opcode_roundtrip() {
         let ops = [
             WorkerOp::IsValidPath,
+            WorkerOp::EnsurePath,
             WorkerOp::BuildPaths,
             WorkerOp::AddTempRoot,
             WorkerOp::SetOptions,

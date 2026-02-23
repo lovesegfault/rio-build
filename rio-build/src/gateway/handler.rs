@@ -76,6 +76,7 @@ where
 
     let result = match op {
         Some(WorkerOp::IsValidPath) => handle_is_valid_path(reader, &mut stderr, store).await,
+        Some(WorkerOp::EnsurePath) => handle_ensure_path(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryPathInfo) => handle_query_path_info(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryValidPaths) => {
             handle_query_valid_paths(reader, &mut stderr, store).await
@@ -169,6 +170,33 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     stderr.finish().await?;
     wire::write_bool(stderr.inner_mut(), valid).await?;
+    Ok(())
+}
+
+/// wopEnsurePath (7): Ensure a store path is valid/available.
+///
+/// In the real nix-daemon, this may trigger substitution. For rio-build,
+/// all paths are either already uploaded or unavailable, so this is
+/// equivalent to checking validity and returning success unconditionally.
+#[instrument(skip_all)]
+async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
+) -> anyhow::Result<()> {
+    let path_str = wire::read_string(reader).await?;
+    debug!(path = %path_str, "wopEnsurePath");
+
+    // Check if the path is valid — log if missing but don't error,
+    // since the real daemon would attempt substitution.
+    if let Ok(path) = StorePath::parse(&path_str)
+        && !store.is_valid_path(&path).await.unwrap_or(false)
+    {
+        debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
+    }
+
+    // wopEnsurePath returns void — STDERR_LAST only, no result value.
+    stderr.finish().await?;
     Ok(())
 }
 
