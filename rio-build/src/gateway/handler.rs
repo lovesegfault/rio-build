@@ -630,16 +630,27 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    let nar_hash = match NixHash::parse(&format!("sha256:{nar_hash_str}")) {
-        Ok(h) => h,
+    let nar_hash = match hex::decode(&nar_hash_str) {
+        Ok(digest) => match NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest) {
+            Ok(h) => h,
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("invalid narHash digest '{nar_hash_str}': {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("invalid narHash: {e}"));
+            }
+        },
         Err(e) => {
             stderr
                 .error(&StderrError::simple(
                     PROGRAM_NAME,
-                    format!("invalid narHash '{nar_hash_str}': {e}"),
+                    format!("invalid narHash hex '{nar_hash_str}': {e}"),
                 ))
                 .await?;
-            return Err(anyhow::anyhow!("invalid narHash: {e}"));
+            return Err(anyhow::anyhow!("invalid narHash hex: {e}"));
         }
     };
 
@@ -780,7 +791,9 @@ async fn parse_add_multiple_entry(
     let path = StorePath::parse(&path_str)
         .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
 
-    let nar_hash = NixHash::parse(&format!("sha256:{nar_hash_str}"))
+    let nar_hash_bytes =
+        hex::decode(&nar_hash_str).map_err(|e| anyhow::anyhow!("invalid narHash hex: {e}"))?;
+    let nar_hash = NixHash::new(rio_nix::hash::HashAlgo::SHA256, nar_hash_bytes)
         .map_err(|e| anyhow::anyhow!("invalid narHash: {e}"))?;
 
     let deriver = if deriver_str.is_empty() {

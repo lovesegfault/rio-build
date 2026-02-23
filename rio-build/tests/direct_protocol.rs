@@ -1,15 +1,17 @@
 //! Direct protocol tests — feed raw bytes through a DuplexStream without SSH.
-//! Tests each Phase 1a opcode at the byte level.
+//! Tests each opcode at the byte level.
 
 use std::sync::Arc;
 
 use rio_build::gateway::session::run_protocol;
-use rio_build::store::MemoryStore;
+use rio_build::store::{MemoryStore, Store};
 use rio_nix::hash::{HashAlgo, NixHash};
+use rio_nix::nar::{self, NarNode};
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
-use rio_nix::protocol::stderr::{STDERR_ERROR, STDERR_LAST};
+use rio_nix::protocol::stderr::{STDERR_ERROR, STDERR_LAST, STDERR_READ};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 
 /// Perform the full handshake + wopSetOptions on a client stream.
@@ -935,4 +937,385 @@ async fn test_version_too_old_sends_stderr_error() {
     let (c, s) = tokio::join!(client, server);
     c.unwrap();
     s.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b: store-interaction opcode byte-level tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a NAR archive containing a single regular file with the given contents.
+fn make_nar(contents: &[u8]) -> Vec<u8> {
+    let node = NarNode::Regular {
+        executable: false,
+        contents: contents.to_vec(),
+    };
+    let mut buf = Vec::new();
+    nar::serialize(&mut buf, &node).unwrap();
+    buf
+}
+
+/// Helper: compute the SHA-256 hex digest of data.
+///
+/// The narHash field on the wire uses plain hex encoding.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+/// Helper: create a simple .drv ATerm string for testing.
+///
+/// Format: `Derive([outputs],[inputDrvs],[inputSrcs],"platform","builder",[args],[env])`
+fn make_test_drv() -> String {
+    r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("name","test"),("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test"),("system","x86_64-linux")])"#.to_string()
+}
+
+/// wopAddToStoreNar (39): Send a store path with NAR data, verify it is stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_nar_direct() {
+    let store = Arc::new(MemoryStore::new());
+    let store2 = store.clone();
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            let nar_data = make_nar(b"hello world");
+            let nar_hash = sha256_hex(&nar_data);
+            let nar_size = nar_data.len() as u64;
+            let path_str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-test-nar";
+
+            // Send wopAddToStoreNar (39)
+            wire::write_u64(&mut s, 39).await.unwrap();
+
+            // Metadata fields
+            wire::write_string(&mut s, path_str).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_string(&mut s, &nar_hash).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap();
+            wire::write_u64(&mut s, nar_size).await.unwrap();
+            wire::write_bool(&mut s, true).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            s.flush().await.unwrap();
+
+            // Server will send STDERR_READ requests — respond with NAR data chunks
+            let mut sent = 0usize;
+            loop {
+                let msg = wire::read_u64(&mut s).await.unwrap();
+                if msg == STDERR_LAST {
+                    break;
+                }
+                if msg == STDERR_ERROR {
+                    let _error_type = wire::read_string(&mut s).await.unwrap();
+                    let _level = wire::read_u64(&mut s).await.unwrap();
+                    let _name = wire::read_string(&mut s).await.unwrap();
+                    let message = wire::read_string(&mut s).await.unwrap();
+                    panic!("unexpected STDERR_ERROR: {message}");
+                }
+                assert_eq!(msg, STDERR_READ, "expected STDERR_READ");
+                let requested = wire::read_u64(&mut s).await.unwrap() as usize;
+                let end = (sent + requested).min(nar_data.len());
+                let chunk = &nar_data[sent..end];
+                wire::write_bytes(&mut s, chunk).await.unwrap();
+                s.flush().await.unwrap();
+                sent = end;
+            }
+
+            // Read success response
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1, "expected success (1)");
+        })
+    })
+    .await;
+
+    // Verify the path was stored
+    let path = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-test-nar").unwrap();
+    assert!(store2.is_valid_path(&path).await.unwrap());
+}
+
+/// wopAddMultipleToStore (44): Send multiple store paths via framed stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_multiple_to_store_direct() {
+    let store = Arc::new(MemoryStore::new());
+    let store2 = store.clone();
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // Build the inner entry data
+            let nar_data = make_nar(b"multi-store content");
+            let nar_hash = sha256_hex(&nar_data);
+            let nar_size = nar_data.len() as u64;
+            let path_str = "/nix/store/cccccccccccccccccccccccccccccccc-multi-test";
+
+            // Serialize one entry into a buffer
+            let mut entry_buf = Vec::new();
+            wire::write_string(&mut entry_buf, path_str).await.unwrap();
+            wire::write_string(&mut entry_buf, "").await.unwrap();
+            wire::write_string(&mut entry_buf, &nar_hash).await.unwrap();
+            wire::write_strings(&mut entry_buf, &[]).await.unwrap();
+            wire::write_u64(&mut entry_buf, 0).await.unwrap();
+            wire::write_u64(&mut entry_buf, nar_size).await.unwrap();
+            wire::write_bool(&mut entry_buf, true).await.unwrap();
+            wire::write_strings(&mut entry_buf, &[]).await.unwrap();
+            wire::write_string(&mut entry_buf, "").await.unwrap();
+            wire::write_framed_stream(&mut entry_buf, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
+
+            // Send wopAddMultipleToStore (44)
+            wire::write_u64(&mut s, 44).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_framed_stream(&mut s, &entry_buf, 64 * 1024)
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            // Read response
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1, "expected success (1)");
+        })
+    })
+    .await;
+
+    let path = StorePath::parse("/nix/store/cccccccccccccccccccccccccccccccc-multi-test").unwrap();
+    assert!(store2.is_valid_path(&path).await.unwrap());
+}
+
+/// wopQueryDerivationOutputMap (41): Upload a .drv, then query its output map.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_derivation_output_map_direct() {
+    let store = Arc::new(MemoryStore::new());
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // First, upload a .drv via wopAddMultipleToStore
+            let drv_content = make_test_drv();
+            let nar_data = make_nar(drv_content.as_bytes());
+            let nar_hash = sha256_hex(&nar_data);
+            let nar_size = nar_data.len() as u64;
+            let drv_path = "/nix/store/dddddddddddddddddddddddddddddddd-test-drv.drv";
+
+            let mut entry_buf = Vec::new();
+            wire::write_string(&mut entry_buf, drv_path).await.unwrap();
+            wire::write_string(&mut entry_buf, "").await.unwrap();
+            wire::write_string(&mut entry_buf, &nar_hash).await.unwrap();
+            wire::write_strings(&mut entry_buf, &[]).await.unwrap();
+            wire::write_u64(&mut entry_buf, 0).await.unwrap();
+            wire::write_u64(&mut entry_buf, nar_size).await.unwrap();
+            wire::write_bool(&mut entry_buf, true).await.unwrap();
+            wire::write_strings(&mut entry_buf, &[]).await.unwrap();
+            wire::write_string(&mut entry_buf, "").await.unwrap();
+            wire::write_framed_stream(&mut entry_buf, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
+
+            wire::write_u64(&mut s, 44).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_framed_stream(&mut s, &entry_buf, 64 * 1024)
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1);
+
+            // Now query the derivation output map (opcode 41)
+            wire::write_u64(&mut s, 41).await.unwrap();
+            wire::write_string(&mut s, drv_path).await.unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            if msg == STDERR_ERROR {
+                let _error_type = wire::read_string(&mut s).await.unwrap();
+                let _level = wire::read_u64(&mut s).await.unwrap();
+                let _name = wire::read_string(&mut s).await.unwrap();
+                let message = wire::read_string(&mut s).await.unwrap();
+                panic!("unexpected STDERR_ERROR from QueryDerivationOutputMap: {message}");
+            }
+            assert_eq!(msg, STDERR_LAST);
+
+            // Read output count + entries
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 1, "expected 1 output");
+
+            let name = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(name, "out");
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(path.contains("test"), "output path should contain 'test'");
+        })
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b: error-path tests
+// ---------------------------------------------------------------------------
+
+/// wopQueryDerivationOutputMap: querying a derivation that doesn't exist
+/// should return STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_derivation_output_map_not_found() {
+    let store = Arc::new(MemoryStore::new());
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // Query a derivation that was never uploaded
+            wire::write_u64(&mut s, 41).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing.drv",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_ERROR, "expected STDERR_ERROR for missing drv");
+
+            // Read error structure
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("not found"),
+                "error should mention 'not found', got: {message}"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopAddToStoreNar: sending a NAR with a mismatched hash should
+/// return STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_nar_hash_mismatch() {
+    let store = Arc::new(MemoryStore::new());
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            let nar_data = make_nar(b"some content");
+            let wrong_hash = "0".repeat(64);
+            let nar_size = nar_data.len() as u64;
+            let path_str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hash-test";
+
+            wire::write_u64(&mut s, 39).await.unwrap();
+            wire::write_string(&mut s, path_str).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_string(&mut s, &wrong_hash).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap();
+            wire::write_u64(&mut s, nar_size).await.unwrap();
+            wire::write_bool(&mut s, true).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            s.flush().await.unwrap();
+
+            // Respond to STDERR_READ requests with NAR data
+            let mut sent = 0usize;
+            loop {
+                let msg = wire::read_u64(&mut s).await.unwrap();
+                if msg == STDERR_ERROR {
+                    // Hash mismatch detected — read the error structure
+                    let _error_type = wire::read_string(&mut s).await.unwrap();
+                    let _level = wire::read_u64(&mut s).await.unwrap();
+                    let _name = wire::read_string(&mut s).await.unwrap();
+                    let message = wire::read_string(&mut s).await.unwrap();
+                    assert!(
+                        message.contains("hash mismatch"),
+                        "error should mention 'hash mismatch', got: {message}"
+                    );
+                    return;
+                }
+                assert_eq!(msg, STDERR_READ, "expected STDERR_READ or STDERR_ERROR");
+                let requested = wire::read_u64(&mut s).await.unwrap() as usize;
+                let end = (sent + requested).min(nar_data.len());
+                let chunk = &nar_data[sent..end];
+                wire::write_bytes(&mut s, chunk).await.unwrap();
+                s.flush().await.unwrap();
+                sent = end;
+            }
+        })
+    })
+    .await;
+}
+
+/// wopAddMultipleToStore: sending an entry with a mismatched NAR hash
+/// should return STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_multiple_to_store_hash_mismatch() {
+    let store = Arc::new(MemoryStore::new());
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            let nar_data = make_nar(b"content");
+            let wrong_hash = "f".repeat(64);
+            let nar_size = nar_data.len() as u64;
+            let path_str = "/nix/store/ffffffffffffffffffffffffffffffff-bad-hash";
+
+            let mut entry_buf = Vec::new();
+            wire::write_string(&mut entry_buf, path_str).await.unwrap();
+            wire::write_string(&mut entry_buf, "").await.unwrap();
+            wire::write_string(&mut entry_buf, &wrong_hash)
+                .await
+                .unwrap();
+            wire::write_strings(&mut entry_buf, &[]).await.unwrap();
+            wire::write_u64(&mut entry_buf, 0).await.unwrap();
+            wire::write_u64(&mut entry_buf, nar_size).await.unwrap();
+            wire::write_bool(&mut entry_buf, true).await.unwrap();
+            wire::write_strings(&mut entry_buf, &[]).await.unwrap();
+            wire::write_string(&mut entry_buf, "").await.unwrap();
+            wire::write_framed_stream(&mut entry_buf, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
+
+            wire::write_u64(&mut s, 44).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_framed_stream(&mut s, &entry_buf, 64 * 1024)
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            // Expect STDERR_ERROR for hash mismatch
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_ERROR, "expected STDERR_ERROR for hash mismatch");
+
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("hash mismatch") || message.contains("failed"),
+                "error should mention hash issue, got: {message}"
+            );
+        })
+    })
+    .await;
 }
