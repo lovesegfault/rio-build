@@ -19,7 +19,7 @@
 - [x] `DerivedPath` string parser (opaque, built with explicit outputs, built with `!*`) — completed in Phase 1a (`rio-nix/src/protocol/derived_path.rs`)
 - [ ] ~~`rio-store`: filesystem backend (NAR files on disk)~~ — deferred; MemoryStore sufficient for Phase 1b single-node
 - [x] Single-threaded local execution for `wopBuildDerivation` (gateway speaks client protocol to local `nix-daemon --stdio`)
-- [ ] Integration test: `nix build --store ssh-ng://localhost .#hello` works end-to-end
+- [x] Integration test: `nix build --store ssh-ng://localhost` exercises full protocol path (`rio-build/tests/integration_build.rs`)
 
 ## Milestones
 
