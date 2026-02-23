@@ -149,15 +149,16 @@ impl StorePath {
     /// Compute the store path for a fixed-output (content-addressed) store object.
     ///
     /// `hash` is the content hash, `is_recursive` indicates NAR vs flat hashing.
-    /// For self-referencing paths, `references` should be empty.
+    ///
+    /// Nix algorithm: for fixed outputs, there's an inner hash step:
+    ///   inner = SHA-256("fixed:out:{r:}{algo}:{nix32hash}:")
+    ///   fingerprint = "output:out:sha256:{nix32(inner)}:/nix/store:{name}"
+    ///   pathHash = compressHash(SHA-256(fingerprint))
     pub fn make_fixed_output(
         name: &str,
         hash: &crate::hash::NixHash,
         is_recursive: bool,
     ) -> Result<Self, StorePathError> {
-        // For fixed output, the fingerprint is:
-        //   "output:out:sha256:{inner_digest}:/nix/store:{name}"
-        // where inner_digest is the hash of "fixed:out:{r:}{algo}:{nix32hash}"
         let r_prefix = if is_recursive { "r:" } else { "" };
         let inner = format!(
             "fixed:out:{r_prefix}{}:{}:",
@@ -178,26 +179,25 @@ impl StorePath {
     ///
     /// `hash` is the SHA-256 of the text content.
     /// `references` are the store paths referenced by the text.
+    ///
+    /// Nix algorithm (single-level hash, no inner step):
+    ///   type = "text" + ":" + ref1 + ":" + ref2 + ...
+    ///   fingerprint = "{type}:sha256:{nix32(hash)}:/nix/store:{name}"
+    ///   pathHash = compressHash(SHA-256(fingerprint))
     pub fn make_text(
         name: &str,
         hash: &crate::hash::NixHash,
         references: &[StorePath],
     ) -> Result<Self, StorePathError> {
-        // For text, the fingerprint is:
-        //   "output:out:sha256:{inner_digest}:/nix/store:{name}"
-        // where inner_digest is the hash of "text:{nix32hash}:{ref1}:{ref2}:..."
-        let mut inner = format!("text:{}:", nixbase32::encode(hash.digest()));
+        let mut type_str = "text".to_string();
         for r in references {
-            inner.push_str(&r.to_string());
-            inner.push(':');
+            type_str.push(':');
+            type_str.push_str(&r.to_string());
         }
 
-        use sha2::{Digest, Sha256};
-        let inner_digest = Sha256::digest(inner.as_bytes());
-
         let fingerprint = format!(
-            "output:out:sha256:{}:{STORE_DIR}:{name}",
-            nixbase32::encode(&inner_digest),
+            "{type_str}:sha256:{}:{STORE_DIR}:{name}",
+            nixbase32::encode(hash.digest()),
         );
         Self::from_fingerprint(name, &fingerprint)
     }
