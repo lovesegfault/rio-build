@@ -812,6 +812,7 @@ pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> Vec<u8> {
 }
 
 /// Build wopQueryDerivationOutputMap (41) client bytes.
+#[allow(dead_code)]
 pub async fn build_query_derivation_output_map_bytes(drv_path: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     wire::write_u64(&mut buf, 41).await.unwrap();
@@ -822,6 +823,7 @@ pub async fn build_query_derivation_output_map_bytes(drv_path: &str) -> Vec<u8> 
 /// Parse wopQueryDerivationOutputMap response fields.
 ///
 /// Response: STDERR_LAST + u64(count) + (string name, string path) * count
+#[allow(dead_code)]
 pub async fn parse_query_derivation_output_map_fields(data: &[u8]) -> Vec<ResponseField> {
     let mut fields = Vec::new();
     let mut cursor = Cursor::new(data.to_vec());

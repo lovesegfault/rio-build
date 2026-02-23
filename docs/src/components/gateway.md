@@ -75,7 +75,7 @@ For protocol >= 1.25 (always present since we target 1.37+):
 |-------|------|-------------|
 | `path` | string | Store path being imported |
 | `deriver` | string | Deriver path (empty if unknown) |
-| `narHash` | string | SHA-256 hash of the NAR (`sha256:...`) |
+| `narHash` | string | SHA-256 hash of the NAR (hex-encoded digest, no algorithm prefix) |
 | `references` | string collection | Referenced store paths |
 | `registrationTime` | u64 | Registration timestamp |
 | `narSize` | u64 | Size of the NAR in bytes |
@@ -200,7 +200,7 @@ If `valid == 1`, the following fields are sent in order:
 | Field | Type | Description |
 |-------|------|-------------|
 | `deriver` | string | Deriver path (empty if unknown) |
-| `narHash` | string | NAR hash (sha256:...) |
+| `narHash` | string | NAR hash (hex-encoded digest, no algorithm prefix) |
 | `references` | string collection | Referenced store paths |
 | `registrationTime` | u64 | Registration timestamp |
 | `narSize` | u64 | NAR size in bytes |
@@ -452,7 +452,7 @@ Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection*
 | Category | Opcodes |
 |----------|---------|
 | Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStoreNar`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap` |
-| CA-aware (Phase 2c: writes/reads metadata; Phase 5: full cutoff) | `wopRegisterDrvOutput`, `wopQueryRealisation` |
+| Stubbed (no-op, accept and ignore — full CA support in Phase 2c/5) | `wopRegisterDrvOutput`, `wopQueryRealisation` |
 | Stubbed (accept & no-op) | `wopAddSignatures` |
 | Stubbed (returns empty) | `wopQueryPathFromHashPart` |
 | Rejected (STDERR_ERROR) | Everything else |
@@ -496,7 +496,6 @@ When a Nix client uses `--builders` (build hook mode) instead of `--store ssh-ng
 
 ## Key Files
 
-- `rio-gateway/src/server.rs` --- SSH server setup (russh)
-- `rio-gateway/src/session.rs` --- Per-client session state
-- `rio-gateway/src/handler.rs` --- Worker protocol opcode dispatch
-- `rio-gateway/src/translate.rs` --- Nix protocol <-> internal gRPC translation
+- `rio-build/src/gateway/server.rs` --- SSH server setup (russh)
+- `rio-build/src/gateway/session.rs` --- Per-client session state, opcode loop
+- `rio-build/src/gateway/handler.rs` --- Worker protocol opcode dispatch
