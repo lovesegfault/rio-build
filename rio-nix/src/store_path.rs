@@ -151,8 +151,8 @@ impl StorePath {
     /// `hash` is the content hash, `is_recursive` indicates NAR vs flat hashing.
     ///
     /// Nix algorithm: for fixed outputs, there's an inner hash step:
-    ///   inner = SHA-256("fixed:out:{r:}{algo}:{nix32hash}:")
-    ///   fingerprint = "output:out:sha256:{nix32(inner)}:/nix/store:{name}"
+    ///   inner = SHA-256("fixed:out:{r:}{algo}:{hex(hash)}:")
+    ///   fingerprint = "output:out:sha256:{hex(inner)}:/nix/store:{name}"
     ///   pathHash = compressHash(SHA-256(fingerprint))
     pub fn make_fixed_output(
         name: &str,
@@ -163,14 +163,14 @@ impl StorePath {
         let inner = format!(
             "fixed:out:{r_prefix}{}:{}:",
             hash.algo(),
-            nixbase32::encode(hash.digest()),
+            hex::encode(hash.digest()),
         );
         use sha2::{Digest, Sha256};
         let inner_digest = Sha256::digest(inner.as_bytes());
 
         let fingerprint = format!(
             "output:out:sha256:{}:{STORE_DIR}:{name}",
-            nixbase32::encode(&inner_digest),
+            hex::encode(inner_digest),
         );
         Self::from_fingerprint(name, &fingerprint)
     }
@@ -182,7 +182,7 @@ impl StorePath {
     ///
     /// Nix algorithm (single-level hash, no inner step):
     ///   type = "text" + ":" + ref1 + ":" + ref2 + ...
-    ///   fingerprint = "{type}:sha256:{nix32(hash)}:/nix/store:{name}"
+    ///   fingerprint = "{type}:sha256:{hex(hash)}:/nix/store:{name}"
     ///   pathHash = compressHash(SHA-256(fingerprint))
     pub fn make_text(
         name: &str,
@@ -197,7 +197,7 @@ impl StorePath {
 
         let fingerprint = format!(
             "{type_str}:sha256:{}:{STORE_DIR}:{name}",
-            nixbase32::encode(hash.digest()),
+            hex::encode(hash.digest()),
         );
         Self::from_fingerprint(name, &fingerprint)
     }
