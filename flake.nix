@@ -2,6 +2,14 @@
   description = "rio-build - Nix build orchestration";
 
   inputs = {
+    nix = {
+      url = "github:NixOS/Nix/2.33.3";
+      inputs = {
+        flake-parts.follows = "flake-parts";
+        git-hooks-nix.follows = "git-hooks-nix";
+      };
+    };
+
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     flake-parts = {
@@ -282,7 +290,7 @@
                 inherit cargoArtifacts;
                 cargoNextestExtraArgs = "--no-tests=warn";
                 nativeCheckInputs = with pkgs; [
-                  nix
+                  inputs.nix.packages.${system}.default
                   openssh
                 ];
               }
@@ -307,7 +315,7 @@
                 nativeBuildInputs =
                   (commonArgs.nativeBuildInputs or [ ])
                   ++ (with pkgs; [
-                    nix
+                    inputs.nix.packages.${system}.default
                     openssh
                   ]);
               }
