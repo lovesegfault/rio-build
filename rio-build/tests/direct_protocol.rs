@@ -1845,3 +1845,223 @@ async fn test_query_realisation_stub() {
     })
     .await;
 }
+
+/// wopEnsurePath (10): unparseable store path still returns success.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ensure_path_unparseable() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopEnsurePath (10) with garbage path
+            wire::write_u64(&mut s, 10).await.unwrap();
+            wire::write_string(&mut s, "not-a-store-path")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            // EnsurePath always returns success
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                result, 1,
+                "ensure_path should return success unconditionally"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopAddToStoreNar (39): oversized nar_size should be rejected with STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_nar_oversized() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddToStoreNar (39)
+            wire::write_u64(&mut s, 39).await.unwrap();
+
+            // Metadata fields
+            wire::write_string(&mut s, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test")
+                .await
+                .unwrap(); // path
+            wire::write_string(&mut s, "").await.unwrap(); // deriver
+            wire::write_string(
+                &mut s,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .await
+            .unwrap(); // narHash
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references
+            wire::write_u64(&mut s, 0).await.unwrap(); // registrationTime
+            wire::write_u64(&mut s, u64::MAX).await.unwrap(); // narSize (way too large)
+            wire::write_u64(&mut s, 1).await.unwrap(); // ultimate
+            wire::write_strings(&mut s, &[]).await.unwrap(); // sigs
+            wire::write_string(&mut s, "").await.unwrap(); // ca
+            wire::write_u64(&mut s, 0).await.unwrap(); // repair
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_ERROR
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_ERROR,
+                "oversized nar_size should produce STDERR_ERROR"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopAddToStore (7): flat:sha256 content-address mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_flat_mode() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddToStore (7)
+            wire::write_u64(&mut s, 7).await.unwrap();
+
+            wire::write_string(&mut s, "flat-test").await.unwrap(); // name
+            wire::write_string(&mut s, "fixed:sha256").await.unwrap(); // cam_str (flat mode)
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references
+            wire::write_u64(&mut s, 0).await.unwrap(); // repair (bool)
+
+            // Framed stream: flat file content (not a NAR)
+            let content = b"hello flat world";
+            wire::write_u64(&mut s, content.len() as u64).await.unwrap();
+            s.write_all(content).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // end of framed stream
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_LAST + ValidPathInfo
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+
+            // Read ValidPathInfo: path
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                path.starts_with("/nix/store/"),
+                "expected a store path, got: {path}"
+            );
+            assert!(
+                path.ends_with("-flat-test"),
+                "path should end with '-flat-test', got: {path}"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopBuildDerivation (36): unknown build mode defaults to Normal (not STDERR_ERROR).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_derivation_unknown_build_mode() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildDerivation (36)
+            wire::write_u64(&mut s, 36).await.unwrap();
+
+            // drvPath
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test.drv",
+            )
+            .await
+            .unwrap();
+
+            // BasicDerivation: 1 output
+            wire::write_u64(&mut s, 1).await.unwrap();
+            wire::write_string(&mut s, "out").await.unwrap();
+            wire::write_string(&mut s, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test")
+                .await
+                .unwrap();
+            wire::write_string(&mut s, "").await.unwrap(); // hashAlgo
+            wire::write_string(&mut s, "").await.unwrap(); // hash
+
+            // inputSrcs, platform, builder, args, env
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_string(&mut s, "x86_64-linux").await.unwrap();
+            wire::write_string(&mut s, "/bin/sh").await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // env pairs count
+
+            // Unknown build mode 99
+            wire::write_u64(&mut s, 99).await.unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_LAST + BuildResult (not STDERR_ERROR)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_LAST,
+                "unknown build mode should not produce STDERR_ERROR"
+            );
+
+            // Read BuildResult status
+            let status = wire::read_u64(&mut s).await.unwrap();
+            // Should be a valid BuildResult (failure is fine since daemon may not be available)
+            assert!(status <= 14, "status {status} out of BuildResult range");
+        })
+    })
+    .await;
+}
+
+/// wopAddTextToStore (8): non-empty references produce a different store path
+/// than empty references.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_text_to_store_with_references() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            let text = "hello world";
+
+            // First: add text with empty references
+            wire::write_u64(&mut s, 8).await.unwrap(); // wopAddTextToStore
+            wire::write_string(&mut s, "test-file").await.unwrap();
+            wire::write_string(&mut s, text).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap(); // no references
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let path_no_refs = wire::read_string(&mut s).await.unwrap();
+
+            // Second: add text with a reference
+            wire::write_u64(&mut s, 8).await.unwrap(); // wopAddTextToStore
+            wire::write_string(&mut s, "test-file").await.unwrap();
+            wire::write_string(&mut s, text).await.unwrap();
+            wire::write_strings(
+                &mut s,
+                &["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string()],
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let path_with_refs = wire::read_string(&mut s).await.unwrap();
+
+            // Paths should differ because references are part of the text store path fingerprint
+            assert_ne!(
+                path_no_refs, path_with_refs,
+                "text store path should differ when references are included"
+            );
+        })
+    })
+    .await;
+}
