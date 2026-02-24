@@ -860,14 +860,18 @@ fn try_cache_drv(
     let drv_bytes = match rio_nix::nar::extract_single_file(nar_data) {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!(path = %path, error = %e, "failed to extract .drv from NAR, skipping cache");
+            error!(path = %path, error = %e,
+                   "failed to extract .drv from NAR; \
+                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
             return;
         }
     };
     let drv_text = match String::from_utf8(drv_bytes) {
         Ok(text) => text,
         Err(e) => {
-            warn!(path = %path, error = %e, "failed to decode .drv as UTF-8, skipping cache");
+            error!(path = %path, error = %e,
+                   "failed to decode .drv as UTF-8; \
+                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
             return;
         }
     };
@@ -877,7 +881,9 @@ fn try_cache_drv(
             drv_cache.insert(path.clone(), drv);
         }
         Err(e) => {
-            warn!(path = %path, error = %e, "failed to parse .drv ATerm, skipping cache");
+            error!(path = %path, error = %e,
+                   "failed to parse .drv ATerm; \
+                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
         }
     }
 }
