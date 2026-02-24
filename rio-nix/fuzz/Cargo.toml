@@ -47,3 +47,9 @@ name = "narinfo_parsing"
 path = "fuzz_targets/narinfo_parsing.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "build_result_parsing"
+path = "fuzz_targets/build_result_parsing.rs"
+test = false
+doc = false
