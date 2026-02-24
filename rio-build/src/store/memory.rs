@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use rio_nix::store_path::StorePath;
 use tracing::{debug, warn};
 
-use super::traits::{PathInfo, PathInfoBuilder, Store};
+use super::traits::{NarReader, PathInfo, PathInfoBuilder, Store};
 
 /// Inner state protected by a single `RwLock`, ensuring atomicity of
 /// insert operations across both maps.
@@ -110,8 +110,13 @@ impl Store for MemoryStore {
         Ok(valid)
     }
 
-    async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(self.read_inner().nars.get(path).cloned())
+    async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<NarReader>> {
+        Ok(self
+            .read_inner()
+            .nars
+            .get(path)
+            .cloned()
+            .map(|data| Box::new(std::io::Cursor::new(data)) as NarReader))
     }
 
     async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()> {
@@ -238,6 +243,7 @@ pub fn import_from_nix_store(store_path: &str) -> anyhow::Result<(PathInfo, Vec<
 #[cfg(test)]
 mod tests {
     use rio_nix::hash::{HashAlgo, NixHash};
+    use tokio::io::AsyncReadExt;
 
     use super::*;
 
@@ -276,10 +282,10 @@ mod tests {
         assert!(store.is_valid_path(&path).await.unwrap());
         let queried = store.query_path_info(&path).await.unwrap().unwrap();
         assert_eq!(queried.nar_size(), 12345);
-        assert_eq!(
-            store.nar_from_path(&path).await.unwrap().unwrap(),
-            b"fake nar content"
-        );
+        let mut reader = store.nar_from_path(&path).await.unwrap().unwrap();
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, b"fake nar content");
     }
 
     #[tokio::test]
@@ -320,10 +326,10 @@ mod tests {
         store.add_path(info, b"nar data".to_vec()).await.unwrap();
 
         assert!(store.is_valid_path(&path).await.unwrap());
-        assert_eq!(
-            store.nar_from_path(&path).await.unwrap().unwrap(),
-            b"nar data"
-        );
+        let mut reader = store.nar_from_path(&path).await.unwrap().unwrap();
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, b"nar data");
     }
 
     #[tokio::test]
@@ -340,6 +346,9 @@ mod tests {
         store.add_path(info, b"second".to_vec()).await.unwrap();
 
         // Original data should be preserved
-        assert_eq!(store.nar_from_path(&path).await.unwrap().unwrap(), b"first");
+        let mut reader = store.nar_from_path(&path).await.unwrap().unwrap();
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, b"first");
     }
 }
