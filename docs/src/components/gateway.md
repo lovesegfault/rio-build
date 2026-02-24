@@ -114,7 +114,7 @@ Each entry in the byte stream contains:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pathInfo` | (same fields as wopAddToStoreNar metadata) | Path metadata |
+| `pathInfo` | (same fields as wopAddToStoreNar metadata, minus the trailing `repair` flag) | Path metadata |
 | NAR data | embedded framed stream | The NAR content (this inner framed stream IS frame-aligned) |
 
 The outer framed stream terminates with a `u64(0)` sentinel.
