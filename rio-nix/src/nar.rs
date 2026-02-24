@@ -599,6 +599,53 @@ mod tests {
         assert!(matches!(result, Err(NarError::UnknownNodeType(ref t)) if t == "fifo"));
     }
 
+    #[test]
+    fn rejects_unsorted_directory_entries() {
+        // Construct NAR bytes with directory entries in reverse order ("z" before "a")
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "directory").unwrap();
+
+        // First entry: "z_file"
+        write_str(&mut buf, "entry").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "name").unwrap();
+        write_str(&mut buf, "z_file").unwrap();
+        write_str(&mut buf, "node").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "regular").unwrap();
+        write_str(&mut buf, "contents").unwrap();
+        write_bytes(&mut buf, b"z content").unwrap();
+        write_str(&mut buf, ")").unwrap(); // close node
+        write_str(&mut buf, ")").unwrap(); // close entry
+
+        // Second entry: "a_file" (out of order!)
+        write_str(&mut buf, "entry").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "name").unwrap();
+        write_str(&mut buf, "a_file").unwrap();
+        write_str(&mut buf, "node").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "regular").unwrap();
+        write_str(&mut buf, "contents").unwrap();
+        write_bytes(&mut buf, b"a content").unwrap();
+        write_str(&mut buf, ")").unwrap(); // close node
+        write_str(&mut buf, ")").unwrap(); // close entry
+
+        write_str(&mut buf, ")").unwrap(); // close directory
+
+        let result = parse(&mut Cursor::new(&buf));
+        assert!(
+            matches!(result, Err(NarError::UnsortedEntries { ref prev, ref cur })
+                     if prev == "z_file" && cur == "a_file"),
+            "expected UnsortedEntries error, got: {result:?}"
+        );
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
