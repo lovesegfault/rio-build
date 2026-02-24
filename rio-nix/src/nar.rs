@@ -231,9 +231,16 @@ fn parse_regular(r: &mut impl Read) -> Result<NarNode> {
             let contents = read_bytes_bounded(r, MAX_CONTENT_SIZE)?;
             (false, contents)
         }
+        ")" => {
+            // Empty file with no "contents" field: ( type regular )
+            return Ok(NarNode::Regular {
+                executable: false,
+                contents: vec![],
+            });
+        }
         _ => {
             return Err(NarError::UnexpectedToken {
-                expected: "\"executable\" or \"contents\"".to_string(),
+                expected: "\"executable\" or \"contents\" or \")\"".to_string(),
                 got: token,
             });
         }
@@ -567,6 +574,27 @@ mod tests {
 
         let parsed = parse(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(parsed, node);
+    }
+
+    #[test]
+    fn parse_empty_regular_no_contents() {
+        // NAR allows empty regular files without a "contents" field:
+        // nix-archive-1 ( type regular )
+        let mut buf = Vec::new();
+        write_str(&mut buf, "nix-archive-1").unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "regular").unwrap();
+        write_str(&mut buf, ")").unwrap();
+
+        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(
+            parsed,
+            NarNode::Regular {
+                executable: false,
+                contents: vec![],
+            }
+        );
     }
 
     #[test]
