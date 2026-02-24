@@ -685,7 +685,18 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     // Read NAR data as framed stream (protocol >= 1.23, always true for 1.37+).
     // read_framed_stream enforces MAX_FRAMED_TOTAL (1 GiB) and MAX_FRAME_SIZE (64 MiB).
-    let nar_data = wire::read_framed_stream(reader).await?;
+    let nar_data = match wire::read_framed_stream(reader).await {
+        Ok(data) => data,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to read NAR data for '{path_str}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("failed to read NAR data: {e}"));
+        }
+    };
 
     // Validate NAR hash
     let computed_hash = {
@@ -978,7 +989,18 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     debug!(name = %name, cam_str = %cam_str, "wopAddToStore");
 
     // Read the dump data via framed stream
-    let dump_data = wire::read_framed_stream(reader).await?;
+    let dump_data = match wire::read_framed_stream(reader).await {
+        Ok(data) => data,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to read dump data for '{name}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("failed to read dump data: {e}"));
+        }
+    };
 
     // Parse content-address method string: "text:sha256", "fixed:sha256", "fixed:r:sha256"
     let (is_text, is_recursive, hash_algo) = match parse_cam_str(&cam_str) {
@@ -1271,7 +1293,18 @@ async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpi
     debug!("wopAddMultipleToStore");
 
     // Read the outer framed stream into a contiguous buffer
-    let stream_data = wire::read_framed_stream(reader).await?;
+    let stream_data = match wire::read_framed_stream(reader).await {
+        Ok(data) => data,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("wopAddMultipleToStore: failed to read framed stream: {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("failed to read framed stream: {e}"));
+        }
+    };
 
     // Parse entries sequentially from the reassembled stream
     let mut cursor = std::io::Cursor::new(stream_data.as_slice());
