@@ -1326,7 +1326,18 @@ async fn handle_query_derivation_output_map<R: AsyncRead + Unpin, W: AsyncWrite 
                 return Err(anyhow::anyhow!("failed to extract .drv from NAR: {e}"));
             }
         };
-        let drv_text = String::from_utf8_lossy(&drv_bytes);
+        let drv_text = match String::from_utf8(drv_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("derivation '{drv_path_str}' contains invalid UTF-8: {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("invalid UTF-8 in .drv: {e}"));
+            }
+        };
         let drv = match Derivation::parse(&drv_text) {
             Ok(drv) => drv,
             Err(e) => {
@@ -1534,7 +1545,18 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                 return Err(anyhow::anyhow!("NAR extract: {e}"));
                             }
                         };
-                        let text = String::from_utf8_lossy(&bytes);
+                        let text = match String::from_utf8(bytes) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                stderr
+                                    .error(&StderrError::simple(
+                                        PROGRAM_NAME,
+                                        format!("invalid UTF-8 in .drv '{}': {}", drv, e),
+                                    ))
+                                    .await?;
+                                return Err(anyhow::anyhow!("invalid UTF-8 in .drv: {e}"));
+                            }
+                        };
                         let parsed = match Derivation::parse(&text) {
                             Ok(d) => d,
                             Err(e) => {
@@ -1684,7 +1706,16 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                                 continue;
                             }
                         };
-                        let text = String::from_utf8_lossy(&bytes);
+                        let text = match String::from_utf8(bytes) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                results.push(BuildResult::failure(
+                                    BuildStatus::MiscFailure,
+                                    format!("invalid UTF-8 in .drv '{}': {e}", drv),
+                                ));
+                                continue;
+                            }
+                        };
                         match Derivation::parse(&text) {
                             Ok(parsed) => {
                                 drv_cache.insert(drv.clone(), parsed.clone());
@@ -1765,7 +1796,7 @@ async fn build_via_local_daemon(
         .arg("--stdio")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
 
     let mut daemon_stdin = match daemon.stdin.take() {
@@ -1837,8 +1868,18 @@ async fn build_via_local_daemon(
         }
     };
 
+    // Kill daemon first, then capture stderr (read_to_end needs EOF from process exit)
+    let mut stderr_pipe = daemon.stderr.take();
     if let Err(e) = daemon.kill().await {
         warn!(drv_path = %drv_path, error = %e, "failed to kill local daemon process");
+    }
+    if let Some(ref mut pipe) = stderr_pipe {
+        let mut buf = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf).await;
+        if !buf.is_empty() {
+            let text = String::from_utf8_lossy(&buf);
+            warn!(drv_path = %drv_path, stderr = %text, "nix-daemon stderr output");
+        }
     }
 
     result
