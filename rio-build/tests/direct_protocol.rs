@@ -380,20 +380,17 @@ async fn test_query_path_from_hash_part_found() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_add_signatures() {
-    let store = Arc::new(MemoryStore::new());
+    let store = make_test_store();
     run_test(store, |s| {
         tokio::spawn(async move {
             let mut s = s;
             do_handshake(&mut s).await;
 
+            let test_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
+
             // wopAddSignatures (37): send a path + string collection of sigs
             wire::write_u64(&mut s, 37).await.unwrap();
-            wire::write_string(
-                &mut s,
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
-            )
-            .await
-            .unwrap();
+            wire::write_string(&mut s, test_path).await.unwrap();
             let sigs = vec![
                 "cache.example.com:fakesig1".to_string(),
                 "cache.example.com:fakesig2".to_string(),
@@ -405,6 +402,33 @@ async fn test_add_signatures() {
             assert_eq!(last, STDERR_LAST);
             let result = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(result, 1);
+
+            // Verify signatures persisted via wopQueryPathInfo (26)
+            wire::write_u64(&mut s, 26).await.unwrap();
+            wire::write_string(&mut s, test_path).await.unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let valid = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(valid, 1, "path should be valid");
+
+            let _deriver = wire::read_string(&mut s).await.unwrap();
+            let _nar_hash = wire::read_string(&mut s).await.unwrap();
+            let _refs = wire::read_strings(&mut s).await.unwrap();
+            let _reg_time = wire::read_u64(&mut s).await.unwrap();
+            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+            let _ultimate = wire::read_u64(&mut s).await.unwrap();
+            let queried_sigs = wire::read_strings(&mut s).await.unwrap();
+
+            assert_eq!(
+                queried_sigs,
+                vec![
+                    "cache.example.com:fakesig1".to_string(),
+                    "cache.example.com:fakesig2".to_string(),
+                ],
+                "signatures should be visible via QueryPathInfo"
+            );
         })
     })
     .await;

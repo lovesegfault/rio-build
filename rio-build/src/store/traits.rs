@@ -121,6 +121,16 @@ impl PathInfo {
         &self.sigs
     }
 
+    /// Merge additional signatures into this path's signature set.
+    /// Duplicates are ignored (set-union semantics, matching nix-daemon).
+    pub fn add_sigs(&mut self, new_sigs: impl IntoIterator<Item = String>) {
+        for sig in new_sigs {
+            if !self.sigs.contains(&sig) {
+                self.sigs.push(sig);
+            }
+        }
+    }
+
     /// Content address (empty for input-addressed paths).
     pub fn ca(&self) -> Option<&str> {
         self.ca.as_deref()
@@ -262,6 +272,12 @@ pub trait Store: Send + Sync {
     /// Returns `Some(path)` if a stored path's hash part matches, `None` otherwise.
     async fn query_path_from_hash_part(&self, hash_part: &str)
     -> anyhow::Result<Option<StorePath>>;
+
+    /// Add signatures to an existing store path.
+    ///
+    /// If the path doesn't exist, this is a no-op (returns `Ok`).
+    /// Signature deduplication uses set-union semantics.
+    async fn add_signatures(&self, path: &StorePath, sigs: Vec<String>) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]
@@ -302,5 +318,21 @@ mod tests {
     fn path_info_accepts_valid_sha256() {
         let result = PathInfoBuilder::new(test_path(), sha256_hash(), 100).build();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn add_sigs_merges_and_deduplicates() {
+        let mut info = PathInfoBuilder::new(test_path(), sha256_hash(), 100)
+            .sigs(vec!["key1:sig1".to_string()])
+            .build()
+            .unwrap();
+
+        // Add new + duplicate
+        info.add_sigs(vec!["key2:sig2".to_string(), "key1:sig1".to_string()]);
+        assert_eq!(info.sigs(), &["key1:sig1", "key2:sig2"]);
+
+        // Add only duplicates — no change
+        info.add_sigs(vec!["key1:sig1".to_string()]);
+        assert_eq!(info.sigs(), &["key1:sig1", "key2:sig2"]);
     }
 }

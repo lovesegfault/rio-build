@@ -134,6 +134,14 @@ impl Store for MemoryStore {
             .cloned())
     }
 
+    async fn add_signatures(&self, path: &StorePath, sigs: Vec<String>) -> anyhow::Result<()> {
+        let mut inner = self.write_inner();
+        if let Some(info) = inner.paths.get_mut(path) {
+            info.add_sigs(sigs);
+        }
+        Ok(())
+    }
+
     async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()> {
         let key = info.path().clone();
         debug!(path = %key, "adding path to memory store");
@@ -365,5 +373,45 @@ mod tests {
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.unwrap();
         assert_eq!(data, b"first");
+    }
+
+    #[tokio::test]
+    async fn test_add_signatures_to_existing_path() {
+        let store = MemoryStore::new();
+        let info = make_test_path_info();
+        let path = info.path().clone();
+        store.insert(info, None);
+
+        store
+            .add_signatures(&path, vec!["key1:sig1".to_string()])
+            .await
+            .unwrap();
+
+        let queried = store.query_path_info(&path).await.unwrap().unwrap();
+        assert_eq!(queried.sigs(), &["key1:sig1"]);
+
+        // Add more, including a duplicate
+        store
+            .add_signatures(
+                &path,
+                vec!["key2:sig2".to_string(), "key1:sig1".to_string()],
+            )
+            .await
+            .unwrap();
+        let queried = store.query_path_info(&path).await.unwrap().unwrap();
+        assert_eq!(queried.sigs(), &["key1:sig1", "key2:sig2"]);
+    }
+
+    #[tokio::test]
+    async fn test_add_signatures_to_missing_path() {
+        let store = MemoryStore::new();
+        let path =
+            StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-missing-1.0").unwrap();
+
+        // Should succeed as a no-op
+        store
+            .add_signatures(&path, vec!["key1:sig1".to_string()])
+            .await
+            .unwrap();
     }
 }
