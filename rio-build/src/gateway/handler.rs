@@ -1699,7 +1699,10 @@ async fn build_via_local_daemon(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!("failed to spawn nix-daemon --stdio (is nix-daemon in PATH?): {e}")
+        })?;
 
     let mut daemon_stdin = match daemon.stdin.take() {
         Some(s) => s,
@@ -1763,6 +1766,7 @@ async fn build_via_local_daemon(
             if let Err(e) = daemon.kill().await {
                 warn!(drv_path = %drv_path, error = %e, "failed to kill local daemon after timeout");
             }
+            let _ = daemon.wait().await;
             return Err(anyhow::anyhow!(
                 "local daemon build timed out after {}s",
                 timeout.as_secs()
@@ -1775,6 +1779,8 @@ async fn build_via_local_daemon(
     if let Err(e) = daemon.kill().await {
         warn!(drv_path = %drv_path, error = %e, "failed to kill local daemon process");
     }
+    // Reap the process to prevent zombie accumulation
+    let _ = daemon.wait().await;
     if let Some(ref mut pipe) = stderr_pipe {
         let mut buf = Vec::new();
         let _ = tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf).await;

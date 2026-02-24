@@ -205,6 +205,11 @@ pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireErr
                     e.message()
                 ))));
             }
+            StderrMessage::Read(_) => {
+                return Err(WireError::Io(std::io::Error::other(
+                    "unexpected STDERR_READ during drain",
+                )));
+            }
             _ => {} // discard log/activity messages
         }
     }
@@ -347,7 +352,16 @@ pub async fn client_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin
                     e.message().to_string(),
                 ));
             }
-            _ => {} // discard log/activity messages for now
+            StderrMessage::Next(msg) => {
+                tracing::debug!(target: "nix-daemon", "{}", msg);
+            }
+            StderrMessage::Read(_) => {
+                return Ok(BuildResult::failure(
+                    BuildStatus::MiscFailure,
+                    "daemon sent STDERR_READ, not supported for build forwarding".to_string(),
+                ));
+            }
+            _ => {} // discard activity messages
         }
     }
 
