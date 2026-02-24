@@ -1320,3 +1320,456 @@ async fn test_add_multiple_to_store_hash_mismatch() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1b: additional opcode byte-level tests
+// ---------------------------------------------------------------------------
+
+/// wopEnsurePath (10): valid path returns STDERR_LAST + u64(1).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ensure_path_success() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopEnsurePath (10)
+            wire::write_u64(&mut s, 10).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1, "EnsurePath should return success for valid path");
+        })
+    })
+    .await;
+}
+
+/// wopEnsurePath (10): missing path still returns STDERR_LAST + u64(1).
+/// EnsurePath never errors — it returns success even for missing paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ensure_path_missing() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopEnsurePath (10) with unknown path
+            wire::write_u64(&mut s, 10).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                result, 1,
+                "EnsurePath should return success even for missing path"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopAddTextToStore (8): import a text file, get back a /nix/store/ path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_text_to_store() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddTextToStore (8)
+            wire::write_u64(&mut s, 8).await.unwrap();
+            wire::write_string(&mut s, "test.txt").await.unwrap(); // name
+            wire::write_string(&mut s, "hello world").await.unwrap(); // text
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references (empty)
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                path.starts_with("/nix/store/"),
+                "expected store path, got: {path}"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopAddToStore (7) with text mode: send framed data, get ValidPathInfo back.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_text_mode() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddToStore (7)
+            wire::write_u64(&mut s, 7).await.unwrap();
+            wire::write_string(&mut s, "test.txt").await.unwrap(); // name
+            wire::write_string(&mut s, "text:sha256").await.unwrap(); // cam_str
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references (empty)
+            wire::write_u64(&mut s, 0).await.unwrap(); // repair = false (wire bool)
+
+            // Framed data stream containing "hello world"
+            let data = b"hello world";
+            wire::write_u64(&mut s, data.len() as u64).await.unwrap(); // frame length
+            s.write_all(data).await.unwrap(); // frame data (no padding in framed stream)
+            wire::write_u64(&mut s, 0).await.unwrap(); // end-of-stream sentinel
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // Read full ValidPathInfo response
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                path.starts_with("/nix/store/"),
+                "expected store path, got: {path}"
+            );
+            let _deriver = wire::read_string(&mut s).await.unwrap();
+            let nar_hash = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(
+                nar_hash.len(),
+                64,
+                "expected 64-char hex hash, got: {nar_hash}"
+            );
+            let _refs = wire::read_strings(&mut s).await.unwrap();
+            let _reg_time = wire::read_u64(&mut s).await.unwrap();
+            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+            let _ultimate = wire::read_u64(&mut s).await.unwrap();
+            let _sigs = wire::read_strings(&mut s).await.unwrap();
+            let _ca = wire::read_string(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+/// wopBuildDerivation (36): when nix-daemon is unavailable, expect
+/// STDERR_LAST + BuildResult with MiscFailure (not a connection drop).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_derivation_daemon_unavailable() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildDerivation (36)
+            wire::write_u64(&mut s, 36).await.unwrap();
+
+            // drvPath
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test.drv",
+            )
+            .await
+            .unwrap();
+
+            // BasicDerivation wire format:
+            // outputs: count + per-output (name, path, hashAlgo, hash)
+            wire::write_u64(&mut s, 1).await.unwrap(); // 1 output
+            wire::write_string(&mut s, "out").await.unwrap();
+            wire::write_string(&mut s, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test")
+                .await
+                .unwrap();
+            wire::write_string(&mut s, "").await.unwrap(); // hashAlgo
+            wire::write_string(&mut s, "").await.unwrap(); // hash
+
+            // inputSrcs: empty
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            // platform
+            wire::write_string(&mut s, "x86_64-linux").await.unwrap();
+            // builder
+            wire::write_string(&mut s, "/bin/sh").await.unwrap();
+            // args: ["-c"]
+            let args = vec!["-c".to_string()];
+            wire::write_strings(&mut s, &args).await.unwrap();
+            // env: [("out", "/nix/store/...")]
+            wire::write_u64(&mut s, 1).await.unwrap(); // 1 pair
+            wire::write_string(&mut s, "out").await.unwrap();
+            wire::write_string(&mut s, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test")
+                .await
+                .unwrap();
+
+            // buildMode: Normal (0)
+            wire::write_u64(&mut s, 0).await.unwrap();
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST (not STDERR_ERROR) — daemon errors become BuildResult failures
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                last, STDERR_LAST,
+                "expected STDERR_LAST, daemon errors should be wrapped in BuildResult"
+            );
+
+            // Read BuildResult
+            let status = wire::read_u64(&mut s).await.unwrap();
+            assert_ne!(
+                status, 0,
+                "status should NOT be Built(0) since the derivation cannot be built"
+            );
+            // The exact failure status depends on whether nix-daemon is available:
+            // - If unavailable: MiscFailure (9) from build_via_local_daemon error path
+            // - If available: PermanentFailure (3) or other from the actual daemon
+            // Either way, it must not be a success status (0=Built, 1=Substituted,
+            // 2=AlreadyValid, 13=ResolvesToAlreadyValid).
+            assert!(
+                status >= 3 && status != 13,
+                "expected a failure status, got {status}"
+            );
+            let _error_msg = wire::read_string(&mut s).await.unwrap();
+            let _times_built = wire::read_u64(&mut s).await.unwrap();
+            let _is_non_deterministic = wire::read_u64(&mut s).await.unwrap();
+            let _start_time = wire::read_u64(&mut s).await.unwrap();
+            let _stop_time = wire::read_u64(&mut s).await.unwrap();
+
+            // cpu_user: optional (tag + optional value)
+            let cpu_user_tag = wire::read_u64(&mut s).await.unwrap();
+            if cpu_user_tag == 1 {
+                let _cpu_user_val = wire::read_u64(&mut s).await.unwrap();
+            }
+            // cpu_system: optional (tag + optional value)
+            let cpu_system_tag = wire::read_u64(&mut s).await.unwrap();
+            if cpu_system_tag == 1 {
+                let _cpu_system_val = wire::read_u64(&mut s).await.unwrap();
+            }
+
+            // builtOutputs count: 0 (build failed, so no outputs)
+            let built_outputs_count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(built_outputs_count, 0, "expected no built outputs");
+        })
+    })
+    .await;
+}
+
+/// wopBuildPaths (9): invalid DerivedPath should return STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_invalid_derived_path() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildPaths (9)
+            wire::write_u64(&mut s, 9).await.unwrap();
+            let paths = vec!["not-a-valid-path".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // buildMode: Normal
+            s.flush().await.unwrap();
+
+            // Expect STDERR_ERROR (path can't be parsed as DerivedPath)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_ERROR,
+                "expected STDERR_ERROR for invalid DerivedPath"
+            );
+
+            // Read error structure
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                !message.is_empty(),
+                "error message should describe the invalid path"
+            );
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+/// wopBuildPathsWithResults (46): opaque path not in store gets MiscFailure.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_with_results_opaque_not_found() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildPathsWithResults (46)
+            wire::write_u64(&mut s, 46).await.unwrap();
+            let paths = vec!["/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // buildMode: Normal
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST (not STDERR_ERROR — per-path errors are in results)
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // Read count
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 1, "expected 1 result");
+
+            // Read DerivedPath key
+            let dp_key = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(
+                dp_key,
+                "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0"
+            );
+
+            // Read BuildResult
+            let status = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(status, 9, "expected MiscFailure(9) for missing opaque path");
+            let error_msg = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                !error_msg.is_empty(),
+                "error message should describe the missing path"
+            );
+            let _times_built = wire::read_u64(&mut s).await.unwrap();
+            let _is_non_deterministic = wire::read_u64(&mut s).await.unwrap();
+            let _start_time = wire::read_u64(&mut s).await.unwrap();
+            let _stop_time = wire::read_u64(&mut s).await.unwrap();
+            let _cpu_user_tag = wire::read_u64(&mut s).await.unwrap();
+            let _cpu_system_tag = wire::read_u64(&mut s).await.unwrap();
+            let built_outputs_count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(built_outputs_count, 0);
+        })
+    })
+    .await;
+}
+
+/// wopBuildPathsWithResults (46): batch with valid + unparseable paths
+/// continues processing all entries without aborting.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_with_results_batch_continues() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildPathsWithResults (46)
+            wire::write_u64(&mut s, 46).await.unwrap();
+            let paths = vec![
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string(),
+                "not-a-valid!!path".to_string(),
+            ];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // buildMode: Normal
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST (batch errors don't abort)
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                last, STDERR_LAST,
+                "expected STDERR_LAST for batch operation"
+            );
+
+            // Read count
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 2, "expected 2 results");
+
+            // --- First result: valid path should be AlreadyValid (2) ---
+            let dp1 = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(
+                dp1,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
+            );
+            let status1 = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                status1, 2,
+                "expected AlreadyValid(2) for existing path, got {status1}"
+            );
+            let _error_msg1 = wire::read_string(&mut s).await.unwrap();
+            let _times_built1 = wire::read_u64(&mut s).await.unwrap();
+            let _is_non_det1 = wire::read_u64(&mut s).await.unwrap();
+            let _start1 = wire::read_u64(&mut s).await.unwrap();
+            let _stop1 = wire::read_u64(&mut s).await.unwrap();
+            let _cpu_user_tag1 = wire::read_u64(&mut s).await.unwrap();
+            let _cpu_system_tag1 = wire::read_u64(&mut s).await.unwrap();
+            let _built_outputs1 = wire::read_u64(&mut s).await.unwrap();
+
+            // --- Second result: unparseable path should be MiscFailure (9) ---
+            let dp2 = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(dp2, "not-a-valid!!path");
+            let status2 = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                status2, 9,
+                "expected MiscFailure(9) for unparseable path, got {status2}"
+            );
+            let error_msg2 = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                !error_msg2.is_empty(),
+                "error message should describe the parse failure"
+            );
+            let _times_built2 = wire::read_u64(&mut s).await.unwrap();
+            let _is_non_det2 = wire::read_u64(&mut s).await.unwrap();
+            let _start2 = wire::read_u64(&mut s).await.unwrap();
+            let _stop2 = wire::read_u64(&mut s).await.unwrap();
+            let _cpu_user_tag2 = wire::read_u64(&mut s).await.unwrap();
+            let _cpu_system_tag2 = wire::read_u64(&mut s).await.unwrap();
+            let _built_outputs2 = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+/// wopAddToStore (7): invalid content-address method string returns STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_invalid_cam() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddToStore (7) with bogus CAM string
+            wire::write_u64(&mut s, 7).await.unwrap();
+            wire::write_string(&mut s, "test.txt").await.unwrap(); // name
+            wire::write_string(&mut s, "bogus:sha256").await.unwrap(); // cam_str (invalid)
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references (empty)
+            wire::write_u64(&mut s, 0).await.unwrap(); // repair = false
+
+            // Framed data stream: "hello"
+            wire::write_u64(&mut s, 5).await.unwrap(); // frame length
+            s.write_all(b"hello").await.unwrap(); // frame data
+            wire::write_u64(&mut s, 0).await.unwrap(); // end-of-stream sentinel
+            s.flush().await.unwrap();
+
+            // Expect STDERR_ERROR (not a connection drop)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_ERROR,
+                "expected STDERR_ERROR for invalid CAM string"
+            );
+
+            // Read error structure
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                !message.is_empty(),
+                "error message should describe the invalid content-address method"
+            );
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
