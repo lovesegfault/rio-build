@@ -94,7 +94,7 @@ After sending the metadata fields, the NAR data is transferred as a **framed byt
 2. Chunk data is NOT padded (unlike string encoding)
 3. Server sends `STDERR_LAST` (`0x616c7473`) — no result value follows
 
-> **Correction (discovered during implementation review):** The original design described a `STDERR_READ` pull loop for NAR data transfer. This is only used for protocol versions 1.21-1.22. For protocol >= 1.23, the Nix C++ daemon uses `FramedSource` (`daemon.cc:918-923`), and the client sends data via `FramedSink` (`remote-store.cc:452-453`). The framed stream format is the same as used by `wopAddMultipleToStore`. Additionally, the original design omitted the `dontCheckSigs` field and incorrectly included a `u64(1)` result value after `STDERR_LAST`.
+> **Correction (discovered during implementation review):** The original design described a `STDERR_READ` pull loop for NAR data transfer. This is only used for protocol versions 1.21-1.22. For protocol >= 1.23, the Nix C++ daemon uses `FramedSource` (in the `wopAddToStoreNar` handler's `protoVersion >= 1.23` branch in `daemon.cc`), and the client sends data via `FramedSink` (in `RemoteStore::addToStore`). The framed stream format is the same as used by `wopAddMultipleToStore`. Additionally, the original design omitted the `dontCheckSigs` field and incorrectly included a `u64(1)` result value after `STDERR_LAST`.
 
 ### wopAddMultipleToStore (44) Wire Format
 
@@ -121,7 +121,7 @@ The outer framed stream terminates with a `u64(0)` sentinel.
 
 **`dontCheckSigs` handling:** The gateway always treats `dontCheckSigs` as `false` regardless of the value sent by the client. This is a security requirement --- remote clients must never bypass signature verification. The field is read and discarded to maintain wire compatibility.
 
-**Response:** The server sends `STDERR_LAST` with no result value (matching `daemon.cc:519-520`).
+**Response:** The server sends `STDERR_LAST` with no result value (matching the `wopAddMultipleToStore` handler's `logger->stopWork()` sequence in `daemon.cc`).
 
 ### DerivedPath Wire Format
 

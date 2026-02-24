@@ -226,9 +226,8 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// wopEnsurePath (10): Ensure a store path is valid/available.
 ///
 /// In the real nix-daemon, this may trigger substitution. For rio-build,
-/// all paths are either already uploaded or unavailable, so this always
-/// returns success (u64(1)). The validity check is logged but does not
-/// affect the response.
+/// missing paths are silently accepted (returns u64(1)) since rio-build
+/// has no substituters. Store I/O errors return STDERR_ERROR.
 #[instrument(skip_all)]
 async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -972,6 +971,9 @@ async fn parse_add_multiple_entry(
 /// Protocol >= 1.25: reads name, content-address method string, references,
 /// repair flag, then a framed data stream (NAR or flat file content).
 /// Returns STDERR_LAST + full ValidPathInfo.
+///
+/// Only the protocol >= 1.25 wire format is implemented (pre-1.25 used
+/// a different field ordering).
 #[instrument(skip_all)]
 async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,

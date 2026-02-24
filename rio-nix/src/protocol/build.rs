@@ -90,7 +90,10 @@ impl BuildStatus {
 
 /// A built output entry in a `BuildResult`.
 ///
-/// On the wire, this is a `DrvOutput` key + `Realisation` JSON value.
+/// On the wire, each entry is a `DrvOutput` key + `Realisation` JSON.
+/// Only the `outPath` field is preserved; `signatures` and
+/// `dependentRealisations` are discarded on read and synthesized
+/// empty on write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltOutput {
     /// DrvOutput ID string (e.g., "sha256:abcdef...!out").
