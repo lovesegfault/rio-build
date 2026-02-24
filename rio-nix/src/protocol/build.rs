@@ -209,14 +209,27 @@ impl BuildResult {
     ///
     /// Used when the local daemon returns a success status (e.g., AlreadyValid)
     /// but with empty builtOutputs — the remote client needs the output paths.
+    ///
+    /// **Known limitation (Phase 1b):** The `drv_output_id` is computed as
+    /// `SHA256(to_aterm())`, which is only correct for fixed-output derivations.
+    /// For input-addressed derivations, Nix uses `hashDerivationModulo` — a
+    /// recursive hash that replaces input drv paths with their modular hashes.
+    /// This means `drv_output_id` values will not match what clients compute
+    /// locally. In practice, this only affects `wopBuildPathsWithResults`
+    /// responses for `AlreadyValid` results, and Nix clients do not currently
+    /// cross-reference these IDs for input-addressed derivations.
+    ///
+    /// TODO: Implement `hashDerivationModulo` for correct DrvOutput IDs.
+    /// Ref: Nix C++ `hashDerivationModulo()` in `derivations.cc`.
+    #[allow(unused_variables)] // drv_path needed for future hashDerivationModulo
     pub fn with_outputs_from_drv(
         mut self,
         drv: &crate::derivation::Derivation,
-        _drv_path: &crate::store_path::StorePath,
+        drv_path: &crate::store_path::StorePath,
     ) -> Self {
         use sha2::{Digest, Sha256};
 
-        // Compute the derivation hash (SHA-256 of the .drv ATerm content)
+        // TODO: Use hashDerivationModulo instead of plain SHA-256 of ATerm
         let drv_aterm = drv.to_aterm();
         let drv_hash = hex::encode(Sha256::digest(drv_aterm.as_bytes()));
 
