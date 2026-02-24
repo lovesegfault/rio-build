@@ -384,16 +384,23 @@ fn node_from_path(path: &std::path::Path) -> Result<NarNode> {
 
     if metadata.is_symlink() {
         let target = std::fs::read_link(path)?;
-        Ok(NarNode::Symlink {
-            target: target.to_string_lossy().into_owned(),
-        })
+        let target = target.into_os_string().into_string().map_err(|os_str| {
+            NarError::Io(io::Error::other(format!(
+                "symlink target is not valid UTF-8: {os_str:?}"
+            )))
+        })?;
+        Ok(NarNode::Symlink { target })
     } else if metadata.is_dir() {
         let mut entries: Vec<NarEntry> = Vec::new();
         let mut dir_entries: Vec<_> = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
         dir_entries.sort_by_key(|e| e.file_name());
 
         for entry in dir_entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let name = entry.file_name().into_string().map_err(|os_str| {
+                NarError::Io(io::Error::other(format!(
+                    "directory entry name is not valid UTF-8: {os_str:?}"
+                )))
+            })?;
             let child_path = entry.path();
             let node = node_from_path(&child_path)?;
             entries.push(NarEntry { name, node });
