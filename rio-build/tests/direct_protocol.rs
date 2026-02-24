@@ -8,7 +8,7 @@ use rio_build::store::{MemoryStore, Store};
 use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::nar::{self, NarNode};
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
-use rio_nix::protocol::stderr::{STDERR_ERROR, STDERR_LAST, STDERR_READ};
+use rio_nix::protocol::stderr::{STDERR_ERROR, STDERR_LAST};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 use sha2::{Digest, Sha256};
@@ -997,35 +997,18 @@ async fn test_add_to_store_nar_direct() {
             wire::write_bool(&mut s, true).await.unwrap();
             wire::write_strings(&mut s, &[]).await.unwrap();
             wire::write_string(&mut s, "").await.unwrap();
-            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap(); // repair
+            wire::write_bool(&mut s, false).await.unwrap(); // dontCheckSigs
+
+            // Send NAR data as framed stream (protocol >= 1.23)
+            wire::write_framed_stream(&mut s, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
             s.flush().await.unwrap();
 
-            // Server will send STDERR_READ requests — respond with NAR data chunks
-            let mut sent = 0usize;
-            loop {
-                let msg = wire::read_u64(&mut s).await.unwrap();
-                if msg == STDERR_LAST {
-                    break;
-                }
-                if msg == STDERR_ERROR {
-                    let _error_type = wire::read_string(&mut s).await.unwrap();
-                    let _level = wire::read_u64(&mut s).await.unwrap();
-                    let _name = wire::read_string(&mut s).await.unwrap();
-                    let message = wire::read_string(&mut s).await.unwrap();
-                    panic!("unexpected STDERR_ERROR: {message}");
-                }
-                assert_eq!(msg, STDERR_READ, "expected STDERR_READ");
-                let requested = wire::read_u64(&mut s).await.unwrap() as usize;
-                let end = (sent + requested).min(nar_data.len());
-                let chunk = &nar_data[sent..end];
-                wire::write_bytes(&mut s, chunk).await.unwrap();
-                s.flush().await.unwrap();
-                sent = end;
-            }
-
-            // Read success response
-            let result = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(result, 1, "expected success (1)");
+            // Read STDERR_LAST (no result value for wopAddToStoreNar)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST, "expected STDERR_LAST");
         })
     })
     .await;
@@ -1076,11 +1059,9 @@ async fn test_add_multiple_to_store_direct() {
                 .unwrap();
             s.flush().await.unwrap();
 
-            // Read response
+            // Read STDERR_LAST (no result value for wopAddMultipleToStore)
             let msg = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(msg, STDERR_LAST);
-            let result = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(result, 1, "expected success (1)");
         })
     })
     .await;
@@ -1128,10 +1109,9 @@ async fn test_query_derivation_output_map_direct() {
                 .unwrap();
             s.flush().await.unwrap();
 
+            // Read STDERR_LAST (no result value for wopAddMultipleToStore)
             let msg = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(msg, STDERR_LAST);
-            let result = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(result, 1);
 
             // Now query the derivation output map (opcode 41)
             wire::write_u64(&mut s, 41).await.unwrap();
@@ -1229,33 +1209,26 @@ async fn test_add_to_store_nar_hash_mismatch() {
             wire::write_bool(&mut s, true).await.unwrap();
             wire::write_strings(&mut s, &[]).await.unwrap();
             wire::write_string(&mut s, "").await.unwrap();
-            wire::write_bool(&mut s, false).await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap(); // repair
+            wire::write_bool(&mut s, false).await.unwrap(); // dontCheckSigs
+
+            // Send NAR data as framed stream
+            wire::write_framed_stream(&mut s, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
             s.flush().await.unwrap();
 
-            // Respond to STDERR_READ requests with NAR data
-            let mut sent = 0usize;
-            loop {
-                let msg = wire::read_u64(&mut s).await.unwrap();
-                if msg == STDERR_ERROR {
-                    // Hash mismatch detected — read the error structure
-                    let _error_type = wire::read_string(&mut s).await.unwrap();
-                    let _level = wire::read_u64(&mut s).await.unwrap();
-                    let _name = wire::read_string(&mut s).await.unwrap();
-                    let message = wire::read_string(&mut s).await.unwrap();
-                    assert!(
-                        message.contains("hash mismatch"),
-                        "error should mention 'hash mismatch', got: {message}"
-                    );
-                    return;
-                }
-                assert_eq!(msg, STDERR_READ, "expected STDERR_READ or STDERR_ERROR");
-                let requested = wire::read_u64(&mut s).await.unwrap() as usize;
-                let end = (sent + requested).min(nar_data.len());
-                let chunk = &nar_data[sent..end];
-                wire::write_bytes(&mut s, chunk).await.unwrap();
-                s.flush().await.unwrap();
-                sent = end;
-            }
+            // Server should detect hash mismatch and send STDERR_ERROR
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_ERROR, "expected STDERR_ERROR for hash mismatch");
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("hash mismatch"),
+                "error should mention 'hash mismatch', got: {message}"
+            );
         })
     })
     .await;
@@ -1902,9 +1875,10 @@ async fn test_add_to_store_nar_oversized() {
             wire::write_strings(&mut s, &[]).await.unwrap(); // sigs
             wire::write_string(&mut s, "").await.unwrap(); // ca
             wire::write_u64(&mut s, 0).await.unwrap(); // repair
+            wire::write_u64(&mut s, 0).await.unwrap(); // dontCheckSigs
             s.flush().await.unwrap();
 
-            // Should receive STDERR_ERROR
+            // Should receive STDERR_ERROR (pre-read rejection for oversized nar_size)
             let msg = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(
                 msg, STDERR_ERROR,

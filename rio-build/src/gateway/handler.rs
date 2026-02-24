@@ -587,14 +587,14 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// wopAddToStoreNar (39): Receive a store path with NAR content via STDERR_READ pull loop.
+/// wopAddToStoreNar (39): Receive a store path with NAR content via framed stream.
 ///
-/// Protocol >= 1.25 (always present for 1.37+):
+/// Protocol >= 1.23 (always present for 1.37+):
 /// 1. Read metadata fields (path, deriver, narHash, references, registrationTime,
-///    narSize, ultimate, sigs, ca, repair)
-/// 2. Pull NAR data via STDERR_READ: send STDERR_READ(count) → client responds
-///    with u64(len) + data + padding → repeat until narSize bytes received
+///    narSize, ultimate, sigs, ca, repair, dontCheckSigs)
+/// 2. Read NAR data as a framed byte stream (u64 chunk lengths, terminated by u64(0))
 /// 3. Validate NAR hash, store path, cache .drv if applicable
+/// 4. Send STDERR_LAST (no result value — unlike wopAddToStore which returns ValidPathInfo)
 #[instrument(skip_all)]
 async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -615,6 +615,7 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let sigs = wire::read_strings(reader).await?;
     let ca_str = wire::read_string(reader).await?;
     let _repair = wire::read_bool(reader).await?;
+    let _dont_check_sigs = wire::read_bool(reader).await?; // always treated as false
 
     debug!(
         path = %path_str,
@@ -622,7 +623,8 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         "wopAddToStoreNar"
     );
 
-    // Validate nar_size before allocation (cap at 1 GiB to prevent OOM)
+    // Quick rejection for obviously oversized nar_size. We cannot drain the framed
+    // stream after rejection, so the connection will close (same as unknown opcodes).
     if nar_size > wire::MAX_FRAMED_TOTAL {
         stderr
             .error(&StderrError::simple(
@@ -636,31 +638,9 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Err(anyhow::anyhow!("nar_size exceeds maximum"));
     }
 
-    // Pull NAR data via STDERR_READ loop
-    let chunk_size: u64 = 64 * 1024; // 64 KiB chunks
-    let mut nar_data = Vec::with_capacity(nar_size as usize);
-    let mut remaining = nar_size;
-
-    while remaining > 0 {
-        let request_size = remaining.min(chunk_size);
-        stderr.read_request(request_size).await?;
-
-        // Client responds with u64(len) + data + padding (same as wire string format)
-        let chunk = wire::read_bytes(reader).await?;
-        if chunk.is_empty() {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("empty chunk received in STDERR_READ loop for {path_str}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!(
-                "client sent empty chunk in STDERR_READ loop for {path_str}"
-            ));
-        }
-        nar_data.extend_from_slice(&chunk);
-        remaining = remaining.saturating_sub(chunk.len() as u64);
-    }
+    // Read NAR data as framed stream (protocol >= 1.23, always true for 1.37+).
+    // read_framed_stream enforces MAX_FRAMED_TOTAL (1 GiB) and MAX_FRAME_SIZE (64 MiB).
+    let nar_data = wire::read_framed_stream(reader).await?;
 
     // Validate NAR hash
     let computed_hash = {
@@ -794,9 +774,8 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // If this is a .drv file, parse and cache it
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    // Send success
+    // Send STDERR_LAST (no result value for wopAddToStoreNar)
     stderr.finish().await?;
-    wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())
 }
 
@@ -1275,9 +1254,8 @@ async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpi
         }
     }
 
-    // Send success
+    // Send STDERR_LAST (no result value for wopAddMultipleToStore)
     stderr.finish().await?;
-    wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())
 }
 
