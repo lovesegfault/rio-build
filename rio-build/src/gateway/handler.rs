@@ -915,6 +915,20 @@ async fn parse_add_multiple_entry(
         "wopAddMultipleToStore entry"
     );
 
+    // Validate NAR size matches declared value
+    let actual_nar_size = nar_data.len() as u64;
+    if actual_nar_size != nar_size {
+        warn!(
+            path = %path_str,
+            declared_size = nar_size,
+            actual_size = actual_nar_size,
+            "NAR size mismatch in wopAddMultipleToStore entry"
+        );
+        return Err(anyhow::anyhow!(
+            "NAR size mismatch for {path_str}: declared {nar_size}, actual {actual_nar_size}"
+        ));
+    }
+
     // Validate NAR hash
     let computed_hash = {
         let mut hasher = Sha256::new();
