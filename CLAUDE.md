@@ -67,6 +67,10 @@ Pre-commit hooks run treefmt automatically on commit.
 - Clippy is configured with `--deny warnings` — all warnings must be fixed.
 - The `target/` directory is gitignored; Nix builds go to `result`/`result-*` (also gitignored).
 - Integration tests may need `nix` available in PATH (it's provided in the dev shell).
+- **Always run cargo commands via `nix develop -c`** to ensure all dev shell dependencies (including fuse3) are available. E.g., `nix develop -c cargo nextest run`, `nix develop -c cargo clippy --all-targets -- --deny warnings`.
+- **Always run `nix develop -c cargo nextest run` before committing** to catch regressions early.
+- Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
+- Keep phase plan docs (`docs/src/phases/`) in sync: mark tasks `[x]` as they're completed.
 
 ## Design Book
 
