@@ -90,22 +90,6 @@ impl WorkerOp {
             WorkerOp::BuildPathsWithResults => "wopBuildPathsWithResults",
         }
     }
-
-    /// Whether this opcode is implemented in Phase 1a (read-only + stubs).
-    pub fn is_phase1a(&self) -> bool {
-        matches!(
-            self,
-            WorkerOp::IsValidPath
-                | WorkerOp::AddTempRoot
-                | WorkerOp::SetOptions
-                | WorkerOp::QueryPathInfo
-                | WorkerOp::QueryPathFromHashPart
-                | WorkerOp::QueryValidPaths
-                | WorkerOp::AddSignatures
-                | WorkerOp::NarFromPath
-                | WorkerOp::QueryMissing
-        )
-    }
 }
 
 impl std::fmt::Display for WorkerOp {
@@ -154,19 +138,5 @@ mod tests {
         assert_eq!(WorkerOp::from_u64(0), None);
         assert_eq!(WorkerOp::from_u64(999), None);
         assert_eq!(WorkerOp::from_u64(2), None); // obsolete HasPathHash
-    }
-
-    #[test]
-    fn test_phase1a_opcodes() {
-        assert!(WorkerOp::IsValidPath.is_phase1a());
-        assert!(WorkerOp::SetOptions.is_phase1a());
-        assert!(WorkerOp::QueryPathInfo.is_phase1a());
-        assert!(WorkerOp::QueryValidPaths.is_phase1a());
-        assert!(WorkerOp::AddTempRoot.is_phase1a());
-        assert!(WorkerOp::NarFromPath.is_phase1a());
-
-        assert!(!WorkerOp::BuildDerivation.is_phase1a());
-        assert!(!WorkerOp::BuildPathsWithResults.is_phase1a());
-        assert!(!WorkerOp::AddToStoreNar.is_phase1a());
     }
 }
