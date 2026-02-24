@@ -343,15 +343,16 @@ mod tests {
                 }
             });
 
-            let built_named = (name_re, proptest::collection::vec("[a-z]{1,8}", 1..4)).prop_map(
-                |(n, output_names)| {
+            let built_named = (name_re, proptest::collection::vec("[a-z]{1,8}", 1..4))
+                .prop_filter_map("output names must be unique", |(n, output_names)| {
                     let path_str = format!("/nix/store/{VALID_HASH}-{n}.drv");
-                    DerivedPath::Built {
-                        drv: StorePath::parse(&path_str).unwrap(),
-                        outputs: OutputSpec::names(output_names).unwrap(),
-                    }
-                },
-            );
+                    OutputSpec::names(output_names)
+                        .ok()
+                        .map(|outputs| DerivedPath::Built {
+                            drv: StorePath::parse(&path_str).unwrap(),
+                            outputs,
+                        })
+                });
 
             prop_oneof![opaque, built_all, built_named]
         }
