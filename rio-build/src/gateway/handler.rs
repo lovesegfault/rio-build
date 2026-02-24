@@ -172,7 +172,10 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             Ok(v) => v,
             Err(e) => return send_store_error(stderr, e).await,
         },
-        Err(_) => false,
+        Err(e) => {
+            debug!(path = %path_str, error = %e, "wopIsValidPath: unparseable store path, reporting as not valid");
+            false
+        }
     };
 
     stderr.finish().await?;
@@ -183,8 +186,9 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// wopEnsurePath (10): Ensure a store path is valid/available.
 ///
 /// In the real nix-daemon, this may trigger substitution. For rio-build,
-/// all paths are either already uploaded or unavailable, so this is
-/// equivalent to checking validity and returning success unconditionally.
+/// all paths are either already uploaded or unavailable, so this always
+/// returns success (u64(1)). The validity check is logged but does not
+/// affect the response.
 #[instrument(skip_all)]
 async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -196,7 +200,9 @@ async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     // Check if the path is valid — log if missing but don't error,
     // since the real daemon would attempt substitution.
-    if let Ok(path) = StorePath::parse(&path_str) {
+    if let Ok(path) = StorePath::parse(&path_str).inspect_err(|e| {
+        debug!(path = %path_str, error = %e, "wopEnsurePath: unparseable store path");
+    }) {
         match store.is_valid_path(&path).await {
             Ok(true) => {}
             Ok(false) => {
