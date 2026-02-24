@@ -599,6 +599,65 @@ mod tests {
         assert!(matches!(result, Err(NarError::UnknownNodeType(ref t)) if t == "fifo"));
     }
 
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy that generates arbitrary `NarNode` trees.
+        ///
+        /// Base cases: regular files and symlinks.
+        /// Recursive case: directories with 0..5 entries, each with a unique
+        /// sorted name and a recursive child node.
+        fn arb_nar_node() -> impl Strategy<Value = NarNode> {
+            let leaf = prop_oneof![
+                // Regular file: arbitrary executable flag + small content
+                (
+                    any::<bool>(),
+                    proptest::collection::vec(any::<u8>(), 0..256)
+                )
+                    .prop_map(|(executable, contents)| NarNode::Regular {
+                        executable,
+                        contents,
+                    }),
+                // Symlink: short target path
+                "[a-z]{1,20}".prop_map(|target| NarNode::Symlink { target }),
+            ];
+
+            leaf.prop_recursive(
+                4,  // max depth
+                64, // max total nodes
+                5,  // items per collection
+                |inner| {
+                    proptest::collection::vec(("[a-z]{1,10}", inner), 0..5).prop_map(
+                        |mut entries| {
+                            // Sort by name and deduplicate to satisfy the parser invariant.
+                            entries.sort_by(|a, b| a.0.cmp(&b.0));
+                            entries.dedup_by(|a, b| a.0 == b.0);
+
+                            let entries = entries
+                                .into_iter()
+                                .map(|(name, node)| NarEntry { name, node })
+                                .collect();
+
+                            NarNode::Directory { entries }
+                        },
+                    )
+                },
+            )
+        }
+
+        proptest! {
+            #[test]
+            fn nar_roundtrip(node in arb_nar_node()) {
+                let mut buf = Vec::new();
+                serialize(&mut buf, &node).unwrap();
+
+                let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+                prop_assert_eq!(parsed, node);
+            }
+        }
+    }
+
     /// Compare our NAR output against `nix-store --dump` for a single file.
     #[test]
     fn golden_single_file() {
