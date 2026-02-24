@@ -519,15 +519,11 @@ async fn test_golden_live_nar_from_path() {
 
     let socket = golden::daemon::shared_daemon_socket();
 
-    // NarFromPath streams larger payloads — use a longer timeout.
     let op = golden::build_nar_from_path_bytes(&test_path).await;
-    let (client_bytes, daemon_response) = golden::daemon::exchange_with_daemon_timeout(
-        &socket,
-        Some(&op),
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .expect("daemon exchange failed");
+    let (client_bytes, daemon_response) =
+        golden::daemon::exchange_with_daemon_nar(&socket, Some(&op))
+            .await
+            .expect("daemon exchange failed");
 
     let rio_response = rio_build_response(&client_bytes, store).await;
 

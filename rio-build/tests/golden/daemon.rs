@@ -18,6 +18,15 @@ const DEFAULT_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 /// Default timeout for reading trailing data after STDERR_LAST.
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How to read data after STDERR_LAST in the STDERR message loop.
+#[derive(Clone, Copy)]
+enum PostLastRead {
+    /// Read trailing data with a timeout (for small result fields like bools/u64s).
+    Timeout(std::time::Duration),
+    /// Parse a complete NAR archive structurally (for NarFromPath).
+    Nar,
+}
+
 /// Shared daemon instance across all tests.
 ///
 /// Uses `LazyLock` so the daemon is started at most once, even when
@@ -45,24 +54,37 @@ pub fn shared_daemon_socket() -> String {
 /// Opcode responses are read using a protocol-aware approach: STDERR
 /// messages are read structurally until STDERR_LAST, then a short
 /// timeout captures any trailing result fields (which are small and
-/// sent immediately after STDERR_LAST). For NarFromPath, the raw NAR
-/// bytes after STDERR_LAST may be large, so use `post_last_timeout`
-/// to control how long to wait for trailing data.
+/// sent immediately after STDERR_LAST).
 ///
 /// Returns (all_client_bytes, all_server_bytes) for the complete session.
 pub async fn exchange_with_daemon(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
-    exchange_with_daemon_timeout(socket_path, opcode_bytes, DEFAULT_READ_TIMEOUT).await
+    exchange_with_daemon_inner(
+        socket_path,
+        opcode_bytes,
+        PostLastRead::Timeout(DEFAULT_READ_TIMEOUT),
+    )
+    .await
 }
 
-/// Like [`exchange_with_daemon`] but with a configurable post-STDERR_LAST
-/// timeout for reading trailing result data.
-pub async fn exchange_with_daemon_timeout(
+/// Like [`exchange_with_daemon`] but parses the post-STDERR_LAST data as a
+/// NAR archive instead of using a timeout. This reads exactly the right
+/// number of bytes by following the NAR structure, so it completes
+/// immediately instead of waiting for a timeout.
+pub async fn exchange_with_daemon_nar(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
-    post_last_timeout: std::time::Duration,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    exchange_with_daemon_inner(socket_path, opcode_bytes, PostLastRead::Nar).await
+}
+
+/// Shared implementation for all `exchange_with_daemon*` variants.
+async fn exchange_with_daemon_inner(
+    socket_path: &str,
+    opcode_bytes: Option<&[u8]>,
+    post_last: PostLastRead,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1};
     use rio_nix::protocol::wire;
@@ -163,7 +185,7 @@ pub async fn exchange_with_daemon_timeout(
         // Read STDERR messages until STDERR_LAST using protocol-aware parsing.
         // This is more reliable than a pure timeout because it follows the
         // actual protocol structure.
-        let op_response = read_stderr_loop(&mut stream, post_last_timeout).await?;
+        let op_response = read_stderr_loop(&mut stream, post_last).await?;
         all_server.extend_from_slice(&op_response);
     }
 
@@ -172,12 +194,13 @@ pub async fn exchange_with_daemon_timeout(
 
 /// Read the STDERR message loop from the daemon, returning all raw bytes.
 ///
-/// Reads STDERR messages structurally until STDERR_LAST, then reads any
-/// trailing result data using `post_last_timeout` (for opcodes like
-/// NarFromPath that send raw data after STDERR_LAST).
+/// Reads STDERR messages structurally until STDERR_LAST, then reads
+/// trailing result data according to `post_last`:
+/// - `Timeout`: reads with a timeout (for small result fields)
+/// - `Nar`: parses a complete NAR archive structurally (instant)
 async fn read_stderr_loop(
     stream: &mut UnixStream,
-    post_last_timeout: std::time::Duration,
+    post_last: PostLastRead,
 ) -> std::io::Result<Vec<u8>> {
     use rio_nix::protocol::stderr::{
         STDERR_ERROR, STDERR_LAST, STDERR_NEXT, STDERR_READ, STDERR_RESULT, STDERR_START_ACTIVITY,
@@ -196,16 +219,25 @@ async fn read_stderr_loop(
         match msg {
             STDERR_LAST => {
                 // STDERR_LAST marks the end of the STDERR loop.
-                // Some opcodes send result data after STDERR_LAST (e.g.,
-                // IsValidPath sends a bool, NarFromPath sends raw NAR bytes).
-                // Read whatever follows with a timeout.
-                loop {
-                    let mut buf = [0u8; 8192];
-                    match tokio::time::timeout(post_last_timeout, stream.read(&mut buf)).await {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => result.extend_from_slice(&buf[..n]),
-                        Ok(Err(e)) => return Err(e),
-                        Err(_) => break,
+                // What follows depends on the opcode.
+                match post_last {
+                    PostLastRead::Nar => {
+                        // NarFromPath: parse the NAR structure to read
+                        // exactly the right number of bytes.
+                        read_nar_from_stream(stream, &mut result).await?;
+                    }
+                    PostLastRead::Timeout(timeout) => {
+                        // Most opcodes send small result fields (a bool,
+                        // a u64, etc.) immediately after STDERR_LAST.
+                        loop {
+                            let mut buf = [0u8; 8192];
+                            match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+                                Ok(Ok(0)) => break,
+                                Ok(Ok(n)) => result.extend_from_slice(&buf[..n]),
+                                Ok(Err(e)) => return Err(e),
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
                 return Ok(result);
@@ -320,9 +352,13 @@ async fn read_stderr_loop(
                 eprintln!(
                     "warning: unknown STDERR message type {other:#x}, falling back to timeout"
                 );
+                let fallback = match post_last {
+                    PostLastRead::Timeout(t) => t,
+                    PostLastRead::Nar => DEFAULT_READ_TIMEOUT,
+                };
                 loop {
                     let mut buf = [0u8; 8192];
-                    match tokio::time::timeout(post_last_timeout, stream.read(&mut buf)).await {
+                    match tokio::time::timeout(fallback, stream.read(&mut buf)).await {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => result.extend_from_slice(&buf[..n]),
                         Ok(Err(e)) => return Err(e),
@@ -348,6 +384,86 @@ async fn read_wire_string(stream: &mut UnixStream, out: &mut Vec<u8>) -> std::io
         stream.read_exact(&mut content).await?;
         out.extend_from_slice(&content);
     }
+    Ok(())
+}
+
+/// Read a wire-format padded string and return its unpadded content.
+/// Appends all raw bytes (length prefix + content + padding) to `buf`.
+async fn read_nar_token(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let pos = buf.len();
+    read_wire_string(stream, buf).await?;
+    let len = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
+    Ok(buf[pos + 8..pos + 8 + len].to_vec())
+}
+
+/// Read a complete NAR node (recursive) from the stream.
+///
+/// NAR nodes have the structure: `( type <type> <type-specific fields> )`
+/// For directories, the closing `)` doubles as the loop terminator so the
+/// function returns immediately after consuming it.
+///
+/// Returns a boxed future because recursive async functions require
+/// indirection to avoid infinitely-sized futures.
+fn read_nar_node<'a>(
+    stream: &'a mut UnixStream,
+    buf: &'a mut Vec<u8>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + 'a>> {
+    Box::pin(async move {
+        read_nar_token(stream, buf).await?; // "("
+        read_nar_token(stream, buf).await?; // "type"
+        let type_val = read_nar_token(stream, buf).await?;
+
+        match type_val.as_slice() {
+            b"regular" => {
+                let next = read_nar_token(stream, buf).await?;
+                if next == b"executable" {
+                    read_wire_string(stream, buf).await?; // "" (empty marker)
+                    read_nar_token(stream, buf).await?; // "contents"
+                }
+                // `next` was "contents", or we just read "contents" above.
+                // Read file data (potentially large — don't extract content).
+                read_wire_string(stream, buf).await?;
+            }
+            b"symlink" => {
+                read_nar_token(stream, buf).await?; // "target"
+                read_wire_string(stream, buf).await?; // target path
+            }
+            b"directory" => {
+                loop {
+                    let tok = read_nar_token(stream, buf).await?;
+                    if tok == b")" {
+                        // Directory closing paren — node is complete.
+                        return Ok(());
+                    }
+                    // tok is "entry"
+                    read_nar_token(stream, buf).await?; // "("
+                    read_nar_token(stream, buf).await?; // "name"
+                    read_wire_string(stream, buf).await?; // entry name
+                    read_nar_token(stream, buf).await?; // "node"
+                    read_nar_node(stream, buf).await?; // recursive child
+                    read_nar_token(stream, buf).await?; // ")" closing the entry
+                }
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown NAR node type: {}", String::from_utf8_lossy(other)),
+                ));
+            }
+        }
+
+        read_nar_token(stream, buf).await?; // ")" closing the node
+        Ok(())
+    })
+}
+
+/// Read a complete NAR archive from the stream by parsing its structure.
+///
+/// Appends all raw bytes to `buf`. Stops reading exactly when the NAR is
+/// complete — no timeout needed.
+async fn read_nar_from_stream(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    read_nar_token(stream, buf).await?; // "nix-archive-1"
+    read_nar_node(stream, buf).await?;
     Ok(())
 }
 
