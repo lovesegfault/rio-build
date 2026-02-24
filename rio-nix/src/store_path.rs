@@ -225,8 +225,19 @@ fn validate_name(name: &str) -> Result<(), StorePathError> {
     if name.len() > MAX_NAME_LEN {
         return Err(StorePathError::NameTooLong(name.len()));
     }
+    // Match Nix C++ checkName: reject only ".", "..", ".-*", "..-*"
+    // Other dot-prefixed names like ".gitignore" are valid.
+    // Ref: src/libstore/path.cc:15-28
     if name.starts_with('.') {
-        return Err(StorePathError::NameStartsWithDot);
+        if name == "." || name == ".." {
+            return Err(StorePathError::NameStartsWithDot);
+        }
+        if name.as_bytes().get(1) == Some(&b'-') {
+            return Err(StorePathError::NameStartsWithDot);
+        }
+        if name.starts_with("..") && name.as_bytes().get(2) == Some(&b'-') {
+            return Err(StorePathError::NameStartsWithDot);
+        }
     }
     for ch in name.chars() {
         if !is_valid_name_char(ch) {
@@ -237,9 +248,10 @@ fn validate_name(name: &str) -> Result<(), StorePathError> {
 }
 
 /// Check if a character is valid in a store path name.
-/// Valid: ASCII alphanumeric + `+` `-` `.` `_`
+/// Valid: ASCII alphanumeric + `+` `-` `.` `_` `?` `=`
+/// Ref: Nix C++ checkName() in src/libstore/path.cc
 fn is_valid_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | '_')
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | '_' | '?' | '=')
 }
 
 /// Nix's custom base32 encoding/decoding.
@@ -366,12 +378,23 @@ mod tests {
     }
 
     #[test]
-    fn test_name_with_dot_prefix() {
-        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.hidden";
-        assert!(matches!(
-            StorePath::parse(path),
-            Err(StorePathError::NameStartsWithDot)
-        ));
+    fn test_name_dot_prefix_rejected() {
+        // "." and ".." are rejected
+        assert!(StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.").is_err());
+        assert!(StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-..").is_err());
+        // ".-foo" and "..-bar" are rejected (first dash-separated component is . or ..)
+        assert!(StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.-foo").is_err());
+        assert!(StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-..-bar").is_err());
+    }
+
+    #[test]
+    fn test_name_dot_prefix_accepted() {
+        // Other dot-prefixed names are valid (e.g., .gitignore)
+        assert!(StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.gitignore").is_ok());
+        assert!(StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-.hidden").is_ok());
+        assert!(
+            StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-..something").is_ok()
+        );
     }
 
     #[test]
@@ -406,6 +429,8 @@ mod tests {
         assert!(is_valid_name_char('-'));
         assert!(is_valid_name_char('.'));
         assert!(is_valid_name_char('_'));
+        assert!(is_valid_name_char('?'));
+        assert!(is_valid_name_char('='));
         assert!(!is_valid_name_char(' '));
         assert!(!is_valid_name_char('/'));
         assert!(!is_valid_name_char('\0'));
