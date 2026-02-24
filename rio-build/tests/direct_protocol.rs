@@ -852,23 +852,20 @@ async fn test_ca_opcodes_accepted_as_noop() {
             let mut s = s;
             do_handshake(&mut s).await;
 
-            // wopRegisterDrvOutput (42): send output_id + output_path
+            // wopRegisterDrvOutput (42): protocol >= 1.31 sends single JSON string
             wire::write_u64(&mut s, 42).await.unwrap();
-            wire::write_string(&mut s, "sha256:abc123!out")
-                .await
-                .unwrap();
-            wire::write_string(&mut s, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test")
+            let realisation_json = r#"{"id":"sha256:abc123!out","outPath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test","signatures":[],"dependentRealisations":{}}"#;
+            wire::write_string(&mut s, realisation_json)
                 .await
                 .unwrap();
             s.flush().await.unwrap();
 
+            // Nix daemon sends only STDERR_LAST (no result value)
             let msg = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(
                 msg, STDERR_LAST,
                 "RegisterDrvOutput should return STDERR_LAST"
             );
-            let result = wire::read_u64(&mut s).await.unwrap();
-            assert_eq!(result, 1, "RegisterDrvOutput should return success");
 
             // wopQueryRealisation (43): send output_id
             wire::write_u64(&mut s, 43).await.unwrap();
