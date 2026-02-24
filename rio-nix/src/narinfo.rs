@@ -54,16 +54,16 @@ pub struct NarInfo {
     nar_size: u64,
     /// Referenced store path basenames, space-separated in text form.
     references: Vec<String>,
-    /// Deriver basename (e.g., `xyz...-hello.drv`). Empty if unknown.
-    deriver: String,
+    /// Deriver basename (e.g., `xyz...-hello.drv`).
+    deriver: Option<String>,
     /// Cryptographic signatures.
     sigs: Vec<String>,
-    /// Content address (e.g., `fixed:sha256:abc...`). Empty if input-addressed.
-    ca: String,
-    /// Compressed file hash (optional, e.g., `sha256:def...`).
-    file_hash: String,
-    /// Compressed file size in bytes (optional, 0 if absent).
-    file_size: u64,
+    /// Content address (e.g., `fixed:sha256:abc...`).
+    ca: Option<String>,
+    /// Compressed file hash (e.g., `sha256:def...`).
+    file_hash: Option<String>,
+    /// Compressed file size in bytes.
+    file_size: Option<u64>,
 }
 
 impl NarInfo {
@@ -75,11 +75,11 @@ impl NarInfo {
         let mut nar_hash = None;
         let mut nar_size = None;
         let mut references = Vec::new();
-        let mut deriver = String::new();
+        let mut deriver = None;
         let mut sigs = Vec::new();
-        let mut ca = String::new();
-        let mut file_hash = String::new();
-        let mut file_size = 0u64;
+        let mut ca = None;
+        let mut file_hash = None;
+        let mut file_size = None;
         let mut refs_seen = false;
 
         for line in text.lines() {
@@ -138,14 +138,16 @@ impl NarInfo {
                         references = value.split_whitespace().map(String::from).collect();
                     }
                 }
-                "Deriver" => deriver = value.to_string(),
+                "Deriver" => deriver = Some(value.to_string()),
                 "Sig" => sigs.push(value.to_string()),
-                "CA" => ca = value.to_string(),
-                "FileHash" => file_hash = value.to_string(),
+                "CA" => ca = Some(value.to_string()),
+                "FileHash" => file_hash = Some(value.to_string()),
                 "FileSize" => {
-                    file_size = value
-                        .parse::<u64>()
-                        .map_err(|_| NarInfoError::InvalidFileSize(value.to_string()))?;
+                    file_size = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| NarInfoError::InvalidFileSize(value.to_string()))?,
+                    );
                 }
                 _ => {} // Ignore unknown fields for forward compatibility
             }
@@ -173,11 +175,11 @@ impl NarInfo {
         out.push_str(&format!("StorePath: {}\n", self.store_path));
         out.push_str(&format!("URL: {}\n", self.url));
         out.push_str(&format!("Compression: {}\n", self.compression));
-        if !self.file_hash.is_empty() {
-            out.push_str(&format!("FileHash: {}\n", self.file_hash));
+        if let Some(ref fh) = self.file_hash {
+            out.push_str(&format!("FileHash: {fh}\n"));
         }
-        if self.file_size > 0 {
-            out.push_str(&format!("FileSize: {}\n", self.file_size));
+        if let Some(fs) = self.file_size {
+            out.push_str(&format!("FileSize: {fs}\n"));
         }
         out.push_str(&format!("NarHash: {}\n", self.nar_hash));
         out.push_str(&format!("NarSize: {}\n", self.nar_size));
@@ -191,16 +193,16 @@ impl NarInfo {
             out.push('\n');
         }
 
-        if !self.deriver.is_empty() {
-            out.push_str(&format!("Deriver: {}\n", self.deriver));
+        if let Some(ref d) = self.deriver {
+            out.push_str(&format!("Deriver: {d}\n"));
         }
 
         for sig in &self.sigs {
-            out.push_str(&format!("Sig: {}\n", sig));
+            out.push_str(&format!("Sig: {sig}\n"));
         }
 
-        if !self.ca.is_empty() {
-            out.push_str(&format!("CA: {}\n", self.ca));
+        if let Some(ref c) = self.ca {
+            out.push_str(&format!("CA: {c}\n"));
         }
 
         out
@@ -236,9 +238,9 @@ impl NarInfo {
         &self.references
     }
 
-    /// Deriver basename (empty if unknown).
-    pub fn deriver(&self) -> &str {
-        &self.deriver
+    /// Deriver basename.
+    pub fn deriver(&self) -> Option<&str> {
+        self.deriver.as_deref()
     }
 
     /// Cryptographic signatures.
@@ -246,18 +248,18 @@ impl NarInfo {
         &self.sigs
     }
 
-    /// Content address (empty if input-addressed).
-    pub fn ca(&self) -> &str {
-        &self.ca
+    /// Content address.
+    pub fn ca(&self) -> Option<&str> {
+        self.ca.as_deref()
     }
 
-    /// Compressed file hash (empty if not present).
-    pub fn file_hash(&self) -> &str {
-        &self.file_hash
+    /// Compressed file hash.
+    pub fn file_hash(&self) -> Option<&str> {
+        self.file_hash.as_deref()
     }
 
-    /// Compressed file size (0 if not present).
-    pub fn file_size(&self) -> u64 {
+    /// Compressed file size in bytes.
+    pub fn file_size(&self) -> Option<u64> {
         self.file_size
     }
 }
@@ -270,11 +272,11 @@ pub struct NarInfoBuilder {
     nar_hash: String,
     nar_size: u64,
     references: Vec<String>,
-    deriver: String,
+    deriver: Option<String>,
     sigs: Vec<String>,
-    ca: String,
-    file_hash: String,
-    file_size: u64,
+    ca: Option<String>,
+    file_hash: Option<String>,
+    file_size: Option<u64>,
 }
 
 impl NarInfoBuilder {
@@ -293,11 +295,11 @@ impl NarInfoBuilder {
             nar_hash: nar_hash.into(),
             nar_size,
             references: Vec::new(),
-            deriver: String::new(),
+            deriver: None,
             sigs: Vec::new(),
-            ca: String::new(),
-            file_hash: String::new(),
-            file_size: 0,
+            ca: None,
+            file_hash: None,
+            file_size: None,
         }
     }
 
@@ -309,7 +311,7 @@ impl NarInfoBuilder {
 
     /// Set the deriver basename.
     pub fn deriver(mut self, deriver: impl Into<String>) -> Self {
-        self.deriver = deriver.into();
+        self.deriver = Some(deriver.into());
         self
     }
 
@@ -321,19 +323,19 @@ impl NarInfoBuilder {
 
     /// Set the content address.
     pub fn ca(mut self, ca: impl Into<String>) -> Self {
-        self.ca = ca.into();
+        self.ca = Some(ca.into());
         self
     }
 
     /// Set the compressed file hash.
     pub fn file_hash(mut self, file_hash: impl Into<String>) -> Self {
-        self.file_hash = file_hash.into();
+        self.file_hash = Some(file_hash.into());
         self
     }
 
     /// Set the compressed file size.
     pub fn file_size(mut self, file_size: u64) -> Self {
-        self.file_size = file_size;
+        self.file_size = Some(file_size);
         self
     }
 
@@ -408,11 +410,11 @@ Sig: cache.nixos.org-1:0N1BDA7KG/Bu1LM0gJmmq5Ns0Ad+3kaE8VrWF0T9qnCGm/s+fuxRHXeXE
         );
         assert_eq!(
             info.deriver(),
-            "c7xq1hry7mx5rxr1vqwf7dhphpd7hl29-hello-2.12.2.drv"
+            Some("c7xq1hry7mx5rxr1vqwf7dhphpd7hl29-hello-2.12.2.drv")
         );
         assert_eq!(info.sigs().len(), 1);
         assert!(info.sigs()[0].starts_with("cache.nixos.org-1:"));
-        assert!(info.ca().is_empty());
+        assert!(info.ca().is_none());
     }
 
     #[test]
@@ -436,9 +438,9 @@ References:
         let info = NarInfo::parse(text).unwrap();
         assert_eq!(info.store_path(), "/nix/store/abc-test");
         assert!(info.references().is_empty());
-        assert!(info.deriver().is_empty());
+        assert!(info.deriver().is_none());
         assert!(info.sigs().is_empty());
-        assert!(info.ca().is_empty());
+        assert!(info.ca().is_none());
     }
 
     #[test]
@@ -453,7 +455,7 @@ References:
 CA: fixed:sha256:abcdef
 ";
         let info = NarInfo::parse(text).unwrap();
-        assert_eq!(info.ca(), "fixed:sha256:abcdef");
+        assert_eq!(info.ca(), Some("fixed:sha256:abcdef"));
     }
 
     #[test]
@@ -487,8 +489,8 @@ NarSize: 10000
 References:
 ";
         let info = NarInfo::parse(text).unwrap();
-        assert_eq!(info.file_hash(), "sha256:deadbeef");
-        assert_eq!(info.file_size(), 5000);
+        assert_eq!(info.file_hash(), Some("sha256:deadbeef"));
+        assert_eq!(info.file_size(), Some(5000));
     }
 
     #[test]
@@ -572,9 +574,9 @@ References:
 
         assert_eq!(info.store_path(), "/nix/store/abc-test");
         assert_eq!(info.references(), &["abc-dep"]);
-        assert_eq!(info.deriver(), "xyz-test.drv");
+        assert_eq!(info.deriver(), Some("xyz-test.drv"));
         assert_eq!(info.sigs(), &["key:sig"]);
-        assert_eq!(info.ca(), "fixed:sha256:beef");
+        assert_eq!(info.ca(), Some("fixed:sha256:beef"));
 
         // Verify it roundtrips
         let serialized = info.serialize();
