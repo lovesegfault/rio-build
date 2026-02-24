@@ -434,8 +434,8 @@ pub fn extract_to_path(node: &NarNode, path: &std::path::Path) -> Result<()> {
 
 /// Extract the content of a single regular file from a NAR.
 ///
-/// Returns `None` if the NAR doesn't contain exactly one regular file
-/// at the top level (i.e., it's a directory or symlink NAR).
+/// Returns `Err(NarError::NotSingleFile)` if the root NAR node is not a
+/// regular file (i.e., it's a directory or symlink).
 /// This is the common case for `.drv` files uploaded via `wopAddToStoreNar`.
 pub fn extract_single_file(nar_data: &[u8]) -> Result<Vec<u8>> {
     let node = parse(&mut io::Cursor::new(nar_data))?;
