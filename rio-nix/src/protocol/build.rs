@@ -273,14 +273,19 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(r: &mut R) -> Result<Ba
     let args = wire::read_strings(r).await?;
     let env = wire::read_string_pairs(r).await?;
 
-    Ok(BasicDerivation::new(
+    BasicDerivation::new(
         outputs,
         input_srcs.into_iter().collect(),
         platform,
         builder,
         args,
         env.into_iter().collect(),
-    ))
+    )
+    .map_err(|e| {
+        wire::WireError::Io(std::io::Error::other(format!(
+            "invalid BasicDerivation: {e}"
+        )))
+    })
 }
 
 /// Write a `BasicDerivation` to the wire (client → server for local daemon).
@@ -549,7 +554,8 @@ mod tests {
             builder.clone(),
             args.clone(),
             env_map.clone(),
-        );
+        )
+        .unwrap();
 
         let mut buf = Vec::new();
         write_basic_derivation(&mut buf, &drv).await.unwrap();
@@ -665,7 +671,7 @@ mod tests {
             ) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
-                    let drv = BasicDerivation::new(outputs, input_srcs, platform, builder, args, env_map);
+                    let drv = BasicDerivation::new(outputs, input_srcs, platform, builder, args, env_map).unwrap();
                     let mut buf = Vec::new();
                     write_basic_derivation(&mut buf, &drv).await.unwrap();
                     let mut reader = Cursor::new(buf);

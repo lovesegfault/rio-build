@@ -19,6 +19,9 @@ pub enum DerivedPathError {
 
     #[error("output name must not be empty")]
     EmptyOutputName,
+
+    #[error("duplicate output name")]
+    DuplicateOutputName,
 }
 
 /// A validated, non-empty collection of output names, each guaranteed non-empty.
@@ -49,6 +52,10 @@ impl OutputSpec {
     pub fn names(names: Vec<String>) -> Result<Self, DerivedPathError> {
         if names.is_empty() || names.iter().any(|n| n.is_empty()) {
             return Err(DerivedPathError::EmptyOutputName);
+        }
+        let unique: std::collections::HashSet<&str> = names.iter().map(|n| n.as_str()).collect();
+        if unique.len() != names.len() {
+            return Err(DerivedPathError::DuplicateOutputName);
         }
         Ok(OutputSpec::Names(OutputNames { names }))
     }
@@ -266,6 +273,14 @@ mod tests {
         assert!(matches!(
             OutputSpec::names(vec!["".to_string()]),
             Err(DerivedPathError::EmptyOutputName)
+        ));
+    }
+
+    #[test]
+    fn output_spec_names_rejects_duplicates() {
+        assert!(matches!(
+            OutputSpec::names(vec!["out".to_string(), "out".to_string()]),
+            Err(DerivedPathError::DuplicateOutputName)
         ));
     }
 

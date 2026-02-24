@@ -220,15 +220,18 @@ impl Derivation {
     }
 
     /// Convert to a `BasicDerivation` by stripping `input_drvs`.
+    ///
+    /// Cannot fail since a valid `Derivation` always has at least one output.
     pub fn to_basic(&self) -> BasicDerivation {
-        BasicDerivation {
-            outputs: self.outputs.clone(),
-            input_srcs: self.input_srcs.clone(),
-            platform: self.platform.clone(),
-            builder: self.builder.clone(),
-            args: self.args.clone(),
-            env: self.env.clone(),
-        }
+        BasicDerivation::new(
+            self.outputs.clone(),
+            self.input_srcs.clone(),
+            self.platform.clone(),
+            self.builder.clone(),
+            self.args.clone(),
+            self.env.clone(),
+        )
+        .expect("Derivation always has outputs")
     }
 
     /// The derivation outputs.
@@ -290,6 +293,9 @@ pub struct BasicDerivation {
 
 impl BasicDerivation {
     /// Create a new basic derivation.
+    ///
+    /// Returns an error if `outputs` is empty (Nix derivations must have
+    /// at least one output).
     pub fn new(
         outputs: Vec<DerivationOutput>,
         input_srcs: BTreeSet<String>,
@@ -297,15 +303,18 @@ impl BasicDerivation {
         builder: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
-    ) -> Self {
-        BasicDerivation {
+    ) -> Result<Self, DerivationError> {
+        if outputs.is_empty() {
+            return Err(DerivationError::EmptyOutputName(0));
+        }
+        Ok(BasicDerivation {
             outputs,
             input_srcs,
             platform,
             builder,
             args,
             env,
-        }
+        })
     }
 
     /// The derivation outputs.
@@ -743,6 +752,19 @@ mod tests {
         assert_eq!(basic.builder(), "/bin/bash");
         assert_eq!(basic.args(), &["-e", "script.sh"]);
         assert_eq!(basic.env().get("name").unwrap(), "hello");
+    }
+
+    #[test]
+    fn basic_derivation_rejects_empty_outputs() {
+        let result = BasicDerivation::new(
+            vec![],
+            std::collections::BTreeSet::new(),
+            "x86_64-linux".to_string(),
+            "/bin/sh".to_string(),
+            vec![],
+            std::collections::BTreeMap::new(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
