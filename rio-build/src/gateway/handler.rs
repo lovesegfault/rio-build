@@ -1761,19 +1761,29 @@ async fn build_via_local_daemon(
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    let mut daemon_stdin = daemon
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("nix-daemon stdin not available"))?;
-    let mut daemon_stdout = daemon
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("nix-daemon stdout not available"))?;
+    let mut daemon_stdin = match daemon.stdin.take() {
+        Some(s) => s,
+        None => {
+            let _ = daemon.kill().await;
+            return Err(anyhow::anyhow!("nix-daemon stdin not available"));
+        }
+    };
+    let mut daemon_stdout = match daemon.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = daemon.kill().await;
+            return Err(anyhow::anyhow!("nix-daemon stdout not available"));
+        }
+    };
 
     let build_fut = async {
-        let _ = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin)
+        let handshake = client::client_handshake(&mut daemon_stdout, &mut daemon_stdin)
             .await
             .map_err(|e| anyhow::anyhow!("daemon handshake failed: {e}"))?;
+        debug!(
+            version = handshake.negotiated_version(),
+            "local daemon handshake"
+        );
 
         client::client_set_options(&mut daemon_stdout, &mut daemon_stdin)
             .await
@@ -1790,16 +1800,29 @@ async fn build_via_local_daemon(
         .map_err(|e| anyhow::anyhow!("daemon build failed: {e}"))
     };
 
-    let timeout = std::env::var("RIO_DAEMON_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map_or(DAEMON_BUILD_TIMEOUT, std::time::Duration::from_secs);
+    let timeout = match std::env::var("RIO_DAEMON_TIMEOUT_SECS") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(secs) => {
+                debug!(timeout_secs = secs, "using configured daemon timeout");
+                std::time::Duration::from_secs(secs)
+            }
+            Err(e) => {
+                warn!(value = %val, error = %e,
+                      "invalid RIO_DAEMON_TIMEOUT_SECS, using default {}s",
+                      DAEMON_BUILD_TIMEOUT.as_secs());
+                DAEMON_BUILD_TIMEOUT
+            }
+        },
+        Err(_) => DAEMON_BUILD_TIMEOUT,
+    };
 
     let result = match tokio::time::timeout(timeout, build_fut).await {
         Ok(r) => r,
         Err(_) => {
             error!(drv_path = %drv_path, "local daemon build timed out");
-            let _ = daemon.kill().await;
+            if let Err(e) = daemon.kill().await {
+                warn!(drv_path = %drv_path, error = %e, "failed to kill local daemon after timeout");
+            }
             return Err(anyhow::anyhow!(
                 "local daemon build timed out after {}s",
                 timeout.as_secs()
@@ -1807,7 +1830,9 @@ async fn build_via_local_daemon(
         }
     };
 
-    let _ = daemon.kill().await;
+    if let Err(e) = daemon.kill().await {
+        warn!(drv_path = %drv_path, error = %e, "failed to kill local daemon process");
+    }
 
     result
 }
