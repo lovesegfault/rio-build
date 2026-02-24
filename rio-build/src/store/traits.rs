@@ -252,6 +252,9 @@ pub trait Store: Send + Sync {
     /// content matches `info.nar_hash()` and `info.nar_size()` before calling.
     ///
     /// Called by `wopAddToStoreNar` and `wopAddMultipleToStore` handlers.
+    // TODO: accept a streaming type (e.g., `NarReader`) instead of `Vec<u8>` to
+    // avoid buffering large NARs on the write path. Requires reworking the hash
+    // validation flow (SHA-256 is computed over the full NAR before inserting).
     #[allow(dead_code)] // used by opcode handlers added in next commits
     async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()>;
 }

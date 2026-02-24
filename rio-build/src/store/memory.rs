@@ -110,6 +110,9 @@ impl Store for MemoryStore {
         Ok(valid)
     }
 
+    // TODO: clones the full NAR Vec on every read. A future S3-backed store
+    // would stream chunks as `Bytes` without cloning; this is fine for the
+    // in-memory dev/test backend.
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<NarReader>> {
         Ok(self
             .read_inner()
