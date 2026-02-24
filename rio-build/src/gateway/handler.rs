@@ -794,17 +794,17 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    let ref_paths: Vec<StorePath> = references
-        .iter()
-        .filter_map(|s| match StorePath::parse(s) {
-            Ok(p) => Some(p),
+    let mut ref_paths = Vec::with_capacity(references.len());
+    for s in &references {
+        match StorePath::parse(s) {
+            Ok(p) => ref_paths.push(p),
             Err(e) => {
-                warn!(path = %path_str, reference = %s, error = %e,
-                      "wopAddToStoreNar: unparseable reference path, dropping");
-                None
+                return Err(anyhow::anyhow!(
+                    "wopAddToStoreNar: invalid reference path '{s}' for '{path_str}': {e}"
+                ));
             }
-        })
-        .collect();
+        }
+    }
 
     let ca = (!ca_str.is_empty()).then_some(ca_str);
 
@@ -967,17 +967,17 @@ async fn parse_add_multiple_entry(
         }
     };
 
-    let ref_paths: Vec<StorePath> = references
-        .iter()
-        .filter_map(|s| match StorePath::parse(s) {
-            Ok(p) => Some(p),
+    let mut ref_paths = Vec::with_capacity(references.len());
+    for s in &references {
+        match StorePath::parse(s) {
+            Ok(p) => ref_paths.push(p),
             Err(e) => {
-                warn!(path = %path_str, reference = %s, error = %e,
-                      "wopAddMultipleToStore: unparseable reference path, dropping");
-                None
+                return Err(anyhow::anyhow!(
+                    "wopAddMultipleToStore: invalid reference path '{s}' for '{path_str}': {e}"
+                ));
             }
-        })
-        .collect();
+        }
+    }
 
     let ca = (!ca_str.is_empty()).then_some(ca_str);
 
@@ -1056,16 +1056,17 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let content_hash = NixHash::compute(hash_algo, &dump_data);
 
     // Compute the store path
-    let ref_paths: Vec<StorePath> = references
-        .iter()
-        .filter_map(|s| match StorePath::parse(s) {
-            Ok(p) => Some(p),
+    let mut ref_paths = Vec::with_capacity(references.len());
+    for s in &references {
+        match StorePath::parse(s) {
+            Ok(p) => ref_paths.push(p),
             Err(e) => {
-                warn!(reference = %s, error = %e, "wopAddToStore: unparseable reference path, dropping");
-                None
+                return Err(anyhow::anyhow!(
+                    "wopAddToStore: invalid reference path '{s}': {e}"
+                ));
             }
-        })
-        .collect();
+        }
+    }
 
     let path = if is_text {
         match StorePath::make_text(&name, &content_hash, &ref_paths) {
@@ -1204,16 +1205,17 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let content_hash = NixHash::compute(HashAlgo::SHA256, text.as_bytes());
 
-    let ref_paths: Vec<StorePath> = references
-        .iter()
-        .filter_map(|s| match StorePath::parse(s) {
-            Ok(p) => Some(p),
+    let mut ref_paths = Vec::with_capacity(references.len());
+    for s in &references {
+        match StorePath::parse(s) {
+            Ok(p) => ref_paths.push(p),
             Err(e) => {
-                warn!(reference = %s, error = %e, "wopAddTextToStore: unparseable reference path, dropping");
-                None
+                return Err(anyhow::anyhow!(
+                    "wopAddTextToStore: invalid reference path '{s}': {e}"
+                ));
             }
-        })
-        .collect();
+        }
+    }
 
     let path = match StorePath::make_text(&name, &content_hash, &ref_paths) {
         Ok(p) => p,
