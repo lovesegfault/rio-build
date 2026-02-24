@@ -29,6 +29,9 @@ pub enum NarInfoError {
     #[error("invalid NarSize value: {0}")]
     InvalidNarSize(String),
 
+    #[error("invalid FileSize value: {0}")]
+    InvalidFileSize(String),
+
     #[error("duplicate field: {0}")]
     DuplicateField(String),
 }
@@ -142,7 +145,7 @@ impl NarInfo {
                 "FileSize" => {
                     file_size = value
                         .parse::<u64>()
-                        .map_err(|_| NarInfoError::InvalidNarSize(value.to_string()))?;
+                        .map_err(|_| NarInfoError::InvalidFileSize(value.to_string()))?;
                 }
                 _ => {} // Ignore unknown fields for forward compatibility
             }
@@ -334,9 +337,21 @@ impl NarInfoBuilder {
         self
     }
 
-    /// Build the [`NarInfo`].
-    pub fn build(self) -> NarInfo {
-        NarInfo {
+    /// Build the [`NarInfo`], validating that required fields are non-empty.
+    pub fn build(self) -> Result<NarInfo, NarInfoError> {
+        if self.store_path.is_empty() {
+            return Err(NarInfoError::MissingField("StorePath"));
+        }
+        if self.url.is_empty() {
+            return Err(NarInfoError::MissingField("URL"));
+        }
+        if self.compression.is_empty() {
+            return Err(NarInfoError::MissingField("Compression"));
+        }
+        if self.nar_hash.is_empty() {
+            return Err(NarInfoError::MissingField("NarHash"));
+        }
+        Ok(NarInfo {
             store_path: self.store_path,
             url: self.url,
             compression: self.compression,
@@ -348,7 +363,7 @@ impl NarInfoBuilder {
             ca: self.ca,
             file_hash: self.file_hash,
             file_size: self.file_size,
-        }
+        })
     }
 }
 
@@ -552,7 +567,8 @@ References:
         .deriver("xyz-test.drv")
         .sig("key:sig")
         .ca("fixed:sha256:beef")
-        .build();
+        .build()
+        .unwrap();
 
         assert_eq!(info.store_path(), "/nix/store/abc-test");
         assert_eq!(info.references(), &["abc-dep"]);
@@ -575,7 +591,8 @@ References:
             "sha256:0000",
             100,
         )
-        .build();
+        .build()
+        .unwrap();
 
         let text = info.serialize();
         assert!(!text.contains("Deriver:"));

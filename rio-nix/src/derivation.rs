@@ -46,18 +46,24 @@ pub struct DerivationOutput {
 
 impl DerivationOutput {
     /// Create a new derivation output.
+    ///
+    /// Returns an error if `name` is empty.
     pub fn new(
         name: impl Into<String>,
         path: impl Into<String>,
         hash_algo: impl Into<String>,
         hash: impl Into<String>,
-    ) -> Self {
-        DerivationOutput {
-            name: name.into(),
+    ) -> Result<Self, DerivationError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(DerivationError::EmptyOutputName(0));
+        }
+        Ok(DerivationOutput {
+            name,
             path: path.into(),
             hash_algo: hash_algo.into(),
             hash: hash.into(),
-        }
+        })
     }
 
     /// The output name.
@@ -855,7 +861,7 @@ mod tests {
                     } else {
                         "0".repeat(64) // 64-char hex digest
                     };
-                    DerivationOutput::new(name, path, hash_algo, hash)
+                    DerivationOutput::new(name, path, hash_algo, hash).unwrap()
                 })
         }
 
