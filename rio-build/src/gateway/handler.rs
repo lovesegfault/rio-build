@@ -1375,8 +1375,27 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     // Read client's request
     let drv_path_str = wire::read_string(reader).await?;
-    let (outputs, input_srcs, platform, builder, args, env) = read_basic_derivation(reader).await?;
-    let build_mode_val = wire::read_u64(reader).await?;
+    let (outputs, input_srcs, platform, builder, args, env) =
+        match read_basic_derivation(reader).await {
+            Ok(v) => v,
+            Err(e) => {
+                return send_store_error(
+                    stderr,
+                    anyhow::anyhow!("wopBuildDerivation: failed to read BasicDerivation: {e}"),
+                )
+                .await;
+            }
+        };
+    let build_mode_val = match wire::read_u64(reader).await {
+        Ok(v) => v,
+        Err(e) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildDerivation: failed to read build mode: {e}"),
+            )
+            .await;
+        }
+    };
     let build_mode = match BuildMode::try_from(build_mode_val) {
         Ok(m) => m,
         Err(_) => {
