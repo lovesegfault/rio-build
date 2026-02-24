@@ -20,3 +20,5 @@ docs/book/
 # Added by cargo
 
 /target
+
+.claude/settings.local.json
