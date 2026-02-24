@@ -130,26 +130,44 @@ fn write_u64(w: &mut impl Write, val: u64) -> io::Result<()> {
     w.write_all(&val.to_le_bytes())
 }
 
-fn read_bytes_bounded(r: &mut impl Read, max_len: u64) -> Result<Vec<u8>> {
-    let len = read_u64(r)?;
-    if len > max_len {
-        return Err(NarError::ContentTooLarge(len));
-    }
-    let len = len as usize;
+/// Read length-prefixed padded bytes from the wire.
+fn read_padded_bytes(r: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-
     let pad = padding_len(len);
     if pad > 0 {
         let mut pad_buf = [0u8; 8];
         r.read_exact(&mut pad_buf[..pad])?;
     }
-
     Ok(buf)
 }
 
+fn read_bytes_bounded(r: &mut impl Read, max_len: u64) -> Result<Vec<u8>> {
+    let len = read_u64(r)?;
+    if len > max_len {
+        return Err(NarError::ContentTooLarge(len));
+    }
+    read_padded_bytes(r, len as usize)
+}
+
+fn read_name_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
+    let len = read_u64(r)?;
+    if len > MAX_NAME_LEN {
+        return Err(NarError::NameTooLong(len));
+    }
+    read_padded_bytes(r, len as usize)
+}
+
+fn read_target_bytes(r: &mut impl Read) -> Result<Vec<u8>> {
+    let len = read_u64(r)?;
+    if len > MAX_TARGET_LEN {
+        return Err(NarError::TargetTooLong(len));
+    }
+    read_padded_bytes(r, len as usize)
+}
+
 fn read_string(r: &mut impl Read) -> Result<String> {
-    let bytes = read_bytes_bounded(r, MAX_TARGET_LEN)?;
+    let bytes = read_target_bytes(r)?;
     String::from_utf8(bytes).map_err(|_| NarError::UnexpectedToken {
         expected: "valid UTF-8 string".to_string(),
         got: "<invalid UTF-8>".to_string(),
@@ -276,7 +294,7 @@ fn parse_directory(r: &mut impl Read) -> Result<NarNode> {
                 expect_str(r, "(")?;
                 expect_str(r, "name")?;
 
-                let name_bytes = read_bytes_bounded(r, MAX_NAME_LEN)?;
+                let name_bytes = read_name_bytes(r)?;
                 let name =
                     String::from_utf8(name_bytes).map_err(|_| NarError::UnexpectedToken {
                         expected: "valid UTF-8 name".to_string(),
@@ -312,7 +330,7 @@ fn parse_directory(r: &mut impl Read) -> Result<NarNode> {
 
 fn parse_symlink(r: &mut impl Read) -> Result<NarNode> {
     expect_str(r, "target")?;
-    let target_bytes = read_bytes_bounded(r, MAX_TARGET_LEN)?;
+    let target_bytes = read_target_bytes(r)?;
     let target = String::from_utf8(target_bytes).map_err(|_| NarError::UnexpectedToken {
         expected: "valid UTF-8 target".to_string(),
         got: "<invalid UTF-8>".to_string(),
