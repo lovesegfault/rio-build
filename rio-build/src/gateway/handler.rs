@@ -881,10 +881,10 @@ async fn parse_add_multiple_entry(
     let path = StorePath::parse(&path_str)
         .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
 
-    let nar_hash_bytes =
-        hex::decode(&nar_hash_str).map_err(|e| anyhow::anyhow!("invalid narHash hex: {e}"))?;
+    let nar_hash_bytes = hex::decode(&nar_hash_str)
+        .map_err(|e| anyhow::anyhow!("entry '{path_str}': invalid narHash hex: {e}"))?;
     let nar_hash = NixHash::new(rio_nix::hash::HashAlgo::SHA256, nar_hash_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid narHash: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("entry '{path_str}': invalid narHash: {e}"))?;
 
     let deriver = if deriver_str.is_empty() {
         None
@@ -924,9 +924,13 @@ async fn parse_add_multiple_entry(
         .ultimate(ultimate)
         .sigs(sigs)
         .ca(ca)
-        .build()?;
+        .build()
+        .map_err(|e| anyhow::anyhow!("entry '{path_str}': PathInfo build failed: {e}"))?;
 
-    store.add_path(info, nar_data.clone()).await?;
+    store
+        .add_path(info, nar_data.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
     try_cache_drv(&path, &nar_data, drv_cache);
 
     Ok(())
