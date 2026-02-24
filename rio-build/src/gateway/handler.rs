@@ -470,19 +470,24 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// Modern Nix clients may send this after a content-addressed build. Accepting
 /// it as a no-op prevents unexpected connection drops. Full CA support is
 /// planned for Phase 2c/5.
+///
+/// Wire format (protocol >= 1.31, which is always true since we target 1.37+):
+/// - Client sends one string: a JSON-encoded `Realisation` object containing
+///   `{"id":"sha256:<hex>!<outputName>","outPath":"/nix/store/...","signatures":[],"dependentRealisations":{}}`
+/// - Daemon responds with only STDERR_LAST (no result value).
+///
+/// Ref: NixOS/nix src/libstore/daemon.cc (WorkerProto::Op::RegisterDrvOutput)
 #[instrument(skip_all)]
 async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
 ) -> anyhow::Result<()> {
-    // Read DrvOutput: outputId (hash!outputName as a single string)
-    let _output_id = wire::read_string(reader).await?;
-    // Read realisation output path
-    let _output_path = wire::read_string(reader).await?;
+    // Protocol >= 1.31: single JSON string containing the full Realisation
+    let _realisation_json = wire::read_string(reader).await?;
     debug!("wopRegisterDrvOutput (stubbed, accepting)");
 
+    // Nix daemon sends only STDERR_LAST, no result value
     stderr.finish().await?;
-    wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())
 }
 

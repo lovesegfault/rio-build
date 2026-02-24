@@ -1773,3 +1773,75 @@ async fn test_add_to_store_invalid_cam() {
     })
     .await;
 }
+
+/// wopRegisterDrvOutput (42): stub reads one JSON string (protocol >= 1.31)
+/// and responds with STDERR_LAST only (no result value).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_drv_output_stub() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopRegisterDrvOutput (42)
+            wire::write_u64(&mut s, 42).await.unwrap();
+
+            // Protocol >= 1.31: single JSON string (Realisation)
+            let realisation_json = r#"{"id":"sha256:0000000000000000000000000000000000000000000000000000000000000000!out","outPath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test","signatures":[],"dependentRealisations":{}}"#;
+            wire::write_string(&mut s, realisation_json)
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_LAST only (no result value)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+
+            // Verify connection is still open by sending another opcode
+            wire::write_u64(&mut s, 1).await.unwrap(); // wopIsValidPath
+            wire::write_string(
+                &mut s,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let _valid = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+/// wopQueryRealisation (43): stub reads one string and responds with
+/// STDERR_LAST + u64(0) (empty set of realisations).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_realisation_stub() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopQueryRealisation (43)
+            wire::write_u64(&mut s, 43).await.unwrap();
+            wire::write_string(
+                &mut s,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000!out",
+            )
+            .await
+            .unwrap();
+            s.flush().await.unwrap();
+
+            // Should receive STDERR_LAST + count=0
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 0);
+        })
+    })
+    .await;
+}
