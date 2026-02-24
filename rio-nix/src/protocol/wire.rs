@@ -565,6 +565,7 @@ mod tests {
         use std::io::Cursor;
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn roundtrip_u64(val: u64) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();

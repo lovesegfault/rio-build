@@ -455,6 +455,7 @@ mod tests {
         use proptest::prelude::*;
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn nixbase32_roundtrip(data in proptest::collection::vec(any::<u8>(), 1..=32)) {
                 let encoded = nixbase32::encode(&data);

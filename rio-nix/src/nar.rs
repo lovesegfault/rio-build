@@ -754,6 +754,7 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn nar_roundtrip(node in arb_nar_node()) {
                 let mut buf = Vec::new();

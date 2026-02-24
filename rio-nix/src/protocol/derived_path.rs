@@ -358,6 +358,7 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn derived_path_roundtrip(dp in arb_derived_path()) {
                 let s = dp.to_string();

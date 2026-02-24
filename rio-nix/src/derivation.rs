@@ -933,6 +933,7 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn aterm_roundtrip(drv in arb_derivation()) {
                 let serialized = drv.to_aterm();
