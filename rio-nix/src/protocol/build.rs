@@ -30,9 +30,9 @@ impl TryFrom<u64> for BuildMode {
 
 /// Build result status codes.
 ///
-/// Wire values match the Nix protocol (serialized as `u8`, not `u64`).
+/// Wire values match the Nix protocol. Logically u8 range but serialized as u64 on the wire (all Nix wire integers are u64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+#[repr(u64)]
 pub enum BuildStatus {
     Built = 0,
     Substituted = 1,
@@ -51,9 +51,9 @@ pub enum BuildStatus {
     NoSubstituters = 14,
 }
 
-impl TryFrom<u8> for BuildStatus {
-    type Error = u8;
-    fn try_from(v: u8) -> std::result::Result<Self, u8> {
+impl TryFrom<u64> for BuildStatus {
+    type Error = u64;
+    fn try_from(v: u64) -> std::result::Result<Self, u64> {
         match v {
             0 => Ok(BuildStatus::Built),
             1 => Ok(BuildStatus::Substituted),
@@ -209,7 +209,7 @@ impl BuildResult {
     pub fn with_outputs_from_drv(
         mut self,
         drv: &crate::derivation::Derivation,
-        drv_path: &crate::store_path::StorePath,
+        _drv_path: &crate::store_path::StorePath,
     ) -> Self {
         use sha2::{Digest, Sha256};
 
@@ -229,7 +229,6 @@ impl BuildResult {
             })
             .collect();
 
-        let _ = drv_path; // used for tracing context in future
         self
     }
 }
@@ -340,8 +339,17 @@ async fn write_optional_i64<W: AsyncWrite + Unpin>(w: &mut W, val: Option<i64>) 
 /// Read a `BuildResult` from the wire (server → client, protocol >= 1.37).
 pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildResult> {
     // Status is logically u8 but serialized as u64 (all Nix wire ints are u64)
-    let status_val = wire::read_u64(r).await? as u8;
-    let status = BuildStatus::try_from(status_val).unwrap_or(BuildStatus::MiscFailure);
+    let status_val = wire::read_u64(r).await?;
+    let status = match BuildStatus::try_from(status_val) {
+        Ok(s) => s,
+        Err(v) => {
+            tracing::warn!(
+                status_val = v,
+                "unknown BuildStatus from daemon, treating as MiscFailure"
+            );
+            BuildStatus::MiscFailure
+        }
+    };
 
     let error_msg = wire::read_string(r).await?;
 
@@ -366,10 +374,17 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         let drv_output_id = wire::read_string(r).await?;
         // Value: Realisation as JSON string
         let json_str = wire::read_string(r).await?;
-        let out_path = serde_json::from_str::<serde_json::Value>(&json_str)
-            .ok()
-            .and_then(|v| v.get("outPath")?.as_str().map(String::from))
-            .unwrap_or_default();
+        let out_path = match serde_json::from_str::<serde_json::Value>(&json_str) {
+            Ok(v) => v
+                .get("outPath")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(e) => {
+                tracing::warn!(json = %json_str, error = %e, "failed to parse Realisation JSON");
+                String::new()
+            }
+        };
         built_outputs.push(BuiltOutput {
             drv_output_id,
             out_path,
@@ -441,10 +456,10 @@ mod tests {
 
     #[test]
     fn build_status_roundtrip() {
-        for val in 0..=14u8 {
+        for val in 0..=14u64 {
             assert!(BuildStatus::try_from(val).is_ok());
         }
-        assert_eq!(BuildStatus::try_from(99u8), Err(99));
+        assert_eq!(BuildStatus::try_from(99u64), Err(99));
     }
 
     #[test]
@@ -542,7 +557,7 @@ mod tests {
         use std::io::Cursor;
 
         fn arb_build_status() -> impl Strategy<Value = BuildStatus> {
-            (0u8..=14).prop_map(|v| BuildStatus::try_from(v).unwrap())
+            (0u64..=14).prop_map(|v| BuildStatus::try_from(v).unwrap())
         }
 
         fn arb_built_output() -> impl Strategy<Value = BuiltOutput> {
