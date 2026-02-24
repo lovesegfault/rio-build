@@ -342,8 +342,16 @@ pub async fn client_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin
     wire::write_u64(writer, build_mode as u64).await?;
     writer.flush().await?;
 
-    // Read STDERR loop until STDERR_LAST
+    // Read STDERR loop until STDERR_LAST (bounded to prevent infinite loops)
+    const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
+    let mut msg_count: u64 = 0;
     loop {
+        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
+            return Err(WireError::Io(std::io::Error::other(
+                "exceeded maximum STDERR messages during build",
+            )));
+        }
+        msg_count += 1;
         match read_stderr_message(reader).await? {
             StderrMessage::Last => break,
             StderrMessage::Error(e) => {
@@ -360,6 +368,13 @@ pub async fn client_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin
                     BuildStatus::MiscFailure,
                     "daemon sent STDERR_READ, not supported for build forwarding".to_string(),
                 ));
+            }
+            StderrMessage::Write(data) => {
+                tracing::debug!(
+                    target: "nix-daemon",
+                    len = data.len(),
+                    "discarding STDERR_WRITE data during build"
+                );
             }
             _ => {} // discard activity messages
         }
