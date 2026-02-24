@@ -145,9 +145,22 @@ impl NarInfo {
                     deriver = Some(value.to_string());
                 }
                 "Sig" => sigs.push(value.to_string()),
-                "CA" => ca = Some(value.to_string()),
-                "FileHash" => file_hash = Some(value.to_string()),
+                "CA" => {
+                    if ca.is_some() {
+                        return Err(NarInfoError::DuplicateField("CA".to_string()));
+                    }
+                    ca = Some(value.to_string());
+                }
+                "FileHash" => {
+                    if file_hash.is_some() {
+                        return Err(NarInfoError::DuplicateField("FileHash".to_string()));
+                    }
+                    file_hash = Some(value.to_string());
+                }
                 "FileSize" => {
+                    if file_size.is_some() {
+                        return Err(NarInfoError::DuplicateField("FileSize".to_string()));
+                    }
                     file_size = Some(
                         value
                             .parse::<u64>()
