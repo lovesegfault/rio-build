@@ -28,6 +28,27 @@ const PROGRAM_NAME: &str = "rio-build";
 /// Default timeout for local daemon build operations (1 hour).
 const DAEMON_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Cached daemon timeout, parsed once from `RIO_DAEMON_TIMEOUT_SECS` env var.
+fn daemon_timeout() -> std::time::Duration {
+    use std::sync::OnceLock;
+    static TIMEOUT: OnceLock<std::time::Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| match std::env::var("RIO_DAEMON_TIMEOUT_SECS") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(secs) => {
+                debug!(timeout_secs = secs, "using configured daemon timeout");
+                std::time::Duration::from_secs(secs)
+            }
+            Err(e) => {
+                warn!(value = %val, error = %e,
+                          "invalid RIO_DAEMON_TIMEOUT_SECS, using default {}s",
+                          DAEMON_BUILD_TIMEOUT.as_secs());
+                DAEMON_BUILD_TIMEOUT
+            }
+        },
+        Err(_) => DAEMON_BUILD_TIMEOUT,
+    })
+}
+
 /// Client build options received via wopSetOptions.
 ///
 /// Fields are populated during Phase 1a and propagated to the scheduler
@@ -1787,21 +1808,7 @@ async fn build_via_local_daemon(
         .map_err(|e| anyhow::anyhow!("daemon build failed: {e}"))
     };
 
-    let timeout = match std::env::var("RIO_DAEMON_TIMEOUT_SECS") {
-        Ok(val) => match val.parse::<u64>() {
-            Ok(secs) => {
-                debug!(timeout_secs = secs, "using configured daemon timeout");
-                std::time::Duration::from_secs(secs)
-            }
-            Err(e) => {
-                warn!(value = %val, error = %e,
-                      "invalid RIO_DAEMON_TIMEOUT_SECS, using default {}s",
-                      DAEMON_BUILD_TIMEOUT.as_secs());
-                DAEMON_BUILD_TIMEOUT
-            }
-        },
-        Err(_) => DAEMON_BUILD_TIMEOUT,
-    };
+    let timeout = daemon_timeout();
 
     let result = match tokio::time::timeout(timeout, build_fut).await {
         Ok(r) => r,
