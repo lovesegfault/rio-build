@@ -29,7 +29,13 @@ pub enum DerivationError {
 
     #[error("empty output name at index {0}")]
     EmptyOutputName(usize),
+
+    #[error("collection too large: {0} items (max {MAX_ATERM_LIST_ITEMS})")]
+    CollectionTooLarge(usize),
 }
+
+/// Maximum number of items in any ATerm list (DoS prevention).
+const MAX_ATERM_LIST_ITEMS: usize = 1_048_576;
 
 /// A single derivation output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,6 +459,9 @@ impl<'a> ATermParser<'a> {
             return Ok(items);
         }
         loop {
+            if items.len() >= MAX_ATERM_LIST_ITEMS {
+                return Err(DerivationError::CollectionTooLarge(items.len()));
+            }
             items.push(self.parse_string()?);
             match self.peek() {
                 Some(',') => self.advance(),
@@ -474,6 +483,9 @@ impl<'a> ATermParser<'a> {
             return Ok(outputs);
         }
         loop {
+            if outputs.len() >= MAX_ATERM_LIST_ITEMS {
+                return Err(DerivationError::CollectionTooLarge(outputs.len()));
+            }
             self.expect("(")?;
             let name = self.parse_string()?;
             self.expect(",")?;
@@ -515,6 +527,9 @@ impl<'a> ATermParser<'a> {
             return Ok(drvs);
         }
         loop {
+            if drvs.len() >= MAX_ATERM_LIST_ITEMS {
+                return Err(DerivationError::CollectionTooLarge(drvs.len()));
+            }
             self.expect("(")?;
             let drv_path = self.parse_string()?;
             self.expect(",")?;
@@ -543,6 +558,9 @@ impl<'a> ATermParser<'a> {
             return Ok(env);
         }
         loop {
+            if env.len() >= MAX_ATERM_LIST_ITEMS {
+                return Err(DerivationError::CollectionTooLarge(env.len()));
+            }
             self.expect("(")?;
             let key = self.parse_string()?;
             self.expect(",")?;
