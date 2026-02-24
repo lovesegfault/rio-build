@@ -248,8 +248,9 @@ async fn read_stderr_loop(
                 read_wire_string(stream, &mut result).await?;
             }
             STDERR_ERROR => {
-                // Error: type + level + name + message + position + traces
-                // (variable-length, but we read until STDERR_LAST or EOF)
+                // Error is a terminal message — the daemon returns to waiting
+                // for the next opcode after sending it. Parse the full error
+                // payload, then return (don't loop for another STDERR message).
                 read_wire_string(stream, &mut result).await?; // type
                 read_wire_string(stream, &mut result).await?; // message/error msg
                 let mut err_code = [0u8; 8];
@@ -282,6 +283,7 @@ async fn read_stderr_loop(
                     }
                     read_wire_string(stream, &mut result).await?; // trace message
                 }
+                return Ok(result);
             }
             STDERR_START_ACTIVITY => {
                 // id + level + type + text + fields(count + typed) + parent
