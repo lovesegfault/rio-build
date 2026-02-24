@@ -1807,8 +1807,19 @@ async fn build_via_local_daemon(
         let mut buf = Vec::new();
         let _ = tokio::io::AsyncReadExt::read_to_end(pipe, &mut buf).await;
         if !buf.is_empty() {
-            let text = String::from_utf8_lossy(&buf);
-            warn!(drv_path = %drv_path, stderr = %text, "nix-daemon stderr output");
+            match String::from_utf8(buf) {
+                Ok(text) => {
+                    warn!(drv_path = %drv_path, stderr = %text, "nix-daemon stderr output");
+                }
+                Err(e) => {
+                    let bytes = e.into_bytes();
+                    warn!(
+                        drv_path = %drv_path,
+                        stderr_len = bytes.len(),
+                        "nix-daemon produced non-UTF-8 stderr output"
+                    );
+                }
+            }
         }
     }
 
