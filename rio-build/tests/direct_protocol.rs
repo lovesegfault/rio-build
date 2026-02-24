@@ -1563,6 +1563,63 @@ async fn test_build_paths_invalid_derived_path() {
     .await;
 }
 
+/// wopBuildPaths (9): opaque path that exists returns success.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_opaque_valid() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildPaths (9) with a path that exists in make_test_store()
+            wire::write_u64(&mut s, 9).await.unwrap();
+            let paths =
+                vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // buildMode: Normal
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST + u64(1) (success)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_LAST,
+                "expected STDERR_LAST for valid opaque path"
+            );
+            let result = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(result, 1, "expected success (1)");
+        })
+    })
+    .await;
+}
+
+/// wopBuildPaths (9): opaque path NOT in store returns STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_opaque_not_found() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildPaths (9) with a path NOT in the store
+            wire::write_u64(&mut s, 9).await.unwrap();
+            let paths = vec!["/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-missing-1.0".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // buildMode: Normal
+            s.flush().await.unwrap();
+
+            // Expect STDERR_ERROR (opaque path not valid)
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_ERROR,
+                "expected STDERR_ERROR for missing opaque path"
+            );
+        })
+    })
+    .await;
+}
+
 /// wopBuildPathsWithResults (46): opaque path not in store gets MiscFailure.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_build_paths_with_results_opaque_not_found() {
