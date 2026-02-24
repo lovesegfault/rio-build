@@ -570,16 +570,45 @@ async fn test_golden_live_nar_from_path() {
     );
 }
 
-// TODO(phase1b): QueryPathFromHashPart is currently stubbed (returns empty).
-// When implemented, add a "found" test case that populates the store with a
-// known path and verifies the correct path is returned for its hash part.
 #[tokio::test]
-async fn test_golden_live_query_path_from_hash_part() {
+async fn test_golden_live_query_path_from_hash_part_not_found() {
     let store = Arc::new(MemoryStore::new());
-    // Use a hash part that doesn't exist — the stub returns empty string.
+    // Use a hash part that doesn't exist — both daemon and rio-build return empty.
     let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     let op = golden::build_query_path_from_hash_part_bytes(hash_part).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_query_path_from_hash_part_fields(data))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_golden_live_query_path_from_hash_part_found() {
+    let test_path = golden::daemon::build_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
+
+    let sp = rio_nix::store_path::StorePath::parse(&test_path).unwrap();
+    let hash_part = sp.hash_part();
+
+    let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await;
+    run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
+        Box::pin(golden::parse_query_path_from_hash_part_fields(data))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_golden_live_query_path_from_hash_part_ca() {
+    let test_path = golden::daemon::build_ca_test_path();
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
+
+    let sp = rio_nix::store_path::StorePath::parse(&test_path).unwrap();
+    let hash_part = sp.hash_part();
+
+    let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_path_from_hash_part_fields(data))
     })

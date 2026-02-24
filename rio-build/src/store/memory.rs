@@ -122,6 +122,18 @@ impl Store for MemoryStore {
             .map(|data| Box::new(std::io::Cursor::new(data)) as NarReader))
     }
 
+    async fn query_path_from_hash_part(
+        &self,
+        hash_part: &str,
+    ) -> anyhow::Result<Option<StorePath>> {
+        Ok(self
+            .read_inner()
+            .paths
+            .keys()
+            .find(|p| p.hash_part() == hash_part)
+            .cloned())
+    }
+
     async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()> {
         let key = info.path().clone();
         debug!(path = %key, "adding path to memory store");

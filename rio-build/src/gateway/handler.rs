@@ -113,7 +113,7 @@ where
         Some(WorkerOp::SetOptions) => handle_set_options(reader, &mut stderr, options).await,
         Some(WorkerOp::NarFromPath) => handle_nar_from_path(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryPathFromHashPart) => {
-            handle_query_path_from_hash_part(reader, &mut stderr).await
+            handle_query_path_from_hash_part(reader, &mut stderr, store).await
         }
         Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr).await,
         Some(WorkerOp::QueryMissing) => handle_query_missing(reader, &mut stderr, store).await,
@@ -522,17 +522,24 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// wopQueryPathFromHashPart (29): Stubbed — returns empty string (no match).
+/// wopQueryPathFromHashPart (29): Resolve a store path from its hash part.
 #[instrument(skip_all)]
 async fn handle_query_path_from_hash_part<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
 ) -> anyhow::Result<()> {
-    let _hash_part = wire::read_string(reader).await?;
-    debug!("wopQueryPathFromHashPart (stubbed, returning empty)");
+    let hash_part = wire::read_string(reader).await?;
+    debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
+
+    let result = match store.query_path_from_hash_part(&hash_part).await {
+        Ok(r) => r,
+        Err(e) => return send_store_error(stderr, e).await,
+    };
 
     stderr.finish().await?;
-    wire::write_string(stderr.inner_mut(), "").await?;
+    let path_str = result.map(|p| p.to_string()).unwrap_or_default();
+    wire::write_string(stderr.inner_mut(), &path_str).await?;
     Ok(())
 }
 

@@ -344,7 +344,35 @@ async fn test_query_path_from_hash_part() {
             let last = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(last, STDERR_LAST);
             let path = wire::read_string(&mut s).await.unwrap();
-            assert!(path.is_empty(), "expected empty string (stub), got: {path}");
+            assert!(path.is_empty(), "expected empty (not found), got: {path}");
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_path_from_hash_part_found() {
+    let store = make_test_store();
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopQueryPathFromHashPart (29): query with the hash part of the
+            // path that exists in make_test_store()
+            wire::write_u64(&mut s, 29).await.unwrap();
+            wire::write_string(&mut s, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(
+                path, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+                "expected found path"
+            );
         })
     })
     .await;
@@ -649,7 +677,7 @@ async fn test_multi_opcode_sequence() {
             assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
             assert_eq!(wire::read_u64(&mut s).await.unwrap(), 1);
 
-            // Op 4: QueryPathFromHashPart (stub)
+            // Op 4: QueryPathFromHashPart (found — hash part matches the store path)
             wire::write_u64(&mut s, 29).await.unwrap();
             wire::write_string(&mut s, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 .await
@@ -657,7 +685,10 @@ async fn test_multi_opcode_sequence() {
             s.flush().await.unwrap();
             assert_eq!(wire::read_u64(&mut s).await.unwrap(), STDERR_LAST);
             let path = wire::read_string(&mut s).await.unwrap();
-            assert!(path.is_empty());
+            assert_eq!(
+                path,
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
+            );
 
             // Op 5: QueryMissing
             wire::write_u64(&mut s, 40).await.unwrap();
