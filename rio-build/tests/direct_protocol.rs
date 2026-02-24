@@ -2148,3 +2148,245 @@ async fn test_build_paths_built_not_in_cache() {
     })
     .await;
 }
+
+/// wopAddToStoreNar (39): correct hash but wrong declared nar_size
+/// should return STDERR_ERROR with "size mismatch".
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_nar_size_mismatch() {
+    let store = Arc::new(MemoryStore::new());
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            let nar_data = make_nar(b"size mismatch content");
+            let nar_hash = sha256_hex(&nar_data);
+            let wrong_nar_size = nar_data.len() as u64 + 1; // off by one
+            let path_str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-size-test";
+
+            wire::write_u64(&mut s, 39).await.unwrap();
+            wire::write_string(&mut s, path_str).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_string(&mut s, &nar_hash).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap();
+            wire::write_u64(&mut s, wrong_nar_size).await.unwrap();
+            wire::write_bool(&mut s, true).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap(); // repair
+            wire::write_bool(&mut s, false).await.unwrap(); // dontCheckSigs
+
+            // Send NAR data as framed stream
+            wire::write_framed_stream(&mut s, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            // Server should detect size mismatch and send STDERR_ERROR
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_ERROR, "expected STDERR_ERROR for size mismatch");
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("size mismatch"),
+                "error should mention 'size mismatch', got: {message}"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopBuildPathsWithResults (46): opaque path that exists in the store
+/// returns STDERR_LAST + count=1 + AlreadyValid(2).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_with_results_opaque_valid() {
+    let store = Arc::new(MemoryStore::new());
+    let store2 = store.clone();
+
+    // Upload a path first via wopAddToStoreNar (39)
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            let nar_data = make_nar(b"build results test");
+            let nar_hash = sha256_hex(&nar_data);
+            let nar_size = nar_data.len() as u64;
+            let path_str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bpwr-test";
+
+            // Upload via wopAddToStoreNar (39)
+            wire::write_u64(&mut s, 39).await.unwrap();
+            wire::write_string(&mut s, path_str).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_string(&mut s, &nar_hash).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap();
+            wire::write_u64(&mut s, nar_size).await.unwrap();
+            wire::write_bool(&mut s, true).await.unwrap();
+            wire::write_strings(&mut s, &[]).await.unwrap();
+            wire::write_string(&mut s, "").await.unwrap();
+            wire::write_bool(&mut s, false).await.unwrap(); // repair
+            wire::write_bool(&mut s, false).await.unwrap(); // dontCheckSigs
+
+            wire::write_framed_stream(&mut s, &nar_data, 64 * 1024)
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST, "upload should succeed");
+
+            // Now send wopBuildPathsWithResults (46) with the uploaded path
+            wire::write_u64(&mut s, 46).await.unwrap();
+            let paths = vec![path_str.to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // buildMode: Normal
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // Read count
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 1, "expected 1 result");
+
+            // Read DerivedPath key
+            let dp_key = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(dp_key, path_str);
+
+            // Read BuildResult: AlreadyValid(2)
+            let status = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                status, 2,
+                "expected AlreadyValid(2) for existing opaque path, got {status}"
+            );
+            let _error_msg = wire::read_string(&mut s).await.unwrap();
+            let _times_built = wire::read_u64(&mut s).await.unwrap();
+            let _is_non_deterministic = wire::read_u64(&mut s).await.unwrap();
+            let _start_time = wire::read_u64(&mut s).await.unwrap();
+            let _stop_time = wire::read_u64(&mut s).await.unwrap();
+            let cpu_user_tag = wire::read_u64(&mut s).await.unwrap();
+            if cpu_user_tag == 1 {
+                let _ = wire::read_u64(&mut s).await.unwrap();
+            }
+            let cpu_system_tag = wire::read_u64(&mut s).await.unwrap();
+            if cpu_system_tag == 1 {
+                let _ = wire::read_u64(&mut s).await.unwrap();
+            }
+            let built_outputs_count = wire::read_u64(&mut s).await.unwrap();
+            // Opaque paths have no derivation outputs
+            assert_eq!(
+                built_outputs_count, 0,
+                "opaque path should have 0 built outputs"
+            );
+        })
+    })
+    .await;
+
+    // Verify the path was stored
+    let path = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bpwr-test").unwrap();
+    assert!(store2.is_valid_path(&path).await.unwrap());
+}
+
+/// wopBuildPathsWithResults (46): build_mode=99 (invalid) returns STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_with_results_unknown_build_mode() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopBuildPathsWithResults (46) with invalid build_mode
+            wire::write_u64(&mut s, 46).await.unwrap();
+            let paths =
+                vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            wire::write_u64(&mut s, 99).await.unwrap(); // build_mode = 99 (invalid)
+            s.flush().await.unwrap();
+
+            // Expect STDERR_ERROR for unsupported build mode
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_ERROR,
+                "expected STDERR_ERROR for unknown build mode"
+            );
+
+            // Read error structure
+            let _error_type = wire::read_string(&mut s).await.unwrap();
+            let _level = wire::read_u64(&mut s).await.unwrap();
+            let _name = wire::read_string(&mut s).await.unwrap();
+            let message = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                message.contains("unsupported build mode"),
+                "error should mention 'unsupported build mode', got: {message}"
+            );
+            let _have_pos = wire::read_u64(&mut s).await.unwrap();
+            let _trace_count = wire::read_u64(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
+
+/// wopAddToStore (7): recursive NAR mode with `fixed:r:sha256`.
+/// The dump data is already a serialized NAR and should be stored as-is.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_recursive_nar_mode() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // wopAddToStore (7)
+            wire::write_u64(&mut s, 7).await.unwrap();
+            wire::write_string(&mut s, "recursive-test").await.unwrap(); // name
+            wire::write_string(&mut s, "fixed:r:sha256").await.unwrap(); // cam_str
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references (empty)
+            wire::write_u64(&mut s, 0).await.unwrap(); // repair = false (wire bool)
+
+            // For recursive mode, the dump data IS a NAR.
+            let nar_data = make_nar(b"recursive nar content");
+            wire::write_u64(&mut s, nar_data.len() as u64)
+                .await
+                .unwrap(); // frame length
+            s.write_all(&nar_data).await.unwrap(); // frame data
+            wire::write_u64(&mut s, 0).await.unwrap(); // end-of-stream sentinel
+            s.flush().await.unwrap();
+
+            // Expect STDERR_LAST
+            let last = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(last, STDERR_LAST);
+
+            // Read full ValidPathInfo response
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                path.starts_with("/nix/store/"),
+                "expected store path, got: {path}"
+            );
+            assert!(
+                path.ends_with("-recursive-test"),
+                "path should end with '-recursive-test', got: {path}"
+            );
+            let _deriver = wire::read_string(&mut s).await.unwrap();
+            let nar_hash = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(
+                nar_hash.len(),
+                64,
+                "expected 64-char hex hash, got: {nar_hash}"
+            );
+            let _refs = wire::read_strings(&mut s).await.unwrap();
+            let _reg_time = wire::read_u64(&mut s).await.unwrap();
+            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+            let _ultimate = wire::read_u64(&mut s).await.unwrap();
+            let _sigs = wire::read_strings(&mut s).await.unwrap();
+            let _ca = wire::read_string(&mut s).await.unwrap();
+        })
+    })
+    .await;
+}
