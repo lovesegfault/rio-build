@@ -180,7 +180,7 @@ async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// wopEnsurePath (7): Ensure a store path is valid/available.
+/// wopEnsurePath (10): Ensure a store path is valid/available.
 ///
 /// In the real nix-daemon, this may trigger substitution. For rio-build,
 /// all paths are either already uploaded or unavailable, so this is
@@ -196,10 +196,16 @@ async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     // Check if the path is valid — log if missing but don't error,
     // since the real daemon would attempt substitution.
-    if let Ok(path) = StorePath::parse(&path_str)
-        && !store.is_valid_path(&path).await.unwrap_or(false)
-    {
-        debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
+    if let Ok(path) = StorePath::parse(&path_str) {
+        match store.is_valid_path(&path).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
+            }
+            Err(e) => {
+                warn!(path = %path_str, error = %e, "wopEnsurePath: store error checking path");
+            }
+        }
     }
 
     stderr.finish().await?;
@@ -631,6 +637,12 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // Client responds with u64(len) + data + padding (same as wire string format)
         let chunk = wire::read_bytes(reader).await?;
         if chunk.is_empty() {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("empty chunk received in STDERR_READ loop for {path_str}"),
+                ))
+                .await?;
             return Err(anyhow::anyhow!(
                 "client sent empty chunk in STDERR_READ loop for {path_str}"
             ));
@@ -708,12 +720,26 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let deriver = if deriver_str.is_empty() {
         None
     } else {
-        StorePath::parse(&deriver_str).ok()
+        match StorePath::parse(&deriver_str) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(path = %path_str, deriver = %deriver_str, error = %e,
+                      "wopAddToStoreNar: unparseable deriver path, treating as unknown");
+                None
+            }
+        }
     };
 
     let ref_paths: Vec<StorePath> = references
         .iter()
-        .filter_map(|s| StorePath::parse(s).ok())
+        .filter_map(|s| match StorePath::parse(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(path = %path_str, reference = %s, error = %e,
+                      "wopAddToStoreNar: unparseable reference path, dropping");
+                None
+            }
+        })
         .collect();
 
     let ca = if ca_str.is_empty() {
@@ -793,7 +819,9 @@ fn try_cache_drv(
 
 /// Parse a single entry from the wopAddMultipleToStore reassembled byte stream.
 ///
-/// Each entry contains the same PathInfo metadata fields as wopAddToStoreNar,
+/// Each entry contains PathInfo metadata fields (path, deriver, narHash,
+/// references, registrationTime, narSize, ultimate, sigs, ca — no `repair`
+/// flag, unlike wopAddToStoreNar where `repair` is per-request),
 /// followed by an inner framed stream containing the NAR data.
 async fn parse_add_multiple_entry(
     cursor: &mut std::io::Cursor<&[u8]>,
@@ -850,12 +878,26 @@ async fn parse_add_multiple_entry(
     let deriver = if deriver_str.is_empty() {
         None
     } else {
-        StorePath::parse(&deriver_str).ok()
+        match StorePath::parse(&deriver_str) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(path = %path_str, deriver = %deriver_str, error = %e,
+                      "wopAddMultipleToStore: unparseable deriver path, treating as unknown");
+                None
+            }
+        }
     };
 
     let ref_paths: Vec<StorePath> = references
         .iter()
-        .filter_map(|s| StorePath::parse(s).ok())
+        .filter_map(|s| match StorePath::parse(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(path = %path_str, reference = %s, error = %e,
+                      "wopAddMultipleToStore: unparseable reference path, dropping");
+                None
+            }
+        })
         .collect();
 
     let ca = if ca_str.is_empty() {
@@ -904,8 +946,18 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let dump_data = wire::read_framed_stream(reader).await?;
 
     // Parse content-address method string: "text:sha256", "fixed:sha256", "fixed:r:sha256"
-    let (is_text, is_recursive, hash_algo) = parse_cam_str(&cam_str)
-        .map_err(|e| anyhow::anyhow!("invalid content-address method '{cam_str}': {e}"))?;
+    let (is_text, is_recursive, hash_algo) = match parse_cam_str(&cam_str) {
+        Ok(v) => v,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("invalid content-address method '{cam_str}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("invalid content-address method: {e}"));
+        }
+    };
 
     // Hash the dump content
     let content_hash = NixHash::compute(hash_algo, &dump_data);
@@ -913,15 +965,43 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // Compute the store path
     let ref_paths: Vec<StorePath> = references
         .iter()
-        .filter_map(|s| StorePath::parse(s).ok())
+        .filter_map(|s| match StorePath::parse(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(reference = %s, error = %e, "wopAddToStore: unparseable reference path, dropping");
+                None
+            }
+        })
         .collect();
 
     let path = if is_text {
-        StorePath::make_text(&name, &content_hash, &ref_paths)
-            .map_err(|e| anyhow::anyhow!("failed to compute text store path: {e}"))?
+        match StorePath::make_text(&name, &content_hash, &ref_paths) {
+            Ok(p) => p,
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("failed to compute text store path for '{name}': {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("failed to compute text store path: {e}"));
+            }
+        }
     } else {
-        StorePath::make_fixed_output(&name, &content_hash, is_recursive)
-            .map_err(|e| anyhow::anyhow!("failed to compute fixed-output store path: {e}"))?
+        match StorePath::make_fixed_output(&name, &content_hash, is_recursive) {
+            Ok(p) => p,
+            Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("failed to compute fixed-output store path for '{name}': {e}"),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!(
+                    "failed to compute fixed-output store path: {e}"
+                ));
+            }
+        }
     };
 
     // Build NAR: if the dump is flat content (text or non-recursive), wrap in NAR.
@@ -934,8 +1014,15 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             contents: dump_data,
         };
         let mut buf = Vec::new();
-        nar::serialize(&mut buf, &node)
-            .map_err(|e| anyhow::anyhow!("failed to serialize NAR: {e}"))?;
+        if let Err(e) = nar::serialize(&mut buf, &node) {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to serialize NAR for '{name}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("failed to serialize NAR: {e}"));
+        }
         buf
     };
 
@@ -955,14 +1042,33 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    let info = PathInfoBuilder::new(path.clone(), nar_hash.clone(), nar_size)
+    let info = match PathInfoBuilder::new(path.clone(), nar_hash.clone(), nar_size)
         .references(ref_paths)
         .ultimate(true)
         .ca(Some(ca.clone()))
         .build()
-        .map_err(|e| anyhow::anyhow!("failed to build PathInfo: {e}"))?;
+    {
+        Ok(info) => info,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to build PathInfo for '{}': {e}", path),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("PathInfo build failed: {e}"));
+        }
+    };
 
-    store.add_path(info, nar_data.clone()).await?;
+    if let Err(e) = store.add_path(info, nar_data.clone()).await {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("failed to store path '{}': {e}", path),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("store error: {e}"));
+    }
     try_cache_drv(&path, &nar_data, drv_cache);
 
     // Send STDERR_LAST + ValidPathInfo
@@ -1007,11 +1113,27 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let ref_paths: Vec<StorePath> = references
         .iter()
-        .filter_map(|s| StorePath::parse(s).ok())
+        .filter_map(|s| match StorePath::parse(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(reference = %s, error = %e, "wopAddTextToStore: unparseable reference path, dropping");
+                None
+            }
+        })
         .collect();
 
-    let path = StorePath::make_text(&name, &content_hash, &ref_paths)
-        .map_err(|e| anyhow::anyhow!("failed to compute text store path: {e}"))?;
+    let path = match StorePath::make_text(&name, &content_hash, &ref_paths) {
+        Ok(p) => p,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to compute text store path for '{name}': {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("failed to compute text store path: {e}"));
+        }
+    };
 
     // Wrap text in NAR
     let node = NarNode::Regular {
@@ -1019,8 +1141,15 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         contents: text.into_bytes(),
     };
     let mut nar_data = Vec::new();
-    nar::serialize(&mut nar_data, &node)
-        .map_err(|e| anyhow::anyhow!("failed to serialize NAR: {e}"))?;
+    if let Err(e) = nar::serialize(&mut nar_data, &node) {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("failed to serialize NAR for '{name}': {e}"),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("failed to serialize NAR: {e}"));
+    }
 
     let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
     let nar_size = nar_data.len() as u64;
@@ -1030,14 +1159,33 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         rio_nix::store_path::nixbase32::encode(content_hash.digest())
     );
 
-    let info = PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
+    let info = match PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
         .references(ref_paths)
         .ultimate(true)
         .ca(Some(ca))
         .build()
-        .map_err(|e| anyhow::anyhow!("failed to build PathInfo: {e}"))?;
+    {
+        Ok(info) => info,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("failed to build PathInfo for '{}': {e}", path),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("PathInfo build failed: {e}"));
+        }
+    };
 
-    store.add_path(info, nar_data.clone()).await?;
+    if let Err(e) = store.add_path(info, nar_data.clone()).await {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!("failed to store path '{}': {e}", path),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("store error: {e}"));
+    }
     try_cache_drv(&path, &nar_data, drv_cache);
 
     // wopAddTextToStore returns STDERR_LAST + store path string
@@ -1229,7 +1377,16 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let drv_path_str = wire::read_string(reader).await?;
     let (outputs, input_srcs, platform, builder, args, env) = read_basic_derivation(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
-    let build_mode = BuildMode::try_from(build_mode_val).unwrap_or(BuildMode::Normal);
+    let build_mode = match BuildMode::try_from(build_mode_val) {
+        Ok(m) => m,
+        Err(_) => {
+            warn!(
+                build_mode = build_mode_val,
+                "wopBuildDerivation: unknown build mode, defaulting to Normal"
+            );
+            BuildMode::Normal
+        }
+    };
 
     debug!(
         path = %drv_path_str,
@@ -1284,7 +1441,16 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
-    let build_mode = BuildMode::try_from(build_mode_val).unwrap_or(BuildMode::Normal);
+    let build_mode = match BuildMode::try_from(build_mode_val) {
+        Ok(m) => m,
+        Err(_) => {
+            warn!(
+                build_mode = build_mode_val,
+                "wopBuildPaths: unknown build mode, defaulting to Normal"
+            );
+            BuildMode::Normal
+        }
+    };
 
     debug!(
         count = raw_paths.len(),
@@ -1308,15 +1474,18 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
         match &dp {
             DerivedPath::Opaque(path) => {
-                // Check if the path exists — opaque paths can't be built
-                if !store.is_valid_path(path).await? {
-                    stderr
-                        .error(&StderrError::simple(
-                            PROGRAM_NAME,
-                            format!("path '{}' is not valid and cannot be built", path),
-                        ))
-                        .await?;
-                    return Err(anyhow::anyhow!("invalid opaque path: {}", path));
+                match store.is_valid_path(path).await {
+                    Ok(true) => { /* exists, fine */ }
+                    Ok(false) => {
+                        stderr
+                            .error(&StderrError::simple(
+                                PROGRAM_NAME,
+                                format!("path '{}' is not valid and cannot be built", path),
+                            ))
+                            .await?;
+                        return Err(anyhow::anyhow!("invalid opaque path: {}", path));
+                    }
+                    Err(e) => return send_store_error(stderr, e).await,
                 }
             }
             DerivedPath::Built { drv, .. } => {
@@ -1418,7 +1587,16 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
-    let build_mode = BuildMode::try_from(build_mode_val).unwrap_or(BuildMode::Normal);
+    let build_mode = match BuildMode::try_from(build_mode_val) {
+        Ok(m) => m,
+        Err(_) => {
+            warn!(
+                build_mode = build_mode_val,
+                "wopBuildPathsWithResults: unknown build mode, defaulting to Normal"
+            );
+            BuildMode::Normal
+        }
+    };
 
     debug!(
         count = raw_paths.len(),
@@ -1441,8 +1619,8 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
         };
 
         match &dp {
-            DerivedPath::Opaque(path) => {
-                if store.is_valid_path(path).await? {
+            DerivedPath::Opaque(path) => match store.is_valid_path(path).await {
+                Ok(true) => {
                     results.push(BuildResult::new(
                         BuildStatus::AlreadyValid,
                         String::new(),
@@ -1454,13 +1632,20 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                         None,
                         Vec::new(),
                     ));
-                } else {
+                }
+                Ok(false) => {
                     results.push(BuildResult::failure(
                         BuildStatus::MiscFailure,
                         format!("path '{}' not valid", path),
                     ));
                 }
-            }
+                Err(e) => {
+                    results.push(BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!("store error checking '{}': {e}", path),
+                    ));
+                }
+            },
             DerivedPath::Built { drv, .. } => {
                 let drv_obj = match drv_cache.get(drv) {
                     Some(d) => d.clone(),
