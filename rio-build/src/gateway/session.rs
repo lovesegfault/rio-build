@@ -27,6 +27,10 @@ where
     let mut options: Option<ClientOptions> = None;
     let mut temp_roots: HashSet<StorePath> = HashSet::new();
     let mut drv_cache: HashMap<StorePath, Derivation> = HashMap::new();
+    // Keyed by drv store path string (e.g. "/nix/store/abc.drv"), matching
+    // the key format used in Derivation::input_drvs(). Session-scoped so
+    // hashes computed for one opcode are reused by subsequent opcodes.
+    let mut modular_hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
 
     // Step 1: Handshake — needs both reader and writer interleaved
     let version_string = format!("rio-build {}", env!("CARGO_PKG_VERSION"));
@@ -93,6 +97,7 @@ where
             &mut options,
             &mut temp_roots,
             &mut drv_cache,
+            &mut modular_hash_cache,
         )
         .await?;
 

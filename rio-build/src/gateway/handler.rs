@@ -75,6 +75,7 @@ pub struct ClientOptions {
 /// and returns `Ok(())` (the connection stays open). Returns `Err` only
 /// for I/O errors that prevent further communication.
 #[instrument(skip_all, fields(opcode))]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_opcode<R, W>(
     opcode: u64,
     reader: &mut R,
@@ -83,6 +84,7 @@ pub async fn handle_opcode<R, W>(
     options: &mut Option<ClientOptions>,
     temp_roots: &mut HashSet<StorePath>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
+    modular_hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -131,7 +133,14 @@ where
             handle_build_paths(reader, &mut stderr, store, drv_cache).await
         }
         Some(WorkerOp::BuildPathsWithResults) => {
-            handle_build_paths_with_results(reader, &mut stderr, store, drv_cache).await
+            handle_build_paths_with_results(
+                reader,
+                &mut stderr,
+                store,
+                drv_cache,
+                modular_hash_cache,
+            )
+            .await
         }
         Some(WorkerOp::RegisterDrvOutput) => handle_register_drv_output(reader, &mut stderr).await,
         Some(WorkerOp::QueryRealisation) => handle_query_realisation(reader, &mut stderr).await,
@@ -225,6 +234,47 @@ async fn resolve_derivation(
 
     drv_cache.insert(drv_path.clone(), drv.clone());
     Ok(drv)
+}
+
+/// Maximum number of transitive input derivations to resolve (DoS prevention).
+const MAX_TRANSITIVE_INPUTS: usize = 10_000;
+
+/// Ensure all transitive input derivations are in `drv_cache`.
+///
+/// BFS traversal of the derivation graph, resolving each `.drv` via
+/// `resolve_derivation` (which checks cache first, then fetches from store).
+async fn resolve_transitive_inputs(
+    drv: &Derivation,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<()> {
+    use std::collections::VecDeque;
+
+    let mut queue: VecDeque<String> = drv.input_drvs().keys().cloned().collect();
+    let mut visited: HashSet<String> = queue.iter().cloned().collect();
+    let mut count = 0usize;
+
+    while let Some(path_str) = queue.pop_front() {
+        count += 1;
+        if count > MAX_TRANSITIVE_INPUTS {
+            return Err(anyhow::anyhow!(
+                "transitive input limit exceeded ({MAX_TRANSITIVE_INPUTS})"
+            ));
+        }
+
+        let sp = StorePath::parse(&path_str)
+            .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
+
+        let resolved = resolve_derivation(&sp, store, drv_cache).await?;
+
+        for child_path in resolved.input_drvs().keys() {
+            if visited.insert(child_path.clone()) {
+                queue.push_back(child_path.clone());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// wopIsValidPath (1): Check if a store path exists.
@@ -1656,6 +1706,7 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
     stderr: &mut StderrWriter<&mut W>,
     store: &dyn Store,
     drv_cache: &mut HashMap<StorePath, Derivation>,
+    modular_hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
@@ -1752,13 +1803,55 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                 // If the daemon returned success but empty builtOutputs
                 // (common for AlreadyValid), populate from the derivation.
                 if result.status().is_success() && result.built_outputs().is_empty() {
-                    result = result.with_outputs_from_drv(&drv_obj, drv);
-                    for out in result.built_outputs() {
-                        debug!(
-                            drv_output_id = %out.drv_output_id,
-                            out_path = %out.out_path,
-                            "populated output from drv"
-                        );
+                    // Resolve transitive inputs, then compute modular hash.
+                    // If either step fails, skip output population rather than
+                    // producing incorrect DrvOutput IDs.
+                    match resolve_transitive_inputs(&drv_obj, store, drv_cache).await {
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                drv = %drv,
+                                "failed to resolve transitive inputs; built_outputs will be empty"
+                            );
+                        }
+                        Ok(()) => {
+                            let resolve = |path: &str| match StorePath::parse(path) {
+                                Ok(sp) => drv_cache.get(&sp),
+                                Err(e) => {
+                                    warn!(
+                                        path = %path,
+                                        error = %e,
+                                        "failed to parse store path during modular hash"
+                                    );
+                                    None
+                                }
+                            };
+                            match rio_nix::derivation::hash_derivation_modulo(
+                                &drv_obj,
+                                &drv.to_string(),
+                                &resolve,
+                                modular_hash_cache,
+                            ) {
+                                Ok(hash) => {
+                                    let drv_hash_hex = hex::encode(hash);
+                                    result = result.with_outputs_from_drv(&drv_obj, &drv_hash_hex);
+                                    for out in result.built_outputs() {
+                                        debug!(
+                                            drv_output_id = %out.drv_output_id,
+                                            out_path = %out.out_path,
+                                            "populated output from drv"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        drv = %drv,
+                                        "failed to compute hashDerivationModulo; built_outputs will be empty"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
 
