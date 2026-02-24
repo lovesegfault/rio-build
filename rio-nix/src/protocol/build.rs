@@ -4,7 +4,7 @@
 //! `BuildResult` is returned by `wopBuildDerivation` and `wopBuildPathsWithResults` (opcode 46).
 
 use super::wire::{self, Result};
-use crate::derivation::DerivationOutput;
+use crate::derivation::{BasicDerivation, DerivationOutput};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Build mode for derivation builds.
@@ -246,16 +246,7 @@ impl BuildResult {
 /// - builder: string
 /// - args: string collection
 /// - env: string-pair collection
-pub async fn read_basic_derivation<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<(
-    Vec<DerivationOutput>,
-    Vec<String>,
-    String,
-    String,
-    Vec<String>,
-    Vec<(String, String)>,
-)> {
+pub async fn read_basic_derivation<R: AsyncRead + Unpin>(r: &mut R) -> Result<BasicDerivation> {
     // outputs
     let output_count = wire::read_u64(r).await?;
     if output_count > wire::MAX_COLLECTION_COUNT {
@@ -282,32 +273,40 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(
     let args = wire::read_strings(r).await?;
     let env = wire::read_string_pairs(r).await?;
 
-    Ok((outputs, input_srcs, platform, builder, args, env))
+    Ok(BasicDerivation::new(
+        outputs,
+        input_srcs.into_iter().collect(),
+        platform,
+        builder,
+        args,
+        env.into_iter().collect(),
+    ))
 }
 
 /// Write a `BasicDerivation` to the wire (client → server for local daemon).
 pub async fn write_basic_derivation<W: AsyncWrite + Unpin>(
     w: &mut W,
-    outputs: &[DerivationOutput],
-    input_srcs: &[String],
-    platform: &str,
-    builder: &str,
-    args: &[String],
-    env: &[(String, String)],
+    drv: &BasicDerivation,
 ) -> Result<()> {
-    wire::write_u64(w, outputs.len() as u64).await?;
-    for output in outputs {
+    wire::write_u64(w, drv.outputs().len() as u64).await?;
+    for output in drv.outputs() {
         wire::write_string(w, output.name()).await?;
         wire::write_string(w, output.path()).await?;
         wire::write_string(w, output.hash_algo()).await?;
         wire::write_string(w, output.hash()).await?;
     }
 
-    wire::write_strings(w, input_srcs).await?;
-    wire::write_string(w, platform).await?;
-    wire::write_string(w, builder).await?;
-    wire::write_strings(w, args).await?;
-    wire::write_string_pairs(w, env).await?;
+    let input_srcs: Vec<String> = drv.input_srcs().iter().cloned().collect();
+    wire::write_strings(w, &input_srcs).await?;
+    wire::write_string(w, drv.platform()).await?;
+    wire::write_string(w, drv.builder()).await?;
+    wire::write_strings(w, drv.args()).await?;
+    let env_pairs: Vec<(String, String)> = drv
+        .env()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    wire::write_string_pairs(w, &env_pairs).await?;
 
     Ok(())
 }
@@ -529,38 +528,41 @@ mod tests {
             DerivationOutput::new("out", "/nix/store/abc-hello", "", "").unwrap(),
             DerivationOutput::new("dev", "/nix/store/def-hello-dev", "", "").unwrap(),
         ];
-        let input_srcs = vec!["/nix/store/ghi-source.sh".to_string()];
-        let platform = "x86_64-linux";
-        let builder = "/nix/store/jkl-bash/bin/bash";
+        let input_srcs: std::collections::BTreeSet<String> =
+            ["/nix/store/ghi-source.sh".to_string()]
+                .into_iter()
+                .collect();
+        let platform = "x86_64-linux".to_string();
+        let builder = "/nix/store/jkl-bash/bin/bash".to_string();
         let args = vec!["-e".to_string(), "script.sh".to_string()];
-        let env = vec![
+        let env_map: std::collections::BTreeMap<String, String> = [
             ("name".to_string(), "hello".to_string()),
             ("system".to_string(), "x86_64-linux".to_string()),
-        ];
+        ]
+        .into_iter()
+        .collect();
+
+        let drv = BasicDerivation::new(
+            outputs.clone(),
+            input_srcs.clone(),
+            platform.clone(),
+            builder.clone(),
+            args.clone(),
+            env_map.clone(),
+        );
 
         let mut buf = Vec::new();
-        write_basic_derivation(
-            &mut buf,
-            &outputs,
-            &input_srcs,
-            platform,
-            builder,
-            &args,
-            &env,
-        )
-        .await
-        .unwrap();
+        write_basic_derivation(&mut buf, &drv).await.unwrap();
 
         let mut reader = Cursor::new(buf);
-        let (r_outputs, r_input_srcs, r_platform, r_builder, r_args, r_env) =
-            read_basic_derivation(&mut reader).await.unwrap();
+        let r_drv = read_basic_derivation(&mut reader).await.unwrap();
 
-        assert_eq!(r_outputs, outputs);
-        assert_eq!(r_input_srcs, input_srcs);
-        assert_eq!(r_platform, platform);
-        assert_eq!(r_builder, builder);
-        assert_eq!(r_args, args);
-        assert_eq!(r_env, env);
+        assert_eq!(r_drv.outputs(), outputs);
+        assert_eq!(*r_drv.input_srcs(), input_srcs);
+        assert_eq!(r_drv.platform(), platform);
+        assert_eq!(r_drv.builder(), builder);
+        assert_eq!(r_drv.args(), args);
+        assert_eq!(*r_drv.env(), env_map);
     }
 
     mod proptests {
@@ -652,28 +654,28 @@ mod tests {
             #[test]
             fn basic_derivation_roundtrip(
                 outputs in proptest::collection::vec(arb_derivation_output(), 1..5),
-                input_srcs in proptest::collection::vec("/nix/store/[a-z0-9]{32}-[a-z]{1,8}", 0..3),
+                input_srcs in proptest::collection::btree_set("/nix/store/[a-z0-9]{32}-[a-z]{1,8}", 0..3),
                 platform in "(x86_64|aarch64)-linux",
                 builder in "/nix/store/[a-z0-9]{32}-bash/bin/bash",
                 args in proptest::collection::vec("[a-zA-Z0-9 -]{0,10}", 0..4),
-                env in proptest::collection::vec(
-                    ("[a-zA-Z_]{1,10}", "[a-zA-Z0-9 /_.-]{0,20}"),
+                env_map in proptest::collection::btree_map(
+                    "[a-zA-Z_]{1,10}", "[a-zA-Z0-9 /_.-]{0,20}",
                     0..5
                 ),
             ) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
+                    let drv = BasicDerivation::new(outputs, input_srcs, platform, builder, args, env_map);
                     let mut buf = Vec::new();
-                    write_basic_derivation(&mut buf, &outputs, &input_srcs, &platform, &builder, &args, &env).await.unwrap();
+                    write_basic_derivation(&mut buf, &drv).await.unwrap();
                     let mut reader = Cursor::new(buf);
-                    let (r_outputs, r_input_srcs, r_platform, r_builder, r_args, r_env) =
-                        read_basic_derivation(&mut reader).await.unwrap();
-                    prop_assert_eq!(r_outputs, outputs);
-                    prop_assert_eq!(r_input_srcs, input_srcs);
-                    prop_assert_eq!(r_platform, platform);
-                    prop_assert_eq!(r_builder, builder);
-                    prop_assert_eq!(r_args, args);
-                    prop_assert_eq!(r_env, env);
+                    let r_drv = read_basic_derivation(&mut reader).await.unwrap();
+                    prop_assert_eq!(r_drv.outputs(), drv.outputs());
+                    prop_assert_eq!(r_drv.input_srcs(), drv.input_srcs());
+                    prop_assert_eq!(r_drv.platform(), drv.platform());
+                    prop_assert_eq!(r_drv.builder(), drv.builder());
+                    prop_assert_eq!(r_drv.args(), drv.args());
+                    prop_assert_eq!(r_drv.env(), drv.env());
                     Ok(())
                 })?;
             }
