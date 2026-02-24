@@ -170,39 +170,37 @@ impl NarInfo {
 
     /// Serialize to narinfo text format.
     pub fn serialize(&self) -> String {
+        use std::fmt::Write;
         let mut out = String::new();
 
-        out.push_str(&format!("StorePath: {}\n", self.store_path));
-        out.push_str(&format!("URL: {}\n", self.url));
-        out.push_str(&format!("Compression: {}\n", self.compression));
+        writeln!(out, "StorePath: {}", self.store_path).unwrap();
+        writeln!(out, "URL: {}", self.url).unwrap();
+        writeln!(out, "Compression: {}", self.compression).unwrap();
         if let Some(ref fh) = self.file_hash {
-            out.push_str(&format!("FileHash: {fh}\n"));
+            writeln!(out, "FileHash: {fh}").unwrap();
         }
         if let Some(fs) = self.file_size {
-            out.push_str(&format!("FileSize: {fs}\n"));
+            writeln!(out, "FileSize: {fs}").unwrap();
         }
-        out.push_str(&format!("NarHash: {}\n", self.nar_hash));
-        out.push_str(&format!("NarSize: {}\n", self.nar_size));
+        writeln!(out, "NarHash: {}", self.nar_hash).unwrap();
+        writeln!(out, "NarSize: {}", self.nar_size).unwrap();
 
-        out.push_str("References:");
         if self.references.is_empty() {
-            out.push('\n');
+            writeln!(out, "References:").unwrap();
         } else {
-            out.push(' ');
-            out.push_str(&self.references.join(" "));
-            out.push('\n');
+            writeln!(out, "References: {}", self.references.join(" ")).unwrap();
         }
 
         if let Some(ref d) = self.deriver {
-            out.push_str(&format!("Deriver: {d}\n"));
+            writeln!(out, "Deriver: {d}").unwrap();
         }
 
         for sig in &self.sigs {
-            out.push_str(&format!("Sig: {sig}\n"));
+            writeln!(out, "Sig: {sig}").unwrap();
         }
 
         if let Some(ref c) = self.ca {
-            out.push_str(&format!("CA: {c}\n"));
+            writeln!(out, "CA: {c}").unwrap();
         }
 
         out

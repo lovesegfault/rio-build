@@ -695,12 +695,10 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         hex::encode(digest)
     };
 
-    // Parse the declared hash — nix-daemon sends just the hex digest
-    let declared_hex = &nar_hash_str;
-    if computed_hash != *declared_hex {
+    if computed_hash != nar_hash_str {
         warn!(
             path = %path_str,
-            declared = %declared_hex,
+            declared = %nar_hash_str,
             computed = %computed_hash,
             "NAR hash mismatch"
         );
@@ -708,7 +706,7 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             .error(&StderrError::simple(
                 PROGRAM_NAME,
                 format!(
-                    "NAR hash mismatch for {path_str}: declared {declared_hex}, computed {computed_hash}"
+                    "NAR hash mismatch for {path_str}: declared {nar_hash_str}, computed {computed_hash}"
                 ),
             ))
             .await?;
@@ -778,11 +776,7 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         })
         .collect();
 
-    let ca = if ca_str.is_empty() {
-        None
-    } else {
-        Some(ca_str)
-    };
+    let ca = (!ca_str.is_empty()).then_some(ca_str);
 
     let info = match PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
         .deriver(deriver)
@@ -941,11 +935,7 @@ async fn parse_add_multiple_entry(
         })
         .collect();
 
-    let ca = if ca_str.is_empty() {
-        None
-    } else {
-        Some(ca_str)
-    };
+    let ca = (!ca_str.is_empty()).then_some(ca_str);
 
     let info = PathInfoBuilder::new(path.clone(), nar_hash, nar_size)
         .deriver(deriver)
