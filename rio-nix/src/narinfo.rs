@@ -637,4 +637,249 @@ Deriver: second.drv
         assert!(!text.contains("FileHash:"));
         assert!(!text.contains("FileSize:"));
     }
+
+    #[test]
+    fn test_parse_minimal_narinfo() {
+        let text = "\
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test
+URL: nar/test.nar.zst
+Compression: zstd
+NarHash: sha256:abc123
+NarSize: 12345
+";
+        let info = NarInfo::parse(text).unwrap();
+
+        assert_eq!(
+            info.store_path(),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test"
+        );
+        assert_eq!(info.url(), "nar/test.nar.zst");
+        assert_eq!(info.compression(), "zstd");
+        assert_eq!(info.nar_hash(), "sha256:abc123");
+        assert_eq!(info.nar_size(), 12345);
+        assert!(info.references().is_empty());
+        assert!(info.deriver().is_none());
+        assert!(info.sigs().is_empty());
+        assert!(info.ca().is_none());
+        assert!(info.file_hash().is_none());
+        assert!(info.file_size().is_none());
+    }
+
+    #[test]
+    fn test_parse_full_narinfo() {
+        let text = "\
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2
+URL: nar/full-test.nar.zst
+Compression: xz
+NarHash: sha256:deadbeef0123456789abcdef
+NarSize: 999999
+References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.42
+Deriver: cccccccccccccccccccccccccccccccc-hello-2.12.2.drv
+Sig: cache.example.com-1:base64signaturedata==
+CA: fixed:sha256:cafebabe
+FileHash: sha256:f00dcafe
+FileSize: 54321
+";
+        let info = NarInfo::parse(text).unwrap();
+
+        assert_eq!(
+            info.store_path(),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2"
+        );
+        assert_eq!(info.url(), "nar/full-test.nar.zst");
+        assert_eq!(info.compression(), "xz");
+        assert_eq!(info.nar_hash(), "sha256:deadbeef0123456789abcdef");
+        assert_eq!(info.nar_size(), 999999);
+        assert_eq!(
+            info.references(),
+            &[
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.42",
+            ]
+        );
+        assert_eq!(
+            info.deriver(),
+            Some("cccccccccccccccccccccccccccccccc-hello-2.12.2.drv")
+        );
+        assert_eq!(info.sigs(), &["cache.example.com-1:base64signaturedata=="]);
+        assert_eq!(info.ca(), Some("fixed:sha256:cafebabe"));
+        assert_eq!(info.file_hash(), Some("sha256:f00dcafe"));
+        assert_eq!(info.file_size(), Some(54321));
+    }
+
+    #[test]
+    fn test_roundtrip_narinfo() {
+        let original = NarInfoBuilder::new(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-roundtrip",
+            "nar/roundtrip.nar.zst",
+            "zstd",
+            "sha256:abcdef0123456789",
+            42000,
+        )
+        .references(vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dep2".to_string(),
+        ])
+        .deriver("cccccccccccccccccccccccccccccccc-roundtrip.drv")
+        .sig("test-key-1:sigdata1==")
+        .sig("test-key-2:sigdata2==")
+        .ca("fixed:sha256:cafef00d")
+        .file_hash("sha256:compressed123")
+        .file_size(8000)
+        .build()
+        .unwrap();
+
+        let serialized = original.serialize();
+        let reparsed = NarInfo::parse(&serialized).unwrap();
+
+        assert_eq!(original.store_path(), reparsed.store_path());
+        assert_eq!(original.url(), reparsed.url());
+        assert_eq!(original.compression(), reparsed.compression());
+        assert_eq!(original.nar_hash(), reparsed.nar_hash());
+        assert_eq!(original.nar_size(), reparsed.nar_size());
+        assert_eq!(original.references(), reparsed.references());
+        assert_eq!(original.deriver(), reparsed.deriver());
+        assert_eq!(original.sigs(), reparsed.sigs());
+        assert_eq!(original.ca(), reparsed.ca());
+        assert_eq!(original.file_hash(), reparsed.file_hash());
+        assert_eq!(original.file_size(), reparsed.file_size());
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn test_duplicate_ca_rejected() {
+        let text = "\
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test
+URL: nar/test.nar.zst
+Compression: zstd
+NarHash: sha256:abc123
+NarSize: 12345
+CA: fixed:sha256:first
+CA: fixed:sha256:second
+";
+        let err = NarInfo::parse(text).unwrap_err();
+        assert!(
+            matches!(err, NarInfoError::DuplicateField(ref f) if f == "CA"),
+            "expected DuplicateField(\"CA\"), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_file_hash_rejected() {
+        let text = "\
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test
+URL: nar/test.nar.zst
+Compression: zstd
+NarHash: sha256:abc123
+NarSize: 12345
+FileHash: sha256:first
+FileHash: sha256:second
+";
+        let err = NarInfo::parse(text).unwrap_err();
+        assert!(
+            matches!(err, NarInfoError::DuplicateField(ref f) if f == "FileHash"),
+            "expected DuplicateField(\"FileHash\"), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_missing_required_fields() {
+        // Base narinfo text with all required fields present.
+        let base_lines = [
+            "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test",
+            "URL: nar/test.nar.zst",
+            "Compression: zstd",
+            "NarHash: sha256:abc123",
+            "NarSize: 12345",
+        ];
+
+        let required_fields: [&str; 5] = ["StorePath", "URL", "Compression", "NarHash", "NarSize"];
+
+        for omit in &required_fields {
+            // Build text with the target field removed.
+            let text: String = base_lines
+                .iter()
+                .filter(|line| !line.starts_with(omit))
+                .map(|line| format!("{line}\n"))
+                .collect();
+
+            let err = NarInfo::parse(&text).unwrap_err();
+            assert!(
+                matches!(err, NarInfoError::MissingField(f) if f == *omit),
+                "omitting {omit}: expected MissingField(\"{omit}\"), got: {err:?}"
+            );
+        }
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn narinfo_builder_roundtrip(
+                hash_suffix in "[a-z0-9]{32}",
+                pkg_name in "[a-z][a-z0-9-]{0,10}",
+                url_name in "[a-z0-9]{1,20}",
+                compression in prop_oneof!["zstd", "xz", "bzip2", "none"],
+                nar_hash_hex in "[a-f0-9]{64}",
+                nar_size in any::<u64>(),
+                ref_count in 0_usize..4,
+                ref_hashes in proptest::collection::vec("[a-z0-9]{32}", 4),
+                ref_names in proptest::collection::vec("[a-z][a-z0-9-]{0,8}", 4),
+                has_deriver in any::<bool>(),
+                drv_hash in "[a-z0-9]{32}",
+                drv_name in "[a-z][a-z0-9-]{0,8}",
+                sig_count in 0_usize..3,
+                sig_keys in proptest::collection::vec("[a-z.-]{1,15}", 3),
+                sig_datas in proptest::collection::vec("[a-zA-Z0-9+/]{8,20}={0,2}", 3),
+                has_ca in any::<bool>(),
+                ca_hash in "[a-f0-9]{64}",
+                has_file_hash in any::<bool>(),
+                file_hash_hex in "[a-f0-9]{64}",
+                file_size_val in any::<u64>(),
+            ) {
+                let store_path = format!("/nix/store/{hash_suffix}-{pkg_name}");
+                let url = format!("nar/{url_name}.nar.{compression}");
+                let nar_hash = format!("sha256:{nar_hash_hex}");
+
+                let refs: Vec<String> = (0..ref_count)
+                    .map(|i| format!("{}-{}", ref_hashes[i], ref_names[i]))
+                    .collect();
+
+                let mut builder = NarInfoBuilder::new(
+                    &store_path,
+                    &url,
+                    &compression,
+                    &nar_hash,
+                    nar_size,
+                )
+                .references(refs);
+
+                if has_deriver {
+                    builder = builder.deriver(format!("{drv_hash}-{drv_name}.drv"));
+                }
+
+                for i in 0..sig_count {
+                    builder = builder.sig(format!("{}:{}", sig_keys[i], sig_datas[i]));
+                }
+
+                if has_ca {
+                    builder = builder.ca(format!("fixed:sha256:{ca_hash}"));
+                }
+
+                if has_file_hash {
+                    builder = builder
+                        .file_hash(format!("sha256:{file_hash_hex}"))
+                        .file_size(file_size_val);
+                }
+
+                let original = builder.build().unwrap();
+                let serialized = original.serialize();
+                let reparsed = NarInfo::parse(&serialized).unwrap();
+
+                prop_assert_eq!(&original, &reparsed);
+            }
+        }
+    }
 }
