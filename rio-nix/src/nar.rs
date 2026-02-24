@@ -246,11 +246,18 @@ fn parse_regular(r: &mut impl Read) -> Result<NarNode> {
     })
 }
 
+/// Maximum number of directory entries (DoS prevention for unbounded allocation).
+const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
+
 fn parse_directory(r: &mut impl Read) -> Result<NarNode> {
     let mut entries = Vec::new();
     let mut prev_name: Option<String> = None;
 
     loop {
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err(NarError::ContentTooLarge(entries.len() as u64));
+        }
+
         // Peek: either "entry" or ")"
         let token = read_string(r)?;
         match token.as_str() {
