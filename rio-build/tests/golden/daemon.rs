@@ -12,9 +12,6 @@ use tokio::net::UnixStream;
 
 use super::StorePathEntry;
 
-/// Default nix-daemon socket path.
-const DEFAULT_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
-
 /// Default timeout for reading trailing data after STDERR_LAST.
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -495,6 +492,46 @@ pub fn build_test_path() -> String {
     path
 }
 
+/// Build a content-addressed (CA) test store path and return its full path string.
+///
+/// Uses a fixed-output derivation with `__contentAddressed = true`, which
+/// requires the `ca-derivations` experimental feature. The output path is
+/// determined by the content hash, not the derivation inputs.
+pub fn build_ca_test_path() -> String {
+    let output = std::process::Command::new("nix")
+        .args([
+            "build",
+            "--extra-experimental-features",
+            "ca-derivations",
+            "--impure",
+            "--no-link",
+            "--print-out-paths",
+            "--expr",
+            r#"derivation {
+                name = "rio-ca-golden";
+                builder = "/bin/sh";
+                args = ["-c" "echo -n ca-golden-test-data > $out"];
+                system = builtins.currentSystem;
+                __contentAddressed = true;
+                outputHashMode = "flat";
+                outputHashAlgo = "sha256";
+            }"#,
+        ])
+        .output()
+        .expect("nix build (CA) must succeed");
+    assert!(
+        output.status.success(),
+        "nix build (CA) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "CA test path does not exist: {path}"
+    );
+    path
+}
+
 /// Query path info from the real nix store via `nix path-info --json`.
 pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
     let output = std::process::Command::new("nix")
@@ -603,6 +640,9 @@ impl Drop for DaemonGuard {
 /// Uses the real store database by symlinking `/nix/var/nix/*` into a temp
 /// dir, then pointing `NIX_STATE_DIR` there. The daemon gets a fresh socket
 /// but can see all existing store paths.
+///
+/// Enables `ca-derivations` experimental feature so golden tests can
+/// validate content-addressed workflows.
 pub fn start_local_daemon() -> (String, DaemonGuard) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
@@ -624,6 +664,10 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
 
     let mut child = std::process::Command::new("nix-daemon")
         .env("NIX_STATE_DIR", temp_dir.path())
+        .env(
+            "NIX_CONFIG",
+            "experimental-features = nix-command flakes ca-derivations",
+        )
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -650,10 +694,12 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
     );
 }
 
-/// Find or start a nix-daemon and return its socket path with an optional guard.
+/// Start a dedicated nix-daemon for golden tests.
 ///
-/// Checks `NIX_DAEMON_SOCKET` env var, then the default socket path,
-/// and falls back to starting a local daemon.
+/// Always starts a local daemon for test isolation — tests should not
+/// depend on the system daemon's configuration (e.g., whether
+/// `ca-derivations` is enabled). Respects `NIX_DAEMON_SOCKET` as an
+/// explicit override for CI environments that manage their own daemon.
 ///
 /// Prefer [`shared_daemon_socket`] for tests — it ensures only one daemon
 /// is started even when tests run in parallel.
@@ -663,10 +709,6 @@ fn get_daemon_socket_inner() -> (String, Option<DaemonGuard>) {
             return (s, None);
         }
         eprintln!("NIX_DAEMON_SOCKET={s} not found, starting local daemon");
-    } else if Path::new(DEFAULT_SOCKET).exists() {
-        return (DEFAULT_SOCKET.to_string(), None);
-    } else {
-        eprintln!("no nix-daemon socket found, starting local daemon");
     }
     let (s, g) = start_local_daemon();
     (s, Some(g))

@@ -257,6 +257,11 @@ pub trait Store: Send + Sync {
     // validation flow (SHA-256 is computed over the full NAR before inserting).
     #[allow(dead_code)] // used by opcode handlers added in next commits
     async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()>;
+
+    /// Resolve a store path from its hash part (32-char nixbase32 string).
+    /// Returns `Some(path)` if a stored path's hash part matches, `None` otherwise.
+    async fn query_path_from_hash_part(&self, hash_part: &str)
+    -> anyhow::Result<Option<StorePath>>;
 }
 
 #[cfg(test)]

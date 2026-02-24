@@ -458,15 +458,12 @@ Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection*
 
 | Category | Opcodes |
 |----------|---------|
-| Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStore`, `wopAddTextToStore`, `wopAddToStoreNar`, `wopEnsurePath`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap` |
+| Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStore`, `wopAddTextToStore`, `wopAddToStoreNar`, `wopEnsurePath`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap`, `wopQueryPathFromHashPart` |
 | Stubbed (no-op, accept and ignore — full CA support in Phase 2c/5) | `wopRegisterDrvOutput`, `wopQueryRealisation` |
 | Stubbed (accept & no-op) | `wopAddSignatures` |
-| Stubbed (returns empty) | `wopQueryPathFromHashPart` |
 | Rejected (STDERR_ERROR) | Everything else |
 
 **Note on `wopQueryDerivationOutputMap`:** Moved from "CA-aware" to "Fully implemented" because modern Nix clients call this for ALL derivation types. For input-addressed derivations, it returns the statically-known output paths. For CA derivations, it returns the realized output paths if known.
-
-**Note on `wopQueryPathFromHashPart`:** Stubbed to return empty (no match). This opcode is used by `nix copy` and during content-addressed store path resolution. Workflows affected by the stub: `nix copy --to ssh-ng://rio` may fail for CA paths that require hash-part resolution, and `nix store ls` on CA outputs may not resolve correctly. For the initial release (input-addressed derivations only), this is acceptable. Full implementation is planned for Phase 5 (CA support).
 
 **Note on `wopAddTempRoot`:** Accepts the store path and records it as a connection-scoped temporary GC root in-memory. These temp roots prevent GC of paths the client is actively using. They are lost on gateway pod restart, which is acceptable given the store's 24-hour GC grace period. The store's GC relies on the 24-hour grace period rather than querying gateways for active temp roots.
 
