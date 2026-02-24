@@ -375,14 +375,20 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         // Value: Realisation as JSON string
         let json_str = wire::read_string(r).await?;
         let out_path = match serde_json::from_str::<serde_json::Value>(&json_str) {
-            Ok(v) => v
-                .get("outPath")
-                .and_then(|p| p.as_str())
-                .unwrap_or("")
-                .to_string(),
+            Ok(v) => match v.get("outPath").and_then(|p| p.as_str()) {
+                Some(p) => p.to_string(),
+                None => {
+                    tracing::warn!(json = %json_str, "Realisation JSON missing 'outPath' field");
+                    return Err(wire::WireError::Io(std::io::Error::other(format!(
+                        "Realisation JSON missing 'outPath': {json_str}"
+                    ))));
+                }
+            },
             Err(e) => {
                 tracing::warn!(json = %json_str, error = %e, "failed to parse Realisation JSON");
-                String::new()
+                return Err(wire::WireError::Io(std::io::Error::other(format!(
+                    "invalid Realisation JSON: {e}"
+                ))));
             }
         };
         built_outputs.push(BuiltOutput {
