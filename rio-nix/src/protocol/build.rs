@@ -353,17 +353,17 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
 
     let error_msg = wire::read_string(r).await?;
 
-    // Protocol 1.29+
+    // Protocol 1.29+ (always present since we target 1.37+)
     let times_built = wire::read_u64(r).await?;
     let is_non_deterministic = wire::read_bool(r).await?;
     let start_time = wire::read_u64(r).await?;
     let stop_time = wire::read_u64(r).await?;
 
-    // Protocol 1.37+: CPU time
+    // Protocol 1.37+ (always present since we target 1.37+): CPU time
     let cpu_user = read_optional_i64(r).await?;
     let cpu_system = read_optional_i64(r).await?;
 
-    // Protocol 1.28+: builtOutputs (DrvOutputs map)
+    // Protocol 1.28+ (always present since we target 1.37+): builtOutputs (DrvOutputs map)
     let output_count = wire::read_u64(r).await?;
     if output_count > wire::MAX_COLLECTION_COUNT {
         return Err(wire::WireError::CollectionTooLarge(output_count));
@@ -419,17 +419,17 @@ pub async fn write_build_result<W: AsyncWrite + Unpin>(
     wire::write_u64(w, result.status as u64).await?;
     wire::write_string(w, &result.error_msg).await?;
 
-    // Protocol 1.29+
+    // Protocol 1.29+ (always present since we target 1.37+)
     wire::write_u64(w, result.times_built).await?;
     wire::write_bool(w, result.is_non_deterministic).await?;
     wire::write_u64(w, result.start_time).await?;
     wire::write_u64(w, result.stop_time).await?;
 
-    // Protocol 1.37+: CPU time
+    // Protocol 1.37+ (always present since we target 1.37+): CPU time
     write_optional_i64(w, result.cpu_user).await?;
     write_optional_i64(w, result.cpu_system).await?;
 
-    // Protocol 1.28+: builtOutputs (DrvOutputs map)
+    // Protocol 1.28+ (always present since we target 1.37+): builtOutputs (DrvOutputs map)
     wire::write_u64(w, result.built_outputs.len() as u64).await?;
     for output in &result.built_outputs {
         // Key: DrvOutput string
