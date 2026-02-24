@@ -1754,6 +1754,10 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
 ///
 /// Handles the full lifecycle: spawn → handshake → setOptions → build → kill.
 /// Applies `DAEMON_BUILD_TIMEOUT` to prevent indefinite hangs.
+///
+/// **Note:** Sends default (hardcoded) options to the local daemon. The remote
+/// client's `wopSetOptions` values are not forwarded in Phase 1b; option
+/// propagation is planned for Phase 2a when the scheduler mediates builds.
 async fn build_via_local_daemon(
     drv_path: &str,
     basic_drv: &rio_nix::derivation::BasicDerivation,

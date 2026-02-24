@@ -12,7 +12,7 @@
   - [x] `wopBuildPathsWithResults` (46): per-path BuildResult via local daemon
   - [x] `wopBuildPaths` (9): delegates to local daemon per DerivedPath
   - [x] `wopAddMultipleToStore` (44): framed stream parsing with per-entry NAR hash validation
-  - [x] `wopAddToStoreNar` (39): STDERR_READ pull loop with NAR hash validation and .drv cache
+  - [x] `wopAddToStoreNar` (39): framed stream parsing with NAR hash/size validation and .drv cache
   - [x] `wopAddToStore` (7): legacy CA import with framed stream parsing
   - [x] `wopAddTextToStore` (8): legacy text file import
   - [x] `wopEnsurePath` (10): store path validity check (no-op success)

@@ -255,6 +255,9 @@ impl BuildResult {
 
 /// Read a `BasicDerivation` from the wire (opcode 36 payload).
 ///
+/// Note: the `drvPath` string is read by the calling opcode handler
+/// before this function is invoked. This reads only the BasicDerivation fields.
+///
 /// Wire format for protocol 1.37+:
 /// - outputs: count + per-output (name, path, hashAlgo, hash)
 /// - inputSrcs: string collection
@@ -304,7 +307,7 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(r: &mut R) -> Result<Ba
     })
 }
 
-/// Write a `BasicDerivation` to the wire (client → server for local daemon).
+/// Write a `BasicDerivation` to the wire.
 pub async fn write_basic_derivation<W: AsyncWrite + Unpin>(
     w: &mut W,
     drv: &BasicDerivation,
