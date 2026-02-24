@@ -282,4 +282,72 @@ mod tests {
             _ => panic!("expected Names"),
         }
     }
+
+    #[test]
+    fn display_roundtrip_opaque() {
+        let path_str = make_path("hello-2.12.1");
+        let dp = DerivedPath::parse(&path_str).unwrap();
+        let roundtripped = DerivedPath::parse(&dp.to_string()).unwrap();
+        assert_eq!(dp, roundtripped);
+    }
+
+    #[test]
+    fn display_roundtrip_built_all() {
+        let path_str = format!("{}!*", make_path("hello.drv"));
+        let dp = DerivedPath::parse(&path_str).unwrap();
+        let roundtripped = DerivedPath::parse(&dp.to_string()).unwrap();
+        assert_eq!(dp, roundtripped);
+    }
+
+    #[test]
+    fn display_roundtrip_built_named() {
+        let path_str = format!("{}!out,dev,lib", make_path("hello.drv"));
+        let dp = DerivedPath::parse(&path_str).unwrap();
+        let roundtripped = DerivedPath::parse(&dp.to_string()).unwrap();
+        assert_eq!(dp, roundtripped);
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_derived_path() -> impl Strategy<Value = DerivedPath> {
+            // Generate a valid store path name component
+            let name_re = "[a-zA-Z][a-zA-Z0-9._+-]{0,20}";
+
+            let opaque = name_re.prop_map(|n| {
+                let path_str = format!("/nix/store/{VALID_HASH}-{n}");
+                DerivedPath::Opaque(StorePath::parse(&path_str).unwrap())
+            });
+
+            let built_all = name_re.prop_map(|n| {
+                let path_str = format!("/nix/store/{VALID_HASH}-{n}.drv");
+                DerivedPath::Built {
+                    drv: StorePath::parse(&path_str).unwrap(),
+                    outputs: OutputSpec::All,
+                }
+            });
+
+            let built_named = (name_re, proptest::collection::vec("[a-z]{1,8}", 1..4)).prop_map(
+                |(n, output_names)| {
+                    let path_str = format!("/nix/store/{VALID_HASH}-{n}.drv");
+                    DerivedPath::Built {
+                        drv: StorePath::parse(&path_str).unwrap(),
+                        outputs: OutputSpec::names(output_names).unwrap(),
+                    }
+                },
+            );
+
+            prop_oneof![opaque, built_all, built_named]
+        }
+
+        proptest! {
+            #[test]
+            fn derived_path_roundtrip(dp in arb_derived_path()) {
+                let s = dp.to_string();
+                let roundtripped = DerivedPath::parse(&s).unwrap();
+                prop_assert_eq!(dp, roundtripped);
+            }
+        }
+    }
 }
