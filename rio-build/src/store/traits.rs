@@ -2,6 +2,10 @@
 
 use rio_nix::hash::{HashAlgo, NixHash};
 use rio_nix::store_path::StorePath;
+use tokio::io::AsyncRead;
+
+/// A boxed async reader for streaming NAR content.
+pub type NarReader = Box<dyn AsyncRead + Send + Unpin>;
 
 /// Errors from [`PathInfo::new`] validation.
 #[derive(Debug, thiserror::Error)]
@@ -237,11 +241,9 @@ pub trait Store: Send + Sync {
     /// Batch validity check: returns only the paths that exist in the store.
     async fn query_valid_paths(&self, paths: &[StorePath]) -> anyhow::Result<Vec<StorePath>>;
 
-    /// Retrieve the NAR content for a store path. Returns `None` if not found.
-    ///
-    // TODO: return a streaming type instead of `Vec<u8>` to avoid buffering
-    // large NARs in memory.
-    async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Retrieve the NAR content for a store path as a streaming reader.
+    /// Returns `None` if not found.
+    async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<NarReader>>;
 
     /// Store a path with its metadata and NAR content.
     ///

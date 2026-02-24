@@ -18,7 +18,7 @@ use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::{debug, error, instrument, warn};
 
 use crate::store::Store;
@@ -189,8 +189,8 @@ async fn resolve_derivation(
         return Ok(cached.clone());
     }
 
-    let nar_data = match store.nar_from_path(drv_path).await {
-        Ok(Some(data)) => data,
+    let mut reader = match store.nar_from_path(drv_path).await {
+        Ok(Some(r)) => r,
         Ok(None) => {
             return Err(anyhow::anyhow!(
                 "derivation '{}' not found in store",
@@ -204,6 +204,12 @@ async fn resolve_derivation(
             ));
         }
     };
+
+    let mut nar_data = Vec::new();
+    reader
+        .read_to_end(&mut nar_data)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read NAR for '{}': {e}", drv_path))?;
 
     let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
         .map_err(|e| anyhow::anyhow!("failed to extract .drv '{}' from NAR: {e}", drv_path))?;
@@ -484,12 +490,18 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     };
 
     match nar {
-        Some(nar_data) => {
-            // Send NAR data via STDERR_WRITE chunks
-            // Chunk size: 64KB to avoid huge single messages
-            const CHUNK_SIZE: usize = 64 * 1024;
-            for chunk in nar_data.chunks(CHUNK_SIZE) {
-                stderr.write_data(chunk).await?;
+        Some(mut reader) => {
+            // Stream NAR data via STDERR_WRITE in 64 KB chunks
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("error reading NAR: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                stderr.write_data(&buf[..n]).await?;
             }
             stderr.finish().await?;
         }
