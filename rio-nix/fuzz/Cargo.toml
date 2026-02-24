@@ -41,3 +41,9 @@ name = "derived_path_parsing"
 path = "fuzz_targets/derived_path_parsing.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "narinfo_parsing"
+path = "fuzz_targets/narinfo_parsing.rs"
+test = false
+doc = false
