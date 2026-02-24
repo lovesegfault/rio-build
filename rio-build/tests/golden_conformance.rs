@@ -615,17 +615,107 @@ async fn test_golden_live_query_path_from_hash_part_ca() {
     .await;
 }
 
-// TODO(phase1b): AddSignatures is currently stubbed (accepts and discards).
-// When implemented, add a test that verifies signatures are actually persisted
-// and visible via QueryPathInfo.
 #[tokio::test]
 async fn test_golden_live_add_signatures() {
     let test_path = golden::daemon::build_test_path();
-    let store = Arc::new(MemoryStore::new());
+    let path_info = golden::daemon::query_path_info_json(&test_path);
+    let store = golden::build_memory_store_from(&[path_info]);
 
     let op = golden::build_add_signatures_bytes(&test_path, &["cache.example.com:fakesig1"]).await;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_add_signatures_fields(data))
     })
     .await;
+}
+
+#[tokio::test]
+async fn test_golden_add_signatures_persisted() {
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+
+    // Pre-populate store with a path that has one existing signature
+    let store = Arc::new(MemoryStore::new());
+    let path =
+        StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1").unwrap();
+    store.insert(
+        rio_build::store::PathInfoBuilder::new(
+            path,
+            NixHash::compute(HashAlgo::SHA256, b"test"),
+            1000,
+        )
+        .registration_time(1700000000)
+        .ultimate(true)
+        .sigs(vec!["existing-key:existingsig".to_string()])
+        .build()
+        .unwrap(),
+        None,
+    );
+
+    // Send AddSignatures with a new signature, then QueryPathInfo
+    let mut client_bytes = build_handshake_client_bytes().await;
+    client_bytes.extend(build_set_options_bytes().await);
+    client_bytes.extend(
+        golden::build_add_signatures_bytes(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            &["new-key:newsig"],
+        )
+        .await,
+    );
+
+    // Append QueryPathInfo to verify signatures
+    let mut qpi_bytes = Vec::new();
+    wire::write_u64(&mut qpi_bytes, 26).await.unwrap();
+    wire::write_string(
+        &mut qpi_bytes,
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+    )
+    .await
+    .unwrap();
+    client_bytes.extend(qpi_bytes);
+
+    let response = rio_build_response(&client_bytes, store).await;
+    let mut reader = Cursor::new(response);
+
+    // Skip handshake
+    let _magic2 = wire::read_u64(&mut reader).await.unwrap();
+    let _version = wire::read_u64(&mut reader).await.unwrap();
+    let _features = wire::read_strings(&mut reader).await.unwrap();
+    let _version_str = wire::read_string(&mut reader).await.unwrap();
+    let _trusted = wire::read_u64(&mut reader).await.unwrap();
+    let _last = wire::read_u64(&mut reader).await.unwrap(); // handshake STDERR_LAST
+    let _last = wire::read_u64(&mut reader).await.unwrap(); // SetOptions STDERR_LAST
+
+    // AddSignatures response
+    let last = wire::read_u64(&mut reader).await.unwrap();
+    assert_eq!(last, STDERR_LAST, "expected STDERR_LAST for AddSignatures");
+    let result = wire::read_u64(&mut reader).await.unwrap();
+    assert_eq!(result, 1, "AddSignatures should return success");
+
+    // QueryPathInfo response
+    let last = wire::read_u64(&mut reader).await.unwrap();
+    assert_eq!(last, STDERR_LAST, "expected STDERR_LAST for QueryPathInfo");
+    let valid = wire::read_u64(&mut reader).await.unwrap();
+    assert_eq!(valid, 1, "path should be valid");
+
+    let _deriver = wire::read_string(&mut reader).await.unwrap();
+    let _nar_hash = wire::read_string(&mut reader).await.unwrap();
+    let _refs = wire::read_strings(&mut reader).await.unwrap();
+    let _reg_time = wire::read_u64(&mut reader).await.unwrap();
+    let _nar_size = wire::read_u64(&mut reader).await.unwrap();
+    let _ultimate = wire::read_u64(&mut reader).await.unwrap();
+    let sigs = wire::read_strings(&mut reader).await.unwrap();
+
+    assert!(
+        sigs.contains(&"existing-key:existingsig".to_string()),
+        "original signature should be preserved, got: {sigs:?}"
+    );
+    assert!(
+        sigs.contains(&"new-key:newsig".to_string()),
+        "new signature should be added, got: {sigs:?}"
+    );
+    assert_eq!(
+        sigs.len(),
+        2,
+        "should have exactly 2 signatures, got: {sigs:?}"
+    );
 }

@@ -115,7 +115,7 @@ where
         Some(WorkerOp::QueryPathFromHashPart) => {
             handle_query_path_from_hash_part(reader, &mut stderr, store).await
         }
-        Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr).await,
+        Some(WorkerOp::AddSignatures) => handle_add_signatures(reader, &mut stderr, store).await,
         Some(WorkerOp::QueryMissing) => handle_query_missing(reader, &mut stderr, store).await,
         Some(WorkerOp::AddToStoreNar) => {
             handle_add_to_store_nar(reader, &mut stderr, store, drv_cache).await
@@ -543,15 +543,26 @@ async fn handle_query_path_from_hash_part<R: AsyncRead + Unpin, W: AsyncWrite + 
     Ok(())
 }
 
-/// wopAddSignatures (37): Stubbed — accepts and discards signatures.
+/// wopAddSignatures (37): Add signatures to an existing store path.
+///
+/// Merges the provided signatures into the path's existing signature set
+/// using set-union semantics (duplicates are ignored). If the path doesn't
+/// exist, this is a no-op that still returns success.
 #[instrument(skip_all)]
 async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    store: &dyn Store,
 ) -> anyhow::Result<()> {
-    let _path = wire::read_string(reader).await?;
-    let _sigs = wire::read_strings(reader).await?;
-    debug!("wopAddSignatures (stubbed, accepting)");
+    let path_str = wire::read_string(reader).await?;
+    let sigs = wire::read_strings(reader).await?;
+    debug!(path = %path_str, count = sigs.len(), "wopAddSignatures");
+
+    if let Ok(path) = StorePath::parse(&path_str)
+        && let Err(e) = store.add_signatures(&path, sigs).await
+    {
+        return send_store_error(stderr, e).await;
+    }
 
     stderr.finish().await?;
     wire::write_u64(stderr.inner_mut(), 1).await?;
