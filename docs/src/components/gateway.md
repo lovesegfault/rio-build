@@ -86,15 +86,15 @@ For protocol >= 1.25 (always present since we target 1.37+):
 | `sigs` | string collection | Signatures |
 | `ca` | string | Content address (empty for input-addressed) |
 | `repair` | u64 bool | Whether to repair/overwrite existing path |
+| `dontCheckSigs` | u64 bool | Skip signature verification (always treated as false by rio-build) |
 
-After sending the metadata fields, the NAR data is transferred via the **STDERR_READ pull loop** (not a trailing framed stream):
+After sending the metadata fields, the NAR data is transferred as a **framed byte stream** (protocol >= 1.23, always true for 1.37+):
 
-1. Server sends `STDERR_READ` (`0x64617461`) + `u64 count` (bytes requested)
-2. Client responds with length-prefixed data: `u64(len) + bytes + padding-to-8`
-3. The loop repeats until the server has received `narSize` bytes
-4. Server sends `STDERR_LAST` (`0x616c7473`) followed by the result (`u64 1` = success)
+1. Client sends framed data: sequence of `u64(chunk_len) + chunk_bytes`, terminated by `u64(0)` sentinel
+2. Chunk data is NOT padded (unlike string encoding)
+3. Server sends `STDERR_LAST` (`0x616c7473`) — no result value follows
 
-This is a server-driven pull: the server controls the flow by requesting specific chunk sizes. The client must not send NAR data until prompted by `STDERR_READ`.
+> **Correction (discovered during implementation review):** The original design described a `STDERR_READ` pull loop for NAR data transfer. This is only used for protocol versions 1.21-1.22. For protocol >= 1.23, the Nix C++ daemon uses `FramedSource` (`daemon.cc:918-923`), and the client sends data via `FramedSink` (`remote-store.cc:452-453`). The framed stream format is the same as used by `wopAddMultipleToStore`. Additionally, the original design omitted the `dontCheckSigs` field and incorrectly included a `u64(1)` result value after `STDERR_LAST`.
 
 ### wopAddMultipleToStore (44) Wire Format
 
@@ -114,12 +114,14 @@ Each entry in the byte stream contains:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pathInfo` | (same fields as wopAddToStoreNar metadata, minus the trailing `repair` flag) | Path metadata |
+| `pathInfo` | (same fields as wopAddToStoreNar metadata, minus the trailing `repair` and `dontCheckSigs` flags) | Path metadata |
 | NAR data | embedded framed stream | The NAR content (this inner framed stream IS frame-aligned) |
 
 The outer framed stream terminates with a `u64(0)` sentinel.
 
 **`dontCheckSigs` handling:** The gateway always treats `dontCheckSigs` as `false` regardless of the value sent by the client. This is a security requirement --- remote clients must never bypass signature verification. The field is read and discarded to maintain wire compatibility.
+
+**Response:** The server sends `STDERR_LAST` with no result value (matching `daemon.cc:519-520`).
 
 ### DerivedPath Wire Format
 
