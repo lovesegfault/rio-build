@@ -267,7 +267,13 @@ pub async fn read_basic_derivation<R: AsyncRead + Unpin>(
         let path = wire::read_string(r).await?;
         let hash_algo = wire::read_string(r).await?;
         let hash = wire::read_string(r).await?;
-        outputs.push(DerivationOutput::new(name, path, hash_algo, hash));
+        outputs.push(
+            DerivationOutput::new(name, path, hash_algo, hash).map_err(|e| {
+                wire::WireError::Io(std::io::Error::other(format!(
+                    "invalid derivation output: {e}"
+                )))
+            })?,
+        );
     }
 
     let input_srcs = wire::read_strings(r).await?;
@@ -520,8 +526,8 @@ mod tests {
     #[tokio::test]
     async fn basic_derivation_roundtrip() {
         let outputs = vec![
-            DerivationOutput::new("out", "/nix/store/abc-hello", "", ""),
-            DerivationOutput::new("dev", "/nix/store/def-hello-dev", "", ""),
+            DerivationOutput::new("out", "/nix/store/abc-hello", "", "").unwrap(),
+            DerivationOutput::new("dev", "/nix/store/def-hello-dev", "", "").unwrap(),
         ];
         let input_srcs = vec!["/nix/store/ghi-source.sh".to_string()];
         let platform = "x86_64-linux";
@@ -625,7 +631,7 @@ mod tests {
                 prop_oneof![Just(String::new()), "[0-9a-f]{64}"],
             )
                 .prop_map(|(name, path, hash_algo, hash)| {
-                    DerivationOutput::new(name, path, hash_algo, hash)
+                    DerivationOutput::new(name, path, hash_algo, hash).unwrap()
                 })
         }
 
