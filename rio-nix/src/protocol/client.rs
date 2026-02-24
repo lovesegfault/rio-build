@@ -330,23 +330,8 @@ pub async fn client_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin
     wire::write_u64(writer, WorkerOp::BuildDerivation as u64).await?;
     wire::write_string(writer, drv_path).await?;
 
-    // Send BasicDerivation fields
-    let input_srcs: Vec<String> = basic_drv.input_srcs().iter().cloned().collect();
-    let env: Vec<(String, String)> = basic_drv
-        .env()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    write_basic_derivation(
-        writer,
-        basic_drv.outputs(),
-        &input_srcs,
-        basic_drv.platform(),
-        basic_drv.builder(),
-        basic_drv.args(),
-        &env,
-    )
-    .await?;
+    // Send BasicDerivation
+    write_basic_derivation(writer, basic_drv).await?;
 
     // Send buildMode
     wire::write_u64(writer, build_mode as u64).await?;

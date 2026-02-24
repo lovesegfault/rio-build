@@ -1396,17 +1396,16 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     // Read client's request
     let drv_path_str = wire::read_string(reader).await?;
-    let (outputs, input_srcs, platform, builder, args, env) =
-        match read_basic_derivation(reader).await {
-            Ok(v) => v,
-            Err(e) => {
-                return send_store_error(
-                    stderr,
-                    anyhow::anyhow!("wopBuildDerivation: failed to read BasicDerivation: {e}"),
-                )
-                .await;
-            }
-        };
+    let basic_drv = match read_basic_derivation(reader).await {
+        Ok(v) => v,
+        Err(e) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildDerivation: failed to read BasicDerivation: {e}"),
+            )
+            .await;
+        }
+    };
     let build_mode_val = match wire::read_u64(reader).await {
         Ok(v) => v,
         Err(e) => {
@@ -1430,20 +1429,10 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     debug!(
         path = %drv_path_str,
-        platform = %platform,
-        builder = %builder,
+        platform = %basic_drv.platform(),
+        builder = %basic_drv.builder(),
         build_mode = ?build_mode,
         "wopBuildDerivation"
-    );
-
-    // Reconstruct BasicDerivation for forwarding
-    let basic_drv = rio_nix::derivation::BasicDerivation::new(
-        outputs,
-        input_srcs.iter().cloned().collect(),
-        platform,
-        builder,
-        args,
-        env.into_iter().collect(),
     );
 
     // Build via local daemon (spawn → handshake → setOptions → build → kill)
