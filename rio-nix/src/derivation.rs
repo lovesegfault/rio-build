@@ -496,16 +496,10 @@ impl<'a> ATermParser<'a> {
             let hash = self.parse_string()?;
             self.expect(")")?;
 
-            if name.is_empty() {
-                return Err(DerivationError::EmptyOutputName(outputs.len()));
-            }
-
-            outputs.push(DerivationOutput {
-                name,
-                path,
-                hash_algo,
-                hash,
-            });
+            outputs.push(
+                DerivationOutput::new(name, path, hash_algo, hash)
+                    .map_err(|_| DerivationError::EmptyOutputName(outputs.len()))?,
+            );
 
             match self.peek() {
                 Some(',') => self.advance(),

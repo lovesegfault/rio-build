@@ -138,7 +138,12 @@ impl NarInfo {
                         references = value.split_whitespace().map(String::from).collect();
                     }
                 }
-                "Deriver" => deriver = Some(value.to_string()),
+                "Deriver" => {
+                    if deriver.is_some() {
+                        return Err(NarInfoError::DuplicateField("Deriver".to_string()));
+                    }
+                    deriver = Some(value.to_string());
+                }
                 "Sig" => sigs.push(value.to_string()),
                 "CA" => ca = Some(value.to_string()),
                 "FileHash" => file_hash = Some(value.to_string()),
@@ -547,6 +552,24 @@ Compression: zstd
 NarHash: sha256:0000
 NarSize: 100
 References:
+";
+        assert!(matches!(
+            NarInfo::parse(text),
+            Err(NarInfoError::DuplicateField(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_deriver() {
+        let text = "\
+StorePath: /nix/store/abc-test
+URL: nar/abc.nar.zst
+Compression: zstd
+NarHash: sha256:0000
+NarSize: 100
+References:
+Deriver: first.drv
+Deriver: second.drv
 ";
         assert!(matches!(
             NarInfo::parse(text),
