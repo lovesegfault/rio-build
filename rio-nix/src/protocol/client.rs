@@ -184,11 +184,19 @@ async fn read_result_fields<R: AsyncRead + Unpin>(
     Ok(fields)
 }
 
+/// Maximum STDERR messages to consume before aborting.
+///
+/// Prevents infinite loops from a buggy or malicious daemon that sends
+/// an unbounded stream of log/activity messages without ever sending
+/// STDERR_LAST.
+const MAX_STDERR_MESSAGES: u64 = 100_000;
+
 /// Drain the STDERR loop until STDERR_LAST, discarding all messages.
 ///
 /// Returns `Ok(())` on STDERR_LAST, `Err` on STDERR_ERROR or I/O error.
+/// Aborts after [`MAX_STDERR_MESSAGES`] to prevent infinite loops.
 pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireError> {
-    loop {
+    for _ in 0..MAX_STDERR_MESSAGES {
         match read_stderr_message(r).await? {
             StderrMessage::Last => return Ok(()),
             StderrMessage::Error(e) => {
@@ -200,6 +208,9 @@ pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireErr
             _ => {} // discard log/activity messages
         }
     }
+    Err(WireError::Io(std::io::Error::other(format!(
+        "exceeded {MAX_STDERR_MESSAGES} STDERR messages without STDERR_LAST"
+    ))))
 }
 
 // ---------------------------------------------------------------------------
