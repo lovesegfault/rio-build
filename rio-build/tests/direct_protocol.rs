@@ -1719,8 +1719,14 @@ async fn test_build_paths_with_results_batch_continues() {
             let _is_non_det1 = wire::read_u64(&mut s).await.unwrap();
             let _start1 = wire::read_u64(&mut s).await.unwrap();
             let _stop1 = wire::read_u64(&mut s).await.unwrap();
-            let _cpu_user_tag1 = wire::read_u64(&mut s).await.unwrap();
-            let _cpu_system_tag1 = wire::read_u64(&mut s).await.unwrap();
+            let cpu_user_tag1 = wire::read_u64(&mut s).await.unwrap();
+            if cpu_user_tag1 == 1 {
+                let _ = wire::read_u64(&mut s).await.unwrap();
+            }
+            let cpu_system_tag1 = wire::read_u64(&mut s).await.unwrap();
+            if cpu_system_tag1 == 1 {
+                let _ = wire::read_u64(&mut s).await.unwrap();
+            }
             let _built_outputs1 = wire::read_u64(&mut s).await.unwrap();
 
             // --- Second result: unparseable path should be MiscFailure (9) ---
@@ -1740,8 +1746,14 @@ async fn test_build_paths_with_results_batch_continues() {
             let _is_non_det2 = wire::read_u64(&mut s).await.unwrap();
             let _start2 = wire::read_u64(&mut s).await.unwrap();
             let _stop2 = wire::read_u64(&mut s).await.unwrap();
-            let _cpu_user_tag2 = wire::read_u64(&mut s).await.unwrap();
-            let _cpu_system_tag2 = wire::read_u64(&mut s).await.unwrap();
+            let cpu_user_tag2 = wire::read_u64(&mut s).await.unwrap();
+            if cpu_user_tag2 == 1 {
+                let _ = wire::read_u64(&mut s).await.unwrap();
+            }
+            let cpu_system_tag2 = wire::read_u64(&mut s).await.unwrap();
+            if cpu_system_tag2 == 1 {
+                let _ = wire::read_u64(&mut s).await.unwrap();
+            }
             let _built_outputs2 = wire::read_u64(&mut s).await.unwrap();
         })
     })
@@ -2075,6 +2087,62 @@ async fn test_add_text_to_store_with_references() {
             assert_ne!(
                 path_no_refs, path_with_refs,
                 "text store path should differ when references are included"
+            );
+        })
+    })
+    .await;
+}
+
+/// wopAddTextToStore (8): empty name returns STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_text_to_store_empty_name() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // opcode 8 = wopAddTextToStore
+            wire::write_u64(&mut s, 8).await.unwrap();
+            // Empty name — should trigger a store path validation error
+            wire::write_string(&mut s, "").await.unwrap();
+            // Text content
+            wire::write_string(&mut s, "some content").await.unwrap();
+            // Empty references
+            let refs: Vec<String> = vec![];
+            wire::write_strings(&mut s, &refs).await.unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_ERROR, "expected STDERR_ERROR for empty name");
+        })
+    })
+    .await;
+}
+
+/// wopBuildPaths (9): Built DerivedPath whose .drv is not in cache returns STDERR_ERROR.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_build_paths_built_not_in_cache() {
+    let store = Arc::new(MemoryStore::new());
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // opcode 9 = wopBuildPaths
+            wire::write_u64(&mut s, 9).await.unwrap();
+            // Single Built DerivedPath with a drv not in the store
+            let paths =
+                vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-notexist.drv!out".to_string()];
+            wire::write_strings(&mut s, &paths).await.unwrap();
+            // buildMode = Normal
+            wire::write_u64(&mut s, 0).await.unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(
+                msg, STDERR_ERROR,
+                "expected STDERR_ERROR for Built path with missing .drv"
             );
         })
     })
