@@ -45,6 +45,10 @@ pub fn padding_len(len: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Read a single byte.
+///
+/// **Note:** Nix wire protocol integers are ALWAYS u64, even for logically
+/// u8 values. This function is for non-protocol byte reading (e.g., NAR
+/// format tag bytes). Do not use for protocol integer fields.
 pub async fn read_u8<R: AsyncRead + Unpin>(r: &mut R) -> Result<u8> {
     let mut buf = [0u8; 1];
     r.read_exact(&mut buf).await?;
@@ -136,6 +140,9 @@ pub async fn read_string_pairs<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<(S
 // ---------------------------------------------------------------------------
 
 /// Write a single byte.
+///
+/// **Note:** Nix wire protocol integers are ALWAYS u64. This function is
+/// for non-protocol byte writing only (e.g., NAR format).
 pub async fn write_u8<W: AsyncWrite + Unpin>(w: &mut W, val: u8) -> Result<()> {
     w.write_all(&[val]).await?;
     Ok(())
