@@ -205,6 +205,9 @@ async fn resolve_derivation(
         }
     };
 
+    // TODO: extract_single_file is synchronous, so we buffer the full NAR here.
+    // Derivation NARs are tiny (< 256 KB), so this is fine. Making the NAR
+    // parser async would be a large change touching all of nar.rs.
     let mut nar_data = Vec::new();
     reader
         .read_to_end(&mut nar_data)
