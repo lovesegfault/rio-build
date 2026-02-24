@@ -697,6 +697,26 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
+    // Validate NAR size matches declared value
+    let actual_nar_size = nar_data.len() as u64;
+    if actual_nar_size != nar_size {
+        warn!(
+            path = %path_str,
+            declared_size = nar_size,
+            actual_size = actual_nar_size,
+            "NAR size mismatch"
+        );
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!(
+                    "NAR size mismatch for {path_str}: declared {nar_size}, actual {actual_nar_size}"
+                ),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("NAR size mismatch for {path_str}"));
+    }
+
     // Validate NAR hash
     let computed_hash = {
         let mut hasher = Sha256::new();
