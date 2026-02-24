@@ -1,0 +1,68 @@
+[store]
+dir = "target/nextest"
+
+# ── Default profile ──────────────────────────────────────────────────
+[profile.default]
+# Most tests are fast unit/wire tests; generous but bounded timeout.
+slow-timeout = { period = "30s", terminate-after = 3 }
+# Warn when a single test exceeds 2 s — useful for catching regressions
+# in what should be sub-second unit tests.
+status-level = "slow"
+final-status-level = "slow"
+
+[profile.default.junit]
+path = "target/nextest/default/junit.xml"
+
+# ── CI profile ───────────────────────────────────────────────────────
+[profile.ci]
+# Retry flaky daemon-based tests once in CI.
+retries = { backoff = "fixed", count = 1, delay = "1s" }
+fail-fast = false
+status-level = "slow"
+final-status-level = "flaky"
+
+[profile.ci.junit]
+path = "target/nextest/ci/junit.xml"
+
+# ── Test groups ──────────────────────────────────────────────────────
+# Golden conformance tests spawn isolated nix-daemon subprocesses
+# (each with its own temp store dir). They run fine fully parallel,
+# so the group just provides a knob to dial down if memory is tight.
+[test-groups.golden-daemon]
+max-threads = 16
+
+# Protocol conformance / integration tests also spawn nix processes.
+[test-groups.integration]
+max-threads = 8
+
+# ── Overrides ────────────────────────────────────────────────────────
+# Golden live-daemon tests: longer timeout since they spawn real daemons.
+[[profile.default.overrides]]
+filter = "test(test_golden_live_)"
+test-group = "golden-daemon"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Protocol conformance and integration build tests also use real nix.
+[[profile.default.overrides]]
+filter = "test(/^test_(nix_store_|nix_path_|build_trivial)/)"
+test-group = "integration"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Proptests can be CPU-heavy; give them more time but keep
+# them in the default thread pool.
+[[profile.default.overrides]]
+filter = "test(/proptest|roundtrip/)"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+# ── CI overrides (inherit default, add retries) ──────────────────────
+[[profile.ci.overrides]]
+filter = "test(test_golden_live_)"
+test-group = "golden-daemon"
+slow-timeout = { period = "90s", terminate-after = 2 }
+retries = { backoff = "fixed", count = 2, delay = "2s" }
+
+[[profile.ci.overrides]]
+filter = "test(/^test_(nix_store_|nix_path_|build_trivial)/)"
+test-group = "integration"
+slow-timeout = { period = "90s", terminate-after = 2 }
+retries = { backoff = "fixed", count = 2, delay = "2s" }
