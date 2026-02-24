@@ -150,7 +150,10 @@ impl russh::server::Server for GatewayServer {
 ///   protocol writer → `response_rx` → response pump task → Handle::data() → client
 struct ChannelSession {
     /// Send client data to the protocol handler.
-    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Wrapped in Option so `channel_eof` can drop it to signal EOF
+    /// without aborting the tasks (which need to finish sending
+    /// EOF/close back to the SSH client).
+    client_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Protocol handler task.
     proto_task: tokio::task::JoinHandle<()>,
     /// Response pump task (reads protocol output, sends via Handle::data).
@@ -289,9 +292,9 @@ impl Handler for ConnectionHandler {
                     break;
                 }
             }
-            if let Err(e) = inbound_writer.shutdown().await {
-                debug!(error = %e, "inbound writer shutdown failed");
-            }
+            // Dropping the writer signals EOF to the protocol handler
+            // via DuplexStream::close_write().
+            drop(inbound_writer);
         });
 
         // Task: run the protocol handler with separate reader/writer
@@ -333,6 +336,9 @@ impl Handler for ConnectionHandler {
             if let Err(e) = handle.eof(channel_id).await {
                 warn!(channel = ?channel_id, error = ?e, "failed to send EOF to SSH client");
             }
+            if let Err(e) = handle.close(channel_id).await {
+                warn!(channel = ?channel_id, error = ?e, "failed to close SSH channel");
+            }
             if let Err(e) = client_pump.await
                 && e.is_panic()
             {
@@ -343,7 +349,7 @@ impl Handler for ConnectionHandler {
         self.sessions.insert(
             channel_id,
             ChannelSession {
-                client_tx,
+                client_tx: Some(client_tx),
                 proto_task,
                 response_task,
             },
@@ -359,12 +365,14 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(session) = self.sessions.get(&channel) {
-            debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
-            if session.client_tx.send(data.to_vec()).await.is_err() {
-                warn!(channel = ?channel, "protocol session dead, closing channel");
-                self.sessions.remove(&channel);
-                metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
-                return Ok(());
+            if let Some(tx) = &session.client_tx {
+                debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
+                if tx.send(data.to_vec()).await.is_err() {
+                    warn!(channel = ?channel, "protocol session dead, closing channel");
+                    self.sessions.remove(&channel);
+                    metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
+                    return Ok(());
+                }
             }
         } else {
             debug!(channel = ?channel, len = data.len(), "data for channel with no session");
@@ -378,8 +386,11 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel EOF");
-        if self.sessions.remove(&channel).is_some() {
-            metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
+        // Drop client_tx to signal EOF to the protocol handler, but keep the
+        // session alive so the response pump can send EOF/close back to the
+        // SSH client. The session is cleaned up in channel_close.
+        if let Some(session) = self.sessions.get_mut(&channel) {
+            session.client_tx.take();
         }
         Ok(())
     }
