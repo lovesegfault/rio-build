@@ -816,6 +816,7 @@ FileHash: sha256:second
         use proptest::prelude::*;
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn narinfo_builder_roundtrip(
                 hash_suffix in "[a-z0-9]{32}",

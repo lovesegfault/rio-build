@@ -663,6 +663,7 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
             #[test]
             fn build_result_roundtrip(result in arb_build_result()) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
