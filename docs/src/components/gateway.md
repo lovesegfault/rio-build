@@ -16,7 +16,10 @@ The gateway is the entry point. It terminates SSH connections and speaks the Nix
 | Opcode | Value | Description |
 |--------|-------|-------------|
 | `wopIsValidPath` | 1 | Check if a store path exists |
+| `wopAddToStore` | 7 | Legacy content-addressed store path import |
+| `wopAddTextToStore` | 8 | Legacy text file import (builtins.toFile) |
 | `wopBuildPaths` | 9 | Build a set of derivations |
+| `wopEnsurePath` | 10 | Ensure a store path is valid/available |
 | `wopAddTempRoot` | 11 | Add temporary GC root |
 | `wopSetOptions` | 19 | Accept client build configuration |
 | `wopQueryPathInfo` | 26 | Return full path metadata |
@@ -260,6 +263,8 @@ Response (after STDERR loop):
 | `isNonDeterministic` | u64 bool | Whether non-deterministic output was detected |
 | `startTime` | u64 | Build start time (Unix epoch) |
 | `stopTime` | u64 | Build stop time (Unix epoch) |
+| `cpuUser` | optional i64 | CPU user time (u64 tag: 0=absent, 1=present; if present, followed by u64 value interpreted as i64) |
+| `cpuSystem` | optional i64 | CPU system time (same encoding as cpuUser) |
 | `builtOutputs` | collection | Output entries (see below) |
 
 **BuildResult status enum:**
@@ -270,24 +275,24 @@ Response (after STDERR loop):
 | 1 | Substituted | Fetched from substituter |
 | 2 | AlreadyValid | Output already existed |
 | 3 | PermanentFailure | Build failed (not retryable) |
-| 4 | TransientFailure | Build failed (may succeed on retry) |
-| 5 | CachedFailure | Previously recorded failure |
-| 6 | TimedOut | Build exceeded timeout |
-| 7 | MiscFailure | Other failure |
-| 8 | DependencyFailed | A dependency failed |
-| 9 | LogLimitExceeded | Build log exceeded size limit |
-| 10 | NotDeterministic | Non-deterministic output detected |
-| 11 | ResolveFailed | Derivation resolution failed |
-| 12 | NoSubstituters | No substituters available |
+| 4 | InputRejected | Input was rejected |
+| 5 | OutputRejected | Output was rejected |
+| 6 | TransientFailure | Build failed (may succeed on retry) |
+| 7 | CachedFailure | Previously recorded failure |
+| 8 | TimedOut | Build exceeded timeout |
+| 9 | MiscFailure | Other failure |
+| 10 | DependencyFailed | A dependency failed |
+| 11 | LogLimitExceeded | Build log exceeded size limit |
+| 12 | NotDeterministic | Non-deterministic output detected |
+| 13 | ResolvesToAlreadyValid | Derivation resolves to already valid output |
+| 14 | NoSubstituters | No substituters available |
 
-Each **builtOutput** entry:
+Each **builtOutput** entry is a `(DrvOutput, Realisation)` pair:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string | Output name |
-| `path` | string | Realized output store path |
-| `hashAlgo` | string | Hash algorithm (for CA outputs) |
-| `hash` | string | Output content hash (for CA outputs) |
+| `drv_output_id` | string | DrvOutput key, e.g. `sha256:abcdef...!out` |
+| `realisation_json` | string | Realisation as JSON: `{"id":"...","outPath":"...","signatures":[],"dependentRealisations":{}}` |
 
 ## Wire Format
 
@@ -451,7 +456,7 @@ Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection*
 
 | Category | Opcodes |
 |----------|---------|
-| Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStoreNar`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap` |
+| Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStore`, `wopAddTextToStore`, `wopAddToStoreNar`, `wopEnsurePath`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap` |
 | Stubbed (no-op, accept and ignore — full CA support in Phase 2c/5) | `wopRegisterDrvOutput`, `wopQueryRealisation` |
 | Stubbed (accept & no-op) | `wopAddSignatures` |
 | Stubbed (returns empty) | `wopQueryPathFromHashPart` |
