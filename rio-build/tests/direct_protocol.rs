@@ -795,10 +795,9 @@ async fn test_nar_from_path_large() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_nar_from_path_missing_closes_connection() {
-    // After NarFromPath sends STDERR_ERROR for a missing path, the connection
-    // closes to prevent protocol desynchronization (the client expects NAR
-    // data but there is none to send).
+async fn test_nar_from_path_missing_sends_error() {
+    // NarFromPath for a missing path sends STDERR_ERROR but keeps the
+    // connection open (matching the invalid-path case).
     let store = make_test_store();
     run_test(store, |s| {
         tokio::spawn(async move {
@@ -830,13 +829,6 @@ async fn test_nar_from_path_missing_closes_connection() {
             let _message = wire::read_string(&mut s).await.unwrap();
             let _have_pos = wire::read_u64(&mut s).await.unwrap();
             let _trace_count = wire::read_u64(&mut s).await.unwrap();
-
-            // Connection should be closed — reading the next opcode should fail
-            let result = wire::read_u64(&mut s).await;
-            assert!(
-                result.is_err(),
-                "connection should close after NarFromPath STDERR_ERROR for missing path"
-            );
         })
     })
     .await;
@@ -1932,7 +1924,7 @@ async fn test_add_to_store_flat_mode() {
     .await;
 }
 
-/// wopBuildDerivation (36): unknown build mode defaults to Normal (not STDERR_ERROR).
+/// wopBuildDerivation (36): unknown build mode produces STDERR_ERROR.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_build_derivation_unknown_build_mode() {
     let store = Arc::new(MemoryStore::new());
@@ -1972,17 +1964,12 @@ async fn test_build_derivation_unknown_build_mode() {
             wire::write_u64(&mut s, 99).await.unwrap();
             s.flush().await.unwrap();
 
-            // Should receive STDERR_LAST + BuildResult (not STDERR_ERROR)
+            // Should receive STDERR_ERROR for unsupported build mode
             let msg = wire::read_u64(&mut s).await.unwrap();
             assert_eq!(
-                msg, STDERR_LAST,
-                "unknown build mode should not produce STDERR_ERROR"
+                msg, STDERR_ERROR,
+                "unknown build mode should produce STDERR_ERROR"
             );
-
-            // Read BuildResult status
-            let status = wire::read_u64(&mut s).await.unwrap();
-            // Should be a valid BuildResult (failure is fine since daemon may not be available)
-            assert!(status <= 14, "status {status} out of BuildResult range");
         })
     })
     .await;

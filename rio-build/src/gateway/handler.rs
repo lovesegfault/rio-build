@@ -209,7 +209,12 @@ async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 debug!(path = %path_str, "wopEnsurePath: path not in store (no substituters)");
             }
             Err(e) => {
-                warn!(path = %path_str, error = %e, "wopEnsurePath: store error checking path");
+                error!(path = %path_str, error = %e, "wopEnsurePath: store error");
+                return send_store_error(
+                    stderr,
+                    anyhow::anyhow!("store error checking '{}': {e}", path_str),
+                )
+                .await;
             }
         }
     }
@@ -435,7 +440,7 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     format!("path '{}' is not valid", path_str),
                 ))
                 .await?;
-            return Err(anyhow::anyhow!("path '{}' has no NAR data", path_str));
+            return Ok(()); // connection stays open after STDERR_ERROR
         }
     }
 
@@ -1408,11 +1413,11 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let build_mode = match BuildMode::try_from(build_mode_val) {
         Ok(m) => m,
         Err(_) => {
-            warn!(
-                build_mode = build_mode_val,
-                "wopBuildDerivation: unknown build mode, defaulting to Normal"
-            );
-            BuildMode::Normal
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildDerivation: unsupported build mode {build_mode_val}"),
+            )
+            .await;
         }
     };
 
@@ -1462,11 +1467,11 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let build_mode = match BuildMode::try_from(build_mode_val) {
         Ok(m) => m,
         Err(_) => {
-            warn!(
-                build_mode = build_mode_val,
-                "wopBuildPaths: unknown build mode, defaulting to Normal"
-            );
-            BuildMode::Normal
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildPaths: unsupported build mode {build_mode_val}"),
+            )
+            .await;
         }
     };
 
@@ -1619,11 +1624,13 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
     let build_mode = match BuildMode::try_from(build_mode_val) {
         Ok(m) => m,
         Err(_) => {
-            warn!(
-                build_mode = build_mode_val,
-                "wopBuildPathsWithResults: unknown build mode, defaulting to Normal"
-            );
-            BuildMode::Normal
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!(
+                    "wopBuildPathsWithResults: unsupported build mode {build_mode_val}"
+                ),
+            )
+            .await;
         }
     };
 
