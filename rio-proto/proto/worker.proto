@@ -9,11 +9,15 @@ import "types.proto";
 service WorkerService {
   // Bidirectional stream for build execution.
   // Scheduler sends: WorkAssignment, CancelSignal, PrefetchHint
-  // Worker sends: WorkAssignmentAck, BuildLogBatch, CompletionReport, ProgressUpdate
+  // Worker sends: WorkerRegister (first), then WorkAssignmentAck, BuildLogBatch,
+  //   CompletionReport, ProgressUpdate
+  // The first message MUST be WorkerRegister{worker_id} — the scheduler uses this
+  // to associate the stream with the worker's identity.
   rpc BuildExecution(stream rio.types.WorkerMessage) returns (stream rio.types.SchedulerMessage);
 
   // Periodic heartbeat with worker capabilities and resource usage.
-  // Worker registration is implicit: the scheduler creates the worker entry when
-  // it receives a heartbeat from a worker_id that also has an open BuildExecution stream.
+  // Worker registration: the scheduler creates the worker entry when it sees
+  // both a WorkerRegister on the BuildExecution stream AND a Heartbeat with
+  // the same worker_id. Only then is the worker eligible for assignments.
   rpc Heartbeat(rio.types.HeartbeatRequest) returns (rio.types.HeartbeatResponse);
 }

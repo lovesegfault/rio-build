@@ -14,7 +14,7 @@ use tracing::info;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
     CompletionReport, HeartbeatRequest, ResourceUsage, WorkAssignmentAck, WorkerMessage,
-    scheduler_message, worker_message,
+    WorkerRegister, scheduler_message, worker_message,
 };
 use rio_proto::worker::worker_service_client::WorkerServiceClient;
 use rio_worker::executor;
@@ -164,6 +164,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up build execution stream (bidirectional)
     let (stream_tx, stream_rx) = mpsc::channel::<WorkerMessage>(256);
+
+    // Send WorkerRegister as the first message before opening the stream.
+    // The scheduler reads this to associate the stream with our worker_id,
+    // ensuring stream and heartbeat share the same identity.
+    stream_tx
+        .send(WorkerMessage {
+            msg: Some(worker_message::Msg::Register(WorkerRegister {
+                worker_id: worker_id.clone(),
+            })),
+        })
+        .await?;
+
     let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
 
     let build_stream = scheduler_client

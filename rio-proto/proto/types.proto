@@ -113,7 +113,14 @@ message WorkerMessage {
     BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
     CompletionReport completion = 3;        // Build result
     ProgressUpdate progress = 4;            // Resource usage, build phase
+    WorkerRegister register = 5;            // First message: identifies the worker
   }
+}
+
+// First message sent by a worker on the BuildExecution stream.
+// Establishes the worker_id before any assignments are dispatched.
+message WorkerRegister {
+  string worker_id = 1;
 }
 
 // Scheduler -> Worker messages on the BuildExecution stream.
