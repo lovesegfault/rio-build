@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 rio-nix = { workspace = true }
 
+# Byte buffers
+bytes = { workspace = true }
+
 # Async runtime
 tokio = { workspace = true }
 async-trait = { workspace = true }

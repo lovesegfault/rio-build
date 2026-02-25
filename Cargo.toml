@@ -15,6 +15,9 @@ repository = "https://github.com/lovesegfault/rio-build"
 rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }
 
+# Byte buffers
+bytes = "1"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

@@ -2386,6 +2386,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
