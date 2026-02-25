@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use rio_nix::store_path::StorePath;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::traits::{NarReader, PathInfo, PathInfoBuilder, Store};
 
@@ -145,23 +145,31 @@ impl Store for MemoryStore {
     async fn add_path<'n>(
         &self,
         info: PathInfo,
-        mut nar_data: Box<dyn tokio::io::AsyncRead + Send + Unpin + 'n>,
+        nar_data: Box<dyn tokio::io::AsyncRead + Send + Unpin + 'n>,
     ) -> anyhow::Result<()> {
+        use super::validate::{HashingReader, validate_nar_digest};
         use tokio::io::AsyncReadExt;
 
         let key = info.path().clone();
         debug!(path = %key, "adding path to memory store");
 
+        // Wrap in HashingReader to compute SHA-256 incrementally while buffering.
         // Always drain the full stream (reader may be wire-backed).
         // Pre-allocate based on declared size to avoid repeated reallocation.
+        let mut hashing = HashingReader::new(nar_data);
         let capacity =
             (info.nar_size() as usize).min(rio_nix::protocol::wire::MAX_FRAMED_TOTAL as usize);
         let mut data = Vec::with_capacity(capacity);
-        nar_data.read_to_end(&mut data).await?;
+        if let Err(e) = hashing.read_to_end(&mut data).await {
+            error!(path = %key, error = %e,
+                   "I/O error during NAR read; stream may not be fully consumed");
+            return Err(e.into());
+        }
+        let digest = hashing.into_digest();
 
         // ALWAYS validate, even for idempotent case — corrupt uploads must be
         // rejected, not silently accepted.
-        super::validate::validate_nar(&data, &info)?;
+        validate_nar_digest(&digest, &info)?;
 
         // Idempotent: if already present, don't overwrite.
         // Check AFTER validation so corrupt data is never silently accepted.
