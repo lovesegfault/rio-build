@@ -946,10 +946,11 @@ fn try_cache_drv(
 
 /// Read a just-stored `.drv` back from the store, parse its ATerm, and cache it.
 ///
-/// Used only by `handle_add_to_store_nar` (opcode 39), where the NAR data is
-/// streamed directly from the wire into the store via `FramedStreamReader` — no
-/// handler-level buffer exists. For handlers that buffer the NAR (opcodes 7, 8,
-/// 44), call `try_cache_drv` directly with the in-memory buffer instead.
+/// Used by `handle_add_to_store_nar` (opcode 39) and `parse_add_multiple_entry`
+/// (opcode 44), where NAR data is streamed directly into the store via
+/// `FramedStreamReader` — no handler-level buffer exists. For handlers that
+/// buffer the NAR (opcodes 7, 8), call `try_cache_drv` directly with the
+/// in-memory buffer instead.
 ///
 /// Best-effort: parse failures are logged but do not fail the store operation.
 async fn cache_drv_if_needed(
@@ -1008,13 +1009,9 @@ async fn parse_add_multiple_entry(
     let sigs = wire::read_strings(cursor).await?;
     let ca_str = wire::read_string(cursor).await?;
 
-    // Read inner framed NAR data
-    let nar_data = wire::read_framed_stream(cursor).await?;
-
     debug!(
         path = %path_str,
         nar_size = nar_size,
-        nar_actual = nar_data.len(),
         "wopAddMultipleToStore entry"
     );
 
@@ -1064,11 +1061,17 @@ async fn parse_add_multiple_entry(
         .build()
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': PathInfo build failed: {e}"))?;
 
+    // Stream the inner NAR directly from the cursor via FramedStreamReader,
+    // matching opcode 39's pattern. The store handles hash/size validation
+    // internally via HashingReader (drain contract).
+    let framed = wire::FramedStreamReader::new(&mut *cursor, nar_size);
     store
-        .add_path(info, Box::new(std::io::Cursor::new(nar_data.as_slice())))
+        .add_path(info, Box::new(framed))
         .await
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
-    try_cache_drv(&path, &nar_data, drv_cache);
+
+    // If this is a .drv file, read back from store and cache it.
+    cache_drv_if_needed(&path, store, drv_cache).await;
 
     Ok(())
 }

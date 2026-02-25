@@ -268,8 +268,12 @@ pub trait Store: Send + Sync {
     /// bytes would corrupt the protocol framing.
     ///
     /// Implementations MUST validate that the NAR content matches
-    /// `info.nar_hash()` (SHA-256) and `info.nar_size()` using
-    /// [`validate::validate_nar`](super::validate::validate_nar).
+    /// `info.nar_hash()` (SHA-256) and `info.nar_size()`. The recommended
+    /// pattern is to wrap `nar_data` in a
+    /// [`HashingReader`](super::validate::HashingReader), drain it via
+    /// `read_to_end`, then call
+    /// [`validate_nar_digest`](super::validate::validate_nar_digest) on the
+    /// resulting [`NarDigest`](super::validate::NarDigest).
     ///
     /// Called by `wopAddToStoreNar` and `wopAddMultipleToStore` handlers.
     async fn add_path<'n>(
