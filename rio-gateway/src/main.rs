@@ -1,6 +1,11 @@
 //! rio-gateway binary entry point.
+//!
+//! Connects to the scheduler and store gRPC services, then starts an
+//! SSH server that speaks the Nix worker protocol.
 
 use clap::Parser;
+use rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
+use rio_proto::store::store_service_client::StoreServiceClient;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -49,12 +54,38 @@ async fn main() -> anyhow::Result<()> {
 
     rio_common::observability::init_metrics(args.metrics_addr)?;
 
+    // Connect to gRPC services
+    let max_msg = rio_proto::max_message_size();
+
+    let store_endpoint = format!("http://{}", args.store_addr);
+    info!(addr = %store_endpoint, "connecting to store service");
+    let store_client = StoreServiceClient::connect(store_endpoint)
+        .await?
+        .max_decoding_message_size(max_msg)
+        .max_encoding_message_size(max_msg);
+
+    let scheduler_endpoint = format!("http://{}", args.scheduler_addr);
+    info!(addr = %scheduler_endpoint, "connecting to scheduler service");
+    let scheduler_client = SchedulerServiceClient::connect(scheduler_endpoint)
+        .await?
+        .max_decoding_message_size(max_msg)
+        .max_encoding_message_size(max_msg);
+
+    // Load SSH keys
+    let host_key = rio_gateway::load_or_generate_host_key(&args.host_key)?;
+    let authorized_keys = rio_gateway::load_authorized_keys(&args.authorized_keys)?;
+
+    // Start SSH server
+    let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys);
+
     info!(
         listen_addr = %args.listen_addr,
         scheduler_addr = %args.scheduler_addr,
         store_addr = %args.store_addr,
-        "rio-gateway is a placeholder — implementation in Step 6"
+        "rio-gateway ready"
     );
+
+    server.run(host_key, args.listen_addr).await?;
 
     Ok(())
 }

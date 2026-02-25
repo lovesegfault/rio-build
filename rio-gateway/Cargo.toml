@@ -17,6 +17,7 @@ rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 tonic = { workspace = true }
 russh = { workspace = true }
@@ -30,6 +31,7 @@ metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+prost-types = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
