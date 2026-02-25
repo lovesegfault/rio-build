@@ -122,6 +122,7 @@ pub async fn execute_build(
     let db_dir = overlay::prepare_nix_state_dirs(overlay_mount.upper_dir())?;
     let db_path = db_dir.join("db.sqlite");
     synth_db::generate_db(&db_path, &synth_paths)
+        .await
         .map_err(|e| ExecutorError::SynthDb(e.to_string()))?;
 
     // 3. Parse the derivation from inline ATerm content

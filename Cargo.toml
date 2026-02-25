@@ -49,7 +49,9 @@ prost-types = "0.14"
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio",
   "postgres",
+  "sqlite",
   "macros",
+  "migrate",
 ] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -59,9 +61,6 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 
 # FUSE
 fuser = "0.17"
-
-# SQLite (for synthetic Nix store DB)
-rusqlite = { version = "0.38" }
 
 # Linux syscalls
 nix = { version = "0.31", features = [

@@ -94,6 +94,40 @@ pub enum ActorCommand {
         reply:
             oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
     },
+
+    /// Test-only: query worker states.
+    #[cfg(test)]
+    DebugQueryWorkers {
+        reply: oneshot::Sender<Vec<DebugWorkerInfo>>,
+    },
+
+    /// Test-only: query a derivation's state.
+    #[cfg(test)]
+    DebugQueryDerivation {
+        drv_hash: String,
+        reply: oneshot::Sender<Option<DebugDerivationInfo>>,
+    },
+}
+
+/// Test-only: snapshot of worker state for assertions.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct DebugWorkerInfo {
+    pub worker_id: String,
+    pub is_registered: bool,
+    pub system: Option<String>,
+    pub running_count: usize,
+}
+
+/// Test-only: snapshot of derivation state for assertions.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct DebugDerivationInfo {
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub status: DerivationStatus,
+    pub retry_count: u32,
+    pub assigned_worker: Option<String>,
 }
 
 /// Errors from the actor.
@@ -245,6 +279,31 @@ impl DagActor {
                 } => {
                     let result = self.handle_watch_build(build_id);
                     let _ = reply.send(result);
+                }
+                #[cfg(test)]
+                ActorCommand::DebugQueryWorkers { reply } => {
+                    let workers: Vec<_> = self
+                        .workers
+                        .values()
+                        .map(|w| DebugWorkerInfo {
+                            worker_id: w.worker_id.clone(),
+                            is_registered: w.is_registered,
+                            system: w.system.clone(),
+                            running_count: w.running_builds.len(),
+                        })
+                        .collect();
+                    let _ = reply.send(workers);
+                }
+                #[cfg(test)]
+                ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
+                    let info = self.dag.nodes.get(&drv_hash).map(|s| DebugDerivationInfo {
+                        drv_hash: s.drv_hash.clone(),
+                        drv_path: s.drv_path.clone(),
+                        status: s.status,
+                        retry_count: s.retry_count,
+                        assigned_worker: s.assigned_worker.clone(),
+                    });
+                    let _ = reply.send(info);
                 }
             }
         }
@@ -1385,5 +1444,158 @@ impl ActorHandle {
         let max = self.tx.max_capacity();
         let used_fraction = 1.0 - (capacity as f64 / max as f64);
         used_fraction >= BACKPRESSURE_HIGH_WATERMARK
+    }
+
+    /// Send a command without backpressure check (for worker lifecycle events).
+    pub async fn send_unchecked(&self, cmd: ActorCommand) -> Result<(), ActorError> {
+        self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
+    }
+
+    /// Test-only: query all worker states.
+    #[cfg(test)]
+    pub async fn debug_query_workers(&self) -> Result<Vec<DebugWorkerInfo>, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugQueryWorkers { reply: tx })
+            .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
+
+    /// Test-only: query a derivation's state.
+    #[cfg(test)]
+    pub async fn debug_query_derivation(
+        &self,
+        drv_hash: &str,
+    ) -> Result<Option<DebugDerivationInfo>, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugQueryDerivation {
+            drv_hash: drv_hash.to_string(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(dead_code)] // Helpers used progressively across Group 1-10 TDD tests
+pub(crate) mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// Set up an actor with the given PgPool and return (handle, task).
+    /// The caller should drop the handle to shut down the actor.
+    pub(crate) async fn setup_actor(
+        pool: sqlx::PgPool,
+    ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
+        let db = SchedulerDb::new(pool);
+        let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
+        let actor = DagActor::new(db);
+        let task = tokio::spawn(actor.run(rx));
+        (ActorHandle { tx }, task)
+    }
+
+    /// Create a minimal test DerivationNode.
+    pub(crate) fn make_test_node(
+        hash: &str,
+        path: &str,
+        system: &str,
+    ) -> rio_proto::types::DerivationNode {
+        rio_proto::types::DerivationNode {
+            drv_hash: hash.into(),
+            drv_path: path.into(),
+            pname: "test-pkg".into(),
+            system: system.into(),
+            required_features: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+        }
+    }
+
+    /// Create a minimal test DerivationEdge.
+    pub(crate) fn make_test_edge(parent: &str, child: &str) -> rio_proto::types::DerivationEdge {
+        rio_proto::types::DerivationEdge {
+            parent_drv_path: parent.into(),
+            child_drv_path: child.into(),
+        }
+    }
+
+    /// Connect a worker (stream + heartbeat) so it becomes fully registered.
+    /// Returns the mpsc::Receiver for scheduler→worker messages.
+    pub(crate) async fn connect_worker(
+        handle: &ActorHandle,
+        worker_id: &str,
+        system: &str,
+        max_builds: u32,
+    ) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
+        let (stream_tx, stream_rx) = mpsc::channel(256);
+        handle
+            .send_unchecked(ActorCommand::WorkerConnected {
+                worker_id: worker_id.into(),
+                stream_tx,
+            })
+            .await
+            .unwrap();
+        handle
+            .send_unchecked(ActorCommand::Heartbeat {
+                worker_id: worker_id.into(),
+                system: system.into(),
+                supported_features: vec![],
+                max_builds,
+                running_builds: vec![],
+            })
+            .await
+            .unwrap();
+        stream_rx
+    }
+
+    /// Merge a single-node DAG and return the event receiver.
+    pub(crate) async fn merge_single_node(
+        handle: &ActorHandle,
+        build_id: Uuid,
+        hash: &str,
+        path: &str,
+        priority_class: &str,
+    ) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: priority_class.into(),
+                nodes: vec![make_test_node(hash, path, "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap()
+    }
+
+    /// Give the actor time to process commands.
+    pub(crate) async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_actor_starts_and_stops(pool: sqlx::PgPool) {
+        let (handle, task) = setup_actor(pool).await;
+        settle().await;
+        // Query should succeed (actor is running)
+        let workers = handle.debug_query_workers().await.unwrap();
+        assert!(workers.is_empty());
+        // Drop handle to close channel
+        drop(handle);
+        // Actor task should exit
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("actor should shut down")
+            .expect("actor should not panic");
     }
 }

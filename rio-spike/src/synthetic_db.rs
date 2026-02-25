@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use rusqlite::Connection;
 use serde::Deserialize;
+use sqlx::{Connection, SqliteConnection};
 
 /// Path metadata from `nix path-info --json`.
 #[derive(Debug, Deserialize)]
@@ -28,16 +28,19 @@ const SCHEMA_VERSION: &str = "10";
 ///
 /// The database contains the minimum schema required for Nix 2.20+
 /// to recognize store paths: Config, ValidPaths, Refs, DerivationOutputs.
-pub fn generate_db(db_path: &Path, paths: &[NixPathInfo]) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
+pub async fn generate_db(db_path: &Path, paths: &[NixPathInfo]) -> anyhow::Result<()> {
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let mut conn = SqliteConnection::connect(&url).await?;
 
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=OFF;",
-    )?;
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&mut conn)
+        .await?;
+    sqlx::query("PRAGMA synchronous=OFF")
+        .execute(&mut conn)
+        .await?;
 
-    create_schema(&conn)?;
-    insert_paths(&conn, paths)?;
+    create_schema(&mut conn).await?;
+    insert_paths(&mut conn, paths).await?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -48,14 +51,13 @@ pub fn generate_db(db_path: &Path, paths: &[NixPathInfo]) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS Config (
+async fn create_schema(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    let stmts = [
+        r#"CREATE TABLE IF NOT EXISTS Config (
             name TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS ValidPaths (
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS ValidPaths (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
             path TEXT UNIQUE NOT NULL,
             hash TEXT NOT NULL,
@@ -65,37 +67,39 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
             ultimate INTEGER DEFAULT 0,
             sigs TEXT DEFAULT '',
             ca TEXT DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS Refs (
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS Refs (
             referrer INTEGER NOT NULL,
             reference INTEGER NOT NULL,
             PRIMARY KEY (referrer, reference),
             FOREIGN KEY (referrer) REFERENCES ValidPaths(id),
             FOREIGN KEY (reference) REFERENCES ValidPaths(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS DerivationOutputs (
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS DerivationOutputs (
             drv INTEGER NOT NULL,
             id TEXT NOT NULL,
             path TEXT NOT NULL,
             PRIMARY KEY (drv, id),
             FOREIGN KEY (drv) REFERENCES ValidPaths(id)
-        );
+        )"#,
+        "CREATE INDEX IF NOT EXISTS IndexValidPathsPath ON ValidPaths(path)",
+        "CREATE INDEX IF NOT EXISTS IndexValidPathsHash ON ValidPaths(hash)",
+    ];
 
-        CREATE INDEX IF NOT EXISTS IndexValidPathsPath ON ValidPaths(path);
-        CREATE INDEX IF NOT EXISTS IndexValidPathsHash ON ValidPaths(hash);",
-    )
+    for stmt in stmts {
+        sqlx::query(stmt).execute(&mut *conn).await?;
+    }
+    Ok(())
 }
 
-fn insert_paths(conn: &Connection, paths: &[NixPathInfo]) -> anyhow::Result<()> {
-    let tx = conn.unchecked_transaction()?;
+async fn insert_paths(conn: &mut SqliteConnection, paths: &[NixPathInfo]) -> anyhow::Result<()> {
+    let mut tx = conn.begin().await?;
 
     // Set schema version
-    tx.execute(
-        "INSERT OR REPLACE INTO Config (name, value) VALUES ('SchemaVersion', ?1)",
-        [SCHEMA_VERSION],
-    )?;
+    sqlx::query("INSERT OR REPLACE INTO Config (name, value) VALUES ('SchemaVersion', ?1)")
+        .bind(SCHEMA_VERSION)
+        .execute(&mut *tx)
+        .await?;
 
     // Build path -> row ID mapping for references
     let mut path_to_id: HashMap<String, i64> = HashMap::new();
@@ -105,24 +109,23 @@ fn insert_paths(conn: &Connection, paths: &[NixPathInfo]) -> anyhow::Result<()> 
         let sigs = info.signatures.join(" ");
         let ca = info.ca.as_deref().unwrap_or("");
 
-        tx.execute(
+        sqlx::query(
             "INSERT OR IGNORE INTO ValidPaths (path, hash, registrationTime, deriver, narSize, ultimate, sigs, ca)
              VALUES (?1, ?2, 0, ?3, ?4, 0, ?5, ?6)",
-            rusqlite::params![
-                info.path,
-                info.nar_hash,
-                info.deriver,
-                info.nar_size as i64,
-                sigs,
-                ca,
-            ],
-        )?;
+        )
+        .bind(&info.path)
+        .bind(&info.nar_hash)
+        .bind(&info.deriver)
+        .bind(info.nar_size as i64)
+        .bind(&sigs)
+        .bind(ca)
+        .execute(&mut *tx)
+        .await?;
 
-        let id: i64 = tx.query_row(
-            "SELECT id FROM ValidPaths WHERE path = ?1",
-            [&info.path],
-            |row| row.get(0),
-        )?;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM ValidPaths WHERE path = ?1")
+            .bind(&info.path)
+            .fetch_one(&mut *tx)
+            .await?;
         path_to_id.insert(info.path.clone(), id);
     }
 
@@ -135,10 +138,11 @@ fn insert_paths(conn: &Connection, paths: &[NixPathInfo]) -> anyhow::Result<()> 
 
         for ref_path in &info.references {
             if let Some(&reference_id) = path_to_id.get(ref_path) {
-                tx.execute(
-                    "INSERT OR IGNORE INTO Refs (referrer, reference) VALUES (?1, ?2)",
-                    [referrer_id, reference_id],
-                )?;
+                sqlx::query("INSERT OR IGNORE INTO Refs (referrer, reference) VALUES (?1, ?2)")
+                    .bind(referrer_id)
+                    .bind(reference_id)
+                    .execute(&mut *tx)
+                    .await?;
             } else {
                 tracing::debug!(
                     referrer = %info.path,
@@ -149,7 +153,7 @@ fn insert_paths(conn: &Connection, paths: &[NixPathInfo]) -> anyhow::Result<()> 
         }
     }
 
-    tx.commit()?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -202,7 +206,7 @@ pub fn query_path_info(store_path: &str) -> anyhow::Result<Vec<NixPathInfo>> {
 }
 
 /// CLI entry point for the sqlite-gen subcommand.
-pub fn run_sqlite_gen(output: &Path, store_path: &str) -> anyhow::Result<()> {
+pub async fn run_sqlite_gen(output: &Path, store_path: &str) -> anyhow::Result<()> {
     tracing::info!(store_path, "querying nix path-info for closure");
     let paths = query_path_info(store_path)?;
     tracing::info!(path_count = paths.len(), "got path info for closure");
@@ -211,7 +215,7 @@ pub fn run_sqlite_gen(output: &Path, store_path: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    generate_db(output, &paths)?;
+    generate_db(output, &paths).await?;
     tracing::info!(output = %output.display(), "SQLite DB written");
     Ok(())
 }
@@ -246,111 +250,115 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn test_generate_db_creates_valid_schema() {
+    async fn open_db(db_path: &Path) -> SqliteConnection {
+        let url = format!("sqlite://{}", db_path.display());
+        SqliteConnection::connect(&url).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_generate_db_creates_valid_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).unwrap();
+        generate_db(&db_path, &sample_paths()).await.unwrap();
 
-        let conn = Connection::open(&db_path).unwrap();
+        let mut conn = open_db(&db_path).await;
 
         // Check schema version
-        let version: String = conn
-            .query_row(
-                "SELECT value FROM Config WHERE name = 'SchemaVersion'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let version: String =
+            sqlx::query_scalar("SELECT value FROM Config WHERE name = 'SchemaVersion'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
         assert_eq!(version, "10");
 
         // Check valid paths count
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ValidPaths", [], |row| row.get(0))
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
+            .fetch_one(&mut conn)
+            .await
             .unwrap();
         assert_eq!(count, 2);
 
         // Check refs count (glibc self-ref + hello->glibc + hello self-ref)
-        let ref_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM Refs", [], |row| row.get(0))
+        let ref_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Refs")
+            .fetch_one(&mut conn)
+            .await
             .unwrap();
         assert_eq!(ref_count, 3);
     }
 
-    #[test]
-    fn test_generate_db_path_lookup() {
+    #[tokio::test]
+    async fn test_generate_db_path_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).unwrap();
+        generate_db(&db_path, &sample_paths()).await.unwrap();
 
-        let conn = Connection::open(&db_path).unwrap();
+        let mut conn = open_db(&db_path).await;
 
         // Verify we can look up paths by path (as Nix does)
-        let hash: String = conn
-            .query_row(
-                "SELECT hash FROM ValidPaths WHERE path = ?1",
-                ["/nix/store/bbbb-hello-2.12.2"],
-                |row| row.get(0),
-            )
+        let hash: String = sqlx::query_scalar("SELECT hash FROM ValidPaths WHERE path = ?1")
+            .bind("/nix/store/bbbb-hello-2.12.2")
+            .fetch_one(&mut conn)
+            .await
             .unwrap();
         assert_eq!(hash, "sha256:cafebabe");
     }
 
-    #[test]
-    fn test_generate_db_pragmas() {
+    #[tokio::test]
+    async fn test_generate_db_pragmas() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).unwrap();
+        generate_db(&db_path, &sample_paths()).await.unwrap();
 
-        let conn = Connection::open(&db_path).unwrap();
+        let mut conn = open_db(&db_path).await;
 
         // WAL mode persists in the file
-        let journal: String = conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut conn)
+            .await
             .unwrap();
         assert_eq!(journal, "wal");
     }
 
-    #[test]
-    fn test_generate_db_empty() {
+    #[tokio::test]
+    async fn test_generate_db_empty() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[]).unwrap();
+        generate_db(&db_path, &[]).await.unwrap();
 
-        let conn = Connection::open(&db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ValidPaths", [], |row| row.get(0))
+        let mut conn = open_db(&db_path).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
+            .fetch_one(&mut conn)
+            .await
             .unwrap();
         assert_eq!(count, 0);
 
         // Schema version should still be set
-        let version: String = conn
-            .query_row(
-                "SELECT value FROM Config WHERE name = 'SchemaVersion'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let version: String =
+            sqlx::query_scalar("SELECT value FROM Config WHERE name = 'SchemaVersion'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
         assert_eq!(version, "10");
     }
 
-    #[test]
-    fn test_generate_db_idempotent() {
+    #[tokio::test]
+    async fn test_generate_db_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
         let paths = sample_paths();
-        generate_db(&db_path, &paths).unwrap();
+        generate_db(&db_path, &paths).await.unwrap();
         // Running again on the same DB should not fail (INSERT OR IGNORE)
-        generate_db(&db_path, &paths).unwrap();
+        generate_db(&db_path, &paths).await.unwrap();
 
-        let conn = Connection::open(&db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ValidPaths", [], |row| row.get(0))
+        let mut conn = open_db(&db_path).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
+            .fetch_one(&mut conn)
+            .await
             .unwrap();
         assert_eq!(count, 2);
     }

@@ -17,7 +17,7 @@ CREATE TABLE narinfo (
     deriver          TEXT,
     nar_hash         BYTEA NOT NULL,           -- SHA-256 digest
     nar_size         BIGINT NOT NULL,
-    references       TEXT[] NOT NULL DEFAULT '{}',
+    "references"     TEXT[] NOT NULL DEFAULT '{}',
     signatures       TEXT[] NOT NULL DEFAULT '{}',
     ca               TEXT,                     -- content address (empty for input-addressed)
     tenant_id        UUID,                     -- nullable: unused in Phase 2a

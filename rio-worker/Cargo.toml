@@ -19,7 +19,7 @@ rio-proto = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 fuser = { workspace = true }
-rusqlite = { workspace = true, features = ["bundled"] }
+sqlx = { workspace = true }
 nix = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }

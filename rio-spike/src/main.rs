@@ -87,7 +87,8 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -112,10 +113,10 @@ fn main() -> anyhow::Result<()> {
         } => overlay::run_overlay_setup(&lower, &base_dir, &build_id),
 
         Command::SqliteGen { output, store_path } => {
-            synthetic_db::run_sqlite_gen(&output, &store_path)
+            synthetic_db::run_sqlite_gen(&output, &store_path).await
         }
 
-        Command::Validate { all, backing_dir } => validate::run_validate(all, backing_dir),
+        Command::Validate { all, backing_dir } => validate::run_validate(all, backing_dir).await,
 
         Command::Benchmark {
             backing_dir,

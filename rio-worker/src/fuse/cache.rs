@@ -11,13 +11,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use sqlx::SqlitePool;
+use tokio::runtime::Handle;
 
 /// Errors from cache operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
     #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("NAR error: {0}")]
@@ -37,15 +38,17 @@ pub struct CacheEntry {
 
 /// LRU cache manager backed by local SSD with SQLite metadata index.
 ///
-/// Thread-safe: the SQLite connection is wrapped in a `Mutex` because
-/// `rusqlite::Connection` is `Send` but not `Sync`.
+/// Thread-safe: uses a connection pool for concurrent access. FUSE callbacks
+/// are synchronous, so all DB ops are bridged via `Handle::block_on`.
 pub struct Cache {
     /// Root directory where cached paths are materialized.
     cache_dir: PathBuf,
     /// Maximum cache size in bytes.
     max_size_bytes: u64,
-    /// SQLite metadata index (protected by mutex for `&self` access).
-    db: Mutex<Connection>,
+    /// SQLite metadata index (async pool, bridged via block_on).
+    pool: SqlitePool,
+    /// Tokio runtime handle for block_on bridging.
+    runtime: Handle,
     /// In-flight fetches to avoid duplicate downloads.
     inflight: Mutex<HashSet<String>>,
 }
@@ -54,30 +57,40 @@ impl Cache {
     /// Create a new cache rooted at `cache_dir` with the given size limit.
     ///
     /// Creates the cache directory and SQLite index if they don't exist.
-    pub fn new(cache_dir: PathBuf, max_size_gb: u64) -> Result<Self, CacheError> {
+    /// Must be called from within a tokio runtime (captures the current `Handle`).
+    pub async fn new(cache_dir: PathBuf, max_size_gb: u64) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
         let db_path = cache_dir.join("cache_index.sqlite");
-        let conn = Connection::open(&db_path)?;
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let runtime = Handle::current();
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
+        let pool = SqlitePool::connect(&url).await?;
 
-             CREATE TABLE IF NOT EXISTS cached_paths (
-                 store_path TEXT PRIMARY KEY NOT NULL,
-                 size_bytes INTEGER NOT NULL,
-                 last_access INTEGER NOT NULL
-             );
-
-             CREATE INDEX IF NOT EXISTS idx_last_access
-                 ON cached_paths(last_access);",
-        )?;
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS cached_paths (
+                store_path TEXT PRIMARY KEY NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                last_access INTEGER NOT NULL
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_last_access ON cached_paths(last_access)")
+            .execute(&pool)
+            .await?;
 
         Ok(Self {
             cache_dir,
             max_size_bytes: max_size_gb * 1024 * 1024 * 1024,
-            db: Mutex::new(conn),
+            pool,
+            runtime,
             inflight: Mutex::new(HashSet::new()),
         })
     }
@@ -89,18 +102,16 @@ impl Cache {
 
     /// Check if a store path is cached.
     pub fn contains(&self, store_path: &str) -> bool {
-        let db = self.db.lock().unwrap_or_else(|e| {
-            tracing::error!("cache db lock poisoned, recovering");
-            e.into_inner()
-        });
-        let count: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1",
-                [store_path],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        count > 0
+        let pool = &self.pool;
+        self.runtime.block_on(async {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1")
+                    .bind(store_path)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+            count > 0
+        })
     }
 
     /// Get the full filesystem path for a cached store path.
@@ -117,54 +128,47 @@ impl Cache {
 
     /// Record a store path as cached after extraction.
     pub fn insert(&self, store_path: &str, size_bytes: u64) -> Result<(), CacheError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let db = self.db.lock().unwrap_or_else(|e| {
-            tracing::error!("cache db lock poisoned, recovering");
-            e.into_inner()
-        });
-        db.execute(
-            "INSERT OR REPLACE INTO cached_paths (store_path, size_bytes, last_access)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![store_path, size_bytes as i64, now],
-        )?;
+        let now = unix_now();
+        let pool = &self.pool;
+        self.runtime.block_on(async {
+            sqlx::query(
+                "INSERT OR REPLACE INTO cached_paths (store_path, size_bytes, last_access)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(store_path)
+            .bind(size_bytes as i64)
+            .bind(now)
+            .execute(pool)
+            .await?;
+            Ok::<_, sqlx::Error>(())
+        })?;
         Ok(())
     }
 
     /// Update the last access timestamp for a cached path.
     fn touch(&self, store_path: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let db = self.db.lock().unwrap_or_else(|e| {
-            tracing::error!("cache db lock poisoned, recovering");
-            e.into_inner()
+        let now = unix_now();
+        let pool = &self.pool;
+        self.runtime.block_on(async {
+            let _ = sqlx::query("UPDATE cached_paths SET last_access = ?1 WHERE store_path = ?2")
+                .bind(now)
+                .bind(store_path)
+                .execute(pool)
+                .await;
         });
-        let _ = db.execute(
-            "UPDATE cached_paths SET last_access = ?1 WHERE store_path = ?2",
-            rusqlite::params![now, store_path],
-        );
     }
 
     /// Total size of all cached paths in bytes.
     pub fn total_size(&self) -> u64 {
-        let db = self.db.lock().unwrap_or_else(|e| {
-            tracing::error!("cache db lock poisoned, recovering");
-            e.into_inner()
-        });
-        let size: i64 = db
-            .query_row(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM cached_paths",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        size as u64
+        let pool = &self.pool;
+        self.runtime.block_on(async {
+            let size: i64 =
+                sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cached_paths")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+            size as u64
+        })
     }
 
     /// Evict least-recently-used entries until total size is under the limit.
@@ -177,25 +181,22 @@ impl Cache {
                 break;
             }
 
-            let entry = {
-                let db = self.db.lock().unwrap_or_else(|e| {
-                    tracing::error!("cache db lock poisoned, recovering");
-                    e.into_inner()
-                });
-                db.query_row(
+            let pool = &self.pool;
+            let entry = self.runtime.block_on(async {
+                let row: Option<(String, i64)> = sqlx::query_as(
                     "SELECT store_path, size_bytes FROM cached_paths
                      ORDER BY last_access ASC LIMIT 1",
-                    [],
-                    |row| {
-                        Ok(CacheEntry {
-                            store_path: row.get(0)?,
-                            size_bytes: row.get::<_, i64>(1)? as u64,
-                            last_access: 0,
-                        })
-                    },
                 )
+                .fetch_optional(pool)
+                .await
                 .ok()
-            };
+                .flatten();
+                row.map(|(path, size)| CacheEntry {
+                    store_path: path,
+                    size_bytes: size as u64,
+                    last_access: 0,
+                })
+            });
 
             let Some(entry) = entry else {
                 break;
@@ -214,16 +215,13 @@ impl Cache {
             }
 
             // Remove from index
-            {
-                let db = self.db.lock().unwrap_or_else(|e| {
-                    tracing::error!("cache db lock poisoned, recovering");
-                    e.into_inner()
-                });
-                db.execute(
-                    "DELETE FROM cached_paths WHERE store_path = ?1",
-                    [&entry.store_path],
-                )?;
-            }
+            let store_path = entry.store_path.clone();
+            self.runtime.block_on(async {
+                sqlx::query("DELETE FROM cached_paths WHERE store_path = ?1")
+                    .bind(&store_path)
+                    .execute(pool)
+                    .await
+            })?;
 
             freed += entry.size_bytes;
             tracing::debug!(
@@ -258,66 +256,95 @@ impl Cache {
     }
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
-    #[test]
-    fn test_cache_new_creates_dir_and_db() {
+    /// Cache sync methods use `block_on`, so tests create the cache in async
+    /// context then exercise the sync methods via `spawn_blocking`.
+    async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> Arc<Cache> {
+        Arc::new(Cache::new(cache_dir, max_size_gb).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_cache_new_creates_dir_and_db() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
 
-        let cache = Cache::new(cache_dir.clone(), 1).unwrap();
+        let cache = make_cache(cache_dir.clone(), 1).await;
         assert!(cache_dir.exists());
         assert!(cache_dir.join("cache_index.sqlite").exists());
-        assert_eq!(cache.total_size(), 0);
+
+        let size = tokio::task::spawn_blocking(move || cache.total_size())
+            .await
+            .unwrap();
+        assert_eq!(size, 0);
     }
 
-    #[test]
-    fn test_cache_insert_and_contains() {
+    #[tokio::test]
+    async fn test_cache_insert_and_contains() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::new(dir.path().join("cache"), 1).unwrap();
+        let cache = make_cache(dir.path().join("cache"), 1).await;
 
-        assert!(!cache.contains("abc-hello-1.0"));
+        tokio::task::spawn_blocking(move || {
+            assert!(!cache.contains("abc-hello-1.0"));
 
-        cache.insert("abc-hello-1.0", 1024).unwrap();
-        assert!(cache.contains("abc-hello-1.0"));
-        assert_eq!(cache.total_size(), 1024);
+            cache.insert("abc-hello-1.0", 1024).unwrap();
+            assert!(cache.contains("abc-hello-1.0"));
+            assert_eq!(cache.total_size(), 1024);
+        })
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn test_cache_get_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path().join("cache");
-        let cache = Cache::new(cache_dir.clone(), 1).unwrap();
-
-        assert!(cache.get_path("abc-hello-1.0").is_none());
-
-        cache.insert("abc-hello-1.0", 512).unwrap();
-        let path = cache.get_path("abc-hello-1.0").unwrap();
-        assert_eq!(path, cache_dir.join("abc-hello-1.0"));
-    }
-
-    #[test]
-    fn test_cache_eviction() {
+    #[tokio::test]
+    async fn test_cache_get_path() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        // 1 byte max to force eviction
-        let cache = Cache::new(cache_dir, 0).unwrap();
-        // max_size_bytes = 0 * 1GB = 0
+        let cache = make_cache(cache_dir.clone(), 1).await;
 
-        cache.insert("old-path", 100).unwrap();
-        cache.insert("new-path", 200).unwrap();
+        tokio::task::spawn_blocking(move || {
+            assert!(cache.get_path("abc-hello-1.0").is_none());
 
-        let freed = cache.evict_if_needed().unwrap();
-        assert!(freed > 0);
+            cache.insert("abc-hello-1.0", 512).unwrap();
+            let path = cache.get_path("abc-hello-1.0").unwrap();
+            assert_eq!(path, cache_dir.join("abc-hello-1.0"));
+        })
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn test_inflight_tracking() {
+    #[tokio::test]
+    async fn test_cache_eviction() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = Cache::new(dir.path().join("cache"), 1).unwrap();
+        // 0 GB max to force eviction
+        let cache = make_cache(dir.path().join("cache"), 0).await;
 
+        tokio::task::spawn_blocking(move || {
+            cache.insert("old-path", 100).unwrap();
+            cache.insert("new-path", 200).unwrap();
+
+            let freed = cache.evict_if_needed().unwrap();
+            assert!(freed > 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_inflight_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"), 1).await;
+
+        // inflight tracking doesn't use block_on, so can test directly
         assert!(cache.try_start_fetch("abc-path"));
         assert!(!cache.try_start_fetch("abc-path"));
 
