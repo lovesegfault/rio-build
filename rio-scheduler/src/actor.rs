@@ -520,6 +520,22 @@ impl DagActor {
         let status = rio_proto::types::BuildResultStatus::try_from(result.status)
             .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
 
+        // The gRPC layer passes CompletionReport.drv_path here (keyed by path,
+        // not hash). Resolve to drv_hash if the key isn't found directly.
+        let resolved_hash: String;
+        let drv_hash: &str = if self.dag.nodes.contains_key(drv_hash) {
+            drv_hash
+        } else if let Some(h) = self.drv_path_to_hash(drv_hash) {
+            resolved_hash = h;
+            &resolved_hash
+        } else {
+            warn!(
+                key = drv_hash,
+                "completion for unknown derivation, ignoring"
+            );
+            return;
+        };
+
         // Find the derivation in the DAG
         let current_status = match self.dag.nodes.get(drv_hash) {
             Some(state) => state.status,
@@ -1272,6 +1288,17 @@ impl DagActor {
         self.dag.nodes.get(drv_hash).map(|s| s.drv_path.clone())
     }
 
+    /// Resolve a drv_path to its drv_hash by scanning DAG nodes.
+    /// Used by handle_completion since the gRPC layer receives CompletionReport
+    /// with drv_path, but the DAG is keyed by drv_hash.
+    fn drv_path_to_hash(&self, drv_path: &str) -> Option<String> {
+        self.dag
+            .nodes
+            .values()
+            .find(|s| s.drv_path == drv_path)
+            .map(|s| s.drv_hash.clone())
+    }
+
     fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {
         self.dag
             .nodes
@@ -1697,5 +1724,101 @@ pub(crate) mod tests {
             .await
             .expect("actor should shut down")
             .expect("actor should not panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 1: Worker-Scheduler wiring
+    // -----------------------------------------------------------------------
+
+    /// Baseline: when a worker connects (stream) and sends a heartbeat with
+    /// the SAME worker_id, the actor should see it as fully registered.
+    /// This SHOULD pass with current code (the bug is in grpc.rs, not the actor).
+    #[tokio::test]
+    async fn test_worker_registers_via_stream_and_heartbeat() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let _stream_rx = connect_worker(&handle, "test-worker-1", "x86_64-linux", 2).await;
+        settle().await;
+
+        let workers = handle.debug_query_workers().await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_id, "test-worker-1");
+        assert!(
+            workers[0].is_registered,
+            "worker should be fully registered after stream + heartbeat"
+        );
+    }
+
+    /// Bug reproduction: handle_completion uses drv_hash as the lookup key,
+    /// but grpc.rs passes drv_path. The completion should be resolved via
+    /// either key. This test sends ProcessCompletion with a drv_PATH and
+    /// expects the build to transition to Succeeded.
+    ///
+    /// Expected to FAIL before fix: completion is dropped ("unknown derivation")
+    /// and the build stays Active forever.
+    #[tokio::test]
+    async fn test_completion_resolves_drv_path_to_hash() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Register a worker
+        let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
+
+        // Merge a single-node DAG
+        let build_id = Uuid::new_v4();
+        let drv_hash = "abc123hash";
+        let drv_path = "/nix/store/abc123hash-foo.drv";
+        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+
+        settle().await;
+
+        // Worker should have received an assignment (derivation is ready, worker has capacity)
+        // Now send completion using drv_PATH (mimics what grpc.rs does with report.drv_path)
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: drv_path.into(), // Note: PATH, not hash!
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    error_msg: String::new(),
+                    times_built: 1,
+                    start_time: None,
+                    stop_time: None,
+                    built_outputs: vec![rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: "/nix/store/xyz-foo".into(),
+                        output_hash: vec![0u8; 32],
+                    }],
+                },
+            })
+            .await
+            .unwrap();
+
+        settle().await;
+
+        // Query build status — should be Succeeded (single derivation, completed)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "build should succeed after completion sent with drv_path (got state={:?})",
+            rio_proto::types::BuildState::try_from(status.state)
+        );
     }
 }

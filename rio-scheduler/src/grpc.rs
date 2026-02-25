@@ -263,6 +263,29 @@ impl WorkerService for SchedulerGrpc {
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
         let mut stream = request.into_inner();
 
+        // The first message MUST be a WorkerRegister with the worker_id.
+        // This ensures the stream and heartbeat use the same identity.
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty BuildExecution stream"))?;
+        let worker_id = match first.msg {
+            Some(rio_proto::types::worker_message::Msg::Register(reg)) => {
+                if reg.worker_id.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "WorkerRegister.worker_id is empty",
+                    ));
+                }
+                reg.worker_id
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first BuildExecution message must be WorkerRegister",
+                ));
+            }
+        };
+        info!(worker_id = %worker_id, "worker stream opened");
+
         // Create the internal channel for the actor to send SchedulerMessages to this worker.
         let (actor_tx, mut actor_rx) = mpsc::channel::<rio_proto::types::SchedulerMessage>(256);
 
@@ -270,20 +293,14 @@ impl WorkerService for SchedulerGrpc {
         let (output_tx, output_rx) =
             mpsc::channel::<Result<rio_proto::types::SchedulerMessage, Status>>(256);
 
-        // We need the worker_id to register. For now, we extract it from
-        // the first WorkerMessage (the ack will contain it) or generate one.
-        // In practice, the worker_id comes from the Heartbeat RPC.
-        // We use a placeholder until the first message arrives.
-        let worker_id = format!("worker-{}", Uuid::new_v4());
-
-        // Register the worker stream with the actor
-        let actor = self.actor.clone();
-        let worker_id_clone = worker_id.clone();
-
-        let _ = actor.try_send(ActorCommand::WorkerConnected {
-            worker_id: worker_id_clone.clone(),
-            stream_tx: actor_tx,
-        });
+        // Register the worker stream with the actor (blocking send — must not drop).
+        self.actor
+            .send_unchecked(ActorCommand::WorkerConnected {
+                worker_id: worker_id.clone(),
+                stream_tx: actor_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("scheduler actor unavailable"))?;
 
         // Bridge actor_rx -> output_tx, wrapping in Ok()
         tokio::spawn(async move {
@@ -302,6 +319,12 @@ impl WorkerService for SchedulerGrpc {
             while let Ok(Some(msg)) = stream.message().await {
                 if let Some(inner) = msg.msg {
                     match inner {
+                        rio_proto::types::worker_message::Msg::Register(_) => {
+                            warn!(
+                                worker_id = %worker_id_for_recv,
+                                "duplicate WorkerRegister on established stream, ignoring"
+                            );
+                        }
                         rio_proto::types::worker_message::Msg::Ack(ack) => {
                             info!(
                                 worker_id = %worker_id_for_recv,
