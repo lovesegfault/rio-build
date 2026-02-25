@@ -1,3 +1,145 @@
 //! In-memory NAR storage backend (for testing).
+//!
+//! Uses a `HashMap<String, Bytes>` protected by a `RwLock` to store NAR blobs
+//! keyed by their SHA-256 hex digest.
 
-// TODO: Step 4 implementation (adapt from rio-build/src/store/memory.rs)
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use bytes::Bytes;
+use tokio::io::AsyncRead;
+use tracing::debug;
+
+use super::NarBackend;
+
+/// Inner state protected by `RwLock`.
+struct Inner {
+    blobs: HashMap<String, Bytes>,
+}
+
+/// In-memory NAR blob storage backend.
+///
+/// Suitable for unit tests and development. Not for production use (no
+/// persistence, bounded by process memory).
+pub struct MemoryBackend {
+    inner: RwLock<Inner>,
+}
+
+impl MemoryBackend {
+    /// Create an empty in-memory backend.
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(Inner {
+                blobs: HashMap::new(),
+            }),
+        }
+    }
+
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("MemoryBackend: recovering from poisoned read lock");
+            e.into_inner()
+        })
+    }
+
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(|e| {
+            tracing::warn!("MemoryBackend: recovering from poisoned write lock");
+            e.into_inner()
+        })
+    }
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl NarBackend for MemoryBackend {
+    async fn put(&self, sha256_hex: &str, data: Bytes) -> anyhow::Result<String> {
+        let key = format!("{sha256_hex}.nar");
+        debug!(key = %key, size = data.len(), "MemoryBackend: storing NAR blob");
+        self.write_inner().blobs.insert(key.clone(), data);
+        Ok(key)
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Box<dyn AsyncRead + Send + Unpin>>> {
+        let data = self.read_inner().blobs.get(key).cloned();
+        Ok(data.map(|b| Box::new(std::io::Cursor::new(b)) as Box<dyn AsyncRead + Send + Unpin>))
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        debug!(key = %key, "MemoryBackend: deleting NAR blob");
+        self.write_inner().blobs.remove(key);
+        Ok(())
+    }
+
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(self.read_inner().blobs.contains_key(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn put_and_get() {
+        let backend = MemoryBackend::new();
+        let data = Bytes::from_static(b"test nar data");
+        let key = backend.put("abc123", data.clone()).await.unwrap();
+        assert_eq!(key, "abc123.nar");
+
+        let mut reader = backend.get(&key).await.unwrap().unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"test nar data");
+    }
+
+    #[tokio::test]
+    async fn get_missing_returns_none() {
+        let backend = MemoryBackend::new();
+        assert!(backend.get("nonexistent.nar").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn exists_and_delete() {
+        let backend = MemoryBackend::new();
+        let key = backend
+            .put("def456", Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert!(backend.exists(&key).await.unwrap());
+
+        backend.delete(&key).await.unwrap();
+        assert!(!backend.exists(&key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_overwrites() {
+        let backend = MemoryBackend::new();
+        backend
+            .put("same", Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let key = backend
+            .put("same", Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+
+        let mut reader = backend.get(&key).await.unwrap().unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"second");
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_is_noop() {
+        let backend = MemoryBackend::new();
+        // Should not error
+        backend.delete("nonexistent.nar").await.unwrap();
+    }
+}

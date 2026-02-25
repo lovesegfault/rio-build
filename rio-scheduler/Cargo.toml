@@ -16,6 +16,7 @@ rio-common = { workspace = true }
 rio-proto = { workspace = true }
 
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
@@ -24,6 +25,8 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
+prost-types = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
