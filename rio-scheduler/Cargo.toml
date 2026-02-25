@@ -1,0 +1,29 @@
+[package]
+name = "rio-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DAG-aware build scheduler for rio-build"
+
+[[bin]]
+name = "rio-scheduler"
+path = "src/main.rs"
+
+[dependencies]
+rio-common = { workspace = true }
+rio-proto = { workspace = true }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

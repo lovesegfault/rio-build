@@ -1,5 +1,15 @@
 [workspace]
-members = ["rio-build", "rio-nix", "rio-proto", "rio-spike"]
+members = [
+  "rio-build",
+  "rio-common",
+  "rio-gateway",
+  "rio-nix",
+  "rio-proto",
+  "rio-scheduler",
+  "rio-spike",
+  "rio-store",
+  "rio-worker",
+]
 exclude = ["rio-nix/fuzz"]
 resolver = "2"
 
@@ -12,6 +22,7 @@ repository = "https://github.com/lovesegfault/rio-build"
 
 [workspace.dependencies]
 # Internal crates
+rio-common = { path = "rio-common" }
 rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }
 
@@ -25,6 +36,41 @@ tokio = { version = "1", features = ["full"] }
 russh = "0.57"
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 async-trait = "0.1"
+
+# gRPC
+tonic = { version = "0.14", features = ["transport"] }
+tonic-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "postgres",
+] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# S3
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
+# FUSE
+fuser = "0.17"
+
+# SQLite (for synthetic Nix store DB)
+rusqlite = { version = "0.38" }
+
+# Linux syscalls
+nix = { version = "0.31", features = [
+  "mount",
+  "sched",
+  "fs",
+  "user",
+  "hostname",
+] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
 
 # Logging & metrics
 tracing = "0.1"
