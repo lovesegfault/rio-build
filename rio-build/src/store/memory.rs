@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use bytes::Bytes;
+
 use rio_nix::store_path::StorePath;
 use tracing::{debug, error, warn};
 
@@ -17,7 +19,7 @@ struct StoreInner {
     /// Path metadata indexed by store path.
     paths: HashMap<StorePath, PathInfo>,
     /// NAR content indexed by store path.
-    nars: HashMap<StorePath, Vec<u8>>,
+    nars: HashMap<StorePath, Bytes>,
 }
 
 /// An in-memory implementation of the Store trait.
@@ -67,7 +69,7 @@ impl MemoryStore {
         debug!(path = %key, "inserting path into memory store");
         let mut inner = self.write_inner();
         if let Some(nar_data) = nar {
-            inner.nars.insert(key.clone(), nar_data);
+            inner.nars.insert(key.clone(), Bytes::from(nar_data));
         }
         inner.paths.insert(key, info);
     }
@@ -110,9 +112,6 @@ impl Store for MemoryStore {
         Ok(valid)
     }
 
-    // TODO: clones the full NAR Vec on every read. A future S3-backed store
-    // would stream chunks as `Bytes` without cloning; this is fine for the
-    // in-memory dev/test backend.
     async fn nar_from_path(&self, path: &StorePath) -> anyhow::Result<Option<NarReader>> {
         Ok(self
             .read_inner()
@@ -180,7 +179,7 @@ impl Store for MemoryStore {
             debug!(path = %key, "path already exists, skipping");
             return Ok(());
         }
-        inner.nars.insert(key.clone(), data);
+        inner.nars.insert(key.clone(), Bytes::from(data));
         inner.paths.insert(key, info);
         Ok(())
     }
