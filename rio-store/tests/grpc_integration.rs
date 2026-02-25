@@ -1,8 +1,10 @@
 //! gRPC-level integration tests for StoreService.
 //!
 //! These tests spin up an in-process tonic server backed by [`MemoryBackend`]
-//! and a real PostgreSQL database (via `#[sqlx::test]`), then exercise the
-//! full gRPC request/response path including streaming.
+//! and a real PostgreSQL database, then exercise the full gRPC request/response
+//! path including streaming.
+//!
+//! Tests skip gracefully if `DATABASE_URL` is not set.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,6 +22,84 @@ use rio_proto::types::{
 };
 use rio_store::backend::memory::MemoryBackend;
 use rio_store::grpc::StoreServiceImpl;
+
+/// Test-database harness. Creates an isolated database per-test and drops on Drop.
+pub struct TestDb {
+    pub pool: PgPool,
+    db_name: String,
+    admin_url: String,
+}
+
+impl TestDb {
+    /// Set up an isolated test database. Returns `None` if `DATABASE_URL` not set.
+    pub async fn new() -> Option<Self> {
+        let admin_url = std::env::var("DATABASE_URL").ok()?;
+
+        let db_name = format!(
+            "rio_store_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let admin_pool = PgPool::connect(&admin_url)
+            .await
+            .expect("failed to connect to admin DATABASE_URL");
+        sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+            .execute(&admin_pool)
+            .await
+            .expect("failed to create test database");
+        admin_pool.close().await;
+
+        let test_url = if let Some(idx) = admin_url.rfind('/') {
+            format!("{}/{}", &admin_url[..idx], db_name)
+        } else {
+            format!("{admin_url}/{db_name}")
+        };
+        let pool = PgPool::connect(&test_url)
+            .await
+            .expect("failed to connect to test database");
+
+        sqlx::migrate!("../migrations")
+            .run(&pool)
+            .await
+            .expect("migrations failed");
+
+        Some(Self {
+            pool,
+            db_name,
+            admin_url,
+        })
+    }
+}
+
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        let db_name = self.db_name.clone();
+        let admin_url = self.admin_url.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let admin_pool = match PgPool::connect(&admin_url).await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let _ = sqlx::query(&format!(
+                    r#"SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                       WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"#
+                ))
+                .execute(&admin_pool)
+                .await;
+                let _ = sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{db_name}""#))
+                    .execute(&admin_pool)
+                    .await;
+            });
+        })
+        .join()
+        .ok();
+    }
+}
 
 /// Spawn an in-process store gRPC server and return a connected client.
 ///
@@ -145,9 +225,13 @@ pub async fn put_path(
     Ok(response.into_inner().created)
 }
 
-#[sqlx::test(migrations = "../migrations")]
-async fn test_harness_smoke(pool: PgPool) {
-    let (mut client, _addr, server) = setup_store(pool).await;
+#[tokio::test]
+async fn test_harness_smoke() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     // QueryPathInfo on missing path should return NOT_FOUND
     let result = client
