@@ -1188,6 +1188,84 @@ async fn test_query_derivation_output_map_direct() {
     .await;
 }
 
+/// wopAddToStore (7) + wopQueryDerivationOutputMap (41): Upload a .drv via
+/// opcode 7 with text:sha256 mode, then query its output map via opcode 41
+/// to verify the .drv was cached during the upload (without store read-back).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_add_to_store_drv_cached() {
+    let store = Arc::new(MemoryStore::new());
+
+    run_test(store, |s| {
+        tokio::spawn(async move {
+            let mut s = s;
+            do_handshake(&mut s).await;
+
+            // Step 1: Upload .drv via wopAddToStore (7) with text:sha256
+            let drv_content = make_test_drv();
+
+            wire::write_u64(&mut s, 7).await.unwrap();
+            wire::write_string(&mut s, "test-drv.drv").await.unwrap(); // name (must end in .drv)
+            wire::write_string(&mut s, "text:sha256").await.unwrap(); // cam_str
+            wire::write_strings(&mut s, &[]).await.unwrap(); // references (empty)
+            wire::write_u64(&mut s, 0).await.unwrap(); // repair = false
+
+            // Framed data stream: raw .drv ATerm content (text mode, not NAR-wrapped)
+            let data = drv_content.as_bytes();
+            wire::write_u64(&mut s, data.len() as u64).await.unwrap();
+            s.write_all(data).await.unwrap();
+            wire::write_u64(&mut s, 0).await.unwrap(); // end-of-stream
+            s.flush().await.unwrap();
+
+            // Read STDERR_LAST
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(msg, STDERR_LAST);
+
+            // Read ValidPathInfo — extract the computed store path
+            let drv_path = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                drv_path.ends_with(".drv"),
+                "path should end with .drv, got: {drv_path}"
+            );
+            let _deriver = wire::read_string(&mut s).await.unwrap();
+            let _nar_hash = wire::read_string(&mut s).await.unwrap();
+            let _refs = wire::read_strings(&mut s).await.unwrap();
+            let _reg_time = wire::read_u64(&mut s).await.unwrap();
+            let _nar_size = wire::read_u64(&mut s).await.unwrap();
+            let _ultimate = wire::read_u64(&mut s).await.unwrap();
+            let _sigs = wire::read_strings(&mut s).await.unwrap();
+            let _ca = wire::read_string(&mut s).await.unwrap();
+
+            // Step 2: Query the derivation output map (opcode 41)
+            wire::write_u64(&mut s, 41).await.unwrap();
+            wire::write_string(&mut s, &drv_path).await.unwrap();
+            s.flush().await.unwrap();
+
+            let msg = wire::read_u64(&mut s).await.unwrap();
+            if msg == STDERR_ERROR {
+                let _error_type = wire::read_string(&mut s).await.unwrap();
+                let _level = wire::read_u64(&mut s).await.unwrap();
+                let _name = wire::read_string(&mut s).await.unwrap();
+                let message = wire::read_string(&mut s).await.unwrap();
+                panic!("unexpected STDERR_ERROR from QueryDerivationOutputMap: {message}");
+            }
+            assert_eq!(msg, STDERR_LAST);
+
+            // Read output map: count + entries
+            let count = wire::read_u64(&mut s).await.unwrap();
+            assert_eq!(count, 1, "expected 1 output from test drv");
+
+            let name = wire::read_string(&mut s).await.unwrap();
+            assert_eq!(name, "out");
+            let path = wire::read_string(&mut s).await.unwrap();
+            assert!(
+                path.contains("test"),
+                "output path should contain 'test', got: {path}"
+            );
+        })
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1b: error-path tests
 // ---------------------------------------------------------------------------
