@@ -214,9 +214,10 @@ async fn resolve_derivation(
         }
     };
 
-    // TODO: extract_single_file is synchronous, so we buffer the full NAR here.
-    // Derivation NARs are tiny (< 256 KB), so this is fine. Making the NAR
-    // parser async would be a large change touching all of nar.rs.
+    // Derivation NARs are buffered fully before sync parsing. This is intentional:
+    // the .drv text content (~100 KB) must be in memory for ATerm parsing regardless,
+    // and the NAR wrapper adds only 112 bytes of overhead. An async NAR parser would
+    // save negligible memory at the cost of converting all of nar.rs to async.
     let mut nar_data = Vec::new();
     reader
         .read_to_end(&mut nar_data)
@@ -945,10 +946,10 @@ fn try_cache_drv(
 
 /// Read a just-stored `.drv` back from the store, parse its ATerm, and cache it.
 ///
-/// After `add_path`, the NAR bytes exist only in the store — the wire reader was
-/// consumed by the store's drain contract. For `.drv` files we need the bytes to
-/// parse the ATerm derivation, so we read them back. This is a small cost (`.drv`
-/// files are typically < 256 KB) in exchange for avoiding handler-level buffering.
+/// Used only by `handle_add_to_store_nar` (opcode 39), where the NAR data is
+/// streamed directly from the wire into the store via `FramedStreamReader` — no
+/// handler-level buffer exists. For handlers that buffer the NAR (opcodes 7, 8,
+/// 44), call `try_cache_drv` directly with the in-memory buffer instead.
 ///
 /// Best-effort: parse failures are logged but do not fail the store operation.
 async fn cache_drv_if_needed(
@@ -1064,10 +1065,10 @@ async fn parse_add_multiple_entry(
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': PathInfo build failed: {e}"))?;
 
     store
-        .add_path(info, Box::new(std::io::Cursor::new(nar_data)))
+        .add_path(info, Box::new(std::io::Cursor::new(nar_data.as_slice())))
         .await
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
-    cache_drv_if_needed(&path, store, drv_cache).await;
+    try_cache_drv(&path, &nar_data, drv_cache);
 
     Ok(())
 }
@@ -1233,12 +1234,12 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     };
 
     if let Err(e) = store
-        .add_path(info, Box::new(std::io::Cursor::new(nar_data)))
+        .add_path(info, Box::new(std::io::Cursor::new(nar_data.as_slice())))
         .await
     {
         return send_store_error(stderr, e).await;
     }
-    cache_drv_if_needed(&path, store, drv_cache).await;
+    try_cache_drv(&path, &nar_data, drv_cache);
 
     // Send STDERR_LAST + ValidPathInfo
     stderr.finish().await?;
@@ -1354,12 +1355,12 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     };
 
     if let Err(e) = store
-        .add_path(info, Box::new(std::io::Cursor::new(nar_data)))
+        .add_path(info, Box::new(std::io::Cursor::new(nar_data.as_slice())))
         .await
     {
         return send_store_error(stderr, e).await;
     }
-    cache_drv_if_needed(&path, store, drv_cache).await;
+    try_cache_drv(&path, &nar_data, drv_cache);
 
     // wopAddTextToStore returns STDERR_LAST + store path string
     stderr.finish().await?;
