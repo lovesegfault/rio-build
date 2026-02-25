@@ -8,10 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Dependencies added in Step 2 when proto files are defined
-# tonic = { workspace = true }
-# prost = { workspace = true }
-# prost-types = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 
-# [build-dependencies]
-# tonic-build = { workspace = true }
+[build-dependencies]
+tonic-prost-build = { workspace = true }

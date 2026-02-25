@@ -1,0 +1,31 @@
+syntax = "proto3";
+package rio.admin;
+
+import "google/protobuf/empty.proto";
+import "types.proto";
+
+// Administrative service for the rio-cli and rio-dashboard.
+// Implemented by the rio-scheduler process (co-located with SchedulerService).
+// gRPC-Web compatibility required for the dashboard (via tonic-web).
+service AdminService {
+  // Get overall cluster status (worker count, queue depth, etc.).
+  rpc ClusterStatus(google.protobuf.Empty) returns (rio.types.ClusterStatusResponse);
+
+  // List registered workers with their status and resource usage.
+  rpc ListWorkers(rio.types.ListWorkersRequest) returns (rio.types.ListWorkersResponse);
+
+  // List builds with optional status filtering and pagination.
+  rpc ListBuilds(rio.types.ListBuildsRequest) returns (rio.types.ListBuildsResponse);
+
+  // Stream build logs for a specific build or derivation.
+  rpc GetBuildLogs(rio.types.GetBuildLogsRequest) returns (stream rio.types.BuildLogChunk);
+
+  // Trigger garbage collection (streaming progress updates).
+  rpc TriggerGC(rio.types.GCRequest) returns (stream rio.types.GCProgress);
+
+  // Drain a worker: stop sending new assignments, wait for running builds to complete.
+  rpc DrainWorker(rio.types.DrainWorkerRequest) returns (rio.types.DrainWorkerResponse);
+
+  // Clear a poisoned derivation so it can be retried.
+  rpc ClearPoison(rio.types.ClearPoisonRequest) returns (rio.types.ClearPoisonResponse);
+}

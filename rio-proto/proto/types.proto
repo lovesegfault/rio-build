@@ -1,0 +1,541 @@
+syntax = "proto3";
+package rio.types;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ---------------------------------------------------------------------------
+// Derivation DAG
+// ---------------------------------------------------------------------------
+
+// A node in the derivation DAG submitted by the gateway.
+message DerivationNode {
+  string drv_path = 1;                      // Store path of the .drv file
+  string drv_hash = 2;                      // Input-addressed: store path; CA: modular hash
+  string pname = 3;                         // Package name (for duration estimation)
+  string system = 4;                        // e.g. "x86_64-linux"
+  repeated string required_features = 5;    // requiredSystemFeatures
+  repeated string output_names = 6;         // e.g. ["out", "dev"]
+  bool is_fixed_output = 7;                 // FOD detection (fetchurl etc.)
+}
+
+// A dependency edge in the derivation DAG.
+message DerivationEdge {
+  string parent_drv_path = 1;               // Derivation that depends on child
+  string child_drv_path = 2;                // Dependency
+}
+
+// ---------------------------------------------------------------------------
+// Build events (streamed to gateways and dashboard)
+// ---------------------------------------------------------------------------
+
+// A build progress event, streamed from scheduler to gateway/dashboard.
+// The sequence field enables stream resumption via WatchBuild(since_sequence).
+message BuildEvent {
+  string build_id = 1;
+  uint64 sequence = 2;                      // Monotonic, for stream resumption
+  google.protobuf.Timestamp timestamp = 3;
+  oneof event {
+    BuildStarted started = 4;
+    BuildProgress progress = 5;
+    BuildLogBatch log = 6;
+    DerivationEvent derivation = 7;         // Per-derivation status changes
+    BuildCompleted completed = 8;
+    BuildFailed failed = 9;
+    BuildCancelled cancelled = 10;
+  }
+}
+
+message BuildStarted {
+  uint32 total_derivations = 1;             // Total nodes in DAG
+  uint32 cached_derivations = 2;            // Already in store
+}
+
+message BuildProgress {
+  uint32 completed = 1;                     // Derivations completed so far
+  uint32 running = 2;                       // Derivations currently building
+  uint32 queued = 3;                        // Derivations waiting
+  uint32 total = 4;                         // Total derivations
+}
+
+message BuildCompleted {
+  repeated string output_paths = 1;         // Final output store paths
+}
+
+message BuildFailed {
+  string error_message = 1;
+  string failed_derivation = 2;             // Which derivation caused the failure
+}
+
+message BuildCancelled {
+  string reason = 1;                        // e.g. "client_disconnect", "user_request"
+}
+
+// Per-derivation status change within a build.
+message DerivationEvent {
+  string derivation_path = 1;
+  oneof status {
+    DerivationQueued queued = 2;
+    DerivationStarted started = 3;
+    DerivationCompleted completed = 4;
+    DerivationCached cached = 5;
+    DerivationFailed failed = 6;
+  }
+}
+
+message DerivationQueued {}
+
+message DerivationStarted {
+  string worker_id = 1;                     // Which worker is building it
+}
+
+message DerivationCompleted {
+  repeated string output_paths = 1;         // Realized output store paths
+}
+
+message DerivationCached {
+  repeated string output_paths = 1;         // Output paths already in store
+}
+
+message DerivationFailed {
+  string error_message = 1;
+  BuildResultStatus status = 2;             // Failure classification
+}
+
+// ---------------------------------------------------------------------------
+// BuildExecution bidirectional stream messages
+// ---------------------------------------------------------------------------
+
+// Worker -> Scheduler messages on the BuildExecution stream.
+message WorkerMessage {
+  oneof msg {
+    WorkAssignmentAck ack = 1;              // Worker confirms receipt of assignment
+    BuildLogBatch log_batch = 2;            // Batched log lines (not per-line)
+    CompletionReport completion = 3;        // Build result
+    ProgressUpdate progress = 4;            // Resource usage, build phase
+  }
+}
+
+// Scheduler -> Worker messages on the BuildExecution stream.
+message SchedulerMessage {
+  oneof msg {
+    WorkAssignment assignment = 1;          // New work to execute
+    CancelSignal cancel = 2;               // Cancel a specific derivation
+    PrefetchHint prefetch = 3;             // Paths to pre-warm in FUSE cache
+  }
+}
+
+// Worker acknowledges receipt of a WorkAssignment.
+message WorkAssignmentAck {
+  string drv_path = 1;                     // Which assignment is being acknowledged
+  string assignment_token = 2;             // Echo back the assignment token
+}
+
+// Log lines batched for efficiency. Worker buffers up to 64 lines or 100ms.
+// Uses bytes (not string) since build output may contain non-UTF-8 data.
+message BuildLogBatch {
+  string derivation_path = 1;              // Which derivation produced these lines
+  repeated bytes lines = 2;                // Batch of log lines (raw bytes)
+  uint64 first_line_number = 3;            // For ordering
+  string worker_id = 4;                    // For debugging
+}
+
+// Worker reports build completion for a derivation.
+message CompletionReport {
+  string drv_path = 1;                     // Derivation that completed
+  BuildResult result = 2;                  // Build result details
+  string assignment_token = 3;             // From the WorkAssignment
+}
+
+// Result of building a single derivation.
+message BuildResult {
+  BuildResultStatus status = 1;
+  string error_msg = 2;                    // Non-empty on failure
+  uint64 times_built = 3;                  // Number of times built (for repeat builds)
+  google.protobuf.Timestamp start_time = 4;
+  google.protobuf.Timestamp stop_time = 5;
+  repeated BuiltOutput built_outputs = 6;  // Realized output paths with hashes
+}
+
+// A single realized output from a build.
+message BuiltOutput {
+  string output_name = 1;                  // e.g. "out", "dev"
+  string output_path = 2;                  // Realized store path
+  bytes output_hash = 3;                   // SHA-256 digest of the output NAR
+}
+
+// Build result status codes.
+enum BuildResultStatus {
+  BUILD_RESULT_STATUS_UNSPECIFIED = 0;
+  BUILD_RESULT_STATUS_BUILT = 1;           // Successfully built
+  BUILD_RESULT_STATUS_SUBSTITUTED = 2;     // Fetched from a substituter
+  BUILD_RESULT_STATUS_ALREADY_VALID = 3;   // Already in the store
+  BUILD_RESULT_STATUS_PERMANENT_FAILURE = 4;
+  BUILD_RESULT_STATUS_TRANSIENT_FAILURE = 5;
+  BUILD_RESULT_STATUS_CACHED_FAILURE = 6;  // Previously failed, result cached
+  BUILD_RESULT_STATUS_DEPENDENCY_FAILED = 7;
+  BUILD_RESULT_STATUS_LOG_LIMIT_EXCEEDED = 8;
+  BUILD_RESULT_STATUS_OUTPUT_REJECTED = 9;
+  BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Worker infra issue (not build)
+}
+
+// Work assignment from scheduler to worker.
+message WorkAssignment {
+  string drv_path = 1;                    // Store path of the .drv file
+  bytes drv_content = 2;                  // Inline ATerm content (avoids re-fetch)
+  repeated string input_paths = 3;        // Store paths needed as build inputs
+  repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
+  BuildOptions build_options = 5;         // Build configuration
+  string assignment_token = 6;            // HMAC-SHA256 signed token
+  uint64 generation = 7;                  // Leader election generation counter
+  bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
+}
+
+// Build configuration options propagated from the client.
+message BuildOptions {
+  uint64 max_silent_time = 1;             // Max seconds without output before timeout
+  uint64 build_timeout = 2;              // Max total build time in seconds
+  uint64 build_cores = 3;               // Number of cores to use (0 = all)
+  bool keep_going = 4;                   // Continue building other derivations on failure
+}
+
+// Cancel a specific derivation on a worker.
+message CancelSignal {
+  string drv_path = 1;                   // Derivation to cancel
+  string reason = 2;                     // e.g. "client_disconnect", "scheduler_reassign"
+}
+
+// Hint to pre-warm FUSE cache for upcoming builds.
+message PrefetchHint {
+  repeated string store_paths = 1;        // Paths to pre-fetch from store
+}
+
+// Worker progress update (resource usage, current build phase).
+message ProgressUpdate {
+  string drv_path = 1;                   // Which derivation this is for
+  ResourceUsage resources = 2;           // Current resource consumption
+  string build_phase = 3;               // e.g. "unpackPhase", "buildPhase", "installPhase"
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+// Worker heartbeat sent periodically to the scheduler.
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated string running_builds = 2;     // Derivation paths currently building
+  ResourceUsage resources = 3;
+  BloomFilter local_paths = 4;            // Bloom filter of cached store paths
+  string system = 5;                      // e.g. "x86_64-linux"
+  repeated string supported_features = 6; // requiredSystemFeatures this worker supports
+  uint32 max_builds = 7;                  // Concurrency limit
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;                      // Whether the scheduler accepted the heartbeat
+  uint64 generation = 2;                  // Current leader generation
+}
+
+// Self-describing Bloom filter for store path membership testing.
+message BloomFilter {
+  bytes data = 1;                         // Filter bit array
+  uint32 hash_count = 2;                  // Number of hash functions
+  uint32 num_bits = 3;                    // Total bits in filter
+  BloomHashAlgorithm hash_algorithm = 4;  // Hash algorithm used
+  uint32 version = 5;                     // Filter format version
+}
+
+enum BloomHashAlgorithm {
+  BLOOM_HASH_ALGORITHM_UNSPECIFIED = 0;
+  BLOOM_HASH_ALGORITHM_MURMUR3_128 = 1;
+  BLOOM_HASH_ALGORITHM_XXHASH64 = 2;
+}
+
+// Worker resource usage reported in heartbeats and progress updates.
+message ResourceUsage {
+  double cpu_fraction = 1;                // CPU usage as fraction [0.0, 1.0]
+  uint64 memory_used_bytes = 2;           // Current memory usage
+  uint64 memory_total_bytes = 3;          // Total available memory
+  uint64 disk_used_bytes = 4;             // Disk usage (SSD cache)
+  uint64 disk_total_bytes = 5;            // Total disk capacity
+  uint32 running_builds = 6;              // Number of active builds
+  uint32 available_build_slots = 7;       // max_builds - running_builds
+}
+
+// ---------------------------------------------------------------------------
+// Build status
+// ---------------------------------------------------------------------------
+
+// Overall build status returned by QueryBuildStatus.
+message BuildStatus {
+  string build_id = 1;
+  BuildState state = 2;
+  uint32 total_derivations = 3;
+  uint32 completed_derivations = 4;
+  uint32 cached_derivations = 5;
+  uint32 running_derivations = 6;
+  uint32 failed_derivations = 7;
+  uint32 queued_derivations = 8;
+  google.protobuf.Timestamp submitted_at = 9;
+  google.protobuf.Timestamp started_at = 10;
+  google.protobuf.Timestamp finished_at = 11;
+  string error_summary = 12;              // Non-empty if state is FAILED
+}
+
+enum BuildState {
+  BUILD_STATE_UNSPECIFIED = 0;
+  BUILD_STATE_PENDING = 1;
+  BUILD_STATE_ACTIVE = 2;
+  BUILD_STATE_SUCCEEDED = 3;
+  BUILD_STATE_FAILED = 4;
+  BUILD_STATE_CANCELLED = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Store types
+// ---------------------------------------------------------------------------
+
+// Metadata about a store path (narinfo equivalent).
+message PathInfo {
+  string store_path = 1;                  // Full store path (e.g. /nix/store/abc...-hello-1.0)
+  bytes store_path_hash = 2;              // Binary hash of the store path
+  string deriver = 3;                     // Derivation that produced this path
+  bytes nar_hash = 4;                     // SHA-256 digest of the NAR serialization
+  uint64 nar_size = 5;                    // Size of the NAR in bytes
+  repeated string references = 6;         // Runtime dependency store paths
+  uint64 registration_time = 7;           // Unix timestamp
+  bool ultimate = 8;                      // Whether this is the ultimate trusted source
+  repeated string signatures = 9;         // Cryptographic signatures
+  string content_address = 10;            // Content address (empty for input-addressed)
+}
+
+// Request to upload a store path. First message contains metadata, subsequent
+// messages contain NAR data chunks.
+message PutPathRequest {
+  oneof msg {
+    PutPathMetadata metadata = 1;         // First message: path metadata
+    bytes nar_chunk = 2;                  // Subsequent messages: NAR data
+  }
+}
+
+message PutPathMetadata {
+  PathInfo info = 1;                      // Path metadata (nar_hash, references, etc.)
+}
+
+message PutPathResponse {
+  bool created = 1;                       // true if newly stored, false if already existed
+}
+
+// Request to download a store path's NAR data.
+message GetPathRequest {
+  string store_path = 1;
+}
+
+// Response containing NAR data chunks. First message may include metadata.
+message GetPathResponse {
+  oneof msg {
+    PathInfo info = 1;                    // First message: path metadata
+    bytes nar_chunk = 2;                  // Subsequent messages: NAR data chunks
+  }
+}
+
+// Request path info for a single store path.
+message QueryPathInfoRequest {
+  string store_path = 1;
+}
+
+// Batch check which paths are missing from the store.
+message FindMissingPathsRequest {
+  repeated string store_paths = 1;
+}
+
+message FindMissingPathsResponse {
+  repeated string missing_paths = 1;      // Paths not found in store
+}
+
+// Content-addressed lookup: find a store path by its content hash.
+message ContentLookupRequest {
+  bytes content_hash = 1;                 // SHA-256 of the output content
+  string output_name = 2;                // Output name hint
+}
+
+message ContentLookupResponse {
+  string store_path = 1;                 // Matching store path, empty if not found
+  PathInfo info = 2;                     // Full path info if found
+}
+
+// ---------------------------------------------------------------------------
+// Chunk service types (Phase 2a: stub, no chunking)
+// ---------------------------------------------------------------------------
+
+message PutChunkRequest {
+  oneof msg {
+    PutChunkMetadata metadata = 1;
+    bytes data = 2;
+  }
+}
+
+message PutChunkMetadata {
+  bytes digest = 1;                       // Expected BLAKE3 digest
+  uint64 size = 2;                        // Expected chunk size
+}
+
+message PutChunkResponse {
+  bytes digest = 1;                       // Confirmed BLAKE3 digest
+}
+
+message GetChunkRequest {
+  bytes digest = 1;                       // BLAKE3 digest of the chunk
+}
+
+message GetChunkResponse {
+  bytes data = 1;                         // Chunk data
+}
+
+message FindMissingChunksRequest {
+  repeated bytes digests = 1;             // BLAKE3 digests to check
+}
+
+message FindMissingChunksResponse {
+  repeated bytes missing_digests = 1;     // Digests not found in store
+}
+
+// ---------------------------------------------------------------------------
+// Submit / Watch / Query / Cancel build requests
+// ---------------------------------------------------------------------------
+
+message SubmitBuildRequest {
+  string tenant_id = 1;                  // Tenant identifier (from SSH key mapping)
+  string priority_class = 2;             // "ci", "interactive", or "scheduled"
+  repeated DerivationNode nodes = 3;     // All derivations in the DAG
+  repeated DerivationEdge edges = 4;     // Dependency edges
+  uint64 max_silent_time = 5;            // Client build option
+  uint64 build_timeout = 6;              // Client build option
+  uint64 build_cores = 7;               // Client build option
+  bool keep_going = 8;                   // Continue on failure
+}
+
+message WatchBuildRequest {
+  string build_id = 1;
+  uint64 since_sequence = 2;             // Resume from this sequence (0 = from start)
+}
+
+message QueryBuildRequest {
+  string build_id = 1;
+}
+
+message CancelBuildRequest {
+  string build_id = 1;
+  string reason = 2;                     // e.g. "client_disconnect", "user_request"
+}
+
+message CancelBuildResponse {
+  bool cancelled = 1;                    // Whether the build was found and cancelled
+}
+
+// ---------------------------------------------------------------------------
+// Admin types
+// ---------------------------------------------------------------------------
+
+message ClusterStatusResponse {
+  uint32 total_workers = 1;
+  uint32 active_workers = 2;
+  uint32 draining_workers = 3;
+  uint32 pending_builds = 4;
+  uint32 active_builds = 5;
+  uint32 queued_derivations = 6;
+  uint32 running_derivations = 7;
+  uint64 store_size_bytes = 8;           // Total store usage
+  google.protobuf.Timestamp uptime_since = 9;
+}
+
+message ListWorkersRequest {
+  string status_filter = 1;              // Optional: "alive", "draining", "dead"
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  string system = 2;
+  repeated string supported_features = 3;
+  uint32 max_builds = 4;
+  uint32 running_builds = 5;
+  string status = 6;                     // "alive", "draining", "dead"
+  ResourceUsage resources = 7;
+  google.protobuf.Timestamp last_heartbeat = 8;
+  google.protobuf.Timestamp connected_since = 9;
+}
+
+message ListBuildsRequest {
+  string status_filter = 1;              // Optional: "pending", "active", "succeeded", "failed", "cancelled"
+  uint32 limit = 2;                      // Max results (default: 100)
+  uint32 offset = 3;                     // Pagination offset
+}
+
+message ListBuildsResponse {
+  repeated BuildInfo builds = 1;
+  uint32 total_count = 2;               // Total matching builds (for pagination)
+}
+
+message BuildInfo {
+  string build_id = 1;
+  string tenant_id = 2;
+  string priority_class = 3;
+  BuildState state = 4;
+  uint32 total_derivations = 5;
+  uint32 completed_derivations = 6;
+  uint32 cached_derivations = 7;
+  google.protobuf.Timestamp submitted_at = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp finished_at = 10;
+  string error_summary = 11;
+}
+
+message GetBuildLogsRequest {
+  string build_id = 1;
+  string derivation_path = 2;            // Optional: filter to a specific derivation
+  uint64 since_line = 3;                 // Resume from this line number
+}
+
+// Chunk of build log data streamed from scheduler.
+message BuildLogChunk {
+  string derivation_path = 1;
+  repeated bytes lines = 2;              // Raw log lines (may be non-UTF-8)
+  uint64 first_line_number = 3;
+  bool is_complete = 4;                  // true if no more lines follow
+}
+
+message GCRequest {
+  bool dry_run = 1;                      // If true, only report what would be collected
+  uint32 grace_period_hours = 2;         // Override default grace period (default: 24)
+}
+
+message GCProgress {
+  uint64 paths_scanned = 1;
+  uint64 paths_collected = 2;
+  uint64 bytes_freed = 3;
+  bool is_complete = 4;
+  string current_path = 5;              // Path currently being processed
+}
+
+message DrainWorkerRequest {
+  string worker_id = 1;
+  bool force = 2;                        // If true, cancel running builds on the worker
+}
+
+message DrainWorkerResponse {
+  bool accepted = 1;
+  uint32 running_builds = 2;             // Builds still running (will complete before drain)
+}
+
+message ClearPoisonRequest {
+  string derivation_hash = 1;            // drv_hash of the poisoned derivation
+}
+
+message ClearPoisonResponse {
+  bool cleared = 1;                      // true if the derivation was poisoned and is now cleared
+}

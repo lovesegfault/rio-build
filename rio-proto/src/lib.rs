@@ -1,5 +1,40 @@
-/// Protocol version for the rio-build internal gRPC API.
+/// Default max gRPC message size: 32 MB.
 ///
-/// This crate will contain protobuf definitions and generated code
-/// starting in Phase 2a. For now it is a placeholder.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes (~12MB serialized).
+/// Configurable at runtime via `RIO_GRPC__MAX_MESSAGE_SIZE` environment variable.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+
+/// Read the max message size from the `RIO_GRPC__MAX_MESSAGE_SIZE` environment
+/// variable, falling back to [`DEFAULT_MAX_MESSAGE_SIZE`] if not set or invalid.
+pub fn max_message_size() -> usize {
+    std::env::var("RIO_GRPC__MAX_MESSAGE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_MESSAGE_SIZE)
+}
+
+/// Shared protobuf types (messages, enums) used across all services.
+pub mod types {
+    tonic::include_proto!("rio.types");
+}
+
+/// Scheduler service: gateway-facing RPCs (SubmitBuild, WatchBuild, etc.).
+pub mod scheduler {
+    tonic::include_proto!("rio.scheduler");
+}
+
+/// Worker service: worker-facing RPCs (BuildExecution, Heartbeat).
+pub mod worker {
+    tonic::include_proto!("rio.worker");
+}
+
+/// Store service: NAR storage and path metadata RPCs.
+/// Also includes ChunkService (stub UNIMPLEMENTED in Phase 2a).
+pub mod store {
+    tonic::include_proto!("rio.store");
+}
+
+/// Admin service: dashboard and CLI RPCs.
+pub mod admin {
+    tonic::include_proto!("rio.admin");
+}

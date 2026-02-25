@@ -1,0 +1,20 @@
+syntax = "proto3";
+package rio.scheduler;
+
+import "types.proto";
+
+// Gateway-facing RPCs for build submission and monitoring.
+// Served by the rio-scheduler process.
+service SchedulerService {
+  // Submit a build DAG and stream progress events.
+  rpc SubmitBuild(rio.types.SubmitBuildRequest) returns (stream rio.types.BuildEvent);
+
+  // Subscribe to an existing build's event stream (for reconnection / dashboard).
+  rpc WatchBuild(rio.types.WatchBuildRequest) returns (stream rio.types.BuildEvent);
+
+  // Query the current status of a build.
+  rpc QueryBuildStatus(rio.types.QueryBuildRequest) returns (rio.types.BuildStatus);
+
+  // Cancel a running or pending build.
+  rpc CancelBuild(rio.types.CancelBuildRequest) returns (rio.types.CancelBuildResponse);
+}
