@@ -17,7 +17,6 @@ use rio_nix::protocol::opcodes::WorkerOp;
 use rio_nix::protocol::stderr::{StderrError, StderrWriter};
 use rio_nix::protocol::wire;
 use rio_nix::store_path::StorePath;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::{debug, error, instrument, warn};
 
@@ -71,9 +70,10 @@ pub struct ClientOptions {
 
 /// Dispatch an opcode to the appropriate handler.
 ///
-/// Returns `Ok(())` on success. On protocol errors, sends STDERR_ERROR
-/// and returns `Ok(())` (the connection stays open). Returns `Err` only
-/// for I/O errors that prevent further communication.
+/// Returns `Ok(())` on success. On errors, sends `STDERR_ERROR` to the
+/// client and returns `Err`, which terminates the session. This applies
+/// to both I/O errors and application-level errors (validation failures,
+/// store errors, etc.).
 #[instrument(skip_all, fields(opcode))]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_opcode<R, W>(
@@ -87,7 +87,7 @@ pub async fn handle_opcode<R, W>(
     modular_hash_cache: &mut HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<()>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
 {
     let mut stderr = StderrWriter::new(writer);
@@ -744,7 +744,7 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// 3. Validate NAR hash, store path, cache .drv if applicable
 /// 4. Send STDERR_LAST (no result value — unlike wopAddToStore which returns ValidPathInfo)
 #[instrument(skip_all)]
-async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
     store: &dyn Store,
@@ -786,68 +786,13 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Err(anyhow::anyhow!("nar_size exceeds maximum"));
     }
 
-    // Read NAR data as framed stream (protocol >= 1.23, always true for 1.37+).
-    // read_framed_stream enforces MAX_FRAMED_TOTAL (1 GiB) and MAX_FRAME_SIZE (64 MiB).
-    let nar_data = match wire::read_framed_stream(reader).await {
-        Ok(data) => data,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("failed to read NAR data for '{path_str}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to read NAR data: {e}"));
-        }
-    };
-
-    // Validate NAR size matches declared value
-    let actual_nar_size = nar_data.len() as u64;
-    if actual_nar_size != nar_size {
-        warn!(
-            path = %path_str,
-            declared_size = nar_size,
-            actual_size = actual_nar_size,
-            "NAR size mismatch"
-        );
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!(
-                    "NAR size mismatch for {path_str}: declared {nar_size}, actual {actual_nar_size}"
-                ),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("NAR size mismatch for {path_str}"));
-    }
-
-    // Validate NAR hash
-    let computed_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(&nar_data);
-        let digest = hasher.finalize();
-        hex::encode(digest)
-    };
-
-    if computed_hash != nar_hash_str {
-        warn!(
-            path = %path_str,
-            declared = %nar_hash_str,
-            computed = %computed_hash,
-            "NAR hash mismatch"
-        );
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!(
-                    "NAR hash mismatch for {path_str}: declared {nar_hash_str}, computed {computed_hash}"
-                ),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("NAR hash mismatch for {path_str}"));
-    }
-
-    // Build PathInfo
+    // Build PathInfo from metadata BEFORE reading NAR data. All metadata fields
+    // were read above and are in local variables. This allows us to stream the
+    // NAR directly to the store without buffering.
+    //
+    // Note: if PathInfo construction fails (invalid path, bad hash hex, etc.),
+    // the framed NAR stream hasn't been consumed, so the connection will close.
+    // This matches the oversized nar_size rejection above — these are client bugs.
     let path = match StorePath::parse(&path_str) {
         Ok(p) => p,
         Err(e) => {
@@ -903,6 +848,12 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match StorePath::parse(s) {
             Ok(p) => ref_paths.push(p),
             Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("invalid reference path '{s}' for '{path_str}': {e}"),
+                    ))
+                    .await?;
                 return Err(anyhow::anyhow!(
                     "wopAddToStoreNar: invalid reference path '{s}' for '{path_str}': {e}"
                 ));
@@ -933,19 +884,16 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    // Store the path
-    if let Err(e) = store.add_path(info, nar_data.clone()).await {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("failed to store path '{path_str}': {e}"),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("store error: {e}"));
+    // Stream the NAR data directly from the wire into the store (no handler-level buffering).
+    // FramedStreamReader enforces MAX_FRAMED_TOTAL (1 GiB) and MAX_FRAME_SIZE (64 MiB).
+    // Hash/size validation is handled by the store (drain contract).
+    let framed = wire::FramedStreamReader::new(&mut *reader, nar_size);
+    if let Err(e) = store.add_path(info, Box::new(framed)).await {
+        return send_store_error(stderr, e).await;
     }
 
-    // If this is a .drv file, parse and cache it
-    try_cache_drv(&path, &nar_data, drv_cache);
+    // If this is a .drv file, read back from store and cache it
+    cache_drv_if_needed(&path, store, drv_cache).await;
 
     // Send STDERR_LAST (no result value for wopAddToStoreNar)
     stderr.finish().await?;
@@ -953,6 +901,9 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 /// If `path` is a `.drv`, extract from NAR, parse ATerm, and cache in drv_cache.
+///
+/// Best-effort: parse failures are logged but not propagated — the store
+/// operation that triggered this has already succeeded.
 fn try_cache_drv(
     path: &StorePath,
     nar_data: &[u8],
@@ -964,18 +915,18 @@ fn try_cache_drv(
     let drv_bytes = match rio_nix::nar::extract_single_file(nar_data) {
         Ok(bytes) => bytes,
         Err(e) => {
-            error!(path = %path, error = %e,
-                   "failed to extract .drv from NAR; \
-                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
+            warn!(path = %path, error = %e,
+                  "failed to extract .drv from NAR; \
+                   wopQueryDerivationOutputMap and build operations will fail for this derivation");
             return;
         }
     };
     let drv_text = match String::from_utf8(drv_bytes) {
         Ok(text) => text,
         Err(e) => {
-            error!(path = %path, error = %e,
-                   "failed to decode .drv as UTF-8; \
-                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
+            warn!(path = %path, error = %e,
+                  "failed to decode .drv as UTF-8; \
+                   wopQueryDerivationOutputMap and build operations will fail for this derivation");
             return;
         }
     };
@@ -985,11 +936,52 @@ fn try_cache_drv(
             drv_cache.insert(path.clone(), drv);
         }
         Err(e) => {
-            error!(path = %path, error = %e,
-                   "failed to parse .drv ATerm; \
-                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
+            warn!(path = %path, error = %e,
+                  "failed to parse .drv ATerm; \
+                   wopQueryDerivationOutputMap and build operations will fail for this derivation");
         }
     }
+}
+
+/// Read a just-stored `.drv` back from the store, parse its ATerm, and cache it.
+///
+/// After `add_path`, the NAR bytes exist only in the store — the wire reader was
+/// consumed by the store's drain contract. For `.drv` files we need the bytes to
+/// parse the ATerm derivation, so we read them back. This is a small cost (`.drv`
+/// files are typically < 256 KB) in exchange for avoiding handler-level buffering.
+///
+/// Best-effort: parse failures are logged but do not fail the store operation.
+async fn cache_drv_if_needed(
+    path: &StorePath,
+    store: &dyn Store,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) {
+    if !path.is_derivation() {
+        return;
+    }
+    let mut reader = match store.nar_from_path(path).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            error!(path = %path,
+                   "just-stored .drv path not found on read-back; \
+                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
+            return;
+        }
+        Err(e) => {
+            error!(path = %path, error = %e,
+                   "failed to read back .drv from store; \
+                    wopQueryDerivationOutputMap and build operations will fail for this derivation");
+            return;
+        }
+    };
+    let mut data = Vec::new();
+    if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut data).await {
+        error!(path = %path, error = %e,
+               "failed to read .drv NAR data from store; \
+                wopQueryDerivationOutputMap and build operations will fail for this derivation");
+        return;
+    }
+    try_cache_drv(path, &data, drv_cache);
 }
 
 /// Parse a single entry from the wopAddMultipleToStore reassembled byte stream.
@@ -1025,37 +1017,7 @@ async fn parse_add_multiple_entry(
         "wopAddMultipleToStore entry"
     );
 
-    // Validate NAR size matches declared value
-    let actual_nar_size = nar_data.len() as u64;
-    if actual_nar_size != nar_size {
-        warn!(
-            path = %path_str,
-            declared_size = nar_size,
-            actual_size = actual_nar_size,
-            "NAR size mismatch in wopAddMultipleToStore entry"
-        );
-        return Err(anyhow::anyhow!(
-            "NAR size mismatch for {path_str}: declared {nar_size}, actual {actual_nar_size}"
-        ));
-    }
-
-    // Validate NAR hash
-    let computed_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(&nar_data);
-        hex::encode(hasher.finalize())
-    };
-    if computed_hash != nar_hash_str {
-        warn!(
-            path = %path_str,
-            declared = %nar_hash_str,
-            computed = %computed_hash,
-            "NAR hash mismatch in wopAddMultipleToStore"
-        );
-        return Err(anyhow::anyhow!("NAR hash mismatch for {path_str}"));
-    }
-
-    // Build PathInfo
+    // Build PathInfo — hash/size validation is handled by the store.
     let path = StorePath::parse(&path_str)
         .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
 
@@ -1102,10 +1064,10 @@ async fn parse_add_multiple_entry(
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': PathInfo build failed: {e}"))?;
 
     store
-        .add_path(info, nar_data.clone())
+        .add_path(info, Box::new(std::io::Cursor::new(nar_data)))
         .await
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
-    try_cache_drv(&path, &nar_data, drv_cache);
+    cache_drv_if_needed(&path, store, drv_cache).await;
 
     Ok(())
 }
@@ -1171,6 +1133,12 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match StorePath::parse(s) {
             Ok(p) => ref_paths.push(p),
             Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("invalid reference path '{s}' for wopAddToStore: {e}"),
+                    ))
+                    .await?;
                 return Err(anyhow::anyhow!(
                     "wopAddToStore: invalid reference path '{s}': {e}"
                 ));
@@ -1264,16 +1232,13 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    if let Err(e) = store.add_path(info, nar_data.clone()).await {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("failed to store path '{}': {e}", path),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("store error: {e}"));
+    if let Err(e) = store
+        .add_path(info, Box::new(std::io::Cursor::new(nar_data)))
+        .await
+    {
+        return send_store_error(stderr, e).await;
     }
-    try_cache_drv(&path, &nar_data, drv_cache);
+    cache_drv_if_needed(&path, store, drv_cache).await;
 
     // Send STDERR_LAST + ValidPathInfo
     stderr.finish().await?;
@@ -1320,6 +1285,12 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match StorePath::parse(s) {
             Ok(p) => ref_paths.push(p),
             Err(e) => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("invalid reference path '{s}' for wopAddTextToStore: {e}"),
+                    ))
+                    .await?;
                 return Err(anyhow::anyhow!(
                     "wopAddTextToStore: invalid reference path '{s}': {e}"
                 ));
@@ -1382,16 +1353,13 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    if let Err(e) = store.add_path(info, nar_data.clone()).await {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("failed to store path '{}': {e}", path),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("store error: {e}"));
+    if let Err(e) = store
+        .add_path(info, Box::new(std::io::Cursor::new(nar_data)))
+        .await
+    {
+        return send_store_error(stderr, e).await;
     }
-    try_cache_drv(&path, &nar_data, drv_cache);
+    cache_drv_if_needed(&path, store, drv_cache).await;
 
     // wopAddTextToStore returns STDERR_LAST + store path string
     stderr.finish().await?;

@@ -1,5 +1,6 @@
 pub mod memory;
 pub mod traits;
+pub(crate) mod validate;
 
 pub use memory::MemoryStore;
 #[allow(unused_imports)] // used by future Store implementations and integration tests
