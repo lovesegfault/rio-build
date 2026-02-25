@@ -91,7 +91,7 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
             deriver = $2,
             nar_hash = $3,
             nar_size = $4,
-            references = $5,
+            "references" = $5,
             signatures = $6,
             ca = $7
         WHERE store_path_hash = $1
@@ -157,7 +157,7 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> anyhow::Result<
     let row: Option<NarinfoRow> = sqlx::query_as(
         r#"
         SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n.references, n.signatures, n.ca
+               n."references", n.signatures, n.ca
         FROM narinfo n
         INNER JOIN nar_blobs b ON n.store_path_hash = b.store_path_hash
         WHERE n.store_path = $1 AND b.status = 'complete'
@@ -179,7 +179,7 @@ pub async fn query_path_info_by_hash(
     let row: Option<NarinfoRow> = sqlx::query_as(
         r#"
         SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n.references, n.signatures, n.ca
+               n."references", n.signatures, n.ca
         FROM narinfo n
         INNER JOIN nar_blobs b ON n.store_path_hash = b.store_path_hash
         WHERE n.store_path_hash = $1 AND b.status = 'complete'

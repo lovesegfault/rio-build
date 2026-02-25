@@ -4,8 +4,8 @@
 //! Async/batched: build_history EMA updates.
 //!
 //! NOTE: UUIDs are passed as strings (`.to_string()`) because the workspace sqlx
-//! config does not include the `uuid` feature (it would pull in sqlx-sqlite which
-//! conflicts with rusqlite). PostgreSQL handles the text-to-UUID cast implicitly.
+//! config does not include the `uuid` feature. PostgreSQL handles the
+//! text-to-UUID cast implicitly via `::uuid`.
 
 use sqlx::PgPool;
 use uuid::Uuid;

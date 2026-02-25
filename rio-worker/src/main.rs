@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Set up FUSE cache and mount
-    let cache = fuse::cache::Cache::new(args.fuse_cache_dir, args.fuse_cache_size_gb)?;
+    let cache = fuse::cache::Cache::new(args.fuse_cache_dir, args.fuse_cache_size_gb).await?;
     let runtime = tokio::runtime::Handle::current();
 
     std::fs::create_dir_all(&args.fuse_mount_point)?;

@@ -33,7 +33,7 @@ fn warn_read_dir(dir: &Path) -> anyhow::Result<Vec<fs::DirEntry>> {
 }
 
 /// Run the full FUSE -> overlay -> sandbox -> build validation chain.
-pub fn run_validate(all: bool, backing_dir: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run_validate(all: bool, backing_dir: Option<PathBuf>) -> anyhow::Result<()> {
     let work_dir = tempfile::tempdir()?;
     let work = work_dir.path();
 
@@ -108,7 +108,7 @@ pub fn run_validate(all: bool, backing_dir: Option<PathBuf>) -> anyhow::Result<(
 
     let db_dir = overlay::prepare_nix_state_dirs(overlay_mount.upper_dir())?;
     let db_path = db_dir.join("db.sqlite");
-    synthetic_db::generate_db(&db_path, &path_infos)?;
+    synthetic_db::generate_db(&db_path, &path_infos).await?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -117,7 +117,7 @@ pub fn run_validate(all: bool, backing_dir: Option<PathBuf>) -> anyhow::Result<(
     );
 
     // Validate SQLite DB consistency
-    validate_sqlite_consistency(&db_path, &path_infos)?;
+    validate_sqlite_consistency(&db_path, &path_infos).await?;
 
     // Step 5: nix-build inside the overlay (using mount namespace for correct layout)
     validate_nix_build(
@@ -134,7 +134,7 @@ pub fn run_validate(all: bool, backing_dir: Option<PathBuf>) -> anyhow::Result<(
         // Drop the first overlay
         overlay::teardown_overlay(overlay_mount)?;
 
-        run_concurrent_isolation_test(&fuse_mount, &overlay_base, &path_infos)?;
+        run_concurrent_isolation_test(&fuse_mount, &overlay_base, &path_infos).await?;
 
         // FUSE read latency benchmark — standard mode
         tracing::info!("running FUSE read latency benchmark (standard mode)");
@@ -442,24 +442,28 @@ fn validate_overlay_correctness(
 }
 
 /// Validate the synthetic SQLite DB is consistent.
-fn validate_sqlite_consistency(
+async fn validate_sqlite_consistency(
     db_path: &Path,
     path_infos: &[synthetic_db::NixPathInfo],
 ) -> anyhow::Result<()> {
+    use sqlx::{Connection, SqliteConnection};
+
     tracing::info!("validating SQLite DB consistency");
 
-    let conn = rusqlite::Connection::open(db_path)?;
+    let url = format!("sqlite://{}", db_path.display());
+    let mut conn = SqliteConnection::connect(&url).await?;
 
     // Check schema version
-    let version: String = conn.query_row(
-        "SELECT value FROM Config WHERE name = 'SchemaVersion'",
-        [],
-        |row| row.get(0),
-    )?;
+    let version: String =
+        sqlx::query_scalar("SELECT value FROM Config WHERE name = 'SchemaVersion'")
+            .fetch_one(&mut conn)
+            .await?;
     anyhow::ensure!(version == "10", "unexpected schema version: {version}");
 
     // Check all paths are present
-    let db_count: i64 = conn.query_row("SELECT COUNT(*) FROM ValidPaths", [], |row| row.get(0))?;
+    let db_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
+        .fetch_one(&mut conn)
+        .await?;
     anyhow::ensure!(
         db_count == path_infos.len() as i64,
         "path count mismatch: DB has {db_count}, expected {}",
@@ -468,11 +472,10 @@ fn validate_sqlite_consistency(
 
     // Check each path is findable by path (as Nix does)
     for info in path_infos {
-        let hash: String = conn.query_row(
-            "SELECT hash FROM ValidPaths WHERE path = ?1",
-            [&info.path],
-            |row| row.get(0),
-        )?;
+        let hash: String = sqlx::query_scalar("SELECT hash FROM ValidPaths WHERE path = ?1")
+            .bind(&info.path)
+            .fetch_one(&mut conn)
+            .await?;
         anyhow::ensure!(
             hash == info.nar_hash,
             "hash mismatch for {}: DB has {hash}, expected {}",
@@ -693,7 +696,7 @@ fn validate_upper_layer_outputs(upper: &Path) -> anyhow::Result<()> {
 }
 
 /// Run concurrent isolation test: two overlays on the same FUSE mount.
-fn run_concurrent_isolation_test(
+async fn run_concurrent_isolation_test(
     fuse_mount: &Path,
     overlay_base: &Path,
     path_infos: &[synthetic_db::NixPathInfo],
@@ -704,10 +707,10 @@ fn run_concurrent_isolation_test(
     let overlay_b = overlay::setup_overlay(fuse_mount, overlay_base, "concurrent-b")?;
 
     let db_dir_a = overlay::prepare_nix_state_dirs(overlay_a.upper_dir())?;
-    synthetic_db::generate_db(&db_dir_a.join("db.sqlite"), path_infos)?;
+    synthetic_db::generate_db(&db_dir_a.join("db.sqlite"), path_infos).await?;
 
     let db_dir_b = overlay::prepare_nix_state_dirs(overlay_b.upper_dir())?;
-    synthetic_db::generate_db(&db_dir_b.join("db.sqlite"), path_infos)?;
+    synthetic_db::generate_db(&db_dir_b.join("db.sqlite"), path_infos).await?;
 
     // Write a marker file to each upper layer
     fs::write(overlay_a.upper_dir().join("marker-a"), "build-a")?;

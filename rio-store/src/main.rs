@@ -66,15 +66,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     info!("PostgreSQL connection established");
 
-    // Verify database connectivity (migrations are applied externally via
-    // `sqlx migrate run` or during deployment — the `sqlx::migrate!()` macro
-    // requires the `migrate` feature which conflicts with rusqlite's bundled
-    // sqlite in the workspace).
-    sqlx::query("SELECT 1")
-        .execute(&pool)
+    sqlx::migrate!("../migrations")
+        .run(&pool)
         .await
-        .inspect_err(|e| error!(error = %e, "database connectivity check failed"))?;
-    info!("database connectivity verified (ensure migrations are applied)");
+        .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
+    info!("database migrations applied");
 
     // Initialize backend
     let backend: Arc<dyn NarBackend> = match args.backend.as_str() {

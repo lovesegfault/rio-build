@@ -64,9 +64,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("connected to PostgreSQL");
 
-    // NOTE: Migrations are applied externally (e.g., via `sqlx migrate run`
-    // or an init container). The `sqlx::migrate!` macro is not used here to
-    // avoid pulling in sqlx-sqlite which conflicts with rusqlite.
+    sqlx::migrate!("../migrations").run(&pool).await?;
+    info!("database migrations applied");
 
     let db = SchedulerDb::new(pool);
 

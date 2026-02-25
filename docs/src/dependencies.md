@@ -25,7 +25,7 @@
 | `ginepro` | gRPC client-side load balancing | 2 | DNS-based service discovery for tonic channels |
 | `ed25519-dalek` | NAR signing/verification | 2 | Binary cache signature support |
 | `fuser` | FUSE filesystem | 2 | Per-worker `/nix/store` mount (rio-fuse) |
-| `rusqlite` | Synthetic store DB | 2 | Worker generates per-build SQLite DB |
+| `sqlx` (sqlite feature) | Synthetic store DB | 2 | Worker generates per-build SQLite DB |
 | `tracing-opentelemetry` | Distributed tracing | 2 | Trace propagation across gRPC boundaries |
 | `kube` + `kube-runtime` | K8s client, CRDs, operator framework | 3 | `features = ["runtime", "derive", "rustls-tls"]` |
 | `k8s-openapi` | K8s API types | 3 | `features = ["latest"]` |

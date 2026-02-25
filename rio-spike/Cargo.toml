@@ -15,8 +15,9 @@ path = "src/main.rs"
 # FUSE filesystem (0.17 adds passthrough mode support)
 fuser = "0.17"
 
-# SQLite for synthetic Nix store DB
-rusqlite = { version = "0.38", features = ["bundled"] }
+# SQLite for synthetic Nix store DB (via sqlx)
+sqlx = { workspace = true }
+tokio = { workspace = true }
 
 # Linux syscalls (mount, umount2, etc.)
 nix = { version = "0.31", features = ["mount", "sched", "fs", "user"] }
