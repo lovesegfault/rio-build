@@ -1244,7 +1244,7 @@ async fn test_add_to_store_nar_hash_mismatch() {
             let nar_data = make_nar(b"some content");
             let wrong_hash = "0".repeat(64);
             let nar_size = nar_data.len() as u64;
-            let path_str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hash-test";
+            let path_str = "/nix/store/dddddddddddddddddddddddddddddddd-hash-test";
 
             wire::write_u64(&mut s, 39).await.unwrap();
             wire::write_string(&mut s, path_str).await.unwrap();
@@ -2218,7 +2218,7 @@ async fn test_add_to_store_nar_size_mismatch() {
             let nar_data = make_nar(b"size mismatch content");
             let nar_hash = sha256_hex(&nar_data);
             let wrong_nar_size = nar_data.len() as u64 + 1; // off by one
-            let path_str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-size-test";
+            let path_str = "/nix/store/dddddddddddddddddddddddddddddddd-size-test";
 
             wire::write_u64(&mut s, 39).await.unwrap();
             wire::write_string(&mut s, path_str).await.unwrap();

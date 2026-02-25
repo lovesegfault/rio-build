@@ -142,16 +142,37 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()> {
+    async fn add_path<'n>(
+        &self,
+        info: PathInfo,
+        mut nar_data: Box<dyn tokio::io::AsyncRead + Send + Unpin + 'n>,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+
         let key = info.path().clone();
         debug!(path = %key, "adding path to memory store");
+
+        // Always drain the full stream (reader may be wire-backed).
+        // Pre-allocate based on declared size to avoid repeated reallocation.
+        let capacity =
+            (info.nar_size() as usize).min(rio_nix::protocol::wire::MAX_FRAMED_TOTAL as usize);
+        let mut data = Vec::with_capacity(capacity);
+        nar_data.read_to_end(&mut data).await?;
+
+        // ALWAYS validate, even for idempotent case — corrupt uploads must be
+        // rejected, not silently accepted.
+        super::validate::validate_nar(&data, &info)?;
+
+        // Idempotent: if already present, don't overwrite.
+        // Check AFTER validation so corrupt data is never silently accepted.
+        // TOCTOU note: another task could insert between validate and write_inner().
+        // This is benign: both tasks validated, the second becomes a no-op.
         let mut inner = self.write_inner();
-        // Idempotent: if already present, don't overwrite
         if inner.paths.contains_key(&key) {
             debug!(path = %key, "path already exists, skipping");
             return Ok(());
         }
-        inner.nars.insert(key.clone(), nar_data);
+        inner.nars.insert(key.clone(), data);
         inner.paths.insert(key, info);
         Ok(())
     }
@@ -340,39 +361,133 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
+    /// Build a PathInfo whose hash and size match the given NAR data.
+    fn make_matching_info(nar_data: &[u8]) -> PathInfo {
+        let path =
+            StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-add-test-1.0").unwrap();
+        PathInfoBuilder::new(
+            path,
+            NixHash::compute(HashAlgo::SHA256, nar_data),
+            nar_data.len() as u64,
+        )
+        .build()
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_add_path_via_trait() {
         let store = MemoryStore::new();
-        let info = make_test_path_info();
+        let nar = b"nar data for add_path test";
+        let info = make_matching_info(nar);
         let path = info.path().clone();
 
-        store.add_path(info, b"nar data".to_vec()).await.unwrap();
+        store
+            .add_path(info, Box::new(std::io::Cursor::new(nar.to_vec())))
+            .await
+            .unwrap();
 
         assert!(store.is_valid_path(&path).await.unwrap());
         let mut reader = store.nar_from_path(&path).await.unwrap().unwrap();
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.unwrap();
-        assert_eq!(data, b"nar data");
+        assert_eq!(data, nar);
     }
 
     #[tokio::test]
     async fn test_add_path_idempotent() {
         let store = MemoryStore::new();
-        let info = make_test_path_info();
+        let nar = b"idempotent nar data";
+        let info = make_matching_info(nar);
         let path = info.path().clone();
 
         store
-            .add_path(info.clone(), b"first".to_vec())
+            .add_path(info.clone(), Box::new(std::io::Cursor::new(nar.to_vec())))
             .await
             .unwrap();
-        // Second add with different data should not overwrite
-        store.add_path(info, b"second".to_vec()).await.unwrap();
+        // Second add with same valid data should succeed without overwriting
+        store
+            .add_path(info, Box::new(std::io::Cursor::new(nar.to_vec())))
+            .await
+            .unwrap();
 
         // Original data should be preserved
         let mut reader = store.nar_from_path(&path).await.unwrap().unwrap();
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await.unwrap();
-        assert_eq!(data, b"first");
+        assert_eq!(data, nar);
+    }
+
+    #[tokio::test]
+    async fn test_add_path_rejects_hash_mismatch() {
+        let store = MemoryStore::new();
+        let nar = b"correct data";
+        let info = make_matching_info(nar);
+        let path = info.path().clone();
+
+        let err = store
+            .add_path(
+                info,
+                Box::new(std::io::Cursor::new(b"wrong data!!".to_vec())),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "expected 'hash mismatch', got: {err}"
+        );
+        // Path should NOT have been inserted
+        assert!(!store.is_valid_path(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_add_path_rejects_size_mismatch() {
+        let store = MemoryStore::new();
+        let nar = b"size test";
+        let info = make_matching_info(nar);
+        let path = info.path().clone();
+
+        let err = store
+            .add_path(info, Box::new(std::io::Cursor::new(b"short".to_vec())))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("size mismatch"),
+            "expected 'size mismatch', got: {err}"
+        );
+        assert!(!store.is_valid_path(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_add_path_idempotent_validates_corrupt() {
+        let store = MemoryStore::new();
+        let nar = b"valid nar content";
+        let info = make_matching_info(nar);
+        let path = info.path().clone();
+
+        // First add succeeds
+        store
+            .add_path(info.clone(), Box::new(std::io::Cursor::new(nar.to_vec())))
+            .await
+            .unwrap();
+
+        // Second add with corrupt data should be rejected even though path exists
+        let err = store
+            .add_path(
+                info,
+                Box::new(std::io::Cursor::new(b"corrupt data!!!!".to_vec())),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("size mismatch") || err.to_string().contains("hash mismatch"),
+            "expected validation error, got: {err}"
+        );
+
+        // Original valid data should still be in the store
+        let mut reader = store.nar_from_path(&path).await.unwrap().unwrap();
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, nar);
     }
 
     #[tokio::test]

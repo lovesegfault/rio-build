@@ -258,15 +258,25 @@ pub trait Store: Send + Sync {
     /// Store a path with its metadata and NAR content.
     ///
     /// If the path already exists, the call succeeds without overwriting
-    /// (idempotent). The caller is responsible for validating that the NAR
-    /// content matches `info.nar_hash()` and `info.nar_size()` before calling.
+    /// (idempotent), but the incoming data is still validated against
+    /// `info.nar_hash()` and `info.nar_size()` — corrupt uploads are always
+    /// rejected, even for existing paths.
+    ///
+    /// **Drain contract:** Implementations MUST fully consume `nar_data`
+    /// regardless of outcome (idempotent hit, validation failure, etc.),
+    /// because the reader may be backed by a wire connection where unconsumed
+    /// bytes would corrupt the protocol framing.
+    ///
+    /// Implementations MUST validate that the NAR content matches
+    /// `info.nar_hash()` (SHA-256) and `info.nar_size()` using
+    /// [`validate::validate_nar`](super::validate::validate_nar).
     ///
     /// Called by `wopAddToStoreNar` and `wopAddMultipleToStore` handlers.
-    // TODO: accept a streaming type (e.g., `NarReader`) instead of `Vec<u8>` to
-    // avoid buffering large NARs on the write path. Requires reworking the hash
-    // validation flow (SHA-256 is computed over the full NAR before inserting).
-    #[allow(dead_code)] // used by opcode handlers added in next commits
-    async fn add_path(&self, info: PathInfo, nar_data: Vec<u8>) -> anyhow::Result<()>;
+    async fn add_path<'n>(
+        &self,
+        info: PathInfo,
+        nar_data: Box<dyn AsyncRead + Send + Unpin + 'n>,
+    ) -> anyhow::Result<()>;
 
     /// Resolve a store path from its hash part (32-char nixbase32 string).
     /// Returns `Some(path)` if a stored path's hash part matches, `None` otherwise.

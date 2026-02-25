@@ -21,7 +21,7 @@ pub async fn run_protocol<R, W>(
     store: &dyn Store,
 ) -> anyhow::Result<()>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
 {
     let mut options: Option<ClientOptions> = None;
