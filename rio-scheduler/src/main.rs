@@ -1,7 +1,15 @@
 //! rio-scheduler binary entry point.
+//!
+//! Starts the gRPC server, connects to PostgreSQL, and spawns the DAG actor.
 
 use clap::Parser;
 use tracing::info;
+
+use rio_proto::scheduler::scheduler_service_server::SchedulerServiceServer;
+use rio_proto::worker::worker_service_server::WorkerServiceServer;
+use rio_scheduler::actor::ActorHandle;
+use rio_scheduler::db::SchedulerDb;
+use rio_scheduler::grpc::SchedulerGrpc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -28,6 +36,10 @@ struct Args {
     /// Prometheus metrics listen address
     #[arg(long, env = "RIO_METRICS_ADDR", default_value = "0.0.0.0:9091")]
     metrics_addr: std::net::SocketAddr,
+
+    /// Tick interval for housekeeping (seconds)
+    #[arg(long, env = "RIO_TICK_INTERVAL_SECS", default_value = "10")]
+    tick_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -44,11 +56,62 @@ async fn main() -> anyhow::Result<()> {
 
     rio_common::observability::init_metrics(args.metrics_addr)?;
 
+    // Connect to PostgreSQL
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&args.database_url)
+        .await?;
+
+    info!("connected to PostgreSQL");
+
+    // NOTE: Migrations are applied externally (e.g., via `sqlx migrate run`
+    // or an init container). The `sqlx::migrate!` macro is not used here to
+    // avoid pulling in sqlx-sqlite which conflicts with rusqlite.
+
+    let db = SchedulerDb::new(pool);
+
+    // Spawn the DAG actor
+    let actor = ActorHandle::spawn(db);
+    info!("DAG actor spawned");
+
+    // Create gRPC service
+    let grpc_service = SchedulerGrpc::new(actor.clone());
+
+    // Start periodic tick task
+    let tick_actor = actor.clone();
+    let tick_interval = std::time::Duration::from_secs(args.tick_interval_secs);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tick_interval);
+        loop {
+            interval.tick().await;
+            let _ = tick_actor.try_send(rio_scheduler::actor::ActorCommand::Tick);
+        }
+    });
+
+    // Start gRPC server
+    let listen_addr: std::net::SocketAddr = args.listen_addr.parse()?;
+    let max_message_size = rio_proto::max_message_size();
+
     info!(
-        listen_addr = %args.listen_addr,
+        listen_addr = %listen_addr,
         store_addr = %args.store_addr,
-        "rio-scheduler is a placeholder — implementation in Step 5"
+        max_message_size,
+        "starting gRPC server"
     );
+
+    tonic::transport::Server::builder()
+        .add_service(
+            SchedulerServiceServer::new(grpc_service.clone())
+                .max_decoding_message_size(max_message_size)
+                .max_encoding_message_size(max_message_size),
+        )
+        .add_service(
+            WorkerServiceServer::new(grpc_service)
+                .max_decoding_message_size(max_message_size)
+                .max_encoding_message_size(max_message_size),
+        )
+        .serve(listen_addr)
+        .await?;
 
     Ok(())
 }
