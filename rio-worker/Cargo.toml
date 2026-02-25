@@ -19,7 +19,7 @@ rio-proto = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 fuser = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
 nix = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
@@ -29,6 +29,8 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+tokio-stream = { workspace = true }
+scopeguard = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

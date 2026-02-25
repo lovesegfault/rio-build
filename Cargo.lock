@@ -3637,6 +3637,7 @@ dependencies = [
  "clap",
  "hex",
  "metrics",
+ "prost-types",
  "rio-common",
  "rio-nix",
  "rio-proto",
@@ -3647,6 +3648,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
 ]
@@ -3759,10 +3761,12 @@ dependencies = [
  "rio-nix",
  "rio-proto",
  "rusqlite",
+ "scopeguard",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
 ]
