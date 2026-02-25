@@ -1487,6 +1487,102 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    /// A test-database harness. Creates an isolated database per-test,
+    /// runs migrations, and drops the database on Drop.
+    pub(crate) struct TestDb {
+        pub pool: sqlx::PgPool,
+        db_name: String,
+        admin_url: String,
+    }
+
+    impl TestDb {
+        /// Set up an isolated test database. Returns `None` if `DATABASE_URL`
+        /// is not set (test should skip).
+        pub(crate) async fn new() -> Option<Self> {
+            let admin_url = std::env::var("DATABASE_URL").ok()?;
+
+            // Generate a unique database name
+            let db_name = format!(
+                "rio_test_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+
+            // Connect to admin DB and create test DB
+            let admin_pool = sqlx::PgPool::connect(&admin_url)
+                .await
+                .expect("failed to connect to admin DATABASE_URL");
+            sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+                .execute(&admin_pool)
+                .await
+                .expect("failed to create test database");
+            admin_pool.close().await;
+
+            // Build test DB URL by replacing the database name
+            let test_url = replace_db_name(&admin_url, &db_name);
+            let pool = sqlx::PgPool::connect(&test_url)
+                .await
+                .expect("failed to connect to test database");
+
+            // Run migrations
+            sqlx::migrate!("../migrations")
+                .run(&pool)
+                .await
+                .expect("migrations failed");
+
+            Some(Self {
+                pool,
+                db_name,
+                admin_url,
+            })
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            // Close the test pool and drop the database. This runs in Drop,
+            // so we need a new runtime for the async cleanup.
+            let db_name = self.db_name.clone();
+            let admin_url = self.admin_url.clone();
+            // Close connections synchronously by dropping the pool's internal state
+            // (pool will be closed when it goes out of scope after this).
+            // Then drop the database via a background thread.
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let admin_pool = match sqlx::PgPool::connect(&admin_url).await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    // Terminate any remaining connections then drop
+                    let _ = sqlx::query(&format!(
+                        r#"SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                           WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"#
+                    ))
+                    .execute(&admin_pool)
+                    .await;
+                    let _ = sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{db_name}""#))
+                        .execute(&admin_pool)
+                        .await;
+                });
+            })
+            .join()
+            .ok();
+        }
+    }
+
+    /// Replace the database name in a PostgreSQL URL.
+    fn replace_db_name(url: &str, new_db: &str) -> String {
+        // postgres://user:pass@host:port/dbname -> ...host:port/new_db
+        if let Some(idx) = url.rfind('/') {
+            format!("{}/{}", &url[..idx], new_db)
+        } else {
+            format!("{url}/{new_db}")
+        }
+    }
+
     /// Set up an actor with the given PgPool and return (handle, task).
     /// The caller should drop the handle to shut down the actor.
     pub(crate) async fn setup_actor(
@@ -1583,9 +1679,13 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    #[sqlx::test(migrations = "../migrations")]
-    async fn test_actor_starts_and_stops(pool: sqlx::PgPool) {
-        let (handle, task) = setup_actor(pool).await;
+    #[tokio::test]
+    async fn test_actor_starts_and_stops() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, task) = setup_actor(db.pool.clone()).await;
         settle().await;
         // Query should succeed (actor is running)
         let workers = handle.debug_query_workers().await.unwrap();
