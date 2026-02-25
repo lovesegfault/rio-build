@@ -36,3 +36,5 @@ prost-types = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-stream = { workspace = true }
+tracing-subscriber = { workspace = true }
