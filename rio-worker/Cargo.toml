@@ -1,0 +1,35 @@
+[package]
+name = "rio-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build executor with FUSE store for rio-build"
+
+[[bin]]
+name = "rio-worker"
+path = "src/main.rs"
+
+[dependencies]
+rio-common = { workspace = true }
+rio-nix = { workspace = true }
+rio-proto = { workspace = true }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+fuser = { workspace = true }
+rusqlite = { workspace = true }
+nix = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
