@@ -1,0 +1,19 @@
+syntax = "proto3";
+package rio.worker;
+
+import "types.proto";
+
+// Worker-facing RPCs served by the rio-scheduler process.
+// Separated from SchedulerService for distinct auth/rate-limiting interceptors
+// and independent evolution. Both services run in the same scheduler binary.
+service WorkerService {
+  // Bidirectional stream for build execution.
+  // Scheduler sends: WorkAssignment, CancelSignal, PrefetchHint
+  // Worker sends: WorkAssignmentAck, BuildLogBatch, CompletionReport, ProgressUpdate
+  rpc BuildExecution(stream rio.types.WorkerMessage) returns (stream rio.types.SchedulerMessage);
+
+  // Periodic heartbeat with worker capabilities and resource usage.
+  // Worker registration is implicit: the scheduler creates the worker entry when
+  // it receives a heartbeat from a worker_id that also has an open BuildExecution stream.
+  rpc Heartbeat(rio.types.HeartbeatRequest) returns (rio.types.HeartbeatResponse);
+}

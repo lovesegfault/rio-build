@@ -1,0 +1,37 @@
+syntax = "proto3";
+package rio.store;
+
+import "types.proto";
+
+// Store service for NAR storage and path metadata.
+// Inspired by tvix castore/store protos (MIT).
+service StoreService {
+  // Upload a store path (metadata + streaming NAR data).
+  rpc PutPath(stream rio.types.PutPathRequest) returns (rio.types.PutPathResponse);
+
+  // Download a store path's NAR data (streaming).
+  rpc GetPath(rio.types.GetPathRequest) returns (stream rio.types.GetPathResponse);
+
+  // Query metadata for a single store path.
+  rpc QueryPathInfo(rio.types.QueryPathInfoRequest) returns (rio.types.PathInfo);
+
+  // Batch check which paths are missing from the store.
+  rpc FindMissingPaths(rio.types.FindMissingPathsRequest) returns (rio.types.FindMissingPathsResponse);
+
+  // Content-addressed lookup: find a store path by its content hash.
+  // Phase 2a: returns UNIMPLEMENTED (no CA cutoff).
+  rpc ContentLookup(rio.types.ContentLookupRequest) returns (rio.types.ContentLookupResponse);
+}
+
+// Chunk-level storage service for content-defined chunking.
+// Phase 2a: all RPCs return UNIMPLEMENTED (full NARs only, no chunking).
+service ChunkService {
+  // Upload a chunk.
+  rpc PutChunk(stream rio.types.PutChunkRequest) returns (rio.types.PutChunkResponse);
+
+  // Download a chunk by its digest.
+  rpc GetChunk(rio.types.GetChunkRequest) returns (stream rio.types.GetChunkResponse);
+
+  // Batch check which chunks are missing from the store.
+  rpc FindMissingChunks(rio.types.FindMissingChunksRequest) returns (rio.types.FindMissingChunksResponse);
+}
