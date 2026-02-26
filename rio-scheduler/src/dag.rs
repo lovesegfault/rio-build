@@ -287,6 +287,40 @@ impl DerivationDag {
         orphaned
     }
 
+    /// Remove a build's interest from all its derivations, and reap (delete)
+    /// any nodes that are now orphaned (no builds interested) AND in a terminal
+    /// state. Returns the number of nodes reaped.
+    ///
+    /// This prevents unbounded DAG growth for long-running schedulers.
+    /// Non-terminal orphaned nodes are preserved (they may be mid-build for
+    /// a different code path, though this shouldn't happen in practice).
+    pub fn remove_build_interest_and_reap(&mut self, build_id: Uuid) -> usize {
+        let mut to_reap = Vec::new();
+
+        for (hash, state) in &mut self.nodes {
+            state.interested_builds.remove(&build_id);
+            if state.interested_builds.is_empty() && state.status().is_terminal() {
+                to_reap.push(hash.clone());
+            }
+        }
+
+        let reaped = to_reap.len();
+        for hash in to_reap {
+            self.nodes.remove(&hash);
+            self.children.remove(&hash);
+            self.parents.remove(&hash);
+            // Also scrub this hash from other nodes' edge sets.
+            for children in self.children.values_mut() {
+                children.remove(&hash);
+            }
+            for parents in self.parents.values_mut() {
+                parents.remove(&hash);
+            }
+        }
+
+        reaped
+    }
+
     /// Determine initial states for newly merged derivations.
     ///
     /// Derivations with no incomplete dependencies go to Queued, then
