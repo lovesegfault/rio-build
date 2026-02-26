@@ -242,8 +242,9 @@ pub struct DerivationState {
     pub output_names: Vec<String>,
     /// Whether this is a fixed-output derivation (fetchurl, etc.).
     pub is_fixed_output: bool,
-    /// Current state machine status.
-    pub status: DerivationStatus,
+    /// Current state machine status. Private: mutate only via `transition()`,
+    /// `reset_to_ready()`, or `reset_from_poison()` to preserve invariants.
+    status: DerivationStatus,
     /// Set of build IDs interested in this derivation.
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
@@ -286,6 +287,11 @@ impl DerivationState {
         }
     }
 
+    /// Current status (read-only). Use `transition()` etc. to mutate.
+    pub fn status(&self) -> DerivationStatus {
+        self.status
+    }
+
     /// Attempt to transition to a new status. Returns the old status on success.
     pub fn transition(
         &mut self,
@@ -301,6 +307,50 @@ impl DerivationState {
 
         self.status = to;
         Ok(from)
+    }
+
+    /// Worker-lost recovery. Transitions Assigned -> Ready, or Running -> Failed -> Ready.
+    /// Clears `assigned_worker`. Returns error if not in Assigned or Running state.
+    ///
+    /// Running -> Ready is not a valid direct transition, so Running goes through
+    /// Failed first (this is a failed build attempt that the caller should count
+    /// as a retry).
+    pub fn reset_to_ready(&mut self) -> Result<(), TransitionError> {
+        match self.status {
+            DerivationStatus::Assigned => {
+                self.transition(DerivationStatus::Ready)?;
+            }
+            DerivationStatus::Running => {
+                self.transition(DerivationStatus::Failed)?;
+                self.transition(DerivationStatus::Ready)?;
+            }
+            _ => {
+                return Err(TransitionError::Invalid {
+                    from: self.status,
+                    to: DerivationStatus::Ready,
+                    reason: "reset_to_ready only valid from Assigned or Running",
+                });
+            }
+        }
+        self.assigned_worker = None;
+        Ok(())
+    }
+
+    /// Poison TTL expiry. Transitions Poisoned -> Created and clears poison state.
+    pub fn reset_from_poison(&mut self) -> Result<(), TransitionError> {
+        self.transition(DerivationStatus::Created)?;
+        self.poisoned_at = None;
+        self.retry_count = 0;
+        self.failed_workers.clear();
+        Ok(())
+    }
+
+    /// Test-only: directly set status bypassing state machine validation.
+    /// For setting up test preconditions where the full transition chain
+    /// would be verbose noise.
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&mut self, status: DerivationStatus) {
+        self.status = status;
     }
 }
 
@@ -346,7 +396,7 @@ pub struct BuildOptions {
 pub struct WorkerState {
     /// Unique worker ID (from pod UID).
     pub worker_id: String,
-    /// Target system (e.g. "x86_64-linux").
+    /// Target system (e.g. "x86_64-linux"). Set on first heartbeat.
     pub system: Option<String>,
     /// Features this worker supports.
     pub supported_features: Vec<String>,
@@ -355,9 +405,8 @@ pub struct WorkerState {
     /// Derivation hashes currently being built by this worker.
     pub running_builds: HashSet<String>,
     /// Channel to send scheduler messages (assignments, cancels) to the worker.
+    /// Set when the BuildExecution stream opens.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<rio_proto::types::SchedulerMessage>>,
-    /// Whether we have received both a stream connection and a heartbeat.
-    pub is_registered: bool,
     /// Timestamp of last heartbeat (for timeout detection).
     pub last_heartbeat: Instant,
     /// Number of consecutive missed heartbeats.
@@ -365,14 +414,21 @@ pub struct WorkerState {
 }
 
 impl WorkerState {
+    /// Whether we have received both a stream connection and a heartbeat.
+    /// Derived from `stream_tx.is_some() && system.is_some()` — no manual
+    /// bookkeeping, so the two channels can't get out of sync.
+    pub fn is_registered(&self) -> bool {
+        self.stream_tx.is_some() && self.system.is_some()
+    }
+
     /// Whether this worker has available build capacity.
     pub fn has_capacity(&self) -> bool {
-        self.is_registered && (self.running_builds.len() as u32) < self.max_builds
+        self.is_registered() && (self.running_builds.len() as u32) < self.max_builds
     }
 
     /// Whether this worker can build the given derivation based on system and features.
     pub fn can_build(&self, system: &str, required_features: &[String]) -> bool {
-        if !self.is_registered {
+        if !self.is_registered() {
             return false;
         }
         // System must match
@@ -490,10 +546,109 @@ mod tests {
         // Terminal -> non-terminal (except poisoned -> created)
         assert!(Completed.validate_transition(Created).is_err());
         assert!(Completed.validate_transition(Running).is_err());
+        assert!(Completed.validate_transition(Ready).is_err());
+        assert!(Completed.validate_transition(Queued).is_err());
 
         // Skip states
         assert!(Created.validate_transition(Running).is_err());
+        assert!(Created.validate_transition(Ready).is_err());
+        assert!(Created.validate_transition(Assigned).is_err());
         assert!(Queued.validate_transition(Assigned).is_err());
+        assert!(Queued.validate_transition(Running).is_err());
+        assert!(Ready.validate_transition(Running).is_err());
+        assert!(Ready.validate_transition(Completed).is_err());
+
+        // Running -> Ready is NOT valid (must go through Failed)
+        assert!(Running.validate_transition(Ready).is_err());
+        assert!(Running.validate_transition(Queued).is_err());
+        assert!(Running.validate_transition(Assigned).is_err());
+
+        // Failed can only go to Ready
+        assert!(Failed.validate_transition(Running).is_err());
+        assert!(Failed.validate_transition(Completed).is_err());
+        assert!(Failed.validate_transition(Queued).is_err());
+
+        // Poisoned can only go to Created (TTL expiry) or stay Poisoned
+        assert!(Poisoned.validate_transition(Ready).is_err());
+        assert!(Poisoned.validate_transition(Running).is_err());
+        assert!(Poisoned.validate_transition(Failed).is_err());
+
+        // Non-terminal self-transitions are invalid
+        assert!(Created.validate_transition(Created).is_err());
+        assert!(Queued.validate_transition(Queued).is_err());
+        assert!(Ready.validate_transition(Ready).is_err());
+        assert!(Assigned.validate_transition(Assigned).is_err());
+        assert!(Running.validate_transition(Running).is_err());
+        assert!(Failed.validate_transition(Failed).is_err());
+    }
+
+    #[test]
+    fn test_reset_to_ready() {
+        let node = rio_proto::types::DerivationNode {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            pname: String::new(),
+            system: "x86_64-linux".into(),
+            required_features: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+        };
+
+        // Assigned -> Ready: direct valid transition
+        let mut state = DerivationState::from_node(&node);
+        state.set_status_for_test(DerivationStatus::Assigned);
+        state.assigned_worker = Some("w1".into());
+        assert!(state.reset_to_ready().is_ok());
+        assert_eq!(state.status(), DerivationStatus::Ready);
+        assert!(state.assigned_worker.is_none());
+
+        // Running -> Failed -> Ready: goes through Failed
+        let mut state = DerivationState::from_node(&node);
+        state.set_status_for_test(DerivationStatus::Running);
+        state.assigned_worker = Some("w1".into());
+        assert!(state.reset_to_ready().is_ok());
+        assert_eq!(state.status(), DerivationStatus::Ready);
+        assert!(state.assigned_worker.is_none());
+
+        // Invalid source states rejected
+        let mut state = DerivationState::from_node(&node);
+        state.set_status_for_test(DerivationStatus::Queued);
+        assert!(state.reset_to_ready().is_err());
+
+        let mut state = DerivationState::from_node(&node);
+        state.set_status_for_test(DerivationStatus::Completed);
+        assert!(state.reset_to_ready().is_err());
+    }
+
+    #[test]
+    fn test_reset_from_poison() {
+        let node = rio_proto::types::DerivationNode {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            pname: String::new(),
+            system: "x86_64-linux".into(),
+            required_features: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+        };
+
+        let mut state = DerivationState::from_node(&node);
+        state.set_status_for_test(DerivationStatus::Poisoned);
+        state.poisoned_at = Some(Instant::now());
+        state.retry_count = 5;
+        state.failed_workers.insert("w1".into());
+        state.failed_workers.insert("w2".into());
+
+        assert!(state.reset_from_poison().is_ok());
+        assert_eq!(state.status(), DerivationStatus::Created);
+        assert!(state.poisoned_at.is_none());
+        assert_eq!(state.retry_count, 0);
+        assert!(state.failed_workers.is_empty());
+
+        // Non-poisoned state rejected
+        let mut state = DerivationState::from_node(&node);
+        state.set_status_for_test(DerivationStatus::Running);
+        assert!(state.reset_from_poison().is_err());
     }
 
     #[test]

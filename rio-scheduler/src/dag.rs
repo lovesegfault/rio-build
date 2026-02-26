@@ -11,6 +11,13 @@ use uuid::Uuid;
 
 use crate::state::{DerivationState, DerivationStatus};
 
+/// Errors from DAG operations.
+#[derive(Debug, thiserror::Error)]
+pub enum DagError {
+    #[error("dependency cycle detected")]
+    CycleDetected,
+}
+
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug)]
 pub struct DerivationDag {
@@ -38,13 +45,18 @@ impl DerivationDag {
     ///
     /// Returns the list of drv_hashes that were newly inserted (not already present).
     /// Existing nodes get the new `build_id` added to their `interested_builds` set.
+    ///
+    /// If the merge would create a cycle, returns `Err(DagError::CycleDetected)`
+    /// and rolls back all newly-inserted nodes and edges.
     pub fn merge(
         &mut self,
         build_id: Uuid,
         nodes: &[rio_proto::types::DerivationNode],
         edges: &[rio_proto::types::DerivationEdge],
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, DagError> {
         let mut newly_inserted = Vec::new();
+        // Track newly-inserted edges for rollback (pairs of hashes)
+        let mut new_edges: Vec<(String, String)> = Vec::new();
 
         // Insert or update nodes
         for node in nodes {
@@ -93,17 +105,93 @@ impl DerivationDag {
                 }
             };
 
-            self.children
+            let inserted_child = self
+                .children
                 .entry(parent_hash.clone())
                 .or_default()
                 .insert(child_hash.clone());
             self.parents
-                .entry(child_hash)
+                .entry(child_hash.clone())
                 .or_default()
-                .insert(parent_hash);
+                .insert(parent_hash.clone());
+
+            if inserted_child {
+                new_edges.push((parent_hash, child_hash));
+            }
         }
 
-        newly_inserted
+        // Cycle check: DFS from each newly-inserted node. Three-color marking.
+        let mut color: HashMap<String, u8> = HashMap::new();
+        for start in &newly_inserted {
+            if self.has_cycle_from(start, &mut color) {
+                // Rollback: remove newly-inserted edges and nodes
+                self.rollback_merge(&newly_inserted, &new_edges, build_id);
+                return Err(DagError::CycleDetected);
+            }
+        }
+
+        Ok(newly_inserted)
+    }
+
+    /// DFS cycle detection with three-color marking.
+    /// color: 0=white (unvisited), 1=gray (in stack), 2=black (done).
+    /// A back-edge to a gray node indicates a cycle.
+    fn has_cycle_from(&self, start: &str, color: &mut HashMap<String, u8>) -> bool {
+        match color.get(start) {
+            Some(1) => return true,  // back edge = cycle
+            Some(2) => return false, // already fully explored
+            _ => {}
+        }
+        color.insert(start.to_string(), 1);
+        if let Some(children) = self.children.get(start) {
+            for child in children {
+                if self.has_cycle_from(child, color) {
+                    return true;
+                }
+            }
+        }
+        color.insert(start.to_string(), 2);
+        false
+    }
+
+    /// Rollback a failed merge: remove newly-inserted nodes, edges, and build interest.
+    fn rollback_merge(
+        &mut self,
+        newly_inserted: &[String],
+        new_edges: &[(String, String)],
+        build_id: Uuid,
+    ) {
+        // Remove newly-inserted edges
+        for (parent, child) in new_edges {
+            if let Some(children) = self.children.get_mut(parent) {
+                children.remove(child);
+                if children.is_empty() {
+                    self.children.remove(parent);
+                }
+            }
+            if let Some(parents) = self.parents.get_mut(child) {
+                parents.remove(parent);
+                if parents.is_empty() {
+                    self.parents.remove(child);
+                }
+            }
+        }
+
+        // Remove newly-inserted nodes
+        let newly_set: HashSet<&str> = newly_inserted.iter().map(|s| s.as_str()).collect();
+        for hash in newly_inserted {
+            self.nodes.remove(hash);
+            // Also clean up any edge entries keyed on this hash
+            self.children.remove(hash);
+            self.parents.remove(hash);
+        }
+
+        // For pre-existing nodes that got this build's interest added, remove it
+        for state in self.nodes.values_mut() {
+            if !newly_set.contains(state.drv_hash.as_str()) {
+                state.interested_builds.remove(&build_id);
+            }
+        }
     }
 
     /// Check whether all dependencies of a derivation are completed.
@@ -116,7 +204,7 @@ impl DerivationDag {
         children.iter().all(|child_hash| {
             self.nodes
                 .get(child_hash)
-                .is_some_and(|n| n.status == DerivationStatus::Completed)
+                .is_some_and(|n| n.status() == DerivationStatus::Completed)
         })
     }
 
@@ -135,7 +223,7 @@ impl DerivationDag {
 
         for parent_hash in self.get_parents(completed_hash) {
             if let Some(node) = self.nodes.get(&parent_hash)
-                && node.status == DerivationStatus::Queued
+                && node.status() == DerivationStatus::Queued
                 && self.all_deps_completed(&parent_hash)
             {
                 ready.push(parent_hash);
@@ -161,7 +249,7 @@ impl DerivationDag {
 
         for (hash, state) in &mut self.nodes {
             state.interested_builds.remove(&build_id);
-            if state.interested_builds.is_empty() && !state.status.is_terminal() {
+            if state.interested_builds.is_empty() && !state.status().is_terminal() {
                 orphaned.push(hash.clone());
             }
         }
@@ -230,7 +318,7 @@ impl DerivationDag {
                 continue;
             }
             summary.total += 1;
-            match state.status {
+            match state.status() {
                 DerivationStatus::Completed => summary.completed += 1,
                 DerivationStatus::Running => summary.running += 1,
                 DerivationStatus::Assigned => summary.running += 1,
@@ -328,7 +416,7 @@ mod tests {
         let nodes = vec![make_node("hash1", "/nix/store/hash1.drv", "x86_64-linux")];
         let edges = vec![];
 
-        let newly = dag.merge(build_id, &nodes, &edges);
+        let newly = dag.merge(build_id, &nodes, &edges).unwrap();
         assert_eq!(newly.len(), 1);
         assert!(dag.nodes.contains_key("hash1"));
         assert!(dag.nodes["hash1"].interested_builds.contains(&build_id));
@@ -341,10 +429,10 @@ mod tests {
         let build2 = Uuid::new_v4();
         let nodes = vec![make_node("hash1", "/nix/store/hash1.drv", "x86_64-linux")];
 
-        let newly1 = dag.merge(build1, &nodes, &[]);
+        let newly1 = dag.merge(build1, &nodes, &[]).unwrap();
         assert_eq!(newly1.len(), 1);
 
-        let newly2 = dag.merge(build2, &nodes, &[]);
+        let newly2 = dag.merge(build2, &nodes, &[]).unwrap();
         assert_eq!(newly2.len(), 0); // Already exists
 
         let node = &dag.nodes["hash1"];
@@ -367,7 +455,7 @@ mod tests {
             make_edge("/nix/store/a.drv", "/nix/store/c.drv"),
         ];
 
-        dag.merge(build_id, &nodes, &edges);
+        dag.merge(build_id, &nodes, &edges).unwrap();
 
         // A has deps, B and C don't
         assert!(!dag.all_deps_completed("hashA"));
@@ -390,7 +478,7 @@ mod tests {
         ];
         let edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
 
-        let newly = dag.merge(build_id, &nodes, &edges);
+        let newly = dag.merge(build_id, &nodes, &edges).unwrap();
         let states = dag.compute_initial_states(&newly);
 
         // B has no deps -> Ready; A has dep on B -> Queued
@@ -413,11 +501,17 @@ mod tests {
         ];
         let edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
 
-        dag.merge(build_id, &nodes, &edges);
+        dag.merge(build_id, &nodes, &edges).unwrap();
 
         // Set B to completed, A to queued
-        dag.nodes.get_mut("hashB").unwrap().status = DerivationStatus::Completed;
-        dag.nodes.get_mut("hashA").unwrap().status = DerivationStatus::Queued;
+        dag.nodes
+            .get_mut("hashB")
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Completed);
+        dag.nodes
+            .get_mut("hashA")
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Queued);
 
         let ready = dag.find_newly_ready("hashB");
         assert_eq!(ready, vec!["hashA".to_string()]);
@@ -438,7 +532,7 @@ mod tests {
             make_edge("/nix/store/b.drv", "/nix/store/a.drv"),
         ];
 
-        dag.merge(build_id, &nodes, &edges);
+        dag.merge(build_id, &nodes, &edges).unwrap();
         let order = dag.topological_order();
 
         // A must come before B, B before C
@@ -447,5 +541,86 @@ mod tests {
         let pos_c = order.iter().position(|h| h == "hashC").unwrap();
         assert!(pos_a < pos_b);
         assert!(pos_b < pos_c);
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 2: Cycle detection
+    // -----------------------------------------------------------------------
+
+    /// A cyclic DAG should be rejected, with all newly-inserted nodes rolled back.
+    #[test]
+    fn test_merge_rejects_cycle() {
+        let mut dag = DerivationDag::new();
+        let build_id = Uuid::new_v4();
+
+        // A depends on B, B depends on A — cycle
+        let nodes = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        ];
+        let edges = vec![
+            make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
+            make_edge("/nix/store/b.drv", "/nix/store/a.drv"), // cycle!
+        ];
+
+        let result = dag.merge(build_id, &nodes, &edges);
+        assert!(result.is_err(), "cyclic DAG should be rejected");
+        assert_eq!(
+            dag.nodes.len(),
+            0,
+            "no nodes should remain after cycle rollback"
+        );
+        assert_eq!(dag.children.len(), 0, "edges should be rolled back");
+        assert_eq!(dag.parents.len(), 0, "edges should be rolled back");
+    }
+
+    /// An indirect cycle (A -> B -> C -> A) should also be detected.
+    #[test]
+    fn test_merge_rejects_indirect_cycle() {
+        let mut dag = DerivationDag::new();
+        let build_id = Uuid::new_v4();
+
+        let nodes = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+            make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        ];
+        // A depends on B, B depends on C, C depends on A — indirect cycle
+        let edges = vec![
+            make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
+            make_edge("/nix/store/b.drv", "/nix/store/c.drv"),
+            make_edge("/nix/store/c.drv", "/nix/store/a.drv"),
+        ];
+
+        let result = dag.merge(build_id, &nodes, &edges);
+        assert!(result.is_err(), "indirect cycle should be rejected");
+        assert_eq!(dag.nodes.len(), 0);
+    }
+
+    /// A valid DAG merged after a cycle-rejected attempt should succeed.
+    #[test]
+    fn test_merge_after_cycle_rollback() {
+        let mut dag = DerivationDag::new();
+        let build_id = Uuid::new_v4();
+
+        // First: try to insert a cycle (should fail and rollback)
+        let cyclic_nodes = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        ];
+        let cyclic_edges = vec![
+            make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
+            make_edge("/nix/store/b.drv", "/nix/store/a.drv"),
+        ];
+        assert!(dag.merge(build_id, &cyclic_nodes, &cyclic_edges).is_err());
+
+        // Second: insert a valid DAG with the same nodes (should succeed)
+        let valid_edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
+        let result = dag.merge(build_id, &cyclic_nodes, &valid_edges);
+        assert!(
+            result.is_ok(),
+            "valid merge after rollback should succeed: {result:?}"
+        );
+        assert_eq!(dag.nodes.len(), 2);
     }
 }
