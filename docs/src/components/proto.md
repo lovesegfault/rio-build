@@ -109,6 +109,9 @@ message HeartbeatRequest {
   repeated string running_builds = 2;
   ResourceUsage resources = 3;
   BloomFilter local_paths = 4;     // Bloom filter of cached store paths
+  string system = 5;               // Worker's system (e.g. "x86_64-linux")
+  repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
+  uint32 max_builds = 7;           // Maximum concurrent builds this worker accepts
 }
 
 message BloomFilter {
@@ -196,7 +199,7 @@ message DerivationEdge {
 
 > **Tenant identification:** `tenant_id` is set by the gateway from the SSH key -> tenant mapping, not from client-provided data. The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`) for downstream authorization checks.
 
-> **BuildResultStatus ↔ Nix BuildStatus mapping:** The gRPC `BuildResultStatus` enum is a superset of Nix's wire `BuildStatus`. Values 0-14 map 1:1 to Nix (`Built`, `Substituted`, ..., `NoSubstituters`). The gRPC enum adds `InfrastructureFailure` (worker-internal errors: daemon crash, overlay failure) which has no Nix equivalent — the gateway maps it to `TransientFailure` (6) when forwarding to the Nix client.
+> **BuildResultStatus ↔ Nix BuildStatus mapping:** The gRPC `BuildResultStatus` enum is a **subset** of Nix's wire `BuildStatus` with a different numbering scheme. The proto enum has `UNSPECIFIED=0` (proto3 default), then `BUILT=1`, `SUBSTITUTED=2`, `ALREADY_VALID=3`, `PERMANENT_FAILURE=4`, `TRANSIENT_FAILURE=5`, `CACHED_FAILURE=6`, `DEPENDENCY_FAILED=7`, `LOG_LIMIT_EXCEEDED=8`, `OUTPUT_REJECTED=9`, `INFRASTRUCTURE_FAILURE=10`. This differs from Nix's wire values (where `TransientFailure=6`, `DependencyFailed=10`). The worker (`executor.rs`) and gateway translate explicitly; they do NOT map 1:1. The proto enum is currently missing `InputRejected`, `TimedOut`, `MiscFailure`, `NotDeterministic`, `ResolvesToAlreadyValid`, and `NoSubstituters` — these Nix statuses currently round-trip through `PERMANENT_FAILURE` or `TRANSIENT_FAILURE` in the gRPC layer. `InfrastructureFailure` is gRPC-only (worker-internal errors: daemon crash, overlay failure); the gateway maps it to Nix `TransientFailure` (6).
 
 ### WatchBuildRequest
 
