@@ -11,7 +11,7 @@ use rio_nix::store_path::StorePath;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types;
 use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::handler::{ClientOptions, resolve_derivation};
 
@@ -62,45 +62,30 @@ pub async fn reconstruct_dag(
             });
 
             if visited.insert(child_path_str.clone()) {
-                // Resolve this child derivation
-                let child_sp = match StorePath::parse(child_path_str) {
-                    Ok(sp) => sp,
-                    Err(e) => {
-                        warn!(
-                            path = %child_path_str,
-                            error = %e,
-                            "invalid inputDrv store path, skipping"
-                        );
-                        continue;
-                    }
-                };
+                // Resolve this child derivation.
+                // An unparseable store path here means the parent .drv is
+                // corrupt — fail hard rather than silently dropping the edge
+                // (which would leave the DAG incomplete and cause a confusing
+                // "edge references unknown node" error downstream).
+                let child_sp = StorePath::parse(child_path_str).map_err(|e| {
+                    anyhow::anyhow!(
+                        "corrupted derivation '{drv_path}': invalid inputDrv path '{child_path_str}': {e}"
+                    )
+                })?;
 
-                match resolve_derivation(&child_sp, store_client, drv_cache).await {
-                    Ok(child_drv) => {
-                        queue.push_back((child_sp, child_drv));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            path = %child_path_str,
-                            error = %e,
-                            "failed to resolve inputDrv, including as leaf node"
-                        );
-                        // Include as a leaf node without further traversal.
-                        // Use drv_path as drv_hash fallback to ensure uniqueness
-                        // (empty hash would collide if multiple children failed).
-                        nodes.push(types::DerivationNode {
-                            drv_path: child_path_str.clone(),
-                            drv_hash: child_path_str.clone(),
-                            pname: String::new(),
-                            system: String::new(),
-                            required_features: Vec::new(),
-                            output_names: Vec::new(),
-                            is_fixed_output: false,
-                            // Unknown — couldn't parse the derivation.
-                            expected_output_paths: Vec::new(),
-                        });
-                    }
-                }
+                // If the child can't be resolved (store unreachable, .drv
+                // missing from store), the build cannot proceed: a stub leaf
+                // with system="" would never match any worker and hang forever.
+                // Fail now with a clear error.
+                let child_drv = resolve_derivation(&child_sp, store_client, drv_cache)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "cannot resolve dependency '{child_path_str}' of '{drv_path}': {e} \
+                             (store unreachable or .drv missing; build cannot proceed)"
+                        )
+                    })?;
+                queue.push_back((child_sp, child_drv));
             }
         }
     }
@@ -261,13 +246,10 @@ mod tests {
 
     use rio_proto::store::store_service_client::StoreServiceClient;
 
-    /// Spin up a mock store that returns NOT_FOUND for everything.
-    /// Used only for the leaf-fallback test; other tests pre-populate drv_cache.
+    /// Spin up a mock store that fails all RPCs (lazy connect to dead port).
+    /// Used to verify reconstruct_dag fails hard on unresolvable inputDrvs.
     async fn unreachable_store() -> StoreServiceClient<tonic::transport::Channel> {
-        // Connect to a port that isn't listening. Any RPC will fail, which
-        // we want for testing the leaf-fallback path.
-        // Actually, we need a WORKING transport but a server that returns NOT_FOUND.
-        // Simplest: use a lazy channel that never connects.
+        // Lazy channel to a dead port — any RPC will fail.
         let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
         StoreServiceClient::new(channel)
     }
@@ -345,8 +327,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconstruct_dag_missing_drv_leaf_fallback() {
-        // inputDrv not in cache AND store unreachable -> leaf node fallback.
+    async fn test_reconstruct_dag_unresolvable_inputdrv_fails() {
+        // inputDrv not in cache AND store unreachable -> hard failure.
+        // Previously this produced a stub leaf with system:"" that never
+        // matched any worker, causing a silent hang. Now it fails immediately.
         let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
         let missing_child = "/nix/store/cccccccccccccccccccccccccccccccc-missing.drv";
 
@@ -356,25 +340,47 @@ mod tests {
         let mut store = unreachable_store().await;
         let mut cache = HashMap::new(); // child NOT in cache
 
-        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
-            .await
-            .expect("reconstruct should not panic on missing drv");
+        let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
 
-        // Root + leaf fallback = 2 nodes. Edge still recorded.
-        assert_eq!(
-            nodes.len(),
-            2,
-            "root + leaf fallback for unresolvable child"
+        let err = result.expect_err("unresolvable inputDrv must fail reconstruct_dag");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot resolve dependency"),
+            "error should mention unresolvable dependency, got: {msg}"
         );
-        assert_eq!(edges.len(), 1);
+        assert!(
+            msg.contains(missing_child),
+            "error should include the missing child path, got: {msg}"
+        );
+        assert!(
+            msg.contains(&root_path.to_string()),
+            "error should include the parent drv path, got: {msg}"
+        );
+    }
 
-        // Leaf fallback node: drv_path set but system/pname empty.
-        let leaf = nodes
-            .iter()
-            .find(|n| n.drv_path == missing_child)
-            .expect("leaf fallback node should exist");
-        assert!(leaf.system.is_empty(), "leaf fallback has no system");
-        assert!(leaf.output_names.is_empty(), "leaf fallback has no outputs");
+    #[tokio::test]
+    async fn test_reconstruct_dag_invalid_inputdrv_path_fails() {
+        // inputDrv is not a valid store path -> hard failure (corrupt .drv).
+        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let bogus_child = "/not/a/store/path";
+
+        let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[(bogus_child, &["out"])]);
+
+        let mut store = unreachable_store().await;
+        let mut cache = HashMap::new();
+
+        let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
+
+        let err = result.expect_err("invalid inputDrv path must fail reconstruct_dag");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("corrupted derivation"),
+            "error should mention corruption, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid inputDrv path"),
+            "error should mention invalid path, got: {msg}"
+        );
     }
 
     #[tokio::test]
