@@ -186,24 +186,72 @@ impl DerivationDag {
         Ok(newly_inserted)
     }
 
-    /// DFS cycle detection with three-color marking.
+    /// Iterative DFS cycle detection with three-color marking.
     /// color: 0=white (unvisited), 1=gray (in stack), 2=black (done).
     /// A back-edge to a gray node indicates a cycle.
+    ///
+    /// Iterative (not recursive) to avoid stack overflow on deep chains:
+    /// MAX_DAG_NODES=100k × ~150B/frame ≈ 15MB >> 2MB default tokio stack.
     fn has_cycle_from(&self, start: &str, color: &mut HashMap<String, u8>) -> bool {
+        // Short-circuit if start already visited (color map persists across
+        // multiple has_cycle_from calls in merge()).
         match color.get(start) {
-            Some(1) => return true,  // back edge = cycle
-            Some(2) => return false, // already fully explored
+            Some(1) => return true,
+            Some(2) => return false,
             _ => {}
         }
+
+        // Explicit stack: each frame is (node, children_iterator_state).
+        // We store the child vec snapshot + index to resume iteration after
+        // returning from a child's subtree.
+        // Using Vec<String> snapshots avoids borrow-checker conflicts with
+        // `color.insert(node.to_string(), ...)` inside the loop.
+        struct Frame {
+            node: String,
+            children: Vec<String>,
+            next_child: usize,
+        }
+
+        let children_of = |n: &str| -> Vec<String> {
+            self.children
+                .get(n)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        let mut stack: Vec<Frame> = vec![Frame {
+            node: start.to_string(),
+            children: children_of(start),
+            next_child: 0,
+        }];
         color.insert(start.to_string(), 1);
-        if let Some(children) = self.children.get(start) {
-            for child in children {
-                if self.has_cycle_from(child, color) {
-                    return true;
+
+        while let Some(frame) = stack.last_mut() {
+            if frame.next_child < frame.children.len() {
+                let child = frame.children[frame.next_child].clone();
+                frame.next_child += 1;
+
+                match color.get(child.as_str()) {
+                    Some(1) => return true, // back edge → cycle
+                    Some(2) => continue,    // already fully explored
+                    _ => {
+                        // Unvisited: push a new frame (descend).
+                        color.insert(child.clone(), 1);
+                        let grandchildren = children_of(&child);
+                        stack.push(Frame {
+                            node: child,
+                            children: grandchildren,
+                            next_child: 0,
+                        });
+                    }
                 }
+            } else {
+                // All children visited: mark black and pop.
+                let done = stack.pop().expect("stack nonempty in else branch");
+                color.insert(done.node, 2);
             }
         }
-        color.insert(start.to_string(), 2);
+
         false
     }
 
@@ -949,5 +997,77 @@ mod tests {
         );
         // B is not terminal, so it survives reaping.
         assert_eq!(dag.hash_for_path("/nix/store/b.drv"), Some("hashB"));
+    }
+
+    /// Regression test for stack overflow in the recursive DFS cycle check.
+    /// The recursive version blew the ~2MB tokio stack at ~10-15k depth.
+    /// The iterative version should handle arbitrary depth bounded only by heap.
+    #[test]
+    fn test_cycle_detection_deep_linear_chain_no_overflow() {
+        let mut dag = DerivationDag::new();
+        let build_id = Uuid::new_v4();
+
+        // 10k-node linear chain: node[i] depends on node[i+1].
+        // No cycle. With the old recursive DFS, this recursed 10k frames
+        // (~1.5MB) which was close to the stack limit; 50k would panic.
+        const DEPTH: usize = 10_000;
+        let nodes: Vec<_> = (0..DEPTH)
+            .map(|i| {
+                make_node(
+                    &format!("hash{i:05}"),
+                    &format!("/nix/store/{i:032}-n{i}.drv"),
+                    "x86_64-linux",
+                )
+            })
+            .collect();
+        let edges: Vec<_> = (0..DEPTH - 1)
+            .map(|i| {
+                make_edge(
+                    &format!("/nix/store/{i:032}-n{i}.drv"),
+                    &format!("/nix/store/{:032}-n{}.drv", i + 1, i + 1),
+                )
+            })
+            .collect();
+
+        // Must not panic (stack overflow) and must succeed (no cycle).
+        let result = dag.merge(build_id, &nodes, &edges);
+        assert!(result.is_ok(), "acyclic deep chain should merge");
+        assert_eq!(dag.nodes.len(), DEPTH);
+    }
+
+    /// Deep chain with a back-edge at the very end: cycle must be detected
+    /// at depth.
+    #[test]
+    fn test_cycle_detection_deep_chain_with_back_edge() {
+        let mut dag = DerivationDag::new();
+        let build_id = Uuid::new_v4();
+
+        const DEPTH: usize = 5_000;
+        let nodes: Vec<_> = (0..DEPTH)
+            .map(|i| {
+                make_node(
+                    &format!("hash{i:05}"),
+                    &format!("/nix/store/{i:032}-n{i}.drv"),
+                    "x86_64-linux",
+                )
+            })
+            .collect();
+        let mut edges: Vec<_> = (0..DEPTH - 1)
+            .map(|i| {
+                make_edge(
+                    &format!("/nix/store/{i:032}-n{i}.drv"),
+                    &format!("/nix/store/{:032}-n{}.drv", i + 1, i + 1),
+                )
+            })
+            .collect();
+        // Back-edge from the deepest node to the root: cycle.
+        edges.push(make_edge(
+            &format!("/nix/store/{:032}-n{}.drv", DEPTH - 1, DEPTH - 1),
+            &format!("/nix/store/{:032}-n{}.drv", 0, 0),
+        ));
+
+        let result = dag.merge(build_id, &nodes, &edges);
+        assert!(result.is_err(), "cycle at depth must be detected");
+        assert_eq!(dag.nodes.len(), 0, "rollback must clear all nodes");
     }
 }
