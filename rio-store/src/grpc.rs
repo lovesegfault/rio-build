@@ -136,12 +136,28 @@ impl StoreService for StoreServiceImpl {
             return Err(Status::internal(format!("database error: {e}")));
         }
 
-        // Step 4: Stream NAR data through HashingReader to backend
-        // Collect all NAR chunks from the stream
+        // Step 4: Stream NAR data through HashingReader to backend.
+        // Bound accumulation by declared nar_size + tolerance to prevent a
+        // malicious/buggy client from OOMing the server.
+        const NAR_SIZE_TOLERANCE: u64 = 4096;
+        let max_allowed = info.nar_size.saturating_add(NAR_SIZE_TOLERANCE);
         let mut nar_data = Vec::with_capacity(info.nar_size as usize);
         while let Some(msg) = stream.message().await? {
             match msg.msg {
                 Some(put_path_request::Msg::NarChunk(chunk)) => {
+                    let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
+                    if new_len > max_allowed {
+                        warn!(
+                            store_path = %info.store_path,
+                            declared = info.nar_size,
+                            received = new_len,
+                            "PutPath: NAR chunks exceed declared size, rejecting"
+                        );
+                        return Err(Status::invalid_argument(format!(
+                            "NAR chunks exceed declared nar_size {} (received {}+ bytes)",
+                            info.nar_size, new_len
+                        )));
+                    }
                     nar_data.extend_from_slice(&chunk);
                 }
                 Some(put_path_request::Msg::Metadata(_)) => {
