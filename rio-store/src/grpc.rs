@@ -74,7 +74,7 @@ impl StoreService for StoreServiceImpl {
     /// 1. Receive first message: PutPathMetadata with PathInfo
     /// 2. Check idempotency: if path already complete, return success
     /// 3. Insert nar_blobs row with status='uploading'
-    /// 4. Stream NAR data through HashingReader to backend
+    /// 4. Accumulate NAR chunks (bounded by declared size + tolerance)
     /// 5. Verify SHA-256 matches declared nar_hash
     /// 6. Complete upload: update narinfo + flip status to 'complete'
     #[instrument(skip(self, request), fields(rpc = "PutPath"))]
@@ -164,7 +164,7 @@ impl StoreService for StoreServiceImpl {
             return Err(internal_error("PutPath: insert_uploading", e));
         }
 
-        // Step 4: Stream NAR data through HashingReader to backend.
+        // Step 4: Accumulate NAR chunks into a buffer.
         // Bound accumulation by declared nar_size + tolerance to prevent a
         // malicious/buggy client from OOMing the server.
         const NAR_SIZE_TOLERANCE: u64 = 4096;
@@ -197,13 +197,11 @@ impl StoreService for StoreServiceImpl {
             }
         }
 
-        // Step 5: Verify SHA-256 via HashingReader
-        let mut hashing = HashingReader::new(std::io::Cursor::new(&nar_data));
-        let mut buf = Vec::with_capacity(nar_data.len());
-        if let Err(e) = hashing.read_to_end(&mut buf).await {
-            return Err(internal_error("NAR read", e));
-        }
-        let digest = hashing.into_digest();
+        // Step 5: Verify SHA-256. The NAR is already fully buffered in memory,
+        // so use from_bytes (single pass over the slice) instead of wrapping in
+        // a HashingReader + read_to_end into a second Vec (peak ~8 GiB for a
+        // 4 GiB NAR).
+        let digest = crate::validate::NarDigest::from_bytes(&nar_data);
 
         if let Err(e) = validate_nar_digest(&digest, &info.nar_hash, info.nar_size) {
             warn!(

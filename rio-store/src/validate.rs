@@ -30,7 +30,6 @@ pub struct NarDigest {
 
 impl NarDigest {
     /// Compute a digest from an already-buffered NAR.
-    #[allow(dead_code)] // used by validate_nar and tests; needed by future Store backends
     pub fn from_bytes(data: &[u8]) -> Self {
         Self {
             sha256: Sha256::digest(data).into(),
