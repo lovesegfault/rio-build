@@ -3685,6 +3685,8 @@ dependencies = [
  "rand 0.9.2",
  "rio-common",
  "rio-proto",
+ "rio-store",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",

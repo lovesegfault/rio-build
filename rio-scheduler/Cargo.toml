@@ -30,3 +30,5 @@ prost-types = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+rio-store = { path = "../rio-store" }
+sha2 = { workspace = true }

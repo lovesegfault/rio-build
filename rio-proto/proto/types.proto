@@ -17,6 +17,11 @@ message DerivationNode {
   repeated string required_features = 5;    // requiredSystemFeatures
   repeated string output_names = 6;         // e.g. ["out", "dev"]
   bool is_fixed_output = 7;                 // FOD detection (fetchurl etc.)
+  // Expected store paths of each output (parallel to output_names).
+  // Populated by the gateway from the parsed derivation so the scheduler
+  // can re-check the store at merge time, closing the TOCTOU window
+  // between the gateway's FindMissingPaths and the scheduler's queue.
+  repeated string expected_output_paths = 8;
 }
 
 // A dependency edge in the derivation DAG.
