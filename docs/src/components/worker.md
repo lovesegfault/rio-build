@@ -200,7 +200,7 @@ The overlay is per-build, not per-worker. Each active build on a worker gets its
 Fixed-output derivations (FODs) have a known output hash declared in `outputHash`. They require special handling:
 
 1. **Detection**: A derivation is a FOD if its `outputHash` attribute is non-empty.
-2. **Network access**: Unlike regular derivations, FODs are allowed network access inside the sandbox. The worker configures the Nix sandbox to skip network namespace isolation for FODs.
+2. **Network access**: Unlike regular derivations, FODs are allowed network access inside the sandbox. This is handled by `nix-daemon` internally — when it sees `outputHash` set on a derivation via `wopBuildDerivation`, it automatically relaxes network namespace isolation for that build. The worker does not need to configure anything special; `sandbox = true` in the worker's `nix.conf` is sufficient (Nix's sandbox is FOD-aware).
 3. **Output verification**: After the build completes, the worker computes the hash of the output and verifies it matches the declared `outputHash`. A mismatch is a build failure.
 4. **Caching**: FODs are cached by their output hash, not their derivation hash. Two FODs with different `src` attributes but the same `outputHash` share the same cached output.
 
