@@ -24,12 +24,14 @@ The scheduler uses a **single-owner actor model** for the in-memory global DAG. 
 - `SubmitBuild` → DAG merge command
 - `ReportCompletion` → node completion + downstream release command
 - `CancelBuild` → orphan derivations command
-- Heartbeat → bloom filter update command
+- Heartbeat → worker liveness + running_builds merge (bloom filter processing deferred to Phase 2c)
 - CA early cutoff → edge cutoff + potential cancellation command
 
 gRPC handler tasks send commands to the DAG actor and `await` responses. This eliminates lock contention, makes operation ordering deterministic, and simplifies reasoning about correctness. PostgreSQL writes are batched and performed asynchronously by the actor.
 
 ## Scheduling Algorithm
+
+> **Phase 2a simplification:** The full scheduling algorithm below is the Phase 2c+ target. Phase 2a implements a minimal FIFO queue with system/feature matching: ready derivations are dispatched to any worker with a matching `system` and available capacity. No critical path priority, no size-class routing, no locality scoring, no bloom filters. Interactive builds (`priority_class="interactive"`) push_front the ready queue for a simple two-tier priority.
 
 ```
 1. Receive derivation DAG from gateway
@@ -185,11 +187,16 @@ stateDiagram-v2
     failed --> ready : retry scheduled
     completed --> [*]
     poisoned --> created : 24h TTL expiry
+    created --> dependency_failed : dep poisoned before queue
+    queued --> dependency_failed : dep poisoned cascade
+    ready --> dependency_failed : dep poisoned cascade
+    dependency_failed --> [*]
 
     note right of queued : Blocked on >=1 dependency
     note right of ready : All deps satisfied,\nawaiting worker
     note right of assigned : Guard: worker has\nrequired features + resources
     note right of poisoned : Auto-expires after 24h\n(returns to created)
+    note right of dependency_failed : Terminal; maps to\nNix BuildStatus=10
 ```
 
 > **Note on the architecture diagram:** The mermaid flowchart in [architecture.md](../architecture.md) shows arrows FROM the scheduler TO workers for the `BuildExecution` stream. This reflects data flow direction (scheduler sends assignments). The gRPC connection direction is the reverse: workers are the gRPC client calling the scheduler's `WorkerService.BuildExecution` RPC.
@@ -204,14 +211,18 @@ stateDiagram-v2
 | `ready → assigned` | A worker passes resource-fit check and is selected by the scoring algorithm |
 | `assigned → running` | Worker sends acknowledgement on the `BuildExecution` stream |
 | `running → completed` | Worker reports success and output is verified in rio-store |
-| `running → failed` | Worker reports a retriable error; retry count < max (default 3) |
+| `running → failed` | Worker reports a retriable error; retry count < max_retries (default 2) |
 | `running → poisoned` | Derivation has failed on `poisonThreshold` distinct workers (default: 3); note that poison tracking spans across builds, not just one build's retry attempts |
 | `assigned → ready` | Assigned worker is lost (heartbeat timeout, pod termination) |
 | `failed → ready` | Retry delay elapsed; derivation re-enters the ready queue |
+| `created → dependency_failed` | A dependency reached `poisoned` before this node was queued |
+| `queued → dependency_failed` | A dependency reached `poisoned` while this node was waiting |
+| `ready → dependency_failed` | A dependency reached `poisoned` after this node became ready |
 
 **Idempotency rules:**
 - `completed → completed`: No-op (duplicate completion reports are accepted and ignored)
 - `poisoned → poisoned`: No-op
+- `dependency_failed → dependency_failed`: No-op
 - Any transition from a terminal state (`completed`, `poisoned`) to a non-terminal state is rejected, except `poisoned` auto-expiry after 24h which resets to `created`
 
 ## Build State Machine
@@ -339,11 +350,12 @@ CREATE INDEX builds_status_idx ON builds (status) WHERE status IN ('pending', 'a
 
 CREATE TABLE derivations (
     derivation_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id           UUID NOT NULL,
+    tenant_id           UUID,                   -- NOT NULL deferred to Phase 4 (multi-tenancy)
     drv_hash            TEXT NOT NULL,          -- input-addressed: store path; CA: modular derivation hash
+    drv_path            TEXT NOT NULL,          -- full /nix/store/...-foo.drv path
     pname               TEXT,
     system              TEXT NOT NULL,
-    status              TEXT NOT NULL CHECK (status IN ('created', 'queued', 'ready', 'assigned', 'running', 'completed', 'failed', 'poisoned')),
+    status              TEXT NOT NULL CHECK (status IN ('created', 'queued', 'ready', 'assigned', 'running', 'completed', 'failed', 'poisoned', 'dependency_failed')),
     required_features   TEXT[] NOT NULL DEFAULT '{}',
     assigned_worker_id  TEXT,
     assignment_gen      BIGINT,
@@ -352,7 +364,7 @@ CREATE TABLE derivations (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT derivations_drv_hash_uq UNIQUE (drv_hash)
 );
-CREATE INDEX derivations_status_idx ON derivations (status) WHERE status NOT IN ('completed', 'poisoned');
+CREATE INDEX derivations_status_idx ON derivations (status) WHERE status NOT IN ('completed', 'poisoned', 'dependency_failed');
 CREATE INDEX derivations_tenant_idx ON derivations (tenant_id);
 
 CREATE TABLE derivation_edges (
@@ -416,17 +428,22 @@ Critical-path priorities are maintained **incrementally**, not via full O(V+E) r
 
 This approach keeps per-event processing well under the 1ms budget needed for 1000+ ops/sec throughput.
 
-## Key Files
+## Key Files (Phase 2a)
 
-- `rio-scheduler/src/actor.rs` --- DAG actor (single-owner event loop)
-- `rio-scheduler/src/dag.rs` --- DAG representation and topological operations
-- `rio-scheduler/src/critical_path.rs` --- Critical path computation, priority assignment
-- `rio-scheduler/src/assignment.rs` --- Worker scoring and assignment algorithm
-- `rio-scheduler/src/queue.rs` --- Priority queue with preemption
-- `rio-scheduler/src/state.rs` --- Scheduler state machine (PostgreSQL-backed)
-- `rio-scheduler/src/early_cutoff.rs` --- CA early cutoff detection and propagation
-- `rio-scheduler/src/estimator.rs` --- Build duration estimation from history
-- `rio-scheduler/src/poison.rs` --- Poison derivation tracking
+- `rio-scheduler/src/actor.rs` — DAG actor (single-owner event loop, dispatch, retry, cleanup)
+- `rio-scheduler/src/dag.rs` — DAG representation, merge, cycle detection, topological ops
+- `rio-scheduler/src/state.rs` — State machines (DerivationStatus, BuildState), transition validation, RetryPolicy
+- `rio-scheduler/src/queue.rs` — FIFO ready queue (VecDeque; priority queue deferred to Phase 2c)
+- `rio-scheduler/src/grpc.rs` — SchedulerService + WorkerService gRPC implementations
+- `rio-scheduler/src/db.rs` — PostgreSQL persistence layer
+
+## Planned Files (Phase 2c+)
+
+- `rio-scheduler/src/critical_path.rs` — Critical path priority computation
+- `rio-scheduler/src/assignment.rs` — Worker scoring (locality, load)
+- `rio-scheduler/src/early_cutoff.rs` — CA early cutoff detection
+- `rio-scheduler/src/estimator.rs` — Duration estimation from history
+- `rio-scheduler/src/poison.rs` — Cross-build poison derivation tracking
 
 ```mermaid
 flowchart LR
