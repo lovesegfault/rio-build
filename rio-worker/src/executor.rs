@@ -209,6 +209,28 @@ pub async fn execute_build(
         // Upload outputs
         match upload::upload_all_outputs(store_client, overlay_mount.upper_dir()).await {
             Ok(upload_results) => {
+                // FOD defense-in-depth: verify output hashes match declared outputHash.
+                // nix-daemon already verifies, but we re-check before accepting.
+                if assignment.is_fixed_output
+                    && let Err(e) =
+                        verify_fod_hashes(&drv, &upload_results, overlay_mount.upper_dir())
+                {
+                    tracing::error!(
+                        drv_path = %drv_path,
+                        error = %e,
+                        "FOD output hash verification failed"
+                    );
+                    return Ok(ExecutionResult {
+                        drv_path: drv_path.clone(),
+                        result: ProtoBuildResult {
+                            status: BuildResultStatus::OutputRejected.into(),
+                            error_msg: format!("FOD output hash verification failed: {e}"),
+                            ..Default::default()
+                        },
+                        assignment_token: assignment.assignment_token.clone(),
+                    });
+                }
+
                 let built_outputs: Vec<BuiltOutput> = upload_results
                     .iter()
                     .zip(assignment.output_names.iter())
@@ -421,6 +443,68 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
     rio_nix::protocol::build::read_build_result(reader).await
 }
 
+/// Verify FOD output hashes match the declared outputHash (defense-in-depth;
+/// nix-daemon also verifies, but we re-check before accepting).
+///
+/// For `r:sha256` (recursive): compare the upload's NAR hash against outputHash.
+/// For `sha256` (flat): read the file from the overlay upper layer, hash its
+/// contents directly, and compare.
+pub(crate) fn verify_fod_hashes(
+    drv: &Derivation,
+    uploads: &[upload::UploadResult],
+    overlay_upper: &Path,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, bail};
+    use sha2::{Digest, Sha256};
+
+    for output in drv.outputs() {
+        // Only FOD outputs have a declared hash
+        if output.hash().is_empty() {
+            continue;
+        }
+
+        let expected = hex::decode(output.hash())
+            .with_context(|| format!("FOD outputHash is not valid hex: {}", output.hash()))?;
+        let is_recursive = output.hash_algo().starts_with("r:");
+
+        if is_recursive {
+            // NAR hash — match against upload result
+            let upload = uploads
+                .iter()
+                .find(|u| u.store_path == output.path())
+                .with_context(|| format!("FOD output '{}' not found in uploads", output.name()))?;
+            if upload.nar_hash != expected {
+                bail!(
+                    "FOD NAR hash mismatch for '{}': expected {}, got {}",
+                    output.name(),
+                    output.hash(),
+                    hex::encode(&upload.nar_hash)
+                );
+            }
+        } else {
+            // Flat hash — read file from overlay upper and hash contents
+            let store_basename = output
+                .path()
+                .strip_prefix("/nix/store/")
+                .with_context(|| format!("invalid output path: {}", output.path()))?;
+            let file_path = overlay_upper.join("nix/store").join(store_basename);
+            let content = std::fs::read(&file_path).with_context(|| {
+                format!("failed to read FOD output file {}", file_path.display())
+            })?;
+            let computed: [u8; 32] = Sha256::digest(&content).into();
+            if computed.as_slice() != expected {
+                bail!(
+                    "FOD flat hash mismatch for '{}': expected {}, got {}",
+                    output.name(),
+                    output.hash(),
+                    hex::encode(computed)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fetch metadata for all input paths from the store.
 async fn fetch_input_metadata(
     store_client: &mut StoreServiceClient<Channel>,
@@ -586,5 +670,121 @@ mod tests {
             DAEMON_SETUP_TIMEOUT < DAEMON_BUILD_TIMEOUT,
             "setup timeout ({DAEMON_SETUP_TIMEOUT:?}) must be shorter than build timeout ({DAEMON_BUILD_TIMEOUT:?})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 6: FOD output hash verification
+    // -----------------------------------------------------------------------
+
+    fn make_fod_drv(
+        output_path: &str,
+        hash_algo: &str,
+        hash_hex: &str,
+    ) -> rio_nix::derivation::Derivation {
+        let output =
+            rio_nix::derivation::DerivationOutput::new("out", output_path, hash_algo, hash_hex)
+                .unwrap();
+        // Build a minimal Derivation ATerm and parse it (Derivation has no public constructor)
+        let aterm = format!(
+            r#"Derive([("out","{output_path}","{hash_algo}","{hash_hex}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{output_path}")])"#
+        );
+        // Actually, Derivation::parse expects proper ATerm; let me use BasicDerivation instead
+        // via the actual parse path... but that's complex. Let me just construct via the
+        // type directly if possible.
+        //
+        // Actually, the simplest thing: verify_fod_hashes iterates drv.outputs(), which
+        // for BasicDerivation is the same. But verify_fod_hashes takes &Derivation, not
+        // &BasicDerivation. Let me check if there's a conversion or if I need a different
+        // test approach.
+        //
+        // Approach: parse a minimal valid ATerm.
+        let _ = output; // unused, we parse instead
+        rio_nix::derivation::Derivation::parse(&aterm)
+            .unwrap_or_else(|e| panic!("invalid test ATerm: {e} -- ATerm was: {aterm}"))
+    }
+
+    #[test]
+    fn test_verify_fod_output_hash_recursive_ok() {
+        // r:sha256 — NAR hash comparison
+        let expected_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let drv = make_fod_drv("/nix/store/test-fod", "r:sha256", expected_hash);
+
+        let upload = upload::UploadResult {
+            store_path: "/nix/store/test-fod".into(),
+            nar_hash: hex::decode(expected_hash).unwrap(),
+            nar_size: 100,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(verify_fod_hashes(&drv, &[upload], tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_verify_fod_output_hash_recursive_mismatch() {
+        let expected_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let drv = make_fod_drv("/nix/store/test-fod", "r:sha256", expected_hash);
+
+        // Upload has DIFFERENT hash
+        let upload = upload::UploadResult {
+            store_path: "/nix/store/test-fod".into(),
+            nar_hash: vec![0u8; 32], // all zeros, != expected
+            nar_size: 100,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let result = verify_fod_hashes(&drv, &[upload], tmp.path());
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("mismatch"),
+            "error should mention hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_verify_fod_output_hash_flat_ok() {
+        use sha2::{Digest, Sha256};
+
+        // Flat sha256 — file content hash
+        let content = b"hello world flat fod content";
+        let expected_hash_bytes: [u8; 32] = Sha256::digest(content).into();
+        let expected_hash = hex::encode(expected_hash_bytes);
+
+        let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &expected_hash);
+
+        // Write the file to overlay/nix/store/test-flat-fod
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("test-flat-fod"), content).unwrap();
+
+        // Uploads not used for flat hash verification
+        assert!(verify_fod_hashes(&drv, &[], tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_verify_fod_output_hash_flat_mismatch() {
+        use sha2::{Digest, Sha256};
+
+        let content = b"actual content";
+        let wrong_hash: [u8; 32] = Sha256::digest(b"different content").into();
+        let wrong_hash_hex = hex::encode(wrong_hash);
+
+        let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &wrong_hash_hex);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("nix/store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(store_dir.join("test-flat-fod"), content).unwrap();
+
+        let result = verify_fod_hashes(&drv, &[], tmp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_fod_non_fod_skipped() {
+        // Non-FOD (no hash) should be skipped without error
+        let drv = make_fod_drv("/nix/store/test-non-fod", "", "");
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(verify_fod_hashes(&drv, &[], tmp.path()).is_ok());
     }
 }

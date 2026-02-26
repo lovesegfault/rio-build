@@ -3,22 +3,23 @@
 //! Wires up FUSE daemon, gRPC clients (WorkerService + StoreService),
 //! executor, and heartbeat loop.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tonic::transport::Channel;
 use tracing::info;
 
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
-    CompletionReport, HeartbeatRequest, ResourceUsage, WorkAssignmentAck, WorkerMessage,
-    WorkerRegister, scheduler_message, worker_message,
+    CompletionReport, WorkAssignmentAck, WorkerMessage, WorkerRegister, scheduler_message,
+    worker_message,
 };
 use rio_proto::worker::worker_service_client::WorkerServiceClient;
-use rio_worker::executor;
-use rio_worker::fuse;
+use rio_worker::{build_heartbeat_request, executor, fuse};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -184,27 +185,29 @@ async fn main() -> anyhow::Result<()> {
         .into_inner();
 
     // Concurrent build semaphore
-    let build_semaphore = std::sync::Arc::new(Semaphore::new(args.max_builds as usize));
+    let build_semaphore = Arc::new(Semaphore::new(args.max_builds as usize));
+
+    // Track running builds (drv_path set) for heartbeat reporting
+    let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
     // Spawn heartbeat loop
     let heartbeat_worker_id = worker_id.clone();
     let heartbeat_system = system.clone();
     let heartbeat_max_builds = args.max_builds;
+    let heartbeat_running = running_builds.clone();
     let mut heartbeat_client = scheduler_client.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
 
-            let request = HeartbeatRequest {
-                worker_id: heartbeat_worker_id.clone(),
-                running_builds: Vec::new(),
-                resources: Some(ResourceUsage::default()),
-                local_paths: None,
-                system: heartbeat_system.clone(),
-                supported_features: Vec::new(),
-                max_builds: heartbeat_max_builds,
-            };
+            let request = build_heartbeat_request(
+                &heartbeat_worker_id,
+                &heartbeat_system,
+                heartbeat_max_builds,
+                &heartbeat_running,
+            )
+            .await;
 
             match heartbeat_client.heartbeat(request).await {
                 Ok(response) => {
@@ -268,9 +271,25 @@ async fn main() -> anyhow::Result<()> {
                 let build_fuse_mount = fuse_mount_point.clone();
                 let build_overlay_dir = overlay_base_dir.clone();
                 let build_tx = stream_tx.clone();
+                let build_running = running_builds.clone();
+                let build_drv_path = assignment.drv_path.clone();
+
+                // Track this build as running (for heartbeat)
+                running_builds.write().await.insert(build_drv_path.clone());
 
                 tokio::spawn(async move {
                     let _permit = permit; // Hold permit until build completes
+
+                    // Remove from running_builds on task exit (success, failure, or panic)
+                    let _running_guard = scopeguard::guard((), move |()| {
+                        let rb = build_running.clone();
+                        let drv = build_drv_path.clone();
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.spawn(async move {
+                                rb.write().await.remove(&drv);
+                            });
+                        }
+                    });
 
                     let result = executor::execute_build(
                         &assignment,
