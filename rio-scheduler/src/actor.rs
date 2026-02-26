@@ -894,7 +894,20 @@ impl DagActor {
             {
                 warn!(drv_hash, error = %e, "Assigned->Running transition failed");
             }
-            if state.transition(DerivationStatus::Completed).is_err() {
+            if let Err(e) = state.transition(DerivationStatus::Completed) {
+                // Worker reported success but the in-memory state machine rejected
+                // the transition (e.g., derivation was cascaded to DependencyFailed
+                // or reset by heartbeat reconciliation in a race). The build result
+                // is lost; downstream derivations will never be released.
+                error!(
+                    drv_hash,
+                    worker_id,
+                    current_state = ?state.status(),
+                    error = %e,
+                    "worker reported success but Running->Completed transition rejected; build will hang"
+                );
+                metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "completed")
+                    .increment(1);
                 return;
             }
 
@@ -1594,17 +1607,29 @@ impl DagActor {
     /// Returns `true` if the assignment was sent, `false` if it failed
     /// (caller should defer the derivation, not retry immediately).
     async fn assign_to_worker(&mut self, drv_hash: &str, worker_id: &str) -> bool {
-        // Transition ready -> assigned
+        // Transition ready -> assigned. Do this FIRST (before recording latency
+        // or clearing ready_at) so a rejected transition doesn't pollute metrics.
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            // Record assignment latency (Ready -> Assigned time) before transitioning
-            if let Some(ready_at) = state.ready_at {
+            if let Err(e) = state.transition(DerivationStatus::Assigned) {
+                // Not in Ready state (TOCTOU vs. the dispatch_ready pre-check).
+                // Caller will defer; the next dispatch pass drops it via the
+                // status != Ready guard. Log so operators can spot races.
+                warn!(
+                    drv_hash,
+                    worker_id,
+                    current = ?state.status(),
+                    error = %e,
+                    "Ready->Assigned transition rejected in assign_to_worker (TOCTOU)"
+                );
+                metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "assigned")
+                    .increment(1);
+                return false;
+            }
+            // Record assignment latency (Ready -> Assigned time) after transitioning
+            if let Some(ready_at) = state.ready_at.take() {
                 let latency = ready_at.elapsed();
                 metrics::histogram!("rio_scheduler_assignment_latency_seconds")
                     .record(latency.as_secs_f64());
-                state.ready_at = None; // clear after recording
-            }
-            if state.transition(DerivationStatus::Assigned).is_err() {
-                return false;
             }
             state.assigned_worker = Some(worker_id.to_string());
         }
@@ -1678,7 +1703,21 @@ impl DagActor {
                 // Do NOT push_front here — that would cause the inner
                 // dispatch loop to spin (channel is still full).
                 if let Some(state) = self.dag.node_mut(drv_hash) {
-                    let _ = state.reset_to_ready();
+                    if let Err(e) = state.reset_to_ready() {
+                        // We already transitioned to Assigned, cleared running_builds,
+                        // and now can't reset. Derivation is orphaned in Assigned
+                        // with no worker actually building. Heartbeat reconciliation
+                        // may eventually catch this, but it's a visible hang until then.
+                        error!(
+                            drv_hash,
+                            worker_id,
+                            current = ?state.status(),
+                            error = %e,
+                            "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
+                        );
+                        metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "ready_reset")
+                            .increment(1);
+                    }
                 }
                 return false;
             }

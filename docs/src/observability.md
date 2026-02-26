@@ -82,6 +82,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_scheduler_workers_active` | Gauge | Fully-registered workers (stream + heartbeat) |
 | `rio_scheduler_assignments_total` | Counter | Total derivation->worker assignments |
 | `rio_scheduler_cleanup_dropped_total` | Counter | Terminal-build cleanup commands dropped due to channel backpressure. Alert if rate > 0 sustained: indicates memory leak under load. |
+| `rio_scheduler_transition_rejected_total` | Counter | State-machine transition rejections in the actor (labeled by `to` target state). Alert if rate > 0: these are defense-in-depth guards that should never fire; any non-zero rate indicates a race or logic bug. |
 | `rio_scheduler_critical_path_accuracy` *(Phase 2c+)* | Histogram | Predicted vs. actual completion ratio |
 | `rio_scheduler_size_class_assignments_total` *(Phase 2c+)* | Counter | Assignments per size class (labeled by class name) |
 | `rio_scheduler_misclassifications_total` *(Phase 2c+)* | Counter | Builds that exceeded 2x their class cutoff duration |
