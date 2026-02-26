@@ -341,6 +341,7 @@ mod tests {
             DerivationStatus::Completed,
             DerivationStatus::Failed,
             DerivationStatus::Poisoned,
+            DerivationStatus::DependencyFailed,
         ] {
             let s = status.as_str();
             let parsed: DerivationStatus = s.parse().unwrap();
