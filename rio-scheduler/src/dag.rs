@@ -267,6 +267,27 @@ impl DerivationDag {
         })
     }
 
+    /// Check whether any dependency is in a terminal failure state.
+    ///
+    /// Used during merge: when a newly inserted node depends on an
+    /// already-`Poisoned`/`DependencyFailed` existing node, the new node can
+    /// never complete. Without this check it would go to `Queued` and stay
+    /// there forever (never Ready since dep != Completed, never cascaded
+    /// since cascade only runs on *transition to* Poisoned).
+    pub fn any_dep_terminally_failed(&self, drv_hash: &str) -> bool {
+        let Some(children) = self.children.get(drv_hash) else {
+            return false;
+        };
+        children.iter().any(|child_hash| {
+            self.nodes.get(child_hash).is_some_and(|n| {
+                matches!(
+                    n.status(),
+                    DerivationStatus::Poisoned | DerivationStatus::DependencyFailed
+                )
+            })
+        })
+    }
+
     /// Get all parent drv_hashes that depend on the given child.
     pub fn get_parents(&self, child_hash: &str) -> Vec<String> {
         self.parents
@@ -370,6 +391,11 @@ impl DerivationDag {
                 // No deps or all deps already completed -> directly to ready
                 // We go created -> queued -> ready
                 transitions.push((drv_hash.clone(), DerivationStatus::Ready));
+            } else if self.any_dep_terminally_failed(drv_hash) {
+                // A dep is already poisoned/failed. This node cannot complete.
+                // Mark DependencyFailed so the build terminates instead of
+                // hanging forever with this node stuck in Queued.
+                transitions.push((drv_hash.clone(), DerivationStatus::DependencyFailed));
             } else {
                 // Has incomplete deps -> queued (waiting for deps)
                 transitions.push((drv_hash.clone(), DerivationStatus::Queued));
@@ -586,6 +612,47 @@ mod tests {
                 assert_eq!(*status, DerivationStatus::Queued);
             }
         }
+    }
+
+    #[test]
+    fn test_initial_states_with_prepoisoned_dep() {
+        let mut dag = DerivationDag::new();
+        let build1 = Uuid::new_v4();
+
+        // Build 1: just the leaf.
+        let leaf_nodes = vec![make_node("leafP", "/nix/store/leafP.drv", "x86_64-linux")];
+        dag.merge(build1, &leaf_nodes, &[]).unwrap();
+
+        // Poison it.
+        dag.nodes
+            .get_mut("leafP")
+            .unwrap()
+            .set_status_for_test(DerivationStatus::Poisoned);
+
+        assert!(!dag.any_dep_terminally_failed("leafP")); // no deps
+
+        // Build 2: parent depending on the poisoned leaf.
+        let build2 = Uuid::new_v4();
+        let parent_nodes = vec![
+            make_node("parentP", "/nix/store/parentP.drv", "x86_64-linux"),
+            make_node("leafP", "/nix/store/leafP.drv", "x86_64-linux"),
+        ];
+        let edges = vec![make_edge("/nix/store/parentP.drv", "/nix/store/leafP.drv")];
+        let newly = dag.merge(build2, &parent_nodes, &edges).unwrap();
+
+        // Only parentP is newly inserted (leafP already existed).
+        assert_eq!(newly, vec!["parentP"]);
+        assert!(dag.any_dep_terminally_failed("parentP"));
+
+        // compute_initial_states should return DependencyFailed for parentP.
+        let states = dag.compute_initial_states(&newly);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].0, "parentP");
+        assert_eq!(
+            states[0].1,
+            DerivationStatus::DependencyFailed,
+            "node with pre-poisoned dep should be DependencyFailed, not Queued"
+        );
     }
 
     #[test]
