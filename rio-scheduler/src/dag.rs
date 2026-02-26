@@ -150,9 +150,20 @@ impl DerivationDag {
             }
         }
 
-        // Cycle check: DFS from each newly-inserted node. Three-color marking.
+        // Cycle check: DFS from each newly-inserted node AND from each parent
+        // endpoint of new edges. The latter catches cycles formed by new edges
+        // between two pre-existing nodes (no new nodes inserted, so the
+        // newly_inserted loop alone would miss them).
         let mut color: HashMap<String, u8> = HashMap::new();
-        for start in &newly_inserted {
+        let mut dfs_starts: Vec<&str> = newly_inserted.iter().map(|s| s.as_str()).collect();
+        for (parent, _child) in &new_edges {
+            // Only need to DFS from edge endpoints not already covered by
+            // newly_inserted (avoids redundant work).
+            if !newly_inserted.iter().any(|n| n == parent) {
+                dfs_starts.push(parent.as_str());
+            }
+        }
+        for start in dfs_starts {
             if self.has_cycle_from(start, &mut color) {
                 // Rollback: remove newly-inserted edges and nodes
                 self.rollback_merge(&newly_inserted, &new_edges, build_id);
@@ -688,5 +699,47 @@ mod tests {
             "valid merge after rollback should succeed: {result:?}"
         );
         assert_eq!(dag.nodes.len(), 2);
+    }
+
+    /// A new edge between two PRE-EXISTING nodes (no new nodes inserted)
+    /// can create a cycle. The DFS must start from edge endpoints, not just
+    /// newly-inserted nodes.
+    #[test]
+    fn test_cycle_via_new_edge_between_existing_nodes() {
+        let mut dag = DerivationDag::new();
+        let build1 = Uuid::new_v4();
+
+        // Insert A and B separately with A->B edge.
+        let nodes = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        ];
+        let initial_edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
+        dag.merge(build1, &nodes, &initial_edges).unwrap();
+        assert_eq!(dag.nodes.len(), 2);
+
+        // Now merge the SAME nodes (no new inserts) with a B->A edge.
+        // This creates a cycle via a new edge between two existing nodes.
+        let build2 = Uuid::new_v4();
+        let cycle_edge = vec![make_edge("/nix/store/b.drv", "/nix/store/a.drv")];
+        let result = dag.merge(build2, &nodes, &cycle_edge);
+
+        assert!(
+            result.is_err(),
+            "cycle via new edge between existing nodes should be detected"
+        );
+        // Rollback: the new edge should be gone, but the original A->B stays.
+        assert!(
+            dag.children
+                .get("hashA")
+                .is_some_and(|c| c.contains("hashB")),
+            "original A->B edge should survive rollback"
+        );
+        assert!(
+            !dag.children
+                .get("hashB")
+                .is_some_and(|c| c.contains("hashA")),
+            "cycle-creating B->A edge should be rolled back"
+        );
     }
 }
