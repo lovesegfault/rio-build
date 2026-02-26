@@ -96,6 +96,8 @@ pub async fn reconstruct_dag(
                             required_features: Vec::new(),
                             output_names: Vec::new(),
                             is_fixed_output: false,
+                            // Unknown — couldn't parse the derivation.
+                            expected_output_paths: Vec::new(),
                         });
                     }
                 }
@@ -123,6 +125,11 @@ pub fn single_node_from_basic(
         .iter()
         .map(|o| o.name().to_string())
         .collect();
+    let expected_output_paths: Vec<String> = basic_drv
+        .outputs()
+        .iter()
+        .map(|o| o.path().to_string())
+        .collect();
 
     let pname = basic_drv.env().get("pname").cloned().unwrap_or_default();
 
@@ -136,12 +143,15 @@ pub fn single_node_from_basic(
         required_features: Vec::new(),
         output_names,
         is_fixed_output: basic_drv.outputs().iter().any(|o| o.is_fixed_output()),
+        expected_output_paths,
     }]
 }
 
 /// Convert a Derivation into a proto DerivationNode.
 fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
     let output_names: Vec<String> = drv.outputs().iter().map(|o| o.name().to_string()).collect();
+    let expected_output_paths: Vec<String> =
+        drv.outputs().iter().map(|o| o.path().to_string()).collect();
 
     let pname = drv.env().get("pname").cloned().unwrap_or_default();
 
@@ -161,6 +171,7 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
         required_features,
         output_names,
         is_fixed_output: drv.is_fixed_output(),
+        expected_output_paths,
     }
 }
 

@@ -601,6 +601,7 @@ mod tests {
             required_features: vec![],
             output_names: vec!["out".into()],
             is_fixed_output: false,
+            expected_output_paths: vec![],
         };
 
         // Assigned -> Ready: direct valid transition
@@ -639,6 +640,7 @@ mod tests {
             required_features: vec![],
             output_names: vec!["out".into()],
             is_fixed_output: false,
+            expected_output_paths: vec![],
         };
 
         let mut state = DerivationState::from_node(&node);

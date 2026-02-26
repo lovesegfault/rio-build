@@ -429,6 +429,7 @@ mod tests {
             required_features: vec![],
             output_names: vec!["out".to_string()],
             is_fixed_output: false,
+            expected_output_paths: vec![],
         }
     }
 

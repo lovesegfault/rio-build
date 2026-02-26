@@ -4,12 +4,16 @@
 //! The actor processes commands serially, ensuring deterministic ordering
 //! and eliminating lock contention.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tonic::transport::Channel;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
@@ -128,6 +132,7 @@ pub struct DebugDerivationInfo {
     pub status: DerivationStatus,
     pub retry_count: u32,
     pub assigned_worker: Option<String>,
+    pub output_paths: Vec<String>,
 }
 
 /// Errors from the actor.
@@ -167,6 +172,9 @@ pub struct DagActor {
     retry_policy: RetryPolicy,
     /// Database handle.
     db: SchedulerDb,
+    /// Store service client for scheduler-side cache checks. `None` in tests
+    /// that don't need the store (cache check is then skipped).
+    store_client: Option<StoreServiceClient<Channel>>,
     /// Whether backpressure is currently active.
     backpressure_active: bool,
     /// Leader generation counter (for assignment tokens).
@@ -174,8 +182,12 @@ pub struct DagActor {
 }
 
 impl DagActor {
-    /// Create a new actor with the given database handle.
-    pub fn new(db: SchedulerDb) -> Self {
+    /// Create a new actor with the given database handle and optional store client.
+    ///
+    /// `store_client` is used for the scheduler-side cache check (closes the
+    /// TOCTOU window between the gateway's FindMissingPaths and DAG merge).
+    /// Pass `None` to skip this check (tests, or if the store is unavailable).
+    pub fn new(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
         Self {
             dag: DerivationDag::new(),
             ready_queue: ReadyQueue::new(),
@@ -185,6 +197,7 @@ impl DagActor {
             workers: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             db,
+            store_client,
             backpressure_active: false,
             generation: 1,
         }
@@ -316,6 +329,7 @@ impl DagActor {
                         status: s.status(),
                         retry_count: s.retry_count,
                         assigned_worker: s.assigned_worker.clone(),
+                        output_paths: s.output_paths.clone(),
                     });
                     let _ = reply.send(info);
                 }
@@ -459,12 +473,69 @@ impl DagActor {
         // Transition build to active
         self.transition_build(build_id, BuildState::Active).await?;
 
-        // Compute initial states for newly inserted derivations
-        // (TOCTOU: cache checks would happen here, inside the actor)
-        let initial_states = self.dag.compute_initial_states(&newly_inserted);
+        // Index proto nodes by hash for efficient lookup during the transition loop.
+        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
+            nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         let total_derivations = nodes.len() as u32;
         let mut cached_count = 0u32;
+
+        // Scheduler-side cache check: query the store for expected_output_paths
+        // of newly-inserted derivations. If all outputs exist, skip straight to
+        // Completed. This closes the TOCTOU window between the gateway's
+        // FindMissingPaths and our merge (another build may have completed the
+        // derivation in between).
+        let cached_hashes = self
+            .check_cached_outputs(&newly_inserted, &node_index)
+            .await;
+
+        for drv_hash in &cached_hashes {
+            let Some(node) = node_index.get(drv_hash.as_str()) else {
+                continue;
+            };
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                if let Err(e) = state.transition(DerivationStatus::Completed) {
+                    warn!(drv_hash, error = %e, "cache-hit Created->Completed transition failed");
+                    continue;
+                }
+                state.output_paths = node.expected_output_paths.clone();
+                cached_count += 1;
+                metrics::counter!("rio_scheduler_cache_hits_total", "source" => "scheduler")
+                    .increment(1);
+
+                if let Err(e) = self
+                    .db
+                    .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
+                    .await
+                {
+                    warn!(drv_hash, error = %e, "failed to persist cache-hit status");
+                }
+
+                self.emit_build_event(
+                    build_id,
+                    rio_proto::types::build_event::Event::Derivation(
+                        rio_proto::types::DerivationEvent {
+                            derivation_path: node.drv_path.clone(),
+                            status: Some(rio_proto::types::derivation_event::Status::Cached(
+                                rio_proto::types::DerivationCached {
+                                    output_paths: node.expected_output_paths.clone(),
+                                },
+                            )),
+                        },
+                    ),
+                );
+            }
+        }
+
+        // Compute initial states for the remaining (non-cached) newly-inserted
+        // derivations. Cached derivations above are now Completed, so their
+        // dependents will correctly be computed as Ready here.
+        let remaining_new: Vec<String> = newly_inserted
+            .iter()
+            .filter(|h| !cached_hashes.contains(h.as_str()))
+            .cloned()
+            .collect();
+        let initial_states = self.dag.compute_initial_states(&remaining_new);
 
         // Interactive builds (IFD) get priority: push_front instead of push_back
         let is_interactive = self
@@ -535,6 +606,66 @@ impl DagActor {
         }
 
         Ok(event_rx)
+    }
+
+    /// Query the store for newly-inserted derivations' expected outputs and
+    /// return the set of drv_hashes whose outputs are all already present.
+    ///
+    /// Returns an empty set if there's no store client (tests) or if the
+    /// RPC fails (non-fatal — we fall back to building).
+    async fn check_cached_outputs(
+        &self,
+        newly_inserted: &[String],
+        node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
+    ) -> HashSet<String> {
+        let Some(store_client) = &self.store_client else {
+            return HashSet::new();
+        };
+
+        // Collect all expected output paths for newly-inserted derivations.
+        // Skip nodes without expected_output_paths (old gateways, unresolvable leaf nodes).
+        let check_paths: Vec<String> = newly_inserted
+            .iter()
+            .filter_map(|h| node_index.get(h.as_str()))
+            .flat_map(|n| n.expected_output_paths.iter().cloned())
+            .collect();
+
+        if check_paths.is_empty() {
+            return HashSet::new();
+        }
+
+        let resp = match store_client
+            .clone()
+            .find_missing_paths(FindMissingPathsRequest {
+                store_paths: check_paths.clone(),
+            })
+            .await
+        {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                warn!(error = %e, "store FindMissingPaths failed; skipping scheduler cache check");
+                return HashSet::new();
+            }
+        };
+
+        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
+        let present: HashSet<String> = check_paths
+            .into_iter()
+            .filter(|p| !missing.contains(p))
+            .collect();
+
+        // A derivation is cached if it has at least one expected output path
+        // AND all of them are present.
+        newly_inserted
+            .iter()
+            .filter(|h| {
+                node_index.get(h.as_str()).is_some_and(|n| {
+                    !n.expected_output_paths.is_empty()
+                        && n.expected_output_paths.iter().all(|p| present.contains(p))
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -1531,9 +1662,9 @@ impl ActorHandle {
     /// Create a new actor handle and spawn the actor task.
     ///
     /// Returns the handle for sending commands.
-    pub fn spawn(db: SchedulerDb) -> Self {
+    pub fn spawn(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-        let actor = DagActor::new(db);
+        let actor = DagActor::new(db, store_client);
         tokio::spawn(actor.run(rx));
         Self { tx }
     }
@@ -1707,9 +1838,17 @@ pub(crate) mod tests {
     pub(crate) async fn setup_actor(
         pool: sqlx::PgPool,
     ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
+        setup_actor_with_store(pool, None).await
+    }
+
+    /// Set up an actor with an optional store client for cache-check tests.
+    pub(crate) async fn setup_actor_with_store(
+        pool: sqlx::PgPool,
+        store_client: Option<StoreServiceClient<Channel>>,
+    ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
         let db = SchedulerDb::new(pool);
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-        let actor = DagActor::new(db);
+        let actor = DagActor::new(db, store_client);
         let task = tokio::spawn(actor.run(rx));
         (ActorHandle { tx }, task)
     }
@@ -1728,6 +1867,7 @@ pub(crate) mod tests {
             required_features: vec![],
             output_names: vec!["out".into()],
             is_fixed_output: false,
+            expected_output_paths: vec![],
         }
     }
 
@@ -2384,5 +2524,223 @@ pub(crate) mod tests {
             info2.status,
             DerivationStatus::Assigned | DerivationStatus::Ready
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduler-side cache check (TOCTOU fix)
+    // -----------------------------------------------------------------------
+
+    /// Spin up an in-process rio-store on an ephemeral port.
+    async fn setup_inproc_store(
+        pool: sqlx::PgPool,
+    ) -> (StoreServiceClient<Channel>, tokio::task::JoinHandle<()>) {
+        use rio_proto::store::store_service_server::StoreServiceServer;
+        use rio_store::backend::memory::MemoryBackend;
+        use rio_store::grpc::StoreServiceImpl;
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let service = StoreServiceImpl::new(backend, pool);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(StoreServiceServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (StoreServiceClient::new(channel), server)
+    }
+
+    /// Build a minimal single-file NAR and upload it to the store.
+    async fn put_test_path(client: &mut StoreServiceClient<Channel>, store_path: &str) {
+        use rio_proto::types::{PathInfo, PutPathMetadata, PutPathRequest, put_path_request};
+        use sha2::{Digest, Sha256};
+
+        // Minimal NAR for a regular file "hello"
+        fn write_str(out: &mut Vec<u8>, s: &[u8]) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s);
+            let pad = (8 - (s.len() % 8)) % 8;
+            out.extend_from_slice(&vec![0u8; pad]);
+        }
+        let contents = b"hello";
+        let mut nar = Vec::new();
+        write_str(&mut nar, b"nix-archive-1");
+        write_str(&mut nar, b"(");
+        write_str(&mut nar, b"type");
+        write_str(&mut nar, b"regular");
+        write_str(&mut nar, b"contents");
+        nar.extend_from_slice(&(contents.len() as u64).to_le_bytes());
+        nar.extend_from_slice(contents);
+        let pad = (8 - (contents.len() % 8)) % 8;
+        nar.extend_from_slice(&vec![0u8; pad]);
+        write_str(&mut nar, b")");
+
+        let nar_hash = Sha256::digest(&nar).to_vec();
+        let info = PathInfo {
+            store_path: store_path.to_string(),
+            nar_hash,
+            nar_size: nar.len() as u64,
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(PutPathRequest {
+            msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+                info: Some(info),
+            })),
+        })
+        .await
+        .unwrap();
+        tx.send(PutPathRequest {
+            msg: Some(put_path_request::Msg::NarChunk(nar)),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        client.put_path(stream).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_cache_check_skips_build() {
+        let Some(sched_db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let Some(store_db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set (store)");
+            return;
+        };
+
+        // Start in-process store and pre-populate the expected output path.
+        let (mut store_client, _store_server) = setup_inproc_store(store_db.pool.clone()).await;
+        let cached_output = "/nix/store/00000000000000000000000000000000-cached-output";
+        put_test_path(&mut store_client, cached_output).await;
+
+        // Spawn actor WITH the store client — cache check will run.
+        let (handle, _task) =
+            setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone())).await;
+
+        // Merge a single-node DAG with expected_output_paths pointing at the
+        // pre-populated path. No worker needed — scheduler should find it
+        // cached and complete immediately.
+        let build_id = Uuid::new_v4();
+        let mut node = make_test_node("cached-hash", "/nix/store/cached-hash.drv", "x86_64-linux");
+        node.expected_output_paths = vec![cached_output.to_string()];
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![node],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _event_rx = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // Derivation should have gone Created → Completed (scheduler cache hit).
+        let info = handle
+            .debug_query_derivation("cached-hash")
+            .await
+            .unwrap()
+            .expect("derivation should exist in DAG");
+        assert_eq!(
+            info.status,
+            DerivationStatus::Completed,
+            "scheduler cache check should mark derivation as Completed"
+        );
+        assert_eq!(info.output_paths, vec![cached_output.to_string()]);
+
+        // Build should be Succeeded (all 1 derivation cached).
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap().unwrap();
+        assert_eq!(status.cached_derivations, 1);
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "build with all-cached derivations should be Succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_cache_check_skipped_without_store() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // No store client — cache check should silently skip.
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let _rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+
+        let build_id = Uuid::new_v4();
+        let mut node = make_test_node(
+            "uncached-hash",
+            "/nix/store/uncached-hash.drv",
+            "x86_64-linux",
+        );
+        // expected_output_paths set but store client is None — should NOT short-circuit
+        node.expected_output_paths = vec!["/nix/store/uncached-out".to_string()];
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![node],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _event_rx = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // Without store client, derivation should proceed normally to dispatch.
+        let info = handle
+            .debug_query_derivation("uncached-hash")
+            .await
+            .unwrap()
+            .expect("derivation should exist");
+        assert!(
+            matches!(
+                info.status,
+                DerivationStatus::Assigned | DerivationStatus::Ready
+            ),
+            "derivation should be dispatched normally without store client, got {:?}",
+            info.status
+        );
     }
 }
