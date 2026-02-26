@@ -242,6 +242,16 @@ impl NixStoreFs {
             })? {
                 match msg.msg {
                     Some(get_path_response::Msg::NarChunk(chunk)) => {
+                        let new_len = (nar_bytes.len() as u64).saturating_add(chunk.len() as u64);
+                        if new_len > rio_common::limits::MAX_NAR_SIZE {
+                            tracing::error!(
+                                store_path = %store_path,
+                                size = new_len,
+                                limit = rio_common::limits::MAX_NAR_SIZE,
+                                "NAR exceeds MAX_NAR_SIZE"
+                            );
+                            return Err(Errno::EFBIG);
+                        }
                         nar_bytes.extend_from_slice(&chunk);
                     }
                     Some(get_path_response::Msg::Info(_)) => {
