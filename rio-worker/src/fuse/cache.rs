@@ -263,27 +263,36 @@ impl Cache {
             Ok::<_, sqlx::Error>(())
         })?;
         // Update cache size metric (ground-truth from DB)
-        metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(self.total_size() as f64);
+        self.update_size_gauge();
         Ok(())
     }
 
     /// Total size of all cached paths in bytes.
-    pub fn total_size(&self) -> u64 {
+    ///
+    /// Propagates SQLite errors rather than silently returning 0: a silent
+    /// 0 on error makes the evict loop think the cache is under limit when
+    /// it may not be, causing unbounded growth until disk fills.
+    pub fn total_size(&self) -> Result<u64, CacheError> {
         let pool = &self.pool;
         self.runtime.block_on(async {
             let size: i64 =
-                match sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cached_paths")
+                sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cached_paths")
                     .fetch_one(pool)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "FUSE cache total_size() query failed");
-                        0
-                    }
-                };
-            size as u64
+                    .await?;
+            Ok(size as u64)
         })
+    }
+
+    /// Update the cache size gauge (best-effort; logs on DB error).
+    fn update_size_gauge(&self) {
+        match self.total_size() {
+            Ok(bytes) => {
+                metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(bytes as f64);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read cache total_size for metric");
+            }
+        }
     }
 
     /// Evict least-recently-used entries until total size is under the limit.
@@ -291,34 +300,41 @@ impl Cache {
         let mut freed = 0u64;
 
         loop {
-            let total = self.total_size();
+            let total = self.total_size()?;
             if total <= self.max_size_bytes {
                 break;
             }
 
             let pool = &self.pool;
-            let entry = self.runtime.block_on(async {
-                let row: Option<(String, i64)> = match sqlx::query_as(
+            let entry: Option<CacheEntry> = self.runtime.block_on(async {
+                let row: Option<(String, i64)> = sqlx::query_as(
                     "SELECT store_path, size_bytes FROM cached_paths
                      ORDER BY last_access ASC LIMIT 1",
                 )
                 .fetch_optional(pool)
                 .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "FUSE cache eviction query failed");
-                        None
-                    }
-                };
-                row.map(|(path, size)| CacheEntry {
+                .map_err(|e| {
+                    // Propagate (not swallow): if this fails while total > max,
+                    // breaking silently would let the cache grow unbounded.
+                    tracing::error!(error = %e, "FUSE cache eviction query failed; cache may grow unbounded");
+                    CacheError::Sqlite(e)
+                })?;
+                Ok::<_, CacheError>(row.map(|(path, size)| CacheEntry {
                     store_path: path,
                     size_bytes: size as u64,
                     last_access: 0,
-                })
-            });
+                }))
+            })?;
 
             let Some(entry) = entry else {
+                // total > max but no rows — index inconsistent with total.
+                // Break to avoid infinite loop; accounting will self-correct
+                // on next insert.
+                tracing::warn!(
+                    total,
+                    max = self.max_size_bytes,
+                    "cache total exceeds limit but no entries to evict; accounting drift"
+                );
                 break;
             };
 
@@ -353,7 +369,7 @@ impl Cache {
 
         // Update cache size metric after eviction
         if freed > 0 {
-            metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(self.total_size() as f64);
+            self.update_size_gauge();
         }
         Ok(freed)
     }
@@ -415,7 +431,7 @@ mod tests {
         assert!(cache_dir.exists());
         assert!(cache_dir.join("cache_index.sqlite").exists());
 
-        let size = tokio::task::spawn_blocking(move || cache.total_size())
+        let size = tokio::task::spawn_blocking(move || cache.total_size().unwrap())
             .await
             .unwrap();
         assert_eq!(size, 0);
@@ -431,7 +447,7 @@ mod tests {
 
             cache.insert("abc-hello-1.0", 1024).unwrap();
             assert!(cache.contains("abc-hello-1.0").unwrap());
-            assert_eq!(cache.total_size(), 1024);
+            assert_eq!(cache.total_size().unwrap(), 1024);
         })
         .await
         .unwrap();
@@ -516,6 +532,22 @@ mod tests {
             assert!(
                 matches!(result, Err(CacheError::Sqlite(_))),
                 "get_path() on closed pool should return Err, got {result:?}"
+            );
+
+            // total_size() must return Err, not 0 (0 would make the evict
+            // loop think the cache is under limit when it may not be).
+            let result = cache.total_size();
+            assert!(
+                matches!(result, Err(CacheError::Sqlite(_))),
+                "total_size() on closed pool should return Err, got {result:?}"
+            );
+
+            // evict_if_needed() must return Err, not Ok(0) (Ok(0) would let
+            // the cache grow unbounded on DB error).
+            let result = cache.evict_if_needed();
+            assert!(
+                matches!(result, Err(CacheError::Sqlite(_))),
+                "evict_if_needed() on closed pool should return Err, got {result:?}"
             );
         })
         .await
