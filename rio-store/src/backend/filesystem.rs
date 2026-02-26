@@ -61,11 +61,23 @@ impl NarBackend for FilesystemBackend {
         // Ensure the base directory exists.
         tokio::fs::create_dir_all(&self.base_dir).await?;
 
-        // Write atomically: write to a temp file, then rename.
-        // This prevents partial writes from being visible.
+        // Write atomically: write to temp + fsync, rename, fsync parent dir.
+        // fsync is critical: complete_upload() flips PG status='complete'
+        // immediately after put() returns. Without fsync, a power loss leaves
+        // PG saying 'complete' but the blob is zero-length or missing (rename
+        // not durable). Subsequent PutPath returns created=false (idempotency
+        // short-circuit), so the path is permanently stuck with a corrupt blob.
         let tmp_path = path.with_extension("nar.tmp");
-        tokio::fs::write(&tmp_path, &data).await?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut f = tokio::fs::File::create(&tmp_path).await?;
+            f.write_all(&data).await?;
+            f.sync_all().await?;
+        }
         tokio::fs::rename(&tmp_path, &path).await?;
+        // fsync the parent directory so the rename itself is durable.
+        let dir = tokio::fs::File::open(&self.base_dir).await?;
+        dir.sync_all().await?;
 
         Ok(key)
     }
