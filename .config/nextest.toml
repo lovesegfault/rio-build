@@ -47,6 +47,7 @@ max-threads = 8
 filter = "test(test_golden_live_)"
 test-group = "golden-daemon"
 slow-timeout = { period = "60s", terminate-after = 2 }
+priority = 100
 
 # Protocol conformance and integration build tests also use real nix.
 [[profile.default.overrides]]
