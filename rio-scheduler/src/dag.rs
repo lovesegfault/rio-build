@@ -29,6 +29,10 @@ pub struct DerivationDag {
     /// Reverse edges: child drv_hash -> set of parent drv_hashes.
     /// Used to find which derivations become ready when a child completes.
     parents: HashMap<String, HashSet<String>>,
+    /// Reverse index: drv_path -> drv_hash.
+    /// Eliminates O(n) scans in completion handling (gRPC layer receives
+    /// drv_path from workers but the DAG is keyed by drv_hash).
+    path_to_hash: HashMap<String, String>,
 }
 
 impl DerivationDag {
@@ -38,6 +42,7 @@ impl DerivationDag {
             nodes: HashMap::new(),
             children: HashMap::new(),
             parents: HashMap::new(),
+            path_to_hash: HashMap::new(),
         }
     }
 
@@ -54,6 +59,11 @@ impl DerivationDag {
     /// Whether a derivation exists in the DAG.
     pub fn contains(&self, drv_hash: &str) -> bool {
         self.nodes.contains_key(drv_hash)
+    }
+
+    /// Look up a drv_hash by drv_path (O(1) via reverse index).
+    pub fn hash_for_path(&self, drv_path: &str) -> Option<&str> {
+        self.path_to_hash.get(drv_path).map(|s| s.as_str())
     }
 
     /// Iterate all (drv_hash, state) pairs.
@@ -106,23 +116,18 @@ impl DerivationDag {
                 // New node
                 let mut state = DerivationState::from_node(node);
                 state.interested_builds.insert(build_id);
+                self.path_to_hash
+                    .insert(state.drv_path.clone(), drv_hash.clone());
                 self.nodes.insert(drv_hash.clone(), state);
                 newly_inserted.push(drv_hash.clone());
             }
         }
 
-        // Build drv_path -> drv_hash lookup for edge resolution
-        let path_to_hash: HashMap<&str, &str> = self
-            .nodes
-            .values()
-            .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
-            .collect();
-
         // Insert edges
         for edge in edges {
             // Edges reference drv_path; resolve to drv_hash
-            let parent_hash = match path_to_hash.get(edge.parent_drv_path.as_str()) {
-                Some(h) => (*h).to_string(),
+            let parent_hash = match self.path_to_hash.get(edge.parent_drv_path.as_str()) {
+                Some(h) => h.clone(),
                 None => {
                     tracing::warn!(
                         parent_path = %edge.parent_drv_path,
@@ -131,8 +136,8 @@ impl DerivationDag {
                     continue;
                 }
             };
-            let child_hash = match path_to_hash.get(edge.child_drv_path.as_str()) {
-                Some(h) => (*h).to_string(),
+            let child_hash = match self.path_to_hash.get(edge.child_drv_path.as_str()) {
+                Some(h) => h.clone(),
                 None => {
                     tracing::warn!(
                         child_path = %edge.child_drv_path,
@@ -228,9 +233,11 @@ impl DerivationDag {
             }
         }
 
-        // Remove newly-inserted nodes
+        // Remove newly-inserted nodes (and their path index entries)
         for hash in newly_inserted {
-            self.nodes.remove(hash);
+            if let Some(state) = self.nodes.remove(hash) {
+                self.path_to_hash.remove(&state.drv_path);
+            }
             // Also clean up any edge entries keyed on this hash
             self.children.remove(hash);
             self.parents.remove(hash);
@@ -328,7 +335,9 @@ impl DerivationDag {
 
         let reaped = to_reap.len();
         for hash in to_reap {
-            self.nodes.remove(&hash);
+            if let Some(state) = self.nodes.remove(&hash) {
+                self.path_to_hash.remove(&state.drv_path);
+            }
             self.children.remove(&hash);
             self.parents.remove(&hash);
             // Also scrub this hash from other nodes' edge sets.
@@ -802,5 +811,76 @@ mod tests {
             !dag.nodes.contains_key("hashC"),
             "newly-inserted C should be rolled back"
         );
+    }
+
+    /// The path_to_hash reverse index must stay in sync with nodes across
+    /// merge, rollback, and reap operations.
+    #[test]
+    fn test_path_to_hash_consistency() {
+        let mut dag = DerivationDag::new();
+        let b1 = Uuid::new_v4();
+
+        // Merge: index should be populated.
+        let nodes = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        ];
+        dag.merge(b1, &nodes, &[]).unwrap();
+        assert_eq!(dag.hash_for_path("/nix/store/a.drv"), Some("hashA"));
+        assert_eq!(dag.hash_for_path("/nix/store/b.drv"), Some("hashB"));
+        assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
+
+        // Cycle rollback: newly-inserted node's path entry must be removed.
+        let cycle_nodes = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        ];
+        let cycle_edges = vec![
+            make_edge("/nix/store/a.drv", "/nix/store/c.drv"),
+            make_edge("/nix/store/c.drv", "/nix/store/a.drv"),
+        ];
+        dag.merge(b1, &cycle_nodes, &cycle_edges).unwrap_err();
+        assert_eq!(
+            dag.hash_for_path("/nix/store/c.drv"),
+            None,
+            "rollback must remove path index for newly-inserted node"
+        );
+        assert_eq!(
+            dag.hash_for_path("/nix/store/a.drv"),
+            Some("hashA"),
+            "rollback must preserve path index for pre-existing node"
+        );
+
+        // Reap: terminal orphaned node's path entry must be removed.
+        // First, mark A as terminal so it's eligible for reaping.
+        dag.node_mut("hashA")
+            .unwrap()
+            .transition(DerivationStatus::Queued)
+            .unwrap();
+        dag.node_mut("hashA")
+            .unwrap()
+            .transition(DerivationStatus::Ready)
+            .unwrap();
+        dag.node_mut("hashA")
+            .unwrap()
+            .transition(DerivationStatus::Assigned)
+            .unwrap();
+        dag.node_mut("hashA")
+            .unwrap()
+            .transition(DerivationStatus::Running)
+            .unwrap();
+        dag.node_mut("hashA")
+            .unwrap()
+            .transition(DerivationStatus::Completed)
+            .unwrap();
+        let reaped = dag.remove_build_interest_and_reap(b1);
+        assert_eq!(reaped, 1, "hashA should be reaped (terminal, no interest)");
+        assert_eq!(
+            dag.hash_for_path("/nix/store/a.drv"),
+            None,
+            "reap must remove path index for reaped node"
+        );
+        // B is not terminal, so it survives reaping.
+        assert_eq!(dag.hash_for_path("/nix/store/b.drv"), Some("hashB"));
     }
 }
