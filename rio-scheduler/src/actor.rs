@@ -696,6 +696,10 @@ impl DagActor {
             Ok(r) => r.into_inner(),
             Err(e) => {
                 warn!(error = %e, "store FindMissingPaths failed; skipping scheduler cache check");
+                metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
+                // TODO(phase2c): circuit-breaker on sustained failures. Treating
+                // every submission as 100% cache miss when the store is unreachable
+                // causes an avalanche of unnecessary rebuilds.
                 return HashSet::new();
             }
         };
