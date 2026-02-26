@@ -34,7 +34,7 @@ use tonic::transport::Channel;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{GetPathRequest, QueryPathInfoRequest};
 
-use self::cache::Cache;
+use self::cache::{Cache, FetchClaim};
 use self::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr, synthetic_dir_attr};
 use self::read::{io_error_to_errno, read_file_range};
 
@@ -177,38 +177,37 @@ impl NixStoreFs {
     /// Ensure a store path is cached locally, fetching from remote if needed.
     ///
     /// Returns the local filesystem path to the materialized store path.
+    /// If another thread is already fetching, blocks on a condition variable
+    /// until that fetch completes (or a 30s timeout, then returns EAGAIN).
     fn ensure_cached(&self, store_basename: &str) -> Result<PathBuf, Errno> {
         if let Some(local_path) = self.cache.get_path(store_basename) {
             return Ok(local_path);
         }
 
-        // Check if another thread is already fetching.
-        // If so, wait with bounded exponential backoff for it to finish.
-        if !self.cache.try_start_fetch(store_basename) {
-            const MAX_ATTEMPTS: u32 = 6;
-            const BASE_BACKOFF_MS: u64 = 50;
-            const MAX_BACKOFF_MS: u64 = 500;
-
-            for attempt in 0..MAX_ATTEMPTS {
-                let backoff_ms = (BASE_BACKOFF_MS << attempt).min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                if let Some(local_path) = self.cache.get_path(store_basename) {
-                    return Ok(local_path);
-                }
+        match self.cache.try_start_fetch(store_basename) {
+            FetchClaim::Fetch(_guard) => {
+                // We own the fetch. _guard notifies waiters on drop (success,
+                // error, or panic) — no explicit cleanup needed.
+                self.fetch_and_extract(store_basename)
             }
-            // Still not cached after ~1.4s total — give up with EAGAIN so
-            // the caller (and ultimately the build) can retry the read.
-            tracing::warn!(
-                store_path = store_basename,
-                "concurrent fetch did not complete after {}ms, returning EAGAIN",
-                BASE_BACKOFF_MS * (1 << MAX_ATTEMPTS).min(MAX_BACKOFF_MS / BASE_BACKOFF_MS)
-            );
-            return Err(Errno::EAGAIN);
+            FetchClaim::WaitFor(entry) => {
+                // Another thread is fetching. Wait for it with a timeout as
+                // belt-and-suspenders against a stuck fetcher (the guard's
+                // Drop impl fires even on panic, so this timeout is defensive).
+                const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+                if !entry.wait(WAIT_TIMEOUT) {
+                    tracing::warn!(
+                        store_path = store_basename,
+                        timeout_secs = WAIT_TIMEOUT.as_secs(),
+                        "concurrent fetch did not complete within timeout, returning EAGAIN"
+                    );
+                    return Err(Errno::EAGAIN);
+                }
+                // Fetch completed — check cache again (the fetcher may have
+                // failed, in which case ENOENT tells the FUSE caller to retry).
+                self.cache.get_path(store_basename).ok_or(Errno::ENOENT)
+            }
         }
-
-        let result = self.fetch_and_extract(store_basename);
-        self.cache.finish_fetch(store_basename);
-        result
     }
 
     /// Fetch a store path's NAR from remote store and extract to local cache.
