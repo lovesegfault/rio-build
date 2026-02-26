@@ -38,10 +38,20 @@ use self::cache::{Cache, FetchClaim};
 use self::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr, synthetic_dir_attr};
 use self::read::{io_error_to_errno, read_file_range};
 
-/// Bidirectional inode-to-path map, protected by a single lock.
+/// Bidirectional inode-to-path map with kernel lookup refcounting, protected
+/// by a single lock.
+///
+/// FUSE protocol: each successful lookup/create reply increments the kernel's
+/// refcount for that inode by 1. The kernel sends `forget(ino, n)` when it
+/// drops n references. When the count hits zero, the filesystem may free
+/// resources associated with the inode.
 struct InodeMap {
     inode_to_path: HashMap<u64, PathBuf>,
     path_to_inode: HashMap<PathBuf, u64>,
+    /// Kernel lookup refcount per inode. Incremented on each reply.entry(),
+    /// decremented (by n) on forget(ino, n). When it hits zero, the inode
+    /// entry is removed from all maps (except ROOT, which is never forgotten).
+    nlookup: HashMap<u64, u64>,
     next_inode: u64,
 }
 
@@ -54,6 +64,7 @@ impl InodeMap {
         Self {
             inode_to_path,
             path_to_inode,
+            nlookup: HashMap::new(),
             next_inode: 2,
         }
     }
@@ -69,6 +80,36 @@ impl InodeMap {
         ino
     }
 
+    /// Increment the kernel lookup refcount for an inode. Call this exactly
+    /// once per successful reply.entry().
+    fn increment_lookup(&mut self, ino: u64) {
+        *self.nlookup.entry(ino).or_insert(0) += 1;
+    }
+
+    /// Decrement the kernel lookup refcount by `n`. If it reaches zero (and
+    /// this is not ROOT), remove the inode from all maps. Returns true iff
+    /// the inode was removed.
+    fn forget(&mut self, ino: u64, n: u64) -> bool {
+        if ino == INodeNo::ROOT.0 {
+            return false;
+        }
+        let Some(count) = self.nlookup.get_mut(&ino) else {
+            // Kernel sent forget for an inode we don't track (e.g., created
+            // via readdir without a subsequent lookup). Nothing to do.
+            return false;
+        };
+        *count = count.saturating_sub(n);
+        if *count == 0 {
+            self.nlookup.remove(&ino);
+            if let Some(path) = self.inode_to_path.remove(&ino) {
+                self.path_to_inode.remove(&path);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn real_path(&self, ino: u64) -> Option<PathBuf> {
         self.inode_to_path.get(&ino).cloned()
     }
@@ -78,6 +119,11 @@ impl InodeMap {
             .parent()
             .and_then(|p| self.path_to_inode.get(p).copied())
             .unwrap_or(INodeNo::ROOT.0)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inode_to_path.len()
     }
 }
 
@@ -145,6 +191,20 @@ impl NixStoreFs {
             e.into_inner()
         });
         map.get_or_create(path)
+    }
+
+    /// Variant of get_or_create_inode that also increments the nlookup
+    /// refcount. Call this exactly once per successful reply.entry() in the
+    /// lookup path. readdir should use get_or_create_inode (no refcount
+    /// increment; the kernel does not forget readdir-returned inodes).
+    fn get_or_create_inode_for_lookup(&self, path: PathBuf) -> u64 {
+        let mut map = self.inodes.write().unwrap_or_else(|e| {
+            tracing::error!("inodes lock poisoned on write, recovering");
+            e.into_inner()
+        });
+        let ino = map.get_or_create(path);
+        map.increment_lookup(ino);
+        ino
     }
 
     fn real_path(&self, ino: u64) -> Option<PathBuf> {
@@ -377,6 +437,16 @@ impl Filesystem for NixStoreFs {
         }
     }
 
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        let mut map = self.inodes.write().unwrap_or_else(|e| {
+            tracing::error!("inodes lock poisoned on forget, recovering");
+            e.into_inner()
+        });
+        if map.forget(ino.0, nlookup) {
+            tracing::trace!(ino = ino.0, "forgot inode");
+        }
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(parent_path) = self.real_path(parent.0) else {
             reply.error(Errno::ENOENT);
@@ -387,7 +457,7 @@ impl Filesystem for NixStoreFs {
 
         // Check local cache first
         if let Ok(meta) = child_path.symlink_metadata() {
-            let ino = self.get_or_create_inode(child_path);
+            let ino = self.get_or_create_inode_for_lookup(child_path);
             let attr = stat_to_attr(ino, &meta);
             reply.entry(&ATTR_TTL, &attr, Generation(0));
             metrics::counter!("rio_worker_fuse_cache_hits_total").increment(1);
@@ -401,7 +471,7 @@ impl Filesystem for NixStoreFs {
                 Ok(true) => {
                     // Path exists remotely; create a synthetic directory entry.
                     // The actual content will be fetched on open/read.
-                    let ino = self.get_or_create_inode(child_path);
+                    let ino = self.get_or_create_inode_for_lookup(child_path);
                     let attr = synthetic_dir_attr(ino);
                     reply.entry(&ATTR_TTL, &attr, Generation(0));
                     return;
@@ -786,6 +856,59 @@ mod tests {
         let _ino = map.get_or_create(child.clone());
 
         assert_eq!(map.parent_inode(&child), INodeNo::ROOT.0);
+    }
+
+    #[test]
+    fn test_inode_map_forget_removes_when_zero() {
+        let root = PathBuf::from("/nix/store");
+        let mut map = InodeMap::new(root);
+        let p = PathBuf::from("/nix/store/abc-hello");
+        let ino = map.get_or_create(p.clone());
+        map.increment_lookup(ino);
+        map.increment_lookup(ino);
+        // nlookup = 2; forget(1) -> nlookup = 1, not removed
+        assert!(!map.forget(ino, 1));
+        assert!(map.real_path(ino).is_some());
+        // forget(1) -> nlookup = 0, removed
+        assert!(map.forget(ino, 1));
+        assert!(map.real_path(ino).is_none());
+        assert_eq!(map.len(), 1, "only ROOT should remain");
+    }
+
+    #[test]
+    fn test_inode_map_forget_keeps_when_nonzero() {
+        let root = PathBuf::from("/nix/store");
+        let mut map = InodeMap::new(root);
+        let ino = map.get_or_create(PathBuf::from("/nix/store/abc"));
+        map.increment_lookup(ino);
+        map.increment_lookup(ino);
+        map.increment_lookup(ino);
+        // nlookup = 3; forget(2) -> nlookup = 1, not removed
+        assert!(!map.forget(ino, 2));
+        assert!(map.real_path(ino).is_some());
+        assert_eq!(map.len(), 2, "ROOT + abc");
+    }
+
+    #[test]
+    fn test_inode_map_forget_never_removes_root() {
+        let root = PathBuf::from("/nix/store");
+        let mut map = InodeMap::new(root.clone());
+        map.increment_lookup(INodeNo::ROOT.0);
+        // Even if nlookup hits zero, ROOT is never removed.
+        assert!(!map.forget(INodeNo::ROOT.0, 100));
+        assert_eq!(map.real_path(INodeNo::ROOT.0), Some(root));
+    }
+
+    #[test]
+    fn test_inode_map_forget_untracked_inode() {
+        let root = PathBuf::from("/nix/store");
+        let mut map = InodeMap::new(root);
+        // Inode created via readdir (get_or_create without increment_lookup).
+        // Kernel should not forget these, but if it does, we handle gracefully.
+        let ino = map.get_or_create(PathBuf::from("/nix/store/no-lookup"));
+        assert!(!map.forget(ino, 1));
+        // Entry is NOT removed (no nlookup entry means we never counted it).
+        assert!(map.real_path(ino).is_some());
     }
 
     #[test]
