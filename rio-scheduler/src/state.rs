@@ -385,8 +385,9 @@ pub struct BuildInfo {
     pub tenant_id: Option<String>,
     /// Priority class ("ci", "interactive", "scheduled").
     pub priority_class: String,
-    /// Current build state.
-    pub state: BuildState,
+    /// Current build state. Private: use `state()` to read, `transition()` to mutate.
+    /// This enforces the BuildState transition validation at every write site.
+    state: BuildState,
     /// Whether to continue building independent derivations on failure.
     pub keep_going: bool,
     /// Build options propagated from the client.
@@ -403,6 +404,48 @@ pub struct BuildInfo {
     pub error_summary: Option<String>,
     /// The derivation that caused the failure (if any).
     pub failed_derivation: Option<String>,
+}
+
+impl BuildInfo {
+    /// Construct a new BuildInfo in the Pending state with zeroed counts.
+    pub fn new_pending(
+        build_id: Uuid,
+        tenant_id: Option<String>,
+        priority_class: String,
+        keep_going: bool,
+        options: BuildOptions,
+        derivation_hashes: HashSet<String>,
+    ) -> Self {
+        Self {
+            build_id,
+            tenant_id,
+            priority_class,
+            state: BuildState::Pending,
+            keep_going,
+            options,
+            derivation_hashes,
+            completed_count: 0,
+            cached_count: 0,
+            failed_count: 0,
+            error_summary: None,
+            failed_derivation: None,
+        }
+    }
+
+    /// Read the current state.
+    pub fn state(&self) -> BuildState {
+        self.state
+    }
+
+    /// Attempt to transition to a new state, validating against the BuildState
+    /// machine. Returns the old state on success, `TransitionError` on invalid
+    /// transition.
+    pub fn transition(&mut self, to: BuildState) -> Result<BuildState, TransitionError> {
+        let from = self.state;
+        from.validate_transition(to)?;
+        self.state = to;
+        Ok(from)
+    }
 }
 
 /// Build configuration options.
@@ -745,5 +788,50 @@ mod tests {
         assert!(d0.as_secs_f64() > 3.0 && d0.as_secs_f64() < 7.0);
         // Second attempt should be around 10s +/- jitter
         assert!(d1.as_secs_f64() > 7.0 && d1.as_secs_f64() < 13.0);
+    }
+
+    #[test]
+    fn test_build_info_transition_validated() {
+        let mut b = BuildInfo::new_pending(
+            Uuid::new_v4(),
+            None,
+            "scheduled".into(),
+            false,
+            BuildOptions::default(),
+            HashSet::new(),
+        );
+        assert_eq!(b.state(), BuildState::Pending);
+
+        // Valid: Pending -> Active
+        let old = b.transition(BuildState::Active).unwrap();
+        assert_eq!(old, BuildState::Pending);
+        assert_eq!(b.state(), BuildState::Active);
+
+        // Valid: Active -> Succeeded
+        b.transition(BuildState::Succeeded).unwrap();
+        assert_eq!(b.state(), BuildState::Succeeded);
+
+        // Invalid: terminal -> anything
+        assert!(b.transition(BuildState::Active).is_err());
+        assert_eq!(
+            b.state(),
+            BuildState::Succeeded,
+            "state must be unchanged after rejected transition"
+        );
+    }
+
+    #[test]
+    fn test_build_info_transition_rejects_skip() {
+        let mut b = BuildInfo::new_pending(
+            Uuid::new_v4(),
+            None,
+            "scheduled".into(),
+            false,
+            BuildOptions::default(),
+            HashSet::new(),
+        );
+        // Invalid: Pending -> Succeeded (skips Active)
+        assert!(b.transition(BuildState::Succeeded).is_err());
+        assert_eq!(b.state(), BuildState::Pending);
     }
 }

@@ -449,20 +449,14 @@ impl DagActor {
         self.build_sequences.insert(build_id, 0);
 
         // Create in-memory build info
-        let build_info = BuildInfo {
+        let build_info = BuildInfo::new_pending(
             build_id,
             tenant_id,
             priority_class,
-            state: BuildState::Pending,
             keep_going,
             options,
-            derivation_hashes: nodes.iter().map(|n| n.drv_hash.clone()).collect(),
-            completed_count: 0,
-            cached_count: 0,
-            failed_count: 0,
-            error_summary: None,
-            failed_derivation: None,
-        };
+            nodes.iter().map(|n| n.drv_hash.clone()).collect(),
+        );
         self.builds.insert(build_id, build_info);
 
         // Merge nodes and edges into the global DAG
@@ -1194,7 +1188,7 @@ impl DagActor {
             None => return Err(ActorError::BuildNotFound(build_id)),
         };
 
-        if build.state.is_terminal() {
+        if build.state().is_terminal() {
             return Ok(false);
         }
 
@@ -1206,9 +1200,11 @@ impl DagActor {
             self.ready_queue.remove(hash);
         }
 
-        // Transition build to cancelled
+        // Transition build to cancelled. Already checked !is_terminal above,
+        // so this can only fail if the state was concurrently modified — but
+        // we're the actor (single owner), so this succeeds.
         if let Some(build) = self.builds.get_mut(&build_id) {
-            build.state = BuildState::Cancelled;
+            let _ = build.transition(BuildState::Cancelled);
         }
 
         self.db
@@ -1444,7 +1440,7 @@ impl DagActor {
         metrics::gauge!("rio_scheduler_builds_active").set(
             self.builds
                 .values()
-                .filter(|b| b.state == BuildState::Active)
+                .filter(|b| b.state() == BuildState::Active)
                 .count() as f64,
         );
         metrics::gauge!("rio_scheduler_derivations_running").set(
@@ -1645,7 +1641,7 @@ impl DagActor {
 
         let summary = self.dag.build_summary(build_id);
 
-        let proto_state = match build.state {
+        let proto_state = match build.state() {
             BuildState::Pending => rio_proto::types::BuildState::Pending,
             BuildState::Active => rio_proto::types::BuildState::Active,
             BuildState::Succeeded => rio_proto::types::BuildState::Succeeded,
@@ -1749,7 +1745,7 @@ impl DagActor {
     async fn check_build_completion(&mut self, build_id: Uuid, _worker_id: &str) {
         let (state, keep_going, total, completed, failed) = match self.builds.get(&build_id) {
             Some(b) => (
-                b.state,
+                b.state(),
                 b.keep_going,
                 b.derivation_hashes.len() as u32,
                 b.completed_count,
@@ -1837,10 +1833,10 @@ impl DagActor {
         build_id: Uuid,
         new_state: BuildState,
     ) -> Result<(), ActorError> {
-        if let Some(build) = self.builds.get_mut(&build_id)
-            && build.state.validate_transition(new_state).is_ok()
-        {
-            build.state = new_state;
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            // Ignore transition errors (invalid transition = no-op).
+            // The DB write below still records the intended terminal state.
+            let _ = build.transition(new_state);
         }
 
         let error_summary = self
@@ -1887,7 +1883,7 @@ impl DagActor {
         let is_terminal = self
             .builds
             .get(&build_id)
-            .map(|b| b.state.is_terminal())
+            .map(|b| b.state().is_terminal())
             .unwrap_or(true); // already removed = fine
         if !is_terminal {
             warn!(build_id = %build_id, "cleanup scheduled for non-terminal build, skipping");
