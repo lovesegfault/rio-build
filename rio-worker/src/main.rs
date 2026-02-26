@@ -190,13 +190,17 @@ async fn main() -> anyhow::Result<()> {
     // Track running builds (drv_path set) for heartbeat reporting
     let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    // Spawn heartbeat loop
+    // Spawn heartbeat loop. A panicking heartbeat loop leaves the worker
+    // silently alive but unreachable from the scheduler's perspective — the
+    // scheduler times it out and re-dispatches its builds to another worker,
+    // leading to duplicate builds. Wrap in spawn_monitored so panics are logged,
+    // and check liveness in the main event loop.
     let heartbeat_worker_id = worker_id.clone();
     let heartbeat_system = system.clone();
     let heartbeat_max_builds = args.max_builds;
     let heartbeat_running = running_builds.clone();
     let mut heartbeat_client = scheduler_client.clone();
-    tokio::spawn(async move {
+    let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
@@ -229,6 +233,14 @@ async fn main() -> anyhow::Result<()> {
     let overlay_base_dir = args.overlay_base_dir.clone();
 
     while let Some(msg_result) = tokio_stream::StreamExt::next(&mut build_stream).await {
+        // A worker without a live heartbeat is a liability (scheduler will
+        // time it out and re-dispatch its builds). Die fast rather than
+        // silently duplicate work.
+        if heartbeat_handle.is_finished() {
+            tracing::error!("heartbeat loop terminated unexpectedly; exiting");
+            std::process::exit(1);
+        }
+
         let msg = match msg_result {
             Ok(m) => m,
             Err(e) => {
@@ -343,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // If the build task panics, send InfrastructureFailure so the
                 // scheduler doesn't leave the derivation stuck in Running.
-                tokio::spawn(async move {
+                rio_common::task::spawn_monitored("build-panic-catcher", async move {
                     if let Err(e) = handle.await
                         && e.is_panic()
                     {
@@ -352,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
                             "build task panicked; sending InfrastructureFailure to scheduler"
                         );
                         let completion = CompletionReport {
-                            drv_path: panic_drv_path,
+                            drv_path: panic_drv_path.clone(),
                             result: Some(rio_proto::types::BuildResult {
                                 status: rio_proto::types::BuildResultStatus::InfrastructureFailure
                                     .into(),
@@ -364,7 +376,13 @@ async fn main() -> anyhow::Result<()> {
                         let msg = WorkerMessage {
                             msg: Some(worker_message::Msg::Completion(completion)),
                         };
-                        let _ = panic_tx.send(msg).await;
+                        if let Err(e) = panic_tx.send(msg).await {
+                            tracing::error!(
+                                drv_path = %panic_drv_path,
+                                error = %e,
+                                "failed to send panic-completion report; derivation may be stuck in Running"
+                            );
+                        }
                     }
                 });
             }
