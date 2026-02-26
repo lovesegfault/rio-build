@@ -893,7 +893,7 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     format!("invalid store path '{path_str}': {e}"),
                 ))
                 .await?;
-            return Ok(());
+            return Err(anyhow::anyhow!("invalid store path '{path_str}': {e}"));
         }
     };
 
@@ -910,7 +910,7 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     format!("path '{}' is not valid", path_str),
                 ))
                 .await?;
-            return Ok(());
+            return Err(anyhow::anyhow!("path '{path_str}' is not valid"));
         }
         Err(e) => {
             return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath failed: {e}")).await;

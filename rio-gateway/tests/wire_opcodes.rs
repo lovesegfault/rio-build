@@ -797,6 +797,28 @@ async fn test_nar_from_path_missing_returns_error() {
     h.finish().await;
 }
 
+#[tokio::test]
+async fn test_nar_from_path_invalid_path_returns_error() {
+    let mut h = TestHarness::setup().await;
+
+    // Send a string that fails StorePath::parse (no /nix/store/ prefix).
+    wire::write_u64(&mut h.stream, 38).await.unwrap(); // wopNarFromPath
+    wire::write_string(&mut h.stream, "not-a-valid-store-path")
+        .await
+        .unwrap();
+    h.stream.flush().await.unwrap();
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(
+        err.message().contains("invalid store path"),
+        "error should mention invalid store path, got: {}",
+        err.message()
+    );
+
+    // Session must terminate after STDERR_ERROR (handler returns Err now).
+    h.finish().await;
+}
+
 // ===========================================================================
 // Opcode tests: AddToStoreNar (39)
 // ===========================================================================
