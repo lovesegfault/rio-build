@@ -84,6 +84,8 @@
                 (craneLib.fileset.commonCargoSources unfilteredRoot)
                 # Proto files for gRPC code generation
                 (pkgs.lib.fileset.fileFilter (file: file.hasExt "proto") unfilteredRoot)
+                # SQL migrations (embedded at compile time via sqlx::migrate!)
+                ./migrations
               ];
             };
             strictDeps = true;
@@ -117,6 +119,8 @@
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
             PROTOC = "${pkgs.protobuf}/bin/protoc";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            # Where rio-test-support finds initdb/postgres (falls back to PATH).
+            PG_BIN = "${pkgs.postgresql_18}/bin";
           };
 
           # Build dependencies only (for caching)
@@ -196,12 +200,16 @@
               # Documentation
               mdbook
               mdbook-mermaid
+
+              # Integration test deps
+              postgresql_18
             ];
 
             RUST_BACKTRACE = "1";
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
             PROTOC = "${pkgs.protobuf}/bin/protoc";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            PG_BIN = "${pkgs.postgresql_18}/bin";
 
             shellHook = config.pre-commit.installationScript;
           };
@@ -292,6 +300,7 @@
                 nativeCheckInputs = with pkgs; [
                   inputs.nix.packages.${system}.default
                   openssh
+                  postgresql_18
                 ];
               }
             );
@@ -317,6 +326,7 @@
                   ++ (with pkgs; [
                     inputs.nix.packages.${system}.default
                     openssh
+                    postgresql_18
                   ]);
               }
             );

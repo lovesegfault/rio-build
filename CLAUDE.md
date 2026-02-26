@@ -69,7 +69,7 @@ Pre-commit hooks run treefmt automatically on commit.
 - Integration tests may need `nix` available in PATH (it's provided in the dev shell).
 - **Always run cargo commands via `nix develop -c`** to ensure all dev shell dependencies (including fuse3) are available. E.g., `nix develop -c cargo nextest run`, `nix develop -c cargo clippy --all-targets -- --deny warnings`.
 - **Always run `nix develop -c cargo nextest run` before committing** to catch regressions early.
-- PostgreSQL integration tests skip gracefully if `DATABASE_URL` is not set. To run them, start a local PG: `docker run -d --name rio-test-pg -e POSTGRES_PASSWORD=rio -e POSTGRES_USER=rio -e POSTGRES_DB=rio -p 15432:5432 postgres:16-alpine` then run with `DATABASE_URL="postgres://rio:rio@localhost:15432/rio" nix develop -c cargo nextest run`.
+- PostgreSQL integration tests bootstrap their own ephemeral postgres server (via `rio-test-support`) using `initdb`/`postgres` binaries from the dev shell. **No manual setup needed.** Tests panic (not skip) if postgres binaries are unavailable. Set `DATABASE_URL` to override with an external PG for debugging.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
 - Keep phase plan docs (`docs/src/phases/`) in sync: mark tasks `[x]` as they're completed.
 

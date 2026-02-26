@@ -8,6 +8,7 @@ members = [
   "rio-scheduler",
   "rio-spike",
   "rio-store",
+  "rio-test-support",
   "rio-worker",
 ]
 exclude = ["rio-nix/fuzz"]
@@ -69,6 +70,8 @@ nix = { version = "0.31", features = [
   "fs",
   "user",
   "hostname",
+  "process",
+  "signal",
 ] }
 
 # CLI

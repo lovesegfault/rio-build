@@ -1734,104 +1734,11 @@ impl ActorHandle {
 #[allow(dead_code)] // Helpers used progressively across Group 1-10 TDD tests
 pub(crate) mod tests {
     use super::*;
+    use rio_test_support::TestDb;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// A test-database harness. Creates an isolated database per-test,
-    /// runs migrations, and drops the database on Drop.
-    pub(crate) struct TestDb {
-        pub pool: sqlx::PgPool,
-        db_name: String,
-        admin_url: String,
-    }
-
-    impl TestDb {
-        /// Set up an isolated test database. Returns `None` if `DATABASE_URL`
-        /// is not set (test should skip).
-        pub(crate) async fn new() -> Option<Self> {
-            let admin_url = std::env::var("DATABASE_URL").ok()?;
-
-            // Generate a unique database name
-            let db_name = format!(
-                "rio_test_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-
-            // Connect to admin DB and create test DB
-            let admin_pool = sqlx::PgPool::connect(&admin_url)
-                .await
-                .expect("failed to connect to admin DATABASE_URL");
-            sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-                .execute(&admin_pool)
-                .await
-                .expect("failed to create test database");
-            admin_pool.close().await;
-
-            // Build test DB URL by replacing the database name
-            let test_url = replace_db_name(&admin_url, &db_name);
-            let pool = sqlx::PgPool::connect(&test_url)
-                .await
-                .expect("failed to connect to test database");
-
-            // Run migrations
-            sqlx::migrate!("../migrations")
-                .run(&pool)
-                .await
-                .expect("migrations failed");
-
-            Some(Self {
-                pool,
-                db_name,
-                admin_url,
-            })
-        }
-    }
-
-    impl Drop for TestDb {
-        fn drop(&mut self) {
-            // Close the test pool and drop the database. This runs in Drop,
-            // so we need a new runtime for the async cleanup.
-            let db_name = self.db_name.clone();
-            let admin_url = self.admin_url.clone();
-            // Close connections synchronously by dropping the pool's internal state
-            // (pool will be closed when it goes out of scope after this).
-            // Then drop the database via a background thread.
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let admin_pool = match sqlx::PgPool::connect(&admin_url).await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    // Terminate any remaining connections then drop
-                    let _ = sqlx::query(&format!(
-                        r#"SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                           WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"#
-                    ))
-                    .execute(&admin_pool)
-                    .await;
-                    let _ = sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{db_name}""#))
-                        .execute(&admin_pool)
-                        .await;
-                });
-            })
-            .join()
-            .ok();
-        }
-    }
-
-    /// Replace the database name in a PostgreSQL URL.
-    fn replace_db_name(url: &str, new_db: &str) -> String {
-        // postgres://user:pass@host:port/dbname -> ...host:port/new_db
-        if let Some(idx) = url.rfind('/') {
-            format!("{}/{}", &url[..idx], new_db)
-        } else {
-            format!("{url}/{new_db}")
-        }
-    }
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
     /// Set up an actor with the given PgPool and return (handle, task).
     /// The caller should drop the handle to shut down the actor.
@@ -1940,10 +1847,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_actor_starts_and_stops() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, task) = setup_actor(db.pool.clone()).await;
         settle().await;
         // Query should succeed (actor is running)
@@ -1967,10 +1871,7 @@ pub(crate) mod tests {
     /// This SHOULD pass with current code (the bug is in grpc.rs, not the actor).
     #[tokio::test]
     async fn test_worker_registers_via_stream_and_heartbeat() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         let _stream_rx = connect_worker(&handle, "test-worker-1", "x86_64-linux", 2).await;
@@ -1994,10 +1895,7 @@ pub(crate) mod tests {
     /// and the build stays Active forever.
     #[tokio::test]
     async fn test_completion_resolves_drv_path_to_hash() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         // Register a worker
@@ -2067,10 +1965,7 @@ pub(crate) mod tests {
     /// increment retry_count.
     #[tokio::test]
     async fn test_worker_disconnect_running_derivation() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         // Register a worker
@@ -2150,10 +2045,7 @@ pub(crate) mod tests {
     /// so this verifies the full path.
     #[tokio::test]
     async fn test_completion_infrastructure_failure_handled() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
@@ -2212,10 +2104,7 @@ pub(crate) mod tests {
     /// Interactive (IFD) builds should jump to the front of the ready queue.
     #[tokio::test]
     async fn test_interactive_builds_pushed_to_front() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         // Worker with capacity for 1 build at a time
@@ -2303,10 +2192,7 @@ pub(crate) mod tests {
     /// keepGoing=false: on PermanentFailure, the entire build fails immediately.
     #[tokio::test]
     async fn test_keepgoing_false_fails_fast() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
@@ -2368,10 +2254,7 @@ pub(crate) mod tests {
     /// keepGoing=true: build waits for all derivations, fails only at the end.
     #[tokio::test]
     async fn test_keepgoing_true_waits_all() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
@@ -2463,10 +2346,7 @@ pub(crate) mod tests {
     /// TransientFailure: retry on a different worker up to max_retries (default 2).
     #[tokio::test]
     async fn test_transient_retry_different_worker() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         // Register two workers
@@ -2618,14 +2498,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_scheduler_cache_check_skips_build() {
-        let Some(sched_db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
-        let Some(store_db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set (store)");
-            return;
-        };
+        let sched_db = TestDb::new(&MIGRATOR).await;
+        let store_db = TestDb::new(&MIGRATOR).await;
 
         // Start in-process store and pre-populate the expected output path.
         let (mut store_client, _store_server) = setup_inproc_store(store_db.pool.clone()).await;
@@ -2693,10 +2567,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_scheduler_cache_check_skipped_without_store() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
 
         // No store client — cache check should silently skip.
         let (handle, _task) = setup_actor(db.pool.clone()).await;
@@ -2754,10 +2625,7 @@ pub(crate) mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_db_failure_during_completion_logged() {
-        let Some(db) = TestDb::new().await else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let db = TestDb::new(&MIGRATOR).await;
         let (handle, _task) = setup_actor(db.pool.clone()).await;
 
         // Get a single derivation to Assigned state.

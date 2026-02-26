@@ -1,10 +1,8 @@
 //! gRPC-level integration tests for StoreService.
 //!
 //! These tests spin up an in-process tonic server backed by [`MemoryBackend`]
-//! and a real PostgreSQL database, then exercise the full gRPC request/response
-//! path including streaming.
-//!
-//! Tests skip gracefully if `DATABASE_URL` is not set.
+//! and an ephemeral PostgreSQL database (bootstrapped by `rio-test-support`),
+//! then exercise the full gRPC request/response path including streaming.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,84 +20,9 @@ use rio_proto::types::{
 };
 use rio_store::backend::memory::MemoryBackend;
 use rio_store::grpc::StoreServiceImpl;
+use rio_test_support::TestDb;
 
-/// Test-database harness. Creates an isolated database per-test and drops on Drop.
-pub struct TestDb {
-    pub pool: PgPool,
-    db_name: String,
-    admin_url: String,
-}
-
-impl TestDb {
-    /// Set up an isolated test database. Returns `None` if `DATABASE_URL` not set.
-    pub async fn new() -> Option<Self> {
-        let admin_url = std::env::var("DATABASE_URL").ok()?;
-
-        let db_name = format!(
-            "rio_store_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let admin_pool = PgPool::connect(&admin_url)
-            .await
-            .expect("failed to connect to admin DATABASE_URL");
-        sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-            .execute(&admin_pool)
-            .await
-            .expect("failed to create test database");
-        admin_pool.close().await;
-
-        let test_url = if let Some(idx) = admin_url.rfind('/') {
-            format!("{}/{}", &admin_url[..idx], db_name)
-        } else {
-            format!("{admin_url}/{db_name}")
-        };
-        let pool = PgPool::connect(&test_url)
-            .await
-            .expect("failed to connect to test database");
-
-        sqlx::migrate!("../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations failed");
-
-        Some(Self {
-            pool,
-            db_name,
-            admin_url,
-        })
-    }
-}
-
-impl Drop for TestDb {
-    fn drop(&mut self) {
-        let db_name = self.db_name.clone();
-        let admin_url = self.admin_url.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let admin_pool = match PgPool::connect(&admin_url).await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                let _ = sqlx::query(&format!(
-                    r#"SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                       WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"#
-                ))
-                .execute(&admin_pool)
-                .await;
-                let _ = sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{db_name}""#))
-                    .execute(&admin_pool)
-                    .await;
-            });
-        })
-        .join()
-        .ok();
-    }
-}
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 /// Spawn an in-process store gRPC server and return a connected client.
 ///
@@ -227,10 +150,7 @@ pub async fn put_path(
 
 #[tokio::test]
 async fn test_harness_smoke() {
-    let Some(db) = TestDb::new().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     // QueryPathInfo on missing path should return NOT_FOUND
@@ -257,10 +177,7 @@ async fn test_harness_smoke() {
 /// should be cleaned up so a retry with the correct data succeeds.
 #[tokio::test]
 async fn test_put_path_cleanup_on_hash_mismatch() {
-    let Some(db) = TestDb::new().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     let store_path = "/nix/store/test-cleanup-path";
@@ -300,10 +217,7 @@ async fn test_put_path_cleanup_on_hash_mismatch() {
 async fn test_put_get_roundtrip() {
     use rio_proto::types::{GetPathRequest, get_path_response};
 
-    let Some(db) = TestDb::new().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     let store_path = "/nix/store/test-roundtrip-path";
@@ -348,10 +262,7 @@ async fn test_put_get_roundtrip() {
 /// Second PutPath with same content should return created=false (idempotent).
 #[tokio::test]
 async fn test_idempotent_put_path() {
-    let Some(db) = TestDb::new().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     let store_path = "/nix/store/test-idempotent-path";
@@ -376,10 +287,7 @@ async fn test_idempotent_put_path() {
 /// PutPath with chunks exceeding declared nar_size should be rejected.
 #[tokio::test]
 async fn test_put_path_rejects_oversized_nar() {
-    let Some(db) = TestDb::new().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     // Declare nar_size=100 but send 100_000 bytes (well over + 4KB tolerance)
