@@ -96,6 +96,25 @@ pub fn setup_overlay(
     fs::create_dir_all(&work)?;
     fs::create_dir_all(&merged)?;
 
+    // The kernel rejects overlayfs mounts where upper and lower share a
+    // filesystem when the lower is FUSE. Compare st_dev proactively so we
+    // fail with a clear message rather than a cryptic EINVAL from mount(2).
+    let lower_dev = nix::sys::stat::stat(lower)
+        .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", lower.display()))?
+        .st_dev;
+    let upper_dev = nix::sys::stat::stat(&upper)
+        .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", upper.display()))?
+        .st_dev;
+    anyhow::ensure!(
+        lower_dev != upper_dev,
+        "overlay upper ({}) and FUSE lower ({}) are on the same filesystem \
+         (st_dev={lower_dev}); the kernel will reject this mount. \
+         Set --overlay-base-dir to a directory on a different mount \
+         (e.g., a local SSD emptyDir volume, not the FUSE mount).",
+        upper.display(),
+        lower.display(),
+    );
+
     let mount_data = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),
@@ -212,5 +231,21 @@ mod tests {
         assert!(setup_overlay(lower, dir.path(), "").is_err());
         assert!(setup_overlay(lower, dir.path(), "foo/bar").is_err());
         assert!(setup_overlay(lower, dir.path(), "foo\0bar").is_err());
+    }
+
+    #[test]
+    fn test_setup_overlay_rejects_same_filesystem() {
+        // Both lower and base_dir under the same tempdir → same st_dev.
+        // The check fires before the mount syscall, so this runs without CAP_SYS_ADMIN.
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("lower");
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&lower).unwrap();
+
+        let Err(e) = setup_overlay(&lower, &base, "test-build") else {
+            panic!("expected setup_overlay to fail when upper and lower share a filesystem");
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("same filesystem"), "got: {msg}");
     }
 }
