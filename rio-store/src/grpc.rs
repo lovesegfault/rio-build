@@ -29,6 +29,30 @@ use crate::validate::{HashingReader, validate_nar_digest};
 /// NAR chunk size for streaming GetPath responses (64 KB).
 const NAR_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Maximum declared NAR size we accept. Prevents OOM from a malicious client
+/// declaring nar_size=u64::MAX to trigger a huge Vec::with_capacity.
+const MAX_NAR_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// Maximum number of paths in a FindMissingPaths request.
+const MAX_BATCH_PATHS: usize = 10_000;
+
+/// Validate a store path string: must parse as a well-formed Nix store path
+/// (`/nix/store/<32-char-nixbase32>-<name>`). Rejects malformed paths, path
+/// traversal attempts, and oversized strings at the RPC boundary.
+fn validate_store_path(s: &str) -> Result<(), Status> {
+    rio_nix::store_path::StorePath::parse(s)
+        .map(|_| ())
+        .map_err(|e| Status::invalid_argument(format!("invalid store path {s:?}: {e}")))
+}
+
+/// Log the full error server-side but return a generic message to the client.
+/// Prevents leaking sqlx internals (connection strings, schema details) in
+/// gRPC responses.
+fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
+    error!(context, error = %e, "internal error");
+    Status::internal("storage operation failed")
+}
+
 /// The StoreService gRPC server.
 ///
 /// Holds a reference to the NAR backend and the PostgreSQL pool for metadata.
@@ -84,13 +108,19 @@ impl StoreService for StoreServiceImpl {
         };
 
         // Validate required fields
-        if info.store_path.is_empty() {
-            return Err(Status::invalid_argument("store_path is empty"));
-        }
+        validate_store_path(&info.store_path)?;
         if info.nar_hash.len() != 32 {
             return Err(Status::invalid_argument(format!(
                 "nar_hash must be 32 bytes (SHA-256), got {}",
                 info.nar_hash.len()
+            )));
+        }
+        // Bound nar_size BEFORE allocation. A malicious client declaring
+        // nar_size=u64::MAX would otherwise attempt a huge Vec::with_capacity.
+        if info.nar_size > MAX_NAR_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "nar_size {} exceeds maximum {} bytes",
+                info.nar_size, MAX_NAR_SIZE
             )));
         }
 
@@ -120,10 +150,9 @@ impl StoreService for StoreServiceImpl {
             }
             Ok(None) => {} // Not yet complete, proceed
             Err(e) => {
-                error!(error = %e, "PutPath: failed to check completion status");
                 // Drain remaining stream messages before returning error
                 drain_stream(&mut stream).await;
-                return Err(Status::internal(format!("database error: {e}")));
+                return Err(internal_error("PutPath: check_complete", e));
             }
         }
 
@@ -133,9 +162,8 @@ impl StoreService for StoreServiceImpl {
             metadata::insert_uploading(&self.pool, &store_path_hash, &info.store_path, &blob_key)
                 .await
         {
-            error!(error = %e, "PutPath: failed to insert uploading record");
             drain_stream(&mut stream).await;
-            return Err(Status::internal(format!("database error: {e}")));
+            return Err(internal_error("PutPath: insert_uploading", e));
         }
 
         // Step 4: Stream NAR data through HashingReader to backend.
@@ -213,8 +241,18 @@ impl StoreService for StoreServiceImpl {
             ..info
         };
         if let Err(e) = metadata::complete_upload(&self.pool, &full_info, &blob_key).await {
-            error!(error = %e, "PutPath: failed to complete upload");
-            return Err(Status::internal(format!("database error: {e}")));
+            // Clean up placeholder rows AND backend blob (unlike validation/backend
+            // failures which only clean metadata). The blob is now orphaned —
+            // metadata never flipped to 'complete', so GetPath can't serve it.
+            if let Err(cleanup_err) =
+                metadata::delete_uploading(&self.pool, &full_info.store_path_hash).await
+            {
+                error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after complete_upload failure");
+            }
+            if let Err(backend_err) = self.backend.delete(&blob_key).await {
+                warn!(error = %backend_err, "PutPath: failed to delete orphaned blob after complete_upload failure");
+            }
+            return Err(internal_error("PutPath: complete_upload", e));
         }
 
         debug!(store_path = %full_info.store_path, "PutPath: upload completed successfully");
@@ -240,20 +278,18 @@ impl StoreService for StoreServiceImpl {
     ) -> Result<Response<Self::GetPathStream>, Status> {
         let req = request.into_inner();
 
-        if req.store_path.is_empty() {
-            return Err(Status::invalid_argument("store_path is empty"));
-        }
+        validate_store_path(&req.store_path)?;
 
         // Step 1: Look up narinfo
         let info = metadata::query_path_info(&self.pool, &req.store_path)
             .await
-            .map_err(|e| Status::internal(format!("database error: {e}")))?
+            .map_err(|e| internal_error("GetPath: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
         // Look up blob key
         let blob_key = metadata::get_blob_key(&self.pool, &req.store_path)
             .await
-            .map_err(|e| Status::internal(format!("database error: {e}")))?
+            .map_err(|e| internal_error("GetPath: get_blob_key", e))?
             .ok_or_else(|| {
                 Status::not_found(format!("NAR blob not found for: {}", req.store_path))
             })?;
@@ -345,13 +381,11 @@ impl StoreService for StoreServiceImpl {
     ) -> Result<Response<PathInfo>, Status> {
         let req = request.into_inner();
 
-        if req.store_path.is_empty() {
-            return Err(Status::invalid_argument("store_path is empty"));
-        }
+        validate_store_path(&req.store_path)?;
 
         let info = metadata::query_path_info(&self.pool, &req.store_path)
             .await
-            .map_err(|e| Status::internal(format!("database error: {e}")))?
+            .map_err(|e| internal_error("QueryPathInfo: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
         Ok(Response::new(info))
@@ -367,9 +401,23 @@ impl StoreService for StoreServiceImpl {
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
         let req = request.into_inner();
 
+        // Bound request size to prevent DoS via huge path lists.
+        if req.store_paths.len() > MAX_BATCH_PATHS {
+            return Err(Status::invalid_argument(format!(
+                "too many paths: {} (max {})",
+                req.store_paths.len(),
+                MAX_BATCH_PATHS
+            )));
+        }
+        // Validate each path format. Reject the whole batch on any malformed
+        // path (client bug indicator).
+        for p in &req.store_paths {
+            validate_store_path(p)?;
+        }
+
         let missing = metadata::find_missing_paths(&self.pool, &req.store_paths)
             .await
-            .map_err(|e| Status::internal(format!("database error: {e}")))?;
+            .map_err(|e| internal_error("FindMissingPaths: find_missing_paths", e))?;
 
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
