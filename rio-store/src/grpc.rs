@@ -29,9 +29,7 @@ use crate::validate::{HashingReader, validate_nar_digest};
 /// NAR chunk size for streaming GetPath responses (64 KB).
 const NAR_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Maximum declared NAR size we accept. Prevents OOM from a malicious client
-/// declaring nar_size=u64::MAX to trigger a huge Vec::with_capacity.
-const MAX_NAR_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+use rio_common::limits::MAX_NAR_SIZE;
 
 /// Maximum number of paths in a FindMissingPaths request.
 const MAX_BATCH_PATHS: usize = 10_000;
