@@ -589,6 +589,11 @@ impl DagActor {
             .map(|b| b.priority_class == "interactive")
             .unwrap_or(false);
 
+        // Track whether any newly inserted node was immediately marked
+        // DependencyFailed (because a dep is already poisoned). If so, the
+        // build may need to fail (!keepGoing) or terminate early (keepGoing).
+        let mut first_dep_failed: Option<String> = None;
+
         for (drv_hash, target_status) in &initial_states {
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 match target_status {
@@ -616,6 +621,25 @@ impl DagActor {
                         self.db
                             .update_derivation_status(drv_hash, DerivationStatus::Queued, None)
                             .await?;
+                    }
+                    DerivationStatus::DependencyFailed => {
+                        if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
+                            warn!(drv_hash, error = %e, "Created->DependencyFailed transition failed");
+                        }
+                        self.db
+                            .update_derivation_status(
+                                drv_hash,
+                                DerivationStatus::DependencyFailed,
+                                None,
+                            )
+                            .await?;
+                        if first_dep_failed.is_none() {
+                            first_dep_failed = Some(drv_hash.clone());
+                        }
+                        debug!(
+                            drv_hash,
+                            "dep already poisoned at merge; marking DependencyFailed"
+                        );
                     }
                     _ => {}
                 }
@@ -648,6 +672,22 @@ impl DagActor {
                 cached_derivations: cached_count,
             }),
         );
+
+        // If a newly merged node depends on an already-poisoned existing
+        // node, handle the failure now (fail build if !keepGoing, or sync
+        // counts + check completion if keepGoing).
+        if let Some(failed_hash) = first_dep_failed {
+            self.handle_derivation_failure(build_id, &failed_hash).await;
+            // handle_derivation_failure may have transitioned the build to
+            // Failed. If so, don't dispatch.
+            if self
+                .builds
+                .get(&build_id)
+                .is_some_and(|b| b.state().is_terminal())
+            {
+                return Ok(event_rx);
+            }
+        }
 
         // Check if the build is already complete (all cache hits)
         if cached_count == total_derivations {
@@ -2888,6 +2928,105 @@ pub(crate) mod tests {
         assert_eq!(
             status.failed_derivations, 3,
             "1 Poisoned + 2 DependencyFailed should all count as failed"
+        );
+    }
+
+    /// When a new build depends on an already-poisoned derivation (from a
+    /// prior build), compute_initial_states must mark the new node
+    /// DependencyFailed immediately. Previously it went to Queued and hung
+    /// forever (never Ready, never cascaded since cascade only runs on
+    /// *transition to* Poisoned).
+    #[tokio::test]
+    async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let _stream_rx = connect_worker(&handle, "poison-worker", "x86_64-linux", 1).await;
+
+        // Build 1: single leaf, poisoned via PermanentFailure.
+        let build1 = Uuid::new_v4();
+        let _rx1 = merge_single_node(
+            &handle,
+            build1,
+            "preleaf",
+            "/nix/store/preleaf.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "poison-worker".into(),
+                drv_hash: "/nix/store/preleaf.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                    error_msg: "preleaf failed".into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Verify preleaf is Poisoned.
+        let leaf = handle
+            .debug_query_derivation("preleaf")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(leaf.status, DerivationStatus::Poisoned);
+
+        // Build 2: new node depending on the poisoned preleaf.
+        // keepGoing=false: build should fail immediately at merge.
+        let build2 = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id: build2,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![
+                    make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
+                    make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
+                ],
+                edges: vec![make_test_edge(
+                    "/nix/store/preparent.drv",
+                    "/nix/store/preleaf.drv",
+                )],
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _rx2 = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // preparent must be DependencyFailed (not stuck Queued).
+        let parent = handle
+            .debug_query_derivation("preparent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent.status,
+            DerivationStatus::DependencyFailed,
+            "new node depending on pre-poisoned dep must be DependencyFailed, not stuck Queued"
+        );
+
+        // Build 2 must be Failed (!keepGoing + dep failure).
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id: build2,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "build depending on pre-poisoned dep must fail immediately (!keepGoing)"
         );
     }
 
