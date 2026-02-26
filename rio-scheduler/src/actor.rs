@@ -870,9 +870,11 @@ impl DagActor {
             && let Some(pname) = &state.pname
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
         {
-            let duration_secs = (stop.seconds - start.seconds) as f64
-                + (stop.nanos - start.nanos) as f64 / 1_000_000_000.0;
+            let duration_secs = stop.seconds.saturating_sub(start.seconds) as f64
+                + stop.nanos.saturating_sub(start.nanos) as f64 / 1_000_000_000.0;
+            // Sanity bound: reject durations > 30 days (bogus worker timestamps)
             if duration_secs > 0.0
+                && duration_secs < 30.0 * 86400.0
                 && let Err(e) = self
                     .db
                     .update_build_history(pname, &state.system, duration_secs)
@@ -2432,6 +2434,68 @@ pub(crate) mod tests {
             ),
             "expected Ready or Assigned after retry, got {:?}",
             info.status
+        );
+    }
+
+    /// Malicious/buggy worker timestamps (i64::MIN start, i64::MAX stop) must
+    /// not panic the actor with integer overflow in the EMA duration computation.
+    #[tokio::test]
+    async fn test_completion_with_extreme_timestamps() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+
+        let build_id = Uuid::new_v4();
+        let drv_hash = "extreme-ts-hash";
+        let drv_path = "/nix/store/extreme-ts-hash.drv";
+        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        settle().await;
+
+        // Send completion with extreme timestamps that would overflow i64 subtraction.
+        // Pre-fix: stop.seconds - start.seconds = i64::MAX - i64::MIN overflows (panic in debug).
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: drv_path.into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    start_time: Some(prost_types::Timestamp {
+                        seconds: i64::MIN,
+                        nanos: i32::MIN,
+                    }),
+                    stop_time: Some(prost_types::Timestamp {
+                        seconds: i64::MAX,
+                        nanos: i32::MAX,
+                    }),
+                    built_outputs: vec![rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: "/nix/store/xyz-extreme".into(),
+                        output_hash: vec![0u8; 32],
+                    }],
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // If we got here, the actor didn't panic. Verify completion was processed
+        // (build succeeded) and actor is still alive.
+        assert!(handle.is_alive(), "actor must survive extreme timestamps");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let status = reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "build should succeed despite bogus timestamps"
         );
     }
 
