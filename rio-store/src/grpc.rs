@@ -60,6 +60,7 @@ impl StoreService for StoreServiceImpl {
         &self,
         request: Request<Streaming<PutPathRequest>>,
     ) -> Result<Response<PutPathResponse>, Status> {
+        let start = std::time::Instant::now();
         let mut stream = request.into_inner();
 
         // Step 1: Receive the first message (must be metadata)
@@ -114,6 +115,7 @@ impl StoreService for StoreServiceImpl {
                 debug!(store_path = %info.store_path, "PutPath: path already complete, returning success");
                 // Drain remaining stream messages (protocol contract)
                 drain_stream(&mut stream).await;
+                metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
                 return Ok(Response::new(PutPathResponse { created: false }));
             }
             Ok(None) => {} // Not yet complete, proceed
@@ -206,6 +208,9 @@ impl StoreService for StoreServiceImpl {
         }
 
         debug!(store_path = %full_info.store_path, "PutPath: upload completed successfully");
+        metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
+        metrics::histogram!("rio_store_put_path_duration_seconds")
+            .record(start.elapsed().as_secs_f64());
         Ok(Response::new(PutPathResponse { created: true }))
     }
 
@@ -308,6 +313,7 @@ impl StoreService for StoreServiceImpl {
             let digest = hashing.into_digest();
             if let Err(e) = validate_nar_digest(&digest, &expected_hash, expected_size) {
                 error!(error = %e, "GetPath: content integrity check failed");
+                metrics::counter!("rio_store_integrity_failures_total").increment(1);
                 let _ = tx
                     .send(Err(Status::data_loss(format!(
                         "content integrity check failed: {e}"

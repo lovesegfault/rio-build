@@ -367,6 +367,8 @@ impl DagActor {
         options: BuildOptions,
         keep_going: bool,
     ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
+        metrics::counter!("rio_scheduler_builds_total").increment(1);
+
         // Create build record in DB
         self.db
             .insert_build(build_id, tenant_id.as_deref(), &priority_class)
@@ -501,6 +503,7 @@ impl DagActor {
                 && state.status() == DerivationStatus::Completed
             {
                 cached_count += 1;
+                metrics::counter!("rio_scheduler_cache_hits_total").increment(1);
             }
         }
 
@@ -1103,7 +1106,28 @@ impl DagActor {
             }
         }
 
-        // Update metrics
+        // Update metrics. All gauges are set from ground-truth state on each
+        // Tick — this is self-healing against any counting bugs elsewhere.
+        metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
+        metrics::gauge!("rio_scheduler_builds_active").set(
+            self.builds
+                .values()
+                .filter(|b| b.state == BuildState::Active)
+                .count() as f64,
+        );
+        metrics::gauge!("rio_scheduler_derivations_running").set(
+            self.dag
+                .nodes
+                .values()
+                .filter(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Running | DerivationStatus::Assigned
+                    )
+                })
+                .count() as f64,
+        );
+        // Legacy metric name (kept for backward compat with existing dashboards)
         metrics::gauge!("rio_scheduler_ready_queue_len").set(self.ready_queue.len() as f64);
         metrics::gauge!("rio_scheduler_active_builds").set(
             self.builds
@@ -1169,6 +1193,13 @@ impl DagActor {
     async fn assign_to_worker(&mut self, drv_hash: &str, worker_id: &str) {
         // Transition ready -> assigned
         if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+            // Record assignment latency (Ready -> Assigned time) before transitioning
+            if let Some(ready_at) = state.ready_at {
+                let latency = ready_at.elapsed();
+                metrics::histogram!("rio_scheduler_assignment_latency_seconds")
+                    .record(latency.as_secs_f64());
+                state.ready_at = None; // clear after recording
+            }
             if state.transition(DerivationStatus::Assigned).is_err() {
                 return;
             }
