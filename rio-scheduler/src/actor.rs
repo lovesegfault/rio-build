@@ -1375,11 +1375,16 @@ impl DagActor {
             self.ready_queue.remove(hash);
         }
 
-        // Transition build to cancelled. Already checked !is_terminal above,
-        // so this can only fail if the state was concurrently modified — but
-        // we're the actor (single owner), so this succeeds.
+        // Transition build to cancelled. Already checked !is_terminal above
+        // and we're the actor (single owner), so this should always succeed.
+        // If it doesn't, skip the DB write to avoid state drift.
         if let Some(build) = self.builds.get_mut(&build_id) {
-            let _ = build.transition(BuildState::Cancelled);
+            if let Err(e) = build.transition(BuildState::Cancelled) {
+                // Should be unreachable (checked !is_terminal earlier).
+                error!(build_id = %build_id, current = ?build.state(), error = %e,
+                       "cancel transition rejected despite !is_terminal check; skipping DB write");
+                return Ok(false);
+            }
         }
 
         self.db
@@ -2108,9 +2113,19 @@ impl DagActor {
         new_state: BuildState,
     ) -> Result<(), ActorError> {
         if let Some(build) = self.builds.get_mut(&build_id) {
-            // Ignore transition errors (invalid transition = no-op).
-            // The DB write below still records the intended terminal state.
-            let _ = build.transition(new_state);
+            if let Err(e) = build.transition(new_state) {
+                // Already terminal or otherwise invalid. Skip the DB write to
+                // avoid in-memory/DB drift (previously: `let _` discarded the
+                // error but DB was still overwritten with the rejected state).
+                debug!(
+                    build_id = %build_id,
+                    from = ?build.state(),
+                    to = ?new_state,
+                    error = %e,
+                    "build transition rejected; skipping DB update (already terminal)"
+                );
+                return Ok(());
+            }
 
             // Record build duration on terminal transition.
             if new_state.is_terminal() {
