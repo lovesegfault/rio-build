@@ -35,6 +35,11 @@ const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
 /// Number of events to retain in each build's event buffer for late subscribers.
 const BUILD_EVENT_BUFFER_SIZE: usize = 1024;
 
+/// Delay before cleaning up terminal build state. Allows late WatchBuild
+/// subscribers to receive the terminal event before the broadcast sender
+/// is dropped.
+const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Commands sent to the DAG actor.
 pub enum ActorCommand {
     /// Merge a new build's derivation DAG into the global graph.
@@ -98,6 +103,10 @@ pub enum ActorCommand {
         reply:
             oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
     },
+
+    /// Internal: clean up terminal build state (maps + DAG interest) after
+    /// a delay. Scheduled by complete_build/transition_build_to_failed/cancel.
+    CleanupTerminalBuild { build_id: Uuid },
 
     /// Test-only: query worker states.
     #[cfg(test)]
@@ -180,6 +189,11 @@ pub struct DagActor {
     backpressure_active: bool,
     /// Leader generation counter (for assignment tokens).
     generation: i64,
+    /// Weak clone of the actor's own command sender, for scheduling delayed
+    /// internal commands (e.g., terminal build cleanup). Weak so the actor
+    /// doesn't prevent channel close when all external handles are dropped.
+    /// `None` if spawned via bare `run()` (no delayed scheduling).
+    self_tx: Option<mpsc::WeakSender<ActorCommand>>,
 }
 
 impl DagActor {
@@ -201,11 +215,30 @@ impl DagActor {
             store_client,
             backpressure_active: false,
             generation: 1,
+            self_tx: None,
         }
     }
 
     /// Run the actor event loop. Consumes commands from the channel until it closes.
     pub async fn run(mut self, mut rx: mpsc::Receiver<ActorCommand>) {
+        // No self_tx: cleanup is synchronous (test helpers don't pass a tx clone).
+        // Production (ActorHandle::spawn) uses run_with_self_tx.
+        self.run_inner(&mut rx).await;
+    }
+
+    /// Run the actor with a weak clone of its own sender for scheduling
+    /// delayed internal commands (terminal cleanup, etc.). The weak sender
+    /// ensures the actor doesn't keep itself alive after all handles drop.
+    pub async fn run_with_self_tx(
+        mut self,
+        mut rx: mpsc::Receiver<ActorCommand>,
+        self_tx: mpsc::WeakSender<ActorCommand>,
+    ) {
+        self.self_tx = Some(self_tx);
+        self.run_inner(&mut rx).await;
+    }
+
+    async fn run_inner(&mut self, rx: &mut mpsc::Receiver<ActorCommand>) {
         info!("DAG actor started");
 
         while let Some(cmd) = rx.recv().await {
@@ -310,6 +343,9 @@ impl DagActor {
                 } => {
                     let result = self.handle_watch_build(build_id);
                     let _ = reply.send(result);
+                }
+                ActorCommand::CleanupTerminalBuild { build_id } => {
+                    self.handle_cleanup_terminal_build(build_id);
                 }
                 #[cfg(test)]
                 ActorCommand::DebugQueryWorkers { reply } => {
@@ -1174,6 +1210,7 @@ impl DagActor {
         );
 
         info!(build_id = %build_id, reason, "build cancelled");
+        self.schedule_terminal_cleanup(build_id);
         Ok(true)
     }
 
@@ -1738,6 +1775,7 @@ impl DagActor {
         );
 
         info!(build_id = %build_id, "build completed successfully");
+        self.schedule_terminal_cleanup(build_id);
         Ok(())
     }
 
@@ -1763,6 +1801,7 @@ impl DagActor {
             }),
         );
 
+        self.schedule_terminal_cleanup(build_id);
         Ok(())
     }
 
@@ -1789,6 +1828,56 @@ impl DagActor {
         Ok(())
     }
 
+    /// Schedule delayed cleanup of terminal build state. After
+    /// TERMINAL_CLEANUP_DELAY, the build's entries in builds/build_events/
+    /// build_sequences are removed and orphaned+terminal DAG nodes are reaped.
+    ///
+    /// The delay allows late WatchBuild subscribers to receive the terminal
+    /// event before the broadcast sender is dropped.
+    ///
+    /// No-op if `self_tx` is None (tests that use bare `run()`).
+    fn schedule_terminal_cleanup(&self, build_id: Uuid) {
+        let Some(weak_tx) = self.self_tx.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(TERMINAL_CLEANUP_DELAY).await;
+            // Upgrade weak->strong at send time. If all handles dropped,
+            // upgrade fails and cleanup is moot (actor is shutting down).
+            // try_send: if channel is full, cleanup is deferred; dropping
+            // cleanup under extreme load is preferable to blocking.
+            if let Some(tx) = weak_tx.upgrade() {
+                let _ = tx.try_send(ActorCommand::CleanupTerminalBuild { build_id });
+            }
+        });
+    }
+
+    /// Handle terminal build cleanup: remove build from in-memory maps and
+    /// reap orphaned+terminal DAG nodes.
+    fn handle_cleanup_terminal_build(&mut self, build_id: Uuid) {
+        // Only clean up if build is actually terminal (guard against misdirected
+        // cleanup, e.g., if build_id was reused, though UUIDs make this unlikely).
+        let is_terminal = self
+            .builds
+            .get(&build_id)
+            .map(|b| b.state.is_terminal())
+            .unwrap_or(true); // already removed = fine
+        if !is_terminal {
+            warn!(build_id = %build_id, "cleanup scheduled for non-terminal build, skipping");
+            return;
+        }
+
+        self.builds.remove(&build_id);
+        self.build_events.remove(&build_id);
+        self.build_sequences.remove(&build_id);
+
+        // Remove build interest from DAG and reap orphaned+terminal nodes.
+        let reaped = self.dag.remove_build_interest_and_reap(build_id);
+        if reaped > 0 {
+            debug!(build_id = %build_id, reaped, "reaped orphaned terminal DAG nodes");
+        }
+    }
+
     fn default_build_options(&self) -> rio_proto::types::BuildOptions {
         rio_proto::types::BuildOptions {
             max_silent_time: 0,
@@ -1810,6 +1899,19 @@ impl ActorHandle {
     ///
     /// Returns the handle for sending commands.
     pub fn spawn(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
+        let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
+        let actor = DagActor::new(db, store_client);
+        let self_tx = tx.downgrade();
+        tokio::spawn(actor.run_with_self_tx(rx, self_tx));
+        Self { tx }
+    }
+
+    /// Legacy constructor without self_tx (kept for tests that manually spawn).
+    #[cfg(test)]
+    pub fn spawn_without_cleanup(
+        db: SchedulerDb,
+        store_client: Option<StoreServiceClient<Channel>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, store_client);
         tokio::spawn(actor.run(rx));
@@ -1903,7 +2005,8 @@ pub(crate) mod tests {
         let db = SchedulerDb::new(pool);
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, store_client);
-        let task = tokio::spawn(actor.run(rx));
+        let self_tx = tx.downgrade();
+        let task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
         (ActorHandle { tx }, task)
     }
 
@@ -2598,6 +2701,82 @@ pub(crate) mod tests {
         assert_eq!(
             status.failed_derivations, 3,
             "1 Poisoned + 2 DependencyFailed should all count as failed"
+        );
+    }
+
+    /// Terminal build state should be cleaned up after TERMINAL_CLEANUP_DELAY
+    /// to prevent unbounded memory growth for long-running schedulers.
+    ///
+    /// This test sends CleanupTerminalBuild directly (bypassing the delay)
+    /// since paused time interferes with PG pool timeouts. The delay
+    /// scheduling itself is trivially correct (tokio::time::sleep + try_send).
+    #[tokio::test]
+    async fn test_terminal_build_cleanup_after_delay() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let _stream_rx = connect_worker(&handle, "cleanup-worker", "x86_64-linux", 1).await;
+
+        // Complete a build.
+        let build_id = Uuid::new_v4();
+        let drv_hash = "cleanup-hash";
+        let drv_path = "/nix/store/cleanup-hash.drv";
+        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        settle().await;
+
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "cleanup-worker".into(),
+                drv_hash: drv_path.into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Build should be Succeeded and still queryable.
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap();
+        assert!(status.is_ok(), "build should be queryable before cleanup");
+
+        // Directly inject the cleanup command (bypassing the 60s delay).
+        handle
+            .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Build should now be gone (BuildNotFound).
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap();
+        assert!(
+            matches!(status, Err(ActorError::BuildNotFound(_))),
+            "build should be cleaned up after delay, got {:?}",
+            status
+        );
+
+        // DAG node should also be reaped (Completed + orphaned).
+        let info = handle.debug_query_derivation(drv_hash).await.unwrap();
+        assert!(
+            info.is_none(),
+            "orphaned+terminal DAG node should be reaped"
         );
     }
 
