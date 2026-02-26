@@ -2163,4 +2163,234 @@ pub(crate) mod tests {
             "interactive build should be dispatched before scheduled"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Group 10: Remaining coverage
+    // -----------------------------------------------------------------------
+
+    /// keepGoing=false: on PermanentFailure, the entire build fails immediately.
+    #[tokio::test]
+    async fn test_keepgoing_false_fails_fast() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
+
+        // Merge a two-node DAG with keepGoing=false
+        let build_id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![
+                    make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
+                    make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
+                ],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false, // critical
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _rx = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // Send PermanentFailure for hashA
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: "/nix/store/hashA.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                    error_msg: "compile error".into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Build should be Failed (not waiting for hashB)
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "build should fail fast on PermanentFailure with keepGoing=false"
+        );
+    }
+
+    /// keepGoing=true: build waits for all derivations, fails only at the end.
+    #[tokio::test]
+    async fn test_keepgoing_true_waits_all() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
+
+        // Merge a two-node DAG with keepGoing=true
+        let build_id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![
+                    make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
+                    make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
+                ],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: true, // critical
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _rx = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // Send PermanentFailure for hashX
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: "/nix/store/hashX.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                    error_msg: "failed".into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Build should still be Active (waiting for hashY)
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Active as i32,
+            "build should still be Active with keepGoing=true and pending derivations"
+        );
+
+        // Complete hashY successfully
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: "/nix/store/hashY.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Now build should be Failed (all resolved, one failed)
+        let (status_tx2, status_rx2) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx2,
+            })
+            .await
+            .unwrap();
+        let status2 = status_rx2.await.unwrap().unwrap();
+        assert_eq!(
+            status2.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "build should fail after all derivations resolve with keepGoing=true"
+        );
+    }
+
+    /// TransientFailure: retry on a different worker up to max_retries (default 2).
+    #[tokio::test]
+    async fn test_transient_retry_different_worker() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Register two workers
+        let _rx1 = connect_worker(&handle, "worker-a", "x86_64-linux", 1).await;
+        let _rx2 = connect_worker(&handle, "worker-b", "x86_64-linux", 1).await;
+
+        let build_id = Uuid::new_v4();
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            "retry-hash",
+            "/nix/store/retry-hash.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        // Get initial worker assignment
+        let info1 = handle
+            .debug_query_derivation("retry-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_worker = info1.assigned_worker.clone().unwrap();
+        assert_eq!(info1.retry_count, 0);
+
+        // Send TransientFailure from the first worker
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: first_worker.clone(),
+                drv_hash: "/nix/store/retry-hash.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
+                    error_msg: "network hiccup".into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Should be retried: retry_count=1, possibly on a different worker
+        let info2 = handle
+            .debug_query_derivation("retry-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info2.retry_count, 1,
+            "transient failure should increment retry_count"
+        );
+        // Note: the retry MAY go to the same worker (no affinity avoidance yet),
+        // but retry_count proves it was processed.
+        assert!(matches!(
+            info2.status,
+            DerivationStatus::Assigned | DerivationStatus::Ready
+        ));
+    }
 }

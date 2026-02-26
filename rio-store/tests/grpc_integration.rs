@@ -291,6 +291,88 @@ async fn test_put_path_cleanup_on_hash_mismatch() {
     server.abort();
 }
 
+// ---------------------------------------------------------------------------
+// Group 10: Remaining coverage
+// ---------------------------------------------------------------------------
+
+/// PutPath followed by GetPath should return the same NAR content.
+#[tokio::test]
+async fn test_put_get_roundtrip() {
+    use rio_proto::types::{GetPathRequest, get_path_response};
+
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let store_path = "/nix/store/test-roundtrip-path";
+    let nar = make_nar(b"roundtrip test content!");
+    let info = make_path_info(store_path, &nar);
+
+    // Put
+    let created = put_path(&mut client, info.clone(), nar.clone())
+        .await
+        .expect("put should succeed");
+    assert!(created, "should be newly created");
+
+    // Get
+    let mut stream = client
+        .get_path(GetPathRequest {
+            store_path: store_path.into(),
+        })
+        .await
+        .expect("get should succeed")
+        .into_inner();
+
+    let mut got_info = None;
+    let mut got_nar = Vec::new();
+    while let Some(msg) = stream.message().await.unwrap() {
+        match msg.msg {
+            Some(get_path_response::Msg::Info(i)) => got_info = Some(i),
+            Some(get_path_response::Msg::NarChunk(chunk)) => got_nar.extend_from_slice(&chunk),
+            None => {}
+        }
+    }
+
+    assert!(got_info.is_some(), "should receive PathInfo");
+    let got_info = got_info.unwrap();
+    assert_eq!(got_info.store_path, store_path);
+    assert_eq!(got_info.nar_hash, info.nar_hash);
+    assert_eq!(got_info.nar_size, info.nar_size);
+    assert_eq!(got_nar, nar, "NAR content should roundtrip exactly");
+
+    server.abort();
+}
+
+/// Second PutPath with same content should return created=false (idempotent).
+#[tokio::test]
+async fn test_idempotent_put_path() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let store_path = "/nix/store/test-idempotent-path";
+    let nar = make_nar(b"idempotent test");
+    let info = make_path_info(store_path, &nar);
+
+    // First put
+    let created1 = put_path(&mut client, info.clone(), nar.clone())
+        .await
+        .expect("first put should succeed");
+    assert!(created1, "first put should create");
+
+    // Second put with same content
+    let created2 = put_path(&mut client, info, nar)
+        .await
+        .expect("second put should succeed (idempotent)");
+    assert!(!created2, "second put should return created=false");
+
+    server.abort();
+}
+
 /// PutPath with chunks exceeding declared nar_size should be rejected.
 #[tokio::test]
 async fn test_put_path_rejects_oversized_nar() {
