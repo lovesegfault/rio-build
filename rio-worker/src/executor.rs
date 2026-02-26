@@ -209,7 +209,11 @@ pub async fn execute_build(
         tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
     }
     // Reap the zombie (bounded wait).
-    let _ = tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await;
+    match tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "daemon.wait() failed after kill"),
+        Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
+    }
 
     // Flush any remaining log lines (best-effort: build result is already determined)
     if batcher.has_pending() {
@@ -326,7 +330,10 @@ pub async fn execute_build(
         }
     };
 
-    // 11. Tear down overlay (explicit, before Drop)
+    // 11. Tear down overlay (explicit, before Drop).
+    // TODO(phase2b): leaked mounts should cause infrastructure failure once
+    // mount tracking is added. For now, Drop is the safety net and the build
+    // already succeeded, so we log but don't fail the result.
     overlay::teardown_overlay(overlay_mount)
         .unwrap_or_else(|e| tracing::error!(error = %e, "overlay teardown failed"));
 
@@ -476,7 +483,11 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
                     "daemon sent STDERR_READ, not supported".to_string(),
                 ));
             }
-            _ => {} // discard activity messages
+            // Activity/progress messages we explicitly don't care about.
+            StderrMessage::Write(_)
+            | StderrMessage::StartActivity { .. }
+            | StderrMessage::StopActivity { .. }
+            | StderrMessage::Result { .. } => {}
         }
     }
 
