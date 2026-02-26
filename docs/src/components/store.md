@@ -197,6 +197,8 @@ CREATE TABLE narinfo (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+> **Phase 2a deferral:** The `manifests` + `manifest_data` + `chunks` tables below are the Phase 2c target schema (chunked NAR storage with FastCDC/BLAKE3 dedup). Phase 2a uses a simpler `nar_blobs` table storing full NARs — see `migrations/002_store_tables.sql` for the actual Phase 2a schema.
+
 CREATE TABLE manifests (
     store_path_hash  BYTEA PRIMARY KEY
                      REFERENCES narinfo(store_path_hash),

@@ -318,6 +318,7 @@ A future improvement would split the worker into two processes:
 - `rio-worker/src/fuse/lookup.rs` --- Path existence and metadata queries
 - `rio-worker/src/fuse/read.rs` --- File content serving and prefetch
 - `rio-worker/src/fuse/cache.rs` --- LRU cache management (SSD-backed)
+- `rio-worker/src/synth_db.rs` --- Synthetic SQLite DB generation for nix-daemon
 - `rio-worker/src/upload.rs` --- Chunk and upload build outputs
 - `rio-worker/src/log_stream.rs` --- Build log streaming via gRPC
-- `rio-worker/src/resource.rs` --- CPU/memory/disk accounting
+- `rio-worker/src/resource.rs` (Phase 2b) --- CPU/memory/disk accounting
