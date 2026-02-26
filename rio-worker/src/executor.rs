@@ -619,41 +619,53 @@ async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
 ) -> Result<Derivation, ExecutorError> {
-    let req = GetPathRequest {
-        store_path: drv_path.to_string(),
-    };
-    let mut stream = store_client
-        .get_path(req)
-        .await
-        .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) failed: {e}")))?
-        .into_inner();
+    // Wrap in GRPC_STREAM_TIMEOUT: this is the first gRPC call after
+    // setup_overlay, so a stalled store would hang the build with an overlay
+    // mount held indefinitely. .drv files are small (KB range), so the
+    // stream timeout is generous.
+    let nar_data = tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, async {
+        let req = GetPathRequest {
+            store_path: drv_path.to_string(),
+        };
+        let mut stream = store_client
+            .get_path(req)
+            .await
+            .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) failed: {e}")))?
+            .into_inner();
 
-    let mut nar_data = Vec::new();
-    while let Some(msg) = stream
-        .message()
-        .await
-        .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) stream error: {e}")))?
-    {
-        match msg.msg {
-            Some(get_path_response::Msg::Info(_)) => {
-                // .drv files are small; we don't need to pre-size from info.
-            }
-            Some(get_path_response::Msg::NarChunk(chunk)) => {
-                let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                if new_len > rio_common::limits::MAX_NAR_SIZE {
-                    return Err(ExecutorError::BuildFailed(format!(
-                        "NAR for {drv_path} exceeds MAX_NAR_SIZE ({} bytes, limit {})",
-                        new_len,
-                        rio_common::limits::MAX_NAR_SIZE
-                    )));
+        let mut nar_data = Vec::new();
+        while let Some(msg) = stream.message().await.map_err(|e| {
+            ExecutorError::BuildFailed(format!("GetPath({drv_path}) stream error: {e}"))
+        })? {
+            match msg.msg {
+                Some(get_path_response::Msg::Info(_)) => {
+                    // .drv files are small; we don't need to pre-size from info.
                 }
-                nar_data.extend_from_slice(&chunk);
-            }
-            None => {
-                tracing::warn!("empty GetPathResponse message (possible proto mismatch)");
+                Some(get_path_response::Msg::NarChunk(chunk)) => {
+                    let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
+                    if new_len > rio_common::limits::MAX_NAR_SIZE {
+                        return Err(ExecutorError::BuildFailed(format!(
+                            "NAR for {drv_path} exceeds MAX_NAR_SIZE ({} bytes, limit {})",
+                            new_len,
+                            rio_common::limits::MAX_NAR_SIZE
+                        )));
+                    }
+                    nar_data.extend_from_slice(&chunk);
+                }
+                None => {
+                    tracing::warn!("empty GetPathResponse message (possible proto mismatch)");
+                }
             }
         }
-    }
+        Ok::<Vec<u8>, ExecutorError>(nar_data)
+    })
+    .await
+    .map_err(|_| {
+        ExecutorError::BuildFailed(format!(
+            "GetPath({drv_path}) timed out after {:?} (store unreachable?)",
+            rio_common::grpc::GRPC_STREAM_TIMEOUT
+        ))
+    })??;
 
     if nar_data.is_empty() {
         return Err(ExecutorError::BuildFailed(format!(
