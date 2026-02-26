@@ -116,7 +116,7 @@ impl SchedulerService for SchedulerGrpc {
         let (tx, rx) = mpsc::channel(256);
         let mut broadcast_rx = broadcast_rx;
 
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("submit-build-bridge", async move {
             loop {
                 match broadcast_rx.recv().await {
                     Ok(event) => {
@@ -177,7 +177,7 @@ impl SchedulerService for SchedulerGrpc {
         let (tx, rx) = mpsc::channel(256);
         let mut broadcast_rx = broadcast_rx;
 
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("watch-build-bridge", async move {
             loop {
                 match broadcast_rx.recv().await {
                     Ok(event) => {
@@ -320,7 +320,7 @@ impl WorkerService for SchedulerGrpc {
             .map_err(|_| Status::unavailable("scheduler actor unavailable"))?;
 
         // Bridge actor_rx -> output_tx, wrapping in Ok()
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("build-exec-bridge", async move {
             while let Some(msg) = actor_rx.recv().await {
                 if output_tx.send(Ok(msg)).await.is_err() {
                     break;
@@ -503,7 +503,7 @@ mod tests {
                 .add_service(WorkerServiceServer::new(grpc))
                 .serve_with_incoming(incoming)
                 .await
-                .ok();
+                .expect("test gRPC server should run");
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 

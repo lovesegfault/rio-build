@@ -3483,7 +3483,7 @@ pub(crate) mod tests {
                 .add_service(StoreServiceServer::new(service))
                 .serve_with_incoming(incoming)
                 .await
-                .ok();
+                .expect("test store gRPC server should run");
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
