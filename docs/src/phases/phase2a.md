@@ -9,7 +9,7 @@
 - [x] `rio-proto`: protobuf definitions for SchedulerService, WorkerService, StoreService, AdminService
 - [x] Simple FIFO scheduler with actor-based concurrency model (no critical path, no locality scoring yet)
 - [x] PostgreSQL for build state (builds, derivations, derivation_edges, assignments tables) with `tenant_id` columns (nullable, unused in this phase)
-- [x] Database migration framework (sqlx migrations with offline query metadata via `sqlx prepare`)
+- [x] Database migration framework (sqlx migrations; unchecked `sqlx::query()` strings, no offline `.sqlx` metadata — simpler CI, no build-time DB dependency)
 - [x] Worker bidirectional BuildExecution stream
 - [x] Worker FUSE store integration (rio-fuse for local `/nix/store` access)
 - [x] Worker local nix invocation for builds (via `nix-daemon --stdio`)
