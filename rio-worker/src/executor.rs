@@ -29,8 +29,8 @@ use rio_nix::protocol::client::{
 use rio_nix::protocol::wire;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
-    BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, QueryPathInfoRequest,
-    WorkAssignment, WorkerMessage, worker_message,
+    BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, GetPathRequest,
+    QueryPathInfoRequest, WorkAssignment, WorkerMessage, get_path_response, worker_message,
 };
 
 use crate::log_stream::LogBatcher;
@@ -123,19 +123,34 @@ pub async fn execute_build(
     // 1. Set up overlay
     let overlay_mount = overlay::setup_overlay(fuse_mount_point, overlay_base_dir, &build_id)?;
 
-    // 2. Fetch input path metadata and generate synthetic DB
-    let synth_paths = fetch_input_metadata(store_client, &assignment.input_paths).await?;
+    // 2. Parse the derivation. If drv_content is inline, use it; otherwise
+    // fetch the .drv from the store and extract ATerm from the NAR.
+    // Phase 2a: scheduler sends drv_content=empty, so we always fetch.
+    let drv = if assignment.drv_content.is_empty() {
+        fetch_drv_from_store(store_client, drv_path).await?
+    } else {
+        let drv_text = String::from_utf8_lossy(&assignment.drv_content);
+        Derivation::parse(&drv_text)
+            .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))?
+    };
+    let basic_drv = drv.to_basic();
+
+    // 3. Compute input closure. If scheduler sent input_paths, trust it;
+    // otherwise compute from the parsed derivation + store references.
+    // Phase 2a: scheduler sends input_paths=empty, so we always compute.
+    let input_paths: Vec<String> = if assignment.input_paths.is_empty() {
+        compute_input_closure(store_client, &drv, drv_path).await?
+    } else {
+        assignment.input_paths.clone()
+    };
+
+    // 4. Fetch input path metadata and generate synthetic DB
+    let synth_paths = fetch_input_metadata(store_client, &input_paths).await?;
     let db_dir = overlay::prepare_nix_state_dirs(overlay_mount.upper_dir())?;
     let db_path = db_dir.join("db.sqlite");
     synth_db::generate_db(&db_path, &synth_paths)
         .await
         .map_err(|e| ExecutorError::SynthDb(e.to_string()))?;
-
-    // 3. Parse the derivation from inline ATerm content
-    let drv_content = String::from_utf8_lossy(&assignment.drv_content);
-    let drv = Derivation::parse(&drv_content)
-        .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))?;
-    let basic_drv = drv.to_basic();
 
     // 4. Set up nix.conf in overlay
     setup_nix_conf(overlay_mount.upper_dir())?;
@@ -559,6 +574,125 @@ async fn fetch_input_metadata(
     Ok(synth_paths)
 }
 
+/// Fetch a .drv file from the store and parse it.
+///
+/// Used when the scheduler sends `drv_content: empty` (Phase 2a default).
+/// The .drv is a single regular file in the store, so we fetch its NAR and
+/// extract the ATerm content via `extract_single_file`.
+async fn fetch_drv_from_store(
+    store_client: &mut StoreServiceClient<Channel>,
+    drv_path: &str,
+) -> Result<Derivation, ExecutorError> {
+    let req = GetPathRequest {
+        store_path: drv_path.to_string(),
+    };
+    let mut stream = store_client
+        .get_path(req)
+        .await
+        .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) failed: {e}")))?
+        .into_inner();
+
+    let mut nar_data = Vec::new();
+    while let Some(msg) = stream
+        .message()
+        .await
+        .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) stream error: {e}")))?
+    {
+        match msg.msg {
+            Some(get_path_response::Msg::Info(_)) => {
+                // .drv files are small; we don't need to pre-size from info.
+            }
+            Some(get_path_response::Msg::NarChunk(chunk)) => {
+                nar_data.extend_from_slice(&chunk);
+            }
+            None => {}
+        }
+    }
+
+    if nar_data.is_empty() {
+        return Err(ExecutorError::BuildFailed(format!(
+            ".drv not found in store: {drv_path}"
+        )));
+    }
+
+    let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
+        .map_err(|e| ExecutorError::BuildFailed(format!("failed to extract .drv from NAR: {e}")))?;
+
+    let drv_text = String::from_utf8(drv_bytes)
+        .map_err(|e| ExecutorError::BuildFailed(format!(".drv is not valid UTF-8: {e}")))?;
+
+    Derivation::parse(&drv_text)
+        .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))
+}
+
+/// Compute the input closure for a derivation by querying the store.
+///
+/// The input closure consists of:
+///   - The .drv file itself (nix-daemon reads it)
+///   - All `input_srcs` (source store paths)
+///   - All outputs of all `input_drvs` (dependency outputs)
+///   - Transitively: all references of the above
+///
+/// We bootstrap from the .drv's own references (which the store computes at
+/// upload time from the NAR content) and walk the reference graph via
+/// QueryPathInfo. Paths not yet in the store (e.g., outputs of not-yet-built
+/// input drvs) are skipped — FUSE will lazy-fetch them at build time.
+async fn compute_input_closure(
+    store_client: &mut StoreServiceClient<Channel>,
+    drv: &Derivation,
+    drv_path: &str,
+) -> Result<Vec<String>, ExecutorError> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut closure: HashSet<String> = HashSet::new();
+    let mut to_visit: VecDeque<String> = VecDeque::new();
+
+    // Seed: the .drv itself, its input_srcs, and input_drv paths.
+    // nix-daemon needs to read the .drv; build needs srcs + dep outputs.
+    to_visit.push_back(drv_path.to_string());
+    for src in drv.input_srcs() {
+        to_visit.push_back(src.clone());
+    }
+    for input_drv in drv.input_drvs().keys() {
+        to_visit.push_back(input_drv.clone());
+    }
+
+    // BFS the reference graph. PathInfo.references gives runtime deps;
+    // for .drv files, references include all inputDrvs and inputSrcs.
+    while let Some(path) = to_visit.pop_front() {
+        if !closure.insert(path.clone()) {
+            continue; // already visited
+        }
+
+        let req = QueryPathInfoRequest {
+            store_path: path.clone(),
+        };
+        let info = match store_client.query_path_info(req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(e) if e.code() == tonic::Code::NotFound => {
+                // Path not in store yet (output of a not-yet-built input drv).
+                // Skip — FUSE will fetch it lazily at build time if needed.
+                tracing::debug!(path = %path, "input path not in store; FUSE will lazy-fetch");
+                continue;
+            }
+            Err(e) => {
+                return Err(ExecutorError::MetadataFetch {
+                    path: path.clone(),
+                    source: e,
+                });
+            }
+        };
+
+        for r in info.references {
+            if !closure.contains(&r) {
+                to_visit.push_back(r);
+            }
+        }
+    }
+
+    Ok(closure.into_iter().collect())
+}
+
 /// Write nix.conf to the overlay upper layer.
 fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
     let conf_dir = upper_dir.join("etc/nix");
@@ -690,6 +824,44 @@ mod tests {
             DAEMON_SETUP_TIMEOUT < DAEMON_BUILD_TIMEOUT,
             "setup timeout ({DAEMON_SETUP_TIMEOUT:?}) must be shorter than build timeout ({DAEMON_BUILD_TIMEOUT:?})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_drv_from_store NAR extraction
+    // -----------------------------------------------------------------------
+
+    /// Verify the NAR extraction + ATerm parsing pipeline works end-to-end.
+    /// This is the core of fetch_drv_from_store (minus the gRPC transport,
+    /// which is straightforward streaming).
+    #[test]
+    fn test_nar_wrapped_drv_parseable() {
+        // Minimal valid ATerm derivation (no inputs, one output).
+        let drv_text = r#"Derive([("out","/nix/store/00000000000000000000000000000000-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/00000000000000000000000000000000-test")])"#;
+
+        // Wrap in NAR as a single regular file (same as a .drv in the store).
+        let nar_node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: drv_text.as_bytes().to_vec(),
+        };
+        let mut nar_bytes = Vec::new();
+        rio_nix::nar::serialize(&mut nar_bytes, &nar_node).unwrap();
+
+        // Extract + parse (the tail of fetch_drv_from_store).
+        let extracted =
+            rio_nix::nar::extract_single_file(&nar_bytes).expect("should extract single-file NAR");
+        let text = String::from_utf8(extracted).expect("should be UTF-8");
+        let drv = Derivation::parse(&text).expect("should parse as ATerm");
+
+        assert_eq!(drv.outputs().len(), 1);
+        assert_eq!(drv.outputs()[0].name(), "out");
+        assert_eq!(drv.platform(), "x86_64-linux");
+    }
+
+    /// Empty NAR data should produce a clear error (not silent success or panic).
+    #[test]
+    fn test_empty_nar_rejected() {
+        let result = rio_nix::nar::extract_single_file(&[]);
+        assert!(result.is_err(), "empty NAR should fail extraction");
     }
 
     // -----------------------------------------------------------------------
