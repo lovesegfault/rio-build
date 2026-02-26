@@ -64,6 +64,16 @@ impl StoreServiceImpl {
     pub fn new(backend: Arc<dyn NarBackend>, pool: PgPool) -> Self {
         Self { backend, pool }
     }
+
+    /// Clean up an uploading placeholder after a PutPath error and record
+    /// the error metric. Call this on any error path AFTER insert_uploading
+    /// returned true (i.e., we own the placeholder).
+    async fn abort_upload(&self, store_path_hash: &[u8]) {
+        if let Err(e) = metadata::delete_uploading(&self.pool, store_path_hash).await {
+            error!(error = %e, "PutPath: failed to clean up placeholder during abort");
+        }
+        metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
+    }
 }
 
 #[tonic::async_trait]
@@ -223,10 +233,28 @@ impl StoreService for StoreServiceImpl {
         // nar_size is already bounded by MAX_NAR_SIZE (4 GiB) above, which
         // fits in usize on 64-bit. try_from is defensive for 32-bit platforms
         // where MAX_NAR_SIZE (4_294_967_296) exceeds u32::MAX (4_294_967_295).
-        let capacity = usize::try_from(info.nar_size)
-            .map_err(|_| Status::invalid_argument("nar_size too large for this platform"))?;
+        let capacity = match usize::try_from(info.nar_size) {
+            Ok(c) => c,
+            Err(_) => {
+                // Practically unreachable on 64-bit (MAX_NAR_SIZE check above),
+                // but clean up defensively.
+                self.abort_upload(&store_path_hash).await;
+                return Err(Status::invalid_argument(
+                    "nar_size too large for this platform",
+                ));
+            }
+        };
         let mut nar_data = Vec::with_capacity(capacity);
-        while let Some(msg) = stream.message().await? {
+        loop {
+            let msg = match stream.message().await {
+                Ok(Some(m)) => m,
+                Ok(None) => break, // stream closed
+                Err(e) => {
+                    warn!(store_path = %info.store_path, error = %e, "PutPath: stream read error");
+                    self.abort_upload(&store_path_hash).await;
+                    return Err(e);
+                }
+            };
             match msg.msg {
                 Some(put_path_request::Msg::NarChunk(chunk)) => {
                     let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
@@ -237,6 +265,7 @@ impl StoreService for StoreServiceImpl {
                             received = new_len,
                             "PutPath: NAR chunks exceed declared size, rejecting"
                         );
+                        self.abort_upload(&store_path_hash).await;
                         return Err(Status::invalid_argument(format!(
                             "NAR chunks exceed declared nar_size {} (received {}+ bytes)",
                             info.nar_size, new_len
@@ -245,7 +274,17 @@ impl StoreService for StoreServiceImpl {
                     nar_data.extend_from_slice(&chunk);
                 }
                 Some(put_path_request::Msg::Metadata(_)) => {
-                    warn!("PutPath: received duplicate metadata message, ignoring");
+                    // Protocol violation: metadata must be first-message-only.
+                    // A buggy client sending duplicate metadata with different
+                    // nar_hash would have its "correction" silently ignored.
+                    warn!(
+                        store_path = %info.store_path,
+                        "PutPath: duplicate metadata mid-stream, rejecting"
+                    );
+                    self.abort_upload(&store_path_hash).await;
+                    return Err(Status::invalid_argument(
+                        "PutPath stream contained duplicate metadata (protocol violation)",
+                    ));
                 }
                 None => {
                     // Empty message, skip
@@ -265,11 +304,7 @@ impl StoreService for StoreServiceImpl {
                 error = %e,
                 "PutPath: NAR validation failed"
             );
-            // Clean up the placeholder rows so a retry can succeed.
-            if let Err(cleanup_err) = metadata::delete_uploading(&self.pool, &store_path_hash).await
-            {
-                error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after validation failure");
-            }
+            self.abort_upload(&store_path_hash).await;
             return Err(Status::invalid_argument(format!(
                 "NAR validation failed: {e}"
             )));
@@ -278,11 +313,7 @@ impl StoreService for StoreServiceImpl {
         // Write to backend
         if let Err(e) = self.backend.put(&sha256_hex, Bytes::from(nar_data)).await {
             error!(error = %e, "PutPath: failed to write to backend");
-            // Clean up placeholder so retry can succeed.
-            if let Err(cleanup_err) = metadata::delete_uploading(&self.pool, &store_path_hash).await
-            {
-                error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after backend failure");
-            }
+            self.abort_upload(&store_path_hash).await;
             return Err(internal_error("backend write", e));
         }
 
@@ -295,11 +326,7 @@ impl StoreService for StoreServiceImpl {
             // Clean up placeholder rows AND backend blob (unlike validation/backend
             // failures which only clean metadata). The blob is now orphaned —
             // metadata never flipped to 'complete', so GetPath can't serve it.
-            if let Err(cleanup_err) =
-                metadata::delete_uploading(&self.pool, &full_info.store_path_hash).await
-            {
-                error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after complete_upload failure");
-            }
+            self.abort_upload(&full_info.store_path_hash).await;
             if let Err(backend_err) = self.backend.delete(&blob_key).await {
                 warn!(error = %backend_err, "PutPath: failed to delete orphaned blob after complete_upload failure");
             }

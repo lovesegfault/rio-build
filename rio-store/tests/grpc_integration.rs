@@ -376,6 +376,93 @@ async fn test_put_path_rejects_oversized_nar() {
     server.abort();
 }
 
+/// Oversized rejection must clean up the uploading placeholder so a retry
+/// with correct data succeeds. Regression test for the placeholder leak at
+/// the chunk-size-exceeded early return.
+#[tokio::test]
+async fn test_put_path_oversized_then_retry_succeeds() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let store_path = "/nix/store/66666666666666666666666666666666-oversized-retry";
+    let real_nar = make_nar(b"retry test data");
+    let real_info = make_path_info(store_path, &real_nar);
+
+    // First attempt: lie about size, send oversized data → rejected.
+    let mut bad_info = real_info.clone();
+    bad_info.nar_size = 100;
+    let oversized = vec![0u8; 100_000];
+    let r1 = put_path(&mut client, bad_info, oversized).await;
+    assert!(r1.is_err(), "oversized must be rejected");
+    assert_eq!(r1.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Second attempt: correct data. Must succeed (placeholder was cleaned up).
+    let r2 = put_path(&mut client, real_info, real_nar.clone())
+        .await
+        .expect("retry with correct data must succeed after oversized rejection");
+    assert!(r2, "retry should create");
+
+    // Verify the path is queryable.
+    let qpi = client
+        .query_path_info(QueryPathInfoRequest {
+            store_path: store_path.into(),
+        })
+        .await
+        .expect("path should be queryable");
+    assert_eq!(qpi.into_inner().nar_size, real_nar.len() as u64);
+
+    server.abort();
+}
+
+/// Duplicate metadata mid-stream is a protocol violation and must be rejected
+/// (not silently ignored).
+#[tokio::test]
+async fn test_put_path_rejects_duplicate_metadata() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let store_path = "/nix/store/77777777777777777777777777777777-dup-metadata";
+    let nar = make_nar(b"dup metadata test");
+    let info = make_path_info(store_path, &nar);
+
+    let (tx, rx) = mpsc::channel(8);
+    // Metadata #1
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info.clone()),
+        })),
+    })
+    .await
+    .unwrap();
+    // Metadata #2 (protocol violation)
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+        })),
+    })
+    .await
+    .unwrap();
+    // Chunk (never read — server should reject before this)
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    let result = client.put_path(ReceiverStream::new(rx)).await;
+    assert!(result.is_err(), "duplicate metadata must be rejected");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("duplicate metadata"),
+        "error should mention duplicate metadata: {}",
+        status.message()
+    );
+
+    server.abort();
+}
+
 /// PutPath with absurdly large declared nar_size should be rejected BEFORE
 /// allocation (prevents OOM from malicious clients).
 #[tokio::test]
