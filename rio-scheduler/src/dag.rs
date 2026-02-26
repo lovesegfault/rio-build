@@ -22,13 +22,13 @@ pub enum DagError {
 #[derive(Debug)]
 pub struct DerivationDag {
     /// All derivation nodes, keyed by drv_hash.
-    pub nodes: HashMap<String, DerivationState>,
+    nodes: HashMap<String, DerivationState>,
     /// Forward edges: parent drv_hash -> set of child drv_hashes.
     /// A "parent" depends on its "children" (children must complete first).
-    pub children: HashMap<String, HashSet<String>>,
+    children: HashMap<String, HashSet<String>>,
     /// Reverse edges: child drv_hash -> set of parent drv_hashes.
     /// Used to find which derivations become ready when a child completes.
-    pub parents: HashMap<String, HashSet<String>>,
+    parents: HashMap<String, HashSet<String>>,
 }
 
 impl DerivationDag {
@@ -39,6 +39,36 @@ impl DerivationDag {
             children: HashMap::new(),
             parents: HashMap::new(),
         }
+    }
+
+    /// Look up a derivation state by hash.
+    pub fn node(&self, drv_hash: &str) -> Option<&DerivationState> {
+        self.nodes.get(drv_hash)
+    }
+
+    /// Look up a mutable derivation state by hash.
+    pub fn node_mut(&mut self, drv_hash: &str) -> Option<&mut DerivationState> {
+        self.nodes.get_mut(drv_hash)
+    }
+
+    /// Whether a derivation exists in the DAG.
+    pub fn contains(&self, drv_hash: &str) -> bool {
+        self.nodes.contains_key(drv_hash)
+    }
+
+    /// Iterate all (drv_hash, state) pairs.
+    pub fn iter_nodes(&self) -> impl Iterator<Item = (&str, &DerivationState)> {
+        self.nodes.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Iterate all derivation states (without keys).
+    pub fn iter_values(&self) -> impl Iterator<Item = &DerivationState> {
+        self.nodes.values()
+    }
+
+    /// Number of derivation nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Merge a set of nodes and edges from a new build into the global DAG.

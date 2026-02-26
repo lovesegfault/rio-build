@@ -310,7 +310,7 @@ impl DagActor {
                 }
                 #[cfg(test)]
                 ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
-                    let info = self.dag.nodes.get(&drv_hash).map(|s| DebugDerivationInfo {
+                    let info = self.dag.node(&drv_hash).map(|s| DebugDerivationInfo {
                         drv_hash: s.drv_hash.clone(),
                         drv_path: s.drv_path.clone(),
                         status: s.status(),
@@ -413,7 +413,7 @@ impl DagActor {
                 DerivationStatus::Created
             } else {
                 // Existing node, just link the build
-                if let Some(state) = self.dag.nodes.get(drv_hash) {
+                if let Some(state) = self.dag.node(drv_hash) {
                     state.status()
                 } else {
                     DerivationStatus::Created
@@ -437,7 +437,7 @@ impl DagActor {
                 .await?;
 
             // Store db_id on the node
-            if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
                 state.db_id = Some(db_id);
             }
 
@@ -474,7 +474,7 @@ impl DagActor {
             .unwrap_or(false);
 
         for (drv_hash, target_status) in &initial_states {
-            if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
                 match target_status {
                     DerivationStatus::Ready => {
                         // Transition created -> queued -> ready
@@ -503,7 +503,7 @@ impl DagActor {
         // Also handle nodes that already existed and are already completed
         for node in &nodes {
             if !newly_inserted.contains(&node.drv_hash)
-                && let Some(state) = self.dag.nodes.get(&node.drv_hash)
+                && let Some(state) = self.dag.node(&node.drv_hash)
                 && state.status() == DerivationStatus::Completed
             {
                 cached_count += 1;
@@ -554,7 +554,7 @@ impl DagActor {
         // The gRPC layer passes CompletionReport.drv_path here (keyed by path,
         // not hash). Resolve to drv_hash if the key isn't found directly.
         let resolved_hash: String;
-        let drv_hash: &str = if self.dag.nodes.contains_key(drv_hash) {
+        let drv_hash: &str = if self.dag.contains(drv_hash) {
             drv_hash
         } else if let Some(h) = self.drv_path_to_hash(drv_hash) {
             resolved_hash = h;
@@ -568,7 +568,7 @@ impl DagActor {
         };
 
         // Find the derivation in the DAG
-        let current_status = match self.dag.nodes.get(drv_hash) {
+        let current_status = match self.dag.node(drv_hash) {
             Some(state) => state.status(),
             None => {
                 warn!(drv_hash, "completion for unknown derivation, ignoring");
@@ -640,7 +640,7 @@ impl DagActor {
         worker_id: &str,
     ) {
         // Transition to completed
-        if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+        if let Some(state) = self.dag.node_mut(drv_hash) {
             // Ensure we're in running state first
             if state.status() == DerivationStatus::Assigned {
                 let _ = state.transition(DerivationStatus::Running);
@@ -667,7 +667,7 @@ impl DagActor {
         }
 
         // Update assignment (non-terminal progress write: log failure, don't block)
-        if let Some(state) = self.dag.nodes.get(drv_hash)
+        if let Some(state) = self.dag.node(drv_hash)
             && let Some(db_id) = state.db_id
             && let Err(e) = self.db.update_assignment_status(db_id, "completed").await
         {
@@ -675,7 +675,7 @@ impl DagActor {
         }
 
         // Async: update build history EMA (best-effort statistics)
-        if let Some(state) = self.dag.nodes.get(drv_hash)
+        if let Some(state) = self.dag.node(drv_hash)
             && let Some(pname) = &state.pname
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
         {
@@ -694,8 +694,7 @@ impl DagActor {
         // Emit derivation completed event
         let output_paths: Vec<String> = self
             .dag
-            .nodes
-            .get(drv_hash)
+            .node(drv_hash)
             .map(|s| s.output_paths.clone())
             .unwrap_or_default();
 
@@ -721,7 +720,7 @@ impl DagActor {
         let newly_ready = self.dag.find_newly_ready(drv_hash);
         for ready_hash in &newly_ready {
             let prioritize = self.should_prioritize(ready_hash);
-            if let Some(state) = self.dag.nodes.get_mut(ready_hash)
+            if let Some(state) = self.dag.node_mut(ready_hash)
                 && state.transition(DerivationStatus::Ready).is_ok()
             {
                 if let Err(e) = self
@@ -747,7 +746,7 @@ impl DagActor {
     }
 
     async fn handle_transient_failure(&mut self, drv_hash: &str, worker_id: &str) {
-        let should_retry = if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+        let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_workers.insert(worker_id.to_string());
 
             // Check poison threshold
@@ -780,18 +779,13 @@ impl DagActor {
         };
 
         if should_retry {
-            let retry_count = self
-                .dag
-                .nodes
-                .get(drv_hash)
-                .map(|s| s.retry_count)
-                .unwrap_or(0);
+            let retry_count = self.dag.node(drv_hash).map(|s| s.retry_count).unwrap_or(0);
 
             // Schedule retry with backoff
             let backoff = self.retry_policy.backoff_duration(retry_count);
             let drv_hash_owned = drv_hash.to_string();
 
-            if let Some(state) = self.dag.nodes.get_mut(&drv_hash_owned) {
+            if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 state.retry_count += 1;
                 state.assigned_worker = None;
             }
@@ -818,7 +812,7 @@ impl DagActor {
             );
 
             // For Phase 2a, immediately re-queue (production would use a delayed re-queue)
-            if let Some(state) = self.dag.nodes.get_mut(&drv_hash_owned) {
+            if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 let _ = state.transition(DerivationStatus::Ready);
                 self.ready_queue.push_back(drv_hash_owned);
             }
@@ -845,7 +839,7 @@ impl DagActor {
         error_msg: &str,
         _worker_id: &str,
     ) {
-        if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+        if let Some(state) = self.dag.node_mut(drv_hash) {
             if state.status() == DerivationStatus::Assigned {
                 let _ = state.transition(DerivationStatus::Running);
             }
@@ -991,7 +985,7 @@ impl DagActor {
             // reset_to_ready() handles Assigned -> Ready and Running -> Failed -> Ready,
             // maintaining state-machine invariants.
             for drv_hash in &worker.running_builds {
-                if let Some(state) = self.dag.nodes.get_mut(drv_hash.as_str()) {
+                if let Some(state) = self.dag.node_mut(drv_hash.as_str()) {
                     if let Err(e) = state.reset_to_ready() {
                         warn!(
                             drv_hash, error = %e,
@@ -1084,18 +1078,18 @@ impl DagActor {
 
         // Check for poisoned derivations that should expire (24h TTL)
         let mut expired_poisons = Vec::new();
-        for (drv_hash, state) in &self.dag.nodes {
+        for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
                 && let Some(poisoned_at) = state.poisoned_at
                 && now.duration_since(poisoned_at) > POISON_TTL
             {
-                expired_poisons.push(drv_hash.clone());
+                expired_poisons.push(drv_hash.to_string());
             }
         }
 
         for drv_hash in expired_poisons {
             info!(drv_hash, "poison TTL expired, resetting to created");
-            if let Some(state) = self.dag.nodes.get_mut(&drv_hash)
+            if let Some(state) = self.dag.node_mut(&drv_hash)
                 && let Err(e) = state.reset_from_poison()
             {
                 warn!(drv_hash, error = %e, "poison reset failed");
@@ -1121,8 +1115,7 @@ impl DagActor {
         );
         metrics::gauge!("rio_scheduler_derivations_running").set(
             self.dag
-                .nodes
-                .values()
+                .iter_values()
                 .filter(|s| {
                     matches!(
                         s.status(),
@@ -1156,7 +1149,7 @@ impl DagActor {
             };
 
             // Find the derivation's requirements
-            let (system, required_features) = match self.dag.nodes.get(&drv_hash) {
+            let (system, required_features) = match self.dag.node(&drv_hash) {
                 Some(state) => (state.system.clone(), state.required_features.clone()),
                 None => {
                     // Stale entry in queue, remove and continue
@@ -1168,8 +1161,7 @@ impl DagActor {
             // Only dispatch if derivation is actually in Ready state
             if self
                 .dag
-                .nodes
-                .get(&drv_hash)
+                .node(&drv_hash)
                 .is_none_or(|s| s.status() != DerivationStatus::Ready)
             {
                 self.ready_queue.pop_front();
@@ -1196,7 +1188,7 @@ impl DagActor {
 
     async fn assign_to_worker(&mut self, drv_hash: &str, worker_id: &str) {
         // Transition ready -> assigned
-        if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
+        if let Some(state) = self.dag.node_mut(drv_hash) {
             // Record assignment latency (Ready -> Assigned time) before transitioning
             if let Some(ready_at) = state.ready_at {
                 let latency = ready_at.elapsed();
@@ -1220,7 +1212,7 @@ impl DagActor {
         }
 
         // Create assignment in DB
-        if let Some(state) = self.dag.nodes.get(drv_hash)
+        if let Some(state) = self.dag.node(drv_hash)
             && let Some(db_id) = state.db_id
             && let Err(e) = self
                 .db
@@ -1236,7 +1228,7 @@ impl DagActor {
         }
 
         // Send WorkAssignment to worker via stream
-        if let Some(state) = self.dag.nodes.get(drv_hash) {
+        if let Some(state) = self.dag.node(drv_hash) {
             let assignment = rio_proto::types::WorkAssignment {
                 drv_path: state.drv_path.clone(),
                 drv_content: Vec::new(), // TODO: inline .drv content in future
@@ -1266,7 +1258,7 @@ impl DagActor {
                 );
                 // Reassign: put back in queue. State is Assigned (we just set it),
                 // so reset_to_ready takes the Assigned -> Ready path.
-                if let Some(state) = self.dag.nodes.get_mut(drv_hash)
+                if let Some(state) = self.dag.node_mut(drv_hash)
                     && state.reset_to_ready().is_ok()
                 {
                     self.ready_queue.push_front(drv_hash.to_string());
@@ -1371,14 +1363,13 @@ impl DagActor {
 
     fn get_interested_builds(&self, drv_hash: &str) -> Vec<Uuid> {
         self.dag
-            .nodes
-            .get(drv_hash)
+            .node(drv_hash)
             .map(|s| s.interested_builds.iter().copied().collect())
             .unwrap_or_default()
     }
 
     fn drv_hash_to_path(&self, drv_hash: &str) -> Option<String> {
-        self.dag.nodes.get(drv_hash).map(|s| s.drv_path.clone())
+        self.dag.node(drv_hash).map(|s| s.drv_path.clone())
     }
 
     /// Whether any interested build for this derivation is interactive (IFD).
@@ -1397,16 +1388,14 @@ impl DagActor {
     /// with drv_path, but the DAG is keyed by drv_hash.
     fn drv_path_to_hash(&self, drv_path: &str) -> Option<String> {
         self.dag
-            .nodes
-            .values()
+            .iter_values()
             .find(|s| s.drv_path == drv_path)
             .map(|s| s.drv_hash.clone())
     }
 
     fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {
         self.dag
-            .nodes
-            .values()
+            .iter_values()
             .find(|s| s.drv_path == drv_path)
             .and_then(|s| s.db_id)
     }
@@ -1457,8 +1446,7 @@ impl DagActor {
             .iter()
             .flat_map(|h| {
                 self.dag
-                    .nodes
-                    .get(h)
+                    .node(h)
                     .map(|s| s.output_paths.clone())
                     .unwrap_or_default()
             })
