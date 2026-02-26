@@ -1837,6 +1837,13 @@ impl DagActor {
             // Ignore transition errors (invalid transition = no-op).
             // The DB write below still records the intended terminal state.
             let _ = build.transition(new_state);
+
+            // Record build duration on terminal transition.
+            if new_state.is_terminal() {
+                let duration = build.submitted_at.elapsed();
+                metrics::histogram!("rio_scheduler_build_duration_seconds")
+                    .record(duration.as_secs_f64());
+            }
         }
 
         let error_summary = self

@@ -404,6 +404,8 @@ pub struct BuildInfo {
     pub error_summary: Option<String>,
     /// The derivation that caused the failure (if any).
     pub failed_derivation: Option<String>,
+    /// When the build was submitted (for rio_scheduler_build_duration_seconds).
+    pub submitted_at: Instant,
 }
 
 impl BuildInfo {
@@ -429,6 +431,7 @@ impl BuildInfo {
             failed_count: 0,
             error_summary: None,
             failed_derivation: None,
+            submitted_at: Instant::now(),
         }
     }
 
