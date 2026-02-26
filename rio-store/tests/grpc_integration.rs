@@ -285,6 +285,65 @@ async fn test_idempotent_put_path() {
     server.abort();
 }
 
+/// Two concurrent PutPath requests for the same path: exactly one should
+/// win (created=true); the other should either see created=false (if it
+/// raced after the first completed) or Aborted (if it raced into the
+/// in-progress window). Never: both created=true, or the loser's cleanup
+/// deleting the winner's placeholder.
+#[tokio::test]
+async fn test_concurrent_putpath_same_path_one_wins() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client1, addr, server) = setup_store(db.pool.clone()).await;
+
+    // Second client to the same server so we can send two concurrent streams.
+    let endpoint = format!("http://{addr}");
+    let channel2 = Channel::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client2 = StoreServiceClient::new(channel2);
+
+    let store_path = "/nix/store/55555555555555555555555555555555-concurrent-race";
+    let nar = make_nar(b"concurrent race test data");
+    let info = make_path_info(store_path, &nar);
+
+    // Launch both PutPath calls concurrently.
+    let (r1, r2) = tokio::join!(
+        put_path(&mut client1, info.clone(), nar.clone()),
+        put_path(&mut client2, info.clone(), nar.clone()),
+    );
+
+    // Categorize outcomes.
+    let outcomes: Vec<_> = [r1, r2]
+        .into_iter()
+        .map(|r| match r {
+            Ok(true) => "created",
+            Ok(false) => "exists",
+            Err(e) if e.code() == tonic::Code::Aborted => "aborted",
+            Err(e) => panic!("unexpected error: {e:?}"),
+        })
+        .collect();
+
+    // Exactly one should have created; the other must be exists or aborted.
+    let created_count = outcomes.iter().filter(|&&o| o == "created").count();
+    assert_eq!(
+        created_count, 1,
+        "exactly one PutPath should create; got outcomes: {outcomes:?}"
+    );
+
+    // The path must be readable after the race settles (winner's data intact).
+    let qpi = client1
+        .query_path_info(QueryPathInfoRequest {
+            store_path: store_path.into(),
+        })
+        .await
+        .expect("path should be queryable after concurrent uploads");
+    assert_eq!(qpi.into_inner().nar_size, nar.len() as u64);
+
+    server.abort();
+}
+
 /// PutPath with chunks exceeding declared nar_size should be rejected.
 #[tokio::test]
 async fn test_put_path_rejects_oversized_nar() {
