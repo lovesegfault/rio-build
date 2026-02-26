@@ -133,15 +133,25 @@ async fn create_schema(conn: &mut SqliteConnection) -> anyhow::Result<()> {
             PRIMARY KEY (drv, id),
             FOREIGN KEY (drv) REFERENCES ValidPaths(id)
         )"#,
+        // Realisations: currently empty (CA support deferred), but schema
+        // matches real Nix (outputPath is an INTEGER FK to ValidPaths(id),
+        // not a TEXT path — the real Nix daemon joins on the FK).
         r#"CREATE TABLE IF NOT EXISTS Realisations (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
             drvPath TEXT NOT NULL,
             outputName TEXT NOT NULL,
-            outputPath TEXT NOT NULL,
-            signatures TEXT DEFAULT ''
+            outputPath INTEGER NOT NULL,
+            signatures TEXT DEFAULT '',
+            FOREIGN KEY (outputPath) REFERENCES ValidPaths(id) ON DELETE CASCADE
         )"#,
         "CREATE INDEX IF NOT EXISTS IndexValidPathsPath ON ValidPaths(path)",
         "CREATE INDEX IF NOT EXISTS IndexValidPathsHash ON ValidPaths(hash)",
+        // IndexReferrer/IndexReference: real Nix schema has these. When
+        // sandbox=true, nix-daemon walks Refs to compute the closure to
+        // bind-mount into the chroot. Without IndexReferrer, a 1000+ path
+        // closure walk is O(n²).
+        "CREATE INDEX IF NOT EXISTS IndexReferrer ON Refs(referrer)",
+        "CREATE INDEX IF NOT EXISTS IndexReference ON Refs(reference)",
     ];
 
     for stmt in stmts {
@@ -311,6 +321,27 @@ mod tests {
             "/nix/store/bbbb-hello-2.12.2".to_string(),
             "/nix/store/bbbb-hello-2.12.2".to_string()
         )));
+
+        // Verify all required indexes exist (matches real Nix schema).
+        // IndexReferrer/IndexReference are critical for nix-daemon's sandbox
+        // closure walk: without them, a 1000+ path closure is O(n²).
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'Index%'",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        for expected in [
+            "IndexValidPathsPath",
+            "IndexValidPathsHash",
+            "IndexReferrer",
+            "IndexReference",
+        ] {
+            assert!(
+                indexes.iter().any(|i| i == expected),
+                "missing index {expected}; got indexes: {indexes:?}"
+            );
+        }
     }
 
     #[tokio::test]
