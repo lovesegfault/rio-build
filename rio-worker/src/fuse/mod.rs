@@ -374,14 +374,20 @@ impl NixStoreFs {
             Errno::EIO
         })?;
 
-        // Record in cache index
+        // Record in cache index. If this fails, the path is on disk but
+        // invisible to contains() — every subsequent access would re-fetch
+        // the NAR, creating an infinite re-fetch loop under DB failure.
+        // Fail loudly (EIO) so the build surfaces the real problem instead
+        // of silently amplifying network traffic.
         let size = dir_size(&local_path);
         if let Err(e) = self.cache.insert(store_basename, size) {
-            tracing::warn!(
+            tracing::error!(
                 store_path = %store_basename,
+                local_path = %local_path.display(),
                 error = %e,
-                "failed to record in cache index"
+                "failed to record in cache index; path on disk but untracked"
             );
+            return Err(Errno::EIO);
         }
 
         // Evict old entries if needed (best-effort)
