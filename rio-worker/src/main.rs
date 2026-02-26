@@ -103,11 +103,19 @@ async fn main() -> anyhow::Result<()> {
     let log_format = rio_common::observability::log_format_from_env();
     rio_common::observability::init_logging(log_format, None)?;
 
+    // worker_id uniquely identifies this worker to the scheduler. Two workers
+    // with the same ID would steal each other's builds via heartbeat merging.
+    // Fail hard rather than silently colliding on "unknown".
     let worker_id = args.worker_id.unwrap_or_else(|| {
         nix::unistd::gethostname()
             .ok()
             .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    "cannot determine worker_id: gethostname() failed and --worker-id not provided"
+                );
+                std::process::exit(1);
+            })
     });
 
     let system = args.system.unwrap_or_else(detect_system);
