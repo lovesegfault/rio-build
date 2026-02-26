@@ -192,35 +192,32 @@ impl Cache {
     }
 
     /// Check if a store path is cached.
-    pub fn contains(&self, store_path: &str) -> bool {
+    ///
+    /// Propagates SQLite errors so callers can distinguish "not cached"
+    /// from "index query failed". Treating DB errors as not-cached would
+    /// trigger re-fetches for every FUSE op during a SQLite hiccup,
+    /// saturating store bandwidth and masking the root cause.
+    pub fn contains(&self, store_path: &str) -> Result<bool, CacheError> {
         let pool = &self.pool;
         self.runtime.block_on(async {
-            let count: i64 = match sqlx::query_scalar(
-                "SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1",
-            )
-            .bind(store_path)
-            .fetch_one(pool)
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(store_path, error = %e, "FUSE cache contains() query failed");
-                    0
-                }
-            };
-            count > 0
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1")
+                    .bind(store_path)
+                    .fetch_one(pool)
+                    .await?;
+            Ok(count > 0)
         })
     }
 
     /// Get the full filesystem path for a cached store path.
     ///
-    /// Returns `None` if the path is not cached.
-    pub fn get_path(&self, store_path: &str) -> Option<PathBuf> {
-        if self.contains(store_path) {
+    /// Returns `Ok(None)` if the path is not cached, `Err` on index failure.
+    pub fn get_path(&self, store_path: &str) -> Result<Option<PathBuf>, CacheError> {
+        if self.contains(store_path)? {
             self.touch(store_path);
-            Some(self.cache_dir.join(store_path))
+            Ok(Some(self.cache_dir.join(store_path)))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -422,10 +419,10 @@ mod tests {
         let cache = make_cache(dir.path().join("cache"), 1).await;
 
         tokio::task::spawn_blocking(move || {
-            assert!(!cache.contains("abc-hello-1.0"));
+            assert!(!cache.contains("abc-hello-1.0").unwrap());
 
             cache.insert("abc-hello-1.0", 1024).unwrap();
-            assert!(cache.contains("abc-hello-1.0"));
+            assert!(cache.contains("abc-hello-1.0").unwrap());
             assert_eq!(cache.total_size(), 1024);
         })
         .await
@@ -439,11 +436,42 @@ mod tests {
         let cache = make_cache(cache_dir.clone(), 1).await;
 
         tokio::task::spawn_blocking(move || {
-            assert!(cache.get_path("abc-hello-1.0").is_none());
+            assert!(cache.get_path("abc-hello-1.0").unwrap().is_none());
 
             cache.insert("abc-hello-1.0", 512).unwrap();
-            let path = cache.get_path("abc-hello-1.0").unwrap();
+            let path = cache.get_path("abc-hello-1.0").unwrap().unwrap();
             assert_eq!(path, cache_dir.join("abc-hello-1.0"));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// DB errors from contains()/get_path() must propagate, not be treated
+    /// as "not cached". Otherwise a SQLite hiccup would trigger re-fetches
+    /// for every FUSE op, saturating store bandwidth and masking root cause.
+    #[tokio::test]
+    async fn test_cache_db_error_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"), 1).await;
+
+        // Close the pool to force DB errors on all subsequent queries.
+        let pool = cache.pool.clone();
+        pool.close().await;
+
+        tokio::task::spawn_blocking(move || {
+            // contains() must return Err, not false.
+            let result = cache.contains("some-path");
+            assert!(
+                matches!(result, Err(CacheError::Sqlite(_))),
+                "contains() on closed pool should return Err, got {result:?}"
+            );
+
+            // get_path() must return Err, not None.
+            let result = cache.get_path("some-path");
+            assert!(
+                matches!(result, Err(CacheError::Sqlite(_))),
+                "get_path() on closed pool should return Err, got {result:?}"
+            );
         })
         .await
         .unwrap();

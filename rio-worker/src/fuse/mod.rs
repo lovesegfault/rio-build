@@ -240,8 +240,13 @@ impl NixStoreFs {
     /// If another thread is already fetching, blocks on a condition variable
     /// until that fetch completes (or a 30s timeout, then returns EAGAIN).
     fn ensure_cached(&self, store_basename: &str) -> Result<PathBuf, Errno> {
-        if let Some(local_path) = self.cache.get_path(store_basename) {
-            return Ok(local_path);
+        match self.cache.get_path(store_basename) {
+            Ok(Some(local_path)) => return Ok(local_path),
+            Ok(None) => {} // not cached, fetch below
+            Err(e) => {
+                tracing::error!(store_path = store_basename, error = %e, "FUSE cache index query failed");
+                return Err(Errno::EIO);
+            }
         }
 
         match self.cache.try_start_fetch(store_basename) {
@@ -263,9 +268,17 @@ impl NixStoreFs {
                     );
                     return Err(Errno::EAGAIN);
                 }
-                // Fetch completed — check cache again (the fetcher may have
-                // failed, in which case ENOENT tells the FUSE caller to retry).
-                self.cache.get_path(store_basename).ok_or(Errno::ENOENT)
+                // Fetch completed — check cache again. Fetcher failure =>
+                // Ok(None) => ENOENT so the FUSE caller can retry.
+                // Index error => EIO (loud failure, not silent re-fetch).
+                match self.cache.get_path(store_basename) {
+                    Ok(Some(p)) => Ok(p),
+                    Ok(None) => Err(Errno::ENOENT),
+                    Err(e) => {
+                        tracing::error!(store_path = store_basename, error = %e, "FUSE cache index query failed after wait");
+                        Err(Errno::EIO)
+                    }
+                }
             }
         }
     }
