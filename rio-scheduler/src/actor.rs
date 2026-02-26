@@ -1511,8 +1511,15 @@ impl DagActor {
 
                 match eligible_worker {
                     Some(worker_id) => {
-                        self.assign_to_worker(&drv_hash, &worker_id).await;
-                        dispatched_any = true;
+                        if self.assign_to_worker(&drv_hash, &worker_id).await {
+                            dispatched_any = true;
+                        } else {
+                            // Assignment send failed (worker stream full or
+                            // disconnected). Defer — retrying immediately in
+                            // the same pass would spin: the channel won't
+                            // drain until we yield to the runtime.
+                            deferred.push(drv_hash);
+                        }
                     }
                     None => {
                         // No eligible worker for this derivation. Defer and
@@ -1529,7 +1536,10 @@ impl DagActor {
         }
     }
 
-    async fn assign_to_worker(&mut self, drv_hash: &str, worker_id: &str) {
+    /// Transition a derivation to Assigned and send it to the worker.
+    /// Returns `true` if the assignment was sent, `false` if it failed
+    /// (caller should defer the derivation, not retry immediately).
+    async fn assign_to_worker(&mut self, drv_hash: &str, worker_id: &str) -> bool {
         // Transition ready -> assigned
         if let Some(state) = self.dag.node_mut(drv_hash) {
             // Record assignment latency (Ready -> Assigned time) before transitioning
@@ -1540,7 +1550,7 @@ impl DagActor {
                 state.ready_at = None; // clear after recording
             }
             if state.transition(DerivationStatus::Assigned).is_err() {
-                return;
+                return false;
             }
             state.assigned_worker = Some(worker_id.to_string());
         }
@@ -1603,14 +1613,20 @@ impl DagActor {
                     error = %e,
                     "failed to send assignment to worker"
                 );
-                // Reassign: put back in queue. State is Assigned (we just set it),
-                // so reset_to_ready takes the Assigned -> Ready path.
-                if let Some(state) = self.dag.node_mut(drv_hash)
-                    && state.reset_to_ready().is_ok()
-                {
-                    self.ready_queue.push_front(drv_hash.to_string());
+                // Clean up worker tracking (we added drv_hash above;
+                // without this, the worker appears to have this derivation
+                // running, causing a phantom capacity leak).
+                if let Some(worker) = self.workers.get_mut(worker_id) {
+                    worker.running_builds.remove(drv_hash);
                 }
-                return;
+                // Reset state: Assigned -> Ready. Caller (dispatch_ready)
+                // will defer the derivation; next dispatch pass retries.
+                // Do NOT push_front here — that would cause the inner
+                // dispatch loop to spin (channel is still full).
+                if let Some(state) = self.dag.node_mut(drv_hash) {
+                    let _ = state.reset_to_ready();
+                }
+                return false;
             }
         }
 
@@ -1634,6 +1650,7 @@ impl DagActor {
 
         debug!(drv_hash, worker_id, "assigned derivation to worker");
         metrics::counter!("rio_scheduler_assignments_total").increment(1);
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -3846,5 +3863,113 @@ pub(crate) mod tests {
         // Clear flag; send() should succeed.
         handle.backpressure.store(false, Ordering::Relaxed);
         assert!(!handle.is_backpressured());
+    }
+
+    /// When try_send to a worker's stream fails (channel full/disconnected),
+    /// assign_to_worker must remove drv_hash from worker.running_builds.
+    /// Without cleanup: phantom capacity leak (worker appears full forever)
+    /// or infinite dispatch loop when max_builds > 1.
+    #[tokio::test]
+    async fn test_assign_send_failure_cleans_running_builds() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Connect worker with capacity-1 stream channel so we can fill it.
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        handle
+            .send_unchecked(ActorCommand::WorkerConnected {
+                worker_id: "tight-worker".into(),
+                stream_tx,
+            })
+            .await
+            .unwrap();
+        handle
+            .send_unchecked(ActorCommand::Heartbeat {
+                worker_id: "tight-worker".into(),
+                system: "x86_64-linux".into(),
+                supported_features: vec![],
+                max_builds: 2, // room for 2, but stream has room for 1
+                running_builds: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Merge 2 leaf derivations. Both go Ready; dispatch assigns both.
+        // First assignment succeeds (fills stream channel). Second try_send
+        // fails (channel full) — this triggers the recovery path.
+        let build_id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![
+                    make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
+                    make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),
+                ],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _event_rx = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // Worker should have EXACTLY 1 running build (the successful assign),
+        // not 2 (which would indicate the failed assign leaked into running_builds).
+        let workers = handle.debug_query_workers().await.unwrap();
+        let worker = workers
+            .iter()
+            .find(|w| w.worker_id == "tight-worker")
+            .unwrap();
+        assert_eq!(
+            worker.running_count, 1,
+            "failed try_send must clean up running_builds; got {:?}",
+            worker.running_builds
+        );
+
+        // The unsent derivation should be back in Ready (not stuck Assigned).
+        let sent_hash = &worker.running_builds[0];
+        let unsent_hash = if sent_hash == "drvA" { "drvB" } else { "drvA" };
+        let unsent = handle
+            .debug_query_derivation(unsent_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unsent.status,
+            DerivationStatus::Ready,
+            "unsent derivation should be reset to Ready"
+        );
+
+        // Drain the stream channel; next dispatch should pick up the unsent drv.
+        let _first_assignment = stream_rx.recv().await.unwrap();
+        // Trigger dispatch via heartbeat.
+        handle
+            .send_unchecked(ActorCommand::Heartbeat {
+                worker_id: "tight-worker".into(),
+                system: "x86_64-linux".into(),
+                supported_features: vec![],
+                max_builds: 2,
+                running_builds: vec![sent_hash.clone()],
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Now both should be assigned.
+        let workers = handle.debug_query_workers().await.unwrap();
+        let worker = workers
+            .iter()
+            .find(|w| w.worker_id == "tight-worker")
+            .unwrap();
+        assert_eq!(
+            worker.running_count, 2,
+            "after draining stream, both derivations should be assigned"
+        );
+        let _second_assignment = stream_rx.recv().await.unwrap();
     }
 }
