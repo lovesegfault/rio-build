@@ -188,7 +188,12 @@ impl StoreService for StoreServiceImpl {
         // malicious/buggy client from OOMing the server.
         const NAR_SIZE_TOLERANCE: u64 = 4096;
         let max_allowed = info.nar_size.saturating_add(NAR_SIZE_TOLERANCE);
-        let mut nar_data = Vec::with_capacity(info.nar_size as usize);
+        // nar_size is already bounded by MAX_NAR_SIZE (4 GiB) above, which
+        // fits in usize on 64-bit. try_from is defensive for 32-bit platforms
+        // where MAX_NAR_SIZE (4_294_967_296) exceeds u32::MAX (4_294_967_295).
+        let capacity = usize::try_from(info.nar_size)
+            .map_err(|_| Status::invalid_argument("nar_size too large for this platform"))?;
+        let mut nar_data = Vec::with_capacity(capacity);
         while let Some(msg) = stream.message().await? {
             match msg.msg {
                 Some(put_path_request::Msg::NarChunk(chunk)) => {
