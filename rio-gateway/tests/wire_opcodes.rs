@@ -356,9 +356,10 @@ impl TestHarness {
                 &mut scheduler_client,
             )
             .await;
-            // Clean EOF is expected. Unknown-opcode errors are also expected
-            // (the handler sends STDERR_ERROR then returns an error to close
-            // the connection — per protocol spec).
+            // Clean EOF is expected. Handlers that send STDERR_ERROR also
+            // return Err to close the connection (per protocol spec), so any
+            // error here is allowed — the test's real assertion is the
+            // client-side drain_stderr_expecting_error check.
             if let Err(e) = &result {
                 let is_eof = e
                     .downcast_ref::<rio_nix::protocol::wire::WireError>()
@@ -369,9 +370,9 @@ impl TestHarness {
                                 if io.kind() == std::io::ErrorKind::UnexpectedEof
                         )
                     });
-                let is_unknown_opcode = e.to_string().contains("unknown opcode");
-                if !is_eof && !is_unknown_opcode {
-                    panic!("unexpected server error: {e}");
+                if !is_eof {
+                    // Log, don't panic — error-path tests expect this.
+                    tracing::debug!(error = %e, "server returned error (expected for error-path tests)");
                 }
             }
         });
@@ -1038,6 +1039,336 @@ async fn test_unknown_opcode_returns_stderr_error() {
         "error should mention unknown/unimplemented opcode: {}",
         err.message()
     );
+
+    h.finish().await;
+}
+
+// ===========================================================================
+// Build opcode tests
+// ===========================================================================
+
+/// wopBuildPaths (9): reads strings(paths) + u64(build_mode), writes u64(1).
+#[tokio::test]
+async fn test_build_paths_success() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        send_completed: true,
+        ..Default::default()
+    });
+
+    // Seed a .drv in store so translate::reconstruct_dag can resolve it.
+    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+
+    wire::write_u64(&mut h.stream, 9).await.unwrap(); // wopBuildPaths
+    // DerivedPath format: "drv_path!output_name" for Built paths
+    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
+        .await
+        .unwrap();
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // build_mode = Normal
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+
+    // Verify scheduler received the submit request.
+    let submits = h.scheduler.submit_calls.read().unwrap().clone();
+    assert_eq!(submits.len(), 1, "scheduler should receive one SubmitBuild");
+
+    h.finish().await;
+}
+
+/// wopBuildPaths with scheduler error: should send STDERR_ERROR.
+#[tokio::test]
+async fn test_build_paths_scheduler_error_returns_stderr_error() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        submit_error: Some(tonic::Code::Unavailable),
+        ..Default::default()
+    });
+
+    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+
+    wire::write_u64(&mut h.stream, 9).await.unwrap(); // wopBuildPaths
+    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
+        .await
+        .unwrap();
+    wire::write_u64(&mut h.stream, 0).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(!err.message().is_empty());
+
+    h.finish().await;
+}
+
+/// wopBuildPathsWithResults (46): reads strings + build_mode, writes
+/// u64(count) + per-entry (string:DerivedPath, BuildResult).
+#[tokio::test]
+async fn test_build_paths_with_results_keyed_format() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        send_completed: true,
+        ..Default::default()
+    });
+
+    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+
+    let derived_path = format!("{drv_path}!out");
+    wire::write_u64(&mut h.stream, 46).await.unwrap(); // wopBuildPathsWithResults
+    wire::write_strings(&mut h.stream, std::slice::from_ref(&derived_path))
+        .await
+        .unwrap();
+    wire::write_u64(&mut h.stream, 0).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+
+    // KeyedBuildResult: u64(count) + per-entry (string:path, BuildResult)
+    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(count, 1, "one DerivedPath requested, one result");
+
+    // DerivedPath echoed back
+    let path = wire::read_string(&mut h.stream).await.unwrap();
+    assert_eq!(path, derived_path, "DerivedPath should be echoed back");
+
+    // BuildResult: status + errorMsg + timesBuilt + isNonDeterministic +
+    // startTime + stopTime + cpuUser(tag+val) + cpuSystem(tag+val) +
+    // builtOutputs(count + per-output pair)
+    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(status, 0, "BuildStatus::Built = 0");
+    let _error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    let _times_built = wire::read_u64(&mut h.stream).await.unwrap();
+    let _is_non_det = wire::read_bool(&mut h.stream).await.unwrap();
+    let _start_time = wire::read_u64(&mut h.stream).await.unwrap();
+    let _stop_time = wire::read_u64(&mut h.stream).await.unwrap();
+    // cpuUser: tag + optional value
+    let cpu_user_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    if cpu_user_tag == 1 {
+        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+    }
+    // cpuSystem: tag + optional value
+    let cpu_system_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    if cpu_system_tag == 1 {
+        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+    }
+    // builtOutputs
+    let built_outputs_count = wire::read_u64(&mut h.stream).await.unwrap();
+    for _ in 0..built_outputs_count {
+        let _drv_output_id = wire::read_string(&mut h.stream).await.unwrap();
+        let _realisation_json = wire::read_string(&mut h.stream).await.unwrap();
+    }
+
+    h.finish().await;
+}
+
+/// wopQueryMissing (40): reads strings(paths), writes willBuild + willSubstitute
+/// + unknown + downloadSize + narSize.
+#[tokio::test]
+async fn test_query_missing_reports_will_build() {
+    let mut h = TestHarness::setup().await;
+
+    // Don't seed the .drv: handler filters paths whose store_path is NOT in
+    // the missing set. A Built path's store_path() is the .drv; if the .drv
+    // is missing from store, the handler reports it in willBuild.
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+
+    wire::write_u64(&mut h.stream, 40).await.unwrap(); // wopQueryMissing
+    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
+        .await
+        .unwrap();
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+
+    let will_build = wire::read_strings(&mut h.stream).await.unwrap();
+    let will_substitute = wire::read_strings(&mut h.stream).await.unwrap();
+    let unknown = wire::read_strings(&mut h.stream).await.unwrap();
+    let download_size = wire::read_u64(&mut h.stream).await.unwrap();
+    let nar_size = wire::read_u64(&mut h.stream).await.unwrap();
+
+    assert_eq!(
+        will_build.len(),
+        1,
+        "missing Built .drv should be in willBuild"
+    );
+    assert!(will_build[0].contains(drv_path));
+    assert!(will_substitute.is_empty(), "Phase 2a: no substitutes");
+    assert!(unknown.is_empty());
+    assert_eq!(download_size, 0);
+    assert_eq!(nar_size, 0);
+
+    h.finish().await;
+}
+
+/// wopQueryDerivationOutputMap (41): reads drv path, writes count +
+/// (name, path) pairs. Error path: missing .drv in store.
+#[tokio::test]
+async fn test_query_derivation_output_map_missing_drv() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 41).await.unwrap();
+    wire::write_string(
+        &mut h.stream,
+        "/nix/store/11111111111111111111111111111111-missing.drv",
+    )
+    .await
+    .unwrap();
+    h.stream.flush().await.unwrap();
+
+    // Missing .drv: STDERR_ERROR
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(!err.message().is_empty());
+
+    h.finish().await;
+}
+
+/// wopQueryDerivationOutputMap (41) happy path: .drv is in store, returns
+/// output name -> path map.
+#[tokio::test]
+async fn test_query_derivation_output_map_found() {
+    let mut h = TestHarness::setup().await;
+
+    let drv_text = r#"Derive([("out","/nix/store/zzz-output","",""),("dev","/nix/store/yyy-dev","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+
+    wire::write_u64(&mut h.stream, 41).await.unwrap();
+    wire::write_string(&mut h.stream, drv_path).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+
+    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(count, 2, "two outputs (out, dev)");
+    let mut outputs = std::collections::HashMap::new();
+    for _ in 0..count {
+        let name = wire::read_string(&mut h.stream).await.unwrap();
+        let path = wire::read_string(&mut h.stream).await.unwrap();
+        outputs.insert(name, path);
+    }
+    assert_eq!(outputs.get("out").unwrap(), "/nix/store/zzz-output");
+    assert_eq!(outputs.get("dev").unwrap(), "/nix/store/yyy-dev");
+
+    h.finish().await;
+}
+
+/// wopAddTextToStore (8): reads name + text + refs, writes computed CA path.
+#[tokio::test]
+async fn test_add_text_to_store() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 8).await.unwrap(); // wopAddTextToStore
+    wire::write_string(&mut h.stream, "my-text").await.unwrap(); // name
+    wire::write_string(&mut h.stream, "hello world")
+        .await
+        .unwrap(); // text
+    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+    let path = wire::read_string(&mut h.stream).await.unwrap();
+    assert!(
+        path.starts_with("/nix/store/") && path.ends_with("-my-text"),
+        "computed path should be a store path ending in -my-text: {path}"
+    );
+
+    // Verify store received the upload.
+    let calls = h.store.put_calls.read().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].store_path, path);
+
+    h.finish().await;
+}
+
+/// wopBuildDerivation (36): reads drv_path + BasicDerivation + build_mode,
+/// writes BuildResult. BasicDerivation format is: output_count +
+/// per-output(name, path, hash_algo, hash) + input_srcs + platform + builder +
+/// args + env_pairs.
+#[tokio::test]
+async fn test_build_derivation_basic_format() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        send_completed: true,
+        ..Default::default()
+    });
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+
+    wire::write_u64(&mut h.stream, 36).await.unwrap(); // wopBuildDerivation
+    wire::write_string(&mut h.stream, drv_path).await.unwrap(); // drv path
+
+    // BasicDerivation: outputs
+    wire::write_u64(&mut h.stream, 1).await.unwrap(); // 1 output
+    wire::write_string(&mut h.stream, "out").await.unwrap(); // name
+    wire::write_string(&mut h.stream, "/nix/store/zzz-output")
+        .await
+        .unwrap(); // path
+    wire::write_string(&mut h.stream, "").await.unwrap(); // hash_algo (input-addressed)
+    wire::write_string(&mut h.stream, "").await.unwrap(); // hash
+
+    // input_srcs
+    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    // platform
+    wire::write_string(&mut h.stream, "x86_64-linux")
+        .await
+        .unwrap();
+    // builder
+    wire::write_string(&mut h.stream, "/bin/sh").await.unwrap();
+    // args
+    wire::write_strings(&mut h.stream, &["-c".into(), "echo hi".into()])
+        .await
+        .unwrap();
+    // env pairs
+    wire::write_string_pairs(
+        &mut h.stream,
+        &[("out".into(), "/nix/store/zzz-output".into())],
+    )
+    .await
+    .unwrap();
+
+    // build_mode
+    wire::write_u64(&mut h.stream, 0).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+
+    // BuildResult: status + errorMsg + timesBuilt + isNonDet + start + stop +
+    // cpuUser(tag+val?) + cpuSystem(tag+val?) + builtOutputs
+    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    assert!(status <= 14, "BuildStatus should be 0-14, got {status}");
+    let _error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    let _times_built = wire::read_u64(&mut h.stream).await.unwrap();
+    let _is_non_det = wire::read_bool(&mut h.stream).await.unwrap();
+    let _start_time = wire::read_u64(&mut h.stream).await.unwrap();
+    let _stop_time = wire::read_u64(&mut h.stream).await.unwrap();
+    let cpu_user_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    if cpu_user_tag == 1 {
+        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+    }
+    let cpu_system_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    if cpu_system_tag == 1 {
+        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+    }
+    let built_outputs_count = wire::read_u64(&mut h.stream).await.unwrap();
+    for _ in 0..built_outputs_count {
+        let _drv_output_id = wire::read_string(&mut h.stream).await.unwrap();
+        let _realisation_json = wire::read_string(&mut h.stream).await.unwrap();
+    }
 
     h.finish().await;
 }
