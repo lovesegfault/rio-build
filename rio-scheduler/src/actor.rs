@@ -5,6 +5,8 @@
 //! and eliminating lock contention.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -185,8 +187,10 @@ pub struct DagActor {
     /// Store service client for scheduler-side cache checks. `None` in tests
     /// that don't need the store (cache check is then skipped).
     store_client: Option<StoreServiceClient<Channel>>,
-    /// Whether backpressure is currently active.
-    backpressure_active: bool,
+    /// Whether backpressure is currently active. Shared with ActorHandle
+    /// so hysteresis (80%/60%) is honored by send() instead of a simple
+    /// threshold check. Arc<AtomicBool> for lock-free reads on the hot path.
+    backpressure_active: Arc<AtomicBool>,
     /// Leader generation counter (for assignment tokens).
     generation: i64,
     /// Weak clone of the actor's own command sender, for scheduling delayed
@@ -213,7 +217,7 @@ impl DagActor {
             retry_policy: RetryPolicy::default(),
             db,
             store_client,
-            backpressure_active: false,
+            backpressure_active: Arc::new(AtomicBool::new(false)),
             generation: 1,
             self_tx: None,
         }
@@ -386,9 +390,10 @@ impl DagActor {
 
     fn update_backpressure(&mut self, queue_len: usize, capacity: usize) {
         let fraction = queue_len as f64 / capacity as f64;
+        let was_active = self.backpressure_active.load(Ordering::Relaxed);
 
-        if !self.backpressure_active && fraction >= BACKPRESSURE_HIGH_WATERMARK {
-            self.backpressure_active = true;
+        if !was_active && fraction >= BACKPRESSURE_HIGH_WATERMARK {
+            self.backpressure_active.store(true, Ordering::Relaxed);
             warn!(
                 queue_len,
                 capacity,
@@ -396,8 +401,8 @@ impl DagActor {
                 fraction * 100.0
             );
             metrics::counter!("rio_scheduler_queue_backpressure").increment(1);
-        } else if self.backpressure_active && fraction <= BACKPRESSURE_LOW_WATERMARK {
-            self.backpressure_active = false;
+        } else if was_active && fraction <= BACKPRESSURE_LOW_WATERMARK {
+            self.backpressure_active.store(false, Ordering::Relaxed);
             info!(
                 queue_len,
                 capacity, "backpressure deactivated, resuming normal operation"
@@ -405,9 +410,14 @@ impl DagActor {
         }
     }
 
-    /// Check if the actor is under backpressure.
+    /// Check if the actor is under backpressure (shared hysteresis state).
     pub fn is_backpressured(&self) -> bool {
-        self.backpressure_active
+        self.backpressure_active.load(Ordering::Relaxed)
+    }
+
+    /// Clone the shared backpressure flag for wiring into ActorHandle.
+    pub(crate) fn backpressure_flag(&self) -> Arc<AtomicBool> {
+        self.backpressure_active.clone()
     }
 
     // -----------------------------------------------------------------------
@@ -1903,6 +1913,11 @@ impl DagActor {
 #[derive(Clone)]
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorCommand>,
+    /// Shared backpressure flag with the actor. The actor computes hysteresis
+    /// (activate at 80%, deactivate at 60%) and writes here; the handle reads
+    /// it for send() and is_backpressured(). Without this, the handle used a
+    /// simple threshold with no hysteresis -> flapping under load near 80%.
+    backpressure: Arc<AtomicBool>,
 }
 
 impl ActorHandle {
@@ -1912,9 +1927,10 @@ impl ActorHandle {
     pub fn spawn(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, store_client);
+        let backpressure = actor.backpressure_flag();
         let self_tx = tx.downgrade();
         rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
-        Self { tx }
+        Self { tx, backpressure }
     }
 
     /// Legacy constructor without self_tx (kept for tests that manually spawn).
@@ -1925,8 +1941,9 @@ impl ActorHandle {
     ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, store_client);
+        let backpressure = actor.backpressure_flag();
         tokio::spawn(actor.run(rx));
-        Self { tx }
+        Self { tx, backpressure }
     }
 
     /// Whether the actor task is still alive. Returns false if the actor
@@ -1937,17 +1954,13 @@ impl ActorHandle {
         !self.tx.is_closed()
     }
 
-    /// Send a command to the actor, checking backpressure.
+    /// Send a command to the actor, checking backpressure (with hysteresis).
     pub async fn send(&self, cmd: ActorCommand) -> Result<(), ActorError> {
-        // Check capacity for backpressure
-        let capacity = self.tx.capacity();
-        let max = self.tx.max_capacity();
-        let used_fraction = 1.0 - (capacity as f64 / max as f64);
-
-        if used_fraction >= BACKPRESSURE_HIGH_WATERMARK {
+        // Read the actor's hysteresis-aware backpressure flag, not a simple
+        // threshold. Activated at 80%, stays active until drained to 60%.
+        if self.backpressure.load(Ordering::Relaxed) {
             return Err(ActorError::Backpressure);
         }
-
         self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
     }
 
@@ -1956,12 +1969,9 @@ impl ActorHandle {
         self.tx.try_send(cmd).map_err(|_| ActorError::ChannelSend)
     }
 
-    /// Check if the channel is under backpressure.
+    /// Check if the actor is under backpressure (hysteresis-aware).
     pub fn is_backpressured(&self) -> bool {
-        let capacity = self.tx.capacity();
-        let max = self.tx.max_capacity();
-        let used_fraction = 1.0 - (capacity as f64 / max as f64);
-        used_fraction >= BACKPRESSURE_HIGH_WATERMARK
+        self.backpressure.load(Ordering::Relaxed)
     }
 
     /// Send a command without backpressure check (for worker lifecycle events).
@@ -2024,9 +2034,10 @@ pub(crate) mod tests {
         let db = SchedulerDb::new(pool);
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, store_client);
+        let backpressure = actor.backpressure_flag();
         let self_tx = tx.downgrade();
         let task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-        (ActorHandle { tx }, task)
+        (ActorHandle { tx, backpressure }, task)
     }
 
     /// Create a minimal test DerivationNode.
@@ -3313,5 +3324,84 @@ pub(crate) mod tests {
 
         // TestDb::drop uses a separate admin connection, so closing the test
         // pool here doesn't prevent database cleanup.
+    }
+
+    // -----------------------------------------------------------------------
+    // Backpressure hysteresis
+    // -----------------------------------------------------------------------
+
+    /// Backpressure should activate at 80%, stay active, and only deactivate
+    /// at 60% (hysteresis). Before the fix, ActorHandle used a simple 80%
+    /// threshold with no hysteresis -> flapping under load near 80%.
+    #[tokio::test]
+    async fn test_backpressure_hysteresis() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let scheduler_db = SchedulerDb::new(db.pool.clone());
+        let mut actor = DagActor::new(scheduler_db, None);
+        let flag = actor.backpressure_flag();
+
+        // Simulate queue at 50% — below high watermark, not active.
+        actor.update_backpressure(5000, 10000);
+        assert!(!flag.load(Ordering::Relaxed), "50%: should not be active");
+
+        // 85% — above high watermark, activates.
+        actor.update_backpressure(8500, 10000);
+        assert!(flag.load(Ordering::Relaxed), "85%: should activate");
+
+        // 70% — between watermarks, STILL active (hysteresis).
+        actor.update_backpressure(7000, 10000);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "70%: should STAY active (hysteresis between 60% and 80%)"
+        );
+
+        // 55% — below low watermark, deactivates.
+        actor.update_backpressure(5500, 10000);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "55%: should deactivate (below 60% low watermark)"
+        );
+
+        // 70% again — below high watermark, STILL inactive (hysteresis).
+        actor.update_backpressure(7000, 10000);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "70%: should STAY inactive (hysteresis between 60% and 80%)"
+        );
+    }
+
+    /// ActorHandle::send() and ::is_backpressured() should honor the shared
+    /// hysteresis flag, not compute their own threshold.
+    #[tokio::test]
+    async fn test_handle_uses_shared_backpressure_flag() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Initially not backpressured (empty queue).
+        assert!(!handle.is_backpressured());
+
+        // Directly set the shared flag (simulating actor's hysteresis decision).
+        handle.backpressure.store(true, Ordering::Relaxed);
+        assert!(
+            handle.is_backpressured(),
+            "handle should read the shared flag"
+        );
+
+        // send() should reject under backpressure.
+        let (reply_tx, _) = oneshot::channel();
+        let result = handle
+            .send(ActorCommand::QueryBuildStatus {
+                build_id: Uuid::new_v4(),
+                reply: reply_tx,
+            })
+            .await;
+        assert!(
+            matches!(result, Err(ActorError::Backpressure)),
+            "send() should reject when shared flag is set"
+        );
+
+        // Clear flag; send() should succeed.
+        handle.backpressure.store(false, Ordering::Relaxed);
+        assert!(!handle.is_backpressured());
     }
 }
