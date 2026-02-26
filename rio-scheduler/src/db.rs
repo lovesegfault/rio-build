@@ -41,7 +41,7 @@ impl SchedulerDb {
         &self,
         build_id: Uuid,
         tenant_id: Option<&str>,
-        priority_class: &str,
+        priority_class: crate::state::PriorityClass,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -51,7 +51,7 @@ impl SchedulerDb {
         )
         .bind(build_id.to_string())
         .bind(tenant_id)
-        .bind(priority_class)
+        .bind(priority_class.as_str())
         .execute(&self.pool)
         .await?;
 

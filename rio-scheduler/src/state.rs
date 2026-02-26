@@ -138,6 +138,56 @@ impl std::str::FromStr for DerivationStatus {
     }
 }
 
+/// Priority class for scheduling.
+///
+/// Phase 2a uses binary interactive/scheduled FIFO: interactive builds
+/// push_front the ready queue; all others push_back. Full max(priority)
+/// across interested builds is deferred to Phase 2c with critical-path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PriorityClass {
+    /// CI builds: normal priority, scheduled order.
+    Ci,
+    /// Interactive builds (e.g., IFD during evaluation): push_front.
+    Interactive,
+    /// Scheduled/batch builds: default, lowest priority.
+    #[default]
+    Scheduled,
+}
+
+impl PriorityClass {
+    /// Database and wire string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ci => "ci",
+            Self::Interactive => "interactive",
+            Self::Scheduled => "scheduled",
+        }
+    }
+
+    /// Whether this class gets push_front treatment in the ready queue.
+    pub fn is_interactive(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+}
+
+impl std::str::FromStr for PriorityClass {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ci" => Ok(Self::Ci),
+            "interactive" => Ok(Self::Interactive),
+            "scheduled" => Ok(Self::Scheduled),
+            _ => Err("invalid priority class (must be 'ci', 'interactive', or 'scheduled')"),
+        }
+    }
+}
+
+impl std::fmt::Display for PriorityClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// State of a build request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildState {
@@ -390,8 +440,8 @@ pub struct BuildInfo {
     pub build_id: Uuid,
     /// Tenant ID (unused in Phase 2a).
     pub tenant_id: Option<String>,
-    /// Priority class ("ci", "interactive", "scheduled").
-    pub priority_class: String,
+    /// Priority class. Interactive gets push_front in the ready queue.
+    pub priority_class: PriorityClass,
     /// Current build state. Private: use `state()` to read, `transition()` to mutate.
     /// This enforces the BuildState transition validation at every write site.
     state: BuildState,
@@ -420,7 +470,7 @@ impl BuildInfo {
     pub fn new_pending(
         build_id: Uuid,
         tenant_id: Option<String>,
-        priority_class: String,
+        priority_class: PriorityClass,
         keep_going: bool,
         options: BuildOptions,
         derivation_hashes: HashSet<String>,
@@ -805,7 +855,7 @@ mod tests {
         let mut b = BuildInfo::new_pending(
             Uuid::new_v4(),
             None,
-            "scheduled".into(),
+            PriorityClass::Scheduled,
             false,
             BuildOptions::default(),
             HashSet::new(),
@@ -835,7 +885,7 @@ mod tests {
         let mut b = BuildInfo::new_pending(
             Uuid::new_v4(),
             None,
-            "scheduled".into(),
+            PriorityClass::Scheduled,
             false,
             BuildOptions::default(),
             HashSet::new(),
@@ -843,5 +893,37 @@ mod tests {
         // Invalid: Pending -> Succeeded (skips Active)
         assert!(b.transition(BuildState::Succeeded).is_err());
         assert_eq!(b.state(), BuildState::Pending);
+    }
+
+    #[test]
+    fn test_priority_class_from_str_roundtrip() {
+        for pc in [
+            PriorityClass::Ci,
+            PriorityClass::Interactive,
+            PriorityClass::Scheduled,
+        ] {
+            let s = pc.as_str();
+            let parsed: PriorityClass = s.parse().expect("as_str output must parse");
+            assert_eq!(parsed, pc, "roundtrip failed for {pc:?}");
+        }
+    }
+
+    #[test]
+    fn test_priority_class_from_str_rejects_unknown() {
+        assert!("urgent".parse::<PriorityClass>().is_err());
+        assert!("".parse::<PriorityClass>().is_err());
+        assert!("INTERACTIVE".parse::<PriorityClass>().is_err()); // case-sensitive
+    }
+
+    #[test]
+    fn test_priority_class_default_is_scheduled() {
+        assert_eq!(PriorityClass::default(), PriorityClass::Scheduled);
+    }
+
+    #[test]
+    fn test_priority_class_is_interactive() {
+        assert!(PriorityClass::Interactive.is_interactive());
+        assert!(!PriorityClass::Ci.is_interactive());
+        assert!(!PriorityClass::Scheduled.is_interactive());
     }
 }
