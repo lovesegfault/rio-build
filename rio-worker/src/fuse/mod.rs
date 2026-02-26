@@ -80,6 +80,11 @@ impl InodeMap {
         ino
     }
 
+    /// Read-only lookup: returns the inode if path is already tracked.
+    fn get_existing(&self, path: &Path) -> Option<u64> {
+        self.path_to_inode.get(path).copied()
+    }
+
     /// Increment the kernel lookup refcount for an inode. Call this exactly
     /// once per successful reply.entry().
     fn increment_lookup(&mut self, ino: u64) {
@@ -125,6 +130,28 @@ impl InodeMap {
     fn len(&self) -> usize {
         self.inode_to_path.len()
     }
+}
+
+/// High bit mask for ephemeral inodes. Persistent inodes start at 2 and
+/// grow sequentially; setting bit 63 guarantees no collision (would need
+/// 2^63 sequential allocations to overlap).
+const EPHEMERAL_INODE_BIT: u64 = 1u64 << 63;
+
+/// Compute a deterministic ephemeral inode from a path.
+///
+/// Used for readdir entries that have not been lookup()'d. FUSE does not
+/// require readdir inode numbers to match lookup inodes — they are
+/// informational (ls -i). Applications doing hardlink detection use
+/// lookup/getattr inodes. We don't implement readdirplus, so there's no
+/// attribute caching from readdir.
+///
+/// If a readdir'd path is later lookup()'d, it gets a real persistent inode
+/// via get_or_create_inode_for_lookup — the ephemeral one is simply forgotten.
+fn ephemeral_inode(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish() | EPHEMERAL_INODE_BIT
 }
 
 /// FUSE filesystem that serves `/nix/store` from a local SSD cache
@@ -174,29 +201,26 @@ impl NixStoreFs {
         }
     }
 
-    fn get_or_create_inode(&self, path: PathBuf) -> u64 {
-        // Fast path: read lock
-        {
-            let map = self.inodes.read().unwrap_or_else(|e| {
-                tracing::error!("inodes lock poisoned on read, recovering");
-                e.into_inner()
-            });
-            if let Some(&ino) = map.path_to_inode.get(&path) {
-                return ino;
-            }
-        }
-        // Slow path: write lock
-        let mut map = self.inodes.write().unwrap_or_else(|e| {
-            tracing::error!("inodes lock poisoned on write, recovering");
+    /// Get an existing persistent inode, or compute an ephemeral one.
+    ///
+    /// For readdir: we don't want to allocate persistent InodeMap entries
+    /// for every directory entry (the kernel never forgets them — monotonic
+    /// growth). If the path was already lookup()'d, reuse its real inode.
+    /// Otherwise, compute a deterministic hash-based ephemeral inode.
+    /// Never inserts into the InodeMap.
+    fn get_or_ephemeral_inode(&self, path: &Path) -> u64 {
+        let map = self.inodes.read().unwrap_or_else(|e| {
+            tracing::error!("inodes lock poisoned on read, recovering");
             e.into_inner()
         });
-        map.get_or_create(path)
+        map.get_existing(path)
+            .unwrap_or_else(|| ephemeral_inode(path))
     }
 
     /// Variant of get_or_create_inode that also increments the nlookup
     /// refcount. Call this exactly once per successful reply.entry() in the
-    /// lookup path. readdir should use get_or_create_inode (no refcount
-    /// increment; the kernel does not forget readdir-returned inodes).
+    /// lookup path. readdir should use get_or_ephemeral_inode (no persistent
+    /// allocation; the kernel does not forget readdir-returned inodes).
     fn get_or_create_inode_for_lookup(&self, path: PathBuf) -> u64 {
         let mut map = self.inodes.write().unwrap_or_else(|e| {
             tracing::error!("inodes lock poisoned on write, recovering");
@@ -827,7 +851,7 @@ impl Filesystem for NixStoreFs {
                 }
             };
 
-            let child_ino = self.get_or_create_inode(child_path);
+            let child_ino = self.get_or_ephemeral_inode(&child_path);
             all_entries.push((child_ino, kind, name));
         }
 
@@ -981,12 +1005,51 @@ mod tests {
     fn test_inode_map_forget_untracked_inode() {
         let root = PathBuf::from("/nix/store");
         let mut map = InodeMap::new(root);
-        // Inode created via readdir (get_or_create without increment_lookup).
-        // Kernel should not forget these, but if it does, we handle gracefully.
-        let ino = map.get_or_create(PathBuf::from("/nix/store/no-lookup"));
-        assert!(!map.forget(ino, 1));
-        // Entry is NOT removed (no nlookup entry means we never counted it).
-        assert!(map.real_path(ino).is_some());
+        // Forget for an inode we never tracked (e.g., an ephemeral readdir
+        // inode, or a stale kernel call) must be a no-op, not a panic.
+        let ephemeral = ephemeral_inode(Path::new("/nix/store/never-looked-up"));
+        assert!(!map.forget(ephemeral, 1));
+        assert!(map.real_path(ephemeral).is_none()); // never in the map
+    }
+
+    #[test]
+    fn test_ephemeral_inode_high_bit_set() {
+        let paths = [
+            "/nix/store/abc-hello",
+            "/nix/store/def-world",
+            "/tmp/anything",
+        ];
+        for p in paths {
+            let ino = ephemeral_inode(Path::new(p));
+            assert!(
+                ino & EPHEMERAL_INODE_BIT != 0,
+                "ephemeral inode for {p} must have high bit set: {ino:#x}"
+            );
+            // And must not be 0 or ROOT (1).
+            assert!(ino > 1);
+        }
+    }
+
+    #[test]
+    fn test_ephemeral_inode_deterministic() {
+        let p = Path::new("/nix/store/same-path");
+        assert_eq!(ephemeral_inode(p), ephemeral_inode(p));
+        // Different paths -> (almost certainly) different inodes.
+        let other = Path::new("/nix/store/other-path");
+        assert_ne!(ephemeral_inode(p), ephemeral_inode(other));
+    }
+
+    #[test]
+    fn test_inode_map_get_existing() {
+        let root = PathBuf::from("/nix/store");
+        let mut map = InodeMap::new(root.clone());
+        // ROOT exists.
+        assert_eq!(map.get_existing(&root), Some(INodeNo::ROOT.0));
+        // Unknown path does not.
+        assert_eq!(map.get_existing(Path::new("/nix/store/nope")), None);
+        // After creating, it does.
+        let ino = map.get_or_create(PathBuf::from("/nix/store/yes"));
+        assert_eq!(map.get_existing(Path::new("/nix/store/yes")), Some(ino));
     }
 
     #[test]
