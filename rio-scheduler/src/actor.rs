@@ -1755,7 +1755,63 @@ impl DagActor {
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
 
-        Ok(tx.subscribe())
+        // Subscribe first so we receive anything sent after this point.
+        let rx = tx.subscribe();
+
+        // If the build is already terminal, the BuildCompleted/Failed/Cancelled
+        // event was already sent (possibly to zero receivers). A late subscriber
+        // would never see it and would hang forever. Re-send a terminal event
+        // so the new subscriber gets it.
+        if let Some(build) = self.builds.get(&build_id)
+            && build.state().is_terminal()
+        {
+            let terminal_event = match build.state() {
+                BuildState::Succeeded => {
+                    // Reconstruct output_paths from DAG roots (same as complete_build).
+                    let roots = self.dag.find_roots(build_id);
+                    let output_paths: Vec<String> = roots
+                        .iter()
+                        .flat_map(|h| {
+                            self.dag
+                                .node(h)
+                                .map(|s| s.output_paths.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    rio_proto::types::build_event::Event::Completed(
+                        rio_proto::types::BuildCompleted { output_paths },
+                    )
+                }
+                BuildState::Failed => {
+                    rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
+                        error_message: build.error_summary.clone().unwrap_or_default(),
+                        failed_derivation: build.failed_derivation.clone().unwrap_or_default(),
+                    })
+                }
+                BuildState::Cancelled => rio_proto::types::build_event::Event::Cancelled(
+                    rio_proto::types::BuildCancelled {
+                        reason: "build was cancelled".to_string(),
+                    },
+                ),
+                // Non-terminal states handled by is_terminal() check above.
+                _ => unreachable!("is_terminal() returned true for non-terminal state"),
+            };
+
+            // Sequence number: reuse the last one (approximate; the subscriber
+            // only cares about receiving a terminal event, not exact sequencing).
+            let seq = self.build_sequences.get(&build_id).copied().unwrap_or(0);
+            let event = rio_proto::types::BuildEvent {
+                build_id: build_id.to_string(),
+                sequence: seq,
+                timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+                event: Some(terminal_event),
+            };
+            // broadcast::send takes &self; Err means no receivers, but we just
+            // subscribed so there's at least one.
+            let _ = tx.send(event);
+        }
+
+        Ok(rx)
     }
 
     // -----------------------------------------------------------------------
@@ -1951,7 +2007,7 @@ impl DagActor {
         let Some(weak_tx) = self.self_tx.clone() else {
             return;
         };
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("terminal-cleanup-timer", async move {
             tokio::time::sleep(TERMINAL_CLEANUP_DELAY).await;
             // Upgrade weak->strong at send time. If all handles dropped,
             // upgrade fails and cleanup is moot (actor is shutting down).
@@ -3041,6 +3097,72 @@ pub(crate) mod tests {
             status.state,
             rio_proto::types::BuildState::Failed as i32,
             "build depending on pre-poisoned dep must fail immediately (!keepGoing)"
+        );
+    }
+
+    /// WatchBuild on an already-terminal build must immediately send the
+    /// terminal event. Previously it just subscribed — if the original
+    /// BuildCompleted was sent to zero receivers (e.g., submit subscriber
+    /// disconnected before completion), a late WatchBuild would hang forever.
+    #[tokio::test]
+    async fn test_watch_build_after_completion_receives_terminal_event() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let _stream_rx = connect_worker(&handle, "watch-worker", "x86_64-linux", 1).await;
+
+        // Submit a build, complete it, then drop the original subscriber.
+        let build_id = Uuid::new_v4();
+        let original_rx = merge_single_node(
+            &handle,
+            build_id,
+            "watch-hash",
+            "/nix/store/watch-hash.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "watch-worker".into(),
+                drv_hash: "/nix/store/watch-hash.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Drop the original subscriber. The BuildCompleted event was already
+        // sent; a NEW subscriber should not hang waiting for it.
+        drop(original_rx);
+
+        // Now WatchBuild. Should receive BuildCompleted immediately.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::WatchBuild {
+                build_id,
+                since_sequence: 0,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let mut watch_rx = reply_rx.await.unwrap().unwrap();
+
+        // Should get a terminal event within a short timeout, not hang.
+        let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.recv())
+            .await
+            .expect("WatchBuild on terminal build should not hang")
+            .expect("should receive an event");
+        assert!(
+            matches!(
+                event.event,
+                Some(rio_proto::types::build_event::Event::Completed(_))
+            ),
+            "late WatchBuild should receive BuildCompleted replay, got: {:?}",
+            event.event
         );
     }
 
