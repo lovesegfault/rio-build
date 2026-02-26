@@ -76,8 +76,9 @@ impl SchedulerService for SchedulerGrpc {
 
         // Validate DAG nodes before passing to the actor. Proto types have
         // all-public fields with no validation; an empty drv_hash would
-        // become a DAG primary key, and empty drv_path breaks the reverse
-        // index. Bound node count to protect against runaway memory.
+        // become a DAG primary key, empty drv_path breaks the reverse
+        // index, and empty system never matches any worker (derivation
+        // stuck in Ready forever). Bound node count to protect memory.
         if req.nodes.len() > rio_common::limits::MAX_DAG_NODES {
             return Err(Status::invalid_argument(format!(
                 "too many nodes: {} (max {})",
@@ -92,6 +93,12 @@ impl SchedulerService for SchedulerGrpc {
             if node.drv_path.is_empty() {
                 return Err(Status::invalid_argument(format!(
                     "node {} drv_path must be non-empty",
+                    node.drv_hash
+                )));
+            }
+            if node.system.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "node {} system must be non-empty",
                     node.drv_hash
                 )));
             }
@@ -720,5 +727,34 @@ mod tests {
         let result = grpc.submit_build(req).await;
         assert!(result.is_err(), "empty drv_path should be rejected");
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    /// SubmitBuild with an empty system should be rejected. An empty system
+    /// never matches any worker's system (e.g., "x86_64-linux"), so the
+    /// derivation would sit in Ready forever with no feedback.
+    #[tokio::test]
+    async fn test_submit_build_rejects_empty_system() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
+        bad_node.system = String::new(); // empty!
+
+        let req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![bad_node],
+            edges: vec![],
+            ..Default::default()
+        });
+
+        let result = grpc.submit_build(req).await;
+        assert!(result.is_err(), "empty system should be rejected");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("system"),
+            "error should mention system: {}",
+            status.message()
+        );
     }
 }
