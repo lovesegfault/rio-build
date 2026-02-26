@@ -579,7 +579,7 @@ impl Filesystem for NixStoreFs {
                     error = %e,
                     "readlink failed"
                 );
-                reply.error(Errno::EINVAL);
+                reply.error(io_error_to_errno(&e));
             }
         }
     }

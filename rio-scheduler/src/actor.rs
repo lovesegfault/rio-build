@@ -735,8 +735,14 @@ impl DagActor {
         drv_hash: &str,
         result: rio_proto::types::BuildResult,
     ) {
-        let status = rio_proto::types::BuildResultStatus::try_from(result.status)
-            .unwrap_or(rio_proto::types::BuildResultStatus::Unspecified);
+        let status =
+            rio_proto::types::BuildResultStatus::try_from(result.status).unwrap_or_else(|_| {
+                tracing::warn!(
+                    raw_status = result.status,
+                    "unknown BuildResultStatus from worker, treating as Unspecified"
+                );
+                rio_proto::types::BuildResultStatus::Unspecified
+            });
 
         // The gRPC layer passes CompletionReport.drv_path here (keyed by path,
         // not hash). Resolve to drv_hash if the key isn't found directly.

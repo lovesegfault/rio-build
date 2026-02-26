@@ -1071,7 +1071,9 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             DerivedPath::Built { drv, .. } => {
                 // For Built paths, walk the derivation to find outputs that need building.
                 // For simplicity in phase 2a, we report the raw DerivedPath string.
-                let _ = resolve_derivation(drv, store_client, drv_cache).await;
+                if let Err(e) = resolve_derivation(drv, store_client, drv_cache).await {
+                    tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
+                }
                 will_build.push(raw.clone());
             }
             DerivedPath::Opaque(_) => unknown.push(raw.clone()),
