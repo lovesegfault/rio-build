@@ -1378,13 +1378,13 @@ impl DagActor {
         // Transition build to cancelled. Already checked !is_terminal above
         // and we're the actor (single owner), so this should always succeed.
         // If it doesn't, skip the DB write to avoid state drift.
-        if let Some(build) = self.builds.get_mut(&build_id) {
-            if let Err(e) = build.transition(BuildState::Cancelled) {
-                // Should be unreachable (checked !is_terminal earlier).
-                error!(build_id = %build_id, current = ?build.state(), error = %e,
-                       "cancel transition rejected despite !is_terminal check; skipping DB write");
-                return Ok(false);
-            }
+        if let Some(build) = self.builds.get_mut(&build_id)
+            && let Err(e) = build.transition(BuildState::Cancelled)
+        {
+            // Should be unreachable (checked !is_terminal earlier).
+            error!(build_id = %build_id, current = ?build.state(), error = %e,
+                   "cancel transition rejected despite !is_terminal check; skipping DB write");
+            return Ok(false);
         }
 
         self.db
@@ -2300,8 +2300,14 @@ impl ActorHandle {
     }
 
     /// Try to send a command without waiting (for fire-and-forget messages).
+    /// Distinguishes `Full` (transient, retry helps) from `Closed` (actor
+    /// panicked, permanent) so callers can choose retry vs fail-fast.
     pub fn try_send(&self, cmd: ActorCommand) -> Result<(), ActorError> {
-        self.tx.try_send(cmd).map_err(|_| ActorError::ChannelSend)
+        use tokio::sync::mpsc::error::TrySendError;
+        self.tx.try_send(cmd).map_err(|e| match e {
+            TrySendError::Full(_) => ActorError::Backpressure,
+            TrySendError::Closed(_) => ActorError::ChannelSend,
+        })
     }
 
     /// Check if the actor is under backpressure (hysteresis-aware).
