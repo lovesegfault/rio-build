@@ -222,7 +222,17 @@ impl DagActor {
                             keep_going,
                         )
                         .await;
-                    let _ = reply.send(result);
+                    // If the reply channel was dropped (client disconnected during
+                    // merge), the build is orphaned. Cancel it immediately.
+                    if reply.send(result).is_err() {
+                        warn!(
+                            build_id = %build_id,
+                            "MergeDag reply receiver dropped, cancelling orphaned build"
+                        );
+                        let _ = self
+                            .handle_cancel_build(build_id, "client_disconnect_during_merge")
+                            .await;
+                    }
                 }
                 ActorCommand::ProcessCompletion {
                     worker_id,
@@ -638,25 +648,28 @@ impl DagActor {
             error!(drv_hash, error = %e, "failed to update derivation status in DB");
         }
 
-        // Update assignment
+        // Update assignment (non-terminal progress write: log failure, don't block)
         if let Some(state) = self.dag.nodes.get(drv_hash)
             && let Some(db_id) = state.db_id
+            && let Err(e) = self.db.update_assignment_status(db_id, "completed").await
         {
-            let _ = self.db.update_assignment_status(db_id, "completed").await;
+            error!(drv_hash, error = %e, "failed to persist assignment completion");
         }
 
-        // Async: update build history EMA
+        // Async: update build history EMA (best-effort statistics)
         if let Some(state) = self.dag.nodes.get(drv_hash)
             && let Some(pname) = &state.pname
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
         {
             let duration_secs = (stop.seconds - start.seconds) as f64
                 + (stop.nanos - start.nanos) as f64 / 1_000_000_000.0;
-            if duration_secs > 0.0 {
-                let _ = self
+            if duration_secs > 0.0
+                && let Err(e) = self
                     .db
                     .update_build_history(pname, &state.system, duration_secs)
-                    .await;
+                    .await
+            {
+                error!(drv_hash, error = %e, "failed to update build history EMA");
             }
         }
 
@@ -759,11 +772,16 @@ impl DagActor {
                 state.assigned_worker = None;
             }
 
-            let _ = self
+            if let Err(e) = self
                 .db
                 .update_derivation_status(drv_hash, DerivationStatus::Failed, None)
-                .await;
-            let _ = self.db.increment_retry_count(drv_hash).await;
+                .await
+            {
+                error!(drv_hash, error = %e, "failed to persist Failed status");
+            }
+            if let Err(e) = self.db.increment_retry_count(drv_hash).await {
+                error!(drv_hash, error = %e, "failed to persist retry increment");
+            }
 
             // After backoff, transition failed -> ready
             // For simplicity in Phase 2a, we re-queue immediately with the backoff
@@ -781,10 +799,13 @@ impl DagActor {
                 self.ready_queue.push_back(drv_hash_owned);
             }
         } else {
-            let _ = self
+            if let Err(e) = self
                 .db
                 .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
-                .await;
+                .await
+            {
+                error!(drv_hash, error = %e, "failed to persist Poisoned status");
+            }
 
             // Propagate failure to interested builds
             let interested_builds = self.get_interested_builds(drv_hash);
@@ -809,10 +830,13 @@ impl DagActor {
             state.poisoned_at = Some(Instant::now());
         }
 
-        let _ = self
+        if let Err(e) = self
             .db
             .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
-            .await;
+            .await
+        {
+            error!(drv_hash, error = %e, "failed to persist Poisoned status");
+        }
 
         // Propagate failure to interested builds
         let interested_builds = self.get_interested_builds(drv_hash);
@@ -1134,20 +1158,24 @@ impl DagActor {
             state.assigned_worker = Some(worker_id.to_string());
         }
 
-        // Update DB
-        let _ = self
+        // Update DB (non-terminal: log failure, don't block dispatch)
+        if let Err(e) = self
             .db
             .update_derivation_status(drv_hash, DerivationStatus::Assigned, Some(worker_id))
-            .await;
+            .await
+        {
+            error!(drv_hash, worker_id, error = %e, "failed to persist Assigned status");
+        }
 
         // Create assignment in DB
         if let Some(state) = self.dag.nodes.get(drv_hash)
             && let Some(db_id) = state.db_id
-        {
-            let _ = self
+            && let Err(e) = self
                 .db
                 .insert_assignment(db_id, worker_id, self.generation)
-                .await;
+                .await
+        {
+            error!(drv_hash, worker_id, error = %e, "failed to insert assignment record");
         }
 
         // Track on worker
@@ -1919,5 +1947,70 @@ pub(crate) mod tests {
             "disconnect during Assigned should count as a retry attempt"
         );
         assert!(info.assigned_worker.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 4: Silent failures
+    // -----------------------------------------------------------------------
+
+    /// A completion with InfrastructureFailure status should transition the
+    /// derivation out of Running (to Failed/Ready for retry, or Poisoned).
+    /// The gRPC layer synthesizes InfrastructureFailure for None results,
+    /// so this verifies the full path.
+    #[tokio::test]
+    async fn test_completion_infrastructure_failure_handled() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+
+        let build_id = Uuid::new_v4();
+        let drv_hash = "infra-fail-hash";
+        let drv_path = "/nix/store/infra-fail-hash.drv";
+        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        settle().await;
+
+        // Send completion with InfrastructureFailure (what gRPC layer sends
+        // for None result)
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: drv_path.into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                    error_msg: "worker sent CompletionReport with no result".into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // The derivation should have gone through Failed -> Ready (retry) and
+        // then been immediately re-dispatched to the worker (Assigned again).
+        // The key assertion: retry_count was incremented, proving the completion
+        // was processed rather than silently dropped.
+        let info = handle
+            .debug_query_derivation(drv_hash)
+            .await
+            .unwrap()
+            .expect("derivation should exist");
+        assert_eq!(
+            info.retry_count, 1,
+            "InfrastructureFailure should count as a retry (completion was processed)"
+        );
+        // Status should be Assigned (re-dispatched) or Ready (if dispatch skipped),
+        // NOT stuck in the original state with retry_count=0.
+        assert!(
+            matches!(
+                info.status,
+                DerivationStatus::Ready | DerivationStatus::Assigned
+            ),
+            "expected Ready or Assigned after retry, got {:?}",
+            info.status
+        );
     }
 }
