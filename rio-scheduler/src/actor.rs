@@ -1724,20 +1724,17 @@ impl DagActor {
         })
     }
 
-    /// Resolve a drv_path to its drv_hash by scanning DAG nodes.
+    /// Resolve a drv_path to its drv_hash via the DAG's reverse index.
     /// Used by handle_completion since the gRPC layer receives CompletionReport
     /// with drv_path, but the DAG is keyed by drv_hash.
     fn drv_path_to_hash(&self, drv_path: &str) -> Option<String> {
-        self.dag
-            .iter_values()
-            .find(|s| s.drv_path == drv_path)
-            .map(|s| s.drv_hash.clone())
+        self.dag.hash_for_path(drv_path).map(str::to_string)
     }
 
     fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {
         self.dag
-            .iter_values()
-            .find(|s| s.drv_path == drv_path)
+            .hash_for_path(drv_path)
+            .and_then(|h| self.dag.node(h))
             .and_then(|s| s.db_id)
     }
 
