@@ -726,20 +726,34 @@ impl DagActor {
             return HashSet::new();
         }
 
-        let resp = match store_client
-            .clone()
-            .find_missing_paths(FindMissingPathsRequest {
-                store_paths: check_paths.clone(),
-            })
-            .await
+        // Wrap in a timeout: this is a synchronous call inside the
+        // single-threaded actor event loop. If the store hangs, NO heartbeats,
+        // completions, or dispatches are processed until this returns.
+        let resp = match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            store_client
+                .clone()
+                .find_missing_paths(FindMissingPathsRequest {
+                    store_paths: check_paths.clone(),
+                }),
+        )
+        .await
         {
-            Ok(r) => r.into_inner(),
-            Err(e) => {
+            Ok(Ok(r)) => r.into_inner(),
+            Ok(Err(e)) => {
                 warn!(error = %e, "store FindMissingPaths failed; skipping scheduler cache check");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
                 // TODO(phase2c): circuit-breaker on sustained failures. Treating
                 // every submission as 100% cache miss when the store is unreachable
                 // causes an avalanche of unnecessary rebuilds.
+                return HashSet::new();
+            }
+            Err(_) => {
+                warn!(
+                    timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    "store FindMissingPaths timed out; skipping scheduler cache check"
+                );
+                metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
                 return HashSet::new();
             }
         };
