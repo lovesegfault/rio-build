@@ -13,6 +13,7 @@
 //! FOD handling: detect fixed-output derivations via `is_fixed_output`
 //! flag on WorkAssignment, skip network namespace isolation.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -232,11 +233,29 @@ pub async fn execute_build(
                     });
                 }
 
+                // Map store_path → output_name from the derivation. Upload
+                // results are unordered (buffer_unordered), and even the
+                // prior sequential scan had undefined order (read_dir).
+                let path_to_name: HashMap<&str, &str> =
+                    drv.outputs().iter().map(|o| (o.path(), o.name())).collect();
                 let built_outputs: Vec<BuiltOutput> = upload_results
                     .iter()
-                    .zip(assignment.output_names.iter())
-                    .map(|(result, name)| BuiltOutput {
-                        output_name: name.clone(),
+                    .map(|result| BuiltOutput {
+                        output_name: path_to_name
+                            .get(result.store_path.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    store_path = %result.store_path,
+                                    "uploaded path not in derivation outputs; using basename"
+                                );
+                                result
+                                    .store_path
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&result.store_path)
+                                    .to_string()
+                            }),
                         output_path: result.store_path.clone(),
                         output_hash: result.nar_hash.clone(),
                     })

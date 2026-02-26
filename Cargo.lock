@@ -3749,6 +3749,7 @@ dependencies = [
  "bytes",
  "clap",
  "fuser",
+ "futures-util",
  "hex",
  "metrics",
  "nix 0.31.1",
