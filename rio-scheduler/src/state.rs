@@ -259,6 +259,8 @@ pub struct DerivationState {
     pub output_paths: Vec<String>,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
+    /// When the derivation entered Ready state (for assignment latency metric).
+    pub(crate) ready_at: Option<Instant>,
 }
 
 impl DerivationState {
@@ -284,6 +286,7 @@ impl DerivationState {
             poisoned_at: None,
             output_paths: Vec::new(),
             db_id: None,
+            ready_at: None,
         }
     }
 
@@ -306,6 +309,12 @@ impl DerivationState {
         }
 
         self.status = to;
+
+        // Track ready_at for assignment latency metric
+        if to == DerivationStatus::Ready {
+            self.ready_at = Some(Instant::now());
+        }
+
         Ok(from)
     }
 

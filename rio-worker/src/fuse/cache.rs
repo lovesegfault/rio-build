@@ -142,6 +142,8 @@ impl Cache {
             .await?;
             Ok::<_, sqlx::Error>(())
         })?;
+        // Update cache size metric (ground-truth from DB)
+        metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(self.total_size() as f64);
         Ok(())
     }
 
@@ -231,6 +233,10 @@ impl Cache {
             );
         }
 
+        // Update cache size metric after eviction
+        if freed > 0 {
+            metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(self.total_size() as f64);
+        }
         Ok(freed)
     }
 

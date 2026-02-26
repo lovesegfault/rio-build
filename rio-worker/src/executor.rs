@@ -114,6 +114,7 @@ pub async fn execute_build(
     );
 
     metrics::gauge!("rio_worker_builds_active").increment(1.0);
+    metrics::counter!("rio_worker_builds_total").increment(1);
     let _build_guard = scopeguard::guard((), |()| {
         metrics::gauge!("rio_worker_builds_active").decrement(1.0);
     });
