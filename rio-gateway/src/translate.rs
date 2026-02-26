@@ -80,16 +80,17 @@ pub async fn reconstruct_dag(
                         queue.push_back((child_sp, child_drv));
                     }
                     Err(e) => {
-                        warn!(
+                        tracing::error!(
                             path = %child_path_str,
                             error = %e,
                             "failed to resolve inputDrv, including as leaf node"
                         );
                         // Include as a leaf node without further traversal.
-                        // The scheduler will handle missing derivations.
+                        // Use drv_path as drv_hash fallback to ensure uniqueness
+                        // (empty hash would collide if multiple children failed).
                         nodes.push(types::DerivationNode {
                             drv_path: child_path_str.clone(),
-                            drv_hash: String::new(),
+                            drv_hash: child_path_str.clone(),
                             pname: String::new(),
                             system: String::new(),
                             required_features: Vec::new(),
@@ -127,7 +128,9 @@ pub fn single_node_from_basic(
 
     vec![types::DerivationNode {
         drv_path: drv_path.to_string(),
-        drv_hash: String::new(),
+        // Use drv_path as drv_hash fallback (input-addressed derivations
+        // already use the store path as the hash; this is consistent)
+        drv_hash: drv_path.to_string(),
         pname,
         system: basic_drv.platform().to_string(),
         required_features: Vec::new(),
@@ -150,7 +153,9 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
 
     types::DerivationNode {
         drv_path: drv_path.to_string(),
-        drv_hash: String::new(), // Populated by scheduler if needed
+        // Input-addressed derivations use the store path as the drv_hash.
+        // This ensures every node has a unique, non-empty key in the DAG.
+        drv_hash: drv_path.to_string(),
         pname,
         system: drv.platform().to_string(),
         required_features,
