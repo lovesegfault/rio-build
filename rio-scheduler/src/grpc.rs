@@ -74,6 +74,29 @@ impl SchedulerService for SchedulerGrpc {
             ));
         }
 
+        // Validate DAG nodes before passing to the actor. Proto types have
+        // all-public fields with no validation; an empty drv_hash would
+        // become a DAG primary key, and empty drv_path breaks the reverse
+        // index. Bound node count to protect against runaway memory.
+        if req.nodes.len() > rio_common::limits::MAX_DAG_NODES {
+            return Err(Status::invalid_argument(format!(
+                "too many nodes: {} (max {})",
+                req.nodes.len(),
+                rio_common::limits::MAX_DAG_NODES
+            )));
+        }
+        for node in &req.nodes {
+            if node.drv_hash.is_empty() {
+                return Err(Status::invalid_argument("node drv_hash must be non-empty"));
+            }
+            if node.drv_path.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "node {} drv_path must be non-empty",
+                    node.drv_hash
+                )));
+            }
+        }
+
         let build_id = Uuid::new_v4();
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -647,5 +670,55 @@ mod tests {
             saw_completed,
             "BuildCompleted event should be emitted after worker sends CompletionReport"
         );
+    }
+
+    /// SubmitBuild with an empty drv_hash in a node should be rejected at
+    /// the gRPC boundary (proto types have no validation; an empty hash
+    /// would become a DAG primary key).
+    #[tokio::test]
+    async fn test_submit_build_rejects_empty_drv_hash() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
+        bad_node.drv_hash = String::new(); // empty!
+
+        let req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![bad_node],
+            edges: vec![],
+            ..Default::default()
+        });
+
+        let result = grpc.submit_build(req).await;
+        assert!(result.is_err(), "empty drv_hash should be rejected");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("drv_hash"),
+            "error should mention drv_hash: {}",
+            status.message()
+        );
+    }
+
+    /// SubmitBuild with an empty drv_path should be rejected.
+    #[tokio::test]
+    async fn test_submit_build_rejects_empty_drv_path() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
+        bad_node.drv_path = String::new(); // empty!
+
+        let req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![bad_node],
+            edges: vec![],
+            ..Default::default()
+        });
+
+        let result = grpc.submit_build(req).await;
+        assert!(result.is_err(), "empty drv_path should be rejected");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 }
