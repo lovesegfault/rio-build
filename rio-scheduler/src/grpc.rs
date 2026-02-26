@@ -397,10 +397,13 @@ impl WorkerService for SchedulerGrpc {
                             }
                         }
                         rio_proto::types::worker_message::Msg::LogBatch(_log) => {
-                            // TODO: buffer and forward build logs
+                            // TODO(phase2b): buffer and forward build logs to gateway.
+                            // Phase 2b spec: 64-line/100ms batching, per-derivation ring
+                            // buffer, async S3 flush on completion.
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
-                            // TODO: forward progress updates
+                            // TODO(phase2b): forward progress updates (resource usage,
+                            // build phase) via OpenTelemetry trace propagation.
                         }
                     }
                 }
@@ -453,7 +456,9 @@ impl WorkerService for SchedulerGrpc {
 
         Ok(Response::new(rio_proto::types::HeartbeatResponse {
             accepted: true,
-            generation: 1, // TODO: actual leader generation
+            // TODO(phase3a): actual leader generation from Kubernetes Lease.
+            // Phase 2a has a single scheduler instance; constant 1 is correct.
+            generation: 1,
         }))
     }
 }
