@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
@@ -37,6 +38,14 @@ struct Args {
     /// S3 key prefix (for S3 backend)
     #[arg(long, env = "RIO_S3_PREFIX", default_value = "nars")]
     s3_prefix: String,
+
+    /// Maximum S3 operation retry attempts (AWS SDK default: 3)
+    #[arg(long, env = "RIO_S3_MAX_RETRIES", default_value = "5")]
+    s3_max_retries: u32,
+
+    /// Per-attempt timeout for S3 operations in seconds
+    #[arg(long, env = "RIO_S3_ATTEMPT_TIMEOUT_SECS", default_value = "30")]
+    s3_attempt_timeout_secs: u64,
 
     /// PostgreSQL connection URL
     #[arg(long, env = "DATABASE_URL")]
@@ -82,8 +91,23 @@ async fn main() -> anyhow::Result<()> {
             let bucket = args
                 .s3_bucket
                 .ok_or_else(|| anyhow::anyhow!("--s3-bucket is required for S3 backend"))?;
-            info!(bucket = %bucket, prefix = %args.s3_prefix, "using S3 backend");
-            let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            info!(
+                bucket = %bucket,
+                prefix = %args.s3_prefix,
+                max_retries = args.s3_max_retries,
+                attempt_timeout_secs = args.s3_attempt_timeout_secs,
+                "using S3 backend"
+            );
+            let retry_config =
+                aws_config::retry::RetryConfig::standard().with_max_attempts(args.s3_max_retries);
+            let timeout_config = aws_config::timeout::TimeoutConfig::builder()
+                .operation_attempt_timeout(Duration::from_secs(args.s3_attempt_timeout_secs))
+                .build();
+            let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .retry_config(retry_config)
+                .timeout_config(timeout_config)
+                .load()
+                .await;
             let s3_client = aws_sdk_s3::Client::new(&aws_config);
             Arc::new(S3Backend::new(s3_client, bucket, args.s3_prefix))
         }
