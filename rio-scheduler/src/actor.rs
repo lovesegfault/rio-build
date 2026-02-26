@@ -370,7 +370,7 @@ impl DagActor {
                 ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
                     let info = self.dag.node(&drv_hash).map(|s| DebugDerivationInfo {
                         drv_hash: s.drv_hash.clone(),
-                        drv_path: s.drv_path.clone(),
+                        drv_path: s.drv_path().to_string(),
                         status: s.status(),
                         retry_count: s.retry_count,
                         assigned_worker: s.assigned_worker.clone(),
@@ -1637,7 +1637,7 @@ impl DagActor {
         // Send WorkAssignment to worker via stream
         if let Some(state) = self.dag.node(drv_hash) {
             let assignment = rio_proto::types::WorkAssignment {
-                drv_path: state.drv_path.clone(),
+                drv_path: state.drv_path().to_string(),
                 // TODO(phase2c): inline .drv content to avoid worker->store round-trip.
                 // Phase 2a: worker fetches via GetPath (see rio-worker/src/executor.rs).
                 drv_content: Vec::new(),
@@ -1787,7 +1787,7 @@ impl DagActor {
     }
 
     fn drv_hash_to_path(&self, drv_hash: &str) -> Option<String> {
-        self.dag.node(drv_hash).map(|s| s.drv_path.clone())
+        self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
     }
 
     /// Whether any interested build for this derivation is interactive (IFD).

@@ -243,8 +243,10 @@ pub enum TransitionError {
 pub struct DerivationState {
     /// Unique hash identifying this derivation (store path for input-addressed, modular hash for CA).
     pub drv_hash: String,
-    /// Store path of the .drv file.
-    pub drv_path: String,
+    /// Store path of the .drv file. Private because the DAG maintains a
+    /// `path_to_hash` reverse index keyed on this field — mutating it
+    /// directly would silently corrupt that index. Read via `drv_path()`.
+    drv_path: String,
     /// Package name (for duration estimation).
     pub pname: Option<String>,
     /// Target system (e.g. "x86_64-linux").
@@ -306,6 +308,11 @@ impl DerivationState {
     /// Current status (read-only). Use `transition()` etc. to mutate.
     pub fn status(&self) -> DerivationStatus {
         self.status
+    }
+
+    /// Store path of the .drv file (read-only; DAG owns the reverse index).
+    pub fn drv_path(&self) -> &str {
+        &self.drv_path
     }
 
     /// Attempt to transition to a new status. Returns the old status on success.
