@@ -1874,10 +1874,18 @@ impl DagActor {
             tokio::time::sleep(TERMINAL_CLEANUP_DELAY).await;
             // Upgrade weak->strong at send time. If all handles dropped,
             // upgrade fails and cleanup is moot (actor is shutting down).
-            // try_send: if channel is full, cleanup is deferred; dropping
-            // cleanup under extreme load is preferable to blocking.
-            if let Some(tx) = weak_tx.upgrade() {
-                let _ = tx.try_send(ActorCommand::CleanupTerminalBuild { build_id });
+            // try_send: if channel is full, cleanup is dropped. Log + count so
+            // sustained drops are visible (unbounded memory growth under load).
+            if let Some(tx) = weak_tx.upgrade()
+                && tx
+                    .try_send(ActorCommand::CleanupTerminalBuild { build_id })
+                    .is_err()
+            {
+                tracing::warn!(
+                    build_id = %build_id,
+                    "cleanup command dropped (channel full); build state will leak until next restart"
+                );
+                metrics::counter!("rio_scheduler_cleanup_dropped_total").increment(1);
             }
         });
     }
