@@ -2743,4 +2743,82 @@ pub(crate) mod tests {
             info.status
         );
     }
+
+    // -----------------------------------------------------------------------
+    // DB fault injection
+    // -----------------------------------------------------------------------
+
+    /// Verify that DB failures during completion are logged but do not block
+    /// the in-memory state machine. This is the policy decided in Group 4:
+    /// DB writes are best-effort; the actor must not stall on DB unavailability.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_db_failure_during_completion_logged() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Get a single derivation to Assigned state.
+        let _rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+        let build_id = Uuid::new_v4();
+        let drv_hash = "db-fault-hash";
+        let drv_path = "/nix/store/db-fault-hash.drv";
+        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        settle().await;
+
+        // Sanity check: derivation was dispatched.
+        let pre = handle
+            .debug_query_derivation(drv_hash)
+            .await
+            .unwrap()
+            .expect("derivation should exist");
+        assert_eq!(pre.status, DerivationStatus::Assigned);
+
+        // Close the DB pool — subsequent DB writes will fail.
+        db.pool.close().await;
+
+        // Send successful completion. DB write will fail but in-memory
+        // transition should succeed.
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: drv_path.into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    built_outputs: vec![rio_proto::types::BuiltOutput {
+                        output_name: "out".into(),
+                        output_path: "/nix/store/fake-output".into(),
+                        output_hash: vec![0u8; 32],
+                    }],
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // In-memory state should have transitioned despite DB failure.
+        let post = handle
+            .debug_query_derivation(drv_hash)
+            .await
+            .unwrap()
+            .expect("derivation should still exist");
+        assert_eq!(
+            post.status,
+            DerivationStatus::Completed,
+            "in-memory transition should succeed despite DB unavailability"
+        );
+
+        // DB failure should have been logged at error level.
+        assert!(
+            logs_contain("failed to update derivation status in DB")
+                || logs_contain("failed to persist"),
+            "DB failure during completion should be logged at error!"
+        );
+
+        // TestDb::drop uses a separate admin connection, so closing the test
+        // pool here doesn't prevent database cleanup.
+    }
 }
