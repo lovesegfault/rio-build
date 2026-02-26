@@ -27,6 +27,16 @@ impl SchedulerGrpc {
         Self { actor }
     }
 
+    /// Check if the actor is alive; return UNAVAILABLE if dead (panicked).
+    fn check_actor_alive(&self) -> Result<(), Status> {
+        if !self.actor.is_alive() {
+            return Err(Status::unavailable(
+                "scheduler actor is unavailable (panicked or exited)",
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert an ActorError to a tonic Status.
     fn actor_error_to_status(err: ActorError) -> Status {
         match err {
@@ -54,6 +64,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::SubmitBuildRequest>,
     ) -> Result<Response<Self::SubmitBuildStream>, Status> {
+        self.check_actor_alive()?;
         let req = request.into_inner();
 
         // Check backpressure before sending to actor
@@ -137,6 +148,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
+        self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id: Uuid = req
             .build_id
@@ -187,6 +199,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::QueryBuildRequest>,
     ) -> Result<Response<rio_proto::types::BuildStatus>, Status> {
+        self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id: Uuid = req
             .build_id
@@ -218,6 +231,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::CancelBuildRequest>,
     ) -> Result<Response<rio_proto::types::CancelBuildResponse>, Status> {
+        self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id: Uuid = req
             .build_id
@@ -261,6 +275,7 @@ impl WorkerService for SchedulerGrpc {
         &self,
         request: Request<tonic::Streaming<rio_proto::types::WorkerMessage>>,
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
+        self.check_actor_alive()?;
         let mut stream = request.into_inner();
 
         // The first message MUST be a WorkerRegister with the worker_id.
@@ -315,7 +330,7 @@ impl WorkerService for SchedulerGrpc {
         let actor_for_recv = self.actor.clone();
         let worker_id_for_recv = worker_id.clone();
 
-        tokio::spawn(async move {
+        rio_common::task::spawn_monitored("worker-stream-reader", async move {
             while let Ok(Some(msg)) = stream.message().await {
                 if let Some(inner) = msg.msg {
                     match inner {
@@ -399,6 +414,7 @@ impl WorkerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::HeartbeatRequest>,
     ) -> Result<Response<rio_proto::types::HeartbeatResponse>, Status> {
+        self.check_actor_alive()?;
         let req = request.into_inner();
 
         if req.worker_id.is_empty() {

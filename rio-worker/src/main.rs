@@ -277,7 +277,12 @@ async fn main() -> anyhow::Result<()> {
                 // Track this build as running (for heartbeat)
                 running_builds.write().await.insert(build_drv_path.clone());
 
-                tokio::spawn(async move {
+                // Clone for the outer panic handler before moving into the task.
+                let panic_tx = stream_tx.clone();
+                let panic_drv_path = assignment.drv_path.clone();
+                let panic_token = assignment.assignment_token.clone();
+
+                let handle = rio_common::task::spawn_monitored("build-executor", async move {
                     let _permit = permit; // Hold permit until build completes
 
                     // Remove from running_builds on task exit (success, failure, or panic)
@@ -333,6 +338,33 @@ async fn main() -> anyhow::Result<()> {
                     };
                     if let Err(e) = build_tx.send(msg).await {
                         tracing::error!(error = %e, "failed to send completion report");
+                    }
+                });
+
+                // If the build task panics, send InfrastructureFailure so the
+                // scheduler doesn't leave the derivation stuck in Running.
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await
+                        && e.is_panic()
+                    {
+                        tracing::error!(
+                            drv_path = %panic_drv_path,
+                            "build task panicked; sending InfrastructureFailure to scheduler"
+                        );
+                        let completion = CompletionReport {
+                            drv_path: panic_drv_path,
+                            result: Some(rio_proto::types::BuildResult {
+                                status: rio_proto::types::BuildResultStatus::InfrastructureFailure
+                                    .into(),
+                                error_msg: "worker build task panicked".into(),
+                                ..Default::default()
+                            }),
+                            assignment_token: panic_token,
+                        };
+                        let msg = WorkerMessage {
+                            msg: Some(worker_message::Msg::Completion(completion)),
+                        };
+                        let _ = panic_tx.send(msg).await;
                     }
                 });
             }

@@ -14,6 +14,10 @@ tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
+# Async runtime (for spawn_monitored)
+tokio = { workspace = true }
+futures-util = "0.3"
+
 # CLI
 clap = { workspace = true }
 
