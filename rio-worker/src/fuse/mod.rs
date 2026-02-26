@@ -278,6 +278,7 @@ impl NixStoreFs {
         tracing::debug!(store_path = %store_path, "fetching from remote store");
 
         // Fetch NAR data via gRPC (async bridged to sync)
+        let fetch_start = std::time::Instant::now();
         let nar_data = self.runtime.block_on(async {
             let mut client = self.store_client.clone();
             let request = GetPathRequest {
@@ -323,6 +324,8 @@ impl NixStoreFs {
 
             Ok::<Vec<u8>, Errno>(nar_bytes)
         })?;
+        metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
+            .record(fetch_start.elapsed().as_secs_f64());
 
         // Parse and extract NAR to local disk
         let node = rio_nix::nar::parse(&mut io::Cursor::new(&nar_data)).map_err(|e| {

@@ -56,6 +56,7 @@ impl NarBackend for S3Backend {
             size = data.len(),
             "S3Backend: uploading NAR blob"
         );
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "put_object").increment(1);
 
         self.client
             .put_object()
@@ -76,6 +77,7 @@ impl NarBackend for S3Backend {
             s3_key = %s3_key,
             "S3Backend: downloading NAR blob"
         );
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "get_object").increment(1);
 
         match self
             .client
@@ -110,6 +112,8 @@ impl NarBackend for S3Backend {
             s3_key = %s3_key,
             "S3Backend: deleting NAR blob"
         );
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "delete_object")
+            .increment(1);
 
         self.client
             .delete_object()
@@ -124,6 +128,7 @@ impl NarBackend for S3Backend {
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
         let s3_key = self.s3_key(key);
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "head_object").increment(1);
         match self
             .client
             .head_object()

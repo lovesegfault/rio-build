@@ -116,8 +116,11 @@ pub async fn execute_build(
 
     metrics::gauge!("rio_worker_builds_active").increment(1.0);
     metrics::counter!("rio_worker_builds_total").increment(1);
-    let _build_guard = scopeguard::guard((), |()| {
+    let build_start = std::time::Instant::now();
+    let _build_guard = scopeguard::guard((), move |()| {
         metrics::gauge!("rio_worker_builds_active").decrement(1.0);
+        metrics::histogram!("rio_worker_build_duration_seconds")
+            .record(build_start.elapsed().as_secs_f64());
     });
 
     // 1. Set up overlay
