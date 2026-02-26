@@ -793,10 +793,13 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let req = types::FindMissingPathsRequest {
         store_paths: path_strs.clone(),
     };
-    let resp = store_client
-        .find_missing_paths(req)
-        .await
-        .map_err(|e| anyhow::anyhow!("gRPC FindMissingPaths failed: {e}"));
+    let resp = tokio::time::timeout(
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        store_client.find_missing_paths(req),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("gRPC FindMissingPaths timed out"))
+    .and_then(|r| r.map_err(|e| anyhow::anyhow!("gRPC FindMissingPaths failed: {e}")));
 
     let missing_set: HashSet<String> = match resp {
         Ok(r) => r.into_inner().missing_paths.into_iter().collect(),
