@@ -120,6 +120,11 @@ impl Cache {
     pub async fn new(cache_dir: PathBuf, max_size_gb: u64) -> Result<Self, CacheError> {
         std::fs::create_dir_all(&cache_dir)?;
 
+        // Clean up stale .tmp-* directories left behind by interrupted NAR
+        // extractions (fetch_and_extract extracts to a sibling tmp dir then
+        // renames atomically; a crash mid-extraction leaves the tmp dir behind).
+        Self::clean_stale_tmp_dirs(&cache_dir);
+
         let db_path = cache_dir.join("cache_index.sqlite");
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let runtime = Handle::current();
@@ -152,6 +157,33 @@ impl Cache {
             runtime,
             inflight: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Remove stale `*.tmp-*` directories from the cache root. These are
+    /// remnants of interrupted NAR extractions.
+    fn clean_stale_tmp_dirs(cache_dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            // Match foo.tmp-<hex> (the pattern used by fetch_and_extract).
+            if name_str.contains(".tmp-") {
+                let path = entry.path();
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove stale tmp extraction dir"
+                    );
+                } else {
+                    tracing::info!(path = %path.display(), "removed stale tmp extraction dir");
+                }
+            }
+        }
     }
 
     /// Root directory where cached paths are materialized.
@@ -524,5 +556,32 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(100));
 
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn test_tmp_cleanup_on_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+
+        // Create a stale tmp dir that mimics an interrupted extraction.
+        let stale_tmp = cache_dir.join("abc-hello.tmp-deadbeef12345678");
+        std::fs::create_dir_all(&stale_tmp).unwrap();
+        std::fs::write(stale_tmp.join("partial_file"), b"incomplete").unwrap();
+        assert!(stale_tmp.exists());
+
+        // Also create a legitimate (non-tmp) entry to verify it's NOT removed.
+        let real_entry = cache_dir.join("def-world");
+        std::fs::create_dir_all(&real_entry).unwrap();
+
+        // Cache::new should clean the stale tmp dir but leave the real entry.
+        let _cache = Cache::new(cache_dir, 10).await.unwrap();
+        assert!(
+            !stale_tmp.exists(),
+            "stale tmp dir should be removed on init"
+        );
+        assert!(
+            real_entry.exists(),
+            "real cache entries must not be removed"
+        );
     }
 }

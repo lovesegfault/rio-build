@@ -3769,6 +3769,7 @@ dependencies = [
  "hex",
  "metrics",
  "nix 0.31.1",
+ "rand 0.9.2",
  "rio-common",
  "rio-nix",
  "rio-proto",

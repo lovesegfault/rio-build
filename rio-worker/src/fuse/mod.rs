@@ -330,12 +330,30 @@ impl NixStoreFs {
             Errno::EIO
         })?;
 
-        rio_nix::nar::extract_to_path(&node, &local_path).map_err(|e| {
+        // Extract to a temp sibling dir, then atomically rename into place.
+        // If extraction fails mid-way (disk full, etc.), the partial tree stays
+        // in the tmp dir and is cleaned up on next cache init, rather than
+        // being served as a broken store path by subsequent lookups.
+        let tmp_path = local_path.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
+        rio_nix::nar::extract_to_path(&node, &tmp_path).map_err(|e| {
             tracing::warn!(
                 store_path = %store_path,
-                local_path = %local_path.display(),
+                tmp_path = %tmp_path.display(),
                 error = %e,
                 "NAR extraction failed"
+            );
+            // Best-effort: remove the partial tmp tree.
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            Errno::EIO
+        })?;
+        std::fs::rename(&tmp_path, &local_path).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            tracing::error!(
+                store_path = %store_path,
+                tmp_path = %tmp_path.display(),
+                local_path = %local_path.display(),
+                error = %e,
+                "failed to rename extracted NAR into cache"
             );
             Errno::EIO
         })?;
