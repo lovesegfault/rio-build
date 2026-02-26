@@ -1,0 +1,14 @@
+[package]
+name = "rio-test-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Test harness: ephemeral PostgreSQL bootstrap for integration tests"
+
+[dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["process", "signal"] }

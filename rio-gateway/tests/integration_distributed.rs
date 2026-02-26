@@ -678,29 +678,26 @@ async fn test_distributed_handshake_wire_sequence() {
 /// `nix build --store ssh-ng://localhost` which requires FUSE mounts
 /// for the worker's /nix/store overlay.
 #[tokio::test]
-#[ignore = "requires CAP_SYS_ADMIN for FUSE mounts and a running PostgreSQL instance"]
+#[ignore = "requires CAP_SYS_ADMIN for FUSE mounts"]
 async fn test_distributed_full_build_with_fuse() {
     // Full distributed build path:
-    // 1. Start PostgreSQL (DATABASE_URL env var)
-    // 2. Run migrations (handled by rio-scheduler/rio-store startup)
+    // 1. Bootstrap PostgreSQL (handled automatically by rio-test-support)
+    // 2. Run migrations (done by TestDb::new)
     // 3. Start rio-store with filesystem backend
     // 4. Start rio-scheduler with PG connection
     // 5. Start rio-worker with FUSE mount (needs CAP_SYS_ADMIN)
     // 6. Start rio-gateway SSH server
     // 7. Run: nix build --store ssh-ng://localhost nixpkgs#hello
-    //
-    // Prerequisites check:
-    if std::env::var("DATABASE_URL").is_err() {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    }
+
+    // PostgreSQL is bootstrapped automatically. Fails hard if unavailable.
+    let _db = rio_test_support::TestDb::new(&sqlx::migrate!("../migrations")).await;
+
     if !std::path::Path::new("/dev/fuse").exists() {
-        eprintln!("skipping: /dev/fuse not available (need CAP_SYS_ADMIN)");
-        return;
+        panic!("/dev/fuse not available — this test requires CAP_SYS_ADMIN");
     }
     // Check for CAP_SYS_ADMIN by attempting a test mount (this would fail fast)
     // ... the actual test implementation would go here once the CI environment
-    // supports privileged containers. For now, the test skips with clear output.
+    // supports privileged containers.
     //
     // The non-FUSE integration path is covered by test_distributed_submit_and_complete
     // above, which exercises: gateway -> scheduler -> worker gRPC flow with mock store.

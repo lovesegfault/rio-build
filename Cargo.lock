@@ -3634,9 +3634,11 @@ dependencies = [
  "rio-common",
  "rio-nix",
  "rio-proto",
+ "rio-test-support",
  "russh",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.18",
@@ -3686,6 +3688,7 @@ dependencies = [
  "rio-common",
  "rio-proto",
  "rio-store",
+ "rio-test-support",
  "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.18",
@@ -3734,6 +3737,7 @@ dependencies = [
  "rio-common",
  "rio-nix",
  "rio-proto",
+ "rio-test-support",
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
@@ -3742,6 +3746,16 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "rio-test-support"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.1",
+ "sqlx",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

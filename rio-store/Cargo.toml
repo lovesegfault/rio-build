@@ -52,6 +52,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+rio-test-support = { path = "../rio-test-support" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }

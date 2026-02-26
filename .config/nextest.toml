@@ -35,6 +35,12 @@ max-threads = 16
 [test-groups.integration]
 max-threads = 8
 
+# PostgreSQL-backed integration tests. One shared postgres per test
+# binary; each test creates its own database. The first test in each
+# binary pays the initdb cost (~1s).
+[test-groups.postgres]
+max-threads = 8
+
 # ── Overrides ────────────────────────────────────────────────────────
 # Golden live-daemon tests: longer timeout since they spawn real daemons.
 [[profile.default.overrides]]
@@ -53,6 +59,18 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = "test(/proptest|roundtrip/)"
 slow-timeout = { period = "30s", terminate-after = 2 }
+
+# PostgreSQL integration tests. First test pays initdb cost; later tests
+# are fast (CREATE DATABASE + migrate + test body).
+[[profile.default.overrides]]
+filter = 'package(rio-scheduler) and test(/^tests::/)'
+test-group = 'postgres'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = 'package(rio-store) and binary(grpc_integration)'
+test-group = 'postgres'
+slow-timeout = { period = "60s", terminate-after = 2 }
 
 # ── CI overrides (inherit default, add retries) ──────────────────────
 [[profile.ci.overrides]]
