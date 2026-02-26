@@ -132,6 +132,16 @@ impl SchedulerService for SchedulerGrpc {
                             lagged = n,
                             "build event subscriber lagged, some events lost"
                         );
+                        // Lagged means we permanently missed n events. If
+                        // BuildCompleted was among them, the client would hang
+                        // forever. Send DATA_LOSS so the gateway fails cleanly
+                        // instead of silently hanging.
+                        let _ = tx
+                            .send(Err(Status::data_loss(format!(
+                                "missed {n} build events; re-subscribe via WatchBuild"
+                            ))))
+                            .await;
+                        break;
                     }
                 }
             }
@@ -188,6 +198,14 @@ impl SchedulerService for SchedulerGrpc {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(lagged = n, "WatchBuild subscriber lagged, some events lost");
+                        // Send DATA_LOSS so the client fails cleanly instead
+                        // of silently hanging on a missed terminal event.
+                        let _ = tx
+                            .send(Err(Status::data_loss(format!(
+                                "missed {n} build events; re-subscribe via WatchBuild"
+                            ))))
+                            .await;
+                        break;
                     }
                 }
             }
