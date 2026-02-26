@@ -606,6 +606,14 @@ async fn fetch_drv_from_store(
                 // .drv files are small; we don't need to pre-size from info.
             }
             Some(get_path_response::Msg::NarChunk(chunk)) => {
+                let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
+                if new_len > rio_common::limits::MAX_NAR_SIZE {
+                    return Err(ExecutorError::BuildFailed(format!(
+                        "NAR for {drv_path} exceeds MAX_NAR_SIZE ({} bytes, limit {})",
+                        new_len,
+                        rio_common::limits::MAX_NAR_SIZE
+                    )));
+                }
                 nar_data.extend_from_slice(&chunk);
             }
             None => {}
