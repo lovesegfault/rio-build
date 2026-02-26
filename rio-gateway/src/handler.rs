@@ -537,8 +537,14 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
         }
     }
 
-    // Stream ended without a terminal event
-    Err(anyhow::anyhow!("build event stream ended unexpectedly"))
+    // Stream ended without a terminal event. Send STDERR_ERROR so the Nix
+    // client sees a clear failure instead of just a dropped connection.
+    let err_msg = "build event stream ended unexpectedly (scheduler disconnected?)";
+    let stderr_err = rio_nix::protocol::stderr::StderrError::simple("rio-gateway", err_msg);
+    if let Err(e) = stderr.error(&stderr_err).await {
+        tracing::warn!(error = %e, "failed to send STDERR_ERROR for unexpected stream end");
+    }
+    Err(anyhow::anyhow!(err_msg))
 }
 
 /// Outcome of processing a build event stream.

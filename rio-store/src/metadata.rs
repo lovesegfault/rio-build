@@ -129,6 +129,42 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
     Ok(())
 }
 
+/// Delete the placeholder rows created by `insert_uploading` for a failed upload.
+///
+/// Safe to call even if no placeholder exists. Only deletes rows where
+/// `nar_size=0` (the placeholder marker — real uploads always have nar_size > 0)
+/// AND `nar_blobs.status='uploading'`. This makes it safe even if a concurrent
+/// upload succeeded for the same path (that upload would have nar_size > 0).
+#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
+pub async fn delete_uploading(pool: &PgPool, store_path_hash: &[u8]) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+
+    // Delete nar_blobs first (FK constraint: nar_blobs references narinfo)
+    sqlx::query(
+        r#"
+        DELETE FROM nar_blobs
+        WHERE store_path_hash = $1 AND status = 'uploading'
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    // Delete narinfo placeholder (nar_size=0 is the placeholder marker)
+    sqlx::query(
+        r#"
+        DELETE FROM narinfo
+        WHERE store_path_hash = $1 AND nar_size = 0
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Check if a store path already has a completed upload.
 ///
 /// Returns `Some(blob_key)` if the path exists with `status='complete'`,

@@ -182,13 +182,27 @@ impl NixStoreFs {
             return Ok(local_path);
         }
 
-        // Check if another thread is already fetching
+        // Check if another thread is already fetching.
+        // If so, wait with bounded exponential backoff for it to finish.
         if !self.cache.try_start_fetch(store_basename) {
-            // Wait briefly then check again (simple spin; production would use condvar)
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            if let Some(local_path) = self.cache.get_path(store_basename) {
-                return Ok(local_path);
+            const MAX_ATTEMPTS: u32 = 6;
+            const BASE_BACKOFF_MS: u64 = 50;
+            const MAX_BACKOFF_MS: u64 = 500;
+
+            for attempt in 0..MAX_ATTEMPTS {
+                let backoff_ms = (BASE_BACKOFF_MS << attempt).min(MAX_BACKOFF_MS);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                if let Some(local_path) = self.cache.get_path(store_basename) {
+                    return Ok(local_path);
+                }
             }
+            // Still not cached after ~1.4s total — give up with EAGAIN so
+            // the caller (and ultimately the build) can retry the read.
+            tracing::warn!(
+                store_path = store_basename,
+                "concurrent fetch did not complete after {}ms, returning EAGAIN",
+                BASE_BACKOFF_MS * (1 << MAX_ATTEMPTS).min(MAX_BACKOFF_MS / BASE_BACKOFF_MS)
+            );
             return Err(Errno::EAGAIN);
         }
 
@@ -277,14 +291,30 @@ impl NixStoreFs {
     }
 
     /// Check if a store path exists in the remote store.
-    fn query_path_exists(&self, store_basename: &str) -> bool {
+    ///
+    /// Returns `Ok(true)` if found, `Ok(false)` if NOT_FOUND, `Err(EIO)` on
+    /// transport/server errors. Previously all errors mapped to `false`,
+    /// which made transient store outages look like missing paths.
+    fn query_path_exists(&self, store_basename: &str) -> Result<bool, Errno> {
         let store_path = format!("/nix/store/{store_basename}");
         self.runtime.block_on(async {
             let mut client = self.store_client.clone();
             let request = QueryPathInfoRequest {
                 store_path: store_path.clone(),
             };
-            client.query_path_info(request).await.is_ok()
+            match client.query_path_info(request).await {
+                Ok(_) => Ok(true),
+                Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
+                Err(status) => {
+                    tracing::warn!(
+                        store_path = %store_path,
+                        code = ?status.code(),
+                        error = %status.message(),
+                        "QueryPathInfo failed with non-NOT_FOUND error"
+                    );
+                    Err(Errno::EIO)
+                }
+            }
         })
     }
 }
@@ -358,13 +388,23 @@ impl Filesystem for NixStoreFs {
         // For top-level entries (direct children of mount point), check remote store
         if parent.0 == INodeNo::ROOT.0 {
             let name_str = name.to_string_lossy();
-            if self.query_path_exists(&name_str) {
-                // Path exists remotely; create a synthetic directory entry.
-                // The actual content will be fetched on open/read.
-                let ino = self.get_or_create_inode(child_path);
-                let attr = synthetic_dir_attr(ino);
-                reply.entry(&ATTR_TTL, &attr, Generation(0));
-                return;
+            match self.query_path_exists(&name_str) {
+                Ok(true) => {
+                    // Path exists remotely; create a synthetic directory entry.
+                    // The actual content will be fetched on open/read.
+                    let ino = self.get_or_create_inode(child_path);
+                    let attr = synthetic_dir_attr(ino);
+                    reply.entry(&ATTR_TTL, &attr, Generation(0));
+                    return;
+                }
+                Ok(false) => {
+                    // Not found — fall through to ENOENT
+                }
+                Err(errno) => {
+                    // Transport/server error — surface as EIO, don't mask as ENOENT
+                    reply.error(errno);
+                    return;
+                }
             }
         }
 
