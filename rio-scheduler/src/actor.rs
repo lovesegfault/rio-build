@@ -242,9 +242,12 @@ impl DagActor {
                             build_id = %build_id,
                             "MergeDag reply receiver dropped, cancelling orphaned build"
                         );
-                        let _ = self
+                        if let Err(e) = self
                             .handle_cancel_build(build_id, "client_disconnect_during_merge")
-                            .await;
+                            .await
+                        {
+                            error!(build_id = %build_id, error = %e, "failed to cancel orphaned build");
+                        }
                     }
                 }
                 ActorCommand::ProcessCompletion {
@@ -549,8 +552,12 @@ impl DagActor {
                 match target_status {
                     DerivationStatus::Ready => {
                         // Transition created -> queued -> ready
-                        let _ = state.transition(DerivationStatus::Queued);
-                        let _ = state.transition(DerivationStatus::Ready);
+                        if let Err(e) = state.transition(DerivationStatus::Queued) {
+                            warn!(drv_hash, error = %e, "Created->Queued transition failed");
+                        }
+                        if let Err(e) = state.transition(DerivationStatus::Ready) {
+                            warn!(drv_hash, error = %e, "Queued->Ready transition failed");
+                        }
                         self.db
                             .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
                             .await?;
@@ -561,7 +568,9 @@ impl DagActor {
                         }
                     }
                     DerivationStatus::Queued => {
-                        let _ = state.transition(DerivationStatus::Queued);
+                        if let Err(e) = state.transition(DerivationStatus::Queued) {
+                            warn!(drv_hash, error = %e, "Created->Queued transition failed");
+                        }
                         self.db
                             .update_derivation_status(drv_hash, DerivationStatus::Queued, None)
                             .await?;
@@ -773,8 +782,10 @@ impl DagActor {
         // Transition to completed
         if let Some(state) = self.dag.node_mut(drv_hash) {
             // Ensure we're in running state first
-            if state.status() == DerivationStatus::Assigned {
-                let _ = state.transition(DerivationStatus::Running);
+            if state.status() == DerivationStatus::Assigned
+                && let Err(e) = state.transition(DerivationStatus::Running)
+            {
+                warn!(drv_hash, error = %e, "Assigned->Running transition failed");
             }
             if state.transition(DerivationStatus::Completed).is_err() {
                 return;
@@ -883,25 +894,37 @@ impl DagActor {
             // Check poison threshold
             if state.failed_workers.len() >= POISON_THRESHOLD {
                 // Transition to poisoned
-                if state.status() == DerivationStatus::Assigned {
-                    let _ = state.transition(DerivationStatus::Running);
+                if state.status() == DerivationStatus::Assigned
+                    && let Err(e) = state.transition(DerivationStatus::Running)
+                {
+                    warn!(drv_hash, error = %e, "Assigned->Running transition failed");
                 }
-                let _ = state.transition(DerivationStatus::Poisoned);
+                if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+                    warn!(drv_hash, error = %e, "->Poisoned transition failed");
+                }
                 state.poisoned_at = Some(Instant::now());
                 false
             } else if state.retry_count < self.retry_policy.max_retries {
                 // Transition running -> failed
-                if state.status() == DerivationStatus::Assigned {
-                    let _ = state.transition(DerivationStatus::Running);
+                if state.status() == DerivationStatus::Assigned
+                    && let Err(e) = state.transition(DerivationStatus::Running)
+                {
+                    warn!(drv_hash, error = %e, "Assigned->Running transition failed");
                 }
-                let _ = state.transition(DerivationStatus::Failed);
+                if let Err(e) = state.transition(DerivationStatus::Failed) {
+                    warn!(drv_hash, error = %e, "Running->Failed transition failed");
+                }
                 true
             } else {
                 // Max retries exceeded: treat as permanent
-                if state.status() == DerivationStatus::Assigned {
-                    let _ = state.transition(DerivationStatus::Running);
+                if state.status() == DerivationStatus::Assigned
+                    && let Err(e) = state.transition(DerivationStatus::Running)
+                {
+                    warn!(drv_hash, error = %e, "Assigned->Running transition failed");
                 }
-                let _ = state.transition(DerivationStatus::Poisoned);
+                if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+                    warn!(drv_hash, error = %e, "->Poisoned transition failed");
+                }
                 state.poisoned_at = Some(Instant::now());
                 false
             }
@@ -944,8 +967,11 @@ impl DagActor {
 
             // For Phase 2a, immediately re-queue (production would use a delayed re-queue)
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
-                let _ = state.transition(DerivationStatus::Ready);
-                self.ready_queue.push_back(drv_hash_owned);
+                if let Err(e) = state.transition(DerivationStatus::Ready) {
+                    warn!(drv_hash, error = %e, "Failed->Ready transition failed");
+                } else {
+                    self.ready_queue.push_back(drv_hash_owned);
+                }
             }
         } else {
             if let Err(e) = self
@@ -971,11 +997,15 @@ impl DagActor {
         _worker_id: &str,
     ) {
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            if state.status() == DerivationStatus::Assigned {
-                let _ = state.transition(DerivationStatus::Running);
+            if state.status() == DerivationStatus::Assigned
+                && let Err(e) = state.transition(DerivationStatus::Running)
+            {
+                warn!(drv_hash, error = %e, "Assigned->Running transition failed");
             }
             // Permanent failure -> poisoned (no retry)
-            let _ = state.transition(DerivationStatus::Poisoned);
+            if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+                warn!(drv_hash, error = %e, "->Poisoned transition failed");
+            }
             state.poisoned_at = Some(Instant::now());
         }
 
@@ -1019,7 +1049,9 @@ impl DagActor {
                 // Fail the entire build immediately
                 build.error_summary = Some(format!("derivation {drv_hash} failed"));
                 build.failed_derivation = Some(drv_hash.to_string());
-                let _ = self.transition_build_to_failed(build_id).await;
+                if let Err(e) = self.transition_build_to_failed(build_id).await {
+                    error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
+                }
             } else {
                 // keepGoing: check if all derivations are resolved
                 self.check_build_completion(build_id, "").await;
@@ -1559,10 +1591,14 @@ impl DagActor {
         let all_resolved = (completed + failed) >= total;
 
         if all_completed && failed == 0 {
-            let _ = self.complete_build(build_id).await;
+            if let Err(e) = self.complete_build(build_id).await {
+                error!(build_id = %build_id, error = %e, "failed to persist build completion");
+            }
         } else if keep_going && all_resolved && failed > 0 {
             // keepGoing: all derivations resolved but some failed
-            let _ = self.transition_build_to_failed(build_id).await;
+            if let Err(e) = self.transition_build_to_failed(build_id).await {
+                error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
+            }
         }
         // !keep_going failures are handled immediately in handle_derivation_failure
     }
@@ -2683,11 +2719,16 @@ pub(crate) mod tests {
             "in-memory transition should succeed despite DB unavailability"
         );
 
-        // DB failure should have been logged at error level.
+        // DB failure should have been logged at error level — both for the
+        // derivation status update AND for the build completion transition.
         assert!(
             logs_contain("failed to update derivation status in DB")
                 || logs_contain("failed to persist"),
-            "DB failure during completion should be logged at error!"
+            "DB failure during derivation completion should be logged"
+        );
+        assert!(
+            logs_contain("failed to persist build completion"),
+            "DB failure in complete_build (transition_build) should be logged, not silently discarded"
         );
 
         // TestDb::drop uses a separate admin connection, so closing the test
