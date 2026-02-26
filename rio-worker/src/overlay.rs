@@ -57,8 +57,13 @@ impl Drop for OverlayMount {
                 tracing::error!(
                     merged = %self.merged.display(),
                     error = %e,
-                    "failed to teardown overlay in Drop"
+                    "failed to teardown overlay in Drop (mount leaked)"
                 );
+                // Centralize the metric here so it fires regardless of exit
+                // path (explicit teardown, ?-early-return, panic unwinding).
+                // The explicit teardown_overlay() call sets mounted=false on
+                // success, so this block only runs on Drop for error/panic paths.
+                metrics::counter!("rio_worker_overlay_teardown_failures_total").increment(1);
             }
             self.mounted = false;
         }
@@ -170,10 +175,14 @@ fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> anyhow::R
 }
 
 /// Explicitly tear down an overlay mount.
+///
+/// On success, sets `mounted=false` so `Drop` is a no-op.
+/// On failure, leaves `mounted=true` so `Drop` will retry teardown and
+/// increment `rio_worker_overlay_teardown_failures_total` (centralized there).
 pub fn teardown_overlay(mut mount: OverlayMount) -> anyhow::Result<()> {
-    let result = teardown_overlay_inner(&mount.merged, &mount.upper, &mount.work);
+    teardown_overlay_inner(&mount.merged, &mount.upper, &mount.work)?;
     mount.mounted = false;
-    result
+    Ok(())
 }
 
 /// Create the Nix state directory structure in the overlay upper layer.
