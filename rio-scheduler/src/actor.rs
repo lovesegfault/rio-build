@@ -3305,6 +3305,201 @@ pub(crate) mod tests {
         ));
     }
 
+    /// max_retries (default 2) exhausted with the SAME worker should poison.
+    /// This branch (retry_count >= max_retries) is distinct from
+    /// POISON_THRESHOLD (3 distinct workers) — same worker failing
+    /// repeatedly hits max_retries first.
+    #[tokio::test]
+    async fn test_transient_failure_max_retries_same_worker_poisons() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let _rx = connect_worker(&handle, "flaky-worker", "x86_64-linux", 1).await;
+
+        let build_id = Uuid::new_v4();
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            "maxretry-hash",
+            "/nix/store/maxretry-hash.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        // Default RetryPolicy::max_retries = 2. Fail 3 times on same worker:
+        // retry_count 0 -> 1 (retry), 1 -> 2 (retry), 2 >= 2 -> Poisoned.
+        for attempt in 0..3 {
+            handle
+                .send_unchecked(ActorCommand::ProcessCompletion {
+                    worker_id: "flaky-worker".into(),
+                    drv_hash: "/nix/store/maxretry-hash.drv".into(),
+                    result: rio_proto::types::BuildResult {
+                        status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
+                        error_msg: format!("attempt {attempt} failed"),
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
+            settle().await;
+        }
+
+        let info = handle
+            .debug_query_derivation("maxretry-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info.status,
+            DerivationStatus::Poisoned,
+            "3 transient failures on same worker (retry_count >= max_retries=2) should poison"
+        );
+    }
+
+    /// CancelBuild on an active build should clean up derivations and emit
+    /// BuildCancelled event. Previously untested.
+    #[tokio::test]
+    async fn test_cancel_build_active_drains_derivations() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        // No workers — derivation stays Ready (never assigned).
+
+        let build_id = Uuid::new_v4();
+        let mut event_rx = merge_single_node(
+            &handle,
+            build_id,
+            "cancel-hash",
+            "/nix/store/cancel-hash.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        // Send CancelBuild.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::CancelBuild {
+                build_id,
+                reason: "test cancel".into(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let cancelled = reply_rx.await.unwrap().unwrap();
+        assert!(cancelled, "CancelBuild should return true for active build");
+        settle().await;
+
+        // Build should be Cancelled.
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Cancelled as i32,
+            "build should be Cancelled after CancelBuild"
+        );
+
+        // Should have received BuildCancelled event.
+        let mut saw_cancelled = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(
+                event.event,
+                Some(rio_proto::types::build_event::Event::Cancelled(_))
+            ) {
+                saw_cancelled = true;
+            }
+        }
+        assert!(saw_cancelled, "BuildCancelled event should be emitted");
+
+        // Second CancelBuild should be a no-op (idempotent: returns false).
+        let (reply_tx2, reply_rx2) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::CancelBuild {
+                build_id,
+                reason: "already cancelled".into(),
+                reply: reply_tx2,
+            })
+            .await
+            .unwrap();
+        let re_cancelled = reply_rx2.await.unwrap().unwrap();
+        assert!(
+            !re_cancelled,
+            "CancelBuild on already-terminal build should return false"
+        );
+    }
+
+    /// WatchBuild during an active build should receive events as they happen.
+    /// (The after-completion case is tested separately.)
+    #[tokio::test]
+    async fn test_watch_build_receives_events() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let _rx = connect_worker(&handle, "watch-events-worker", "x86_64-linux", 1).await;
+
+        let build_id = Uuid::new_v4();
+        let _original = merge_single_node(
+            &handle,
+            build_id,
+            "watch-events-hash",
+            "/nix/store/watch-events-hash.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        // WatchBuild on the active build.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::WatchBuild {
+                build_id,
+                since_sequence: 0,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let mut watch_rx = reply_rx.await.unwrap().unwrap();
+
+        // Complete the build; watcher should see BuildCompleted.
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "watch-events-worker".into(),
+                drv_hash: "/nix/store/watch-events-hash.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+
+        let mut saw_completed = false;
+        // Drain events with a timeout.
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_millis(200), watch_rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if matches!(
+                        event.event,
+                        Some(rio_proto::types::build_event::Event::Completed(_))
+                    ) {
+                        saw_completed = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            saw_completed,
+            "WatchBuild subscriber should see BuildCompleted"
+        );
+    }
+
     /// Dispatch should skip over derivations with no eligible worker (wrong
     /// system or missing feature) instead of blocking the entire queue.
     #[tokio::test]
