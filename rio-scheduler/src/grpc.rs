@@ -86,6 +86,13 @@ impl SchedulerService for SchedulerGrpc {
                 rio_common::limits::MAX_DAG_NODES
             )));
         }
+        if req.edges.len() > rio_common::limits::MAX_DAG_EDGES {
+            return Err(Status::invalid_argument(format!(
+                "too many edges: {} (max {})",
+                req.edges.len(),
+                rio_common::limits::MAX_DAG_EDGES
+            )));
+        }
         for node in &req.nodes {
             if node.drv_hash.is_empty() {
                 return Err(Status::invalid_argument("node drv_hash must be non-empty"));
@@ -118,7 +125,16 @@ impl SchedulerService for SchedulerGrpc {
             tenant_id: if req.tenant_id.is_empty() {
                 None
             } else {
-                Some(req.tenant_id)
+                // Parse at the boundary: a malformed UUID (e.g., "customer-foo")
+                // would otherwise leak as a PostgreSQL text-to-uuid cast error.
+                Some(
+                    req.tenant_id
+                        .parse::<uuid::Uuid>()
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("invalid tenant_id UUID: {e}"))
+                        })?
+                        .to_string(),
+                )
             },
             priority_class: if req.priority_class.is_empty() {
                 crate::state::PriorityClass::default()
@@ -488,6 +504,27 @@ impl WorkerService for SchedulerGrpc {
             return Err(Status::invalid_argument("worker_id is required"));
         }
 
+        // Bound heartbeat payload sizes. Heartbeats bypass backpressure
+        // (send_unchecked below), so an unbounded running_builds list from
+        // a malicious/buggy worker would allocate megabytes and stall the
+        // actor event loop during reconciliation with no backpressure signal.
+        const MAX_HEARTBEAT_FEATURES: usize = 64;
+        const MAX_HEARTBEAT_RUNNING_BUILDS: usize = 1000;
+        if req.supported_features.len() > MAX_HEARTBEAT_FEATURES {
+            return Err(Status::invalid_argument(format!(
+                "heartbeat supported_features has {} entries (max {})",
+                req.supported_features.len(),
+                MAX_HEARTBEAT_FEATURES
+            )));
+        }
+        if req.running_builds.len() > MAX_HEARTBEAT_RUNNING_BUILDS {
+            return Err(Status::invalid_argument(format!(
+                "heartbeat running_builds has {} entries (max {})",
+                req.running_builds.len(),
+                MAX_HEARTBEAT_RUNNING_BUILDS
+            )));
+        }
+
         let cmd = ActorCommand::Heartbeat {
             worker_id: req.worker_id,
             system: req.system,
@@ -783,6 +820,101 @@ mod tests {
         assert!(
             status.message().contains("priority_class"),
             "error should mention priority_class: {}",
+            status.message()
+        );
+    }
+
+    /// SubmitBuild with a non-empty tenant_id that's not a valid UUID should
+    /// be rejected at the gRPC boundary, not leak as a PostgreSQL cast error.
+    #[tokio::test]
+    async fn test_submit_build_rejects_invalid_tenant_id() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        let req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![make_test_node("h", "/nix/store/h.drv", "x86_64-linux")],
+            edges: vec![],
+            tenant_id: "customer-foo".into(), // not a UUID
+            ..Default::default()
+        });
+
+        let result = grpc.submit_build(req).await;
+        assert!(result.is_err(), "invalid tenant_id should be rejected");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("tenant_id"),
+            "error should mention tenant_id: {}",
+            status.message()
+        );
+    }
+
+    /// SubmitBuild with more edges than MAX_DAG_EDGES should be rejected
+    /// (DoS prevention: O(edges) merge loop).
+    #[tokio::test]
+    async fn test_submit_build_rejects_too_many_edges() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        // Construct MAX_DAG_EDGES+1 edges. Content doesn't matter — rejection
+        // happens before any path validation.
+        let too_many: Vec<_> = (0..rio_common::limits::MAX_DAG_EDGES + 1)
+            .map(|i| rio_proto::types::DerivationEdge {
+                parent_drv_path: format!("/nix/store/{i}-parent.drv"),
+                child_drv_path: format!("/nix/store/{i}-child.drv"),
+            })
+            .collect();
+
+        let req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![make_test_node("h", "/nix/store/h.drv", "x86_64-linux")],
+            edges: too_many,
+            ..Default::default()
+        });
+
+        let result = grpc.submit_build(req).await;
+        assert!(result.is_err(), "too many edges should be rejected");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("edges"),
+            "error should mention edges: {}",
+            status.message()
+        );
+    }
+
+    /// Heartbeat with too many running_builds entries should be rejected.
+    /// Heartbeats bypass backpressure (send_unchecked), so unbounded payload
+    /// would stall the actor event loop with no backpressure signal.
+    #[tokio::test]
+    async fn test_heartbeat_rejects_too_many_running_builds() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        let too_many: Vec<String> = (0..1001).map(|i| format!("/nix/store/{i}.drv")).collect();
+
+        let req = Request::new(rio_proto::types::HeartbeatRequest {
+            worker_id: "test-worker".into(),
+            system: "x86_64-linux".into(),
+            supported_features: vec![],
+            max_builds: 1,
+            running_builds: too_many,
+            resources: None,
+            local_paths: None,
+        });
+
+        let result = grpc.heartbeat(req).await;
+        assert!(
+            result.is_err(),
+            "heartbeat with >1000 running_builds should be rejected"
+        );
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("running_builds"),
+            "error should mention running_builds: {}",
             status.message()
         );
     }

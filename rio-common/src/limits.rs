@@ -28,3 +28,11 @@ pub const MAX_SIGNATURES: usize = 100;
 /// can legitimately have tens of thousands of derivations; 100k gives
 /// headroom without allowing runaway memory.
 pub const MAX_DAG_NODES: usize = 100_000;
+
+/// Maximum number of DAG edges in a single SubmitBuild request.
+///
+/// Realistic derivation DAGs have average out-degree 1-5; nixpkgs full
+/// is ~200k edges for ~60k nodes. 500k gives headroom for dense DAGs
+/// while bounding the O(edges) merge loop against a fully-connected
+/// pathological submission (100k nodes = 10^10 edges).
+pub const MAX_DAG_EDGES: usize = 500_000;
