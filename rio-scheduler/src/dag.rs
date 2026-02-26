@@ -87,14 +87,21 @@ impl DerivationDag {
         let mut newly_inserted = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(String, String)> = Vec::new();
+        // Track pre-existing nodes that gained interest in this merge, so
+        // rollback only removes interest from these (not from nodes where
+        // build_id was already present from a prior successful merge).
+        let mut interest_added: Vec<String> = Vec::new();
 
         // Insert or update nodes
         for node in nodes {
             let drv_hash = &node.drv_hash;
 
             if let Some(existing) = self.nodes.get_mut(drv_hash) {
-                // Node already exists: add this build's interest
-                existing.interested_builds.insert(build_id);
+                // Node already exists: add this build's interest.
+                // `insert` returns true iff build_id was not already present.
+                if existing.interested_builds.insert(build_id) {
+                    interest_added.push(drv_hash.clone());
+                }
             } else {
                 // New node
                 let mut state = DerivationState::from_node(node);
@@ -166,7 +173,7 @@ impl DerivationDag {
         for start in dfs_starts {
             if self.has_cycle_from(start, &mut color) {
                 // Rollback: remove newly-inserted edges and nodes
-                self.rollback_merge(&newly_inserted, &new_edges, build_id);
+                self.rollback_merge(&newly_inserted, &new_edges, &interest_added, build_id);
                 return Err(DagError::CycleDetected);
             }
         }
@@ -195,11 +202,14 @@ impl DerivationDag {
         false
     }
 
-    /// Rollback a failed merge: remove newly-inserted nodes, edges, and build interest.
+    /// Rollback a failed merge: remove newly-inserted nodes and edges, and
+    /// remove build interest from pre-existing nodes that gained it during
+    /// this merge (but not from nodes where build_id was already present).
     fn rollback_merge(
         &mut self,
         newly_inserted: &[String],
         new_edges: &[(String, String)],
+        interest_added: &[String],
         build_id: Uuid,
     ) {
         // Remove newly-inserted edges
@@ -219,7 +229,6 @@ impl DerivationDag {
         }
 
         // Remove newly-inserted nodes
-        let newly_set: HashSet<&str> = newly_inserted.iter().map(|s| s.as_str()).collect();
         for hash in newly_inserted {
             self.nodes.remove(hash);
             // Also clean up any edge entries keyed on this hash
@@ -227,9 +236,11 @@ impl DerivationDag {
             self.parents.remove(hash);
         }
 
-        // For pre-existing nodes that got this build's interest added, remove it
-        for state in self.nodes.values_mut() {
-            if !newly_set.contains(state.drv_hash.as_str()) {
+        // Remove build interest only from pre-existing nodes that gained it
+        // during THIS merge. Nodes where build_id was already present from a
+        // prior successful merge are left untouched.
+        for hash in interest_added {
+            if let Some(state) = self.nodes.get_mut(hash) {
                 state.interested_builds.remove(&build_id);
             }
         }
@@ -740,6 +751,56 @@ mod tests {
                 .get("hashB")
                 .is_some_and(|c| c.contains("hashA")),
             "cycle-creating B->A edge should be rolled back"
+        );
+    }
+
+    /// When a build merges successfully, then later merges again with a cycle,
+    /// rollback must NOT clear the build's interest from nodes that already
+    /// had it from the prior successful merge.
+    #[test]
+    fn test_cycle_rollback_preserves_prior_interest() {
+        let mut dag = DerivationDag::new();
+        let b1 = Uuid::new_v4();
+
+        // Step 1: merge B1 with node A only — succeeds. A.interested = {B1}.
+        let nodes_a = vec![make_node("hashA", "/nix/store/a.drv", "x86_64-linux")];
+        dag.merge(b1, &nodes_a, &[]).unwrap();
+        assert!(
+            dag.nodes
+                .get("hashA")
+                .unwrap()
+                .interested_builds
+                .contains(&b1),
+            "B1 interest in A should be set after successful merge"
+        );
+
+        // Step 2: merge B1 again with nodes {A, C} and cycle A->C->A — fails.
+        // Pre-fix: rollback would clear B1 from A even though B1 was already
+        // interested in A from step 1.
+        let nodes_ac = vec![
+            make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
+            make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        ];
+        let cycle_edges = vec![
+            make_edge("/nix/store/a.drv", "/nix/store/c.drv"),
+            make_edge("/nix/store/c.drv", "/nix/store/a.drv"),
+        ];
+        let result = dag.merge(b1, &nodes_ac, &cycle_edges);
+        assert!(result.is_err(), "cycle should be rejected");
+
+        // Step 3: A should STILL have B1 interest (was present before the
+        // failed merge). C should be gone entirely (was newly inserted).
+        assert!(
+            dag.nodes
+                .get("hashA")
+                .unwrap()
+                .interested_builds
+                .contains(&b1),
+            "B1 interest in A from prior successful merge must survive rollback"
+        );
+        assert!(
+            !dag.nodes.contains_key("hashC"),
+            "newly-inserted C should be rolled back"
         );
     }
 }
