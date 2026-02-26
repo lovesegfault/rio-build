@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures_util::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 
@@ -22,6 +23,10 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 /// Maximum NAR chunk size for streaming upload (256 KB).
 const NAR_CHUNK_SIZE: usize = 256 * 1024;
+
+/// Maximum concurrent output uploads. Bounds peak memory: each in-flight
+/// upload holds one full NAR in memory during the PutPath stream.
+const MAX_PARALLEL_UPLOADS: usize = 4;
 
 /// Result of uploading a single output path.
 #[derive(Debug)]
@@ -65,6 +70,8 @@ pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
         }
     }
 
+    // read_dir order is filesystem-dependent; sort for deterministic behavior.
+    outputs.sort();
     Ok(outputs)
 }
 
@@ -176,23 +183,37 @@ async fn do_upload(
 
 /// Upload all new outputs from the overlay upper layer.
 ///
-/// Returns the list of successfully uploaded outputs. On exhausted retries,
-/// returns an error (caller should report `InfrastructureFailure`).
+/// Uploads run concurrently (bounded by `MAX_PARALLEL_UPLOADS`). On exhausted
+/// retries for any output, returns an error — partial uploads are safe since
+/// `PutPath` is idempotent and the caller will report `InfrastructureFailure`.
+///
+/// Result order is **not** guaranteed. Callers must not assume results
+/// correspond positionally to any input list; use `UploadResult.store_path`
+/// to identify outputs.
 pub async fn upload_all_outputs(
-    store_client: &mut StoreServiceClient<Channel>,
+    store_client: &StoreServiceClient<Channel>,
     upper_dir: &Path,
 ) -> Result<Vec<UploadResult>, UploadError> {
     let outputs = scan_new_outputs(upper_dir)?;
 
-    tracing::info!(count = outputs.len(), "scanning overlay for new outputs");
+    tracing::info!(
+        count = outputs.len(),
+        max_parallel = MAX_PARALLEL_UPLOADS,
+        "uploading build outputs"
+    );
 
-    let mut results = Vec::new();
-    for output in &outputs {
-        let result = upload_output(store_client, upper_dir, output).await?;
-        results.push(result);
-    }
+    let upper_dir = upper_dir.to_path_buf();
+    let results: Vec<Result<UploadResult, UploadError>> = stream::iter(outputs)
+        .map(|output| {
+            let mut client = store_client.clone();
+            let upper_dir = upper_dir.clone();
+            async move { upload_output(&mut client, &upper_dir, &output).await }
+        })
+        .buffer_unordered(MAX_PARALLEL_UPLOADS)
+        .collect()
+        .await;
 
-    Ok(results)
+    results.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -213,13 +234,14 @@ mod tests {
         let store_dir = dir.path().join("nix/store");
         fs::create_dir_all(&store_dir).unwrap();
 
-        fs::create_dir(store_dir.join("abc-hello")).unwrap();
+        // Create in reverse alphabetical order to verify internal sort.
         fs::create_dir(store_dir.join("def-world")).unwrap();
+        fs::create_dir(store_dir.join("abc-hello")).unwrap();
         // Hidden files should be skipped
         fs::write(store_dir.join(".links"), "").unwrap();
 
-        let mut outputs = scan_new_outputs(dir.path()).unwrap();
-        outputs.sort();
+        // scan_new_outputs sorts internally for deterministic output.
+        let outputs = scan_new_outputs(dir.path()).unwrap();
         assert_eq!(outputs, vec!["abc-hello", "def-world"]);
     }
 

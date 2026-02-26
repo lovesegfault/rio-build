@@ -30,6 +30,7 @@ metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true }
+futures-util = "0.3"
 scopeguard = "1"
 
 [dev-dependencies]
