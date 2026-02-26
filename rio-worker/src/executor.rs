@@ -334,8 +334,15 @@ pub async fn execute_build(
     // TODO(phase2b): leaked mounts should cause infrastructure failure once
     // mount tracking is added. For now, Drop is the safety net and the build
     // already succeeded, so we log but don't fail the result.
-    overlay::teardown_overlay(overlay_mount)
-        .unwrap_or_else(|e| tracing::error!(error = %e, "overlay teardown failed"));
+    let merged_path = overlay_mount.merged_dir().to_path_buf();
+    if let Err(e) = overlay::teardown_overlay(overlay_mount) {
+        tracing::error!(
+            error = %e,
+            merged = %merged_path.display(),
+            "overlay teardown failed; mount leaked"
+        );
+        metrics::counter!("rio_worker_overlay_teardown_failures_total").increment(1);
+    }
 
     Ok(ExecutionResult {
         drv_path: drv_path.clone(),
