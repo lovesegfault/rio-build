@@ -186,6 +186,11 @@ impl StoreService for StoreServiceImpl {
                 error = %e,
                 "PutPath: NAR validation failed"
             );
+            // Clean up the placeholder rows so a retry can succeed.
+            if let Err(cleanup_err) = metadata::delete_uploading(&self.pool, &store_path_hash).await
+            {
+                error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after validation failure");
+            }
             return Err(Status::invalid_argument(format!(
                 "NAR validation failed: {e}"
             )));
@@ -194,6 +199,11 @@ impl StoreService for StoreServiceImpl {
         // Write to backend
         if let Err(e) = self.backend.put(&sha256_hex, Bytes::from(nar_data)).await {
             error!(error = %e, "PutPath: failed to write to backend");
+            // Clean up placeholder so retry can succeed.
+            if let Err(cleanup_err) = metadata::delete_uploading(&self.pool, &store_path_hash).await
+            {
+                error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after backend failure");
+            }
             return Err(Status::internal(format!("backend write error: {e}")));
         }
 

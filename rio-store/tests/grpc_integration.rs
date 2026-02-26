@@ -249,6 +249,48 @@ async fn test_harness_smoke() {
 // Group 5: Protocol safety bounds
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Group 9: Error handling
+// ---------------------------------------------------------------------------
+
+/// After a PutPath fails validation (hash mismatch), the placeholder rows
+/// should be cleaned up so a retry with the correct data succeeds.
+#[tokio::test]
+async fn test_put_path_cleanup_on_hash_mismatch() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let store_path = "/nix/store/test-cleanup-path";
+    let good_nar = make_nar(b"correct content");
+    let bad_nar = make_nar(b"wrong content");
+
+    // Declare the hash of good_nar but send bad_nar — should fail validation
+    let info = make_path_info(store_path, &good_nar);
+    let result = put_path(&mut client, info.clone(), bad_nar).await;
+    assert!(result.is_err(), "hash mismatch should be rejected");
+
+    // Verify no stale rows remain (check via SQL: nar_blobs with status='uploading')
+    let stale: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nar_blobs WHERE status = 'uploading'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stale, 0, "uploading placeholder should be cleaned up");
+
+    // Retry with correct content should succeed (no unique constraint violation)
+    let result = put_path(&mut client, info, good_nar).await;
+    assert!(
+        result.is_ok(),
+        "retry after cleanup should succeed: {result:?}"
+    );
+    assert!(result.unwrap(), "should be newly created");
+
+    server.abort();
+}
+
 /// PutPath with chunks exceeding declared nar_size should be rejected.
 #[tokio::test]
 async fn test_put_path_rejects_oversized_nar() {
