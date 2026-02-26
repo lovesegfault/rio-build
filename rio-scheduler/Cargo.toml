@@ -32,3 +32,4 @@ prost-types = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-store = { path = "../rio-store" }
 sha2 = { workspace = true }
+tracing-test = "0.2"
