@@ -271,9 +271,7 @@ async fn grpc_put_path(
     Ok(resp.into_inner().created)
 }
 
-/// Maximum NAR size accepted from the store over gRPC (4 GiB).
-/// Prevents a misbehaving store from OOMing the gateway.
-const MAX_NAR_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+use rio_common::limits::MAX_NAR_SIZE;
 
 /// Fetch NAR data from store via gRPC GetPath.
 /// Returns (PathInfo, NAR bytes) or None if not found.
