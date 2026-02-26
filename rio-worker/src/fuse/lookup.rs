@@ -3,7 +3,6 @@
 //! Handles `lookup` and `getattr` operations by checking the local SSD cache
 //! first, then falling back to `StoreService.QueryPathInfo` via gRPC.
 
-use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{FileAttr, FileType, INodeNo};
@@ -82,17 +81,6 @@ pub fn synthetic_dir_attr(ino: u64) -> FileAttr {
     }
 }
 
-/// Extract the store path basename from a full path under `/nix/store/`.
-///
-/// For example, `/nix/store/abc...-hello-1.0` returns `Some("abc...-hello-1.0")`.
-/// For deeper paths like `/nix/store/abc...-hello-1.0/bin/hello`, returns the
-/// first component `Some("abc...-hello-1.0")`.
-pub fn extract_store_basename(path: &Path) -> Option<&str> {
-    // The mount point is the root inode; children under it are store path basenames.
-    // We look for the first component after stripping the mount prefix.
-    path.file_name()?.to_str()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,11 +115,5 @@ mod tests {
         assert_eq!(attr.ino, INodeNo(10));
         assert_eq!(attr.kind, FileType::Directory);
         assert_eq!(attr.perm, 0o555);
-    }
-
-    #[test]
-    fn test_extract_store_basename() {
-        let p = Path::new("abc-hello-1.0");
-        assert_eq!(extract_store_basename(p), Some("abc-hello-1.0"));
     }
 }

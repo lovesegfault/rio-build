@@ -919,20 +919,28 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
 
-    // Stream NAR chunks via STDERR_WRITE
-    while let Some(msg) = stream
-        .message()
-        .await
-        .map_err(|e| anyhow::anyhow!("gRPC GetPath stream error: {e}"))?
-    {
-        match msg.msg {
-            Some(types::get_path_response::Msg::NarChunk(chunk)) => {
-                stderr.write_data(&chunk).await?;
+    // Stream NAR chunks via STDERR_WRITE. On mid-stream error, send
+    // STDERR_ERROR so the client gets a proper error instead of a partial
+    // NAR followed by connection drop.
+    loop {
+        match stream.message().await {
+            Ok(Some(msg)) => match msg.msg {
+                Some(types::get_path_response::Msg::NarChunk(chunk)) => {
+                    stderr.write_data(&chunk).await?;
+                }
+                Some(types::get_path_response::Msg::Info(_)) => {
+                    // PathInfo in first message, skip for NAR streaming
+                }
+                None => {}
+            },
+            Ok(None) => break, // stream complete
+            Err(e) => {
+                return send_store_error(
+                    stderr,
+                    anyhow::anyhow!("gRPC GetPath stream error mid-transfer: {e}"),
+                )
+                .await;
             }
-            Some(types::get_path_response::Msg::Info(_)) => {
-                // PathInfo in first message, skip for NAR streaming
-            }
-            None => {}
         }
     }
 

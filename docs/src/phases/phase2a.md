@@ -16,7 +16,7 @@
 - [x] Store: simple filesystem or S3 backend (full NARs, no chunking) with NAR hash verification on PutPath
 - [x] Multi-process deployment (gateway, scheduler, store, workers as separate processes)
 - [x] IFD handling: `wopBuildDerivation` during evaluation treated as normal build request, prioritized in scheduler
-- [x] Basic TransientFailure retry (re-queue to another worker, 2 attempts, exponential backoff)
+- [x] Basic TransientFailure retry (re-queue to another worker, 2 attempts; exponential backoff computed but immediate re-queue — delayed re-queue deferred to Phase 3)
 - [x] Build hook protocol: `--builders` mode path where Nix delegates individual derivations to rio-build
 
 > **FUSE fallback impact:** If the Phase 1a FUSE+overlay spike resulted in the bind-mount fallback, the "Worker FUSE store integration" task above changes significantly: instead of `rio-fuse`, workers use `nix-store --realise` to pre-materialize all input store paths on local disk before each build. This eliminates lazy loading and prefetch hints, but simplifies the worker architecture. The scheduler's bloom filter locality scoring still applies (workers cache materialized paths), but the cache management is simpler (explicit directory management instead of FUSE).

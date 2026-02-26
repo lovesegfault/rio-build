@@ -163,12 +163,19 @@ impl Cache {
     pub fn contains(&self, store_path: &str) -> bool {
         let pool = &self.pool;
         self.runtime.block_on(async {
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1")
-                    .bind(store_path)
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or(0);
+            let count: i64 = match sqlx::query_scalar(
+                "SELECT COUNT(*) FROM cached_paths WHERE store_path = ?1",
+            )
+            .bind(store_path)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(store_path, error = %e, "FUSE cache contains() query failed");
+                    0
+                }
+            };
             count > 0
         })
     }
@@ -211,11 +218,15 @@ impl Cache {
         let now = unix_now();
         let pool = &self.pool;
         self.runtime.block_on(async {
-            let _ = sqlx::query("UPDATE cached_paths SET last_access = ?1 WHERE store_path = ?2")
-                .bind(now)
-                .bind(store_path)
-                .execute(pool)
-                .await;
+            if let Err(e) =
+                sqlx::query("UPDATE cached_paths SET last_access = ?1 WHERE store_path = ?2")
+                    .bind(now)
+                    .bind(store_path)
+                    .execute(pool)
+                    .await
+            {
+                tracing::warn!(store_path, error = %e, "FUSE cache touch() failed");
+            }
         });
     }
 
@@ -224,10 +235,16 @@ impl Cache {
         let pool = &self.pool;
         self.runtime.block_on(async {
             let size: i64 =
-                sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cached_paths")
+                match sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cached_paths")
                     .fetch_one(pool)
                     .await
-                    .unwrap_or(0);
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "FUSE cache total_size() query failed");
+                        0
+                    }
+                };
             size as u64
         })
     }
@@ -244,14 +261,19 @@ impl Cache {
 
             let pool = &self.pool;
             let entry = self.runtime.block_on(async {
-                let row: Option<(String, i64)> = sqlx::query_as(
+                let row: Option<(String, i64)> = match sqlx::query_as(
                     "SELECT store_path, size_bytes FROM cached_paths
                      ORDER BY last_access ASC LIMIT 1",
                 )
                 .fetch_optional(pool)
                 .await
-                .ok()
-                .flatten();
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "FUSE cache eviction query failed");
+                        None
+                    }
+                };
                 row.map(|(path, size)| CacheEntry {
                     store_path: path,
                     size_bytes: size as u64,

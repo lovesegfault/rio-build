@@ -194,8 +194,8 @@ enum BuildResultStatus {
 // Work assignment from scheduler to worker.
 message WorkAssignment {
   string drv_path = 1;                    // Store path of the .drv file
-  bytes drv_content = 2;                  // Inline ATerm content (avoids re-fetch)
-  repeated string input_paths = 3;        // Store paths needed as build inputs
+  bytes drv_content = 2;                  // Inline ATerm content (empty in Phase 2a; worker fetches from store via GetPath)
+  repeated string input_paths = 3;        // Store paths needed as build inputs (empty in Phase 2a; worker computes closure via QueryPathInfo)
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
   string assignment_token = 6;            // Opaque token (NOT cryptographically signed in Phase 2a;
