@@ -310,24 +310,31 @@ impl StoreService for StoreServiceImpl {
             )));
         }
 
-        // Write to backend
-        if let Err(e) = self.backend.put(&sha256_hex, Bytes::from(nar_data)).await {
-            error!(error = %e, "PutPath: failed to write to backend");
-            self.abort_upload(&store_path_hash).await;
-            return Err(internal_error("backend write", e));
-        }
+        // Write to backend. Capture the actual storage key returned by put()
+        // instead of using the pre-computed blob_key: if a backend adds
+        // sharding (e.g., "ab/abcd...nar"), the two would silently drift and
+        // break GetPath. Currently both produce "{sha}.nar" so this is
+        // future-proofing.
+        let actual_blob_key = match self.backend.put(&sha256_hex, Bytes::from(nar_data)).await {
+            Ok(key) => key,
+            Err(e) => {
+                error!(error = %e, "PutPath: failed to write to backend");
+                self.abort_upload(&store_path_hash).await;
+                return Err(internal_error("backend write", e));
+            }
+        };
 
         // Step 6: Complete upload — update narinfo + flip status to 'complete'
         let full_info = PathInfo {
             store_path_hash,
             ..info
         };
-        if let Err(e) = metadata::complete_upload(&self.pool, &full_info, &blob_key).await {
+        if let Err(e) = metadata::complete_upload(&self.pool, &full_info, &actual_blob_key).await {
             // Clean up placeholder rows AND backend blob (unlike validation/backend
             // failures which only clean metadata). The blob is now orphaned —
             // metadata never flipped to 'complete', so GetPath can't serve it.
             self.abort_upload(&full_info.store_path_hash).await;
-            if let Err(backend_err) = self.backend.delete(&blob_key).await {
+            if let Err(backend_err) = self.backend.delete(&actual_blob_key).await {
                 warn!(error = %backend_err, "PutPath: failed to delete orphaned blob after complete_upload failure");
             }
             return Err(internal_error("PutPath: complete_upload", e));
