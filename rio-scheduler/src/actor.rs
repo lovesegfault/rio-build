@@ -1902,7 +1902,7 @@ impl ActorHandle {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let actor = DagActor::new(db, store_client);
         let self_tx = tx.downgrade();
-        tokio::spawn(actor.run_with_self_tx(rx, self_tx));
+        rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
         Self { tx }
     }
 
@@ -1916,6 +1916,14 @@ impl ActorHandle {
         let actor = DagActor::new(db, store_client);
         tokio::spawn(actor.run(rx));
         Self { tx }
+    }
+
+    /// Whether the actor task is still alive. Returns false if the actor
+    /// panicked or exited (its receiver dropped, closing the channel).
+    ///
+    /// gRPC handlers should check this and return UNAVAILABLE if false.
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
     }
 
     /// Send a command to the actor, checking backpressure.
@@ -2110,6 +2118,28 @@ pub(crate) mod tests {
             .await
             .expect("actor should shut down")
             .expect("actor should not panic");
+    }
+
+    /// is_alive() should detect actor death (channel closed = receiver dropped).
+    #[tokio::test]
+    async fn test_actor_is_alive_detection() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, task) = setup_actor(db.pool.clone()).await;
+        settle().await;
+
+        // Actor should be alive after spawn.
+        assert!(handle.is_alive(), "actor should be alive after spawn");
+
+        // Abort the actor task to simulate a panic/crash.
+        task.abort();
+        // Give the abort time to propagate and the receiver to drop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // is_alive() should now report false (channel closed).
+        assert!(
+            !handle.is_alive(),
+            "is_alive should report false after actor task dies"
+        );
     }
 
     // -----------------------------------------------------------------------

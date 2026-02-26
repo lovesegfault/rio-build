@@ -98,11 +98,19 @@ async fn main() -> anyhow::Result<()> {
     // Start periodic tick task
     let tick_actor = actor.clone();
     let tick_interval = std::time::Duration::from_secs(args.tick_interval_secs);
-    tokio::spawn(async move {
+    rio_common::task::spawn_monitored("tick-loop", async move {
         let mut interval = tokio::time::interval(tick_interval);
         loop {
             interval.tick().await;
-            let _ = tick_actor.try_send(rio_scheduler::actor::ActorCommand::Tick);
+            // If the actor is dead (channel closed), stop ticking.
+            if tick_actor
+                .try_send(rio_scheduler::actor::ActorCommand::Tick)
+                .is_err()
+                && !tick_actor.is_alive()
+            {
+                tracing::warn!("actor channel closed, stopping tick loop");
+                break;
+            }
         }
     });
 
