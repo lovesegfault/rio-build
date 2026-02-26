@@ -460,6 +460,13 @@ impl DagActor {
         let total_derivations = nodes.len() as u32;
         let mut cached_count = 0u32;
 
+        // Interactive builds (IFD) get priority: push_front instead of push_back
+        let is_interactive = self
+            .builds
+            .get(&build_id)
+            .map(|b| b.priority_class == "interactive")
+            .unwrap_or(false);
+
         for (drv_hash, target_status) in &initial_states {
             if let Some(state) = self.dag.nodes.get_mut(drv_hash) {
                 match target_status {
@@ -470,7 +477,11 @@ impl DagActor {
                         self.db
                             .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
                             .await?;
-                        self.ready_queue.push_back(drv_hash.clone());
+                        if is_interactive {
+                            self.ready_queue.push_front(drv_hash.clone());
+                        } else {
+                            self.ready_queue.push_back(drv_hash.clone());
+                        }
                     }
                     DerivationStatus::Queued => {
                         let _ = state.transition(DerivationStatus::Queued);
@@ -698,9 +709,11 @@ impl DagActor {
             );
         }
 
-        // Release downstream: find newly ready derivations
+        // Release downstream: find newly ready derivations.
+        // Interactive (IFD) derivations go to the front of the queue.
         let newly_ready = self.dag.find_newly_ready(drv_hash);
         for ready_hash in &newly_ready {
+            let prioritize = self.should_prioritize(ready_hash);
             if let Some(state) = self.dag.nodes.get_mut(ready_hash)
                 && state.transition(DerivationStatus::Ready).is_ok()
             {
@@ -711,7 +724,11 @@ impl DagActor {
                 {
                     error!(drv_hash = ready_hash, error = %e, "failed to update status");
                 }
-                self.ready_queue.push_back(ready_hash.clone());
+                if prioritize {
+                    self.ready_queue.push_front(ready_hash.clone());
+                } else {
+                    self.ready_queue.push_back(ready_hash.clone());
+                }
             }
         }
 
@@ -1327,6 +1344,17 @@ impl DagActor {
 
     fn drv_hash_to_path(&self, drv_hash: &str) -> Option<String> {
         self.dag.nodes.get(drv_hash).map(|s| s.drv_path.clone())
+    }
+
+    /// Whether any interested build for this derivation is interactive (IFD).
+    /// Interactive derivations get push_front on the ready queue.
+    fn should_prioritize(&self, drv_hash: &str) -> bool {
+        self.get_interested_builds(drv_hash).iter().any(|build_id| {
+            self.builds
+                .get(build_id)
+                .map(|b| b.priority_class == "interactive")
+                .unwrap_or(false)
+        })
     }
 
     /// Resolve a drv_path to its drv_hash by scanning DAG nodes.
@@ -2011,6 +2039,97 @@ pub(crate) mod tests {
             ),
             "expected Ready or Assigned after retry, got {:?}",
             info.status
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 6: Feature completions
+    // -----------------------------------------------------------------------
+
+    /// Interactive (IFD) builds should jump to the front of the ready queue.
+    #[tokio::test]
+    async fn test_interactive_builds_pushed_to_front() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Worker with capacity for 1 build at a time
+        let mut stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+
+        // Merge a "scheduled" build first (should go to back of queue)
+        let build_normal = Uuid::new_v4();
+        let _rx1 = merge_single_node(
+            &handle,
+            build_normal,
+            "hash-normal",
+            "/nix/store/hash-normal.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        // The normal build gets assigned first (only one in queue)
+        let first = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let first_path = match first.msg {
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
+            _ => panic!("expected assignment"),
+        };
+        assert_eq!(first_path, "/nix/store/hash-normal.drv");
+
+        // Now merge a second "scheduled" build — goes to back
+        let build_scheduled2 = Uuid::new_v4();
+        let _rx2 = merge_single_node(
+            &handle,
+            build_scheduled2,
+            "hash-scheduled2",
+            "/nix/store/hash-scheduled2.drv",
+            "scheduled",
+        )
+        .await;
+
+        // Merge an "interactive" build — should go to FRONT
+        let build_ifd = Uuid::new_v4();
+        let _rx3 = merge_single_node(
+            &handle,
+            build_ifd,
+            "hash-ifd",
+            "/nix/store/hash-ifd.drv",
+            "interactive",
+        )
+        .await;
+        settle().await;
+
+        // Complete the first build to free worker capacity
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "test-worker".into(),
+                drv_hash: "/nix/store/hash-normal.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::Built.into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // The next assignment should be the IFD derivation (was pushed to front)
+        let second = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_path = match second.msg {
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
+            _ => panic!("expected assignment"),
+        };
+        assert_eq!(
+            second_path, "/nix/store/hash-ifd.drv",
+            "interactive build should be dispatched before scheduled"
         );
     }
 }
