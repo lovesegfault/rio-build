@@ -117,7 +117,7 @@ impl DerivationDag {
                 let mut state = DerivationState::from_node(node);
                 state.interested_builds.insert(build_id);
                 self.path_to_hash
-                    .insert(state.drv_path.clone(), drv_hash.clone());
+                    .insert(state.drv_path().to_string(), drv_hash.clone());
                 self.nodes.insert(drv_hash.clone(), state);
                 newly_inserted.push(drv_hash.clone());
             }
@@ -236,7 +236,7 @@ impl DerivationDag {
         // Remove newly-inserted nodes (and their path index entries)
         for hash in newly_inserted {
             if let Some(state) = self.nodes.remove(hash) {
-                self.path_to_hash.remove(&state.drv_path);
+                self.path_to_hash.remove(state.drv_path());
             }
             // Also clean up any edge entries keyed on this hash
             self.children.remove(hash);
@@ -357,7 +357,7 @@ impl DerivationDag {
         let reaped = to_reap.len();
         for hash in to_reap {
             if let Some(state) = self.nodes.remove(&hash) {
-                self.path_to_hash.remove(&state.drv_path);
+                self.path_to_hash.remove(state.drv_path());
             }
             self.children.remove(&hash);
             self.parents.remove(&hash);
