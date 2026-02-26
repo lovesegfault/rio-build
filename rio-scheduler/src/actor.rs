@@ -984,6 +984,10 @@ impl DagActor {
                 error!(drv_hash, error = %e, "failed to persist Poisoned status");
             }
 
+            // Cascade: parents of a poisoned derivation can never complete.
+            // Transition them to DependencyFailed so keepGoing builds terminate.
+            self.cascade_dependency_failure(drv_hash).await;
+
             // Propagate failure to interested builds
             let interested_builds = self.get_interested_builds(drv_hash);
             for build_id in interested_builds {
@@ -1019,6 +1023,9 @@ impl DagActor {
             error!(drv_hash, error = %e, "failed to persist Poisoned status");
         }
 
+        // Cascade: parents of a poisoned derivation can never complete.
+        self.cascade_dependency_failure(drv_hash).await;
+
         // Propagate failure to interested builds
         let interested_builds = self.get_interested_builds(drv_hash);
         for build_id in interested_builds {
@@ -1043,21 +1050,82 @@ impl DagActor {
         }
     }
 
-    async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &str) {
-        if let Some(build) = self.builds.get_mut(&build_id) {
-            build.failed_count += 1;
+    /// Transitively walk parents of a poisoned derivation and transition all
+    /// Queued/Ready/Created ancestors to DependencyFailed.
+    ///
+    /// Without this, keepGoing builds with a poisoned leaf hang forever:
+    /// parents stay Queued, so completed+failed never reaches total.
+    async fn cascade_dependency_failure(&mut self, poisoned_hash: &str) {
+        let mut to_visit: Vec<String> = self.dag.get_parents(poisoned_hash);
+        let mut visited: HashSet<String> = HashSet::new();
 
-            if !build.keep_going {
-                // Fail the entire build immediately
-                build.error_summary = Some(format!("derivation {drv_hash} failed"));
-                build.failed_derivation = Some(drv_hash.to_string());
-                if let Err(e) = self.transition_build_to_failed(build_id).await {
-                    error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
-                }
-            } else {
-                // keepGoing: check if all derivations are resolved
-                self.check_build_completion(build_id, "").await;
+        while let Some(parent_hash) = to_visit.pop() {
+            if !visited.insert(parent_hash.clone()) {
+                continue; // already processed
             }
+
+            let Some(state) = self.dag.node_mut(&parent_hash) else {
+                continue;
+            };
+
+            // Only cascade to derivations that haven't started yet.
+            // Assigned/Running derivations will complete or fail on their own
+            // (and their completion handler will re-cascade if they succeed
+            // but a sibling dep is dead — but actually they'd never become
+            // Ready in the first place since all_deps_completed is false).
+            if !matches!(
+                state.status(),
+                DerivationStatus::Queued | DerivationStatus::Ready | DerivationStatus::Created
+            ) {
+                continue;
+            }
+
+            if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
+                warn!(drv_hash = %parent_hash, error = %e, "cascade ->DependencyFailed transition failed");
+                continue;
+            }
+
+            debug!(
+                drv_hash = %parent_hash,
+                poisoned_dep = %poisoned_hash,
+                "cascaded DependencyFailed from poisoned dependency"
+            );
+
+            // Remove from ready queue if present (Ready -> DependencyFailed).
+            self.ready_queue.remove(&parent_hash);
+
+            if let Err(e) = self
+                .db
+                .update_derivation_status(&parent_hash, DerivationStatus::DependencyFailed, None)
+                .await
+            {
+                error!(drv_hash = %parent_hash, error = %e, "failed to persist DependencyFailed");
+            }
+
+            // Continue cascade: this parent's parents also cannot complete.
+            to_visit.extend(self.dag.get_parents(&parent_hash));
+        }
+    }
+
+    async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &str) {
+        // Sync counts from DAG ground truth. The cascade may have transitioned
+        // additional parents to DependencyFailed; those must be counted here.
+        self.update_build_counts(build_id);
+
+        let Some(build) = self.builds.get_mut(&build_id) else {
+            return;
+        };
+
+        if !build.keep_going {
+            // Fail the entire build immediately
+            build.error_summary = Some(format!("derivation {drv_hash} failed"));
+            build.failed_derivation = Some(drv_hash.to_string());
+            if let Err(e) = self.transition_build_to_failed(build_id).await {
+                error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
+            }
+        } else {
+            // keepGoing: check if all derivations are resolved
+            self.check_build_completion(build_id, "").await;
         }
     }
 
@@ -2419,6 +2487,117 @@ pub(crate) mod tests {
             status2.state,
             rio_proto::types::BuildState::Failed as i32,
             "build should fail after all derivations resolve with keepGoing=true"
+        );
+    }
+
+    /// keepGoing=true with a dependency chain: poisoning a leaf must cascade
+    /// DependencyFailed to all ancestors so the build terminates. Without the
+    /// cascade, parents stay Queued forever and completed+failed never reaches
+    /// total -> build hangs.
+    #[tokio::test]
+    async fn test_keepgoing_poisoned_dependency_cascades_failure() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Worker with capacity 1: only the leaf gets dispatched initially.
+        let _stream_rx = connect_worker(&handle, "cascade-worker", "x86_64-linux", 1).await;
+
+        // Chain: A depends on B depends on C. C is the leaf.
+        let build_id = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![
+                    make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
+                    make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
+                    make_test_node("cascadeC", "/nix/store/cascadeC.drv", "x86_64-linux"),
+                ],
+                edges: vec![
+                    make_test_edge("/nix/store/cascadeA.drv", "/nix/store/cascadeB.drv"),
+                    make_test_edge("/nix/store/cascadeB.drv", "/nix/store/cascadeC.drv"),
+                ],
+                options: BuildOptions::default(),
+                keep_going: true,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _rx = reply_rx.await.unwrap().unwrap();
+        settle().await;
+
+        // Sanity: C is the only Ready/Assigned derivation; A and B are Queued.
+        let info_a = handle
+            .debug_query_derivation("cascadeA")
+            .await
+            .unwrap()
+            .unwrap();
+        let info_b = handle
+            .debug_query_derivation("cascadeB")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info_a.status, DerivationStatus::Queued);
+        assert_eq!(info_b.status, DerivationStatus::Queued);
+
+        // Poison C via PermanentFailure.
+        handle
+            .send_unchecked(ActorCommand::ProcessCompletion {
+                worker_id: "cascade-worker".into(),
+                drv_hash: "/nix/store/cascadeC.drv".into(),
+                result: rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
+                    error_msg: "compile error".into(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // B and A should now be DependencyFailed (cascaded transitively).
+        let info_b = handle
+            .debug_query_derivation("cascadeB")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info_b.status,
+            DerivationStatus::DependencyFailed,
+            "immediate parent B should be DependencyFailed after C poisoned"
+        );
+        let info_a = handle
+            .debug_query_derivation("cascadeA")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info_a.status,
+            DerivationStatus::DependencyFailed,
+            "transitive parent A should also be DependencyFailed"
+        );
+
+        // Build should terminate as Failed (all 3 derivations resolved:
+        // 1 Poisoned + 2 DependencyFailed counted in failed).
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status = status_rx.await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "keepGoing build with poisoned dependency chain should terminate as Failed, not hang"
+        );
+        assert_eq!(
+            status.failed_derivations, 3,
+            "1 Poisoned + 2 DependencyFailed should all count as failed"
         );
     }
 
