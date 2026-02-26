@@ -1534,7 +1534,7 @@ impl DagActor {
     fn update_build_counts(&mut self, build_id: Uuid) {
         let summary = self.dag.build_summary(build_id);
         if let Some(build) = self.builds.get_mut(&build_id) {
-            build.completed_count = summary.completed + build.cached_count;
+            build.completed_count = summary.completed;
             build.failed_count = summary.failed;
         }
     }
@@ -2558,6 +2558,10 @@ pub(crate) mod tests {
             .unwrap();
         let status = status_rx.await.unwrap().unwrap();
         assert_eq!(status.cached_derivations, 1);
+        assert_eq!(
+            status.completed_derivations, 1,
+            "completed should count cached exactly once (no double-counting)"
+        );
         assert_eq!(
             status.state,
             rio_proto::types::BuildState::Succeeded as i32,
