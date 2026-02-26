@@ -352,7 +352,9 @@ impl DerivationDag {
                 DerivationStatus::Completed => summary.completed += 1,
                 DerivationStatus::Running => summary.running += 1,
                 DerivationStatus::Assigned => summary.running += 1,
-                DerivationStatus::Failed | DerivationStatus::Poisoned => summary.failed += 1,
+                DerivationStatus::Failed
+                | DerivationStatus::Poisoned
+                | DerivationStatus::DependencyFailed => summary.failed += 1,
                 DerivationStatus::Ready | DerivationStatus::Queued | DerivationStatus::Created => {
                     summary.queued += 1;
                 }

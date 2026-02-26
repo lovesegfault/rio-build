@@ -25,12 +25,19 @@ pub enum DerivationStatus {
     Completed,
     Failed,
     Poisoned,
+    /// A dependency of this derivation failed/poisoned. This derivation can
+    /// never complete in the current build. Terminal (like Poisoned).
+    /// Maps to Nix BuildStatus::DependencyFailed=10.
+    DependencyFailed,
 }
 
 impl DerivationStatus {
     /// Whether this is a terminal state (no further progress without external reset).
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Poisoned)
+        matches!(
+            self,
+            Self::Completed | Self::Poisoned | Self::DependencyFailed
+        )
     }
 
     /// Validate a state transition.
@@ -42,6 +49,7 @@ impl DerivationStatus {
             match self {
                 Self::Completed => return Ok(()),
                 Self::Poisoned => return Ok(()),
+                Self::DependencyFailed => return Ok(()),
                 _ => {
                     return Err(TransitionError::Invalid {
                         from: self,
@@ -63,16 +71,19 @@ impl DerivationStatus {
 
         // Valid transitions
         let valid = match (self, to) {
-            (Self::Created, Self::Completed) => true, // cache hit
-            (Self::Created, Self::Queued) => true,    // build accepted
-            (Self::Queued, Self::Ready) => true,      // all deps complete
-            (Self::Ready, Self::Assigned) => true,    // worker selected
-            (Self::Assigned, Self::Running) => true,  // worker ack
-            (Self::Assigned, Self::Ready) => true,    // worker lost
-            (Self::Running, Self::Completed) => true, // build succeeded
-            (Self::Running, Self::Failed) => true,    // retriable failure
-            (Self::Running, Self::Poisoned) => true,  // failed on 3+ workers
-            (Self::Failed, Self::Ready) => true,      // retry scheduled
+            (Self::Created, Self::Completed) => true,       // cache hit
+            (Self::Created, Self::Queued) => true,          // build accepted
+            (Self::Queued, Self::Ready) => true,            // all deps complete
+            (Self::Queued, Self::DependencyFailed) => true, // dep poisoned, cascade
+            (Self::Ready, Self::DependencyFailed) => true,  // dep poisoned, cascade
+            (Self::Created, Self::DependencyFailed) => true, // dep poisoned before queue
+            (Self::Ready, Self::Assigned) => true,          // worker selected
+            (Self::Assigned, Self::Running) => true,        // worker ack
+            (Self::Assigned, Self::Ready) => true,          // worker lost
+            (Self::Running, Self::Completed) => true,       // build succeeded
+            (Self::Running, Self::Failed) => true,          // retriable failure
+            (Self::Running, Self::Poisoned) => true,        // failed on 3+ workers
+            (Self::Failed, Self::Ready) => true,            // retry scheduled
             _ => false,
         };
 
@@ -98,6 +109,7 @@ impl DerivationStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Poisoned => "poisoned",
+            Self::DependencyFailed => "dependency_failed",
         }
     }
 }
@@ -120,6 +132,7 @@ impl std::str::FromStr for DerivationStatus {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "poisoned" => Ok(Self::Poisoned),
+            "dependency_failed" => Ok(Self::DependencyFailed),
             other => Err(TransitionError::UnknownStatus(other.to_string())),
         }
     }
@@ -517,17 +530,20 @@ mod tests {
         use DerivationStatus::*;
 
         let valid_transitions = [
-            (Created, Completed), // cache hit
-            (Created, Queued),    // build accepted
-            (Queued, Ready),      // all deps complete
-            (Ready, Assigned),    // worker selected
-            (Assigned, Running),  // worker ack
-            (Assigned, Ready),    // worker lost
-            (Running, Completed), // build succeeded
-            (Running, Failed),    // retriable failure
-            (Running, Poisoned),  // failed on 3+ workers
-            (Failed, Ready),      // retry scheduled
-            (Poisoned, Created),  // 24h TTL expiry
+            (Created, Completed),        // cache hit
+            (Created, Queued),           // build accepted
+            (Queued, Ready),             // all deps complete
+            (Ready, Assigned),           // worker selected
+            (Assigned, Running),         // worker ack
+            (Assigned, Ready),           // worker lost
+            (Running, Completed),        // build succeeded
+            (Running, Failed),           // retriable failure
+            (Running, Poisoned),         // failed on 3+ workers
+            (Failed, Ready),             // retry scheduled
+            (Poisoned, Created),         // 24h TTL expiry
+            (Queued, DependencyFailed),  // dep poisoned cascade
+            (Ready, DependencyFailed),   // dep poisoned cascade
+            (Created, DependencyFailed), // dep poisoned before queue
         ];
 
         for (from, to) in valid_transitions {
@@ -546,6 +562,12 @@ mod tests {
         assert!(Completed.validate_transition(Completed).is_ok());
         // poisoned -> poisoned is no-op
         assert!(Poisoned.validate_transition(Poisoned).is_ok());
+        // dependency_failed -> dependency_failed is no-op
+        assert!(
+            DependencyFailed
+                .validate_transition(DependencyFailed)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -581,6 +603,14 @@ mod tests {
         assert!(Poisoned.validate_transition(Ready).is_err());
         assert!(Poisoned.validate_transition(Running).is_err());
         assert!(Poisoned.validate_transition(Failed).is_err());
+
+        // DependencyFailed is terminal: can't go anywhere except self
+        assert!(DependencyFailed.validate_transition(Ready).is_err());
+        assert!(DependencyFailed.validate_transition(Queued).is_err());
+        assert!(DependencyFailed.validate_transition(Created).is_err());
+        // Assigned/Running cannot cascade to DependencyFailed (already started)
+        assert!(Assigned.validate_transition(DependencyFailed).is_err());
+        assert!(Running.validate_transition(DependencyFailed).is_err());
 
         // Non-terminal self-transitions are invalid
         assert!(Created.validate_transition(Created).is_err());
