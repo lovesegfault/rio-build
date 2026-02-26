@@ -898,24 +898,10 @@ mod tests {
         hash_algo: &str,
         hash_hex: &str,
     ) -> rio_nix::derivation::Derivation {
-        let output =
-            rio_nix::derivation::DerivationOutput::new("out", output_path, hash_algo, hash_hex)
-                .unwrap();
-        // Build a minimal Derivation ATerm and parse it (Derivation has no public constructor)
+        // Derivation has no public constructor; parse a minimal ATerm.
         let aterm = format!(
             r#"Derive([("out","{output_path}","{hash_algo}","{hash_hex}")],[],[],"x86_64-linux","/bin/sh",[],[("out","{output_path}")])"#
         );
-        // Actually, Derivation::parse expects proper ATerm; let me use BasicDerivation instead
-        // via the actual parse path... but that's complex. Let me just construct via the
-        // type directly if possible.
-        //
-        // Actually, the simplest thing: verify_fod_hashes iterates drv.outputs(), which
-        // for BasicDerivation is the same. But verify_fod_hashes takes &Derivation, not
-        // &BasicDerivation. Let me check if there's a conversion or if I need a different
-        // test approach.
-        //
-        // Approach: parse a minimal valid ATerm.
-        let _ = output; // unused, we parse instead
         rio_nix::derivation::Derivation::parse(&aterm)
             .unwrap_or_else(|e| panic!("invalid test ATerm: {e} -- ATerm was: {aterm}"))
     }

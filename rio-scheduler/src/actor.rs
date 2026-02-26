@@ -2226,7 +2226,7 @@ pub(crate) mod tests {
 
     /// Baseline: when a worker connects (stream) and sends a heartbeat with
     /// the SAME worker_id, the actor should see it as fully registered.
-    /// This SHOULD pass with current code (the bug is in grpc.rs, not the actor).
+    /// Validates that stream + heartbeat with the same worker_id registers correctly.
     #[tokio::test]
     async fn test_worker_registers_via_stream_and_heartbeat() {
         let db = TestDb::new(&MIGRATOR).await;
