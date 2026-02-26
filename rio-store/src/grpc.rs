@@ -201,8 +201,7 @@ impl StoreService for StoreServiceImpl {
         let mut hashing = HashingReader::new(std::io::Cursor::new(&nar_data));
         let mut buf = Vec::with_capacity(nar_data.len());
         if let Err(e) = hashing.read_to_end(&mut buf).await {
-            error!(error = %e, "PutPath: failed to read NAR data through hasher");
-            return Err(Status::internal(format!("NAR read error: {e}")));
+            return Err(internal_error("NAR read", e));
         }
         let digest = hashing.into_digest();
 
@@ -230,7 +229,7 @@ impl StoreService for StoreServiceImpl {
             {
                 error!(error = %cleanup_err, "PutPath: failed to clean up placeholder after backend failure");
             }
-            return Err(Status::internal(format!("backend write error: {e}")));
+            return Err(internal_error("backend write", e));
         }
 
         // Step 6: Complete upload — update narinfo + flip status to 'complete'
@@ -297,7 +296,7 @@ impl StoreService for StoreServiceImpl {
             .backend
             .get(&blob_key)
             .await
-            .map_err(|e| Status::internal(format!("backend read error: {e}")))?
+            .map_err(|e| internal_error("backend read", e))?
             .ok_or_else(|| {
                 Status::not_found(format!("NAR blob missing from backend: {blob_key}"))
             })?;
@@ -342,9 +341,7 @@ impl StoreService for StoreServiceImpl {
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("NAR read error: {e}"))))
-                            .await;
+                        let _ = tx.send(Err(internal_error("NAR stream read", e))).await;
                         return;
                     }
                 }
