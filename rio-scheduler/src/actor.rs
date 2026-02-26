@@ -1566,8 +1566,12 @@ impl DagActor {
         if let Some(state) = self.dag.node(drv_hash) {
             let assignment = rio_proto::types::WorkAssignment {
                 drv_path: state.drv_path.clone(),
-                drv_content: Vec::new(), // TODO: inline .drv content in future
-                input_paths: Vec::new(), // TODO: compute closure
+                // TODO(phase2c): inline .drv content to avoid worker->store round-trip.
+                // Phase 2a: worker fetches via GetPath (see rio-worker/src/executor.rs).
+                drv_content: Vec::new(),
+                // TODO(phase2c): compute closure scheduler-side for prefetch hints.
+                // Phase 2a: worker computes via QueryPathInfo BFS.
+                input_paths: Vec::new(),
                 output_names: state.output_names.clone(),
                 build_options: Some(self.build_options_for_derivation(drv_hash)),
                 assignment_token: format!("{}-{}-{}", worker_id, drv_hash, self.generation),

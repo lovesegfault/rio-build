@@ -87,6 +87,43 @@ This project has a comprehensive design book in `docs/src/`. When implementing a
 
 When implementation reveals that a design doc is wrong (e.g., the spec says u32 but the real protocol uses u64), update the design doc in the same commit that fixes the code. Don't let them drift.
 
+### Deferred work and TODOs
+
+**Every deferred task must have a phase-tagged TODO comment.** Untagged TODOs accumulate into an untracked backlog that never gets scheduled.
+
+Format: `TODO(phaseXY): <what> — <why deferred / what it's blocked on>`
+
+```rust
+// GOOD: tagged with phase, explains current behavior and future intent
+// TODO(phase2b): buffer and forward build logs to gateway.
+// Phase 2b spec: 64-line/100ms batching, per-derivation ring buffer.
+
+// GOOD: points to the blocking dependency
+// TODO(phase3a): actual leader generation from Kubernetes Lease.
+// Phase 2a has a single scheduler instance; constant 1 is correct.
+generation: 1,
+
+// BAD: no phase tag, no context — when does this get done? what's blocking it?
+// TODO: fix this later
+```
+
+**Choosing the right phase:**
+- Check `docs/src/phases/phase*.md` task lists — find the one that mentions the feature
+- If nothing matches, the work is either (a) actually in-scope for the current phase, or (b) a design gap that needs a phase doc update before tagging
+- When the phase doc doesn't mention it but clearly should, update the doc in the same commit
+
+**When to write a TODO:**
+- You're implementing a stub/placeholder that a later phase will fill in
+- You're making a simplifying assumption that's correct now but won't be later (e.g., "single scheduler instance")
+- You're skipping an optimization that's out of scope (e.g., scheduler-side closure computation)
+- A test is blocked on infrastructure (e.g., privileged CI containers)
+
+**When NOT to write a TODO:**
+- The deferred behavior is already documented in a `> **Phase X deferral:**` block in the design doc — reference it in a normal comment instead
+- The code is actually complete for the current phase and there's no concrete future work
+
+**Audit before phase completion:** Grep for `TODO[^(]` (untagged) and `TODO\(phase2a\)` (current-phase) before marking a phase done. Untagged TODOs must be either tagged or resolved; current-phase TODOs must be resolved.
+
 ## Protocol Implementation Guidelines
 
 rio-build implements the Nix worker protocol. Protocol work has specific pitfalls:
