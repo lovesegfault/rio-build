@@ -142,7 +142,7 @@ pub async fn upload_output(
     metrics::counter!("rio_worker_uploads_total", "status" => "exhausted").increment(1);
     Err(UploadError::UploadExhausted {
         path: store_path,
-        source: last_error.unwrap(),
+        source: last_error.expect("retry loop ran ≥1 times; each failure sets last_error"),
     })
 }
 

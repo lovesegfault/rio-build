@@ -2011,8 +2011,8 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
 
         // Apply the build result to all derivation paths
         for (idx, raw) in raw_paths.iter().enumerate() {
-            if opaque_results.contains_key(&idx) {
-                results.push(opaque_results.remove(&idx).unwrap());
+            if let Some(opaque) = opaque_results.remove(&idx) {
+                results.push(opaque);
             } else {
                 let _ = raw; // suppress unused warning
                 results.push(build_result.clone());
