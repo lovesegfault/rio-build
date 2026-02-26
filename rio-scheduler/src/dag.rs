@@ -409,7 +409,6 @@ impl Default for DerivationDag {
 pub struct BuildSummary {
     pub total: u32,
     pub completed: u32,
-    pub cached: u32,
     pub running: u32,
     pub failed: u32,
     pub queued: u32,
