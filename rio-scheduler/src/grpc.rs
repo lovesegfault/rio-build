@@ -186,7 +186,9 @@ impl SchedulerService for SchedulerGrpc {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "WatchBuild subscriber lagged, some events lost");
+                    }
                 }
             }
         });
@@ -331,7 +333,19 @@ impl WorkerService for SchedulerGrpc {
         let worker_id_for_recv = worker_id.clone();
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
-            while let Ok(Some(msg)) = stream.message().await {
+            loop {
+                let msg = match stream.message().await {
+                    Ok(Some(m)) => m,
+                    Ok(None) => break, // clean disconnect
+                    Err(e) => {
+                        warn!(
+                            worker_id = %worker_id_for_recv,
+                            error = %e,
+                            "worker stream read error, treating as disconnect"
+                        );
+                        break;
+                    }
+                };
                 if let Some(inner) = msg.msg {
                     match inner {
                         rio_proto::types::worker_message::Msg::Register(_) => {
@@ -429,8 +443,11 @@ impl WorkerService for SchedulerGrpc {
             running_builds: req.running_builds,
         };
 
+        // Heartbeats bypass backpressure: dropping a heartbeat under load
+        // would cause a false worker timeout -> reassignment -> more load.
+        // Same pattern as WorkerConnected/WorkerDisconnected.
         self.actor
-            .send(cmd)
+            .send_unchecked(cmd)
             .await
             .map_err(Self::actor_error_to_status)?;
 
