@@ -244,3 +244,39 @@ async fn test_harness_smoke() {
 
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Group 5: Protocol safety bounds
+// ---------------------------------------------------------------------------
+
+/// PutPath with chunks exceeding declared nar_size should be rejected.
+#[tokio::test]
+async fn test_put_path_rejects_oversized_nar() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    // Declare nar_size=100 but send 100_000 bytes (well over + 4KB tolerance)
+    let mut info = make_path_info("/nix/store/oversized-test", &[0u8; 100]);
+    info.nar_size = 100; // Lie about the size
+
+    let oversized_data = vec![0u8; 100_000];
+    let result = put_path(&mut client, info, oversized_data).await;
+
+    assert!(result.is_err(), "oversized NAR should be rejected");
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "should be INVALID_ARGUMENT, got: {status:?}"
+    );
+    assert!(
+        status.message().contains("exceed"),
+        "error message should mention size exceeded: {}",
+        status.message()
+    );
+
+    server.abort();
+}

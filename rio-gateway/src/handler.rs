@@ -271,6 +271,10 @@ async fn grpc_put_path(
     Ok(resp.into_inner().created)
 }
 
+/// Maximum NAR size accepted from the store over gRPC (4 GiB).
+/// Prevents a misbehaving store from OOMing the gateway.
+const MAX_NAR_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Fetch NAR data from store via gRPC GetPath.
 /// Returns (PathInfo, NAR bytes) or None if not found.
 async fn grpc_get_path(
@@ -299,6 +303,14 @@ async fn grpc_get_path(
                 info = Some(i);
             }
             Some(types::get_path_response::Msg::NarChunk(chunk)) => {
+                let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
+                if new_len > MAX_NAR_SIZE {
+                    return Err(anyhow::anyhow!(
+                        "NAR for {store_path} exceeds maximum {} bytes (received {}+)",
+                        MAX_NAR_SIZE,
+                        new_len
+                    ));
+                }
                 nar_data.extend_from_slice(&chunk);
             }
             None => {}
