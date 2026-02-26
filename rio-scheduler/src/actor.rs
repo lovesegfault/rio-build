@@ -1452,48 +1452,59 @@ impl DagActor {
     /// Dispatch ready derivations to available workers (FIFO).
     #[allow(clippy::while_let_loop)]
     async fn dispatch_ready(&mut self) {
-        loop {
-            // Peek at the next ready derivation
-            let drv_hash = match self.ready_queue.peek() {
-                Some(h) => h.to_string(),
-                None => break,
-            };
+        // Drain the queue, dispatching eligible derivations and deferring
+        // ineligible ones. Previously, `None => break` on the first ineligible
+        // derivation blocked all subsequent work (e.g., an aarch64 drv at
+        // queue head blocked all x86_64 dispatch).
+        let mut deferred: Vec<String> = Vec::new();
+        let mut dispatched_any = true;
 
-            // Find the derivation's requirements
-            let (system, required_features) = match self.dag.node(&drv_hash) {
-                Some(state) => (state.system.clone(), state.required_features.clone()),
-                None => {
-                    // Stale entry in queue, remove and continue
-                    self.ready_queue.pop_front();
-                    continue;
+        // Keep cycling until a full pass with no dispatches AND no stale removals.
+        // In practice this terminates quickly: each derivation is either
+        // dispatched, deferred, or removed (stale) exactly once per pass.
+        while dispatched_any {
+            dispatched_any = false;
+
+            while let Some(drv_hash) = self.ready_queue.pop_front() {
+                // Find the derivation's requirements
+                let (system, required_features) = match self.dag.node(&drv_hash) {
+                    Some(state) => (state.system.clone(), state.required_features.clone()),
+                    None => continue, // stale entry, drop
+                };
+
+                // Only dispatch if derivation is actually in Ready state
+                if self
+                    .dag
+                    .node(&drv_hash)
+                    .is_none_or(|s| s.status() != DerivationStatus::Ready)
+                {
+                    continue; // stale state, drop
                 }
-            };
 
-            // Only dispatch if derivation is actually in Ready state
-            if self
-                .dag
-                .node(&drv_hash)
-                .is_none_or(|s| s.status() != DerivationStatus::Ready)
-            {
-                self.ready_queue.pop_front();
-                continue;
+                // Find first eligible worker with capacity (FIFO - no scoring)
+                let eligible_worker = self
+                    .workers
+                    .values()
+                    .find(|w| w.has_capacity() && w.can_build(&system, &required_features))
+                    .map(|w| w.worker_id.clone());
+
+                match eligible_worker {
+                    Some(worker_id) => {
+                        self.assign_to_worker(&drv_hash, &worker_id).await;
+                        dispatched_any = true;
+                    }
+                    None => {
+                        // No eligible worker for this derivation. Defer and
+                        // continue scanning for others we CAN dispatch.
+                        deferred.push(drv_hash);
+                    }
+                }
             }
 
-            // Find first eligible worker with capacity (FIFO - no scoring)
-            let eligible_worker = self
-                .workers
-                .values()
-                .find(|w| w.has_capacity() && w.can_build(&system, &required_features))
-                .map(|w| w.worker_id.clone());
-
-            let worker_id = match eligible_worker {
-                Some(id) => id,
-                None => break, // No eligible workers, stop dispatching
-            };
-
-            // Pop from queue and assign
-            self.ready_queue.pop_front();
-            self.assign_to_worker(&drv_hash, &worker_id).await;
+            // Re-queue deferred derivations at the front, preserving order.
+            for hash in deferred.drain(..).rev() {
+                self.ready_queue.push_front(hash);
+            }
         }
     }
 
@@ -2871,6 +2882,78 @@ pub(crate) mod tests {
             info2.status,
             DerivationStatus::Assigned | DerivationStatus::Ready
         ));
+    }
+
+    /// Dispatch should skip over derivations with no eligible worker (wrong
+    /// system or missing feature) instead of blocking the entire queue.
+    #[tokio::test]
+    async fn test_dispatch_skips_ineligible_derivation() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Only x86_64 worker registered.
+        let mut stream_rx = connect_worker(&handle, "x86-only-worker", "x86_64-linux", 2).await;
+
+        // Merge aarch64 derivation FIRST (goes to queue head), then x86_64.
+        // With the old `None => break`, the aarch64 drv at head would block
+        // the x86_64 drv from being dispatched.
+        let build_arm = Uuid::new_v4();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id: build_arm,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes: vec![make_test_node(
+                    "arm-hash",
+                    "/nix/store/arm-hash.drv",
+                    "aarch64-linux",
+                )],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let _rx = reply_rx.await.unwrap().unwrap();
+
+        let build_x86 = Uuid::new_v4();
+        let _rx = merge_single_node(
+            &handle,
+            build_x86,
+            "x86-hash",
+            "/nix/store/x86-hash.drv",
+            "scheduled",
+        )
+        .await;
+        settle().await;
+
+        // x86_64 derivation should be dispatched despite aarch64 ahead of it.
+        let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .expect("x86_64 derivation should be dispatched within 2s")
+            .expect("stream should not close");
+        let dispatched_path = match msg.msg {
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
+            _ => panic!("expected assignment"),
+        };
+        assert_eq!(
+            dispatched_path, "/nix/store/x86-hash.drv",
+            "x86_64 derivation should be dispatched even with ineligible aarch64 ahead in queue"
+        );
+
+        // aarch64 derivation should still be Ready (not stuck, not dispatched).
+        let arm_info = handle
+            .debug_query_derivation("arm-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            arm_info.status,
+            DerivationStatus::Ready,
+            "aarch64 derivation should remain Ready (no eligible worker)"
+        );
     }
 
     /// TOCTOU fix: a stale heartbeat (sent before scheduler assigned a
