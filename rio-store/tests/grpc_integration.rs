@@ -345,6 +345,52 @@ async fn test_put_path_rejects_absurd_nar_size() {
     server.abort();
 }
 
+/// PutPath with more than MAX_REFERENCES entries should be rejected.
+#[tokio::test]
+async fn test_put_path_rejects_excessive_references() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let nar = make_nar(b"refs-test");
+    let mut info = make_path_info(
+        "/nix/store/66666666666666666666666666666666-too-many-refs",
+        &nar,
+    );
+    // MAX_REFERENCES = 10_000; send 10_001 to trigger the check.
+    info.references = (0..10_001)
+        .map(|i| format!("/nix/store/{:032}-{}", i, i))
+        .collect();
+
+    let result = put_path(&mut client, info, nar).await;
+    assert!(result.is_err(), "10,001 references should be rejected");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("too many references"),
+        "error should mention reference limit: {}",
+        status.message()
+    );
+
+    server.abort();
+}
+
+/// PutPath with a malformed reference path should be rejected.
+#[tokio::test]
+async fn test_put_path_rejects_malformed_reference() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let nar = make_nar(b"refs-test");
+    let mut info = make_path_info("/nix/store/77777777777777777777777777777777-bad-ref", &nar);
+    info.references = vec!["not-a-valid-store-path".into()];
+
+    let result = put_path(&mut client, info, nar).await;
+    assert!(result.is_err(), "malformed reference should be rejected");
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    server.abort();
+}
+
 /// Malformed store paths (no 32-char hash prefix, traversal attempts) should
 /// be rejected with INVALID_ARGUMENT at the RPC boundary.
 #[tokio::test]

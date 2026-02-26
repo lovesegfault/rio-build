@@ -121,6 +121,25 @@ impl StoreService for StoreServiceImpl {
                 info.nar_size, MAX_NAR_SIZE
             )));
         }
+        // Bound and validate references. Unbounded repeated fields from
+        // untrusted input would be persisted to the DB without check.
+        if info.references.len() > rio_common::limits::MAX_REFERENCES {
+            return Err(Status::invalid_argument(format!(
+                "too many references: {} (max {})",
+                info.references.len(),
+                rio_common::limits::MAX_REFERENCES
+            )));
+        }
+        for r in &info.references {
+            validate_store_path(r)?;
+        }
+        if info.signatures.len() > rio_common::limits::MAX_SIGNATURES {
+            return Err(Status::invalid_argument(format!(
+                "too many signatures: {} (max {})",
+                info.signatures.len(),
+                rio_common::limits::MAX_SIGNATURES
+            )));
+        }
 
         // Compute store_path_hash if not provided
         let store_path_hash = if info.store_path_hash.is_empty() {
