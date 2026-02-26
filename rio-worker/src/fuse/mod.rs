@@ -298,44 +298,61 @@ impl NixStoreFs {
                 store_path: store_path.clone(),
             };
 
-            let response = client.get_path(request).await.map_err(|e| {
-                tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
-                Errno::EIO
-            })?;
+            // Timeout the entire fetch (initial call + stream drain). A stalled
+            // store would otherwise block this FUSE thread forever; a few
+            // stalls exhaust the FUSE thread pool and freeze the whole mount.
+            let fetch_fut = async {
+                let response = client.get_path(request).await.map_err(|e| {
+                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                    Errno::EIO
+                })?;
 
-            let mut stream = response.into_inner();
-            let mut nar_bytes = Vec::new();
+                let mut stream = response.into_inner();
+                let mut nar_bytes = Vec::new();
 
-            while let Some(msg) = stream.message().await.map_err(|e| {
-                tracing::warn!(
-                    store_path = %store_path,
-                    error = %e,
-                    "GetPath stream error"
-                );
-                Errno::EIO
-            })? {
-                match msg.msg {
-                    Some(get_path_response::Msg::NarChunk(chunk)) => {
-                        let new_len = (nar_bytes.len() as u64).saturating_add(chunk.len() as u64);
-                        if new_len > rio_common::limits::MAX_NAR_SIZE {
-                            tracing::error!(
-                                store_path = %store_path,
-                                size = new_len,
-                                limit = rio_common::limits::MAX_NAR_SIZE,
-                                "NAR exceeds MAX_NAR_SIZE"
-                            );
-                            return Err(Errno::EFBIG);
+                while let Some(msg) = stream.message().await.map_err(|e| {
+                    tracing::warn!(
+                        store_path = %store_path,
+                        error = %e,
+                        "GetPath stream error"
+                    );
+                    Errno::EIO
+                })? {
+                    match msg.msg {
+                        Some(get_path_response::Msg::NarChunk(chunk)) => {
+                            let new_len =
+                                (nar_bytes.len() as u64).saturating_add(chunk.len() as u64);
+                            if new_len > rio_common::limits::MAX_NAR_SIZE {
+                                tracing::error!(
+                                    store_path = %store_path,
+                                    size = new_len,
+                                    limit = rio_common::limits::MAX_NAR_SIZE,
+                                    "NAR exceeds MAX_NAR_SIZE"
+                                );
+                                return Err(Errno::EFBIG);
+                            }
+                            nar_bytes.extend_from_slice(&chunk);
                         }
-                        nar_bytes.extend_from_slice(&chunk);
+                        Some(get_path_response::Msg::Info(_)) => {
+                            // First message contains metadata; we already have it
+                        }
+                        None => {}
                     }
-                    Some(get_path_response::Msg::Info(_)) => {
-                        // First message contains metadata; we already have it
-                    }
-                    None => {}
                 }
-            }
 
-            Ok::<Vec<u8>, Errno>(nar_bytes)
+                Ok::<Vec<u8>, Errno>(nar_bytes)
+            };
+
+            tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, fetch_fut)
+                .await
+                .map_err(|_| {
+                    tracing::error!(
+                        store_path = %store_path,
+                        timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                        "GetPath timed out; FUSE thread would block indefinitely without this"
+                    );
+                    Errno::EIO
+                })?
         })?;
         metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
             .record(fetch_start.elapsed().as_secs_f64());
@@ -411,15 +428,31 @@ impl NixStoreFs {
             let request = QueryPathInfoRequest {
                 store_path: store_path.clone(),
             };
-            match client.query_path_info(request).await {
-                Ok(_) => Ok(true),
-                Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
-                Err(status) => {
+            // Timeout: QueryPathInfo is called from lookup() for every
+            // top-level store path miss. A stalled store would block this
+            // FUSE thread forever; lookup is the most frequent FUSE op.
+            match tokio::time::timeout(
+                rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                client.query_path_info(request),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(true),
+                Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(false),
+                Ok(Err(status)) => {
                     tracing::warn!(
                         store_path = %store_path,
                         code = ?status.code(),
                         error = %status.message(),
                         "QueryPathInfo failed with non-NOT_FOUND error"
+                    );
+                    Err(Errno::EIO)
+                }
+                Err(_) => {
+                    tracing::error!(
+                        store_path = %store_path,
+                        timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                        "QueryPathInfo timed out"
                     );
                     Err(Errno::EIO)
                 }
