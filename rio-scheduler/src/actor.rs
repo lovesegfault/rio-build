@@ -438,17 +438,35 @@ impl DagActor {
     ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
         metrics::counter!("rio_scheduler_builds_total").increment(1);
 
-        // Create build record in DB
+        // === Step 1: DB build row ==================================
+        // If this fails, nothing is in memory; caller gets a clean error.
         self.db
             .insert_build(build_id, tenant_id.as_deref(), &priority_class)
             .await?;
 
-        // Create broadcast channel for build events
+        // === Step 2: DAG merge (BEFORE in-memory map inserts) ========
+        // If merge fails (cycle), nothing is in the actor's maps; only the
+        // DB build row exists, which we best-effort delete. This ordering
+        // prevents the leak where a cyclic submission left permanent entries
+        // in build_events/build_sequences/builds with no cleanup scheduled.
+        let merge_result = match self.dag.merge(build_id, &nodes, &edges) {
+            Ok(r) => r,
+            Err(e) => {
+                // Best-effort: clean up the orphan build row.
+                if let Err(db_e) = self.db.delete_build(build_id).await {
+                    warn!(build_id = %build_id, error = %db_e,
+                          "failed to delete orphan build row after DAG merge failure");
+                }
+                return Err(ActorError::Internal(format!("DAG merge failed: {e}")));
+            }
+        };
+        let newly_inserted = &merge_result.newly_inserted;
+
+        // === Step 3: In-memory map inserts ============================
         let (event_tx, event_rx) = broadcast::channel(BUILD_EVENT_BUFFER_SIZE);
         self.build_events.insert(build_id, event_tx);
         self.build_sequences.insert(build_id, 0);
 
-        // Create in-memory build info
         let build_info = BuildInfo::new_pending(
             build_id,
             tenant_id,
@@ -459,64 +477,30 @@ impl DagActor {
         );
         self.builds.insert(build_id, build_info);
 
-        // Merge nodes and edges into the global DAG
-        let newly_inserted = self
-            .dag
-            .merge(build_id, &nodes, &edges)
-            .map_err(|e| ActorError::Internal(format!("DAG merge failed: {e}")))?;
-
-        // Persist newly inserted derivations and edges to DB
-        for node in &nodes {
-            let drv_hash = &node.drv_hash;
-            let status = if newly_inserted.contains(drv_hash) {
-                DerivationStatus::Created
-            } else {
-                // Existing node, just link the build
-                if let Some(state) = self.dag.node(drv_hash) {
-                    state.status()
-                } else {
-                    DerivationStatus::Created
-                }
-            };
-
-            let db_id = self
-                .db
-                .upsert_derivation(
-                    drv_hash,
-                    &node.drv_path,
-                    if node.pname.is_empty() {
-                        None
-                    } else {
-                        Some(&node.pname)
-                    },
-                    &node.system,
-                    status,
-                    &node.required_features,
-                )
-                .await?;
-
-            // Store db_id on the node
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                state.db_id = Some(db_id);
-            }
-
-            // Link build to derivation in DB
-            self.db.insert_build_derivation(build_id, db_id).await?;
+        // === Step 4: DB persistence with rollback on error ============
+        // If any of these fail, roll back the merge AND the map inserts
+        // AND delete the DB build row, so in-memory and DB state stay
+        // consistent. After this block the build is committed (Active).
+        if let Err(e) = self
+            .persist_merge_to_db(build_id, &nodes, &edges, newly_inserted)
+            .await
+        {
+            error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back");
+            self.cleanup_failed_merge(build_id, &merge_result).await;
+            return Err(e);
         }
 
-        // Persist edges
-        for edge in &edges {
-            // Resolve drv_path -> db_id
-            let parent_id = self.find_db_id_by_path(&edge.parent_drv_path);
-            let child_id = self.find_db_id_by_path(&edge.child_drv_path);
-
-            if let (Some(pid), Some(cid)) = (parent_id, child_id) {
-                self.db.insert_edge(pid, cid).await?;
-            }
+        // Transition build to active. If this fails, roll back everything.
+        if let Err(e) = self.transition_build(build_id, BuildState::Active).await {
+            error!(build_id = %build_id, error = %e, "transition to Active failed; rolling back");
+            self.cleanup_failed_merge(build_id, &merge_result).await;
+            return Err(e);
         }
 
-        // Transition build to active
-        self.transition_build(build_id, BuildState::Active).await?;
+        // === Step 5: Post-Active processing ==========================
+        // From here on, DB write failures are log-and-continue (build is
+        // Active and in a valid state; DB sync will catch up on next status
+        // update or heartbeat reconciliation).
 
         // Index proto nodes by hash for efficient lookup during the transition loop.
         let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
@@ -530,9 +514,7 @@ impl DagActor {
         // Completed. This closes the TOCTOU window between the gateway's
         // FindMissingPaths and our merge (another build may have completed the
         // derivation in between).
-        let cached_hashes = self
-            .check_cached_outputs(&newly_inserted, &node_index)
-            .await;
+        let cached_hashes = self.check_cached_outputs(newly_inserted, &node_index).await;
 
         for drv_hash in &cached_hashes {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
@@ -605,9 +587,13 @@ impl DagActor {
                         if let Err(e) = state.transition(DerivationStatus::Ready) {
                             warn!(drv_hash, error = %e, "Queued->Ready transition failed");
                         }
-                        self.db
+                        if let Err(e) = self
+                            .db
                             .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
-                            .await?;
+                            .await
+                        {
+                            error!(drv_hash, error = %e, "failed to persist Ready status (build is Active; continuing)");
+                        }
                         if is_interactive {
                             self.ready_queue.push_front(drv_hash.clone());
                         } else {
@@ -618,21 +604,29 @@ impl DagActor {
                         if let Err(e) = state.transition(DerivationStatus::Queued) {
                             warn!(drv_hash, error = %e, "Created->Queued transition failed");
                         }
-                        self.db
+                        if let Err(e) = self
+                            .db
                             .update_derivation_status(drv_hash, DerivationStatus::Queued, None)
-                            .await?;
+                            .await
+                        {
+                            error!(drv_hash, error = %e, "failed to persist Queued status (build is Active; continuing)");
+                        }
                     }
                     DerivationStatus::DependencyFailed => {
                         if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
                             warn!(drv_hash, error = %e, "Created->DependencyFailed transition failed");
                         }
-                        self.db
+                        if let Err(e) = self
+                            .db
                             .update_derivation_status(
                                 drv_hash,
                                 DerivationStatus::DependencyFailed,
                                 None,
                             )
-                            .await?;
+                            .await
+                        {
+                            error!(drv_hash, error = %e, "failed to persist DependencyFailed status (build is Active; continuing)");
+                        }
                         if first_dep_failed.is_none() {
                             first_dep_failed = Some(drv_hash.clone());
                         }
@@ -698,6 +692,110 @@ impl DagActor {
         }
 
         Ok(event_rx)
+    }
+
+    /// Persist nodes and edges to the DB after a successful DAG merge.
+    /// Extracted from handle_merge_dag so failures can be caught and
+    /// rolled back via cleanup_failed_merge.
+    async fn persist_merge_to_db(
+        &mut self,
+        build_id: Uuid,
+        nodes: &[rio_proto::types::DerivationNode],
+        edges: &[rio_proto::types::DerivationEdge],
+        newly_inserted: &[String],
+    ) -> Result<(), ActorError> {
+        for node in nodes {
+            let drv_hash = &node.drv_hash;
+            let status = if newly_inserted.contains(drv_hash) {
+                DerivationStatus::Created
+            } else if let Some(state) = self.dag.node(drv_hash) {
+                // Existing node, just link the build
+                state.status()
+            } else {
+                DerivationStatus::Created
+            };
+
+            let db_id = self
+                .db
+                .upsert_derivation(
+                    drv_hash,
+                    &node.drv_path,
+                    if node.pname.is_empty() {
+                        None
+                    } else {
+                        Some(&node.pname)
+                    },
+                    &node.system,
+                    status,
+                    &node.required_features,
+                )
+                .await?;
+
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                state.db_id = Some(db_id);
+            }
+
+            self.db.insert_build_derivation(build_id, db_id).await?;
+        }
+
+        for edge in edges {
+            let parent_id = self.find_db_id_by_path(&edge.parent_drv_path);
+            let child_id = self.find_db_id_by_path(&edge.child_drv_path);
+
+            match (parent_id, child_id) {
+                (Some(pid), Some(cid)) => {
+                    self.db.insert_edge(pid, cid).await?;
+                }
+                _ => {
+                    // A db_id lookup failure means the edge references a
+                    // derivation that wasn't upserted above — a bug in the
+                    // merge/persist flow. Previously this was silently
+                    // skipped, meaning the in-memory DAG had the edge but
+                    // PostgreSQL did not. After a scheduler restart, the
+                    // recovered DAG would be missing dependency edges.
+                    error!(
+                        parent_path = %edge.parent_drv_path,
+                        child_path = %edge.child_drv_path,
+                        parent_id = ?parent_id,
+                        child_id = ?child_id,
+                        "edge persistence failed: db_id lookup failed (DAG/DB would drift)"
+                    );
+                    return Err(ActorError::Internal(format!(
+                        "edge {} -> {} references unpersisted derivation (db_id missing)",
+                        edge.parent_drv_path, edge.child_drv_path
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Undo all in-memory state from a failed handle_merge_dag AFTER the
+    /// merge succeeded but DB persistence or transition_build failed.
+    /// Rolls back the DAG merge, removes map entries, and best-effort
+    /// deletes the orphan DB build row.
+    async fn cleanup_failed_merge(
+        &mut self,
+        build_id: Uuid,
+        merge_result: &crate::dag::MergeResult,
+    ) {
+        self.dag.rollback_merge(
+            &merge_result.newly_inserted,
+            &merge_result.new_edges,
+            &merge_result.interest_added,
+            build_id,
+        );
+        self.build_events.remove(&build_id);
+        self.build_sequences.remove(&build_id);
+        self.builds.remove(&build_id);
+        if let Err(db_e) = self.db.delete_build(build_id).await {
+            warn!(
+                build_id = %build_id,
+                error = %db_e,
+                "failed to delete orphan build row during merge rollback"
+            );
+        }
     }
 
     /// Query the store for newly-inserted derivations' expected outputs and
@@ -4293,6 +4391,82 @@ pub(crate) mod tests {
 
         // TestDb::drop uses a separate admin connection, so closing the test
         // pool here doesn't prevent database cleanup.
+    }
+
+    /// A cyclic DAG submission must not leak into the actor's in-memory maps.
+    /// Regression test for the reorder fix: merge() now runs BEFORE the map
+    /// inserts, so a CycleDetected error leaves no trace in
+    /// build_events/build_sequences/builds.
+    #[tokio::test]
+    async fn test_cyclic_merge_does_not_leak_in_memory_state() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        let build_id = Uuid::new_v4();
+        // A depends on B, B depends on A — cycle.
+        let nodes = vec![
+            make_test_node("cycA", "/nix/store/cycA.drv", "x86_64-linux"),
+            make_test_node("cycB", "/nix/store/cycB.drv", "x86_64-linux"),
+        ];
+        let edges = vec![
+            rio_proto::types::DerivationEdge {
+                parent_drv_path: "/nix/store/cycA.drv".into(),
+                child_drv_path: "/nix/store/cycB.drv".into(),
+            },
+            rio_proto::types::DerivationEdge {
+                parent_drv_path: "/nix/store/cycB.drv".into(),
+                child_drv_path: "/nix/store/cycA.drv".into(),
+            },
+        ];
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::MergeDag {
+                build_id,
+                tenant_id: None,
+                priority_class: "scheduled".into(),
+                nodes,
+                edges,
+                options: BuildOptions::default(),
+                keep_going: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let result = reply_rx.await.unwrap();
+        assert!(
+            result.is_err(),
+            "cyclic DAG should be rejected with an error"
+        );
+
+        // The build must NOT be in the actor's maps (it was never inserted,
+        // or it was rolled back). QueryBuildStatus should return NotFound.
+        let (status_tx, status_rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::QueryBuildStatus {
+                build_id,
+                reply: status_tx,
+            })
+            .await
+            .unwrap();
+        let status_result = status_rx.await.unwrap();
+        assert!(
+            matches!(status_result, Err(ActorError::BuildNotFound(_))),
+            "build should not be in actor maps after cyclic merge failure; got {status_result:?}"
+        );
+
+        // The DAG should have no trace of the cyclic nodes.
+        let drv_a = handle.debug_query_derivation("cycA").await.unwrap();
+        assert!(
+            drv_a.is_none(),
+            "cycA should not exist in DAG after cycle rollback"
+        );
+        let drv_b = handle.debug_query_derivation("cycB").await.unwrap();
+        assert!(
+            drv_b.is_none(),
+            "cycB should not exist in DAG after cycle rollback"
+        );
     }
 
     // -----------------------------------------------------------------------
