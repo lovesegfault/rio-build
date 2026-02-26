@@ -121,6 +121,7 @@ pub struct DebugWorkerInfo {
     pub is_registered: bool,
     pub system: Option<String>,
     pub running_count: usize,
+    pub running_builds: Vec<String>,
 }
 
 /// Test-only: snapshot of derivation state for assertions.
@@ -320,6 +321,7 @@ impl DagActor {
                             is_registered: w.is_registered(),
                             system: w.system.clone(),
                             running_count: w.running_builds.len(),
+                            running_builds: w.running_builds.iter().cloned().collect(),
                         })
                         .collect();
                     let _ = reply.send(workers);
@@ -1184,6 +1186,49 @@ impl DagActor {
         max_builds: u32,
         running_builds: Vec<String>,
     ) {
+        // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
+        // The scheduler is authoritative for what it assigned. We reconcile:
+        //   - Keep scheduler-known builds that are still Assigned/Running
+        //     in the DAG (heartbeat may predate the assignment).
+        //   - Accept heartbeat-reported builds we don't know about, but warn
+        //     (shouldn't happen; indicates split-brain or restart).
+        //   - Remove builds absent from heartbeat only if DAG state is no
+        //     longer Assigned/Running (completion already processed).
+        let heartbeat_set: HashSet<String> = running_builds.into_iter().collect();
+
+        // Compute the reconciled running set before borrowing `worker` mutably,
+        // so we can read self.dag for derivation state checks.
+        let prev_running: HashSet<String> = self
+            .workers
+            .get(&worker_id)
+            .map(|w| w.running_builds.clone())
+            .unwrap_or_default();
+
+        let mut reconciled: HashSet<String> = HashSet::new();
+        // Keep scheduler-assigned builds that are still in-flight.
+        for drv_hash in &prev_running {
+            let still_inflight = self.dag.node(drv_hash).is_some_and(|s| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Assigned | DerivationStatus::Running
+                )
+            });
+            if still_inflight {
+                reconciled.insert(drv_hash.clone());
+            }
+        }
+        // Add heartbeat-reported builds we don't know about (with warning).
+        for drv_hash in &heartbeat_set {
+            if !reconciled.contains(drv_hash) && !prev_running.contains(drv_hash) {
+                warn!(
+                    worker_id = %worker_id,
+                    drv_hash,
+                    "heartbeat reports running build scheduler did not assign"
+                );
+                reconciled.insert(drv_hash.clone());
+            }
+        }
+
         let worker = self
             .workers
             .entry(worker_id.clone())
@@ -1205,9 +1250,7 @@ impl DagActor {
         worker.max_builds = max_builds;
         worker.last_heartbeat = Instant::now();
         worker.missed_heartbeats = 0;
-
-        // Update running builds from heartbeat
-        worker.running_builds = running_builds.into_iter().collect();
+        worker.running_builds = reconciled;
 
         if !was_registered && worker.is_registered() {
             info!(worker_id, "worker fully registered (heartbeat + stream)");
@@ -2440,6 +2483,72 @@ pub(crate) mod tests {
             info2.status,
             DerivationStatus::Assigned | DerivationStatus::Ready
         ));
+    }
+
+    /// TOCTOU fix: a stale heartbeat (sent before scheduler assigned a
+    /// derivation) must not clobber the scheduler's fresh assignment in
+    /// worker.running_builds. The scheduler is authoritative.
+    #[tokio::test]
+    async fn test_heartbeat_does_not_clobber_fresh_assignment() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+
+        // Register worker (initial heartbeat has empty running_builds).
+        let _stream_rx = connect_worker(&handle, "toctou-worker", "x86_64-linux", 2).await;
+        settle().await;
+
+        // Merge a derivation. Scheduler will assign it to the worker and
+        // insert it into worker.running_builds.
+        let build_id = Uuid::new_v4();
+        let drv_hash = "toctou-drv-hash";
+        let drv_path = "/nix/store/toctou-drv-hash.drv";
+        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        settle().await;
+
+        // Verify: derivation is Assigned, worker.running_builds contains it.
+        let info = handle
+            .debug_query_derivation(drv_hash)
+            .await
+            .unwrap()
+            .expect("derivation should exist");
+        assert_eq!(info.status, DerivationStatus::Assigned);
+
+        let workers = handle.debug_query_workers().await.unwrap();
+        let w = workers
+            .iter()
+            .find(|w| w.worker_id == "toctou-worker")
+            .unwrap();
+        assert!(
+            w.running_builds.contains(&drv_hash.to_string()),
+            "scheduler should have tracked the assignment in worker.running_builds"
+        );
+
+        // Send a STALE heartbeat with empty running_builds. This mimics the
+        // race: worker sent heartbeat before receiving/acking the assignment.
+        handle
+            .send_unchecked(ActorCommand::Heartbeat {
+                worker_id: "toctou-worker".into(),
+                system: "x86_64-linux".into(),
+                supported_features: vec![],
+                max_builds: 2,
+                running_builds: vec![], // stale — does NOT include fresh assignment
+            })
+            .await
+            .unwrap();
+        settle().await;
+
+        // Assignment must still be tracked. Before the fix, running_builds
+        // would be wholesale replaced with the empty set, orphaning the
+        // assignment (completion would later warn "unknown derivation").
+        let workers = handle.debug_query_workers().await.unwrap();
+        let w = workers
+            .iter()
+            .find(|w| w.worker_id == "toctou-worker")
+            .unwrap();
+        assert!(
+            w.running_builds.contains(&drv_hash.to_string()),
+            "stale heartbeat must not clobber scheduler's fresh assignment"
+        );
     }
 
     // -----------------------------------------------------------------------
