@@ -457,7 +457,25 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
         }
         msg_count += 1;
 
-        // Check for timeout-based flush
+        // Check for timeout-based flush.
+        //
+        // TODO(phase2b): honor the 100ms BATCH_TIMEOUT during silent periods.
+        // Currently maybe_flush() only fires once per stderr message, so a
+        // build that's silent for 60s (common: long compile that buffers
+        // stdout) won't flush its partial batch until the next STDERR_NEXT
+        // or STDERR_LAST arrives. The observability spec's "64 lines / 100ms"
+        // guarantee is NOT upheld during quiet periods.
+        //
+        // The obvious fix (tokio::time::timeout around read_stderr_message)
+        // is UNSAFE: dropping the read future mid-u64-read leaves partial
+        // bytes consumed from the daemon stdout pipe; the next read desyncs
+        // the Nix STDERR protocol. Safe fixes:
+        //   (a) Spawn read_stderr_message into an owned task that pushes to
+        //       a mpsc channel (cancel-safe); select! on rx.recv() + interval.
+        //   (b) Fused-future pattern: hold the pinned read future across
+        //       select! iterations, only recreate on completion.
+        // Both require reworking the &mut R borrow. Impact is user-visible
+        // log latency (build appears hung), not correctness.
         if let Some(batch) = batcher.maybe_flush()
             && !send_batch(log_tx, batch).await
         {

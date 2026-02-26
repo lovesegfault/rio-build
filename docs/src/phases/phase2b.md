@@ -11,6 +11,7 @@
   - Scheduler maintains per-derivation ring buffer for active log serving
   - Async flush to S3 on derivation completion
   - Log rate limiting per build (`log_rate_limit`, `log_size_limit`)
+  - Honor 100ms BATCH_TIMEOUT during silent build periods (spawn reader into owned task, select! on channel + interval; naive timeout-wrap is cancel-unsafe)
 - [ ] Build correlation IDs (UUID v7): generated at `SubmitBuild`, propagated via gRPC metadata, included in all log spans
 - [ ] `tracing-opentelemetry`: trace propagation across gRPC boundaries (export to stdout or local Jaeger in dev)
 - [ ] Container images for each component (Nix-based via `dockerTools.buildLayeredImage`)
