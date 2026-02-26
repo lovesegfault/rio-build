@@ -22,7 +22,7 @@ use crate::db::SchedulerDb;
 use crate::queue::ReadyQueue;
 use crate::state::{
     BuildInfo, BuildOptions, BuildState, DerivationStatus, HEARTBEAT_TIMEOUT_SECS,
-    MAX_MISSED_HEARTBEATS, POISON_THRESHOLD, POISON_TTL, RetryPolicy, WorkerState,
+    MAX_MISSED_HEARTBEATS, POISON_THRESHOLD, POISON_TTL, PriorityClass, RetryPolicy, WorkerState,
 };
 
 /// Channel capacity for the actor command channel.
@@ -48,7 +48,7 @@ pub enum ActorCommand {
     MergeDag {
         build_id: Uuid,
         tenant_id: Option<String>,
-        priority_class: String,
+        priority_class: PriorityClass,
         nodes: Vec<rio_proto::types::DerivationNode>,
         edges: Vec<rio_proto::types::DerivationEdge>,
         options: BuildOptions,
@@ -430,7 +430,7 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
         tenant_id: Option<String>,
-        priority_class: String,
+        priority_class: PriorityClass,
         nodes: Vec<rio_proto::types::DerivationNode>,
         edges: Vec<rio_proto::types::DerivationEdge>,
         options: BuildOptions,
@@ -441,7 +441,7 @@ impl DagActor {
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
         self.db
-            .insert_build(build_id, tenant_id.as_deref(), &priority_class)
+            .insert_build(build_id, tenant_id.as_deref(), priority_class)
             .await?;
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========
@@ -568,7 +568,7 @@ impl DagActor {
         let is_interactive = self
             .builds
             .get(&build_id)
-            .map(|b| b.priority_class == "interactive")
+            .map(|b| b.priority_class.is_interactive())
             .unwrap_or(false);
 
         // Track whether any newly inserted node was immediately marked
@@ -1989,7 +1989,7 @@ impl DagActor {
         self.get_interested_builds(drv_hash).iter().any(|build_id| {
             self.builds
                 .get(build_id)
-                .map(|b| b.priority_class == "interactive")
+                .map(|b| b.priority_class.is_interactive())
                 .unwrap_or(false)
         })
     }
@@ -2421,14 +2421,14 @@ pub(crate) mod tests {
         build_id: Uuid,
         hash: &str,
         path: &str,
-        priority_class: &str,
+        priority_class: PriorityClass,
     ) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: priority_class.into(),
+                priority_class,
                 nodes: vec![make_test_node(hash, path, "x86_64-linux")],
                 edges: vec![],
                 options: BuildOptions::default(),
@@ -2527,7 +2527,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "abc123hash";
         let drv_path = "/nix/store/abc123hash-foo.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
 
         settle().await;
 
@@ -2597,7 +2604,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "disconnect-test-hash";
         let drv_path = "/nix/store/disconnect-test-hash.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Worker should have received an assignment
@@ -2675,7 +2689,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "infra-fail-hash";
         let drv_path = "/nix/store/infra-fail-hash.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Send completion with InfrastructureFailure (what gRPC layer sends
@@ -2731,7 +2752,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "extreme-ts-hash";
         let drv_path = "/nix/store/extreme-ts-hash.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Send completion with extreme timestamps that would overflow i64 subtraction.
@@ -2801,7 +2829,7 @@ pub(crate) mod tests {
             build_normal,
             "hash-normal",
             "/nix/store/hash-normal.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -2824,7 +2852,7 @@ pub(crate) mod tests {
             build_scheduled2,
             "hash-scheduled2",
             "/nix/store/hash-scheduled2.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
 
@@ -2835,7 +2863,7 @@ pub(crate) mod tests {
             build_ifd,
             "hash-ifd",
             "/nix/store/hash-ifd.drv",
-            "interactive",
+            PriorityClass::Interactive,
         )
         .await;
         settle().await;
@@ -2888,7 +2916,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![
                     make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
                     make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
@@ -2950,7 +2978,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![
                     make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
                     make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
@@ -3046,7 +3074,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![
                     make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
                     make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
@@ -3156,7 +3184,7 @@ pub(crate) mod tests {
             build1,
             "preleaf",
             "/nix/store/preleaf.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3190,7 +3218,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id: build2,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![
                     make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
                     make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
@@ -3254,7 +3282,7 @@ pub(crate) mod tests {
             build_id,
             "watch-hash",
             "/nix/store/watch-hash.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3320,7 +3348,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "cleanup-hash";
         let drv_path = "/nix/store/cleanup-hash.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         handle
@@ -3395,7 +3430,7 @@ pub(crate) mod tests {
             build_id,
             "retry-hash",
             "/nix/store/retry-hash.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3458,7 +3493,7 @@ pub(crate) mod tests {
             build_id,
             "maxretry-hash",
             "/nix/store/maxretry-hash.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3507,7 +3542,7 @@ pub(crate) mod tests {
             build_id,
             "cancel-hash",
             "/nix/store/cancel-hash.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3585,7 +3620,7 @@ pub(crate) mod tests {
             build_id,
             "watch-events-hash",
             "/nix/store/watch-events-hash.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3656,7 +3691,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id: build_arm,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_test_node(
                     "arm-hash",
                     "/nix/store/arm-hash.drv",
@@ -3677,7 +3712,7 @@ pub(crate) mod tests {
             build_x86,
             "x86-hash",
             "/nix/store/x86-hash.drv",
-            "scheduled",
+            PriorityClass::Scheduled,
         )
         .await;
         settle().await;
@@ -3725,7 +3760,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![make_test_node(
                     "opts-hash",
                     "/nix/store/opts-hash.drv",
@@ -3783,7 +3818,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "toctou-drv-hash";
         let drv_path = "/nix/store/toctou-drv-hash.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Verify: derivation is Assigned, worker.running_builds contains it.
@@ -3851,7 +3893,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "poison-drv";
         let drv_path = "/nix/store/poison-drv.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
@@ -3915,7 +3964,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![
                     make_test_node("chainA", "/nix/store/chainA.drv", "x86_64-linux"),
                     make_test_node("chainB", "/nix/store/chainB.drv", "x86_64-linux"),
@@ -4007,8 +4056,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "idem-hash";
         let drv_path = "/nix/store/idem-hash.drv";
-        let mut event_rx =
-            merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let mut event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Send completion TWICE.
@@ -4216,7 +4271,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
                 edges: vec![],
                 options: BuildOptions::default(),
@@ -4285,7 +4340,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![node],
                 edges: vec![],
                 options: BuildOptions::default(),
@@ -4331,7 +4386,14 @@ pub(crate) mod tests {
         let build_id = Uuid::new_v4();
         let drv_hash = "db-fault-hash";
         let drv_path = "/nix/store/db-fault-hash.drv";
-        let _event_rx = merge_single_node(&handle, build_id, drv_hash, drv_path, "scheduled").await;
+        let _event_rx = merge_single_node(
+            &handle,
+            build_id,
+            drv_hash,
+            drv_path,
+            PriorityClass::Scheduled,
+        )
+        .await;
         settle().await;
 
         // Sanity check: derivation was dispatched.
@@ -4424,7 +4486,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes,
                 edges,
                 options: BuildOptions::default(),
@@ -4586,7 +4648,7 @@ pub(crate) mod tests {
             .send_unchecked(ActorCommand::MergeDag {
                 build_id,
                 tenant_id: None,
-                priority_class: "scheduled".into(),
+                priority_class: PriorityClass::Scheduled,
                 nodes: vec![
                     make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
                     make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),

@@ -121,9 +121,11 @@ impl SchedulerService for SchedulerGrpc {
                 Some(req.tenant_id)
             },
             priority_class: if req.priority_class.is_empty() {
-                "scheduled".to_string()
+                crate::state::PriorityClass::default()
             } else {
                 req.priority_class
+                    .parse()
+                    .map_err(|e| Status::invalid_argument(format!("priority_class: {e}")))?
             },
             nodes: req.nodes,
             edges: req.edges,
@@ -754,6 +756,33 @@ mod tests {
         assert!(
             status.message().contains("system"),
             "error should mention system: {}",
+            status.message()
+        );
+    }
+
+    /// SubmitBuild with an unrecognized priority_class should be rejected
+    /// at the gRPC boundary (PriorityClass::FromStr). Previously this leaked
+    /// as a PostgreSQL CHECK constraint violation in Status::internal.
+    #[tokio::test]
+    async fn test_submit_build_rejects_invalid_priority_class() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let (handle, _task) = setup_actor(db.pool.clone()).await;
+        let grpc = SchedulerGrpc::new(handle);
+
+        let req = Request::new(rio_proto::types::SubmitBuildRequest {
+            nodes: vec![make_test_node("h", "/nix/store/h.drv", "x86_64-linux")],
+            edges: vec![],
+            priority_class: "urgent".into(), // not in {ci, interactive, scheduled}
+            ..Default::default()
+        });
+
+        let result = grpc.submit_build(req).await;
+        assert!(result.is_err(), "invalid priority_class should be rejected");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("priority_class"),
+            "error should mention priority_class: {}",
             status.message()
         );
     }
