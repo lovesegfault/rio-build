@@ -58,6 +58,18 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Delete a build row (best-effort cleanup after a failed merge).
+    /// Cascade deletes build_derivations links. Used by handle_merge_dag
+    /// rollback to clean up the orphan build row if DB persistence fails
+    /// after insert_build succeeded.
+    pub async fn delete_build(&self, build_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM builds WHERE build_id = $1::uuid")
+            .bind(build_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Update a build's status.
     pub async fn update_build_status(
         &self,

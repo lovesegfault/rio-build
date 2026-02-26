@@ -18,6 +18,21 @@ pub enum DagError {
     CycleDetected,
 }
 
+/// Result of a successful `merge()` operation. Surfaces all the rollback
+/// state that `merge()` already tracks internally, so callers can invoke
+/// `rollback_merge()` if their own post-merge persistence fails.
+#[derive(Debug)]
+pub struct MergeResult {
+    /// Hashes of nodes newly inserted by this merge (not pre-existing).
+    pub newly_inserted: Vec<String>,
+    /// Edges newly added by this merge as (parent_hash, child_hash) pairs.
+    pub new_edges: Vec<(String, String)>,
+    /// Hashes of pre-existing nodes that gained build_id interest.
+    /// Rollback removes interest only from these (not from nodes where
+    /// build_id was already present from a prior merge).
+    pub interest_added: Vec<String>,
+}
+
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug)]
 pub struct DerivationDag {
@@ -83,17 +98,23 @@ impl DerivationDag {
 
     /// Merge a set of nodes and edges from a new build into the global DAG.
     ///
-    /// Returns the list of drv_hashes that were newly inserted (not already present).
-    /// Existing nodes get the new `build_id` added to their `interested_builds` set.
+    /// Returns a `MergeResult` with the hashes of newly-inserted nodes,
+    /// newly-added edges, and pre-existing nodes that gained build interest.
+    /// Existing nodes get the new `build_id` added to `interested_builds`.
     ///
     /// If the merge would create a cycle, returns `Err(DagError::CycleDetected)`
-    /// and rolls back all newly-inserted nodes and edges.
+    /// and rolls back all newly-inserted nodes/edges/interest.
+    ///
+    /// Callers that perform additional persistence (e.g., DB writes) after a
+    /// successful merge should call `rollback_merge()` with the returned
+    /// `MergeResult` fields if their persistence fails, to avoid in-memory
+    /// DAG state drifting from the DB.
     pub fn merge(
         &mut self,
         build_id: Uuid,
         nodes: &[rio_proto::types::DerivationNode],
         edges: &[rio_proto::types::DerivationEdge],
-    ) -> Result<Vec<String>, DagError> {
+    ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(String, String)> = Vec::new();
@@ -183,7 +204,11 @@ impl DerivationDag {
             }
         }
 
-        Ok(newly_inserted)
+        Ok(MergeResult {
+            newly_inserted,
+            new_edges,
+            interest_added,
+        })
     }
 
     /// Iterative DFS cycle detection with three-color marking.
@@ -258,7 +283,7 @@ impl DerivationDag {
     /// Rollback a failed merge: remove newly-inserted nodes and edges, and
     /// remove build interest from pre-existing nodes that gained it during
     /// this merge (but not from nodes where build_id was already present).
-    fn rollback_merge(
+    pub(crate) fn rollback_merge(
         &mut self,
         newly_inserted: &[String],
         new_edges: &[(String, String)],
@@ -587,7 +612,7 @@ mod tests {
         let nodes = vec![make_node("hash1", "/nix/store/hash1.drv", "x86_64-linux")];
         let edges = vec![];
 
-        let newly = dag.merge(build_id, &nodes, &edges).unwrap();
+        let newly = dag.merge(build_id, &nodes, &edges).unwrap().newly_inserted;
         assert_eq!(newly.len(), 1);
         assert!(dag.nodes.contains_key("hash1"));
         assert!(dag.nodes["hash1"].interested_builds.contains(&build_id));
@@ -600,11 +625,12 @@ mod tests {
         let build2 = Uuid::new_v4();
         let nodes = vec![make_node("hash1", "/nix/store/hash1.drv", "x86_64-linux")];
 
-        let newly1 = dag.merge(build1, &nodes, &[]).unwrap();
+        let newly1 = dag.merge(build1, &nodes, &[]).unwrap().newly_inserted;
         assert_eq!(newly1.len(), 1);
 
-        let newly2 = dag.merge(build2, &nodes, &[]).unwrap();
-        assert_eq!(newly2.len(), 0); // Already exists
+        let result2 = dag.merge(build2, &nodes, &[]).unwrap();
+        assert_eq!(result2.newly_inserted.len(), 0); // Already exists
+        assert_eq!(result2.interest_added, vec!["hash1"]);
 
         let node = &dag.nodes["hash1"];
         assert!(node.interested_builds.contains(&build1));
@@ -649,7 +675,7 @@ mod tests {
         ];
         let edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
 
-        let newly = dag.merge(build_id, &nodes, &edges).unwrap();
+        let newly = dag.merge(build_id, &nodes, &edges).unwrap().newly_inserted;
         let states = dag.compute_initial_states(&newly);
 
         // B has no deps -> Ready; A has dep on B -> Queued
@@ -686,7 +712,10 @@ mod tests {
             make_node("leafP", "/nix/store/leafP.drv", "x86_64-linux"),
         ];
         let edges = vec![make_edge("/nix/store/parentP.drv", "/nix/store/leafP.drv")];
-        let newly = dag.merge(build2, &parent_nodes, &edges).unwrap();
+        let newly = dag
+            .merge(build2, &parent_nodes, &edges)
+            .unwrap()
+            .newly_inserted;
 
         // Only parentP is newly inserted (leafP already existed).
         assert_eq!(newly, vec!["parentP"]);
