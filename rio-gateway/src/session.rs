@@ -96,12 +96,23 @@ where
                         build_id: build_id.clone(),
                         reason: "client_disconnect".to_string(),
                     };
-                    if let Err(e) = scheduler_client.cancel_build(req).await {
-                        warn!(
-                            build_id = %build_id,
-                            error = %e,
-                            "failed to cancel build on disconnect"
-                        );
+                    // Best-effort cancel: wrap in timeout so an unreachable
+                    // scheduler doesn't block the disconnect cleanup loop.
+                    match tokio::time::timeout(
+                        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                        scheduler_client.cancel_build(req),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            debug!(build_id = %build_id, "cancelled build on disconnect");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(build_id = %build_id, error = %e, "failed to cancel build on disconnect");
+                        }
+                        Err(_) => {
+                            warn!(build_id = %build_id, "cancel_build timed out on disconnect");
+                        }
                     }
                 }
 
