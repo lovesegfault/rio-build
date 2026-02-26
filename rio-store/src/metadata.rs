@@ -12,11 +12,20 @@ use tracing::{debug, instrument};
 
 /// Insert a `nar_blobs` row with `status='uploading'` for a new upload.
 ///
-/// This is the first step of the write-ahead pattern: mark the blob as
-/// "uploading" before writing data to the backend. The narinfo row is NOT
-/// inserted until the upload completes (review finding: defer narinfo to
-/// 'complete' flip to prevent concurrent QueryPathInfo from returning
-/// metadata for incomplete uploads).
+/// Write-ahead pattern step 1: mark the blob as "uploading" before writing
+/// data to the backend.
+///
+/// Implementation detail: `nar_blobs` has a FK to `narinfo`, so we insert a
+/// placeholder `narinfo` row (with zero nar_hash and nar_size=0) in the same
+/// transaction. The placeholder is overwritten with real metadata at
+/// `complete_upload()` time. `QueryPathInfo` and `find_missing_paths` filter
+/// on `nar_blobs.status='complete'`, so the placeholder is never exposed to
+/// clients.
+///
+/// The `nar_size=0` placeholder is a safe marker: the minimum valid NAR is
+/// ~100 bytes, so nar_size=0 can never represent a real uploaded path. This
+/// enables `delete_uploading` to safely identify and clean up orphaned
+/// placeholders.
 ///
 /// Returns `true` if inserted, `false` if a row already exists (idempotent).
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
@@ -26,14 +35,6 @@ pub async fn insert_uploading(
     store_path: &str,
     blob_key: &str,
 ) -> anyhow::Result<bool> {
-    // We need a narinfo row first (FK constraint), but we insert a minimal
-    // placeholder that will be updated at complete time. Use a dummy nar_hash
-    // and nar_size=1 that will be overwritten.
-    //
-    // Actually, per the review finding, we should NOT insert narinfo at
-    // uploading time. But nar_blobs has a FK to narinfo. So we insert both
-    // in a transaction, but QueryPathInfo will filter on nar_blobs.status =
-    // 'complete' to avoid exposing incomplete uploads.
     let mut tx = pool.begin().await?;
 
     // Insert narinfo placeholder (ON CONFLICT DO NOTHING for idempotency)
@@ -151,7 +152,8 @@ pub async fn check_complete(
 }
 
 /// Query path info for a store path. Only returns paths with `status='complete'`
-/// in `nar_blobs` (review finding: exclude partially-uploaded paths).
+/// in `nar_blobs` to exclude the placeholder narinfo rows created by
+/// `insert_uploading`.
 #[instrument(skip(pool))]
 pub async fn query_path_info(pool: &PgPool, store_path: &str) -> anyhow::Result<Option<PathInfo>> {
     let row: Option<NarinfoRow> = sqlx::query_as(
@@ -194,8 +196,9 @@ pub async fn query_path_info_by_hash(
 
 /// Batch check which store paths are missing (not in the store with `status='complete'`).
 ///
-/// Per the review finding, only paths with `nar_blobs.status = 'complete'`
-/// are considered "present". Partially-uploaded paths are treated as missing.
+/// Only paths with `nar_blobs.status = 'complete'` are considered present.
+/// Paths stuck in `status='uploading'` (from an interrupted upload) are
+/// treated as missing so the client can retry.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
 pub async fn find_missing_paths(
     pool: &PgPool,

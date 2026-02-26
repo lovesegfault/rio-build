@@ -217,7 +217,7 @@ impl StoreService for StoreServiceImpl {
     /// 1. Look up narinfo + nar_blobs from PostgreSQL
     /// 2. First response message: PathInfo metadata
     /// 3. Subsequent messages: NAR data chunks (64 KB each)
-    /// 4. Verify content integrity via HashingReader (review finding)
+    /// 4. Verify content integrity via HashingReader (detects on-disk corruption)
     #[instrument(skip(self, request), fields(rpc = "GetPath"))]
     async fn get_path(
         &self,
@@ -301,7 +301,10 @@ impl StoreService for StoreServiceImpl {
                 }
             }
 
-            // Step 4: Verify content integrity (review finding)
+            // Step 4: Verify content integrity — the NAR on disk may have been
+            // corrupted (bitrot, partial write) since it was originally stored.
+            // If the hash doesn't match, send DATA_LOSS so the client knows not
+            // to trust the data.
             let digest = hashing.into_digest();
             if let Err(e) = validate_nar_digest(&digest, &expected_hash, expected_size) {
                 error!(error = %e, "GetPath: content integrity check failed");

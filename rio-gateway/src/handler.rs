@@ -422,29 +422,6 @@ pub(crate) async fn resolve_derivation(
     Ok(drv)
 }
 
-/// Read back a .drv from the store after uploading and cache it. Best-effort.
-#[allow(dead_code)] // Used by opcode 39 path when NAR data is not buffered
-async fn cache_drv_if_needed(
-    path: &StorePath,
-    store_client: &mut StoreServiceClient<Channel>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-) {
-    if !path.is_derivation() {
-        return;
-    }
-    match grpc_get_path(store_client, &path.to_string()).await {
-        Ok(Some((_info, nar_data))) => {
-            try_cache_drv(path, &nar_data, drv_cache);
-        }
-        Ok(None) => {
-            error!(path = %path, "just-stored .drv not found on read-back");
-        }
-        Err(e) => {
-            error!(path = %path, error = %e, "failed to read back .drv from store");
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Build event → STDERR translation
 // ---------------------------------------------------------------------------
