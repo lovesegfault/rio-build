@@ -1394,3 +1394,240 @@ async fn test_build_derivation_basic_format() {
 
     h.finish().await;
 }
+
+// ===========================================================================
+// Additional coverage: K2/K3 from phase 2a review
+// ===========================================================================
+//
+// Note on error-path behavior discovered during test development:
+// Many opcodes GRACEFULLY handle invalid store paths instead of sending
+// STDERR_ERROR. This is intentional Nix-compatible behavior:
+//   - IsValidPath (1):   invalid path -> returns false (not error)
+//   - EnsurePath (10):   invalid path -> ignored, returns success
+//   - AddTempRoot (11):  invalid path -> ignored, returns success
+//   - QueryPathInfo (26): invalid path -> returns valid=false (not error)
+//   - SetOptions (19):   no error path (fixed-width fields only)
+// These opcodes DO have STDERR_ERROR paths for gRPC failures (store unreachable),
+// but those are harder to trigger in the mock harness and are covered by the
+// timeout integration path rather than byte-level tests.
+//
+// Opcodes with true STDERR_ERROR paths for client-side invalid input:
+//   - NarFromPath (38):  invalid path -> error (tested above)
+//   - AddToStoreNar (39): invalid path, oversized nar_size -> error (tested below)
+//   - BuildDerivation (36): parse failure -> connection drop (wire read error)
+
+/// QueryValidPaths (31) happy path: returns paths present in the mock store.
+#[tokio::test]
+async fn test_query_valid_paths_filters_missing() {
+    let mut h = TestHarness::setup().await;
+    let (nar, hash) = make_nar(b"qvp");
+    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    // TEST_PATH_MISSING is not seeded.
+
+    wire::write_u64(&mut h.stream, 31).await.unwrap(); // wopQueryValidPaths
+    wire::write_strings(
+        &mut h.stream,
+        &[TEST_PATH_A.into(), TEST_PATH_MISSING.into()],
+    )
+    .await
+    .unwrap();
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // substitute
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+    let valid = wire::read_strings(&mut h.stream).await.unwrap();
+    assert_eq!(
+        valid,
+        vec![TEST_PATH_A.to_string()],
+        "only seeded path should be valid"
+    );
+
+    h.finish().await;
+}
+
+/// QueryValidPaths with empty input returns empty output.
+#[tokio::test]
+async fn test_query_valid_paths_empty() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 31).await.unwrap();
+    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_bool(&mut h.stream, false).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+    let valid = wire::read_strings(&mut h.stream).await.unwrap();
+    assert!(valid.is_empty());
+
+    h.finish().await;
+}
+
+/// SetOptions (19) standalone: verifies the opcode round-trip independently
+/// of the harness setup (which also sends it). Confirms STDERR_LAST with no
+/// result data.
+#[tokio::test]
+async fn test_set_options_standalone() {
+    let mut h = TestHarness::setup().await;
+
+    // Send a second SetOptions with different values.
+    wire::write_u64(&mut h.stream, 19).await.unwrap(); // wopSetOptions
+    wire::write_bool(&mut h.stream, true).await.unwrap(); // keepFailed
+    wire::write_bool(&mut h.stream, true).await.unwrap(); // keepGoing
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // tryFallback
+    wire::write_u64(&mut h.stream, 5).await.unwrap(); // verbosity
+    wire::write_u64(&mut h.stream, 4).await.unwrap(); // maxBuildJobs
+    wire::write_u64(&mut h.stream, 600).await.unwrap(); // maxSilentTime
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // useBuildHook
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // verboseBuild
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // logType
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // printBuildTrace
+    wire::write_u64(&mut h.stream, 8).await.unwrap(); // buildCores
+    wire::write_bool(&mut h.stream, true).await.unwrap(); // useSubstitutes
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // overrides count
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+    // SetOptions has no result data.
+
+    h.finish().await;
+}
+
+/// IsValidPath with unparseable path returns false (not STDERR_ERROR).
+/// This documents the graceful-degradation behavior for Nix compatibility.
+#[tokio::test]
+async fn test_is_valid_path_garbage_returns_false() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 1).await.unwrap();
+    wire::write_string(&mut h.stream, "garbage-not-a-store-path")
+        .await
+        .unwrap();
+    h.stream.flush().await.unwrap();
+
+    // Should NOT receive STDERR_ERROR — just STDERR_LAST + false.
+    drain_stderr_until_last(&mut h.stream).await;
+    let valid = wire::read_bool(&mut h.stream).await.unwrap();
+    assert!(!valid, "garbage path should return false, not error");
+
+    h.finish().await;
+}
+
+/// AddToStoreNar with invalid store path should send STDERR_ERROR.
+#[tokio::test]
+async fn test_add_to_store_nar_invalid_path_returns_error() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 39).await.unwrap();
+    wire::write_string(&mut h.stream, "not-a-valid-store-path")
+        .await
+        .unwrap(); // path — INVALID
+    wire::write_string(&mut h.stream, "").await.unwrap(); // deriver
+    wire::write_string(&mut h.stream, &hex::encode([0u8; 32]))
+        .await
+        .unwrap(); // narHash
+    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // reg_time
+    wire::write_u64(&mut h.stream, 100).await.unwrap(); // nar_size
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // ultimate
+    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // sigs
+    wire::write_string(&mut h.stream, "").await.unwrap(); // ca
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
+    wire::write_bool(&mut h.stream, true).await.unwrap(); // dontCheckSigs
+    // No framed data — handler should error before reading it.
+    h.stream.flush().await.unwrap();
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(
+        err.message().contains("invalid store path"),
+        "error should mention invalid path: {}",
+        err.message()
+    );
+
+    h.finish().await;
+}
+
+/// AddToStoreNar with nar_size > MAX_FRAMED_TOTAL should send STDERR_ERROR
+/// before reading any NAR data (prevents DoS).
+#[tokio::test]
+async fn test_add_to_store_nar_oversized_returns_error() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 39).await.unwrap();
+    wire::write_string(&mut h.stream, TEST_PATH_A)
+        .await
+        .unwrap();
+    wire::write_string(&mut h.stream, "").await.unwrap(); // deriver
+    wire::write_string(&mut h.stream, &hex::encode([0u8; 32]))
+        .await
+        .unwrap();
+    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_u64(&mut h.stream, 0).await.unwrap();
+    wire::write_u64(&mut h.stream, u64::MAX).await.unwrap(); // nar_size HUGE
+    wire::write_bool(&mut h.stream, false).await.unwrap();
+    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_string(&mut h.stream, "").await.unwrap();
+    wire::write_bool(&mut h.stream, false).await.unwrap();
+    wire::write_bool(&mut h.stream, true).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(
+        err.message().contains("exceeds maximum"),
+        "error should mention size limit: {}",
+        err.message()
+    );
+
+    h.finish().await;
+}
+
+/// BuildPathsWithResults (46) with an invalid build mode should still return
+/// results (not STDERR_ERROR) — the handler treats unknown modes as Normal.
+/// But invalid DerivedPath strings DO cause per-entry failures.
+#[tokio::test]
+async fn test_build_paths_with_results_invalid_derived_path() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 46).await.unwrap();
+    // One invalid DerivedPath (unparseable).
+    wire::write_strings(&mut h.stream, &["garbage!not@a#path".into()])
+        .await
+        .unwrap();
+    wire::write_u64(&mut h.stream, 0).await.unwrap(); // buildMode = Normal
+    h.stream.flush().await.unwrap();
+
+    // Per CLAUDE.md: "per-entry errors in batch opcodes push
+    // BuildResult::failure and continue, not abort". So we should get
+    // STDERR_LAST + a failed BuildResult, not STDERR_ERROR.
+    drain_stderr_until_last(&mut h.stream).await;
+    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(count, 1, "should get one result for one input path");
+    let _path = wire::read_string(&mut h.stream).await.unwrap();
+    // BuildResult: first field is status (u64).
+    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    // Should be a failure status (NOT Built=0).
+    assert_ne!(
+        status, 0,
+        "invalid DerivedPath should produce failure status"
+    );
+    // Drain remaining BuildResult fields.
+    let _err_msg = wire::read_string(&mut h.stream).await.unwrap();
+    let _times = wire::read_u64(&mut h.stream).await.unwrap();
+    let _nondet = wire::read_bool(&mut h.stream).await.unwrap();
+    let _start = wire::read_u64(&mut h.stream).await.unwrap();
+    let _stop = wire::read_u64(&mut h.stream).await.unwrap();
+    let tag1 = wire::read_u64(&mut h.stream).await.unwrap();
+    if tag1 == 1 {
+        let _ = wire::read_u64(&mut h.stream).await.unwrap();
+    }
+    let tag2 = wire::read_u64(&mut h.stream).await.unwrap();
+    if tag2 == 1 {
+        let _ = wire::read_u64(&mut h.stream).await.unwrap();
+    }
+    let outputs = wire::read_u64(&mut h.stream).await.unwrap();
+    for _ in 0..outputs {
+        let _ = wire::read_string(&mut h.stream).await.unwrap();
+        let _ = wire::read_string(&mut h.stream).await.unwrap();
+    }
+
+    h.finish().await;
+}
