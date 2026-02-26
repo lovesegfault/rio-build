@@ -349,6 +349,9 @@ async fn run_daemon_build(
 }
 
 /// Read the STDERR loop from the daemon, streaming logs via the batcher.
+///
+/// If the log channel closes during the build, returns an InfrastructureFailure —
+/// the scheduler stream is gone, so there's no way to report completion anyway.
 async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     batcher: &mut LogBatcher,
@@ -356,6 +359,17 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
 ) -> Result<rio_nix::protocol::build::BuildResult, rio_nix::protocol::wire::WireError> {
     const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
     let mut msg_count: u64 = 0;
+
+    /// Helper: send a log batch. Returns false if the channel is closed.
+    async fn send_batch(
+        log_tx: &mpsc::Sender<WorkerMessage>,
+        batch: rio_proto::types::BuildLogBatch,
+    ) -> bool {
+        let msg = WorkerMessage {
+            msg: Some(worker_message::Msg::LogBatch(batch)),
+        };
+        log_tx.send(msg).await.is_ok()
+    }
 
     loop {
         if msg_count >= MAX_BUILD_STDERR_MESSAGES {
@@ -366,11 +380,13 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
         msg_count += 1;
 
         // Check for timeout-based flush
-        if let Some(batch) = batcher.maybe_flush() {
-            let msg = WorkerMessage {
-                msg: Some(worker_message::Msg::LogBatch(batch)),
-            };
-            let _ = log_tx.send(msg).await;
+        if let Some(batch) = batcher.maybe_flush()
+            && !send_batch(log_tx, batch).await
+        {
+            return Ok(rio_nix::protocol::build::BuildResult::failure(
+                rio_nix::protocol::build::BuildStatus::MiscFailure,
+                "log channel closed during build (scheduler stream gone)".to_string(),
+            ));
         }
 
         match read_stderr_message(reader).await? {
@@ -382,11 +398,13 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
                 ));
             }
             StderrMessage::Next(msg) => {
-                if let Some(batch) = batcher.add_line(msg.into_bytes()) {
-                    let msg = WorkerMessage {
-                        msg: Some(worker_message::Msg::LogBatch(batch)),
-                    };
-                    let _ = log_tx.send(msg).await;
+                if let Some(batch) = batcher.add_line(msg.into_bytes())
+                    && !send_batch(log_tx, batch).await
+                {
+                    return Ok(rio_nix::protocol::build::BuildResult::failure(
+                        rio_nix::protocol::build::BuildStatus::MiscFailure,
+                        "log channel closed during build (scheduler stream gone)".to_string(),
+                    ));
                 }
             }
             StderrMessage::Read(_) => {

@@ -334,12 +334,37 @@ impl WorkerService for SchedulerGrpc {
                         }
                         rio_proto::types::worker_message::Msg::Completion(report) => {
                             let drv_path = report.drv_path.clone();
-                            if let Some(result) = report.result {
-                                let _ = actor_for_recv.try_send(ActorCommand::ProcessCompletion {
+                            // A CompletionReport with result: None is malformed, but
+                            // we must not silently drop it — the derivation would hang
+                            // in Running forever. Synthesize an InfrastructureFailure.
+                            let result = report.result.unwrap_or_else(|| {
+                                warn!(
+                                    worker_id = %worker_id_for_recv,
+                                    drv_path = %drv_path,
+                                    "completion with None result, synthesizing InfrastructureFailure"
+                                );
+                                rio_proto::types::BuildResult {
+                                    status:
+                                        rio_proto::types::BuildResultStatus::InfrastructureFailure
+                                            .into(),
+                                    error_msg: "worker sent CompletionReport with no result"
+                                        .into(),
+                                    ..Default::default()
+                                }
+                            });
+                            // Use blocking send for completion — dropping it would
+                            // leave the derivation stuck in Running.
+                            if actor_for_recv
+                                .send_unchecked(ActorCommand::ProcessCompletion {
                                     worker_id: worker_id_for_recv.clone(),
                                     drv_hash: drv_path,
                                     result,
-                                });
+                                })
+                                .await
+                                .is_err()
+                            {
+                                warn!("actor channel closed while sending completion");
+                                break;
                             }
                         }
                         rio_proto::types::worker_message::Msg::LogBatch(_log) => {
@@ -352,10 +377,18 @@ impl WorkerService for SchedulerGrpc {
                 }
             }
 
-            // Stream closed: worker disconnected
-            let _ = actor_for_recv.try_send(ActorCommand::WorkerDisconnected {
-                worker_id: worker_id_for_recv,
-            });
+            // Stream closed: worker disconnected. Use blocking send — if this
+            // is dropped due to backpressure, running derivations won't be
+            // reassigned and will hang forever.
+            if actor_for_recv
+                .send_unchecked(ActorCommand::WorkerDisconnected {
+                    worker_id: worker_id_for_recv,
+                })
+                .await
+                .is_err()
+            {
+                warn!("actor channel closed while sending worker disconnect");
+            }
         });
 
         Ok(Response::new(ReceiverStream::new(output_rx)))
