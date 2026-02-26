@@ -163,6 +163,10 @@ impl Drop for ChannelSession {
     fn drop(&mut self) {
         self.proto_task.abort();
         self.response_task.abort();
+        // Gauge decrement lives here so it fires on ALL drop paths: normal
+        // channel_close, connection drop (HashMap clears), and session removal
+        // after a dead protocol task. Avoids gauge leak on abnormal paths.
+        metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
     }
 }
 
@@ -179,13 +183,11 @@ pub struct ConnectionHandler {
 impl Drop for ConnectionHandler {
     fn drop(&mut self) {
         metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
-        let remaining_channels = self.sessions.len();
-        if remaining_channels > 0 {
-            metrics::gauge!("rio_gateway_channels_active").decrement(remaining_channels as f64);
-        }
+        // Channel gauge decrement is handled by ChannelSession::Drop when
+        // the sessions HashMap is cleared.
         debug!(
             peer = ?self.peer_addr,
-            remaining_channels = remaining_channels,
+            remaining_channels = self.sessions.len(),
             "SSH connection handler dropped"
         );
     }
@@ -269,7 +271,7 @@ impl Handler for ConnectionHandler {
         let (mut outbound_reader, outbound_writer) = tokio::io::duplex(256 * 1024);
 
         // Task: forward SSH client data -> inbound pipe
-        let client_pump = tokio::spawn(async move {
+        let client_pump = rio_common::task::spawn_monitored("client-pump", async move {
             while let Some(data) = client_rx.recv().await {
                 if let Err(e) = inbound_writer.write_all(&data).await {
                     debug!(error = %e, "client pump: inbound write failed");
@@ -282,7 +284,8 @@ impl Handler for ConnectionHandler {
         // Task: run the protocol handler with gRPC clients
         let mut store_client = self.store_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
-        let proto_task = tokio::spawn(
+        let proto_task = rio_common::task::spawn_monitored(
+            "proto-task",
             async move {
                 let mut reader = inbound_reader;
                 let mut writer = outbound_writer;
@@ -303,7 +306,7 @@ impl Handler for ConnectionHandler {
 
         // Task: pump protocol responses -> SSH client
         let handle = session.handle();
-        let response_task = tokio::spawn(async move {
+        let response_task = rio_common::task::spawn_monitored("response-task", async move {
             let mut buf = vec![0u8; 32 * 1024];
             loop {
                 match outbound_reader.read(&mut buf).await {
@@ -359,8 +362,8 @@ impl Handler for ConnectionHandler {
                 debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");
                 if tx.send(data.to_vec()).await.is_err() {
                     warn!(channel = ?channel, "protocol session dead, closing channel");
+                    // Gauge decrement handled by ChannelSession::Drop.
                     self.sessions.remove(&channel);
-                    metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
                     return Ok(());
                 }
             }
@@ -388,9 +391,8 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!(channel = ?channel, "SSH channel closed");
-        if self.sessions.remove(&channel).is_some() {
-            metrics::gauge!("rio_gateway_channels_active").decrement(1.0);
-        }
+        // Gauge decrement handled by ChannelSession::Drop.
+        self.sessions.remove(&channel);
         Ok(())
     }
 }
