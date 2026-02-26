@@ -143,7 +143,7 @@ rio-build/
 │   │   ├── store_sync.rs          # Fetch missing paths
 │   │   ├── upload.rs              # Chunk and upload outputs
 │   │   ├── log_stream.rs          # Build log streaming
-│   │   └── resource.rs            # Resource accounting
+│   │   └── resource.rs            # Resource accounting (Phase 2b)
 │   └── Cargo.toml
 │
 ├── rio-controller/                # Kubernetes operator

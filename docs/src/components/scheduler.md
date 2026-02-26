@@ -237,6 +237,7 @@ stateDiagram-v2
     active --> failed : any derivation PermanentFailure/poisoned (keepGoing=false)
     active --> failed : all derivations resolved, at least one failed (keepGoing=true)
     active --> cancelled : CancelBuild received
+    pending --> cancelled : CancelBuild before DAG merged
     cancelled --> [*]
     succeeded --> [*]
     failed --> [*]
@@ -358,7 +359,7 @@ CREATE TABLE derivations (
     status              TEXT NOT NULL CHECK (status IN ('created', 'queued', 'ready', 'assigned', 'running', 'completed', 'failed', 'poisoned', 'dependency_failed')),
     required_features   TEXT[] NOT NULL DEFAULT '{}',
     assigned_worker_id  TEXT,
-    assignment_gen      BIGINT,
+    -- assignment_gen lives on assignments table (as generation), not here
     retry_count         INT NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
