@@ -168,4 +168,30 @@ mod tests {
         let result = batcher.maybe_flush();
         assert!(result.is_none());
     }
+
+    /// Verify the 100ms timeout causes a flush of a partial batch.
+    /// Uses real time (LogBatcher uses Instant, not tokio::time).
+    #[test]
+    fn test_batcher_100ms_timeout_flush() {
+        let mut batcher = LogBatcher::new("drv-path".into(), "worker-1".into());
+
+        // Add a line — should not flush (< 64 lines)
+        let result = batcher.add_line(b"line 0".to_vec());
+        assert!(result.is_none());
+
+        // Before timeout: maybe_flush returns None
+        assert!(batcher.maybe_flush().is_none());
+
+        // After timeout: maybe_flush returns the batch
+        std::thread::sleep(std::time::Duration::from_millis(110));
+        let batch = batcher.maybe_flush();
+        assert!(batch.is_some(), "should flush after 100ms timeout");
+        let batch = batch.unwrap();
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(batch.lines[0], b"line 0");
+        assert!(
+            !batcher.has_pending(),
+            "batcher should be empty after flush"
+        );
+    }
 }

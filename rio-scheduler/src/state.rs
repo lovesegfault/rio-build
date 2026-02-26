@@ -675,9 +675,32 @@ mod tests {
     fn test_build_terminal_rejected() {
         use BuildState::*;
 
+        // Terminal -> any non-terminal
         assert!(Succeeded.validate_transition(Active).is_err());
+        assert!(Succeeded.validate_transition(Pending).is_err());
         assert!(Failed.validate_transition(Active).is_err());
+        assert!(Failed.validate_transition(Pending).is_err());
         assert!(Cancelled.validate_transition(Active).is_err());
+        assert!(Cancelled.validate_transition(Pending).is_err());
+
+        // Terminal -> other terminal
+        assert!(Succeeded.validate_transition(Failed).is_err());
+        assert!(Succeeded.validate_transition(Cancelled).is_err());
+        assert!(Failed.validate_transition(Succeeded).is_err());
+        assert!(Failed.validate_transition(Cancelled).is_err());
+        assert!(Cancelled.validate_transition(Succeeded).is_err());
+        assert!(Cancelled.validate_transition(Failed).is_err());
+
+        // Self-transitions
+        assert!(Pending.validate_transition(Pending).is_err());
+        assert!(Active.validate_transition(Active).is_err());
+        assert!(Succeeded.validate_transition(Succeeded).is_err());
+        assert!(Failed.validate_transition(Failed).is_err());
+        assert!(Cancelled.validate_transition(Cancelled).is_err());
+
+        // Skip states
+        assert!(Pending.validate_transition(Succeeded).is_err());
+        assert!(Pending.validate_transition(Failed).is_err());
     }
 
     #[test]

@@ -285,6 +285,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ref_count, 3);
+
+        // Verify specific FK pairs (referrer.path, reference.path) — not just count
+        let pairs: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT vp_referrer.path, vp_reference.path
+               FROM Refs r
+               JOIN ValidPaths vp_referrer ON r.referrer = vp_referrer.id
+               JOIN ValidPaths vp_reference ON r.reference = vp_reference.id
+               ORDER BY vp_referrer.path, vp_reference.path"#,
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+
+        // Expected: glibc->glibc (self), hello->glibc, hello->hello (self)
+        assert!(pairs.contains(&(
+            "/nix/store/aaaa-glibc-2.39".to_string(),
+            "/nix/store/aaaa-glibc-2.39".to_string()
+        )));
+        assert!(pairs.contains(&(
+            "/nix/store/bbbb-hello-2.12.2".to_string(),
+            "/nix/store/aaaa-glibc-2.39".to_string()
+        )));
+        assert!(pairs.contains(&(
+            "/nix/store/bbbb-hello-2.12.2".to_string(),
+            "/nix/store/bbbb-hello-2.12.2".to_string()
+        )));
     }
 
     #[tokio::test]
