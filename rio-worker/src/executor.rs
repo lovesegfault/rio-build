@@ -181,7 +181,10 @@ pub async fn execute_build(
         .env("NIX_CONF_DIR", overlay_mount.upper_dir().join("etc/nix"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        // Inherit stderr: daemon diagnostics go to worker's stderr (visible in
+        // container logs). Piping without reading would deadlock if nix-daemon
+        // writes >64KB to stderr (pipe buffer full, daemon blocks on write).
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .map_err(ExecutorError::DaemonSpawn)?;
 

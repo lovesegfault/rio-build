@@ -18,12 +18,5 @@ metrics-exporter-prometheus = { workspace = true }
 tokio = { workspace = true }
 futures-util = "0.3"
 
-# CLI
-clap = { workspace = true }
-
 # Error handling
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-
-# Serialization
-serde = { workspace = true }

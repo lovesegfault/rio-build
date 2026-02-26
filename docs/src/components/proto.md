@@ -71,6 +71,9 @@ message WorkerMessage {
     BuildLogBatch log_batch = 2;      // Batched log lines (not per-line)
     CompletionReport completion = 3;  // Build result
     ProgressUpdate progress = 4;      // Resource usage, build phase
+    WorkerRegister register = 5;      // First message on BuildExecution stream:
+                                      //   worker_id identity. Scheduler reads this
+                                      //   to associate stream + heartbeat by same ID.
   }
 }
 
@@ -166,6 +169,7 @@ message SubmitBuildRequest {
   uint64 max_silent_time = 5;
   uint64 build_timeout = 6;
   uint64 build_cores = 7;
+  bool keep_going = 8;             // Continue building independent derivations on failure
 }
 
 message DerivationNode {
@@ -176,6 +180,10 @@ message DerivationNode {
   repeated string required_features = 5;
   repeated string output_names = 6; // e.g. ["out", "dev"]
   bool is_fixed_output = 7;        // FOD detection
+  repeated string expected_output_paths = 8;  // Predicted output store paths
+                                              // (for scheduler-side cache check: closes
+                                              //  TOCTOU between gateway FindMissingPaths
+                                              //  and DAG merge)
 }
 
 message DerivationEdge {
@@ -187,6 +195,8 @@ message DerivationEdge {
 > **Size limits:** A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes. At ~200 bytes per `DerivationNode`, the message is ~12MB. The gateway should enforce a per-tenant `max_dag_size` limit (default: 100,000 nodes) before constructing the request. gRPC max message size should be set to at least 32MB.
 
 > **Tenant identification:** `tenant_id` is set by the gateway from the SSH key -> tenant mapping, not from client-provided data. The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`) for downstream authorization checks.
+
+> **BuildResultStatus ↔ Nix BuildStatus mapping:** The gRPC `BuildResultStatus` enum is a superset of Nix's wire `BuildStatus`. Values 0-14 map 1:1 to Nix (`Built`, `Substituted`, ..., `NoSubstituters`). The gRPC enum adds `InfrastructureFailure` (worker-internal errors: daemon crash, overlay failure) which has no Nix equivalent — the gateway maps it to `TransientFailure` (6) when forwarding to the Nix client.
 
 ### WatchBuildRequest
 

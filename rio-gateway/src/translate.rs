@@ -140,7 +140,11 @@ pub fn single_node_from_basic(
         drv_hash: drv_path.to_string(),
         pname,
         system: basic_drv.platform().to_string(),
-        required_features: Vec::new(),
+        required_features: basic_drv
+            .env()
+            .get("requiredSystemFeatures")
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default(),
         output_names,
         is_fixed_output: basic_drv.outputs().iter().any(|o| o.is_fixed_output()),
         expected_output_paths,
@@ -201,5 +205,49 @@ pub fn build_submit_request(
         build_timeout,
         build_cores,
         keep_going,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use rio_nix::derivation::DerivationOutput;
+
+    fn make_basic_drv(env: BTreeMap<String, String>) -> BasicDerivation {
+        let output = DerivationOutput::new("out", "/nix/store/test-out", "", "").unwrap();
+        BasicDerivation::new(
+            vec![output],
+            BTreeSet::new(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            env,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_single_node_extracts_features() {
+        let mut env = BTreeMap::new();
+        env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
+        let drv = make_basic_drv(env);
+
+        let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].required_features,
+            vec!["kvm".to_string(), "big-parallel".to_string()],
+            "requiredSystemFeatures should be extracted from BasicDerivation env"
+        );
+    }
+
+    #[test]
+    fn test_single_node_no_features() {
+        let drv = make_basic_drv(BTreeMap::new());
+        let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].required_features.is_empty());
     }
 }

@@ -76,13 +76,16 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_scheduler_derivations_running` | Gauge | Derivations currently building |
 | `rio_scheduler_assignment_latency_seconds` | Histogram | Time from ready to assigned |
 | `rio_scheduler_build_duration_seconds` | Histogram | Total build duration |
-| `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache |
-| `rio_scheduler_critical_path_accuracy` | Histogram | Predicted vs. actual completion ratio |
-| `rio_scheduler_size_class_assignments_total` | Counter | Assignments per size class (labeled by class name) |
-| `rio_scheduler_misclassifications_total` | Counter | Builds that exceeded 2x their class cutoff duration |
-| `rio_scheduler_cutoff_seconds` | Gauge | Current duration cutoff per class boundary (labeled by class) |
-| `rio_scheduler_class_load_fraction` | Gauge | Load fraction per size class (should be ~equal when SITA-E is active) |
-| `rio_scheduler_class_queue_depth` | Gauge | Queue depth per size class |
+| `rio_scheduler_cache_hits_total` | Counter | Derivations served from cache (labeled by `source`: `scheduler`=TOCTOU check, `existing`=pre-existing completed) |
+| `rio_scheduler_queue_backpressure` | Counter | Backpressure activations (queue reached 80% capacity) |
+| `rio_scheduler_workers_active` | Gauge | Fully-registered workers (stream + heartbeat) |
+| `rio_scheduler_assignments_total` | Counter | Total derivation->worker assignments |
+| `rio_scheduler_critical_path_accuracy` *(Phase 2c+)* | Histogram | Predicted vs. actual completion ratio |
+| `rio_scheduler_size_class_assignments_total` *(Phase 2c+)* | Counter | Assignments per size class (labeled by class name) |
+| `rio_scheduler_misclassifications_total` *(Phase 2c+)* | Counter | Builds that exceeded 2x their class cutoff duration |
+| `rio_scheduler_cutoff_seconds` *(Phase 2c+)* | Gauge | Current duration cutoff per class boundary (labeled by class) |
+| `rio_scheduler_class_load_fraction` *(Phase 2c+)* | Gauge | Load fraction per size class (should be ~equal when SITA-E is active) |
+| `rio_scheduler_class_queue_depth` *(Phase 2c+)* | Gauge | Queue depth per size class |
 
 ### Store Metrics
 
@@ -90,19 +93,23 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 |--------|------|-------------|
 | `rio_store_put_path_total` | Counter | Total PutPath operations |
 | `rio_store_put_path_duration_seconds` | Histogram | PutPath latency |
-| `rio_store_chunks_total` | Gauge | Total chunks in storage |
-| `rio_store_chunk_dedup_ratio` | Gauge | Chunk deduplication ratio |
+| `rio_store_integrity_failures_total` | Counter | GetPath content integrity check failures (bitrot/corruption) |
+| `rio_store_chunks_total` *(Phase 2c+)* | Gauge | Total chunks in storage |
+| `rio_store_chunk_dedup_ratio` *(Phase 2c+)* | Gauge | Chunk deduplication ratio |
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |
-| `rio_store_cache_hit_ratio` | Gauge | In-process LRU cache hit ratio |
+| `rio_store_cache_hit_ratio` *(Phase 2c+)* | Gauge | In-process LRU cache hit ratio |
 
 ### Worker Metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_worker_builds_total` | Counter | Total builds executed |
+| `rio_worker_builds_active` | Gauge | Currently running builds on this worker |
+| `rio_worker_uploads_total` | Counter | Output uploads (labeled by `result`) |
 | `rio_worker_build_duration_seconds` | Histogram | Per-derivation build time |
 | `rio_worker_fuse_cache_size_bytes` | Gauge | FUSE SSD cache usage |
-| `rio_worker_fuse_cache_hit_ratio` | Gauge | FUSE cache hit ratio |
+| `rio_worker_fuse_cache_hits_total` | Counter | FUSE cache hits |
+| `rio_worker_fuse_cache_misses_total` | Counter | FUSE cache misses |
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
 
 > **Note on ratio metrics:** Metrics like `rio_store_cache_hit_ratio` and `rio_worker_fuse_cache_hit_ratio` are shown for local dashboards but should not be relied upon for aggregation across instances. For aggregatable cache metrics, use counter pairs (e.g., `rio_store_cache_hits_total` + `rio_store_cache_misses_total`) and compute ratios at query time. Gauge ratios lose meaning when averaged across instances.

@@ -89,6 +89,8 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 
 **Authorization:** Worker `PutPath` calls must include a valid assignment token (HMAC-SHA256, issued by the scheduler). The store verifies the token signature and checks that the output path matches `expected_output_paths`. See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 
+> **Phase 2a deferral:** Assignment token HMAC signing and verification are deferred to Phase 3 (with leader election). In Phase 2a, tokens are opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. This matches the `types.proto` comment on `WorkAssignment.assignment_token`.
+
 1. Write manifest to PostgreSQL with `status='uploading'` (includes chunk list and chunk refcount increments --- this protects chunks from GC sweep immediately)
 2. Upload all chunks to S3 (call `FindMissingChunks` first to skip existing)
 3. Verify all chunks present in S3 (via HeadObject)
