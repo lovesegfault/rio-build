@@ -224,7 +224,11 @@ async fn grpc_query_path_info(
     let req = types::QueryPathInfoRequest {
         store_path: store_path.to_string(),
     };
-    match store_client.query_path_info(req).await {
+    match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.query_path_info(req))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("gRPC QueryPathInfo timed out after {DEFAULT_GRPC_TIMEOUT:?}")
+        })? {
         Ok(resp) => Ok(Some(resp.into_inner())),
         Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
         Err(e) => Err(anyhow::anyhow!("gRPC QueryPathInfo failed: {e}")),
@@ -263,14 +267,15 @@ async fn grpc_put_path(
     }
 
     let stream = tokio_stream::iter(messages);
-    let resp = store_client
-        .put_path(stream)
+    let resp = tokio::time::timeout(GRPC_STREAM_TIMEOUT, store_client.put_path(stream))
         .await
+        .map_err(|_| anyhow::anyhow!("gRPC PutPath timed out after {GRPC_STREAM_TIMEOUT:?}"))?
         .map_err(|e| anyhow::anyhow!("gRPC PutPath failed: {e}"))?;
 
     Ok(resp.into_inner().created)
 }
 
+use rio_common::grpc::{DEFAULT_GRPC_TIMEOUT, GRPC_STREAM_TIMEOUT};
 use rio_common::limits::MAX_NAR_SIZE;
 
 /// Fetch NAR data from store via gRPC GetPath.
@@ -282,7 +287,10 @@ async fn grpc_get_path(
     let req = types::GetPathRequest {
         store_path: store_path.to_string(),
     };
-    let mut stream = match store_client.get_path(req).await {
+    let mut stream = match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req))
+        .await
+        .map_err(|_| anyhow::anyhow!("gRPC GetPath timed out after {DEFAULT_GRPC_TIMEOUT:?}"))?
+    {
         Ok(resp) => resp.into_inner(),
         Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
         Err(e) => return Err(anyhow::anyhow!("gRPC GetPath failed: {e}")),
@@ -567,11 +575,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     request: types::SubmitBuildRequest,
     active_build_ids: &mut Vec<(String, u64)>,
 ) -> anyhow::Result<BuildResult> {
-    let mut event_stream = scheduler_client
-        .submit_build(request)
-        .await
-        .map_err(|e| anyhow::anyhow!("gRPC SubmitBuild failed: {e}"))?
-        .into_inner();
+    let mut event_stream =
+        tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, scheduler_client.submit_build(request))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("gRPC SubmitBuild timed out after {DEFAULT_GRPC_TIMEOUT:?}")
+            })?
+            .map_err(|e| anyhow::anyhow!("gRPC SubmitBuild failed: {e}"))?
+            .into_inner();
 
     // Extract build_id from first event if available
     // (the first event should be BuildStarted)
@@ -901,21 +912,29 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let req = types::GetPathRequest {
         store_path: path.to_string(),
     };
-    let mut stream = match store_client.get_path(req).await {
-        Ok(resp) => resp.into_inner(),
-        Err(status) if status.code() == tonic::Code::NotFound => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("path '{}' is not valid", path_str),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("path '{path_str}' is not valid"));
-        }
-        Err(e) => {
-            return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath failed: {e}")).await;
-        }
-    };
+    let mut stream =
+        match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req)).await {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
+                stderr
+                    .error(&StderrError::simple(
+                        PROGRAM_NAME,
+                        format!("path '{}' is not valid", path_str),
+                    ))
+                    .await?;
+                return Err(anyhow::anyhow!("path '{path_str}' is not valid"));
+            }
+            Ok(Err(e)) => {
+                return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath failed: {e}")).await;
+            }
+            Err(_) => {
+                return send_store_error(
+                    stderr,
+                    anyhow::anyhow!("gRPC GetPath timed out after {DEFAULT_GRPC_TIMEOUT:?}"),
+                )
+                .await;
+            }
+        };
 
     // Stream NAR chunks via STDERR_WRITE. On mid-stream error, send
     // STDERR_ERROR so the client gets a proper error instead of a partial
@@ -1052,10 +1071,22 @@ async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let req = types::FindMissingPathsRequest {
         store_paths: store_paths.clone(),
     };
-    let missing_set: HashSet<String> = match store_client.find_missing_paths(req).await {
-        Ok(r) => r.into_inner().missing_paths.into_iter().collect(),
-        Err(e) => {
+    let missing_set: HashSet<String> = match tokio::time::timeout(
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.find_missing_paths(req),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+        Ok(Err(e)) => {
             return send_store_error(stderr, anyhow::anyhow!("gRPC FindMissingPaths: {e}")).await;
+        }
+        Err(_) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("gRPC FindMissingPaths timed out after {DEFAULT_GRPC_TIMEOUT:?}"),
+            )
+            .await;
         }
     };
 

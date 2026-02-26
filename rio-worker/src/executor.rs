@@ -38,9 +38,6 @@ use crate::overlay;
 use crate::synth_db::{self, SynthPathInfo, path_info_to_synth};
 use crate::upload;
 
-/// Default timeout for daemon operations.
-const DAEMON_BUILD_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
-
 /// Timeout for the daemon setup sequence (handshake + setOptions + send build).
 /// This bounds the blast radius of a stuck daemon before the build timeout kicks in.
 const DAEMON_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -169,7 +166,7 @@ pub async fn execute_build(
                 None
             }
         })
-        .unwrap_or(DAEMON_BUILD_TIMEOUT);
+        .unwrap_or_else(rio_common::grpc::daemon_timeout);
 
     let mut daemon = Command::new("nix-daemon")
         .arg("--stdio")
@@ -576,12 +573,17 @@ async fn fetch_input_metadata(
             store_path: path.clone(),
         };
 
-        match store_client.query_path_info(request).await {
-            Ok(response) => {
+        match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            store_client.query_path_info(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
                 let info = response.into_inner();
                 synth_paths.push(path_info_to_synth(&info));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     path = %path,
                     error = %e,
@@ -590,6 +592,12 @@ async fn fetch_input_metadata(
                 return Err(ExecutorError::MetadataFetch {
                     path: path.clone(),
                     source: e,
+                });
+            }
+            Err(_) => {
+                return Err(ExecutorError::MetadataFetch {
+                    path: path.clone(),
+                    source: tonic::Status::deadline_exceeded("QueryPathInfo timed out"),
                 });
             }
         }
@@ -699,18 +707,31 @@ async fn compute_input_closure(
         let req = QueryPathInfoRequest {
             store_path: path.clone(),
         };
-        let info = match store_client.query_path_info(req).await {
-            Ok(resp) => resp.into_inner(),
-            Err(e) if e.code() == tonic::Code::NotFound => {
+        let info = match tokio::time::timeout(
+            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            store_client.query_path_info(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) if e.code() == tonic::Code::NotFound => {
                 // Path not in store yet (output of a not-yet-built input drv).
                 // Skip — FUSE will fetch it lazily at build time if needed.
                 tracing::debug!(path = %path, "input path not in store; FUSE will lazy-fetch");
                 continue;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Err(ExecutorError::MetadataFetch {
                     path: path.clone(),
                     source: e,
+                });
+            }
+            Err(_) => {
+                return Err(ExecutorError::MetadataFetch {
+                    path: path.clone(),
+                    source: tonic::Status::deadline_exceeded(
+                        "QueryPathInfo timed out (closure BFS)",
+                    ),
                 });
             }
         };
@@ -847,14 +868,14 @@ mod tests {
         assert!(!alive, "daemon process should be dead after kill + wait");
     }
 
-    /// Verify that DAEMON_SETUP_TIMEOUT is shorter than DAEMON_BUILD_TIMEOUT.
-    /// This is a compile-time invariant check — if setup timeout were longer,
-    /// it would be pointless.
+    /// Verify that DAEMON_SETUP_TIMEOUT is shorter than the default daemon
+    /// build timeout. If setup timeout were longer, it would be pointless.
     #[test]
     fn test_timeout_ordering() {
         assert!(
-            DAEMON_SETUP_TIMEOUT < DAEMON_BUILD_TIMEOUT,
-            "setup timeout ({DAEMON_SETUP_TIMEOUT:?}) must be shorter than build timeout ({DAEMON_BUILD_TIMEOUT:?})"
+            DAEMON_SETUP_TIMEOUT < rio_common::grpc::DEFAULT_DAEMON_TIMEOUT,
+            "setup timeout ({DAEMON_SETUP_TIMEOUT:?}) must be shorter than default daemon timeout ({:?})",
+            rio_common::grpc::DEFAULT_DAEMON_TIMEOUT
         );
     }
 

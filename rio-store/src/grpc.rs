@@ -307,56 +307,76 @@ impl StoreService for StoreServiceImpl {
 
         // Send metadata as first message
         let info_clone = info;
-        tokio::spawn(async move {
-            // First message: PathInfo
-            if tx
-                .send(Ok(GetPathResponse {
-                    msg: Some(get_path_response::Msg::Info(info_clone)),
-                }))
+        rio_common::task::spawn_monitored("get-path-stream", async move {
+            // Bound the entire streaming task. A stalled backend read or a
+            // slow-consuming client can otherwise keep this task alive forever,
+            // leaking resources.
+            let stream_fut = async {
+                // First message: PathInfo
+                if tx
+                    .send(Ok(GetPathResponse {
+                        msg: Some(get_path_response::Msg::Info(info_clone)),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                // Step 3: Stream NAR data through HashingReader for integrity verification
+                let mut hashing = HashingReader::new(reader);
+                let mut buf = vec![0u8; NAR_CHUNK_SIZE];
+
+                loop {
+                    match hashing.read(&mut buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let chunk = buf[..n].to_vec();
+                            if tx
+                                .send(Ok(GetPathResponse {
+                                    msg: Some(get_path_response::Msg::NarChunk(chunk)),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return; // Client disconnected
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(internal_error("NAR stream read", e))).await;
+                            return;
+                        }
+                    }
+                }
+
+                // Step 4: Verify content integrity — the NAR on disk may have been
+                // corrupted (bitrot, partial write) since it was originally stored.
+                // If the hash doesn't match, send DATA_LOSS so the client knows not
+                // to trust the data.
+                let digest = hashing.into_digest();
+                if let Err(e) = validate_nar_digest(&digest, &expected_hash, expected_size) {
+                    error!(error = %e, "GetPath: content integrity check failed");
+                    metrics::counter!("rio_store_integrity_failures_total").increment(1);
+                    let _ = tx
+                        .send(Err(Status::data_loss(format!(
+                            "content integrity check failed: {e}"
+                        ))))
+                        .await;
+                }
+            };
+
+            if tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, stream_fut)
                 .await
                 .is_err()
             {
-                return;
-            }
-
-            // Step 3: Stream NAR data through HashingReader for integrity verification
-            let mut hashing = HashingReader::new(reader);
-            let mut buf = vec![0u8; NAR_CHUNK_SIZE];
-
-            loop {
-                match hashing.read(&mut buf).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        let chunk = buf[..n].to_vec();
-                        if tx
-                            .send(Ok(GetPathResponse {
-                                msg: Some(get_path_response::Msg::NarChunk(chunk)),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return; // Client disconnected
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(internal_error("NAR stream read", e))).await;
-                        return;
-                    }
-                }
-            }
-
-            // Step 4: Verify content integrity — the NAR on disk may have been
-            // corrupted (bitrot, partial write) since it was originally stored.
-            // If the hash doesn't match, send DATA_LOSS so the client knows not
-            // to trust the data.
-            let digest = hashing.into_digest();
-            if let Err(e) = validate_nar_digest(&digest, &expected_hash, expected_size) {
-                error!(error = %e, "GetPath: content integrity check failed");
-                metrics::counter!("rio_store_integrity_failures_total").increment(1);
+                warn!(
+                    timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                    "GetPath streaming task timed out"
+                );
                 let _ = tx
-                    .send(Err(Status::data_loss(format!(
-                        "content integrity check failed: {e}"
-                    ))))
+                    .send(Err(Status::deadline_exceeded(
+                        "GetPath streaming timed out",
+                    )))
                     .await;
             }
         });
@@ -483,9 +503,21 @@ fn compute_store_path_hash(store_path: &str) -> Vec<u8> {
 /// Drain remaining messages from a streaming request.
 ///
 /// Must be called before returning early from PutPath to avoid leaving
-/// unconsumed data on the gRPC transport.
+/// unconsumed data on the gRPC transport. Bounded by DEFAULT_GRPC_TIMEOUT
+/// to prevent a slow client from holding the handler indefinitely.
 async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
-    while let Ok(Some(_)) = stream.message().await {
-        // discard
+    let drain = async {
+        while let Ok(Some(_)) = stream.message().await {
+            // discard
+        }
+    };
+    if tokio::time::timeout(rio_common::grpc::DEFAULT_GRPC_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            "drain_stream timed out; client may be sending slowly"
+        );
     }
 }
