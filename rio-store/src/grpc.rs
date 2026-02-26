@@ -173,14 +173,46 @@ impl StoreService for StoreServiceImpl {
             }
         }
 
-        // Step 3: Insert nar_blobs row with status='uploading'
+        // Step 3: Insert nar_blobs row with status='uploading'.
+        // insert_uploading returns false (ON CONFLICT DO NOTHING no-op) if
+        // another uploader already holds a placeholder for this path.
+        // In that case we must NOT proceed: if we do and later fail
+        // validation, delete_uploading would delete the OTHER uploader's
+        // placeholder, losing their valid upload.
         let blob_key = format!("{sha256_hex}.nar");
-        if let Err(e) =
-            metadata::insert_uploading(&self.pool, &store_path_hash, &info.store_path, &blob_key)
-                .await
+        let inserted = match metadata::insert_uploading(
+            &self.pool,
+            &store_path_hash,
+            &info.store_path,
+            &blob_key,
+        )
+        .await
         {
+            Ok(b) => b,
+            Err(e) => {
+                drain_stream(&mut stream).await;
+                return Err(internal_error("PutPath: insert_uploading", e));
+            }
+        };
+        if !inserted {
+            // Another upload is in progress (or just completed in the window
+            // between check_complete above and now). Re-check: if it flipped
+            // to complete, return success; otherwise tell the client to retry.
             drain_stream(&mut stream).await;
-            return Err(internal_error("PutPath: insert_uploading", e));
+            match metadata::check_complete(&self.pool, &store_path_hash).await {
+                Ok(Some(_)) => {
+                    debug!(store_path = %info.store_path, "PutPath: concurrent upload won the race");
+                    metrics::counter!("rio_store_put_path_total", "result" => "exists")
+                        .increment(1);
+                    return Ok(Response::new(PutPathResponse { created: false }));
+                }
+                _ => {
+                    debug!(store_path = %info.store_path, "PutPath: concurrent upload in progress, aborting");
+                    return Err(Status::aborted(
+                        "concurrent PutPath in progress for this path; retry",
+                    ));
+                }
+            }
         }
 
         // Step 4: Accumulate NAR chunks into a buffer.
