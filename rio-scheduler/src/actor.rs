@@ -284,6 +284,10 @@ impl DagActor {
                 }
                 ActorCommand::WatchBuild {
                     build_id,
+                    // TODO(phase3): since_sequence is for resuming after gateway reconnect
+                    // to a new leader. Phase 2a has no leader election; the broadcast
+                    // channel's 1024-event buffer provides limited late-subscriber replay.
+                    // Full resumption requires persistent event log + leader handoff.
                     since_sequence: _,
                     reply,
                 } => {
