@@ -40,6 +40,10 @@ use crate::upload;
 /// Default timeout for daemon operations.
 const DAEMON_BUILD_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 
+/// Timeout for the daemon setup sequence (handshake + setOptions + send build).
+/// This bounds the blast radius of a stuck daemon before the build timeout kicks in.
+const DAEMON_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Worker nix.conf content for sandbox builds.
 const WORKER_NIX_CONF: &str = "\
 builders =
@@ -164,73 +168,39 @@ pub async fn execute_build(
         .spawn()
         .map_err(ExecutorError::DaemonSpawn)?;
 
-    let mut stdin = daemon
-        .stdin
-        .take()
-        .ok_or_else(|| ExecutorError::DaemonHandshake("failed to get daemon stdin".into()))?;
-    let mut stdout = daemon
-        .stdout
-        .take()
-        .ok_or_else(|| ExecutorError::DaemonHandshake("failed to get daemon stdout".into()))?;
-
-    // 6. Client handshake + wopSetOptions
-    let handshake_result = tokio::time::timeout(
-        Duration::from_secs(30),
-        client_handshake(&mut stdout, &mut stdin),
-    )
-    .await
-    .map_err(|_| ExecutorError::DaemonHandshake("handshake timed out".into()))?
-    .map_err(|e| ExecutorError::DaemonHandshake(format!("{e}")))?;
-
-    tracing::debug!(
-        version = handshake_result.negotiated_version(),
-        "daemon handshake complete"
-    );
-
-    client_set_options(&mut stdout, &mut stdin)
-        .await
-        .map_err(|e| ExecutorError::DaemonHandshake(format!("setOptions failed: {e}")))?;
-
-    // 7. Send wopBuildDerivation
-    wire::write_u64(
-        &mut stdin,
-        rio_nix::protocol::opcodes::WorkerOp::BuildDerivation as u64,
-    )
-    .await
-    .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-    wire::write_string(&mut stdin, drv_path)
-        .await
-        .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-    rio_nix::protocol::build::write_basic_derivation(&mut stdin, &basic_drv)
-        .await
-        .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-    wire::write_u64(&mut stdin, BuildMode::Normal as u64)
-        .await
-        .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-    tokio::io::AsyncWriteExt::flush(&mut stdin)
-        .await
-        .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-
-    // 8. Read STDERR loop with log streaming
+    // All daemon I/O is in a helper so we can ALWAYS kill on error.
+    // Previously, any `?` between spawn and kill leaked the daemon process.
     let mut batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string());
-    let build_result = tokio::time::timeout(timeout, async {
-        read_build_stderr_loop(&mut stdout, &mut batcher, log_tx).await
-    })
-    .await
-    .map_err(|_| ExecutorError::BuildFailed("build timed out".into()))?
-    .map_err(|e| ExecutorError::BuildFailed(format!("{e}")))?;
+    let build_result = run_daemon_build(
+        &mut daemon,
+        drv_path,
+        &basic_drv,
+        timeout,
+        &mut batcher,
+        log_tx,
+    )
+    .await;
 
-    // Flush any remaining log lines
+    // ALWAYS kill the daemon, regardless of success/failure.
+    if let Err(e) = daemon.kill().await {
+        tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
+    }
+    // Reap the zombie (bounded wait).
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await;
+
+    // Flush any remaining log lines (best-effort: build result is already determined)
     if batcher.has_pending() {
         let batch = batcher.flush();
         let msg = WorkerMessage {
             msg: Some(worker_message::Msg::LogBatch(batch)),
         };
-        let _ = log_tx.send(msg).await;
+        if log_tx.send(msg).await.is_err() {
+            tracing::warn!("log channel closed during final flush");
+        }
     }
 
-    // 9. Kill daemon
-    let _ = daemon.kill().await;
+    // NOW propagate any daemon error (after kill).
+    let build_result = build_result?;
 
     // 10. Check build result
     let proto_result = if build_result.status().is_success() {
@@ -302,6 +272,80 @@ pub async fn execute_build(
         result: proto_result,
         assignment_token: assignment.assignment_token.clone(),
     })
+}
+
+/// All daemon I/O after spawn: handshake, setOptions, wopBuildDerivation, stderr loop.
+///
+/// Caller MUST kill the daemon after this returns (whether Ok or Err).
+/// This is the only function that should touch daemon stdin/stdout —
+/// keeping it isolated ensures the caller's always-kill path is reliable.
+async fn run_daemon_build(
+    daemon: &mut tokio::process::Child,
+    drv_path: &str,
+    basic_drv: &rio_nix::derivation::BasicDerivation,
+    build_timeout: Duration,
+    batcher: &mut LogBatcher,
+    log_tx: &mpsc::Sender<WorkerMessage>,
+) -> Result<rio_nix::protocol::build::BuildResult, ExecutorError> {
+    let mut stdin = daemon
+        .stdin
+        .take()
+        .ok_or_else(|| ExecutorError::DaemonHandshake("failed to get daemon stdin".into()))?;
+    let mut stdout = daemon
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutorError::DaemonHandshake("failed to get daemon stdout".into()))?;
+
+    // Handshake + setOptions + send build — all bounded by DAEMON_SETUP_TIMEOUT.
+    // Previously only the handshake was timed out; a stuck setOptions or
+    // a stalled write would hang until build_timeout (potentially hours).
+    tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
+        let handshake_result = client_handshake(&mut stdout, &mut stdin)
+            .await
+            .map_err(|e| ExecutorError::DaemonHandshake(format!("{e}")))?;
+
+        tracing::debug!(
+            version = handshake_result.negotiated_version(),
+            "daemon handshake complete"
+        );
+
+        client_set_options(&mut stdout, &mut stdin)
+            .await
+            .map_err(|e| ExecutorError::DaemonHandshake(format!("setOptions failed: {e}")))?;
+
+        wire::write_u64(
+            &mut stdin,
+            rio_nix::protocol::opcodes::WorkerOp::BuildDerivation as u64,
+        )
+        .await
+        .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+        wire::write_string(&mut stdin, drv_path)
+            .await
+            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+        rio_nix::protocol::build::write_basic_derivation(&mut stdin, basic_drv)
+            .await
+            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+        wire::write_u64(&mut stdin, BuildMode::Normal as u64)
+            .await
+            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+        tokio::io::AsyncWriteExt::flush(&mut stdin)
+            .await
+            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+
+        Ok::<_, ExecutorError>(())
+    })
+    .await
+    .map_err(|_| ExecutorError::DaemonHandshake("daemon setup sequence timed out".into()))??;
+
+    // Read STDERR loop with log streaming (build may run for a long time)
+    let build_result = tokio::time::timeout(build_timeout, async {
+        read_build_stderr_loop(&mut stdout, batcher, log_tx).await
+    })
+    .await
+    .map_err(|_| ExecutorError::BuildFailed("build timed out".into()))?
+    .map_err(|e| ExecutorError::BuildFailed(format!("{e}")))?;
+
+    Ok(build_result)
 }
 
 /// Read the STDERR loop from the daemon, streaming logs via the batcher.
@@ -444,5 +488,85 @@ mod tests {
         assert!(conf_path.exists());
         let content = std::fs::read_to_string(&conf_path).unwrap();
         assert!(content.contains("sandbox = true"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 3: Daemon lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Verify that run_daemon_build fails when the process doesn't speak the
+    /// Nix protocol (handshake failure), and that the caller's always-kill
+    /// pattern leaves no leaked process.
+    #[tokio::test]
+    async fn test_daemon_killed_on_handshake_failure() {
+        // Spawn a process that closes stdout immediately (causing handshake
+        // read to get EOF fast) but keeps running. `sh -c 'exec >&-; sleep 1000'`
+        // closes stdout (FD 1) then sleeps.
+        let mut fake_daemon = Command::new("sh")
+            .arg("-c")
+            .arg("exec >&-; sleep 1000")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let pid = fake_daemon.id().expect("pid");
+
+        // Minimal basic derivation for the test
+        let output =
+            rio_nix::derivation::DerivationOutput::new("out", "/nix/store/test-out", "", "")
+                .unwrap();
+        let basic_drv = rio_nix::derivation::BasicDerivation::new(
+            vec![output],
+            Default::default(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            Default::default(),
+        )
+        .unwrap();
+        let mut batcher = LogBatcher::new("test.drv".into(), "test-worker".into());
+        let (log_tx, _log_rx) = mpsc::channel(4);
+
+        // run_daemon_build should fail quickly (handshake reads EOF from closed stdout).
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_daemon_build(
+                &mut fake_daemon,
+                "/nix/store/test.drv",
+                &basic_drv,
+                Duration::from_secs(5),
+                &mut batcher,
+                &log_tx,
+            ),
+        )
+        .await
+        .expect("handshake should fail fast, not hang");
+        assert!(
+            result.is_err(),
+            "handshake against closed stdout should fail"
+        );
+
+        // Caller must kill (as execute_build does)
+        let _ = fake_daemon.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), fake_daemon.wait()).await;
+
+        // Verify the process is actually dead. On Linux, /proc/<pid> goes away
+        // once the process is reaped. We reaped it above via wait(), so check.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let proc_path = format!("/proc/{pid}");
+        let alive = std::path::Path::new(&proc_path).exists();
+        assert!(!alive, "daemon process should be dead after kill + wait");
+    }
+
+    /// Verify that DAEMON_SETUP_TIMEOUT is shorter than DAEMON_BUILD_TIMEOUT.
+    /// This is a compile-time invariant check — if setup timeout were longer,
+    /// it would be pointless.
+    #[test]
+    fn test_timeout_ordering() {
+        assert!(
+            DAEMON_SETUP_TIMEOUT < DAEMON_BUILD_TIMEOUT,
+            "setup timeout ({DAEMON_SETUP_TIMEOUT:?}) must be shorter than build timeout ({DAEMON_BUILD_TIMEOUT:?})"
+        );
     }
 }
