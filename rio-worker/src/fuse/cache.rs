@@ -209,12 +209,37 @@ impl Cache {
         })
     }
 
+    /// Check if cached AND update last_access atomically in one DB roundtrip.
+    ///
+    /// Replaces the contains() + touch() pair in get_path's hot path. Each
+    /// block_on involves cross-thread sync with the tokio runtime; doing
+    /// both in a single call halves the overhead on every cache hit.
+    fn get_and_touch(&self, store_path: &str) -> Result<bool, CacheError> {
+        let now = unix_now();
+        let pool = &self.pool;
+        self.runtime.block_on(async {
+            // UPDATE...RETURNING: affects 0 rows if path not cached.
+            let result = sqlx::query(
+                "UPDATE cached_paths SET last_access = ?1 WHERE store_path = ?2 RETURNING store_path",
+            )
+            .bind(now)
+            .bind(store_path)
+            .fetch_optional(pool)
+            .await?;
+            Ok(result.is_some())
+        })
+    }
+
     /// Get the full filesystem path for a cached store path.
     ///
     /// Returns `Ok(None)` if the path is not cached, `Err` on index failure.
+    // TODO(phase2b): TOCTOU with evict_if_needed — DB says cached but disk
+    // may have evicted between this check and caller's open. In practice
+    // eviction is rare and the caller's symlink_metadata/open failure falls
+    // back to re-fetch anyway (slower but correct). Proper fix: RCU-style
+    // claim-before-evict or disk existence check here (adds syscall to hot path).
     pub fn get_path(&self, store_path: &str) -> Result<Option<PathBuf>, CacheError> {
-        if self.contains(store_path)? {
-            self.touch(store_path);
+        if self.get_and_touch(store_path)? {
             Ok(Some(self.cache_dir.join(store_path)))
         } else {
             Ok(None)
@@ -240,23 +265,6 @@ impl Cache {
         // Update cache size metric (ground-truth from DB)
         metrics::gauge!("rio_worker_fuse_cache_size_bytes").set(self.total_size() as f64);
         Ok(())
-    }
-
-    /// Update the last access timestamp for a cached path.
-    fn touch(&self, store_path: &str) {
-        let now = unix_now();
-        let pool = &self.pool;
-        self.runtime.block_on(async {
-            if let Err(e) =
-                sqlx::query("UPDATE cached_paths SET last_access = ?1 WHERE store_path = ?2")
-                    .bind(now)
-                    .bind(store_path)
-                    .execute(pool)
-                    .await
-            {
-                tracing::warn!(store_path, error = %e, "FUSE cache touch() failed");
-            }
-        });
     }
 
     /// Total size of all cached paths in bytes.
@@ -441,6 +449,43 @@ mod tests {
             cache.insert("abc-hello-1.0", 512).unwrap();
             let path = cache.get_path("abc-hello-1.0").unwrap().unwrap();
             assert_eq!(path, cache_dir.join("abc-hello-1.0"));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// get_and_touch must update last_access in a single DB roundtrip.
+    #[tokio::test]
+    async fn test_get_and_touch_updates_last_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"), 1).await;
+        let pool = cache.pool.clone();
+
+        tokio::task::spawn_blocking(move || {
+            cache.insert("touch-path", 100).unwrap();
+            // Wait 1s so last_access changes detectably.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+
+            let found = cache.get_and_touch("touch-path").unwrap();
+            assert!(found, "inserted path should be found");
+
+            // Verify last_access was updated (should be >= now - 1s).
+            let last_access: i64 = cache.runtime.block_on(async {
+                sqlx::query_scalar("SELECT last_access FROM cached_paths WHERE store_path = ?1")
+                    .bind("touch-path")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            });
+            let now = super::unix_now();
+            assert!(
+                (now - last_access).abs() <= 1,
+                "last_access should be ~now after get_and_touch; got diff = {}",
+                now - last_access
+            );
+
+            // Nonexistent path: returns false, no error.
+            assert!(!cache.get_and_touch("no-such-path").unwrap());
         })
         .await
         .unwrap();
