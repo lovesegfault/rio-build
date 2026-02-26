@@ -250,4 +250,154 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].required_features.is_empty());
     }
+
+    // -------------------------------------------------------------------
+    // T7: reconstruct_dag unit tests (8.7)
+    // -------------------------------------------------------------------
+    //
+    // reconstruct_dag calls resolve_derivation which checks drv_cache FIRST
+    // before hitting the store. By pre-populating drv_cache with all needed
+    // derivations, we can test reconstruct_dag without a live store.
+
+    use rio_proto::store::store_service_client::StoreServiceClient;
+
+    /// Spin up a mock store that returns NOT_FOUND for everything.
+    /// Used only for the leaf-fallback test; other tests pre-populate drv_cache.
+    async fn unreachable_store() -> StoreServiceClient<tonic::transport::Channel> {
+        // Connect to a port that isn't listening. Any RPC will fail, which
+        // we want for testing the leaf-fallback path.
+        // Actually, we need a WORKING transport but a server that returns NOT_FOUND.
+        // Simplest: use a lazy channel that never connects.
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        StoreServiceClient::new(channel)
+    }
+
+    /// Parse a minimal ATerm derivation with the given inputDrvs.
+    /// Format: Derive([outputs],[inputDrvs],[inputSrcs],system,builder,args,env)
+    fn make_test_derivation(out_path: &str, input_drvs: &[(&str, &[&str])]) -> Derivation {
+        let outputs = format!(r#"[("out","{out_path}","","")]"#);
+        let inputs: Vec<String> = input_drvs
+            .iter()
+            .map(|(path, outs)| {
+                let outs_str: Vec<String> = outs.iter().map(|o| format!(r#""{o}""#)).collect();
+                format!(r#"("{path}",[{}])"#, outs_str.join(","))
+            })
+            .collect();
+        let input_drvs_str = format!("[{}]", inputs.join(","));
+        let aterm = format!(
+            r#"Derive({outputs},{input_drvs_str},[],"x86_64-linux","/bin/sh",[],[("out","{out_path}")])"#
+        );
+        Derivation::parse(&aterm).expect("test ATerm should parse")
+    }
+
+    fn sp(s: &str) -> StorePath {
+        StorePath::parse(s).expect("valid test store path")
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_dag_single_node_no_inputs() {
+        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[]);
+
+        let mut store = unreachable_store().await;
+        let mut cache = HashMap::new();
+
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+            .await
+            .expect("reconstruct should succeed");
+
+        assert_eq!(nodes.len(), 1, "single derivation -> 1 node");
+        assert_eq!(nodes[0].drv_path, root_path.to_string());
+        assert_eq!(nodes[0].system, "x86_64-linux");
+        assert!(edges.is_empty(), "no inputDrvs -> 0 edges");
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_dag_one_input_drv() {
+        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-child.drv");
+
+        let root_drv = make_test_derivation(
+            "/nix/store/aaa-root-out",
+            &[(&child_path.to_string(), &["out"])],
+        );
+        let child_drv = make_test_derivation("/nix/store/bbb-child-out", &[]);
+
+        let mut store = unreachable_store().await;
+        // Pre-populate cache so resolve_derivation finds the child without gRPC.
+        let mut cache = HashMap::new();
+        cache.insert(child_path.clone(), child_drv);
+
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+            .await
+            .expect("reconstruct should succeed");
+
+        assert_eq!(nodes.len(), 2, "root + 1 inputDrv -> 2 nodes");
+        assert_eq!(edges.len(), 1, "1 inputDrv relationship -> 1 edge");
+        assert_eq!(edges[0].parent_drv_path, root_path.to_string());
+        assert_eq!(edges[0].child_drv_path, child_path.to_string());
+
+        // Both nodes should have correct drv_path set.
+        let paths: std::collections::HashSet<String> =
+            nodes.iter().map(|n| n.drv_path.clone()).collect();
+        assert!(paths.contains(&root_path.to_string()));
+        assert!(paths.contains(&child_path.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_dag_missing_drv_leaf_fallback() {
+        // inputDrv not in cache AND store unreachable -> leaf node fallback.
+        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let missing_child = "/nix/store/cccccccccccccccccccccccccccccccc-missing.drv";
+
+        let root_drv =
+            make_test_derivation("/nix/store/aaa-root-out", &[(missing_child, &["out"])]);
+
+        let mut store = unreachable_store().await;
+        let mut cache = HashMap::new(); // child NOT in cache
+
+        let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
+            .await
+            .expect("reconstruct should not panic on missing drv");
+
+        // Root + leaf fallback = 2 nodes. Edge still recorded.
+        assert_eq!(
+            nodes.len(),
+            2,
+            "root + leaf fallback for unresolvable child"
+        );
+        assert_eq!(edges.len(), 1);
+
+        // Leaf fallback node: drv_path set but system/pname empty.
+        let leaf = nodes
+            .iter()
+            .find(|n| n.drv_path == missing_child)
+            .expect("leaf fallback node should exist");
+        assert!(leaf.system.is_empty(), "leaf fallback has no system");
+        assert!(leaf.output_names.is_empty(), "leaf fallback has no outputs");
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_dag_transitive_chain() {
+        // A -> B -> C chain. All in cache.
+        let a_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let b_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        let c_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
+
+        let a_drv = make_test_derivation("/nix/store/aaa-out", &[(&b_path.to_string(), &["out"])]);
+        let b_drv = make_test_derivation("/nix/store/bbb-out", &[(&c_path.to_string(), &["out"])]);
+        let c_drv = make_test_derivation("/nix/store/ccc-out", &[]);
+
+        let mut store = unreachable_store().await;
+        let mut cache = HashMap::new();
+        cache.insert(b_path.clone(), b_drv);
+        cache.insert(c_path.clone(), c_drv);
+
+        let (nodes, edges) = reconstruct_dag(&a_path, &a_drv, &mut store, &mut cache)
+            .await
+            .expect("reconstruct should succeed");
+
+        assert_eq!(nodes.len(), 3, "A->B->C chain -> 3 nodes");
+        assert_eq!(edges.len(), 2, "A->B and B->C -> 2 edges");
+    }
 }
