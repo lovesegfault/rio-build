@@ -270,14 +270,19 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - Attic's FastCDC-based chunking approach: reference for chunk size tuning and dedup strategy
 - NAR and narinfo formats: implemented from scratch in `rio-nix`
 
-## Key Files
+## Key Files (Phase 2a)
 
-- `rio-store/src/cas.rs` --- Core CAS logic: put/get paths with integrity verification
+- `rio-store/src/grpc.rs` --- StoreService gRPC implementation (PutPath, GetPath, QueryPathInfo, FindMissingPaths)
+- `rio-store/src/metadata.rs` --- PathInfo, narinfo persistence (PostgreSQL)
+- `rio-store/src/validate.rs` --- NAR hash verification (HashingReader, NarDigest)
+- `rio-store/src/backend/` --- NarBackend trait + filesystem, S3, memory backends
+
+## Planned Files (Phase 2c+)
+
+- `rio-store/src/cas.rs` --- Chunked CAS put/get with integrity verification
 - `rio-store/src/chunker.rs` --- FastCDC content-defined chunking
-- `rio-store/src/manifest.rs` --- Chunk manifest (ordered list of chunk digests)
-- `rio-store/src/metadata.rs` --- PathInfo, narinfo, references (PostgreSQL)
+- `rio-store/src/manifest.rs` --- Chunk manifest (ordered digest list)
 - `rio-store/src/content_index.rs` --- Content hash -> store path index (CA cutoff)
-- `rio-store/src/backend/` --- ChunkBackend trait + S3, filesystem, memory backends
 - `rio-store/src/cache_server.rs` --- Binary cache HTTP server (axum) with `/nix-cache-info`
 - `rio-store/src/gc.rs` --- Garbage collection (mark/grace/sweep + orphan cleanup)
 - `rio-store/src/signing.rs` --- ed25519 NAR signing/verification
