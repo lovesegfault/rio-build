@@ -86,7 +86,7 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
     let mut tx = pool.begin().await?;
 
     // Update narinfo with full metadata
-    sqlx::query(
+    let narinfo_result = sqlx::query(
         r#"
         UPDATE narinfo SET
             deriver = $2,
@@ -108,8 +108,17 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
     .execute(&mut *tx)
     .await?;
 
+    // Placeholder must exist. If rows_affected==0, another process deleted it
+    // (via delete_uploading) between insert_uploading and now. Fail explicitly.
+    if narinfo_result.rows_affected() == 0 {
+        anyhow::bail!(
+            "complete_upload: narinfo placeholder missing for {} (concurrently deleted?)",
+            info.store_path
+        );
+    }
+
     // Flip nar_blobs status to 'complete' and update blob_key
-    sqlx::query(
+    let blobs_result = sqlx::query(
         r#"
         UPDATE nar_blobs SET
             status = 'complete',
@@ -122,6 +131,13 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
     .bind(blob_key)
     .execute(&mut *tx)
     .await?;
+
+    if blobs_result.rows_affected() == 0 {
+        anyhow::bail!(
+            "complete_upload: nar_blobs placeholder missing for {} (concurrently deleted?)",
+            info.store_path
+        );
+    }
 
     tx.commit().await?;
 

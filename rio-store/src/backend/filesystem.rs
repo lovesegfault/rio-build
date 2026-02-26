@@ -2,7 +2,7 @@
 //!
 //! Stores NARs as `{base_dir}/{sha256-hex}.nar` using `tokio::fs` for async I/O.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use tokio::io::AsyncRead;
@@ -28,6 +28,22 @@ impl FilesystemBackend {
         }
     }
 
+    /// Validate a storage key: reject path-separator characters, parent
+    /// directory components, and null bytes. Keys are SHA-256 hex strings
+    /// in practice, but the trait accepts arbitrary strings.
+    fn validate_key(key: &str) -> anyhow::Result<()> {
+        if key.is_empty() {
+            anyhow::bail!("storage key is empty");
+        }
+        if key.contains('/') || key.contains('\\') || key.contains('\0') {
+            anyhow::bail!("storage key contains path separator or null byte: {key:?}");
+        }
+        if key.contains("..") {
+            anyhow::bail!("storage key contains parent directory component: {key:?}");
+        }
+        Ok(())
+    }
+
     /// Compute the full file path for a given storage key.
     fn blob_path(&self, key: &str) -> PathBuf {
         self.base_dir.join(key)
@@ -38,6 +54,7 @@ impl FilesystemBackend {
 impl NarBackend for FilesystemBackend {
     async fn put(&self, sha256_hex: &str, data: Bytes) -> anyhow::Result<String> {
         let key = format!("{sha256_hex}.nar");
+        Self::validate_key(&key)?;
         let path = self.blob_path(&key);
         debug!(path = %path.display(), size = data.len(), "FilesystemBackend: storing NAR blob");
 
@@ -54,6 +71,7 @@ impl NarBackend for FilesystemBackend {
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<Box<dyn AsyncRead + Send + Unpin>>> {
+        Self::validate_key(key)?;
         let path = self.blob_path(key);
         match tokio::fs::File::open(&path).await {
             Ok(file) => Ok(Some(Box::new(file) as Box<dyn AsyncRead + Send + Unpin>)),
@@ -63,6 +81,7 @@ impl NarBackend for FilesystemBackend {
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        Self::validate_key(key)?;
         let path = self.blob_path(key);
         debug!(path = %path.display(), "FilesystemBackend: deleting NAR blob");
         match tokio::fs::remove_file(&path).await {
@@ -73,8 +92,9 @@ impl NarBackend for FilesystemBackend {
     }
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        Self::validate_key(key)?;
         let path = self.blob_path(key);
-        Ok(Path::new(&path).exists())
+        Ok(tokio::fs::try_exists(&path).await.unwrap_or(false))
     }
 }
 
@@ -137,5 +157,21 @@ mod tests {
             .await
             .unwrap();
         assert!(nested.exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(dir.path());
+
+        // All operations should reject traversal attempts.
+        assert!(backend.get("../etc/passwd").await.is_err());
+        assert!(backend.get("foo/../bar").await.is_err());
+        assert!(backend.delete("../../outside").await.is_err());
+        assert!(backend.exists("subdir/file.nar").await.is_err());
+        assert!(backend.get("").await.is_err());
+
+        // Valid keys (no slashes, no ..) should work.
+        assert!(backend.get("valid-key.nar").await.is_ok());
     }
 }

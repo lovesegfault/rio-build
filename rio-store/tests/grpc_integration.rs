@@ -16,7 +16,8 @@ use tonic::transport::{Channel, Server};
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::store::store_service_server::StoreServiceServer;
 use rio_proto::types::{
-    PathInfo, PutPathMetadata, PutPathRequest, QueryPathInfoRequest, put_path_request,
+    FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, QueryPathInfoRequest,
+    put_path_request,
 };
 use rio_store::backend::memory::MemoryBackend;
 use rio_store::grpc::StoreServiceImpl;
@@ -156,7 +157,7 @@ async fn test_harness_smoke() {
     // QueryPathInfo on missing path should return NOT_FOUND
     let result = client
         .query_path_info(QueryPathInfoRequest {
-            store_path: "/nix/store/does-not-exist".into(),
+            store_path: "/nix/store/00000000000000000000000000000000-does-not-exist".into(),
         })
         .await;
     assert!(result.is_err());
@@ -180,7 +181,7 @@ async fn test_put_path_cleanup_on_hash_mismatch() {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
-    let store_path = "/nix/store/test-cleanup-path";
+    let store_path = "/nix/store/11111111111111111111111111111111-test-cleanup-path";
     let good_nar = make_nar(b"correct content");
     let bad_nar = make_nar(b"wrong content");
 
@@ -220,7 +221,7 @@ async fn test_put_get_roundtrip() {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
-    let store_path = "/nix/store/test-roundtrip-path";
+    let store_path = "/nix/store/22222222222222222222222222222222-test-roundtrip-path";
     let nar = make_nar(b"roundtrip test content!");
     let info = make_path_info(store_path, &nar);
 
@@ -265,7 +266,7 @@ async fn test_idempotent_put_path() {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
-    let store_path = "/nix/store/test-idempotent-path";
+    let store_path = "/nix/store/33333333333333333333333333333333-test-idempotent-path";
     let nar = make_nar(b"idempotent test");
     let info = make_path_info(store_path, &nar);
 
@@ -291,7 +292,10 @@ async fn test_put_path_rejects_oversized_nar() {
     let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
 
     // Declare nar_size=100 but send 100_000 bytes (well over + 4KB tolerance)
-    let mut info = make_path_info("/nix/store/oversized-test", &[0u8; 100]);
+    let mut info = make_path_info(
+        "/nix/store/44444444444444444444444444444444-oversized-test",
+        &[0u8; 100],
+    );
     info.nar_size = 100; // Lie about the size
 
     let oversized_data = vec![0u8; 100_000];
@@ -307,6 +311,98 @@ async fn test_put_path_rejects_oversized_nar() {
     assert!(
         status.message().contains("exceed"),
         "error message should mention size exceeded: {}",
+        status.message()
+    );
+
+    server.abort();
+}
+
+/// PutPath with absurdly large declared nar_size should be rejected BEFORE
+/// allocation (prevents OOM from malicious clients).
+#[tokio::test]
+async fn test_put_path_rejects_absurd_nar_size() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let mut info = make_path_info(
+        "/nix/store/55555555555555555555555555555555-absurd-size-test",
+        &[0u8; 10],
+    );
+    info.nar_size = u64::MAX; // Attempt to trigger huge Vec::with_capacity
+
+    let result = put_path(&mut client, info, vec![0u8; 10]).await;
+
+    // Must be rejected promptly — no hang, no crash.
+    assert!(result.is_err(), "u64::MAX nar_size should be rejected");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("exceeds maximum"),
+        "error should mention size limit: {}",
+        status.message()
+    );
+
+    server.abort();
+}
+
+/// Malformed store paths (no 32-char hash prefix, traversal attempts) should
+/// be rejected with INVALID_ARGUMENT at the RPC boundary.
+#[tokio::test]
+async fn test_rejects_malformed_store_paths() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let bad_paths = [
+        "/nix/store/too-short",     // no 32-char hash
+        "/nix/store/../etc/passwd", // traversal
+        "not-a-store-path",         // no /nix/store/ prefix
+        "",                         // empty
+    ];
+
+    for path in bad_paths {
+        let result = client
+            .query_path_info(QueryPathInfoRequest {
+                store_path: path.into(),
+            })
+            .await;
+        assert!(result.is_err(), "path {path:?} should be rejected");
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::InvalidArgument,
+            "path {path:?} should return INVALID_ARGUMENT"
+        );
+    }
+
+    server.abort();
+}
+
+/// FindMissingPaths with > MAX_BATCH_PATHS entries should be rejected.
+#[tokio::test]
+async fn test_find_missing_paths_rejects_oversized_batch() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    // 10_001 paths (one over the limit).
+    let paths: Vec<String> = (0..10_001)
+        .map(|i| {
+            format!(
+                "/nix/store/{:032}-path-{}",
+                i % 100_000_000_000_000_000_000_000_000_000_000u128,
+                i
+            )
+        })
+        .collect();
+
+    let result = client
+        .find_missing_paths(FindMissingPathsRequest { store_paths: paths })
+        .await;
+
+    assert!(result.is_err(), "oversized batch should be rejected");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("too many paths"),
+        "error should mention path limit: {}",
         status.message()
     );
 
