@@ -1702,22 +1702,22 @@ impl DagActor {
                 // will defer the derivation; next dispatch pass retries.
                 // Do NOT push_front here — that would cause the inner
                 // dispatch loop to spin (channel is still full).
-                if let Some(state) = self.dag.node_mut(drv_hash) {
-                    if let Err(e) = state.reset_to_ready() {
-                        // We already transitioned to Assigned, cleared running_builds,
-                        // and now can't reset. Derivation is orphaned in Assigned
-                        // with no worker actually building. Heartbeat reconciliation
-                        // may eventually catch this, but it's a visible hang until then.
-                        error!(
-                            drv_hash,
-                            worker_id,
-                            current = ?state.status(),
-                            error = %e,
-                            "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
-                        );
-                        metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "ready_reset")
-                            .increment(1);
-                    }
+                if let Some(state) = self.dag.node_mut(drv_hash)
+                    && let Err(e) = state.reset_to_ready()
+                {
+                    // We already transitioned to Assigned, cleared running_builds,
+                    // and now can't reset. Derivation is orphaned in Assigned
+                    // with no worker actually building. Heartbeat reconciliation
+                    // may eventually catch this, but it's a visible hang until then.
+                    error!(
+                        drv_hash,
+                        worker_id,
+                        current = ?state.status(),
+                        error = %e,
+                        "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
+                    );
+                    metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "ready_reset")
+                        .increment(1);
                 }
                 return false;
             }

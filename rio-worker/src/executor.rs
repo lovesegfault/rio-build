@@ -720,7 +720,10 @@ async fn compute_input_closure(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) if e.code() == tonic::Code::NotFound => {
                 // Path not in store yet (output of a not-yet-built input drv).
-                // Skip — FUSE will fetch it lazily at build time if needed.
+                // Remove it from the closure set (we inserted it above for
+                // dedup) so downstream fetch_input_metadata doesn't fail on it.
+                // FUSE will lazy-fetch it at build time if needed.
+                closure.remove(&path);
                 tracing::debug!(path = %path, "input path not in store; FUSE will lazy-fetch");
                 continue;
             }
