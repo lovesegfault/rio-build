@@ -2,6 +2,11 @@
 //!
 //! Stores NARs as `{prefix}/{sha256-hex}.nar` in an S3 bucket using the
 //! `aws-sdk-s3` client.
+//!
+// TODO(phase2b): unit test is_not_found() branching with mocked aws-sdk-s3
+// responses (NoSuchKey vs network errors vs 5xx). S3 is the primary
+// production backend; a bug conflating network errors with 404s would
+// produce phantom "path not found" errors.
 
 use aws_sdk_s3::Client;
 use bytes::Bytes;
