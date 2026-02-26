@@ -7,9 +7,10 @@
 //! A lightweight SQLite index tracks cached paths, sizes, and access
 //! timestamps for LRU eviction decisions.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 use tokio::runtime::Handle;
@@ -23,6 +24,64 @@ pub enum CacheError {
     Io(#[from] std::io::Error),
     #[error("NAR error: {0}")]
     Nar(#[from] rio_nix::nar::NarError),
+}
+
+/// Per-path coordination for in-flight fetches.
+///
+/// Waiters block on `cv` until `done` flips to true.
+pub struct InflightEntry {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl InflightEntry {
+    /// Block the current thread until the fetch completes or `timeout` elapses.
+    ///
+    /// Returns `true` if the fetch completed, `false` on timeout.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, wait_result) = self
+            .cv
+            .wait_timeout_while(done, timeout, |d| !*d)
+            .unwrap_or_else(|e| e.into_inner());
+        !wait_result.timed_out() && *done
+    }
+}
+
+/// Outcome of [`Cache::try_start_fetch`].
+pub enum FetchClaim<'a> {
+    /// Caller owns the fetch. The guard notifies all waiters when dropped,
+    /// regardless of fetch success or failure.
+    Fetch(FetchGuard<'a>),
+    /// Another thread is already fetching. Caller should wait on the entry.
+    WaitFor(Arc<InflightEntry>),
+}
+
+/// RAII guard for an in-flight fetch claim.
+///
+/// On drop, removes the path from the inflight map and notifies all waiters.
+/// This fires even if the fetcher panics, ensuring waiters are never stuck
+/// indefinitely (they also have a belt-and-suspenders timeout).
+pub struct FetchGuard<'a> {
+    cache: &'a Cache,
+    path: String,
+}
+
+impl Drop for FetchGuard<'_> {
+    fn drop(&mut self) {
+        let entry = {
+            let mut inflight = self
+                .cache
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            inflight.remove(&self.path)
+        };
+        if let Some(entry) = entry {
+            *entry.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            entry.cv.notify_all();
+        }
+    }
 }
 
 /// Metadata for a cached store path.
@@ -49,8 +108,8 @@ pub struct Cache {
     pool: SqlitePool,
     /// Tokio runtime handle for block_on bridging.
     runtime: Handle,
-    /// In-flight fetches to avoid duplicate downloads.
-    inflight: Mutex<HashSet<String>>,
+    /// In-flight fetches with per-path condition variables for waiter notification.
+    inflight: Mutex<HashMap<String, Arc<InflightEntry>>>,
 }
 
 impl Cache {
@@ -91,7 +150,7 @@ impl Cache {
             max_size_bytes: max_size_gb * 1024 * 1024 * 1024,
             pool,
             runtime,
-            inflight: Mutex::new(HashSet::new()),
+            inflight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -240,25 +299,33 @@ impl Cache {
         Ok(freed)
     }
 
-    /// Try to mark a path as in-flight (being fetched).
+    /// Try to claim responsibility for fetching a path.
     ///
-    /// Returns `true` if the path was not already in-flight (caller should fetch).
-    /// Returns `false` if another task is already fetching it.
-    pub fn try_start_fetch(&self, store_path: &str) -> bool {
+    /// Returns [`FetchClaim::Fetch`] if the path was not already in-flight;
+    /// the caller must perform the fetch. The returned guard notifies all
+    /// waiters on drop (including on panic).
+    ///
+    /// Returns [`FetchClaim::WaitFor`] if another thread is already fetching;
+    /// the caller should block on [`InflightEntry::wait`].
+    pub fn try_start_fetch(&self, store_path: &str) -> FetchClaim<'_> {
+        use std::collections::hash_map::Entry;
         let mut inflight = self.inflight.lock().unwrap_or_else(|e| {
             tracing::error!("inflight lock poisoned, recovering");
             e.into_inner()
         });
-        inflight.insert(store_path.to_string())
-    }
-
-    /// Mark a path as no longer in-flight.
-    pub fn finish_fetch(&self, store_path: &str) {
-        let mut inflight = self.inflight.lock().unwrap_or_else(|e| {
-            tracing::error!("inflight lock poisoned, recovering");
-            e.into_inner()
-        });
-        inflight.remove(store_path);
+        match inflight.entry(store_path.to_string()) {
+            Entry::Occupied(e) => FetchClaim::WaitFor(e.get().clone()),
+            Entry::Vacant(e) => {
+                e.insert(Arc::new(InflightEntry {
+                    done: Mutex::new(false),
+                    cv: Condvar::new(),
+                }));
+                FetchClaim::Fetch(FetchGuard {
+                    cache: self,
+                    path: store_path.to_string(),
+                })
+            }
+        }
     }
 }
 
@@ -346,15 +413,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inflight_tracking() {
+    async fn test_inflight_claim_and_notify() {
         let dir = tempfile::tempdir().unwrap();
         let cache = make_cache(dir.path().join("cache"), 1).await;
 
-        // inflight tracking doesn't use block_on, so can test directly
-        assert!(cache.try_start_fetch("abc-path"));
-        assert!(!cache.try_start_fetch("abc-path"));
+        // First claim should succeed.
+        let FetchClaim::Fetch(guard) = cache.try_start_fetch("abc-path") else {
+            panic!("first claim should return Fetch");
+        };
+        // Second claim should get WaitFor.
+        let FetchClaim::WaitFor(entry) = cache.try_start_fetch("abc-path") else {
+            panic!("second claim should return WaitFor");
+        };
 
-        cache.finish_fetch("abc-path");
-        assert!(cache.try_start_fetch("abc-path"));
+        // Drop guard → should notify. Waiter should see completion immediately.
+        drop(guard);
+        assert!(entry.wait(Duration::from_millis(100)));
+
+        // After guard drop, path is no longer inflight — can claim again.
+        let FetchClaim::Fetch(_) = cache.try_start_fetch("abc-path") else {
+            panic!("should be able to re-claim after guard drop");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_inflight_concurrent_wait() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"), 1).await;
+        let fetch_count = Arc::new(AtomicU32::new(0));
+
+        // Two threads race to fetch the same path. Exactly one should get
+        // Fetch; the other should WaitFor and be woken promptly (not after
+        // the old 1.4s backoff).
+        let (c1, f1) = (cache.clone(), fetch_count.clone());
+        let (c2, f2) = (cache.clone(), fetch_count.clone());
+
+        let t1 = std::thread::spawn(move || do_claim(&c1, &f1));
+        let t2 = std::thread::spawn(move || do_claim(&c2, &f2));
+
+        let (d1, d2) = (t1.join().unwrap(), t2.join().unwrap());
+
+        // Exactly one fetch happened.
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        // Both threads finished in roughly the fetcher's sleep time (200ms),
+        // not the old backoff total (1.4s). Generous bound for CI.
+        assert!(d1 < Duration::from_millis(800), "t1 took {d1:?}");
+        assert!(d2 < Duration::from_millis(800), "t2 took {d2:?}");
+
+        fn do_claim(cache: &Cache, fetch_count: &AtomicU32) -> Duration {
+            let start = Instant::now();
+            match cache.try_start_fetch("race-path") {
+                FetchClaim::Fetch(_guard) => {
+                    fetch_count.fetch_add(1, Ordering::SeqCst);
+                    // Simulate a fetch taking 200ms.
+                    std::thread::sleep(Duration::from_millis(200));
+                    // _guard drops here, notifying the waiter.
+                }
+                FetchClaim::WaitFor(entry) => {
+                    assert!(
+                        entry.wait(Duration::from_secs(5)),
+                        "waiter should be notified"
+                    );
+                }
+            }
+            start.elapsed()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inflight_wait_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(dir.path().join("cache"), 1).await;
+
+        // Claim the fetch but never drop the guard.
+        let FetchClaim::Fetch(guard) = cache.try_start_fetch("stuck-path") else {
+            panic!("first claim should return Fetch");
+        };
+        let FetchClaim::WaitFor(entry) = cache.try_start_fetch("stuck-path") else {
+            panic!("second claim should return WaitFor");
+        };
+
+        // Wait should time out since the guard is never dropped.
+        let start = std::time::Instant::now();
+        assert!(!entry.wait(Duration::from_millis(100)));
+        assert!(start.elapsed() >= Duration::from_millis(100));
+
+        drop(guard);
     }
 }
