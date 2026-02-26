@@ -336,7 +336,12 @@ impl NixStoreFs {
                         Some(get_path_response::Msg::Info(_)) => {
                             // First message contains metadata; we already have it
                         }
-                        None => {}
+                        None => {
+                            tracing::warn!(
+                                store_path = %store_path,
+                                "empty GetPathResponse message (possible proto mismatch)"
+                            );
+                        }
                     }
                 }
 

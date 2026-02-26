@@ -59,6 +59,8 @@ pub enum ExecutorError {
     Overlay(#[from] anyhow::Error),
     #[error("synthetic DB generation failed: {0}")]
     SynthDb(String),
+    #[error("nix.conf setup failed: {0}")]
+    NixConf(String),
     #[error("daemon spawn failed: {0}")]
     DaemonSpawn(std::io::Error),
     #[error("daemon handshake failed: {0}")]
@@ -645,7 +647,9 @@ async fn fetch_drv_from_store(
                 }
                 nar_data.extend_from_slice(&chunk);
             }
-            None => {}
+            None => {
+                tracing::warn!("empty GetPathResponse message (possible proto mismatch)");
+            }
         }
     }
 
@@ -750,9 +754,9 @@ async fn compute_input_closure(
 fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
     let conf_dir = upper_dir.join("etc/nix");
     std::fs::create_dir_all(&conf_dir)
-        .map_err(|e| ExecutorError::SynthDb(format!("failed to create nix conf dir: {e}")))?;
+        .map_err(|e| ExecutorError::NixConf(format!("failed to create nix conf dir: {e}")))?;
     std::fs::write(conf_dir.join("nix.conf"), WORKER_NIX_CONF)
-        .map_err(|e| ExecutorError::SynthDb(format!("failed to write nix.conf: {e}")))?;
+        .map_err(|e| ExecutorError::NixConf(format!("failed to write nix.conf: {e}")))?;
     Ok(())
 }
 
