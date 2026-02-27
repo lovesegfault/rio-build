@@ -1375,6 +1375,140 @@ async fn test_add_text_to_store() {
     h.finish().await;
 }
 
+/// wopAddToStore (7) with cam_str="text:sha256": text-method CA path.
+/// Reads name + cam_str + references + repair + framed dump, returns
+/// a 9-field ValidPathInfo. The computed path should match
+/// StorePath::make_text (content-addressed text import).
+#[tokio::test]
+async fn test_add_to_store_text_method() {
+    let mut h = TestHarness::setup().await;
+
+    let content = b"hello from text method";
+
+    wire::write_u64(&mut h.stream, 7).await.unwrap(); // wopAddToStore
+    wire::write_string(&mut h.stream, "text-test")
+        .await
+        .unwrap(); // name
+    wire::write_string(&mut h.stream, "text:sha256")
+        .await
+        .unwrap(); // cam_str
+    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
+    wire::write_framed_stream(&mut h.stream, content, 8192)
+        .await
+        .unwrap(); // dump data
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+
+    // 9-field ValidPathInfo response
+    let path = wire::read_string(&mut h.stream).await.unwrap();
+    let _deriver = wire::read_string(&mut h.stream).await.unwrap();
+    let nar_hash_hex = wire::read_string(&mut h.stream).await.unwrap();
+    let _references = wire::read_strings(&mut h.stream).await.unwrap();
+    let _reg_time = wire::read_u64(&mut h.stream).await.unwrap();
+    let nar_size = wire::read_u64(&mut h.stream).await.unwrap();
+    let _ultimate = wire::read_bool(&mut h.stream).await.unwrap();
+    let _sigs = wire::read_strings(&mut h.stream).await.unwrap();
+    let ca = wire::read_string(&mut h.stream).await.unwrap();
+
+    assert!(
+        path.starts_with("/nix/store/") && path.ends_with("-text-test"),
+        "computed path should be a store path ending in -text-test: {path}"
+    );
+    assert_eq!(nar_hash_hex.len(), 64, "nar_hash should be hex sha256");
+    assert!(nar_size > 0);
+    assert!(
+        ca.starts_with("text:sha256:"),
+        "ca should start with text:sha256:, got: {ca}"
+    );
+
+    // Verify store received the upload at the computed path.
+    let calls = h.store.put_calls.read().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].store_path, path);
+
+    h.finish().await;
+}
+
+/// wopAddToStore (7) with cam_str="fixed:sha256": flat-file fixed-output.
+/// The dump data is raw file content (not NAR); handler wraps it in NAR.
+#[tokio::test]
+async fn test_add_to_store_fixed_flat() {
+    let mut h = TestHarness::setup().await;
+
+    let content = b"raw file content for flat fixed-output";
+
+    wire::write_u64(&mut h.stream, 7).await.unwrap(); // wopAddToStore
+    wire::write_string(&mut h.stream, "flat-test")
+        .await
+        .unwrap(); // name
+    wire::write_string(&mut h.stream, "fixed:sha256")
+        .await
+        .unwrap(); // cam_str (flat, no r:)
+    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
+    wire::write_framed_stream(&mut h.stream, content, 8192)
+        .await
+        .unwrap(); // dump data (raw, not NAR)
+    h.stream.flush().await.unwrap();
+
+    drain_stderr_until_last(&mut h.stream).await;
+
+    let path = wire::read_string(&mut h.stream).await.unwrap();
+    let _deriver = wire::read_string(&mut h.stream).await.unwrap();
+    let _nar_hash = wire::read_string(&mut h.stream).await.unwrap();
+    let _refs = wire::read_strings(&mut h.stream).await.unwrap();
+    let _reg_time = wire::read_u64(&mut h.stream).await.unwrap();
+    let nar_size = wire::read_u64(&mut h.stream).await.unwrap();
+    let _ult = wire::read_bool(&mut h.stream).await.unwrap();
+    let _sigs = wire::read_strings(&mut h.stream).await.unwrap();
+    let ca = wire::read_string(&mut h.stream).await.unwrap();
+
+    assert!(path.ends_with("-flat-test"));
+    // Flat: NAR wraps the raw content, so nar_size > content.len()
+    assert!(
+        nar_size > content.len() as u64,
+        "NAR wrapping should increase size: nar_size={nar_size}, content={}",
+        content.len()
+    );
+    assert!(
+        ca.starts_with("fixed:sha256:"),
+        "flat ca should be fixed:sha256: (no r:), got: {ca}"
+    );
+
+    h.finish().await;
+}
+
+/// wopAddToStore (7) with an invalid cam_str should send STDERR_ERROR
+/// (not crash or silently succeed).
+#[tokio::test]
+async fn test_add_to_store_invalid_cam_str_returns_error() {
+    let mut h = TestHarness::setup().await;
+
+    wire::write_u64(&mut h.stream, 7).await.unwrap(); // wopAddToStore
+    wire::write_string(&mut h.stream, "bad-test").await.unwrap(); // name
+    wire::write_string(&mut h.stream, "bogus:sha256")
+        .await
+        .unwrap(); // INVALID cam_str
+    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
+    // Handler reads framed stream BEFORE parsing cam_str, so we must send it.
+    wire::write_framed_stream(&mut h.stream, b"data", 8192)
+        .await
+        .unwrap();
+    h.stream.flush().await.unwrap();
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(
+        err.message().contains("content-address method") || err.message().contains("bogus"),
+        "error should mention invalid cam_str: {}",
+        err.message()
+    );
+
+    h.finish().await;
+}
+
 /// wopBuildDerivation (36): reads drv_path + BasicDerivation + build_mode,
 /// writes BuildResult. BasicDerivation format is: output_count +
 /// per-output(name, path, hash_algo, hash) + input_srcs + platform + builder +
