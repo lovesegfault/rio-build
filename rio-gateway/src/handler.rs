@@ -2008,6 +2008,11 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
     let mut all_edges = Vec::new();
     let mut drv_indices: Vec<Option<usize>> = Vec::new(); // maps raw_paths index to build result
     let mut opaque_results: HashMap<usize, BuildResult> = HashMap::new();
+    // Track idx → (drvPath, Derivation) for successful Built paths so we can
+    // populate builtOutputs per-derivation after the build completes.
+    // Without builtOutputs, the client can't map the derivation to its outputs
+    // and falls back to some NAR-based verification → "error: no sink".
+    let mut drv_for_idx: HashMap<usize, (String, Derivation)> = HashMap::new();
 
     for (idx, raw) in raw_paths.iter().enumerate() {
         let dp = match DerivedPath::parse(raw) {
@@ -2068,6 +2073,7 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
                         drv_indices.push(Some(idx));
+                        drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
                     }
                     Err(e) => {
                         opaque_results.insert(
@@ -2098,12 +2104,44 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
                     BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
                 });
 
-        // Apply the build result to all derivation paths
-        for (idx, raw) in raw_paths.iter().enumerate() {
+        // Apply the build result to all derivation paths, enriching each with
+        // its builtOutputs (drvHashModulo!outputName → Realisation JSON).
+        // Uses drv_cache as the resolver for hash_derivation_modulo's transitive deps.
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        for (idx, _raw) in raw_paths.iter().enumerate() {
             if let Some(opaque) = opaque_results.remove(&idx) {
                 results.push(opaque);
+            } else if build_result.status().is_success() {
+                if let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx) {
+                    let resolve =
+                        |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+                    match rio_nix::derivation::hash_derivation_modulo(
+                        drv_obj,
+                        drv_path,
+                        &resolve,
+                        &mut hash_cache,
+                    ) {
+                        Ok(hash) => {
+                            let hash_hex = hex::encode(hash);
+                            results.push(
+                                build_result
+                                    .clone()
+                                    .with_outputs_from_drv(drv_obj, &hash_hex),
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                drv_path = %drv_path,
+                                error = %e,
+                                "hash_derivation_modulo failed; builtOutputs will be empty"
+                            );
+                            results.push(build_result.clone());
+                        }
+                    }
+                } else {
+                    results.push(build_result.clone());
+                }
             } else {
-                let _ = raw; // suppress unused warning
                 results.push(build_result.clone());
             }
         }
