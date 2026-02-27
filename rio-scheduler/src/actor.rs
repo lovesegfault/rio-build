@@ -166,6 +166,32 @@ pub enum ActorError {
     Internal(String),
 }
 
+/// Read-only view of the actor's backpressure state.
+///
+/// Only the actor can toggle backpressure (it computes the 80%/60% hysteresis);
+/// handles can only observe. Wrapping `Arc<AtomicBool>` makes the read-only
+/// invariant compile-time: there's no `store()` method on this type.
+#[derive(Clone)]
+pub struct BackpressureReader(Arc<AtomicBool>);
+
+impl BackpressureReader {
+    pub(crate) fn new(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    /// Whether backpressure is currently active (hysteresis-aware).
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: simulate the actor toggling backpressure.
+    /// In production, only the actor's update_backpressure writes this.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, active: bool) {
+        self.0.store(active, Ordering::Relaxed);
+    }
+}
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -338,7 +364,7 @@ impl DagActor {
                 }
                 ActorCommand::WatchBuild {
                     build_id,
-                    // TODO(phase3): since_sequence is for resuming after gateway reconnect
+                    // TODO(phase3a): since_sequence is for resuming after gateway reconnect
                     // to a new leader. Phase 2a has no leader election; the broadcast
                     // channel's 1024-event buffer provides limited late-subscriber replay.
                     // Full resumption requires persistent event log + leader handoff.
@@ -415,9 +441,10 @@ impl DagActor {
         self.backpressure_active.load(Ordering::Relaxed)
     }
 
-    /// Clone the shared backpressure flag for wiring into ActorHandle.
-    pub(crate) fn backpressure_flag(&self) -> Arc<AtomicBool> {
-        self.backpressure_active.clone()
+    /// Clone the shared backpressure flag as a read-only reader for wiring
+    /// into ActorHandle. The actor keeps the writable Arc<AtomicBool>.
+    pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
+        BackpressureReader::new(self.backpressure_active.clone())
     }
 
     // -----------------------------------------------------------------------
@@ -1193,7 +1220,8 @@ impl DagActor {
                 "scheduling retry after transient failure"
             );
 
-            // TODO(phase3): delayed re-queue using the computed backoff duration.
+            // TODO(phase3b): delayed re-queue using the computed backoff duration
+            // (K8s-aware retry extends Phase 2a basic retry; see phase3b.md task 12).
             // Phase 2a re-queues immediately (see docs/src/phases/phase2a.md).
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 if let Err(e) = state.transition(DerivationStatus::Ready) {
@@ -1784,7 +1812,7 @@ impl DagActor {
                 // TODO(phase2c): inline .drv content to avoid worker->store round-trip.
                 // Phase 2a: worker fetches via GetPath (see rio-worker/src/executor.rs).
                 drv_content: Vec::new(),
-                // TODO(phase2c): compute closure scheduler-side for prefetch hints.
+                // TODO(phase3a): compute closure scheduler-side for prefetch hints.
                 // Phase 2a: worker computes via QueryPathInfo BFS.
                 input_paths: Vec::new(),
                 output_names: state.output_names.clone(),
@@ -2271,11 +2299,12 @@ impl DagActor {
 #[derive(Clone)]
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorCommand>,
-    /// Shared backpressure flag with the actor. The actor computes hysteresis
-    /// (activate at 80%, deactivate at 60%) and writes here; the handle reads
-    /// it for send() and is_backpressured(). Without this, the handle used a
-    /// simple threshold with no hysteresis -> flapping under load near 80%.
-    backpressure: Arc<AtomicBool>,
+    /// Shared read-only backpressure flag with the actor. The actor computes
+    /// hysteresis (activate at 80%, deactivate at 60%) and writes to its
+    /// Arc<AtomicBool>; the handle reads it via this read-only view for
+    /// send() and is_backpressured(). Without hysteresis, the handle used a
+    /// simple threshold -> flapping under load near 80%.
+    backpressure: BackpressureReader,
 }
 
 impl ActorHandle {
@@ -2316,7 +2345,7 @@ impl ActorHandle {
     pub async fn send(&self, cmd: ActorCommand) -> Result<(), ActorError> {
         // Read the actor's hysteresis-aware backpressure flag, not a simple
         // threshold. Activated at 80%, stays active until drained to 60%.
-        if self.backpressure.load(Ordering::Relaxed) {
+        if self.backpressure.is_active() {
             return Err(ActorError::Backpressure);
         }
         self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
@@ -2335,7 +2364,7 @@ impl ActorHandle {
 
     /// Check if the actor is under backpressure (hysteresis-aware).
     pub fn is_backpressured(&self) -> bool {
-        self.backpressure.load(Ordering::Relaxed)
+        self.backpressure.is_active()
     }
 
     /// Send a command without backpressure check (for worker lifecycle events).
@@ -4591,30 +4620,30 @@ pub(crate) mod tests {
 
         // Simulate queue at 50% — below high watermark, not active.
         actor.update_backpressure(5000, 10000);
-        assert!(!flag.load(Ordering::Relaxed), "50%: should not be active");
+        assert!(!flag.is_active(), "50%: should not be active");
 
         // 85% — above high watermark, activates.
         actor.update_backpressure(8500, 10000);
-        assert!(flag.load(Ordering::Relaxed), "85%: should activate");
+        assert!(flag.is_active(), "85%: should activate");
 
         // 70% — between watermarks, STILL active (hysteresis).
         actor.update_backpressure(7000, 10000);
         assert!(
-            flag.load(Ordering::Relaxed),
+            flag.is_active(),
             "70%: should STAY active (hysteresis between 60% and 80%)"
         );
 
         // 55% — below low watermark, deactivates.
         actor.update_backpressure(5500, 10000);
         assert!(
-            !flag.load(Ordering::Relaxed),
+            !flag.is_active(),
             "55%: should deactivate (below 60% low watermark)"
         );
 
         // 70% again — below high watermark, STILL inactive (hysteresis).
         actor.update_backpressure(7000, 10000);
         assert!(
-            !flag.load(Ordering::Relaxed),
+            !flag.is_active(),
             "70%: should STAY inactive (hysteresis between 60% and 80%)"
         );
     }
@@ -4630,7 +4659,7 @@ pub(crate) mod tests {
         assert!(!handle.is_backpressured());
 
         // Directly set the shared flag (simulating actor's hysteresis decision).
-        handle.backpressure.store(true, Ordering::Relaxed);
+        handle.backpressure.set_for_test(true);
         assert!(
             handle.is_backpressured(),
             "handle should read the shared flag"
@@ -4650,7 +4679,7 @@ pub(crate) mod tests {
         );
 
         // Clear flag; send() should succeed.
-        handle.backpressure.store(false, Ordering::Relaxed);
+        handle.backpressure.set_for_test(false);
         assert!(!handle.is_backpressured());
     }
 
