@@ -309,6 +309,11 @@ impl NixStoreFs {
 
     /// Fetch a store path's NAR from remote store and extract to local cache.
     fn fetch_and_extract(&self, store_basename: &str) -> Result<PathBuf, Errno> {
+        // Increment on miss (entry to this function), not on fetch success:
+        // failed fetches (store outage, NAR parse error) are still cache
+        // misses. The metric should spike during store outages so dashboards
+        // surface the problem; incrementing only on success hides it.
+        metrics::counter!("rio_worker_fuse_cache_misses_total").increment(1);
         let store_path = format!("/nix/store/{store_basename}");
         let local_path = self.cache.cache_dir().join(store_basename);
 
@@ -441,7 +446,6 @@ impl NixStoreFs {
             tracing::warn!(error = %e, "cache eviction failed");
         }
 
-        metrics::counter!("rio_worker_fuse_cache_misses_total").increment(1);
         Ok(local_path)
     }
 
@@ -491,22 +495,39 @@ impl NixStoreFs {
 }
 
 /// Recursively compute the size of a directory tree.
+///
+/// Returns 0 and logs on I/O error. A silent 0 on error means the cache
+/// index records size=0 for a large NAR — eviction never selects it (it
+/// "takes no space"), and the cache can fill past its limit. The warn!
+/// makes this visible.
 fn dir_size(path: &Path) -> u64 {
-    if path.is_file() {
-        return path.metadata().map(|m| m.len()).unwrap_or(0);
-    }
-    let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                total += dir_size(&p);
-            } else {
-                total += p.metadata().map(|m| m.len()).unwrap_or(0);
-            }
+    match dir_size_inner(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "dir_size failed; recording 0 (cache accounting will drift)"
+            );
+            0
         }
     }
-    total
+}
+
+fn dir_size_inner(path: &Path) -> io::Result<u64> {
+    let meta = path.symlink_metadata()?;
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    if !meta.is_dir() {
+        // symlink, fifo, etc. — 0 contribution
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        total += dir_size_inner(&entry?.path())?;
+    }
+    Ok(total)
 }
 
 // We need this import for the match arms on GetPathResponse::Msg.
@@ -557,13 +578,30 @@ impl Filesystem for NixStoreFs {
 
         let child_path = parent_path.join(name);
 
-        // Check local cache first
-        if let Ok(meta) = child_path.symlink_metadata() {
-            let ino = self.get_or_create_inode_for_lookup(child_path);
-            let attr = stat_to_attr(ino, &meta);
-            reply.entry(&ATTR_TTL, &attr, Generation(0));
-            metrics::counter!("rio_worker_fuse_cache_hits_total").increment(1);
-            return;
+        // Check local cache first. Distinguish NotFound (fall through to
+        // remote query) from other I/O errors (EACCES on corrupt perms,
+        // EIO on disk failure): treating all errors as cache miss triggers
+        // a re-fetch on every lookup, amplifying network + masking root cause.
+        match child_path.symlink_metadata() {
+            Ok(meta) => {
+                let ino = self.get_or_create_inode_for_lookup(child_path);
+                let attr = stat_to_attr(ino, &meta);
+                reply.entry(&ATTR_TTL, &attr, Generation(0));
+                metrics::counter!("rio_worker_fuse_cache_hits_total").increment(1);
+                return;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Fall through to remote query below.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %child_path.display(),
+                    error = %e,
+                    "lookup: local symlink_metadata failed with non-ENOENT error"
+                );
+                reply.error(io_error_to_errno(&e));
+                return;
+            }
         }
 
         // For top-level entries (direct children of mount point), check remote store
