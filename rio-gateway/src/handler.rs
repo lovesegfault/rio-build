@@ -972,7 +972,9 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ///
 /// Uses QueryPathInfo with a constructed path. Since the gRPC store doesn't
 /// have a dedicated hash-part lookup, we query FindMissingPaths as a
-/// workaround. The real implementation would need a dedicated RPC.
+/// workaround.
+/// TODO(phase2c): add a dedicated QueryPathFromHashPart store RPC.
+/// Current approach returns empty for any non-full-path query.
 #[instrument(skip_all)]
 async fn handle_query_path_from_hash_part<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -1012,7 +1014,8 @@ async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let sigs = wire::read_strings(reader).await?;
     debug!(path = %path_str, count = sigs.len(), "wopAddSignatures");
 
-    // Signatures are deferred to a later phase. Accept and discard.
+    // TODO(phase2c): implement via dedicated AddSignatures store RPC.
+    // Signatures are deferred; currently accept and discard.
     stderr.finish().await?;
     wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())

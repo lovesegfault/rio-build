@@ -20,6 +20,9 @@
 - [ ] Integration test: multi-derivation build (A → B → C) across 3+ workers
 - [ ] Integration test: cache hit path (second build is instant)
 - [ ] gRPC contract tests for each service boundary
+- [ ] Add `rio-proto/src/validated.rs` with `ValidatedPathInfo { store_path: StorePath, nar_hash: [u8; 32], ... }` + `TryFrom<PathInfo>`. Migrate gRPC handlers and `NarinfoRow::into_path_info` (DB egress, currently no validation) to validated types
+- [ ] Lazy NAR upload streaming: replace eager `Vec<PutPathRequest>` (4GiB NAR → ~8GiB peak, ×4 parallel = 32GiB) with `stream::unfold` or `Arc<[u8]>`-based lazy chunk iterator
+- [ ] Track leaked overlay mounts across worker lifetime; escalate to infrastructure failure after N leaks (currently metric only)
 
 ## Milestone
 

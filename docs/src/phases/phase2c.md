@@ -21,6 +21,11 @@
 - [ ] Integration test: CA data model validates correctly (write via wopRegisterDrvOutput, read via wopQueryRealisation, verify ContentLookup returns hits for previously-built CA derivations)
 - [ ] Integration test: chunk deduplication measured
 - [ ] Integration test: scheduling optimizations measurable against FIFO baseline
+- [ ] Circuit-breaker on scheduler cache-check failures: sustained store unreachability should skip the TOCTOU cache check and alert, not treat every submission as 100% miss (avalanche of rebuilds)
+- [ ] Inline .drv content in SchedulerMessage for small derivations (avoid worker round-trip to store for common case)
+- [ ] `QueryPathFromHashPart` store RPC: gateway currently uses FindMissingPaths workaround that returns empty for non-full-path queries
+- [ ] `AddSignatures` store RPC: gateway stub currently accepts and discards
+- [ ] Persist `registration_time`/`ultimate` in narinfo table: currently dropped on PutPath, returned as 0/false on QueryPathInfo
 
 ## Milestone
 
