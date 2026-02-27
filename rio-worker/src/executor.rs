@@ -126,8 +126,18 @@ pub async fn execute_build(
             .record(build_start.elapsed().as_secs_f64());
     });
 
-    // 1. Set up overlay
-    let overlay_mount = overlay::setup_overlay(fuse_mount_point, overlay_base_dir, &build_id)?;
+    // 1. Set up overlay. `setup_overlay` is synchronous (mkdir + stat +
+    // overlayfs mount syscall); run on the blocking pool so a slow mount
+    // (e.g., FUSE lower stalled on remote fetch) doesn't starve the Tokio
+    // worker thread and block the heartbeat loop.
+    let fuse_mp = fuse_mount_point.to_path_buf();
+    let overlay_base = overlay_base_dir.to_path_buf();
+    let build_id_owned = build_id.clone();
+    let overlay_mount = tokio::task::spawn_blocking(move || {
+        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
+    })
+    .await
+    .map_err(|e| ExecutorError::Overlay(anyhow::anyhow!("overlay setup task panicked: {e}")))??;
 
     // 2. Parse the derivation. If drv_content is inline, use it; otherwise
     // fetch the .drv from the store and extract ATerm from the NAR.

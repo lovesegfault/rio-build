@@ -157,10 +157,8 @@ fn ephemeral_inode(path: &Path) -> u64 {
 /// FUSE filesystem that serves `/nix/store` from a local SSD cache
 /// backed by remote `StoreService` gRPC.
 pub struct NixStoreFs {
-    /// Mount point path (e.g. `/nix/store`).
-    #[allow(dead_code)]
-    mount_point: PathBuf,
     /// Inode map (interior mutability for `&self` FUSE callbacks).
+    /// Rooted at `cache.cache_dir()`, NOT the FUSE mount point — see `new()`.
     inodes: RwLock<InodeMap>,
     /// Next file handle counter.
     next_fh: AtomicU64,
@@ -179,17 +177,26 @@ pub struct NixStoreFs {
 }
 
 impl NixStoreFs {
-    /// Create a new FUSE filesystem.
+    /// Create a new FUSE filesystem backed by the given local cache.
+    ///
+    /// `InodeMap` is rooted at `cache.cache_dir()`, NOT the FUSE mount point:
+    /// all `real_path(ino)` lookups resolve to paths inside the local cache
+    /// directory. FUSE callbacks (`getattr`, `lookup`, `readdir`) then do
+    /// `stat()`/`read_dir()` on those cache paths — normal filesystem ops.
+    ///
+    /// Previously the InodeMap was rooted at the mount point, so `getattr(ROOT)`
+    /// did `stat(mount_point)` — which re-enters FUSE via `getattr(ROOT)`,
+    /// recursing until all FUSE threads deadlocked. This bug was latent (unit
+    /// tests never actually mounted) until the VM milestone test called
+    /// `overlay::setup_overlay`, which stats the FUSE mount as the overlay lower.
     pub fn new(
-        mount_point: PathBuf,
         cache: Cache,
         store_client: StoreServiceClient<Channel>,
         runtime: Handle,
         passthrough: bool,
     ) -> Self {
-        let inodes = InodeMap::new(mount_point.clone());
+        let inodes = InodeMap::new(cache.cache_dir().to_path_buf());
         Self {
-            mount_point,
             inodes: RwLock::new(inodes),
             next_fh: AtomicU64::new(1),
             passthrough,
@@ -938,13 +945,7 @@ pub fn mount_fuse_background(
     passthrough: bool,
     n_threads: u32,
 ) -> anyhow::Result<fuser::BackgroundSession> {
-    let fs = NixStoreFs::new(
-        mount_point.to_path_buf(),
-        cache,
-        store_client,
-        runtime,
-        passthrough,
-    );
+    let fs = NixStoreFs::new(cache, store_client, runtime, passthrough);
 
     let config = make_fuse_config(n_threads);
     let session = fuser::spawn_mount2(fs, mount_point, &config)?;
