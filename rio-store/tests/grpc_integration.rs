@@ -66,6 +66,43 @@ pub async fn setup_store(
     (client, addr, server)
 }
 
+/// Like setup_store but also returns the Arc<MemoryBackend> so tests can
+/// corrupt blobs directly (for integrity-check tests).
+pub async fn setup_store_with_backend(
+    pool: PgPool,
+) -> (
+    StoreServiceClient<Channel>,
+    Arc<MemoryBackend>,
+    tokio::task::JoinHandle<()>,
+) {
+    let backend = Arc::new(MemoryBackend::new());
+    let service = StoreServiceImpl::new(backend.clone(), pool);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(StoreServiceServer::new(service))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let endpoint = format!("http://{addr}");
+    let channel = Channel::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let client = StoreServiceClient::new(channel);
+
+    (client, backend, server)
+}
+
 /// Build a minimal valid NAR for a regular file with the given contents.
 ///
 /// This matches the Nix NAR format for a single regular file.
@@ -256,6 +293,109 @@ async fn test_put_get_roundtrip() {
     assert_eq!(got_info.nar_hash, info.nar_hash);
     assert_eq!(got_info.nar_size, info.nar_size);
     assert_eq!(got_nar, nar, "NAR content should roundtrip exactly");
+
+    server.abort();
+}
+
+/// GetPath on a path that was never uploaded should return NOT_FOUND.
+#[tokio::test]
+async fn test_get_path_nonexistent_returns_not_found() {
+    use rio_proto::types::GetPathRequest;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _addr, server) = setup_store(db.pool.clone()).await;
+
+    let result = client
+        .get_path(GetPathRequest {
+            store_path: "/nix/store/99999999999999999999999999999999-never-uploaded".into(),
+        })
+        .await;
+
+    assert!(result.is_err(), "nonexistent path should fail GetPath");
+    assert_eq!(
+        result.unwrap_err().code(),
+        tonic::Code::NotFound,
+        "should be NOT_FOUND"
+    );
+
+    server.abort();
+}
+
+/// GetPath on a corrupted blob (bitrot, disk failure) should stream chunks
+/// then send DATA_LOSS at the end. This is the HashingReader integrity check
+/// — the NAR's sha256 computed during streaming doesn't match the stored hash.
+/// If this check is broken, corrupted NARs would be served silently, causing
+/// silent build output corruption.
+#[tokio::test]
+async fn test_get_path_corrupted_blob_returns_data_loss() {
+    use rio_proto::types::{GetPathRequest, get_path_response};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store_with_backend(db.pool.clone()).await;
+
+    // 1. Upload a valid NAR.
+    let store_path = "/nix/store/88888888888888888888888888888888-corruption-test";
+    let good_nar = make_nar(b"valid content for corruption test");
+    let info = make_path_info(store_path, &good_nar);
+    let sha256_hex = hex::encode(&info.nar_hash);
+
+    let created = put_path(&mut client, info, good_nar)
+        .await
+        .expect("put should succeed");
+    assert!(created);
+
+    // 2. Corrupt the blob directly in the backend (same length so size check
+    // passes, different content so hash check fails).
+    let corrupt_data = vec![0xAAu8; 200]; // garbage, wrong sha256
+    backend.corrupt_for_test(
+        &format!("{sha256_hex}.nar"),
+        bytes::Bytes::from(corrupt_data),
+    );
+
+    // 3. GetPath — stream should deliver chunks then DATA_LOSS at the end.
+    let mut stream = client
+        .get_path(GetPathRequest {
+            store_path: store_path.into(),
+        })
+        .await
+        .expect("get_path call should succeed (error comes in stream)")
+        .into_inner();
+
+    let mut got_data_loss = false;
+    let mut got_chunks = false;
+    loop {
+        match stream.message().await {
+            Ok(Some(msg)) => {
+                if matches!(msg.msg, Some(get_path_response::Msg::NarChunk(_))) {
+                    got_chunks = true;
+                }
+            }
+            Ok(None) => break, // stream ended without error — bad if corrupt!
+            Err(e) => {
+                assert_eq!(
+                    e.code(),
+                    tonic::Code::DataLoss,
+                    "corrupted blob should yield DATA_LOSS, got: {e:?}"
+                );
+                assert!(
+                    e.message().contains("integrity"),
+                    "error should mention integrity check: {}",
+                    e.message()
+                );
+                got_data_loss = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        got_chunks,
+        "should have received at least one chunk before DATA_LOSS"
+    );
+    assert!(
+        got_data_loss,
+        "corrupted blob MUST yield DATA_LOSS at end of stream, not succeed silently"
+    );
 
     server.abort();
 }

@@ -48,6 +48,14 @@ impl MemoryBackend {
             e.into_inner()
         })
     }
+
+    /// TEST-ONLY: directly overwrite a blob's contents.
+    /// Used by integration tests to corrupt stored NARs and verify that
+    /// GetPath's HashingReader integrity check fires DATA_LOSS.
+    /// MemoryBackend is already test-only, so no cfg guard.
+    pub fn corrupt_for_test(&self, key: &str, new_data: Bytes) {
+        self.write_inner().blobs.insert(key.to_string(), new_data);
+    }
 }
 
 impl Default for MemoryBackend {
