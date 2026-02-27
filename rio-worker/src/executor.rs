@@ -17,6 +17,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
+use nix::mount::{MsFlags, mount};
+use nix::sched::{CloneFlags, unshare};
+
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
@@ -158,7 +161,17 @@ pub async fn execute_build(
     // 4. Set up nix.conf in overlay
     setup_nix_conf(overlay_mount.upper_dir())?;
 
-    // 5. Spawn nix-daemon --stdio
+    // 5. Spawn nix-daemon --stdio in a private mount namespace.
+    //
+    // The daemon sees the overlay bind-mounted at canonical paths:
+    //   /nix/store       → overlay merged (FUSE inputs ∪ build outputs)
+    //   /nix/var/nix/db  → synthetic SQLite DB (input closure metadata)
+    //   /etc/nix         → WORKER_NIX_CONF (sandbox=true, no substituters)
+    //
+    // This replaces the earlier (broken) NIX_STORE_DIR env var approach:
+    // derivations hardcode `/nix/store/...` paths, so the daemon's store
+    // root MUST be `/nix/store` — not some overlay subdirectory. The
+    // namespace bind-mount achieves that without touching the host's store.
     let timeout = assignment
         .build_options
         .as_ref()
@@ -171,25 +184,7 @@ pub async fn execute_build(
         })
         .unwrap_or_else(rio_common::grpc::daemon_timeout);
 
-    let mut daemon = Command::new("nix-daemon")
-        .arg("--stdio")
-        .env(
-            "NIX_STORE_DIR",
-            overlay_mount.merged_dir().join("nix/store"),
-        )
-        .env(
-            "NIX_STATE_DIR",
-            overlay_mount.merged_dir().join("nix/var/nix"),
-        )
-        .env("NIX_CONF_DIR", overlay_mount.upper_dir().join("etc/nix"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        // Inherit stderr: daemon diagnostics go to worker's stderr (visible in
-        // container logs). Piping without reading would deadlock if nix-daemon
-        // writes >64KB to stderr (pipe buffer full, daemon blocks on write).
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(ExecutorError::DaemonSpawn)?;
+    let mut daemon = spawn_daemon_in_namespace(&overlay_mount)?;
 
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // Previously, any `?` between spawn and kill leaked the daemon process.
@@ -351,6 +346,107 @@ pub async fn execute_build(
         result: proto_result,
         assignment_token: assignment.assignment_token.clone(),
     })
+}
+
+/// Spawn `nix-daemon --stdio` in a private mount namespace with the overlay
+/// bind-mounted at canonical paths.
+///
+/// The child process gets its own mount namespace (CLONE_NEWNS), then:
+///   1. Makes `/` MS_PRIVATE so bind mounts don't leak to the parent ns
+///      (systemd defaults to MS_SHARED; without this, the bind propagates).
+///   2. Bind-mounts the overlay merged dir at `/nix/store`.
+///   3. Bind-mounts the synthetic DB dir at `/nix/var/nix/db`.
+///   4. Bind-mounts the nix.conf dir at `/etc/nix`.
+///
+/// The daemon's own sandbox builds inherit these mounts (CLONE_NEWNS gives
+/// children a COPY of the parent's mounts), so sandboxed builders see the
+/// overlay-backed `/nix/store` too.
+///
+/// # Constraints
+///
+/// - Requires `CAP_SYS_ADMIN` (for unshare + mount).
+/// - The bind targets `/nix/store`, `/nix/var/nix/db`, `/etc/nix` must
+///   exist in the worker's mount namespace. On NixOS (nix.enable=true) they
+///   do. Non-Nix hosts are unsupported (the worker already requires a
+///   `nix-daemon` binary).
+///
+/// # Safety
+///
+/// The `pre_exec` closure runs post-fork, pre-exec, and must be async-signal-
+/// safe: no allocation, no locks. `nix::sched::unshare` and `nix::mount::mount`
+/// are direct syscall wrappers (no allocation). `std::io::Error::from(Errno)`
+/// stores only an i32 (no allocation). PathBufs are cloned OUTSIDE the closure
+/// and captured by move (the clone happens in the parent, pre-fork).
+fn spawn_daemon_in_namespace(
+    overlay_mount: &overlay::OverlayMount,
+) -> Result<tokio::process::Child, ExecutorError> {
+    // Clone paths BEFORE the closure — the clones happen in the parent
+    // pre-fork, so they're safe. The closure captures owned PathBufs.
+    let merged = overlay_mount.merged_dir().to_path_buf();
+    let upper_db = overlay_mount.upper_dir().join("nix/var/nix/db");
+    let upper_conf = overlay_mount.upper_dir().join("etc/nix");
+
+    let mut cmd = Command::new("nix-daemon");
+    cmd.arg("--stdio")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // Inherit stderr: daemon diagnostics go to worker's stderr (visible in
+        // container logs). Piping without reading would deadlock if nix-daemon
+        // writes >64KB to stderr (pipe buffer full, daemon blocks on write).
+        .stderr(std::process::Stdio::inherit());
+
+    // SAFETY: see function doc. Closure body is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            // New mount namespace for this process tree (daemon + sandbox).
+            unshare(CloneFlags::CLONE_NEWNS).map_err(std::io::Error::from)?;
+
+            // Make `/` private so bind mounts below don't propagate to the
+            // parent namespace. MS_REC applies recursively (submounts too).
+            mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            )
+            .map_err(std::io::Error::from)?;
+
+            // Bind overlay merged → /nix/store
+            mount(
+                Some(merged.as_path()),
+                "/nix/store",
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(std::io::Error::from)?;
+
+            // Bind synthetic DB → /nix/var/nix/db
+            mount(
+                Some(upper_db.as_path()),
+                "/nix/var/nix/db",
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(std::io::Error::from)?;
+
+            // Bind nix.conf dir → /etc/nix
+            mount(
+                Some(upper_conf.as_path()),
+                "/etc/nix",
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(std::io::Error::from)?;
+
+            Ok(())
+        });
+    }
+
+    cmd.spawn().map_err(ExecutorError::DaemonSpawn)
 }
 
 /// All daemon I/O after spawn: handshake, setOptions, wopBuildDerivation, stderr loop.

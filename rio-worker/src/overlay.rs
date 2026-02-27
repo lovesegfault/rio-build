@@ -1,9 +1,12 @@
 //! Per-build overlayfs management.
 //!
 //! Each build gets its own overlayfs mount with:
-//! - Lower layer: FUSE mount at `/nix/store`
-//! - Upper layer: local SSD directory (separate filesystem from FUSE)
+//! - Lower layer: FUSE mount (presents store paths at its root)
+//! - Upper layer: `{upper}/nix/store/` on local SSD (separate FS from FUSE)
 //! - Work directory: required by overlayfs (same filesystem as upper)
+//! - Merged: bind-mounted to `/nix/store` in the per-build daemon's mount
+//!   namespace (see executor.rs `pre_exec`). Outputs written by nix-daemon
+//!   land in `{upper}/nix/store/{hash}-{name}`; upload.rs scans that path.
 //!
 //! The overlay is cleaned up (unmounted + directories removed) on drop.
 //! Worker must NOT drop `CAP_SYS_ADMIN` between overlay setup and Nix
@@ -17,6 +20,13 @@ use nix::mount::{MntFlags, MsFlags};
 /// An active overlayfs mount with FUSE lower layer and per-build upper layer.
 ///
 /// The overlay is cleaned up (unmounted + directories removed) on drop.
+///
+/// Directory layout under `{base}/{build_id}/`:
+///   - `upper/nix/store/`   — overlayfs upperdir (build outputs land here)
+///   - `upper/nix/var/nix/db/` — synthetic SQLite DB (NOT part of overlay)
+///   - `upper/etc/nix/`     — nix.conf (NOT part of overlay)
+///   - `work/`              — overlayfs workdir
+///   - `merged/`            — overlayfs mountpoint, bind-mounted to /nix/store
 pub struct OverlayMount {
     #[allow(dead_code)]
     lower: PathBuf,
@@ -33,7 +43,13 @@ impl OverlayMount {
         &self.lower
     }
 
-    /// The upper layer path where build outputs will appear.
+    /// The upper root path under which outputs, synth DB, and nix.conf live.
+    ///
+    /// Note: the overlayfs `upperdir` is `{upper}/nix/store/`, not `{upper}/`.
+    /// Callers use `upper_dir().join("nix/store")` to scan outputs,
+    /// `upper_dir().join("nix/var/nix/db")` for the synth DB, and
+    /// `upper_dir().join("etc/nix")` for nix.conf. The latter two are
+    /// bind-mounted separately (not visible through the overlay).
     pub fn upper_dir(&self) -> &Path {
         &self.upper
     }
@@ -94,10 +110,15 @@ pub fn setup_overlay(
 
     let build_dir = base_dir.join(build_id);
     let upper = build_dir.join("upper");
+    // overlayfs upperdir: a dedicated subdirectory so (a) outputs land at
+    // `{upper}/nix/store/{hash}-{name}` where upload.rs expects them, and
+    // (b) the synth DB (`{upper}/nix/var/nix/db`) and nix.conf (`{upper}/etc/nix`)
+    // remain OUTSIDE the overlay (they're bind-mounted separately).
+    let store_upper = upper.join("nix/store");
     let work = build_dir.join("work");
     let merged = build_dir.join("merged");
 
-    fs::create_dir_all(&upper)?;
+    fs::create_dir_all(&store_upper)?;
     fs::create_dir_all(&work)?;
     fs::create_dir_all(&merged)?;
 
@@ -107,8 +128,8 @@ pub fn setup_overlay(
     let lower_dev = nix::sys::stat::stat(lower)
         .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", lower.display()))?
         .st_dev;
-    let upper_dev = nix::sys::stat::stat(&upper)
-        .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", upper.display()))?
+    let upper_dev = nix::sys::stat::stat(&store_upper)
+        .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", store_upper.display()))?
         .st_dev;
     anyhow::ensure!(
         lower_dev != upper_dev,
@@ -116,14 +137,14 @@ pub fn setup_overlay(
          (st_dev={lower_dev}); the kernel will reject this mount. \
          Set --overlay-base-dir to a directory on a different mount \
          (e.g., a local SSD emptyDir volume, not the FUSE mount).",
-        upper.display(),
+        store_upper.display(),
         lower.display(),
     );
 
     let mount_data = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower.display(),
-        upper.display(),
+        store_upper.display(),
         work.display()
     );
 
@@ -256,5 +277,30 @@ mod tests {
         };
         let msg = e.to_string();
         assert!(msg.contains("same filesystem"), "got: {msg}");
+    }
+
+    /// Verify that setup_overlay creates `{upper}/nix/store/` as the overlayfs
+    /// upperdir (so build outputs land where upload.rs expects them).
+    /// Uses the same-filesystem rejection path to test dir creation without
+    /// needing CAP_SYS_ADMIN for the actual mount.
+    #[test]
+    fn test_setup_overlay_creates_store_upper() {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("lower");
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(&lower).unwrap();
+
+        // Fails at st_dev check (post-mkdir, pre-mount).
+        let _ = setup_overlay(&lower, &base, "test-build");
+
+        // Overlayfs upperdir should have been created at upper/nix/store/,
+        // NOT just upper/. This is critical for upload.rs which scans
+        // `upper_dir().join("nix/store")` for build outputs.
+        let store_upper = base.join("test-build/upper/nix/store");
+        assert!(
+            store_upper.exists(),
+            "overlayfs upperdir {store_upper:?} should be created"
+        );
+        assert!(store_upper.is_dir());
     }
 }
