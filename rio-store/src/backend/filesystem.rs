@@ -106,7 +106,11 @@ impl NarBackend for FilesystemBackend {
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
         Self::validate_key(key)?;
         let path = self.blob_path(key);
-        Ok(tokio::fs::try_exists(&path).await.unwrap_or(false))
+        // Propagate I/O errors (permission denied, disk failure) instead of
+        // treating them as "does not exist": a silent false on error triggers
+        // re-uploads of already-existing blobs (load amplification + masks
+        // the root cause).
+        Ok(tokio::fs::try_exists(&path).await?)
     }
 }
 
