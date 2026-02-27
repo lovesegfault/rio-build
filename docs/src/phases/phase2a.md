@@ -26,3 +26,40 @@
 ## Milestone
 
 `nix build --store ssh-ng://rio nixpkgs#hello` completes across 2+ workers.
+
+## Automated Validation
+
+The milestone is validated by a NixOS VM test:
+
+```bash
+nix build .#checks.x86_64-linux.rio-milestone-vm
+```
+
+Four VMs (control + 2 workers + client) exercise the full distributed path:
+
+1. **Seed**: client uploads `pkgsStatic.busybox` (closure of 1 path) via
+   `nix copy --to ssh-ng://control` — exercises the gateway's `wopAddMultipleToStore`.
+2. **Build**: client runs `nix-build --store ssh-ng://control` on a 5-node
+   fan-out DAG (4 parallel leaves + 1 collector) — exercises scheduler dispatch,
+   worker FUSE lazy-fetch, overlay + mount-namespace per-build, and output upload.
+3. **Assert**: Prometheus metrics verify both workers executed derivations
+   (`rio_worker_builds_total{outcome="success"} ≥1` on each), FUSE fetched
+   inputs (`rio_worker_fuse_cache_misses_total ≥1` on each), and the store
+   received all outputs (`rio_store_put_path_total{result="created"} ≥5`).
+
+The test substitutes a tiny busybox-based DAG for `nixpkgs#hello` (seeding the
+full stdenv closure would dominate test time), but otherwise exercises real
+FUSE + overlayfs + `CLONE_NEWNS` with `CAP_SYS_ADMIN` in a way that `#[ignore]`d
+integration tests never could.
+
+For interactive debugging:
+
+```bash
+nix build .#checks.x86_64-linux.rio-milestone-vm.driverInteractive
+./result/bin/nixos-test-driver
+>>> start_all(); control.shell_interact()
+```
+
+> **KVM requirement:** Without `/dev/kvm` the test falls back to TCG emulation
+> (10–50× slower). GitHub Actions standard runners lack nested virt; use
+> self-hosted runners with KVM, or accept slow CI.
