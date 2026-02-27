@@ -104,36 +104,14 @@ pub async fn setup_store_with_backend(
 }
 
 /// Build a minimal valid NAR for a regular file with the given contents.
-///
-/// This matches the Nix NAR format for a single regular file.
 pub fn make_nar(contents: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    let mut nar = Vec::new();
-
-    // NAR format: length-prefixed strings padded to 8 bytes
-    fn write_str(out: &mut Vec<u8>, s: &[u8]) {
-        let len = s.len() as u64;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(s);
-        // Pad to 8-byte boundary
-        let pad = (8 - (s.len() % 8)) % 8;
-        out.extend_from_slice(&vec![0u8; pad]);
-    }
-
-    write_str(&mut nar, b"nix-archive-1");
-    write_str(&mut nar, b"(");
-    write_str(&mut nar, b"type");
-    write_str(&mut nar, b"regular");
-    write_str(&mut nar, b"contents");
-    // File contents: length-prefixed + padded
-    let len = contents.len() as u64;
-    nar.extend_from_slice(&len.to_le_bytes());
-    nar.write_all(contents).unwrap();
-    let pad = (8 - (contents.len() % 8)) % 8;
-    nar.extend_from_slice(&vec![0u8; pad]);
-    write_str(&mut nar, b")");
-
-    nar
+    let node = rio_nix::nar::NarNode::Regular {
+        executable: false,
+        contents: contents.to_vec(),
+    };
+    let mut buf = Vec::new();
+    rio_nix::nar::serialize(&mut buf, &node).unwrap();
+    buf
 }
 
 /// Build a PathInfo for a store path with the given NAR content.
