@@ -772,18 +772,20 @@ async fn test_nar_from_path_streams_chunks() {
         .unwrap();
     h.stream.flush().await.unwrap();
 
-    // NarFromPath streams NAR data as STDERR_WRITE messages BEFORE STDERR_LAST.
+    // NarFromPath: STDERR_LAST first, then RAW NAR bytes (NOT STDERR_WRITE).
+    // Nix client: processStderr(ex) with no sink → copyNAR(from, sink).
     let msgs = drain_stderr_until_last(&mut h.stream).await;
-    let mut received = Vec::new();
-    for msg in msgs {
-        match msg {
-            StderrMessage::Write(data) => received.extend_from_slice(&data),
-            other => panic!("unexpected message during NAR streaming: {other:?}"),
-        }
-    }
+    assert!(
+        msgs.is_empty(),
+        "no STDERR messages expected before STDERR_LAST; got: {msgs:?}"
+    );
+    // Read the raw NAR bytes that follow STDERR_LAST.
+    let mut received = vec![0u8; nar.len()];
+    tokio::io::AsyncReadExt::read_exact(&mut h.stream, &mut received)
+        .await
+        .unwrap();
     assert_eq!(received, nar, "received NAR bytes should match seeded NAR");
 
-    // No result data after STDERR_LAST for NarFromPath.
     h.finish().await;
 }
 
