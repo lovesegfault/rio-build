@@ -157,6 +157,7 @@ pub async fn execute_build(
     // Each inputDrv's .drv file is already in rio-store (uploaded by the
     // gateway during SubmitBuild); fetch + parse to get output paths.
     let mut resolved_input_srcs = drv.input_srcs().clone();
+    // TODO(phase2b): fetch input drvs concurrently via buffer_unordered.
     for (input_drv_path, output_names) in drv.input_drvs() {
         let input_drv = fetch_drv_from_store(store_client, input_drv_path).await?;
         for out in input_drv.outputs() {
@@ -800,6 +801,8 @@ async fn fetch_input_metadata(
 ) -> Result<Vec<SynthPathInfo>, ExecutorError> {
     let mut synth_paths = Vec::with_capacity(input_paths.len());
 
+    // TODO(phase2b): parallelize via buffer_unordered. At 5ms RTT, 200 serial
+    // input paths add ~1s to every build before the daemon spawns.
     for path in input_paths {
         let request = QueryPathInfoRequest {
             store_path: path.clone(),
@@ -945,6 +948,8 @@ async fn compute_input_closure(
 
     // BFS the reference graph. PathInfo.references gives runtime deps;
     // for .drv files, references include all inputDrvs and inputSrcs.
+    // TODO(phase2b): process BFS layers concurrently. Serial RTT-bound for
+    // transitive closure of 100-500 paths = 0.5-2.5s per build.
     while let Some(path) = to_visit.pop_front() {
         if !closure.insert(path.clone()) {
             continue; // already visited
