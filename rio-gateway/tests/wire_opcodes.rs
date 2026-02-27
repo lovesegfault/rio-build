@@ -187,6 +187,10 @@ struct MockSchedulerOutcome {
     send_completed: bool,
     /// If set, SubmitBuild sends BuildFailed after BuildStarted.
     send_failed: bool,
+    /// If set, the stream is closed immediately after BuildStarted (no
+    /// terminal event). Regression test for process_build_events STDERR
+    /// frame sequence when the scheduler disconnects mid-build.
+    close_stream_early: bool,
 }
 
 #[derive(Clone)]
@@ -266,6 +270,11 @@ impl SchedulerService for MockScheduler {
                         })),
                     }))
                     .await;
+            } else if outcome.close_stream_early {
+                // Drop tx immediately: stream ends without a terminal event
+                // (BuildCompleted/BuildFailed/BuildCancelled). Simulates
+                // scheduler disconnect mid-build.
+                drop(tx);
             } else {
                 // Keep open
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -1132,6 +1141,55 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() {
     h.finish().await;
 }
 
+/// wopBuildPaths when the scheduler stream closes without a terminal event
+/// (BuildCompleted/BuildFailed/BuildCancelled). Regression for commit b2d3863:
+/// process_build_events must NOT send STDERR_ERROR itself — it returns Err
+/// and lets the CALLER send STDERR_ERROR (opcode 9) or STDERR_LAST + failure
+/// (opcode 46). Before b2d3863, process_build_events sent STDERR_ERROR inside
+/// the loop, causing a double-STDERR_ERROR or STDERR_ERROR-then-STDERR_LAST
+/// invalid frame sequence depending on the opcode.
+///
+/// For opcode 9, the correct behavior is: EXACTLY ONE STDERR_ERROR, then the
+/// session closes. We verify this by using drain_stderr_expecting_error which
+/// reads until it gets STDERR_ERROR; if process_build_events had already sent
+/// one AND the handler sent another, the test harness's handler_task would
+/// fail or the stream would desync.
+#[tokio::test]
+async fn test_build_paths_stream_closed_without_terminal_single_error() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        close_stream_early: true,
+        ..Default::default()
+    });
+
+    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
+    let drv_path = "/nix/store/00000000000000000000000000000000-early-close.drv";
+    h.store
+        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+
+    wire::write_u64(&mut h.stream, 9).await.unwrap(); // wopBuildPaths
+    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
+        .await
+        .unwrap();
+    wire::write_u64(&mut h.stream, 0).await.unwrap();
+    h.stream.flush().await.unwrap();
+
+    // For opcode 9: caller (handle_build_paths) sends STDERR_ERROR on failure.
+    // process_build_events must NOT also have sent one (that's the b2d3863 fix).
+    // drain_stderr_expecting_error reads one STDERR_ERROR and stops; if there
+    // were two, the leftover bytes would desync the stream and h.finish()
+    // would fail.
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(
+        err.message().contains("stream ended") || err.message().contains("disconnect"),
+        "error should mention stream ended / scheduler disconnect: {}",
+        err.message()
+    );
+
+    h.finish().await;
+}
+
 /// wopBuildPathsWithResults (46): reads strings + build_mode, writes
 /// u64(count) + per-entry (string:DerivedPath, BuildResult).
 #[tokio::test]
@@ -1372,8 +1430,15 @@ async fn test_build_derivation_basic_format() {
     // BuildResult: status + errorMsg + timesBuilt + isNonDet + start + stop +
     // cpuUser(tag+val?) + cpuSystem(tag+val?) + builtOutputs
     let status = wire::read_u64(&mut h.stream).await.unwrap();
-    assert!(status <= 14, "BuildStatus should be 0-14, got {status}");
-    let _error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    // Mock sent send_completed: true, so status should be Built (0), not
+    // just "any valid status". Previously: assert!(status <= 14) accepted
+    // failures as passing.
+    assert_eq!(
+        status, 0,
+        "status should be Built (0) since mock sent completed, got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    assert!(error_msg.is_empty(), "error_msg should be empty on success");
     let _times_built = wire::read_u64(&mut h.stream).await.unwrap();
     let _is_non_det = wire::read_bool(&mut h.stream).await.unwrap();
     let _start_time = wire::read_u64(&mut h.stream).await.unwrap();
