@@ -80,14 +80,6 @@ pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create a root tracing span with the given component name.
-///
-/// All rio-* binaries should enter this span at the top of `main()` so that
-/// every log line carries `component=...` for filtering in log aggregators.
-pub fn root_span(component: &'static str) -> tracing::Span {
-    tracing::info_span!("root", component)
-}
-
 /// Parse `RIO_LOG_FORMAT` environment variable, defaulting to JSON.
 pub fn log_format_from_env() -> LogFormat {
     match std::env::var("RIO_LOG_FORMAT") {
