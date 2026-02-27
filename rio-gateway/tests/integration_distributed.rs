@@ -750,7 +750,7 @@ async fn test_distributed_full_build_with_fuse() {
     // above, which exercises: gateway -> scheduler -> worker gRPC flow with mock store.
     eprintln!(
         "TODO(phase3a): full multi-process build with FUSE. See docs/src/phases/phase2a.md \
-         section 'End-to-End Verification' for the manual procedure. CI support blocked on \
+         § Milestone for the manual procedure. CI support blocked on \
          infrastructure (privileged container pool for CAP_SYS_ADMIN + /dev/fuse)."
     );
 }
