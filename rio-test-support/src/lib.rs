@@ -12,7 +12,7 @@
 //! No silent skips: if postgres can't be found or started, tests **panic**.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,7 +26,9 @@ static PG: OnceLock<PgServer> = OnceLock::new();
 
 enum PgServer {
     /// Ephemeral server we bootstrapped ourselves. The child process dies
-    /// when the test binary exits (PR_SET_PDEATHSIG on Linux).
+    /// when the test binary exits (PR_SET_PDEATHSIG on Linux). The tempdir
+    /// lives in a static so `TempDir::drop` NEVER runs — cleanup happens
+    /// via [`gc_stale_dirs`] on the next bootstrap.
     Ephemeral {
         _tempdir: TempDir,
         _child: Child,
@@ -55,6 +57,11 @@ impl PgServer {
     }
 
     fn bootstrap() -> Self {
+        // Reclaim /tmp space from dead prior test processes before adding
+        // our own dir. Must run before tempdir creation — see gc_stale_dirs
+        // for the liveness protocol.
+        gc_stale_dirs();
+
         // Short tempdir path: Unix socket paths are limited to 108 bytes on
         // Linux. In the Nix sandbox $TMPDIR can be long (/build/source/...).
         // Force /tmp explicitly.
@@ -62,6 +69,15 @@ impl PgServer {
             .prefix("rio-pg-")
             .tempdir_in("/tmp")
             .expect("failed to create tempdir for postgres");
+
+        // Write our PID immediately so concurrent gc_stale_dirs scanners
+        // recognize this dir as live (even before initdb finishes).
+        std::fs::write(
+            tempdir.path().join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .expect("failed to write owner.pid");
+
         let pgdata = tempdir.path().join("data");
         let sockdir = tempdir.path().join("sock");
         std::fs::create_dir(&sockdir).expect("failed to create socket dir");
@@ -194,6 +210,70 @@ fn find_pg_bin() -> PathBuf {
         "postgres binaries (initdb) not found in PATH and PG_BIN not set.\n\
          Run inside `nix develop` or set PG_BIN=/path/to/postgresql/bin"
     );
+}
+
+/// Remove stale `/tmp/rio-pg-*` directories left by dead test processes.
+///
+/// Because [`PG`] is a static, Rust never runs its `Drop` — the `TempDir`
+/// inside is leaked on every process exit. This scanner reclaims those dirs
+/// on the *next* bootstrap, bounding the leak to O(concurrent test processes).
+///
+/// **Liveness protocol:** each bootstrap writes its process PID to
+/// `<dir>/owner.pid` immediately after creating the tempdir. A dir is stale
+/// iff that PID is dead (or the file is missing/corrupt — pre-fix dirs, or
+/// dirs whose owner crashed between mkdtemp and write).
+///
+/// Races with concurrent scanners are benign: `remove_dir_all` on an
+/// already-removed dir just returns ENOENT, which we ignore.
+fn gc_stale_dirs() {
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("rio-pg-"))
+        {
+            continue;
+        }
+        if is_dir_stale(&path) {
+            // Best-effort. May race with another scanner; ignore errors.
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn is_dir_stale(dir: &Path) -> bool {
+    let pid = match std::fs::read_to_string(dir.join("owner.pid")) {
+        Ok(s) => match s.trim().parse::<i32>() {
+            Ok(pid) => pid,
+            Err(_) => return true, // corrupt — reap it
+        },
+        Err(_) => return true, // missing — pre-fix dir, or mkdtemp/write race
+    };
+    !pid_alive(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: i32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // Signal 0: probe existence without actually signalling.
+    // ESRCH = no such process; EPERM = exists but not ours (still alive).
+    match kill(Pid::from_raw(pid), None) {
+        Ok(_) => true,
+        Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_alive(_pid: i32) -> bool {
+    // Conservative: assume alive on non-Linux. We never GC, but PG tests
+    // only run on Linux anyway (initdb/postgres from Nix dev shell).
+    true
 }
 
 /// Build a URL for the given database name from an admin URL.
