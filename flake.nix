@@ -54,6 +54,17 @@
         inputs.git-hooks-nix.flakeModule
       ];
 
+      # NixOS modules for deploying rio services. These are consumed by the
+      # phase-2a milestone VM test (nix/tests/milestone.nix) and can be reused
+      # for real deployments. Each module reads `services.rio.package` for
+      # binaries, so callers must set that to a workspace build.
+      flake.nixosModules = {
+        store = ./nix/modules/store.nix;
+        scheduler = ./nix/modules/scheduler.nix;
+        gateway = ./nix/modules/gateway.nix;
+        worker = ./nix/modules/worker.nix;
+      };
+
       perSystem =
         {
           config,
@@ -330,6 +341,20 @@
                   ]);
               }
             );
+          }
+          # Phase 2a milestone VM test (Linux-only: needs KVM + NixOS VMs).
+          # 4 VMs (control + 2 workers + client) exercise the full distributed
+          # pipeline: gateway ssh-ng, scheduler dispatch, worker FUSE + overlay
+          # + mount namespace, store PutPath — validated via Prometheus metrics.
+          #
+          # Run: nix build .#checks.x86_64-linux.rio-milestone-vm
+          # Debug: nix build .#checks.x86_64-linux.rio-milestone-vm.driverInteractive
+          #        && ./result/bin/nixos-test-driver
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            rio-milestone-vm = import ./nix/tests/milestone.nix {
+              inherit pkgs rio-workspace;
+              rioModules = inputs.self.nixosModules;
+            };
           };
 
           # Formatter for 'nix fmt'
