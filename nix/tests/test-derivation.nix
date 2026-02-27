@@ -22,6 +22,7 @@ let
       args = [
         "-c"
         ''
+          set -ex
           ${bb} mkdir -p $out
           ${bb} echo "${name}" > $out/stamp
           ${builtins.concatStringsSep "\n" (map (d: "${bb} cat ${d}/stamp >> $out/stamp") deps)}

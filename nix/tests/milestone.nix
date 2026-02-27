@@ -64,14 +64,32 @@ let
     # curl for metric scraping.
     environment.systemPackages = [ pkgs.curl ];
 
-    # 2 cores: tokio multi_thread runtime uses num_cpus worker threads.
-    # With 1 vCPU, FUSE callbacks doing Handle::block_on(gRPC) can starve
-    # when the single worker thread is busy driving other futures. 2 cores
-    # also matches max_builds=2 for reasonable build parallelism.
+    # 4 cores: tokio multi_thread runtime uses num_cpus worker threads.
+    # FUSE callbacks doing Handle::block_on(gRPC) need spare worker threads
+    # to drive the reactor; 4 cores gives headroom at max_builds=2.
     virtualisation = {
       memorySize = 1024;
       diskSize = 4096;
-      cores = 2;
+      cores = 4;
+      # Worker VMs must NOT have a writable /nix/store. With writableStore=true
+      # (the NixOS-test default), /nix/store is itself an overlayfs (tmpfs
+      # upper on 9p lower). Our per-build overlay uses /nix/store as a lower;
+      # overlay-on-overlay breaks copy-up → nix-daemon creates chroot dirs,
+      # builder writes $out, but the parent can't see it → OutputRejected.
+      # With writableStore=false, /nix/store is the plain 9p mount.
+      writableStore = false;
+      # But the host nix-daemon (NixOS module) still wants to create
+      # /nix/var/nix/gcroots etc. — point it at a tmpfs via /nix/var.
+      # (Our per-build daemon uses the overlay's synth DB via bind-mount,
+      # so this only affects the host daemon's state, not builds.)
+    };
+
+    # With writableStore=false, /nix/var is on the RO 9p mount too.
+    # Mount tmpfs there so host nix-daemon + our synth-DB bind target
+    # have writable paths. The per-build overlay handles /nix/store writes.
+    fileSystems."/nix/var" = {
+      fsType = "tmpfs";
+      neededForBoot = true;
     };
   };
 in
@@ -144,8 +162,11 @@ pkgs.testers.runNixOSTest {
         9092
       ];
 
-      virtualisation.memorySize = 1024;
-      virtualisation.diskSize = 4096;
+      virtualisation = {
+        memorySize = 1024;
+        diskSize = 4096;
+        cores = 4;
+      };
     };
 
     worker1 = workerConfig "worker1";
@@ -181,6 +202,7 @@ pkgs.testers.runNixOSTest {
       '';
 
       virtualisation.memorySize = 1024;
+      virtualisation.cores = 4;
     };
   };
 

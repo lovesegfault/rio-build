@@ -41,6 +41,23 @@ pub struct SynthPathInfo {
     pub ca: Option<String>,
 }
 
+/// A derivation's output map entry for the DerivationOutputs table.
+///
+/// nix-daemon's `queryPartialDerivationOutputMap()` reads this table to
+/// determine the expected output paths for a derivation. Without it,
+/// `initialOutputs[...].known` is None → `scratchPath = makeFallbackPath()`
+/// → the builder writes `$out` to the REAL path but nix-daemon checks the
+/// fallback path → "builder failed to produce output path".
+#[derive(Debug, Clone)]
+pub struct SynthDrvOutput {
+    /// Full .drv store path (must also be in ValidPaths).
+    pub drv_path: String,
+    /// Output name (e.g., "out", "dev").
+    pub output_name: String,
+    /// Full output store path.
+    pub output_path: String,
+}
+
 /// Convert a `PathInfo` protobuf message to `SynthPathInfo`.
 pub fn path_info_to_synth(info: &rio_proto::types::PathInfo) -> SynthPathInfo {
     let nar_hash = format!("sha256:{}", hex::encode(&info.nar_hash));
@@ -76,7 +93,11 @@ const SCHEMA_VERSION: &str = "10";
 /// The database contains the minimum schema required for Nix 2.20+
 /// to recognize store paths: Config, ValidPaths, Refs, DerivationOutputs,
 /// and Realisations (empty, for future CA support).
-pub async fn generate_db(db_path: &Path, paths: &[SynthPathInfo]) -> anyhow::Result<()> {
+pub async fn generate_db(
+    db_path: &Path,
+    paths: &[SynthPathInfo],
+    drv_outputs: &[SynthDrvOutput],
+) -> anyhow::Result<()> {
     // sqlx sqlite URI format: sqlite:///absolute/path or sqlite://relative
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
     let mut conn = SqliteConnection::connect(&url).await?;
@@ -91,10 +112,12 @@ pub async fn generate_db(db_path: &Path, paths: &[SynthPathInfo]) -> anyhow::Res
 
     create_schema(&mut conn).await?;
     insert_paths(&mut conn, paths).await?;
+    insert_drv_outputs(&mut conn, drv_outputs).await?;
 
     tracing::info!(
         db_path = %db_path.display(),
         path_count = paths.len(),
+        drv_output_count = drv_outputs.len(),
         "synthetic Nix store DB generated"
     );
 
@@ -229,6 +252,50 @@ async fn insert_paths(conn: &mut SqliteConnection, paths: &[SynthPathInfo]) -> a
     Ok(())
 }
 
+/// Populate the DerivationOutputs table.
+///
+/// Without this, nix-daemon's `queryPartialDerivationOutputMap(drvPath)`
+/// returns empty → `initialOutputs[outputName].known` stays None → nix-daemon
+/// builds at `makeFallbackPath()` (a hash of `"rewrite:<drvPath>:name:<out>"`
+/// with all-zero content hash) instead of the real output path. The builder's
+/// `$out` env var has the REAL path (from the BasicDerivation we send on the
+/// wire), so the builder writes there, but nix-daemon checks the fallback path
+/// → "builder failed to produce output path".
+async fn insert_drv_outputs(
+    conn: &mut SqliteConnection,
+    drv_outputs: &[SynthDrvOutput],
+) -> anyhow::Result<()> {
+    if drv_outputs.is_empty() {
+        return Ok(());
+    }
+    let mut tx = conn.begin().await?;
+    for out in drv_outputs {
+        // drv column is an FK to ValidPaths(id). The .drv must already be
+        // in ValidPaths (insert_paths runs first). If it's not found, this
+        // is a bug in the caller (closure didn't include the .drv).
+        let drv_id: Option<i64> = sqlx::query_scalar("SELECT id FROM ValidPaths WHERE path = ?1")
+            .bind(&out.drv_path)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(drv_id) = drv_id else {
+            tracing::warn!(
+                drv_path = %out.drv_path,
+                output = %out.output_name,
+                "DerivationOutputs insert skipped: .drv not in ValidPaths (closure bug?)"
+            );
+            continue;
+        };
+        sqlx::query("INSERT OR IGNORE INTO DerivationOutputs (drv, id, path) VALUES (?1, ?2, ?3)")
+            .bind(drv_id)
+            .bind(&out.output_name)
+            .bind(&out.output_path)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +337,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
 
@@ -345,11 +412,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_db_derivation_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+
+        // .drv file MUST be in ValidPaths for the FK to resolve.
+        let paths = vec![SynthPathInfo {
+            path: "/nix/store/xxxx-hello.drv".to_string(),
+            nar_hash: "sha256:abcd".to_string(),
+            nar_size: 512,
+            deriver: None,
+            references: vec![],
+            signatures: vec![],
+            ca: None,
+        }];
+        let drv_outputs = vec![
+            SynthDrvOutput {
+                drv_path: "/nix/store/xxxx-hello.drv".to_string(),
+                output_name: "out".to_string(),
+                output_path: "/nix/store/yyyy-hello".to_string(),
+            },
+            SynthDrvOutput {
+                drv_path: "/nix/store/xxxx-hello.drv".to_string(),
+                output_name: "dev".to_string(),
+                output_path: "/nix/store/zzzz-hello-dev".to_string(),
+            },
+        ];
+
+        generate_db(&db_path, &paths, &drv_outputs).await.unwrap();
+
+        let mut conn = open_db(&db_path).await;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT d.id, d.path FROM DerivationOutputs d
+               JOIN ValidPaths vp ON d.drv = vp.id
+               WHERE vp.path = '/nix/store/xxxx-hello.drv'
+               ORDER BY d.id"#,
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ("dev".to_string(), "/nix/store/zzzz-hello-dev".to_string())
+        );
+        assert_eq!(
+            rows[1],
+            ("out".to_string(), "/nix/store/yyyy-hello".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_db_derivation_outputs_skips_missing_drv() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+
+        // .drv NOT in ValidPaths → FK resolve fails → warn + skip (not error).
+        let drv_outputs = vec![SynthDrvOutput {
+            drv_path: "/nix/store/missing.drv".to_string(),
+            output_name: "out".to_string(),
+            output_path: "/nix/store/some-output".to_string(),
+        }];
+
+        generate_db(&db_path, &[], &drv_outputs).await.unwrap();
+
+        let mut conn = open_db(&db_path).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM DerivationOutputs")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "should skip insert when .drv not in ValidPaths");
+    }
+
+    #[tokio::test]
     async fn test_generate_db_has_realisations_table() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[]).await.unwrap();
+        generate_db(&db_path, &[], &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
 
@@ -366,7 +507,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
 
@@ -388,7 +529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
 
@@ -405,7 +546,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths()).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
 
@@ -421,7 +562,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[]).await.unwrap();
+        generate_db(&db_path, &[], &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
@@ -444,8 +585,8 @@ mod tests {
         let db_path = dir.path().join("db.sqlite");
 
         let paths = sample_paths();
-        generate_db(&db_path, &paths).await.unwrap();
-        generate_db(&db_path, &paths).await.unwrap();
+        generate_db(&db_path, &paths, &[]).await.unwrap();
+        generate_db(&db_path, &paths, &[]).await.unwrap();
 
         let mut conn = open_db(&db_path).await;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
