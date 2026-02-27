@@ -3,10 +3,7 @@
 -- Tables: builds, derivations, derivation_edges, build_derivations,
 --         assignments, build_history.
 --
--- Phase 2a deviations from spec (docs/src/components/scheduler.md):
---   - tenant_id is nullable (multi-tenancy unused in Phase 2a)
---   - derivations.drv_path added (not in spec; needed for DAG reconstruction)
---   - assignment_gen lives on assignments table (as generation), not derivations
+-- Schema matches docs/src/components/scheduler.md § Schema (pseudo-DDL) as of Phase 2a.
 
 -- Build requests
 CREATE TABLE builds (
