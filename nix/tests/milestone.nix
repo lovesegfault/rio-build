@@ -64,8 +64,15 @@ let
     # curl for metric scraping.
     environment.systemPackages = [ pkgs.curl ];
 
-    virtualisation.memorySize = 1024;
-    virtualisation.diskSize = 4096;
+    # 2 cores: tokio multi_thread runtime uses num_cpus worker threads.
+    # With 1 vCPU, FUSE callbacks doing Handle::block_on(gRPC) can starve
+    # when the single worker thread is busy driving other futures. 2 cores
+    # also matches max_builds=2 for reasonable build parallelism.
+    virtualisation = {
+      memorySize = 1024;
+      diskSize = 4096;
+      cores = 2;
+    };
   };
 in
 pkgs.testers.runNixOSTest {
@@ -222,12 +229,20 @@ pkgs.testers.runNixOSTest {
     # ── Phase 5: Milestone build ──────────────────────────────────────
     # Build the 5-node fan-out DAG. `--no-link` to avoid pulling results back.
     # `nix-build` (not `nix build`) for simpler --arg passing without flakes.
-    client.succeed(
-        "nix-build --no-out-link "
-        "--store 'ssh-ng://control' "
-        "--arg busybox '(builtins.storePath ${busybox})' "
-        "${testDrvFile}"
-    )
+    # On failure, dump worker journals before raising (testScript catches the
+    # exception from `succeed()` and re-raises after printing).
+    try:
+        client.succeed(
+            "nix-build --no-out-link "
+            "--store 'ssh-ng://control' "
+            "--arg busybox '(builtins.storePath ${busybox})' "
+            "${testDrvFile}"
+        )
+    except Exception:
+        for w in [worker1, worker2]:
+            w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
+        control.execute("journalctl -u rio-scheduler --no-pager -n 100 >&2")
+        raise
 
     # ── Phase 6: Verification ─────────────────────────────────────────
     # Build succeeded (exit code already checked by succeed()).
