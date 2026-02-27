@@ -353,6 +353,19 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
+                    // Record outcome for SLI dashboards. Ok(exec) doesn't mean
+                    // success — check the proto status. Err(ExecutorError) is
+                    // always infrastructure failure.
+                    let outcome = match &completion.result {
+                        Some(r)
+                            if r.status == rio_proto::types::BuildResultStatus::Built as i32 =>
+                        {
+                            "success"
+                        }
+                        _ => "failure",
+                    };
+                    metrics::counter!("rio_worker_builds_total", "outcome" => outcome).increment(1);
+
                     let msg = WorkerMessage {
                         msg: Some(worker_message::Msg::Completion(completion)),
                     };

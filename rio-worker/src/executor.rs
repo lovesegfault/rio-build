@@ -114,7 +114,8 @@ pub async fn execute_build(
     );
 
     metrics::gauge!("rio_worker_builds_active").increment(1.0);
-    metrics::counter!("rio_worker_builds_total").increment(1);
+    // rio_worker_builds_total is incremented at completion (main.rs) with
+    // an outcome label so SLI queries can compute success rate.
     let build_start = std::time::Instant::now();
     let _build_guard = scopeguard::guard((), move |()| {
         metrics::gauge!("rio_worker_builds_active").decrement(1.0);

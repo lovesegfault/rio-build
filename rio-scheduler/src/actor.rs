@@ -436,7 +436,9 @@ impl DagActor {
         options: BuildOptions,
         keep_going: bool,
     ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
-        metrics::counter!("rio_scheduler_builds_total").increment(1);
+        // rio_scheduler_builds_total is incremented at terminal transition
+        // (complete_build/transition_build_to_failed/handle_cancel_build)
+        // with an outcome label, so SLI queries can compute success rate.
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
@@ -1066,7 +1068,13 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_default(),
+                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
+                            warn!(
+                                drv_hash,
+                                "drv_hash_to_path returned None; using hash as fallback"
+                            );
+                            drv_hash.to_string()
+                        }),
                         status: Some(rio_proto::types::derivation_event::Status::Completed(
                             rio_proto::types::DerivationCompleted {
                                 output_paths: output_paths.clone(),
@@ -1253,7 +1261,13 @@ impl DagActor {
                 build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_default(),
+                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
+                            warn!(
+                                drv_hash,
+                                "drv_hash_to_path returned None; using hash as fallback"
+                            );
+                            drv_hash.to_string()
+                        }),
                         status: Some(rio_proto::types::derivation_event::Status::Failed(
                             rio_proto::types::DerivationFailed {
                                 error_message: error_msg.to_string(),
@@ -1400,6 +1414,7 @@ impl DagActor {
         );
 
         info!(build_id = %build_id, reason, "build cancelled");
+        metrics::counter!("rio_scheduler_builds_total", "outcome" => "cancelled").increment(1);
         self.schedule_terminal_cleanup(build_id);
         Ok(true)
     }
@@ -1833,7 +1848,13 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_default(),
+                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
+                            warn!(
+                                drv_hash,
+                                "drv_hash_to_path returned None; using hash as fallback"
+                            );
+                            drv_hash.to_string()
+                        }),
                         status: Some(rio_proto::types::derivation_event::Status::Started(
                             rio_proto::types::DerivationStarted {
                                 worker_id: worker_id.to_string(),
@@ -2077,6 +2098,7 @@ impl DagActor {
         );
 
         info!(build_id = %build_id, "build completed successfully");
+        metrics::counter!("rio_scheduler_builds_total", "outcome" => "succeeded").increment(1);
         self.schedule_terminal_cleanup(build_id);
         Ok(())
     }
@@ -2102,6 +2124,7 @@ impl DagActor {
                 failed_derivation,
             }),
         );
+        metrics::counter!("rio_scheduler_builds_total", "outcome" => "failed").increment(1);
 
         self.schedule_terminal_cleanup(build_id);
         Ok(())
