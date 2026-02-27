@@ -611,9 +611,18 @@ impl Filesystem for NixStoreFs {
             }
         }
 
-        // For top-level entries (direct children of mount point), check remote store
+        // For top-level entries (direct children of mount point), check remote store.
+        // Skip names that can't be valid store basenames: store paths are
+        // `{32-char-nixbase32-hash}-{name}`, so anything shorter than 34 chars
+        // or starting with `.` (like `.links`, Nix's hardlink-optimise dir) is
+        // not a store path — don't gRPC-query it (would get InvalidArgument →
+        // EIO, which cascades to callers like nix-daemon's mkdir .links).
         if parent.0 == INodeNo::ROOT.0 {
             let name_str = name.to_string_lossy();
+            if name_str.len() < 34 || name_str.starts_with('.') {
+                reply.error(Errno::ENOENT);
+                return;
+            }
             match self.query_path_exists(&name_str) {
                 Ok(true) => {
                     // Path exists remotely; create a synthetic directory entry.

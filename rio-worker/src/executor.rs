@@ -436,6 +436,12 @@ async fn spawn_daemon_in_namespace(
     // See "Why async + spawn_blocking" in the function doc for the deadlock chain
     // this avoids. tokio::process::Command is not Send (the FnMut pre_exec
     // closure makes it !Send), so we build it INSIDE the spawn_blocking closure.
+    //
+    // `nix-daemon` and its dynamic library deps live in the HOST `/nix/store`.
+    // The overlay merged dir (bind-mounted at `/nix/store` in the child)
+    // includes the host store as its FIRST lower layer (see overlay.rs), so
+    // nix-daemon + glibc + etc. stay visible through the overlay alongside
+    // FUSE-served rio-store paths.
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("nix-daemon");
         cmd.arg("--stdio")

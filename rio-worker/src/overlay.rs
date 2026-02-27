@@ -93,6 +93,18 @@ impl Drop for OverlayMount {
 ///
 /// Requires `CAP_SYS_ADMIN`.
 ///
+/// # Stacked lower layers
+///
+/// The overlay uses TWO lower layers (colon-separated, left-to-right priority):
+///   1. `/nix/store` (host) — so nix-daemon + glibc + all its deps stay
+///      reachable through the overlay. Without this, exec() after the child's
+///      `/nix/store` bind-mount would get ENOENT resolving nix-daemon's path
+///      or its dynamic library deps (all living in `/nix/store/...`).
+///   2. `lower` (FUSE mount) — lazy-fetch store paths from rio-store.
+///
+/// Host-store paths take priority on collision (unlikely: rio-store paths
+/// have distinct hashes). Build outputs go to upperdir via copy-up.
+///
 /// # Important
 ///
 /// The upper and work directories MUST be on a different filesystem than the
@@ -103,6 +115,7 @@ pub fn setup_overlay(
     base_dir: &Path,
     build_id: &str,
 ) -> anyhow::Result<OverlayMount> {
+    const HOST_STORE: &str = "/nix/store";
     anyhow::ensure!(
         !build_id.contains('/') && !build_id.contains('\0') && !build_id.is_empty(),
         "build_id must not contain path separators or be empty: {build_id:?}"
@@ -141,8 +154,11 @@ pub fn setup_overlay(
         lower.display(),
     );
 
+    // Stacked lowers: host /nix/store first (for nix-daemon + deps), FUSE second.
+    // Colon-separated, left-to-right lookup priority.
     let mount_data = format!(
-        "lowerdir={},upperdir={},workdir={}",
+        "lowerdir={}:{},upperdir={},workdir={}",
+        HOST_STORE,
         lower.display(),
         store_upper.display(),
         work.display()
