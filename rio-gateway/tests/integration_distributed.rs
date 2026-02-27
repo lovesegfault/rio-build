@@ -719,39 +719,37 @@ async fn test_distributed_handshake_wire_sequence() {
 }
 
 /// FUSE-dependent tests are marked `#[ignore]` since they require
-/// CAP_SYS_ADMIN which is not available in standard CI environments.
+/// CAP_SYS_ADMIN which is not available in standard `cargo nextest` CI.
 ///
-/// These tests would exercise the full nix build pipeline:
-/// `nix build --store ssh-ng://localhost` which requires FUSE mounts
-/// for the worker's /nix/store overlay.
+/// **The full end-to-end path IS now covered** by the NixOS VM test:
+///
+/// ```bash
+/// nix build .#checks.x86_64-linux.rio-milestone-vm
+/// ```
+///
+/// See `nix/tests/milestone.nix` and docs/src/phases/phase2a.md § Automated
+/// Validation. Four real VMs exercise gateway ssh-ng + scheduler dispatch +
+/// worker FUSE/overlay/CLONE_NEWNS + store PutPath, with Prometheus-metric
+/// assertions that both workers built derivations.
+///
+/// This `#[ignore]` stub is kept for local `cargo nextest run --ignored`
+/// debugging against a persistent PG; if you want end-to-end validation,
+/// use the VM test instead.
 #[tokio::test]
-#[ignore = "requires CAP_SYS_ADMIN for FUSE mounts"]
+#[ignore = "requires CAP_SYS_ADMIN; use nix/tests/milestone.nix VM test instead"]
 async fn test_distributed_full_build_with_fuse() {
-    // Full distributed build path:
-    // 1. Bootstrap PostgreSQL (handled automatically by rio-test-support)
-    // 2. Run migrations (done by TestDb::new)
-    // 3. Start rio-store with filesystem backend
-    // 4. Start rio-scheduler with PG connection
-    // 5. Start rio-worker with FUSE mount (needs CAP_SYS_ADMIN)
-    // 6. Start rio-gateway SSH server
-    // 7. Run: nix build --store ssh-ng://localhost nixpkgs#hello
-
-    // PostgreSQL is bootstrapped automatically. Fails hard if unavailable.
     let _db = rio_test_support::TestDb::new(&sqlx::migrate!("../migrations")).await;
 
     if !std::path::Path::new("/dev/fuse").exists() {
         panic!("/dev/fuse not available — this test requires CAP_SYS_ADMIN");
     }
-    // Check for CAP_SYS_ADMIN by attempting a test mount (this would fail fast)
-    // ... the actual test implementation would go here once the CI environment
-    // supports privileged containers.
-    //
     // The non-FUSE integration path is covered by test_distributed_submit_and_complete
-    // above, which exercises: gateway -> scheduler -> worker gRPC flow with mock store.
+    // above (gateway -> scheduler -> worker gRPC flow with mock store).
+    // Full multi-process + FUSE coverage is in nix/tests/milestone.nix.
     eprintln!(
-        "TODO(phase3a): full multi-process build with FUSE. See docs/src/phases/phase2a.md \
-         § Milestone for the manual procedure. CI support blocked on \
-         infrastructure (privileged container pool for CAP_SYS_ADMIN + /dev/fuse)."
+        "Full multi-process build with FUSE is covered by the NixOS VM test: \
+         `nix build .#checks.x86_64-linux.rio-milestone-vm`. \
+         See docs/src/phases/phase2a.md § Automated Validation."
     );
 }
 
