@@ -4248,25 +4248,12 @@ pub(crate) mod tests {
         use rio_proto::types::{PathInfo, PutPathMetadata, PutPathRequest, put_path_request};
         use sha2::{Digest, Sha256};
 
-        // Minimal NAR for a regular file "hello"
-        fn write_str(out: &mut Vec<u8>, s: &[u8]) {
-            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
-            out.extend_from_slice(s);
-            let pad = (8 - (s.len() % 8)) % 8;
-            out.extend_from_slice(&vec![0u8; pad]);
-        }
-        let contents = b"hello";
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: b"hello".to_vec(),
+        };
         let mut nar = Vec::new();
-        write_str(&mut nar, b"nix-archive-1");
-        write_str(&mut nar, b"(");
-        write_str(&mut nar, b"type");
-        write_str(&mut nar, b"regular");
-        write_str(&mut nar, b"contents");
-        nar.extend_from_slice(&(contents.len() as u64).to_le_bytes());
-        nar.extend_from_slice(contents);
-        let pad = (8 - (contents.len() % 8)) % 8;
-        nar.extend_from_slice(&vec![0u8; pad]);
-        write_str(&mut nar, b")");
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
 
         let nar_hash = Sha256::digest(&nar).to_vec();
         let info = PathInfo {
