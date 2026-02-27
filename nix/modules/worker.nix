@@ -146,12 +146,22 @@ in
     };
 
     # Ensure /var/rio/* directories exist (worker creates them too, but this
-    # runs earlier and sets correct permissions).
+    # runs earlier and sets correct permissions). Also create the bind-mount
+    # TARGETS that executor pre_exec mounts onto: `/nix/var/nix/db` is created
+    # by nix-daemon on first local use, but the worker never runs local
+    # nix-daemon (only the namespaced --stdio child), so that path may not exist.
     systemd.tmpfiles.rules = [
       "d /var/rio 0755 root root -"
       "d ${cfg.fuseCacheDir} 0755 root root -"
       "d ${cfg.overlayBaseDir} 0755 root root -"
       "d ${cfg.fuseMountPoint} 0755 root root -"
+      # Bind-mount targets for executor pre_exec (spawn_daemon_in_namespace).
+      # /nix/store and /etc/nix are created by NixOS activation, but
+      # /nix/var/nix/db is lazy-created by the local nix-daemon. tmpfiles `d`
+      # does NOT create parents, so list the full chain explicitly.
+      "d /nix/var 0755 root root -"
+      "d /nix/var/nix 0755 root root -"
+      "d /nix/var/nix/db 0755 root root -"
     ];
   };
 }
