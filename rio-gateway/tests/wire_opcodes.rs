@@ -930,10 +930,20 @@ async fn test_add_multiple_to_store_batch() {
     let (nar_a, hash_a) = make_nar(b"multi-a");
     let (nar_b, hash_b) = make_nar(b"multi-b");
 
-    // Build the inner framed payload: concatenated entries (NO count prefix;
-    // handler iterates until end-of-buffer). Each entry has per-entry
-    // metadata + inner-framed NAR.
+    // Build the inner framed payload per the REAL Nix protocol
+    // (`Store::addMultipleToStore(Source &)` in store-api.cc):
+    //   [num_paths: u64]
+    //   for each: ValidPathInfo (9 fields) + NAR as narSize PLAIN bytes
+    // The NAR is NOT nested-framed — `addToStore(info, source)` reads narSize
+    // bytes directly from the already-framed outer stream.
+    //
+    // Previous test wrote NO count prefix + inner-framed NAR, matching a buggy
+    // parser rather than the spec. Fixed after VM test caught it running real
+    // `nix copy --to ssh-ng://`.
     let mut inner = Vec::new();
+
+    // Count prefix
+    wire::write_u64(&mut inner, 2).await.unwrap();
 
     // Entry 1
     wire::write_string(&mut inner, TEST_PATH_A).await.unwrap();
@@ -949,9 +959,8 @@ async fn test_add_multiple_to_store_batch() {
     wire::write_bool(&mut inner, false).await.unwrap(); // ultimate
     wire::write_strings(&mut inner, &[]).await.unwrap(); // sigs
     wire::write_string(&mut inner, "").await.unwrap(); // ca
-    wire::write_framed_stream(&mut inner, &nar_a, 8192)
-        .await
-        .unwrap();
+    // NAR: narSize plain bytes (NOT framed)
+    inner.extend_from_slice(&nar_a);
 
     // Entry 2
     let test_path_b = "/nix/store/22222222222222222222222222222222-multi-b";
@@ -968,9 +977,7 @@ async fn test_add_multiple_to_store_batch() {
     wire::write_bool(&mut inner, false).await.unwrap();
     wire::write_strings(&mut inner, &[]).await.unwrap();
     wire::write_string(&mut inner, "").await.unwrap();
-    wire::write_framed_stream(&mut inner, &nar_b, 8192)
-        .await
-        .unwrap();
+    inner.extend_from_slice(&nar_b);
 
     // Send opcode + outer framing
     wire::write_u64(&mut h.stream, 44).await.unwrap(); // wopAddMultipleToStore
@@ -990,6 +997,51 @@ async fn test_add_multiple_to_store_batch() {
     assert!(paths.contains(&test_path_b));
 
     h.finish().await;
+}
+
+/// Regression: handler must reject truncated NAR (nar_size claims more bytes
+/// than remain in the framed stream) instead of panicking on slice OOB.
+#[tokio::test]
+async fn test_add_multiple_to_store_truncated_nar() {
+    let mut h = TestHarness::setup().await;
+    let (nar, hash) = make_nar(b"truncated");
+
+    let mut inner = Vec::new();
+    wire::write_u64(&mut inner, 1).await.unwrap(); // num_paths
+    wire::write_string(&mut inner, TEST_PATH_A).await.unwrap();
+    wire::write_string(&mut inner, "").await.unwrap();
+    wire::write_string(&mut inner, &hex::encode(hash))
+        .await
+        .unwrap();
+    wire::write_strings(&mut inner, &[]).await.unwrap();
+    wire::write_u64(&mut inner, 0).await.unwrap();
+    // LIE about nar_size: claim more bytes than we actually send.
+    wire::write_u64(&mut inner, nar.len() as u64 + 100)
+        .await
+        .unwrap();
+    wire::write_bool(&mut inner, false).await.unwrap();
+    wire::write_strings(&mut inner, &[]).await.unwrap();
+    wire::write_string(&mut inner, "").await.unwrap();
+    inner.extend_from_slice(&nar); // actual NAR, 100 bytes short of claimed size
+
+    wire::write_u64(&mut h.stream, 44).await.unwrap();
+    wire::write_bool(&mut h.stream, false).await.unwrap();
+    wire::write_bool(&mut h.stream, true).await.unwrap();
+    wire::write_framed_stream(&mut h.stream, &inner, 8192)
+        .await
+        .unwrap();
+    h.stream.flush().await.unwrap();
+
+    // Handler should send STDERR_ERROR (not crash).
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(
+        err.message().contains("truncated"),
+        "expected 'truncated' in error, got: {}",
+        err.message()
+    );
+
+    // No PutPath calls should have been made.
+    assert_eq!(h.store.put_calls.read().unwrap().len(), 0);
 }
 
 // ===========================================================================
