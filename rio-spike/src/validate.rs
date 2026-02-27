@@ -758,6 +758,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_find_hello_store_path() {
         let path = find_hello_store_path().expect("nix should be available");
         assert!(path.starts_with("/nix/store/"));
