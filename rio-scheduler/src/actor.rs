@@ -586,7 +586,7 @@ impl DagActor {
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
         // dependents will correctly be computed as Ready here.
-        let remaining_new: Vec<String> = newly_inserted
+        let remaining_new: HashSet<String> = newly_inserted
             .iter()
             .filter(|h| !cached_hashes.contains(h.as_str()))
             .cloned()
@@ -731,11 +731,14 @@ impl DagActor {
         build_id: Uuid,
         nodes: &[rio_proto::types::DerivationNode],
         edges: &[rio_proto::types::DerivationEdge],
-        newly_inserted: &[String],
+        newly_inserted: &HashSet<String>,
     ) -> Result<(), ActorError> {
+        // TODO(phase2b): batch via INSERT...ON CONFLICT with UNNEST or QueryBuilder.
+        // 2N+E serial PG roundtrips stall the actor ~3.5s for a 1000-node DAG,
+        // blocking all heartbeats/completions/dispatches.
         for node in nodes {
             let drv_hash = &node.drv_hash;
-            let status = if newly_inserted.contains(drv_hash) {
+            let status = if newly_inserted.contains(drv_hash.as_str()) {
                 DerivationStatus::Created
             } else if let Some(state) = self.dag.node(drv_hash) {
                 // Existing node, just link the build
@@ -834,7 +837,7 @@ impl DagActor {
     /// RPC fails (non-fatal — we fall back to building).
     async fn check_cached_outputs(
         &self,
-        newly_inserted: &[String],
+        newly_inserted: &HashSet<String>,
         node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
     ) -> HashSet<String> {
         let Some(store_client) = &self.store_client else {

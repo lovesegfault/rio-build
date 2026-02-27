@@ -24,7 +24,7 @@ pub enum DagError {
 #[derive(Debug)]
 pub struct MergeResult {
     /// Hashes of nodes newly inserted by this merge (not pre-existing).
-    pub newly_inserted: Vec<String>,
+    pub newly_inserted: HashSet<String>,
     /// Edges newly added by this merge as (parent_hash, child_hash) pairs.
     pub new_edges: Vec<(String, String)>,
     /// Hashes of pre-existing nodes that gained build_id interest.
@@ -115,7 +115,7 @@ impl DerivationDag {
         nodes: &[rio_proto::types::DerivationNode],
         edges: &[rio_proto::types::DerivationEdge],
     ) -> Result<MergeResult, DagError> {
-        let mut newly_inserted = Vec::new();
+        let mut newly_inserted = HashSet::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(String, String)> = Vec::new();
         // Track pre-existing nodes that gained interest in this merge, so
@@ -140,7 +140,7 @@ impl DerivationDag {
                 self.path_to_hash
                     .insert(state.drv_path().to_string(), drv_hash.clone());
                 self.nodes.insert(drv_hash.clone(), state);
-                newly_inserted.push(drv_hash.clone());
+                newly_inserted.insert(drv_hash.clone());
             }
         }
 
@@ -192,7 +192,7 @@ impl DerivationDag {
         for (parent, _child) in &new_edges {
             // Only need to DFS from edge endpoints not already covered by
             // newly_inserted (avoids redundant work).
-            if !newly_inserted.iter().any(|n| n == parent) {
+            if !newly_inserted.contains(parent) {
                 dfs_starts.push(parent.as_str());
             }
         }
@@ -285,7 +285,7 @@ impl DerivationDag {
     /// this merge (but not from nodes where build_id was already present).
     pub(crate) fn rollback_merge(
         &mut self,
-        newly_inserted: &[String],
+        newly_inserted: &HashSet<String>,
         new_edges: &[(String, String)],
         interest_added: &[String],
         build_id: Uuid,
@@ -457,7 +457,7 @@ impl DerivationDag {
     /// Returns lists of (drv_hash, new_status) transitions.
     pub fn compute_initial_states(
         &self,
-        newly_inserted: &[String],
+        newly_inserted: &HashSet<String>,
     ) -> Vec<(String, DerivationStatus)> {
         let mut transitions = Vec::new();
 
@@ -720,7 +720,7 @@ mod tests {
             .newly_inserted;
 
         // Only parentP is newly inserted (leafP already existed).
-        assert_eq!(newly, vec!["parentP"]);
+        assert_eq!(newly, HashSet::from(["parentP".to_string()]));
         assert!(dag.any_dep_terminally_failed("parentP"));
 
         // compute_initial_states should return DependencyFailed for parentP.
