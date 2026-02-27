@@ -622,7 +622,8 @@ impl Filesystem for NixStoreFs {
         }
 
         // ENOENT is normal for probing
-        if name.to_string_lossy() != ".Trash" && name.to_string_lossy() != ".Trash-0" {
+        let name_str = name.to_string_lossy();
+        if name_str != ".Trash" && name_str != ".Trash-0" {
             tracing::trace!(parent = parent.0, name = ?name, "lookup: not found");
         }
         reply.error(Errno::ENOENT);

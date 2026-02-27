@@ -56,12 +56,14 @@ pub enum UploadError {
 /// that represent build outputs.
 pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
     let store_dir = upper_dir.join("nix/store");
-    if !store_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let read_dir = match std::fs::read_dir(&store_dir) {
+        Ok(iter) => iter,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
 
     let mut outputs = Vec::new();
-    for entry in std::fs::read_dir(&store_dir)? {
+    for entry in read_dir {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // Skip hidden files and the .links directory
