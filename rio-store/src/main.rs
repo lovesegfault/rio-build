@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let backend: Arc<dyn NarBackend> = match args.backend.as_str() {
         "filesystem" => {
             info!(base_dir = %args.base_dir, "using filesystem backend");
-            Arc::new(FilesystemBackend::new(&args.base_dir))
+            Arc::new(FilesystemBackend::new(&args.base_dir)?)
         }
         "s3" => {
             let bucket = args
