@@ -21,11 +21,11 @@ pub struct FilesystemBackend {
 impl FilesystemBackend {
     /// Create a new filesystem backend rooted at `base_dir`.
     ///
-    /// The directory is created lazily on the first `put` call.
-    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            base_dir: base_dir.into(),
-        }
+    /// The directory is created eagerly; fails fast if it cannot be created.
+    pub fn new(base_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let base_dir = base_dir.into();
+        std::fs::create_dir_all(&base_dir)?;
+        Ok(Self { base_dir })
     }
 
     /// Validate a storage key: reject path-separator characters, parent
@@ -57,9 +57,6 @@ impl NarBackend for FilesystemBackend {
         Self::validate_key(&key)?;
         let path = self.blob_path(&key);
         debug!(path = %path.display(), size = data.len(), "FilesystemBackend: storing NAR blob");
-
-        // Ensure the base directory exists.
-        tokio::fs::create_dir_all(&self.base_dir).await?;
 
         // Write atomically: write to temp + fsync, rename, fsync parent dir.
         // fsync is critical: complete_upload() flips PG status='complete'
@@ -122,7 +119,7 @@ mod tests {
     #[tokio::test]
     async fn put_and_get() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path());
+        let backend = FilesystemBackend::new(dir.path()).unwrap();
         let data = Bytes::from_static(b"filesystem test nar data");
         let key = backend.put("abc123", data.clone()).await.unwrap();
         assert_eq!(key, "abc123.nar");
@@ -136,14 +133,14 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path());
+        let backend = FilesystemBackend::new(dir.path()).unwrap();
         assert!(backend.get("nonexistent.nar").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn exists_and_delete() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path());
+        let backend = FilesystemBackend::new(dir.path()).unwrap();
         let key = backend
             .put("def456", Bytes::from_static(b"data"))
             .await
@@ -157,28 +154,23 @@ mod tests {
     #[tokio::test]
     async fn delete_nonexistent_is_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path());
+        let backend = FilesystemBackend::new(dir.path()).unwrap();
         backend.delete("nonexistent.nar").await.unwrap();
     }
 
     #[tokio::test]
-    async fn creates_base_dir_on_put() {
+    async fn creates_base_dir_on_construction() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("deep").join("nested");
-        let backend = FilesystemBackend::new(&nested);
-
         assert!(!nested.exists());
-        backend
-            .put("test", Bytes::from_static(b"data"))
-            .await
-            .unwrap();
+        let _backend = FilesystemBackend::new(&nested).unwrap();
         assert!(nested.exists());
     }
 
     #[tokio::test]
     async fn rejects_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path());
+        let backend = FilesystemBackend::new(dir.path()).unwrap();
 
         // All operations should reject traversal attempts.
         assert!(backend.get("../etc/passwd").await.is_err());
