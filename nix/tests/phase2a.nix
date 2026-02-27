@@ -16,7 +16,7 @@
 #   client    — Nix client speaking ssh-ng to control
 #
 # Run interactively for debugging:
-#   nix build .#checks.x86_64-linux.rio-milestone-vm.driverInteractive
+#   nix build .#checks.x86_64-linux.rio-phase2a.driverInteractive
 #   ./result/bin/nixos-test-driver
 #   >>> start_all(); control.shell_interact()
 {
@@ -39,7 +39,7 @@ let
 
   # The 5-node test DAG. Passed to `nix-build` on the client via
   # `--arg busybox '<storePath>'`.
-  testDrvFile = ./test-derivation.nix;
+  testDrvFile = ./phase2a-derivation.nix;
 
   # PostgreSQL connection URL — both store and scheduler run migrations on
   # startup (sqlx migrate, advisory-lock serialized), so no separate oneshot.
@@ -94,7 +94,7 @@ let
   };
 in
 pkgs.testers.runNixOSTest {
-  name = "rio-milestone-vm";
+  name = "rio-phase2a";
 
   nodes = {
     control = {

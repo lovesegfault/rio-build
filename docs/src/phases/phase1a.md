@@ -57,6 +57,27 @@
 - [x] **Week 6-8:** `nix path-info --store ssh-ng://localhost /nix/store/...-hello` returns correct info
 - [x] **Month 3:** `nix store ls --store ssh-ng://localhost /nix/store/...` works
 
+## Automated Validation
+
+The Phase 1a milestones are validated by a NixOS VM test:
+
+```bash
+nix build .#checks.x86_64-linux.rio-phase1a
+```
+
+Two VMs (gateway + client) exercise the read-only protocol path:
+
+1. **Handshake**: `nix store info --store ssh-ng://gateway` validates the full
+   ssh-ng SSH layer + 4-phase Nix protocol handshake.
+2. **Seed**: client uploads `pkgsStatic.busybox` via `nix copy` so read-only
+   queries have real data to return.
+3. **Query**: `nix path-info --json` exercises `wopQueryPathInfo`; the test
+   asserts `narHash` and `narSize` are populated correctly.
+4. **Browse**: `nix store ls` exercises `wopNarFromPath` (fetches the NAR,
+   parses its directory structure).
+5. **Negative**: querying a nonexistent store path cleanly fails (no hang,
+   no crash, proper STDERR_ERROR).
+
 ### FUSE+Overlay Fallback Plan
 
 If the FUSE+overlay spike fails (e.g., kernel incompatibility on EKS, unacceptable FUSE overhead), the fallback is a bind-mount approach with explicit store path materialization via `nix-store --realise`. This trades lazy loading for simplicity: all input paths are fully materialized on the worker's local disk before the build starts, and bind-mounted into the sandbox. Decision gate: end of Week 2.

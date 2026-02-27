@@ -31,4 +31,25 @@
 - **Month 5:** `wopBuildDerivation` for a trivial derivation (e.g., `writeText`) succeeds end-to-end
 - **Month 6:** `nix build --store ssh-ng://localhost .#hello` completes --- full end-to-end single-node build
 
+## Automated Validation
+
+The Phase 1b milestone is validated by a NixOS VM test:
+
+```bash
+nix build .#checks.x86_64-linux.rio-phase1b
+```
+
+Three VMs (control + 1 worker + client) exercise the single-node build path:
+
+1. **Seed**: client uploads `pkgsStatic.busybox` via `nix copy`.
+2. **Build**: client runs `nix-build --store ssh-ng://control` on a single
+   trivial derivation (busybox sh + mkdir + echo). Exercises the full chain:
+   gateway → scheduler → worker → `nix-daemon --stdio` → output upload.
+3. **Assert**: worker executed exactly 1 build
+   (`rio_worker_builds_total{outcome="success"} 1`), store received the
+   output, and the output is queryable via `nix path-info` over ssh-ng.
+
+This is a strict subset of the phase2a test (2 workers, 5-node DAG) but
+validates the single-node milestone without distribution concerns.
+
 > **Scope note:** This is the densest phase in the plan. ATerm parsing and NAR streaming are each substantial. If the scope proves too large, consider extending by one month or splitting NAR/narinfo work from build opcodes.

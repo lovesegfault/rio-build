@@ -55,7 +55,7 @@
       ];
 
       # NixOS modules for deploying rio services. These are consumed by the
-      # phase-2a milestone VM test (nix/tests/milestone.nix) and can be reused
+      # phase-milestone VM tests (nix/tests/phase*.nix) and can be reused
       # for real deployments. Each module reads `services.rio.package` for
       # binaries, so callers must set that to a workspace build.
       flake.nixosModules = {
@@ -342,20 +342,29 @@
               }
             );
           }
-          # Phase 2a milestone VM test (Linux-only: needs KVM + NixOS VMs).
-          # 4 VMs (control + 2 workers + client) exercise the full distributed
-          # pipeline: gateway ssh-ng, scheduler dispatch, worker FUSE + overlay
-          # + mount namespace, store PutPath — validated via Prometheus metrics.
+          # Per-phase milestone VM tests (Linux-only: need KVM + NixOS VMs).
+          # Each validates the corresponding phase milestone in docs/src/phases/.
           #
-          # Run: nix build .#checks.x86_64-linux.rio-milestone-vm
-          # Debug: nix build .#checks.x86_64-linux.rio-milestone-vm.driverInteractive
+          #   rio-phase1a — 2 VMs: read-only opcodes (path-info, store ls)
+          #   rio-phase1b — 3 VMs: single-worker end-to-end build
+          #   rio-phase2a — 4 VMs: distributed build across 2+ workers
+          #
+          # Run:   nix build .#checks.x86_64-linux.rio-phase2a
+          # Debug: nix build .#checks.x86_64-linux.rio-phase2a.driverInteractive
           #        && ./result/bin/nixos-test-driver
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            rio-milestone-vm = import ./nix/tests/milestone.nix {
-              inherit pkgs rio-workspace;
-              rioModules = inputs.self.nixosModules;
-            };
-          };
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            let
+              vmTestArgs = {
+                inherit pkgs rio-workspace;
+                rioModules = inputs.self.nixosModules;
+              };
+            in
+            {
+              rio-phase1a = import ./nix/tests/phase1a.nix vmTestArgs;
+              rio-phase1b = import ./nix/tests/phase1b.nix vmTestArgs;
+              rio-phase2a = import ./nix/tests/phase2a.nix vmTestArgs;
+            }
+          );
 
           # Formatter for 'nix fmt'
           formatter = config.treefmt.build.wrapper;
