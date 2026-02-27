@@ -70,7 +70,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rio_scheduler_builds_total` | Counter | Total builds submitted |
+| `rio_scheduler_builds_total` | Counter | Total builds at terminal state (labeled by `outcome`: `succeeded`/`failed`/`cancelled`) |
 | `rio_scheduler_builds_active` | Gauge | Currently active builds |
 | `rio_scheduler_derivations_queued` | Gauge | Derivations waiting for assignment |
 | `rio_scheduler_derivations_running` | Gauge | Derivations currently building |
@@ -106,14 +106,15 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rio_worker_builds_total` | Counter | Total builds executed |
+| `rio_worker_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`) |
 | `rio_worker_builds_active` | Gauge | Currently running builds on this worker |
-| `rio_worker_uploads_total` | Counter | Output uploads (labeled by `result`) |
+| `rio_worker_uploads_total` | Counter | Output uploads (labeled by `status`) |
 | `rio_worker_build_duration_seconds` | Histogram | Per-derivation build time |
 | `rio_worker_fuse_cache_size_bytes` | Gauge | FUSE SSD cache usage |
 | `rio_worker_fuse_cache_hits_total` | Counter | FUSE cache hits |
 | `rio_worker_fuse_cache_misses_total` | Counter | FUSE cache misses |
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
+| `rio_worker_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
 
 > **Note on ratio metrics:** Metrics like `rio_store_cache_hit_ratio` and `rio_worker_fuse_cache_hit_ratio` are shown for local dashboards but should not be relied upon for aggregation across instances. For aggregatable cache metrics, use counter pairs (e.g., `rio_store_cache_hits_total` + `rio_store_cache_misses_total`) and compute ratios at query time. Gauge ratios lose meaning when averaged across instances.
 

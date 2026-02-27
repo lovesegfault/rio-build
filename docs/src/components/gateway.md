@@ -500,6 +500,6 @@ When a Nix client uses `--builders` (build hook mode) instead of `--store ssh-ng
 ## Key Files
 
 - `rio-gateway/src/server.rs` --- SSH server setup (russh), per-channel task spawning
-- `rio-gateway/src/handler.rs` --- Nix worker protocol opcode dispatch (run_protocol), gRPC delegation
-- `rio-gateway/src/session.rs` --- Per-SSH-channel protocol session loop
+- `rio-gateway/src/handler.rs` --- Nix worker protocol opcode dispatch (`handle_opcode`), gRPC delegation
+- `rio-gateway/src/session.rs` --- Per-SSH-channel protocol session loop (`run_protocol`), CancelBuild on disconnect
 - `rio-gateway/src/translate.rs` --- DAG reconstruction from .drv references, proto <-> wire translation

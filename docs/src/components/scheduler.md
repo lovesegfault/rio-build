@@ -337,7 +337,7 @@ Normal processing resumes when the queue depth drops below 60% (hysteresis to pr
 ```sql
 CREATE TABLE builds (
     build_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID NOT NULL,
+    tenant_id       UUID,                   -- NOT NULL deferred to Phase 4 (multi-tenancy)
     requestor       TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('pending', 'active', 'succeeded', 'failed', 'cancelled')),
     priority_class  TEXT NOT NULL DEFAULT 'scheduled' CHECK (priority_class IN ('ci', 'interactive', 'scheduled')),
@@ -345,7 +345,7 @@ CREATE TABLE builds (
     started_at      TIMESTAMPTZ,
     finished_at     TIMESTAMPTZ,
     error_summary   TEXT,
-    CONSTRAINT builds_tenant_idx UNIQUE (tenant_id, build_id)
+    -- UNIQUE (tenant_id, build_id) deferred to Phase 4 with NOT NULL constraint
 );
 CREATE INDEX builds_status_idx ON builds (status) WHERE status IN ('pending', 'active');
 
