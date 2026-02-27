@@ -1227,6 +1227,20 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Un
 }
 
 /// Parse a single entry from the wopAddMultipleToStore reassembled byte stream.
+///
+/// Wire format (per Nix `Store::addMultipleToStore(Source &, ...)` in
+/// store-api.cc, called with protocol version 16):
+///   path: string
+///   deriver: string (empty if none)
+///   narHash: string (hex — `Hash::parseAny(.., SHA256)`)
+///   references: [string]
+///   registrationTime: u64
+///   narSize: u64
+///   ultimate: bool
+///   sigs: [string]
+///   ca: string (empty if none)
+///   NAR: narSize plain bytes (NOT framed — `addToStore(info, source)` reads
+///        narSize bytes directly from the already-framed outer stream)
 async fn parse_add_multiple_entry(
     cursor: &mut std::io::Cursor<&[u8]>,
     store_client: &mut StoreServiceClient<Channel>,
@@ -1250,10 +1264,30 @@ async fn parse_add_multiple_entry(
     let nar_hash_bytes = hex::decode(&nar_hash_str)
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': invalid narHash hex: {e}"))?;
 
-    // Read inner NAR data via framed stream
-    let nar_data = wire::read_framed_stream(cursor)
-        .await
-        .map_err(|e| anyhow::anyhow!("entry '{path_str}': failed to read inner NAR: {e}"))?;
+    // Read NAR data as narSize plain bytes (NOT a nested framed stream).
+    // The outer framed stream has already been reassembled; Nix's
+    // `addToStore(info, source)` reads narSize bytes directly.
+    if nar_size > rio_common::limits::MAX_NAR_SIZE {
+        return Err(anyhow::anyhow!(
+            "entry '{path_str}': nar_size {nar_size} exceeds MAX_NAR_SIZE {}",
+            rio_common::limits::MAX_NAR_SIZE
+        ));
+    }
+    let nar_size_usize = usize::try_from(nar_size)
+        .map_err(|_| anyhow::anyhow!("entry '{path_str}': nar_size {nar_size} overflows usize"))?;
+    let pos = cursor.position() as usize;
+    let buf = cursor.get_ref();
+    let end = pos.checked_add(nar_size_usize).ok_or_else(|| {
+        anyhow::anyhow!("entry '{path_str}': nar_size {nar_size} overflows offset")
+    })?;
+    if end > buf.len() {
+        return Err(anyhow::anyhow!(
+            "entry '{path_str}': truncated NAR (expected {nar_size} bytes, {} remaining)",
+            buf.len().saturating_sub(pos)
+        ));
+    }
+    let nar_data = buf[pos..end].to_vec();
+    cursor.set_position(end as u64);
 
     // Cache .drv before uploading
     try_cache_drv(&path, &nar_data, drv_cache);
@@ -1549,6 +1583,21 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
 }
 
 /// wopAddMultipleToStore (44): Receive multiple store paths via framed stream.
+///
+/// Wire format (per Nix `daemon.cc` case `AddMultipleToStore`):
+///   repair: bool
+///   dontCheckSigs: bool
+///   [framed stream (chunked, terminated by 0-length chunk):
+///     num_paths: u64      ← count prefix INSIDE the framed stream
+///     for i in 0..num_paths:
+///       ValidPathInfo (9 fields — see parse_add_multiple_entry)
+///       NAR data (narSize plain bytes, NOT nested-framed)
+///   ]
+///
+/// This was previously parsed WRONG (no count prefix, NAR read as nested
+/// framed). The bug was masked by a byte-level test written to match the
+/// buggy parser rather than the spec — caught by the VM test running real
+/// `nix copy --to ssh-ng://`.
 #[instrument(skip_all)]
 async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -1575,9 +1624,40 @@ async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpi
     };
 
     let mut cursor = std::io::Cursor::new(stream_data.as_slice());
-    let total_len = stream_data.len() as u64;
 
-    while cursor.position() < total_len {
+    // Count prefix: Nix `Store::addMultipleToStore(Source &)` reads this
+    // first (`readNum<uint64_t>(source)`) before the per-entry loop.
+    let num_paths = match wire::read_u64(&mut cursor).await {
+        Ok(n) => n,
+        Err(e) => {
+            stderr
+                .error(&StderrError::simple(
+                    PROGRAM_NAME,
+                    format!("wopAddMultipleToStore: missing num_paths prefix: {e}"),
+                ))
+                .await?;
+            return Err(anyhow::anyhow!("missing num_paths prefix: {e}"));
+        }
+    };
+    if num_paths > wire::MAX_COLLECTION_COUNT {
+        stderr
+            .error(&StderrError::simple(
+                PROGRAM_NAME,
+                format!(
+                    "wopAddMultipleToStore: num_paths {num_paths} exceeds MAX_COLLECTION_COUNT {}",
+                    wire::MAX_COLLECTION_COUNT
+                ),
+            ))
+            .await?;
+        return Err(anyhow::anyhow!("num_paths {num_paths} exceeds maximum"));
+    }
+
+    debug!(
+        num_paths = num_paths,
+        "wopAddMultipleToStore: processing entries"
+    );
+
+    for _ in 0..num_paths {
         if let Err(e) = parse_add_multiple_entry(&mut cursor, store_client, drv_cache).await {
             stderr
                 .error(&StderrError::simple(

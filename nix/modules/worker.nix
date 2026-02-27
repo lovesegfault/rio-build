@@ -102,8 +102,12 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
-      # nix-daemon --stdio must be on PATH.
-      path = [ config.nix.package ];
+      # nix-daemon --stdio must be on PATH. fuse3 provides fusermount3,
+      # required by the fuser crate's MountOption::AutoUnmount.
+      path = [
+        config.nix.package
+        pkgs.fuse3
+      ];
 
       environment = {
         RIO_SCHEDULER_ADDR = cfg.schedulerAddr;
@@ -121,11 +125,14 @@ in
 
       serviceConfig = {
         ExecStart = "${config.services.rio.package}/bin/rio-worker";
-        # CAP_SYS_ADMIN for: FUSE mount, overlayfs mount, CLONE_NEWNS + bind
-        # in executor pre_exec. Bounding set narrowed to this single cap.
-        AmbientCapabilities = [ "CAP_SYS_ADMIN" ];
-        CapabilityBoundingSet = [ "CAP_SYS_ADMIN" ];
-        # Allow opening /dev/fuse (device cgroup allowlist).
+        # The worker runs as root (no User=), so CAP_SYS_ADMIN is already
+        # available for FUSE mount, overlayfs, and CLONE_NEWNS in pre_exec.
+        # We do NOT narrow CapabilityBoundingSet: the spawned `nix-daemon
+        # --stdio` child inherits the bounding set, and its sandbox setup
+        # needs CAP_SETUID/SETGID (nixbld users), CAP_CHOWN (output ownership),
+        # CAP_SYS_CHROOT (sandbox chroot), CAP_MKNOD (/dev nodes), etc.
+        # Allow opening /dev/fuse (device cgroup allowlist; DevicePolicy=auto
+        # so pseudo-devices like /dev/null are always allowed).
         DeviceAllow = [ "/dev/fuse rw" ];
         # Worker connects to scheduler at startup; scheduler might not be
         # ready yet (remote host, no `After=` ordering across machines).
