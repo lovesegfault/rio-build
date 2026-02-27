@@ -173,7 +173,7 @@ impl SchedulerService for SchedulerGrpc {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break; // Build completed
+                        break; // Build terminal (sender dropped) or actor shut down
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(

@@ -451,6 +451,8 @@ impl DerivationDag {
     /// Derivations with no incomplete dependencies go to Queued, then
     /// immediately to Ready. Others stay in Created until they become Queued
     /// (when their dependencies complete).
+    /// Derivations whose dependency is already Poisoned/DependencyFailed go
+    /// directly to DependencyFailed (pre-poisoned detection).
     ///
     /// Returns lists of (drv_hash, new_status) transitions.
     pub fn compute_initial_states(
