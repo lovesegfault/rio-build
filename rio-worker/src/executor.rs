@@ -38,7 +38,7 @@ use rio_proto::types::{
 
 use crate::log_stream::LogBatcher;
 use crate::overlay;
-use crate::synth_db::{self, SynthPathInfo, path_info_to_synth};
+use crate::synth_db::{self, SynthDrvOutput, SynthPathInfo, path_info_to_synth};
 use crate::upload;
 
 /// Timeout for the daemon setup sequence (handshake + setOptions + send build).
@@ -149,22 +149,72 @@ pub async fn execute_build(
         Derivation::parse(&drv_text)
             .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))?
     };
-    let basic_drv = drv.to_basic();
 
-    // 3. Compute input closure. If scheduler sent input_paths, trust it;
-    // otherwise compute from the parsed derivation + store references.
-    // Phase 2a: scheduler sends input_paths=empty, so we always compute.
-    let input_paths: Vec<String> = if assignment.input_paths.is_empty() {
+    // Resolve inputDrv outputs → add to BasicDerivation's inputSrcs.
+    // `drv.to_basic()` only copies the static input_srcs (e.g., busybox);
+    // it does NOT resolve inputDrvs to their output paths. nix-daemon's
+    // sandbox only bind-mounts inputSrcs into the chroot, so without this
+    // the builder can't find its input derivations' outputs.
+    // Each inputDrv's .drv file is already in rio-store (uploaded by the
+    // gateway during SubmitBuild); fetch + parse to get output paths.
+    let mut resolved_input_srcs = drv.input_srcs().clone();
+    for (input_drv_path, output_names) in drv.input_drvs() {
+        let input_drv = fetch_drv_from_store(store_client, input_drv_path).await?;
+        for out in input_drv.outputs() {
+            if output_names.contains(out.name()) {
+                resolved_input_srcs.insert(out.path().to_string());
+            }
+        }
+    }
+    let basic_drv = rio_nix::derivation::BasicDerivation::new(
+        drv.outputs().to_vec(),
+        resolved_input_srcs.clone(),
+        drv.platform().to_string(),
+        drv.builder().to_string(),
+        drv.args().to_vec(),
+        drv.env().clone(),
+    )
+    .map_err(|e| ExecutorError::BuildFailed(format!("failed to build BasicDerivation: {e}")))?;
+
+    // 3. Compute input closure for the synthetic DB (ValidPaths table).
+    // Seed with resolved_input_srcs (includes inputDrv outputs, not just
+    // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
+    // compute_input_closure only seeds from drv.input_srcs() (static), so
+    // we merge the resolved set in.
+    let mut input_paths: Vec<String> = if assignment.input_paths.is_empty() {
         compute_input_closure(store_client, &drv, drv_path).await?
     } else {
         assignment.input_paths.clone()
     };
+    // Add resolved inputDrv outputs (their runtime closure is BFS'd via
+    // fetch_input_metadata's references, but they need to be in the seed
+    // set first). Dedup via set conversion.
+    {
+        let mut set: std::collections::HashSet<String> = input_paths.into_iter().collect();
+        set.extend(resolved_input_srcs.iter().cloned());
+        input_paths = set.into_iter().collect();
+    }
 
-    // 4. Fetch input path metadata and generate synthetic DB
+    // 4. Fetch input path metadata and generate synthetic DB.
+    // CRITICAL: populate DerivationOutputs so nix-daemon's
+    // queryPartialDerivationOutputMap(drvPath) returns our output paths.
+    // Without it, initialOutputs[out].known is None → nix-daemon builds at
+    // makeFallbackPath() (hash of "rewrite:<drvPath>:name:out" + zero hash),
+    // but the builder's $out (from BasicDerivation env) is the REAL path →
+    // output path mismatch → "builder failed to produce output path".
     let synth_paths = fetch_input_metadata(store_client, &input_paths).await?;
+    let drv_outputs: Vec<SynthDrvOutput> = drv
+        .outputs()
+        .iter()
+        .map(|o| SynthDrvOutput {
+            drv_path: drv_path.clone(),
+            output_name: o.name().to_string(),
+            output_path: o.path().to_string(),
+        })
+        .collect();
     let db_dir = overlay::prepare_nix_state_dirs(overlay_mount.upper_dir())?;
     let db_path = db_dir.join("db.sqlite");
-    synth_db::generate_db(&db_path, &synth_paths)
+    synth_db::generate_db(&db_path, &synth_paths, &drv_outputs)
         .await
         .map_err(|e| ExecutorError::SynthDb(e.to_string()))?;
 
