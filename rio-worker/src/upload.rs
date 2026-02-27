@@ -167,7 +167,11 @@ async fn do_upload(
         })),
     };
 
-    // Chunk the NAR data
+    // Chunk the NAR data.
+    // TODO(phase2b): lazy chunk stream instead of eager Vec. Current approach
+    // materializes all chunks upfront: 4GiB NAR → ~8GiB peak (nar_data +
+    // messages Vec); MAX_PARALLEL_UPLOADS=4 → 32GiB worst case. Defeats gRPC
+    // backpressure. Use stream::unfold or Arc<[u8]>-based lazy iterator.
     let mut messages = vec![metadata_msg];
     for chunk in nar_data.chunks(NAR_CHUNK_SIZE) {
         messages.push(PutPathRequest {

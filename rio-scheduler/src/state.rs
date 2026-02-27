@@ -362,6 +362,9 @@ impl DerivationState {
 
     /// Store path of the .drv file (read-only; DAG owns the reverse index).
     pub fn drv_path(&self) -> &str {
+        // TODO(phase2b): migrate drv_path to StorePath newtype. Currently
+        // String; validation only at gRPC boundary. StorePath exists in
+        // rio-nix and validates the /nix/store/{hash}-{name} format.
         &self.drv_path
     }
 

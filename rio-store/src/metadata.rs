@@ -329,6 +329,10 @@ impl NarinfoRow {
             nar_hash: self.nar_hash,
             nar_size: self.nar_size as u64,
             references: self.references,
+            // TODO(phase2c): persist registration_time/ultimate columns.
+            // Currently dropped (narinfo table doesn't have them); gateway
+            // returns 0/false which is observable via nix store --query but
+            // doesn't break clients.
             registration_time: 0,
             ultimate: false,
             signatures: self.signatures,
