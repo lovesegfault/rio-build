@@ -59,28 +59,6 @@ pub fn stat_to_attr(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     }
 }
 
-/// Build a synthetic `FileAttr` for a directory that exists in the store
-/// but hasn't been cached locally yet.
-pub fn synthetic_dir_attr(ino: u64) -> FileAttr {
-    FileAttr {
-        ino: INodeNo(ino),
-        size: 0,
-        blocks: 0,
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
-        ctime: UNIX_EPOCH,
-        crtime: UNIX_EPOCH,
-        kind: FileType::Directory,
-        perm: 0o555,
-        nlink: 2,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        blksize: BLOCK_SIZE,
-        flags: 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,13 +85,5 @@ mod tests {
         let attr = stat_to_attr(1, &meta);
 
         assert_eq!(attr.kind, FileType::Directory);
-    }
-
-    #[test]
-    fn test_synthetic_dir_attr() {
-        let attr = synthetic_dir_attr(10);
-        assert_eq!(attr.ino, INodeNo(10));
-        assert_eq!(attr.kind, FileType::Directory);
-        assert_eq!(attr.perm, 0o555);
     }
 }

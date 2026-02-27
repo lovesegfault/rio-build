@@ -32,10 +32,10 @@ use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
 use rio_proto::store::store_service_client::StoreServiceClient;
-use rio_proto::types::{GetPathRequest, QueryPathInfoRequest};
+use rio_proto::types::GetPathRequest;
 
 use self::cache::{Cache, FetchClaim};
-use self::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr, synthetic_dir_attr};
+use self::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr};
 use self::read::{io_error_to_errno, read_file_range};
 
 /// Bidirectional inode-to-path map with kernel lookup refcounting, protected
@@ -339,8 +339,14 @@ impl NixStoreFs {
             // stalls exhaust the FUSE thread pool and freeze the whole mount.
             let fetch_fut = async {
                 let response = client.get_path(request).await.map_err(|e| {
-                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
-                    Errno::EIO
+                    if e.code() == tonic::Code::NotFound {
+                        // Path not in remote store. lookup() probes unknown
+                        // names (.lock files, tmp paths); ENOENT is normal here.
+                        Errno::ENOENT
+                    } else {
+                        tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                        Errno::EIO
+                    }
                 })?;
 
                 let mut stream = response.into_inner();
@@ -454,50 +460,6 @@ impl NixStoreFs {
         }
 
         Ok(local_path)
-    }
-
-    /// Check if a store path exists in the remote store.
-    ///
-    /// Returns `Ok(true)` if found, `Ok(false)` if NOT_FOUND, `Err(EIO)` on
-    /// transport/server errors. Previously all errors mapped to `false`,
-    /// which made transient store outages look like missing paths.
-    fn query_path_exists(&self, store_basename: &str) -> Result<bool, Errno> {
-        let store_path = format!("/nix/store/{store_basename}");
-        self.runtime.block_on(async {
-            let mut client = self.store_client.clone();
-            let request = QueryPathInfoRequest {
-                store_path: store_path.clone(),
-            };
-            // Timeout: QueryPathInfo is called from lookup() for every
-            // top-level store path miss. A stalled store would block this
-            // FUSE thread forever; lookup is the most frequent FUSE op.
-            match tokio::time::timeout(
-                rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                client.query_path_info(request),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Ok(true),
-                Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(false),
-                Ok(Err(status)) => {
-                    tracing::warn!(
-                        store_path = %store_path,
-                        code = ?status.code(),
-                        error = %status.message(),
-                        "QueryPathInfo failed with non-NOT_FOUND error"
-                    );
-                    Err(Errno::EIO)
-                }
-                Err(_) => {
-                    tracing::error!(
-                        store_path = %store_path,
-                        timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                        "QueryPathInfo timed out"
-                    );
-                    Err(Errno::EIO)
-                }
-            }
-        })
     }
 }
 
@@ -623,20 +585,36 @@ impl Filesystem for NixStoreFs {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            match self.query_path_exists(&name_str) {
-                Ok(true) => {
-                    // Path exists remotely; create a synthetic directory entry.
-                    // The actual content will be fetched on open/read.
-                    let ino = self.get_or_create_inode_for_lookup(child_path);
-                    let attr = synthetic_dir_attr(ino);
-                    reply.entry(&ATTR_TTL, &attr, Generation(0));
-                    return;
-                }
-                Ok(false) => {
-                    // Not found — fall through to ENOENT
+            // Materialize on lookup. Previously this returned a synthetic
+            // dir attr ("exists, details later") with a 1-hour ATTR_TTL,
+            // deferring the actual NAR fetch to getattr/open/readdir. But
+            // the kernel caches the lookup attr and NEVER calls getattr —
+            // so `lookup(busybox_ino, "bin")` hit an empty cache_dir →
+            // ENOENT → build fails with OutputRejected. Fetching here
+            // ensures the whole tree is on disk before any child lookup.
+            match self.ensure_cached(&name_str) {
+                Ok(local_path) => match local_path.symlink_metadata() {
+                    Ok(meta) => {
+                        let ino = self.get_or_create_inode_for_lookup(child_path);
+                        let attr = stat_to_attr(ino, &meta);
+                        reply.entry(&ATTR_TTL, &attr, Generation(0));
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %local_path.display(),
+                            error = %e,
+                            "ensure_cached succeeded but stat failed"
+                        );
+                        reply.error(io_error_to_errno(&e));
+                        return;
+                    }
+                },
+                Err(errno) if i32::from(errno) == i32::from(Errno::ENOENT) => {
+                    // Not in remote store — fall through to final ENOENT reply.
                 }
                 Err(errno) => {
-                    // Transport/server error — surface as EIO, don't mask as ENOENT
+                    // Transport/server/extract error — surface it, don't mask as ENOENT.
                     reply.error(errno);
                     return;
                 }
