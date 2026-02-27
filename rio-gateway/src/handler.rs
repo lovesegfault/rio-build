@@ -887,7 +887,12 @@ async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// wopNarFromPath (38): Export path as NAR via STDERR_WRITE chunks.
+/// wopNarFromPath (38): Export path as raw NAR bytes AFTER STDERR_LAST.
+///
+/// Nix client: `processStderr(ex)` (no sink) → `copyNAR(from, sink)`.
+/// The stderr loop exits on STDERR_LAST; the NAR is read as raw bytes after.
+/// Previously this used STDERR_WRITE (like wopExportPaths), but narFromPath's
+/// client does NOT pass a sink to processStderr → 'error: no sink'.
 #[instrument(skip_all)]
 async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -904,14 +909,18 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             stderr
                 .error(&StderrError::simple(
                     PROGRAM_NAME,
-                    format!("invalid store path '{path_str}': {e}"),
+                    format!("invalid store path '{path_str}': {e}'"),
                 ))
                 .await?;
             return Err(anyhow::anyhow!("invalid store path '{path_str}': {e}"));
         }
     };
 
-    // Stream NAR from store via gRPC GetPath
+    // Fetch the FULL NAR before sending STDERR_LAST. We can't stream
+    // incrementally because a mid-stream gRPC error would leave the client's
+    // copyNAR() with a truncated NAR and no way to signal the error (it's
+    // already past the stderr loop). For Phase 2a this is acceptable; Phase 2b
+    // should add NAR framing (length-prefixed) or use wopExportPaths instead.
     let req = types::GetPathRequest {
         store_path: path.to_string(),
     };
@@ -939,32 +948,40 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
         };
 
-    // Stream NAR chunks via STDERR_WRITE. On mid-stream error, send
-    // STDERR_ERROR so the client gets a proper error instead of a partial
-    // NAR followed by connection drop.
+    let mut nar_data = Vec::new();
     loop {
         match stream.message().await {
             Ok(Some(msg)) => match msg.msg {
                 Some(types::get_path_response::Msg::NarChunk(chunk)) => {
-                    stderr.write_data(&chunk).await?;
+                    let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
+                    if new_len > rio_common::limits::MAX_NAR_SIZE {
+                        return send_store_error(
+                            stderr,
+                            anyhow::anyhow!(
+                                "NAR for {path_str} exceeds MAX_NAR_SIZE ({new_len} > {})",
+                                rio_common::limits::MAX_NAR_SIZE
+                            ),
+                        )
+                        .await;
+                    }
+                    nar_data.extend_from_slice(&chunk);
                 }
-                Some(types::get_path_response::Msg::Info(_)) => {
-                    // PathInfo in first message, skip for NAR streaming
-                }
+                Some(types::get_path_response::Msg::Info(_)) => {}
                 None => {}
             },
-            Ok(None) => break, // stream complete
+            Ok(None) => break,
             Err(e) => {
-                return send_store_error(
-                    stderr,
-                    anyhow::anyhow!("gRPC GetPath stream error mid-transfer: {e}"),
-                )
-                .await;
+                return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath stream error: {e}"))
+                    .await;
             }
         }
     }
 
+    // STDERR_LAST first, then raw NAR bytes. Client's copyNAR reads until
+    // the NAR's closing ')' sentinel — no length prefix.
     stderr.finish().await?;
+    let w = stderr.inner_mut();
+    tokio::io::AsyncWriteExt::write_all(w, &nar_data).await?;
     Ok(())
 }
 
