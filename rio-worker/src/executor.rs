@@ -96,7 +96,6 @@ pub struct ExecutionResult {
 /// This is the main entry point for building a derivation. It handles
 /// the full lifecycle: overlay setup, synthetic DB, daemon invocation,
 /// log streaming, output upload, and cleanup.
-#[allow(clippy::too_many_arguments)]
 pub async fn execute_build(
     assignment: &WorkAssignment,
     fuse_mount_point: &Path,
