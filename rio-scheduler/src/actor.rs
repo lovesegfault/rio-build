@@ -436,11 +436,6 @@ impl DagActor {
         }
     }
 
-    /// Check if the actor is under backpressure (shared hysteresis state).
-    pub fn is_backpressured(&self) -> bool {
-        self.backpressure_active.load(Ordering::Relaxed)
-    }
-
     /// Clone the shared backpressure flag as a read-only reader for wiring
     /// into ActorHandle. The actor keeps the writable Arc<AtomicBool>.
     pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
@@ -912,11 +907,12 @@ impl DagActor {
     // ProcessCompletion
     // -----------------------------------------------------------------------
 
-    #[instrument(skip(self, result), fields(worker_id = %worker_id, drv_hash = %drv_hash))]
+    #[instrument(skip(self, result), fields(worker_id = %worker_id, drv_key = %drv_key))]
     async fn handle_completion(
         &mut self,
         worker_id: &str,
-        drv_hash: &str,
+        // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
+        drv_key: &str,
         result: rio_proto::types::BuildResult,
     ) {
         let status =
@@ -928,19 +924,15 @@ impl DagActor {
                 rio_proto::types::BuildResultStatus::Unspecified
             });
 
-        // The gRPC layer passes CompletionReport.drv_path here (keyed by path,
-        // not hash). Resolve to drv_hash if the key isn't found directly.
+        // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
         let resolved_hash: String;
-        let drv_hash: &str = if self.dag.contains(drv_hash) {
-            drv_hash
-        } else if let Some(h) = self.drv_path_to_hash(drv_hash) {
+        let drv_hash: &str = if self.dag.contains(drv_key) {
+            drv_key
+        } else if let Some(h) = self.drv_path_to_hash(drv_key) {
             resolved_hash = h;
             &resolved_hash
         } else {
-            warn!(
-                key = drv_hash,
-                "completion for unknown derivation, ignoring"
-            );
+            warn!(key = drv_key, "completion for unknown derivation, ignoring");
             return;
         };
 
@@ -1141,7 +1133,7 @@ impl DagActor {
         // Update build completion status
         for build_id in &interested_builds {
             self.update_build_counts(*build_id);
-            self.check_build_completion(*build_id, worker_id).await;
+            self.check_build_completion(*build_id).await;
         }
     }
 
@@ -1389,7 +1381,7 @@ impl DagActor {
             }
         } else {
             // keepGoing: check if all derivations are resolved
-            self.check_build_completion(build_id, "").await;
+            self.check_build_completion(build_id).await;
         }
     }
 
@@ -1464,16 +1456,7 @@ impl DagActor {
         let worker = self
             .workers
             .entry(worker_id.clone())
-            .or_insert_with(|| WorkerState {
-                worker_id: worker_id.clone(),
-                system: None,
-                supported_features: Vec::new(),
-                max_builds: 0,
-                running_builds: Default::default(),
-                stream_tx: None,
-                last_heartbeat: Instant::now(),
-                missed_heartbeats: 0,
-            });
+            .or_insert_with(|| WorkerState::new(worker_id.clone()));
 
         let was_registered = worker.is_registered();
         worker.stream_tx = Some(stream_tx);
@@ -1582,16 +1565,7 @@ impl DagActor {
         let worker = self
             .workers
             .entry(worker_id.clone())
-            .or_insert_with(|| WorkerState {
-                worker_id: worker_id.clone(),
-                system: None,
-                supported_features: Vec::new(),
-                max_builds: 0,
-                running_builds: Default::default(),
-                stream_tx: None,
-                last_heartbeat: Instant::now(),
-                missed_heartbeats: 0,
-            });
+            .or_insert_with(|| WorkerState::new(worker_id.clone()));
 
         let was_registered = worker.is_registered();
 
@@ -2073,7 +2047,7 @@ impl DagActor {
         }
     }
 
-    async fn check_build_completion(&mut self, build_id: Uuid, _worker_id: &str) {
+    async fn check_build_completion(&mut self, build_id: Uuid) {
         let (state, keep_going, total, completed, failed) = match self.builds.get(&build_id) {
             Some(b) => (
                 b.state(),

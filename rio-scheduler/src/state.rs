@@ -542,6 +542,22 @@ pub struct WorkerState {
 }
 
 impl WorkerState {
+    /// Create an unregistered worker entry. Registration completes when both
+    /// a BuildExecution stream connects (sets `stream_tx`) and a heartbeat
+    /// arrives (sets `system`/`max_builds`).
+    pub fn new(worker_id: String) -> Self {
+        Self {
+            worker_id,
+            system: None,
+            supported_features: Vec::new(),
+            max_builds: 0,
+            running_builds: HashSet::new(),
+            stream_tx: None,
+            last_heartbeat: Instant::now(),
+            missed_heartbeats: 0,
+        }
+    }
+
     /// Whether we have received both a stream connection and a heartbeat.
     /// Derived from `stream_tx.is_some() && system.is_some()` — no manual
     /// bookkeeping, so the two channels can't get out of sync.
