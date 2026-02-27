@@ -2009,6 +2009,9 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
             submit_and_process_build(stderr, scheduler_client, request, active_build_ids)
                 .await
                 .unwrap_or_else(|e| {
+                    warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
+                    metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
+                        .increment(1);
                     BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
                 });
 
