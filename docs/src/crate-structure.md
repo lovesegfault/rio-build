@@ -87,9 +87,6 @@ rio-build/
 │   │   └── hash.rs                # Nix hash types
 │   └── Cargo.toml                 # No external Nix deps
 │
-├── rio-spike/                    # Phase 1a FUSE+overlay spike/prototype (not shipped)
-│   └── src/                      # Validation benchmarks for FUSE, overlay, sandbox chain
-│
 ├── rio-store/                     # Chunked content-addressable store
 │   ├── src/
 │   │   ├── lib.rs

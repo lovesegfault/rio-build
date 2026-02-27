@@ -226,67 +226,7 @@
           };
 
           # Packages
-          packages = {
-            default = rio-workspace;
-
-            # OCI image for the FUSE+overlay+sandbox spike
-            # Build: nix build .#spike-image
-            # Load: docker load < result
-            spike-image = pkgs.dockerTools.buildLayeredImage {
-              name = "rio-spike";
-              tag = "latest";
-              maxLayers = 50;
-
-              # Create /tmp and /nix/var directories (not included by default in Nix images)
-              extraCommands = ''
-                mkdir -p tmp var/rio nix/var/nix/db etc/nix
-                chmod 1777 tmp
-                cat > etc/nix/nix.conf <<NIXCONF
-                experimental-features = nix-command flakes
-                sandbox = true
-                sandbox-fallback = false
-                substitute = false
-                build-users-group = # empty: build as current user (no nixbld group in container)
-                NIXCONF
-              '';
-
-              contents = with pkgs; [
-                # The rio-spike binary
-                rio-workspace
-
-                # Nix tooling (nix-store, nix-build, nix path-info)
-                nix
-
-                # Test data: hello and its closure (pre-populated in /nix/store)
-                hello
-
-                # Runtime essentials
-                coreutils
-                bashInteractive
-                fuse3
-
-                # Needed by overlay/sandbox validation
-                util-linux # mount, umount
-                gnugrep
-                findutils
-
-                # CA certificates for potential network access
-                cacert
-              ];
-
-              config = {
-                Cmd = [
-                  "rio-spike"
-                  "validate"
-                  "--all"
-                ];
-                Env = [
-                  "RUST_LOG=info"
-                  "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-                ];
-              };
-            };
-          };
+          packages.default = rio-workspace;
 
           # Checks (run with 'nix flake check')
           checks = {
