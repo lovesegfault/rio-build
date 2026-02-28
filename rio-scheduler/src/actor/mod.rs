@@ -21,8 +21,9 @@ use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
 use crate::queue::ReadyQueue;
 use crate::state::{
-    BuildInfo, BuildOptions, BuildState, DerivationStatus, HEARTBEAT_TIMEOUT_SECS,
-    MAX_MISSED_HEARTBEATS, POISON_THRESHOLD, POISON_TTL, PriorityClass, RetryPolicy, WorkerState,
+    BuildInfo, BuildOptions, BuildState, DerivationStatus, DrvHash, HEARTBEAT_TIMEOUT_SECS,
+    MAX_MISSED_HEARTBEATS, POISON_THRESHOLD, POISON_TTL, PriorityClass, RetryPolicy, WorkerId,
+    WorkerState,
 };
 
 /// Channel capacity for the actor command channel.
@@ -59,8 +60,10 @@ pub enum ActorCommand {
 
     /// Process a completion report from a worker.
     ProcessCompletion {
-        worker_id: String,
-        drv_hash: String,
+        worker_id: WorkerId,
+        /// Either a drv_hash OR a full drv_path — handle_completion resolves both.
+        /// Workers send drv_path; tests sometimes send drv_hash directly.
+        drv_key: String,
         result: rio_proto::types::BuildResult,
     },
 
@@ -73,19 +76,20 @@ pub enum ActorCommand {
 
     /// A worker opened a BuildExecution stream.
     WorkerConnected {
-        worker_id: String,
+        worker_id: WorkerId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
     },
 
     /// A worker's BuildExecution stream closed.
-    WorkerDisconnected { worker_id: String },
+    WorkerDisconnected { worker_id: WorkerId },
 
     /// Periodic heartbeat from a worker.
     Heartbeat {
-        worker_id: String,
+        worker_id: WorkerId,
         system: String,
         supported_features: Vec<String>,
         max_builds: u32,
+        /// drv_paths from worker proto (not hashes).
         running_builds: Vec<String>,
     },
 
@@ -205,7 +209,7 @@ pub struct DagActor {
     /// Per-build sequence counters.
     build_sequences: HashMap<Uuid, u64>,
     /// Connected workers.
-    workers: HashMap<String, WorkerState>,
+    workers: HashMap<WorkerId, WorkerState>,
     /// Retry policy.
     retry_policy: RetryPolicy,
     /// Database handle.
@@ -316,10 +320,10 @@ impl DagActor {
                 }
                 ActorCommand::ProcessCompletion {
                     worker_id,
-                    drv_hash,
+                    drv_key,
                     result,
                 } => {
-                    self.handle_completion(&worker_id, &drv_hash, result).await;
+                    self.handle_completion(&worker_id, &drv_key, result).await;
                 }
                 ActorCommand::CancelBuild {
                     build_id,
@@ -383,11 +387,15 @@ impl DagActor {
                         .workers
                         .values()
                         .map(|w| DebugWorkerInfo {
-                            worker_id: w.worker_id.clone(),
+                            worker_id: w.worker_id.to_string(),
                             is_registered: w.is_registered(),
                             system: w.system.clone(),
                             running_count: w.running_builds.len(),
-                            running_builds: w.running_builds.iter().cloned().collect(),
+                            running_builds: w
+                                .running_builds
+                                .iter()
+                                .map(|h| h.to_string())
+                                .collect(),
                         })
                         .collect();
                     let _ = reply.send(workers);
@@ -395,11 +403,11 @@ impl DagActor {
                 #[cfg(test)]
                 ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
                     let info = self.dag.node(&drv_hash).map(|s| DebugDerivationInfo {
-                        drv_hash: s.drv_hash.clone(),
+                        drv_hash: s.drv_hash.to_string(),
                         drv_path: s.drv_path().to_string(),
                         status: s.status(),
                         retry_count: s.retry_count,
-                        assigned_worker: s.assigned_worker.clone(),
+                        assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),
                         output_paths: s.output_paths.clone(),
                     });
                     let _ = reply.send(info);
@@ -488,8 +496,8 @@ impl DagActor {
     /// Resolve a drv_path to its drv_hash via the DAG's reverse index.
     /// Used by handle_completion since the gRPC layer receives CompletionReport
     /// with drv_path, but the DAG is keyed by drv_hash.
-    fn drv_path_to_hash(&self, drv_path: &str) -> Option<String> {
-        self.dag.hash_for_path(drv_path).map(str::to_string)
+    fn drv_path_to_hash(&self, drv_path: &str) -> Option<DrvHash> {
+        self.dag.hash_for_path(drv_path).cloned()
     }
 
     fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {

@@ -379,7 +379,7 @@ impl WorkerService for SchedulerGrpc {
         // Register the worker stream with the actor (blocking send — must not drop).
         self.actor
             .send_unchecked(ActorCommand::WorkerConnected {
-                worker_id: worker_id.clone(),
+                worker_id: worker_id.clone().into(),
                 stream_tx: actor_tx,
             })
             .await
@@ -451,8 +451,8 @@ impl WorkerService for SchedulerGrpc {
                             // leave the derivation stuck in Running.
                             if actor_for_recv
                                 .send_unchecked(ActorCommand::ProcessCompletion {
-                                    worker_id: worker_id_for_recv.clone(),
-                                    drv_hash: drv_path,
+                                    worker_id: worker_id_for_recv.clone().into(),
+                                    drv_key: drv_path,
                                     result,
                                 })
                                 .await
@@ -480,7 +480,7 @@ impl WorkerService for SchedulerGrpc {
             // reassigned and will hang forever.
             if actor_for_recv
                 .send_unchecked(ActorCommand::WorkerDisconnected {
-                    worker_id: worker_id_for_recv,
+                    worker_id: worker_id_for_recv.into(),
                 })
                 .await
                 .is_err()
@@ -526,7 +526,7 @@ impl WorkerService for SchedulerGrpc {
         }
 
         let cmd = ActorCommand::Heartbeat {
-            worker_id: req.worker_id,
+            worker_id: req.worker_id.into(),
             system: req.system,
             supported_features: req.supported_features,
             max_builds: req.max_builds,

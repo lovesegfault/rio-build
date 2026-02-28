@@ -66,9 +66,29 @@ impl std::borrow::Borrow<str> for DrvHash {
         &self.0
     }
 }
+impl std::borrow::Borrow<String> for DrvHash {
+    fn borrow(&self) -> &String {
+        &self.0
+    }
+}
 impl AsRef<str> for DrvHash {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+impl PartialEq<str> for DrvHash {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+impl PartialEq<&str> for DrvHash {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+impl PartialEq<String> for DrvHash {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
     }
 }
 
@@ -111,6 +131,11 @@ impl std::ops::Deref for WorkerId {
 }
 impl std::borrow::Borrow<str> for WorkerId {
     fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+impl std::borrow::Borrow<String> for WorkerId {
+    fn borrow(&self) -> &String {
         &self.0
     }
 }
@@ -398,7 +423,7 @@ pub enum TransitionError {
 #[derive(Debug, Clone)]
 pub struct DerivationState {
     /// Unique hash identifying this derivation (store path for input-addressed, modular hash for CA).
-    pub drv_hash: String,
+    pub drv_hash: DrvHash,
     /// Store path of the .drv file. Private because the DAG maintains a
     /// `path_to_hash` reverse index keyed on this field — mutating it
     /// directly would silently corrupt that index. Read via `drv_path()`.
@@ -419,11 +444,11 @@ pub struct DerivationState {
     /// Set of build IDs interested in this derivation.
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
-    pub assigned_worker: Option<String>,
+    pub assigned_worker: Option<WorkerId>,
     /// Number of retry attempts so far.
     pub retry_count: u32,
     /// Workers that have failed building this derivation (for poison tracking).
-    pub failed_workers: HashSet<String>,
+    pub failed_workers: HashSet<WorkerId>,
     /// When the derivation entered the poisoned state (for TTL expiry).
     pub poisoned_at: Option<Instant>,
     /// Realized output store paths (filled on completion).
@@ -438,7 +463,7 @@ impl DerivationState {
     /// Create a new derivation state from a proto DerivationNode.
     pub fn from_node(node: &rio_proto::types::DerivationNode) -> Self {
         Self {
-            drv_hash: node.drv_hash.clone(),
+            drv_hash: node.drv_hash.clone().into(),
             drv_path: node.drv_path.clone(),
             pname: if node.pname.is_empty() {
                 None
@@ -559,7 +584,7 @@ pub struct BuildInfo {
     /// Build options propagated from the client.
     pub options: BuildOptions,
     /// All derivation hashes involved in this build.
-    pub derivation_hashes: HashSet<String>,
+    pub derivation_hashes: HashSet<DrvHash>,
     /// Number of derivations that are completed (including cache hits).
     pub completed_count: u32,
     /// Number of derivations that are cached.
@@ -582,7 +607,7 @@ impl BuildInfo {
         priority_class: PriorityClass,
         keep_going: bool,
         options: BuildOptions,
-        derivation_hashes: HashSet<String>,
+        derivation_hashes: HashSet<DrvHash>,
     ) -> Self {
         Self {
             build_id,
@@ -629,7 +654,7 @@ pub struct BuildOptions {
 #[derive(Debug)]
 pub struct WorkerState {
     /// Unique worker ID (from pod UID).
-    pub worker_id: String,
+    pub worker_id: WorkerId,
     /// Target system (e.g. "x86_64-linux"). Set on first heartbeat.
     pub system: Option<String>,
     /// Features this worker supports.
@@ -637,7 +662,7 @@ pub struct WorkerState {
     /// Maximum concurrent builds.
     pub max_builds: u32,
     /// Derivation hashes currently being built by this worker.
-    pub running_builds: HashSet<String>,
+    pub running_builds: HashSet<DrvHash>,
     /// Channel to send scheduler messages (assignments, cancels) to the worker.
     /// Set when the BuildExecution stream opens.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<rio_proto::types::SchedulerMessage>>,
@@ -651,7 +676,7 @@ impl WorkerState {
     /// Create an unregistered worker entry. Registration completes when both
     /// a BuildExecution stream connects (sets `stream_tx`) and a heartbeat
     /// arrives (sets `system`/`max_builds`).
-    pub fn new(worker_id: String) -> Self {
+    pub fn new(worker_id: WorkerId) -> Self {
         Self {
             worker_id,
             system: None,

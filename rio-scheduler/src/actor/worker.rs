@@ -9,7 +9,7 @@ impl DagActor {
 
     pub(super) fn handle_worker_connected(
         &mut self,
-        worker_id: String,
+        worker_id: WorkerId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
     ) {
         info!(worker_id = %worker_id, "worker stream connected");
@@ -23,7 +23,7 @@ impl DagActor {
         worker.stream_tx = Some(stream_tx);
 
         if !was_registered && worker.is_registered() {
-            info!(worker_id, "worker fully registered (stream + heartbeat)");
+            info!(worker_id = %worker_id, "worker fully registered (stream + heartbeat)");
         }
     }
 
@@ -46,7 +46,7 @@ impl DagActor {
             if let Some(state) = self.dag.node_mut(drv_hash.as_str()) {
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
-                        drv_hash, error = %e,
+                        drv_hash = %drv_hash, error = %e,
                         "invalid state for worker-lost recovery, skipping"
                     );
                     continue;
@@ -54,14 +54,14 @@ impl DagActor {
                 // Worker disconnect during build is a failed attempt: count it.
                 state.retry_count += 1;
                 if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                    error!(drv_hash, error = %e, "failed to persist retry increment");
+                    error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
                 }
                 if let Err(e) = self
                     .db
                     .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
                     .await
                 {
-                    error!(drv_hash, error = %e, "failed to persist Ready status");
+                    error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status");
                 }
                 self.ready_queue.push_back(drv_hash.clone());
             }
@@ -74,11 +74,11 @@ impl DagActor {
 
     pub(super) fn handle_heartbeat(
         &mut self,
-        worker_id: String,
+        worker_id: WorkerId,
         system: String,
         supported_features: Vec<String>,
         max_builds: u32,
-        running_builds: Vec<String>,
+        running_builds: Vec<String>, // drv_paths from worker proto
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -88,17 +88,23 @@ impl DagActor {
         //     (shouldn't happen; indicates split-brain or restart).
         //   - Remove builds absent from heartbeat only if DAG state is no
         //     longer Assigned/Running (completion already processed).
-        let heartbeat_set: HashSet<String> = running_builds.into_iter().collect();
+        // Worker reports drv_paths; resolve to drv_hashes via the DAG index.
+        // Unknown paths (not in DAG) are silently dropped — they indicate
+        // split-brain or a stale heartbeat after scheduler restart.
+        let heartbeat_set: HashSet<DrvHash> = running_builds
+            .into_iter()
+            .filter_map(|path| self.dag.hash_for_path(&path).cloned())
+            .collect();
 
         // Compute the reconciled running set before borrowing `worker` mutably,
         // so we can read self.dag for derivation state checks.
-        let prev_running: HashSet<String> = self
+        let prev_running: HashSet<DrvHash> = self
             .workers
-            .get(&worker_id)
+            .get(worker_id.as_str())
             .map(|w| w.running_builds.clone())
             .unwrap_or_default();
 
-        let mut reconciled: HashSet<String> = HashSet::new();
+        let mut reconciled: HashSet<DrvHash> = HashSet::new();
         // Keep scheduler-assigned builds that are still in-flight.
         for drv_hash in &prev_running {
             let still_inflight = self.dag.node(drv_hash).is_some_and(|s| {
@@ -116,7 +122,7 @@ impl DagActor {
             if !reconciled.contains(drv_hash) && !prev_running.contains(drv_hash) {
                 warn!(
                     worker_id = %worker_id,
-                    drv_hash,
+                    drv_hash = %drv_hash,
                     "heartbeat reports running build scheduler did not assign"
                 );
                 reconciled.insert(drv_hash.clone());
@@ -138,7 +144,7 @@ impl DagActor {
         worker.running_builds = reconciled;
 
         if !was_registered && worker.is_registered() {
-            info!(worker_id, "worker fully registered (heartbeat + stream)");
+            info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
         }
     }
@@ -163,7 +169,7 @@ impl DagActor {
         }
 
         for worker_id in timed_out_workers {
-            warn!(worker_id, "worker timed out (missed heartbeats)");
+            warn!(worker_id = %worker_id, "worker timed out (missed heartbeats)");
             self.handle_worker_disconnected(&worker_id).await;
         }
 

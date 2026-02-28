@@ -5,6 +5,8 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use crate::state::DrvHash;
+
 /// A FIFO queue of derivation hashes that are ready to be assigned to workers.
 ///
 /// Maintains a companion `HashSet` for O(1) membership checks: the
@@ -15,10 +17,10 @@ use std::collections::{HashSet, VecDeque};
 #[derive(Debug)]
 pub struct ReadyQueue {
     /// The queue itself. Front is highest priority.
-    queue: VecDeque<String>,
+    queue: VecDeque<DrvHash>,
     /// Membership index for O(1) dedup. Invariant: `members` contains
     /// exactly the elements of `queue`.
-    members: HashSet<String>,
+    members: HashSet<DrvHash>,
 }
 
 impl ReadyQueue {
@@ -32,7 +34,7 @@ impl ReadyQueue {
 
     /// Push a derivation hash to the back of the queue (normal priority).
     /// O(1) average (HashSet membership check + insert).
-    pub fn push_back(&mut self, drv_hash: String) {
+    pub fn push_back(&mut self, drv_hash: DrvHash) {
         if self.members.insert(drv_hash.clone()) {
             self.queue.push_back(drv_hash);
         }
@@ -41,7 +43,7 @@ impl ReadyQueue {
     /// Push a derivation hash to the front of the queue (IFD priority).
     /// O(1) for new items; O(n) for move-to-front (rare: IFD re-prioritization
     /// of already-queued item).
-    pub fn push_front(&mut self, drv_hash: String) {
+    pub fn push_front(&mut self, drv_hash: DrvHash) {
         if self.members.insert(drv_hash.clone()) {
             // New item: just push to front.
             self.queue.push_front(drv_hash);
@@ -57,9 +59,9 @@ impl ReadyQueue {
 
     /// Pop the next ready derivation hash from the front of the queue.
     /// O(1) average.
-    pub fn pop_front(&mut self) -> Option<String> {
+    pub fn pop_front(&mut self) -> Option<DrvHash> {
         let h = self.queue.pop_front()?;
-        self.members.remove(&h);
+        self.members.remove(h.as_str());
         Some(h)
     }
 
@@ -73,7 +75,7 @@ impl ReadyQueue {
     /// present case (VecDeque position scan).
     pub fn remove(&mut self, drv_hash: &str) -> bool {
         if self.members.remove(drv_hash) {
-            if let Some(pos) = self.queue.iter().position(|h| h == drv_hash) {
+            if let Some(pos) = self.queue.iter().position(|h| h.as_str() == drv_hash) {
                 self.queue.remove(pos);
             }
             true
@@ -98,7 +100,7 @@ impl ReadyQueue {
     }
 
     /// Drain all items from the queue.
-    pub fn drain(&mut self) -> impl Iterator<Item = String> + '_ {
+    pub fn drain(&mut self) -> impl Iterator<Item = DrvHash> + '_ {
         self.members.clear();
         self.queue.drain(..)
     }
@@ -122,54 +124,54 @@ mod tests {
     #[test]
     fn test_fifo_order() {
         let mut q = ReadyQueue::new();
-        q.push_back("a".to_string());
-        q.push_back("b".to_string());
-        q.push_back("c".to_string());
+        q.push_back("a".into());
+        q.push_back("b".into());
+        q.push_back("c".into());
 
-        assert_eq!(q.pop_front(), Some("a".to_string()));
-        assert_eq!(q.pop_front(), Some("b".to_string()));
-        assert_eq!(q.pop_front(), Some("c".to_string()));
+        assert_eq!(q.pop_front(), Some("a".into()));
+        assert_eq!(q.pop_front(), Some("b".into()));
+        assert_eq!(q.pop_front(), Some("c".into()));
         assert_eq!(q.pop_front(), None);
     }
 
     #[test]
     fn test_ifd_priority() {
         let mut q = ReadyQueue::new();
-        q.push_back("normal1".to_string());
-        q.push_back("normal2".to_string());
-        q.push_front("ifd".to_string());
+        q.push_back("normal1".into());
+        q.push_back("normal2".into());
+        q.push_front("ifd".into());
 
-        assert_eq!(q.pop_front(), Some("ifd".to_string()));
-        assert_eq!(q.pop_front(), Some("normal1".to_string()));
-        assert_eq!(q.pop_front(), Some("normal2".to_string()));
+        assert_eq!(q.pop_front(), Some("ifd".into()));
+        assert_eq!(q.pop_front(), Some("normal1".into()));
+        assert_eq!(q.pop_front(), Some("normal2".into()));
     }
 
     #[test]
     fn test_no_duplicates() {
         let mut q = ReadyQueue::new();
-        q.push_back("a".to_string());
-        q.push_back("a".to_string()); // duplicate
+        q.push_back("a".into());
+        q.push_back("a".into()); // duplicate
         assert_eq!(q.len(), 1);
 
-        q.push_back("b".to_string());
-        q.push_front("b".to_string()); // moves b to front
+        q.push_back("b".into());
+        q.push_front("b".into()); // moves b to front
         assert_eq!(q.len(), 2);
-        assert_eq!(q.pop_front(), Some("b".to_string()));
-        assert_eq!(q.pop_front(), Some("a".to_string()));
+        assert_eq!(q.pop_front(), Some("b".into()));
+        assert_eq!(q.pop_front(), Some("a".into()));
     }
 
     #[test]
     fn test_remove() {
         let mut q = ReadyQueue::new();
-        q.push_back("a".to_string());
-        q.push_back("b".to_string());
-        q.push_back("c".to_string());
+        q.push_back("a".into());
+        q.push_back("b".into());
+        q.push_back("c".into());
 
         assert!(q.remove("b"));
         assert!(!q.remove("b")); // already removed
         assert_eq!(q.len(), 2);
-        assert_eq!(q.pop_front(), Some("a".to_string()));
-        assert_eq!(q.pop_front(), Some("c".to_string()));
+        assert_eq!(q.pop_front(), Some("a".into()));
+        assert_eq!(q.pop_front(), Some("c".into()));
     }
 
     /// Stress test: 10k pushes of the same key should never duplicate
@@ -179,13 +181,13 @@ mod tests {
         let mut q = ReadyQueue::new();
         for i in 0..10_000 {
             if i % 2 == 0 {
-                q.push_back("same".to_string());
+                q.push_back("same".into());
             } else {
-                q.push_front("same".to_string());
+                q.push_front("same".into());
             }
         }
         assert_eq!(q.len(), 1);
-        assert_eq!(q.pop_front(), Some("same".to_string()));
+        assert_eq!(q.pop_front(), Some("same".into()));
         assert!(q.is_empty());
     }
 
@@ -195,7 +197,7 @@ mod tests {
     fn test_queue_members_invariant_stress() {
         let mut q = ReadyQueue::new();
         for i in 0..10_000 {
-            q.push_back(format!("item{i}"));
+            q.push_back(format!("item{i}").into());
         }
         assert_eq!(q.len(), 10_000);
 
