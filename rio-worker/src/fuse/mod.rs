@@ -32,7 +32,6 @@ use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
 use rio_proto::store::store_service_client::StoreServiceClient;
-use rio_proto::types::GetPathRequest;
 
 use self::cache::{Cache, FetchClaim};
 use self::lookup::{ATTR_TTL, BLOCK_SIZE, stat_to_attr};
@@ -331,68 +330,42 @@ impl NixStoreFs {
 
         tracing::debug!(store_path = %store_path, "fetching from remote store");
 
-        // Fetch NAR data via gRPC (async bridged to sync)
+        // Fetch NAR data via gRPC (async bridged to sync). Timeout bounds the
+        // entire fetch (initial call + stream drain) — a stalled store would
+        // otherwise block this FUSE thread forever, and a few stalls exhaust
+        // the FUSE thread pool and freeze the whole mount.
         let fetch_start = std::time::Instant::now();
         let nar_data = self.runtime.block_on(async {
             let mut client = self.store_client.clone();
-            let request = GetPathRequest {
-                store_path: store_path.clone(),
-            };
-
-            // Timeout the entire fetch (initial call + stream drain). A stalled
-            // store would otherwise block this FUSE thread forever; a few
-            // stalls exhaust the FUSE thread pool and freeze the whole mount.
-            let fetch_fut = async {
-                let response = client.get_path(request).await.map_err(|e| {
-                    if e.code() == tonic::Code::NotFound {
-                        // Path not in remote store. lookup() probes unknown
-                        // names (.lock files, tmp paths); ENOENT is normal here.
-                        Errno::ENOENT
-                    } else {
-                        tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
-                        Errno::EIO
-                    }
-                })?;
-
-                let mut stream = response.into_inner();
-                let (_info, nar_bytes) = rio_proto::client::collect_nar_stream(
-                    &mut stream,
-                    rio_common::limits::MAX_NAR_SIZE,
-                )
-                .await
-                .map_err(|e| match e {
-                    rio_proto::client::NarCollectError::SizeExceeded { got, limit } => {
-                        tracing::error!(
-                            store_path = %store_path,
-                            size = got,
-                            limit,
-                            "NAR exceeds MAX_NAR_SIZE"
-                        );
-                        Errno::EFBIG
-                    }
-                    rio_proto::client::NarCollectError::Stream(status) => {
-                        tracing::warn!(
-                            store_path = %store_path,
-                            error = %status,
-                            "GetPath stream error"
-                        );
-                        Errno::EIO
-                    }
-                })?;
-
-                Ok::<Vec<u8>, Errno>(nar_bytes)
-            };
-
-            tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, fetch_fut)
-                .await
-                .map_err(|_| {
+            match rio_proto::client::get_path_nar(
+                &mut client,
+                &store_path,
+                rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                rio_common::limits::MAX_NAR_SIZE,
+            )
+            .await
+            {
+                Ok(Some((_info, nar))) => Ok(nar),
+                Ok(None) => {
+                    // Path not in remote store. lookup() probes unknown names
+                    // (.lock files, tmp paths); ENOENT is normal here.
+                    Err(Errno::ENOENT)
+                }
+                Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
                     tracing::error!(
                         store_path = %store_path,
-                        timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
-                        "GetPath timed out; FUSE thread would block indefinitely without this"
+                        size = got,
+                        limit,
+                        "NAR exceeds MAX_NAR_SIZE"
                     );
-                    Errno::EIO
-                })?
+                    Err(Errno::EFBIG)
+                }
+                Err(e) if e.is_not_found() => Err(Errno::ENOENT),
+                Err(e) => {
+                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                    Err(Errno::EIO)
+                }
+            }
         })?;
         metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
             .record(fetch_start.elapsed().as_secs_f64());

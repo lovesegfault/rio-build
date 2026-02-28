@@ -33,8 +33,8 @@ use rio_nix::protocol::client::{
 use rio_nix::protocol::wire;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
-    BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, GetPathRequest,
-    QueryPathInfoRequest, WorkAssignment, WorkerMessage, worker_message,
+    BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, WorkAssignment, WorkerMessage,
+    worker_message,
 };
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
@@ -818,24 +818,23 @@ async fn fetch_input_metadata(
         .map(|path| {
             let mut client = store_client.clone();
             async move {
-                let request = QueryPathInfoRequest {
-                    store_path: path.clone(),
-                };
-                match rio_common::grpc::with_timeout_status(
-                    "QueryPathInfo",
+                match rio_proto::client::query_path_info_opt(
+                    &mut client,
+                    &path,
                     rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                    client.query_path_info(request),
                 )
                 .await
                 {
-                    Ok(response) => Ok(path_info_to_synth(&response.into_inner())),
-                    Err(e) => {
+                    Ok(Some(info)) => Ok(path_info_to_synth(&info)),
+                    Ok(None) | Err(_) => {
                         tracing::warn!(
                             path = %path,
-                            error = %e,
-                            "failed to fetch input path metadata"
+                            "failed to fetch input path metadata (not found or error)"
                         );
-                        Err(ExecutorError::MetadataFetch { path, source: e })
+                        Err(ExecutorError::MetadataFetch {
+                            path,
+                            source: tonic::Status::not_found("path missing from store"),
+                        })
                     }
                 }
             }
@@ -856,39 +855,26 @@ async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
 ) -> Result<Derivation, ExecutorError> {
-    // Wrap in GRPC_STREAM_TIMEOUT: this is the first gRPC call after
-    // setup_overlay, so a stalled store would hang the build with an overlay
-    // mount held indefinitely. .drv files are small (KB range), so the
-    // stream timeout is generous.
-    let nar_data = tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, async {
-        let req = GetPathRequest {
-            store_path: drv_path.to_string(),
-        };
-        let mut stream = store_client
-            .get_path(req)
-            .await
-            .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) failed: {e}")))?
-            .into_inner();
-
-        let (_info, nar_data) =
-            rio_proto::client::collect_nar_stream(&mut stream, rio_common::limits::MAX_NAR_SIZE)
-                .await
-                .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}): {e}")))?;
-        Ok::<Vec<u8>, ExecutorError>(nar_data)
-    })
+    // .drv files are small (KB range), but wrap in stream timeout: this is
+    // the first gRPC call after setup_overlay, so a stalled store would hang
+    // the build with an overlay mount held indefinitely.
+    let result = rio_proto::client::get_path_nar(
+        store_client,
+        drv_path,
+        rio_common::grpc::GRPC_STREAM_TIMEOUT,
+        rio_common::limits::MAX_NAR_SIZE,
+    )
     .await
-    .map_err(|_| {
-        ExecutorError::BuildFailed(format!(
-            "GetPath({drv_path}) timed out after {:?} (store unreachable?)",
-            rio_common::grpc::GRPC_STREAM_TIMEOUT
-        ))
-    })??;
+    .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}): {e}")))?;
 
-    if nar_data.is_empty() {
-        return Err(ExecutorError::BuildFailed(format!(
-            ".drv not found in store: {drv_path}"
-        )));
-    }
+    let nar_data = match result {
+        Some((_, nar)) => nar,
+        None => {
+            return Err(ExecutorError::BuildFailed(format!(
+                ".drv not found in store: {drv_path}"
+            )));
+        }
+    };
 
     let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
         .map_err(|e| ExecutorError::BuildFailed(format!("failed to extract .drv from NAR: {e}")))?;
@@ -948,18 +934,15 @@ async fn compute_input_closure(
             .map(|path| {
                 let mut client = store_client.clone();
                 async move {
-                    let req = QueryPathInfoRequest {
-                        store_path: path.clone(),
-                    };
-                    match rio_common::grpc::with_timeout_status(
-                        "QueryPathInfo",
+                    match rio_proto::client::query_path_info_opt(
+                        &mut client,
+                        &path,
                         rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                        client.query_path_info(req),
                     )
                     .await
                     {
-                        Ok(resp) => Ok((path, Some(resp.into_inner().references))),
-                        Err(e) if e.code() == tonic::Code::NotFound => {
+                        Ok(Some(info)) => Ok((path, Some(info.references))),
+                        Ok(None) => {
                             // Path not in store yet (output of a not-yet-built
                             // input drv). FUSE will lazy-fetch at build time.
                             tracing::debug!(path = %path, "input not in store; FUSE will lazy-fetch");

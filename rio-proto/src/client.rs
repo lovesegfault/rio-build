@@ -6,13 +6,16 @@
 //!   [`chunk_nar_for_put`] builds a lazy `PutPath` request stream.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
 use tonic::transport::Channel;
 
+use crate::store::store_service_client::StoreServiceClient;
 use crate::types::{
-    GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest, get_path_response, put_path_request,
+    GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest,
+    QueryPathInfoRequest, get_path_response, put_path_request,
 };
 
 /// Unified chunk size for NAR streaming (256 KiB).
@@ -82,6 +85,13 @@ pub enum NarCollectError {
     SizeExceeded { got: u64, limit: u64 },
 }
 
+impl NarCollectError {
+    /// True if this error represents a server-side NotFound (path doesn't exist).
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, NarCollectError::Stream(s) if s.code() == tonic::Code::NotFound)
+    }
+}
+
 /// Drain a `GetPath` response stream into `(Option<PathInfo>, nar_bytes)`.
 ///
 /// Enforces `max_size` (callers typically pass `rio_common::limits::MAX_NAR_SIZE`).
@@ -138,4 +148,61 @@ pub fn chunk_nar_for_put(
     });
 
     tokio_stream::once(metadata).chain(chunks)
+}
+
+// ===========================================================================
+// High-level store operations with timeout + NotFound handling
+// ===========================================================================
+
+/// QueryPathInfo with timeout. Returns `None` if the store reports NotFound.
+///
+/// Collapses the common `match { Ok => Some, NotFound => None, Err => Err }`
+/// pattern. On timeout, returns `Status::deadline_exceeded`.
+pub async fn query_path_info_opt(
+    client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+    timeout: Duration,
+) -> Result<Option<PathInfo>, tonic::Status> {
+    let req = QueryPathInfoRequest {
+        store_path: store_path.to_string(),
+    };
+    match tokio::time::timeout(timeout, client.query_path_info(req)).await {
+        Ok(Ok(resp)) => Ok(Some(resp.into_inner())),
+        Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(None),
+        Ok(Err(status)) => Err(status),
+        Err(_) => Err(tonic::Status::deadline_exceeded(format!(
+            "QueryPathInfo timed out after {timeout:?}"
+        ))),
+    }
+}
+
+/// GetPath with timeout, full NAR collection, and NotFound handling.
+///
+/// Combines the `GetPath → collect_nar_stream → NotFound-branch` pattern.
+/// The whole operation (initial call + stream drain) is bounded by `timeout`.
+/// Returns `None` if the path doesn't exist or the stream contains no PathInfo.
+pub async fn get_path_nar(
+    client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+    timeout: Duration,
+    max_nar_size: u64,
+) -> Result<Option<(PathInfo, Vec<u8>)>, NarCollectError> {
+    let req = GetPathRequest {
+        store_path: store_path.to_string(),
+    };
+    let fut = async {
+        let mut stream = match client.get_path(req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(status) => return Err(NarCollectError::Stream(status)),
+        };
+        let (info, nar) = collect_nar_stream(&mut stream, max_nar_size).await?;
+        Ok(info.map(|i| (i, nar)))
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(NarCollectError::Stream(tonic::Status::deadline_exceeded(
+            format!("GetPath({store_path}) timed out after {timeout:?}"),
+        ))),
+    }
 }
