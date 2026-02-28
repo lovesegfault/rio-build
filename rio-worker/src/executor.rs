@@ -74,7 +74,9 @@ pub enum ExecutorError {
     #[error("daemon spawn failed: {0}")]
     DaemonSpawn(std::io::Error),
     #[error("daemon handshake failed: {0}")]
-    DaemonHandshake(String),
+    Handshake(#[from] rio_nix::protocol::handshake::HandshakeError),
+    #[error("daemon setup failed: {0}")]
+    DaemonSetup(String),
     #[error("build failed: {0}")]
     BuildFailed(String),
     #[error("upload failed: {0}")]
@@ -84,7 +86,7 @@ pub enum ExecutorError {
     #[error("input metadata fetch failed for {path}: {source}")]
     MetadataFetch { path: String, source: tonic::Status },
     #[error("wire protocol error: {0}")]
-    Wire(String),
+    Wire(#[from] rio_nix::protocol::wire::WireError),
 }
 
 /// Result of executing a single build.
@@ -604,60 +606,48 @@ async fn run_daemon_build(
     let mut stdin = daemon
         .stdin
         .take()
-        .ok_or_else(|| ExecutorError::DaemonHandshake("failed to get daemon stdin".into()))?;
+        .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdin".into()))?;
     let mut stdout = daemon
         .stdout
         .take()
-        .ok_or_else(|| ExecutorError::DaemonHandshake("failed to get daemon stdout".into()))?;
+        .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdout".into()))?;
 
     // Handshake + setOptions + send build — all bounded by DAEMON_SETUP_TIMEOUT.
     // Previously only the handshake was timed out; a stuck setOptions or
     // a stalled write would hang until build_timeout (potentially hours).
     tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
-        let handshake_result = client_handshake(&mut stdout, &mut stdin)
-            .await
-            .map_err(|e| ExecutorError::DaemonHandshake(format!("{e}")))?;
+        let handshake_result = client_handshake(&mut stdout, &mut stdin).await?;
 
         tracing::debug!(
             version = handshake_result.negotiated_version(),
             "daemon handshake complete"
         );
 
-        client_set_options(&mut stdout, &mut stdin)
-            .await
-            .map_err(|e| ExecutorError::DaemonHandshake(format!("setOptions failed: {e}")))?;
+        client_set_options(&mut stdout, &mut stdin).await?;
 
         wire::write_u64(
             &mut stdin,
             rio_nix::protocol::opcodes::WorkerOp::BuildDerivation as u64,
         )
-        .await
-        .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-        wire::write_string(&mut stdin, drv_path)
-            .await
-            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-        rio_nix::protocol::build::write_basic_derivation(&mut stdin, basic_drv)
-            .await
-            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
-        wire::write_u64(&mut stdin, BuildMode::Normal as u64)
-            .await
-            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+        .await?;
+        wire::write_string(&mut stdin, drv_path).await?;
+        rio_nix::protocol::build::write_basic_derivation(&mut stdin, basic_drv).await?;
+        wire::write_u64(&mut stdin, BuildMode::Normal as u64).await?;
         tokio::io::AsyncWriteExt::flush(&mut stdin)
             .await
-            .map_err(|e| ExecutorError::Wire(format!("{e}")))?;
+            .map_err(wire::WireError::from)?;
 
         Ok::<_, ExecutorError>(())
     })
     .await
-    .map_err(|_| ExecutorError::DaemonHandshake("daemon setup sequence timed out".into()))??;
+    .map_err(|_| ExecutorError::DaemonSetup("daemon setup sequence timed out".into()))??;
 
     // Read STDERR loop with log streaming (build may run for a long time)
     let build_result = tokio::time::timeout(build_timeout, async {
         read_build_stderr_loop(&mut stdout, batcher, log_tx).await
     })
     .await
-    .map_err(|_| ExecutorError::BuildFailed("build timed out".into()))?
-    .map_err(|e| ExecutorError::BuildFailed(format!("{e}")))?;
+    .map_err(|_| ExecutorError::BuildFailed("build timed out".into()))??;
 
     Ok(build_result)
 }
