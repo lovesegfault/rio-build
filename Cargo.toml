@@ -51,6 +51,7 @@ sqlx = { version = "0.8", default-features = false, features = [
   "sqlite",
   "macros",
   "migrate",
+  "uuid",
 ] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

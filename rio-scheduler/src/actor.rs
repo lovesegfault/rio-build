@@ -728,73 +728,72 @@ impl DagActor {
         edges: &[rio_proto::types::DerivationEdge],
         newly_inserted: &HashSet<String>,
     ) -> Result<(), ActorError> {
-        // TODO(phase2b): batch via INSERT...ON CONFLICT with UNNEST or QueryBuilder.
-        // 2N+E serial PG roundtrips stall the actor ~3.5s for a 1000-node DAG,
-        // blocking all heartbeats/completions/dispatches.
-        for node in nodes {
-            let drv_hash = &node.drv_hash;
-            let status = if newly_inserted.contains(drv_hash.as_str()) {
-                DerivationStatus::Created
-            } else if let Some(state) = self.dag.node(drv_hash) {
-                // Existing node, just link the build
-                state.status()
-            } else {
-                DerivationStatus::Created
-            };
-
-            let db_id = self
-                .db
-                .upsert_derivation(
-                    drv_hash,
-                    &node.drv_path,
+        // Build input rows for batch upsert.
+        let node_rows: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                let status = if newly_inserted.contains(node.drv_hash.as_str()) {
+                    DerivationStatus::Created
+                } else if let Some(state) = self.dag.node(&node.drv_hash) {
+                    state.status()
+                } else {
+                    DerivationStatus::Created
+                };
+                (
+                    node.drv_hash.clone(),
+                    node.drv_path.clone(),
                     if node.pname.is_empty() {
                         None
                     } else {
-                        Some(&node.pname)
+                        Some(node.pname.clone())
                     },
-                    &node.system,
+                    node.system.clone(),
                     status,
-                    &node.required_features,
+                    node.required_features.clone(),
                 )
-                .await?;
+            })
+            .collect();
 
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                state.db_id = Some(db_id);
+        // Transaction: 3 batched roundtrips instead of 2N+E serial.
+        let mut tx = self.db.pool().begin().await?;
+
+        // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
+        let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
+
+        // Update in-memory db_id from returned map.
+        for (hash, db_id) in &id_map {
+            if let Some(state) = self.dag.node_mut(hash) {
+                state.db_id = Some(*db_id);
             }
-
-            self.db.insert_build_derivation(build_id, db_id).await?;
         }
 
-        for edge in edges {
-            let parent_id = self.find_db_id_by_path(&edge.parent_drv_path);
-            let child_id = self.find_db_id_by_path(&edge.child_drv_path);
+        // Batch 2: link all nodes to this build.
+        let db_ids: Vec<Uuid> = id_map.values().copied().collect();
+        crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
-            match (parent_id, child_id) {
-                (Some(pid), Some(cid)) => {
-                    self.db.insert_edge(pid, cid).await?;
-                }
-                _ => {
-                    // A db_id lookup failure means the edge references a
-                    // derivation that wasn't upserted above — a bug in the
-                    // merge/persist flow. Previously this was silently
-                    // skipped, meaning the in-memory DAG had the edge but
-                    // PostgreSQL did not. After a scheduler restart, the
-                    // recovered DAG would be missing dependency edges.
-                    error!(
-                        parent_path = %edge.parent_drv_path,
-                        child_path = %edge.child_drv_path,
-                        parent_id = ?parent_id,
-                        child_id = ?child_id,
-                        "edge persistence failed: db_id lookup failed (DAG/DB would drift)"
-                    );
-                    return Err(ActorError::Internal(format!(
+        // Batch 3: insert edges (resolve drv_path -> db_id via find_db_id_by_path).
+        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
+            .iter()
+            .map(|e| {
+                let parent = self.find_db_id_by_path(&e.parent_drv_path).ok_or_else(|| {
+                    ActorError::Internal(format!(
                         "edge {} -> {} references unpersisted derivation (db_id missing)",
-                        edge.parent_drv_path, edge.child_drv_path
-                    )));
-                }
-            }
-        }
+                        e.parent_drv_path, e.child_drv_path
+                    ))
+                })?;
+                let child = self.find_db_id_by_path(&e.child_drv_path).ok_or_else(|| {
+                    ActorError::Internal(format!(
+                        "edge {} -> {} references unpersisted derivation (db_id missing)",
+                        e.parent_drv_path, e.child_drv_path
+                    ))
+                })?;
+                Ok((parent, child))
+            })
+            .collect();
+        let edge_rows = edge_rows?;
+        crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
 
+        tx.commit().await?;
         Ok(())
     }
 

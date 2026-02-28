@@ -3,11 +3,11 @@
 //! Synchronous writes: state transitions, assignment changes, build terminal status.
 //! Async/batched: build_history EMA updates.
 //!
-//! NOTE: UUIDs are passed as strings (`.to_string()`) because the workspace sqlx
-//! config does not include the `uuid` feature. PostgreSQL handles the
-//! text-to-UUID cast implicitly via `::uuid`.
+//! UUIDs are bound natively via the sqlx `uuid` feature (added for batch inserts).
 
-use sqlx::PgPool;
+use std::collections::HashMap;
+
+use sqlx::{PgConnection, PgPool, QueryBuilder};
 use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus};
@@ -229,6 +229,87 @@ impl SchedulerDb {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch operations (for persist_merge_to_db)
+    // -----------------------------------------------------------------------
+
+    /// Batch-upsert derivations. Returns a map `drv_hash -> derivation_id`.
+    ///
+    /// Uses QueryBuilder::push_values for multi-row INSERT. RETURNING includes
+    /// drv_hash because PG doesn't guarantee RETURNING order matches input.
+    #[allow(clippy::type_complexity)]
+    pub async fn batch_upsert_derivations(
+        tx: &mut PgConnection,
+        rows: &[(
+            String,
+            String,
+            Option<String>,
+            String,
+            DerivationStatus,
+            Vec<String>,
+        )],
+    ) -> Result<HashMap<String, Uuid>, sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut qb = QueryBuilder::new(
+            "INSERT INTO derivations (drv_hash, drv_path, pname, system, status, required_features) ",
+        );
+        qb.push_values(rows, |mut b, (hash, path, pname, sys, status, feats)| {
+            b.push_bind(hash)
+                .push_bind(path)
+                .push_bind(pname)
+                .push_bind(sys)
+                .push_bind(status.as_str())
+                .push_bind(feats);
+        });
+        qb.push(
+            " ON CONFLICT (drv_hash) DO UPDATE SET updated_at = now() \
+             RETURNING drv_hash, derivation_id",
+        );
+
+        let result: Vec<(String, Uuid)> = qb.build_query_as().fetch_all(&mut *tx).await?;
+        Ok(result.into_iter().collect())
+    }
+
+    /// Batch-insert build_derivations links.
+    pub async fn batch_insert_build_derivations(
+        tx: &mut PgConnection,
+        build_id: Uuid,
+        derivation_ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut qb = QueryBuilder::new("INSERT INTO build_derivations (build_id, derivation_id) ");
+        qb.push_values(derivation_ids, |mut b, did| {
+            b.push_bind(build_id).push_bind(did);
+        });
+        qb.push(" ON CONFLICT DO NOTHING");
+        qb.build().execute(&mut *tx).await?;
+        Ok(())
+    }
+
+    /// Batch-insert edges.
+    pub async fn batch_insert_edges(
+        tx: &mut PgConnection,
+        edges: &[(Uuid, Uuid)],
+    ) -> Result<(), sqlx::Error> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+
+        let mut qb = QueryBuilder::new("INSERT INTO derivation_edges (parent_id, child_id) ");
+        qb.push_values(edges, |mut b, (p, c)| {
+            b.push_bind(p).push_bind(c);
+        });
+        qb.push(" ON CONFLICT DO NOTHING");
+        qb.build().execute(&mut *tx).await?;
         Ok(())
     }
 

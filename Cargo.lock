@@ -4297,6 +4297,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4329,6 +4330,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn",
@@ -4367,6 +4369,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.5",
  "rsa 0.9.10",
+ "serde",
  "sha1 0.10.6",
  "sha2 0.10.9",
  "smallvec",
@@ -4374,6 +4377,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -4411,6 +4415,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -4436,6 +4441,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
