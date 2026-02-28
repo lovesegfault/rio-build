@@ -3639,9 +3639,14 @@ name = "rio-test-support"
 version = "0.1.0"
 dependencies = [
  "nix 0.31.1",
+ "rio-nix",
+ "rio-proto",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

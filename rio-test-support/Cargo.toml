@@ -3,12 +3,17 @@ name = "rio-test-support"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "Test harness: ephemeral PostgreSQL bootstrap for integration tests"
+description = "Test harness: ephemeral PostgreSQL, wire protocol helpers, mock gRPC services"
 
 [dependencies]
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
+rio-nix = { workspace = true }
+rio-proto = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }

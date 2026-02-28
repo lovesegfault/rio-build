@@ -1,0 +1,340 @@
+//! Mock gRPC services and server spawn helpers for tests.
+//!
+//! `MockStore` stores NAR bytes in-memory, records PutPath calls, and supports
+//! prefix-match QueryPathInfo (for hash-part lookups).
+//!
+//! `MockScheduler` has a configurable `MockSchedulerOutcome` and records both
+//! SubmitBuild and CancelBuild calls.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
+use tonic::{Request, Response, Status, Streaming};
+
+use rio_proto::scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
+use rio_proto::store::store_service_server::{StoreService, StoreServiceServer};
+use rio_proto::types;
+
+// ============================================================================
+// MockStore
+// ============================================================================
+
+/// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
+///
+/// Records PutPath calls and supports prefix-match QueryPathInfo (for
+/// hash-part lookups via QueryPathFromHashPart).
+#[derive(Clone, Default)]
+pub struct MockStore {
+    /// store_path -> (PathInfo, NAR bytes)
+    #[allow(clippy::type_complexity)]
+    pub paths: Arc<RwLock<HashMap<String, (types::PathInfo, Vec<u8>)>>>,
+    /// Every PutPath metadata received (for assertions on upload count/contents).
+    pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
+}
+
+impl MockStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed a path into the store. For tests that want a pre-populated store.
+    pub fn seed(&self, info: types::PathInfo, nar: Vec<u8>) {
+        let store_path = info.store_path.clone();
+        self.paths.write().unwrap().insert(store_path, (info, nar));
+    }
+}
+
+#[tonic::async_trait]
+impl StoreService for MockStore {
+    async fn put_path(
+        &self,
+        request: Request<Streaming<types::PutPathRequest>>,
+    ) -> Result<Response<types::PutPathResponse>, Status> {
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty PutPath stream"))?;
+        let info = match first.msg {
+            Some(types::put_path_request::Msg::Metadata(m)) => m
+                .info
+                .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))?,
+            _ => return Err(Status::invalid_argument("first message must be metadata")),
+        };
+        // Drain NAR chunks
+        let mut nar = Vec::new();
+        while let Some(msg) = stream.message().await? {
+            if let Some(types::put_path_request::Msg::NarChunk(chunk)) = msg.msg {
+                nar.extend_from_slice(&chunk);
+            }
+        }
+        self.put_calls.write().unwrap().push(info.clone());
+        let store_path = info.store_path.clone();
+        self.paths.write().unwrap().insert(store_path, (info, nar));
+        Ok(Response::new(types::PutPathResponse { created: true }))
+    }
+
+    type GetPathStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::GetPathResponse, Status>>;
+
+    async fn get_path(
+        &self,
+        request: Request<types::GetPathRequest>,
+    ) -> Result<Response<Self::GetPathStream>, Status> {
+        let store_path = request.into_inner().store_path;
+        let entry = self.paths.read().unwrap().get(&store_path).cloned();
+        match entry {
+            Some((info, nar)) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Ok(types::GetPathResponse {
+                            msg: Some(types::get_path_response::Msg::Info(info)),
+                        }))
+                        .await;
+                    // Send NAR in 64 KiB chunks (matches real store)
+                    for chunk in nar.chunks(64 * 1024) {
+                        let _ = tx
+                            .send(Ok(types::GetPathResponse {
+                                msg: Some(types::get_path_response::Msg::NarChunk(chunk.to_vec())),
+                            }))
+                            .await;
+                    }
+                });
+                Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                    rx,
+                )))
+            }
+            None => Err(Status::not_found(format!("not found: {store_path}"))),
+        }
+    }
+
+    async fn query_path_info(
+        &self,
+        request: Request<types::QueryPathInfoRequest>,
+    ) -> Result<Response<types::PathInfo>, Status> {
+        let store_path = request.into_inner().store_path;
+        let paths = self.paths.read().unwrap();
+        // Exact match first, then prefix match (for QueryPathFromHashPart,
+        // which queries /nix/store/{hash_part} expecting a prefix lookup).
+        if let Some((info, _)) = paths.get(&store_path) {
+            return Ok(Response::new(info.clone()));
+        }
+        for (k, (info, _)) in paths.iter() {
+            if k.starts_with(&store_path) {
+                return Ok(Response::new(info.clone()));
+            }
+        }
+        Err(Status::not_found(format!("not found: {store_path}")))
+    }
+
+    async fn find_missing_paths(
+        &self,
+        request: Request<types::FindMissingPathsRequest>,
+    ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
+        let requested = request.into_inner().store_paths;
+        let paths = self.paths.read().unwrap();
+        let missing: Vec<String> = requested
+            .into_iter()
+            .filter(|p| !paths.contains_key(p))
+            .collect();
+        Ok(Response::new(types::FindMissingPathsResponse {
+            missing_paths: missing,
+        }))
+    }
+
+    async fn content_lookup(
+        &self,
+        _request: Request<types::ContentLookupRequest>,
+    ) -> Result<Response<types::ContentLookupResponse>, Status> {
+        Ok(Response::new(types::ContentLookupResponse {
+            store_path: String::new(),
+            info: None,
+        }))
+    }
+}
+
+// ============================================================================
+// MockScheduler
+// ============================================================================
+
+/// Configurable scheduler behavior for a single SubmitBuild stream.
+#[derive(Clone, Default)]
+pub struct MockSchedulerOutcome {
+    /// If set, SubmitBuild immediately fails with this status code.
+    pub submit_error: Option<tonic::Code>,
+    /// If set, SubmitBuild sends BuildCompleted after BuildStarted.
+    pub send_completed: bool,
+    /// If set, SubmitBuild sends BuildFailed after BuildStarted.
+    pub send_failed: bool,
+    /// If set, the stream is closed immediately after BuildStarted (no
+    /// terminal event). Simulates scheduler disconnect mid-build.
+    pub close_stream_early: bool,
+}
+
+/// Mock scheduler that records SubmitBuild + CancelBuild calls and has a
+/// configurable outcome for SubmitBuild streams.
+#[derive(Clone, Default)]
+pub struct MockScheduler {
+    pub outcome: Arc<RwLock<MockSchedulerOutcome>>,
+    /// Full SubmitBuild requests received (for inspecting DAG contents).
+    pub submit_calls: Arc<RwLock<Vec<types::SubmitBuildRequest>>>,
+    /// CancelBuild calls received: (build_id, reason).
+    pub cancel_calls: Arc<RwLock<Vec<(String, String)>>>,
+}
+
+impl MockScheduler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_outcome(&self, outcome: MockSchedulerOutcome) {
+        *self.outcome.write().unwrap() = outcome;
+    }
+}
+
+#[tonic::async_trait]
+impl SchedulerService for MockScheduler {
+    type SubmitBuildStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::BuildEvent, Status>>;
+
+    async fn submit_build(
+        &self,
+        request: Request<types::SubmitBuildRequest>,
+    ) -> Result<Response<Self::SubmitBuildStream>, Status> {
+        let req = request.into_inner();
+        self.submit_calls.write().unwrap().push(req.clone());
+
+        let outcome = self.outcome.read().unwrap().clone();
+        if let Some(code) = outcome.submit_error {
+            return Err(Status::new(code, "mock scheduler error"));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(types::BuildEvent {
+                    build_id: build_id.clone(),
+                    sequence: 0,
+                    timestamp: None,
+                    event: Some(types::build_event::Event::Started(types::BuildStarted {
+                        total_derivations: 1,
+                        cached_derivations: 0,
+                    })),
+                }))
+                .await;
+
+            if outcome.send_completed {
+                let _ = tx
+                    .send(Ok(types::BuildEvent {
+                        build_id: build_id.clone(),
+                        sequence: 1,
+                        timestamp: None,
+                        event: Some(types::build_event::Event::Completed(
+                            types::BuildCompleted {
+                                output_paths: vec!["/nix/store/zzz-output".into()],
+                            },
+                        )),
+                    }))
+                    .await;
+            } else if outcome.send_failed {
+                let _ = tx
+                    .send(Ok(types::BuildEvent {
+                        build_id,
+                        sequence: 1,
+                        timestamp: None,
+                        event: Some(types::build_event::Event::Failed(types::BuildFailed {
+                            error_message: "mock build failure".into(),
+                            failed_derivation: String::new(),
+                        })),
+                    }))
+                    .await;
+            } else if outcome.close_stream_early {
+                // Drop tx immediately: stream ends without a terminal event.
+                drop(tx);
+            } else {
+                // Keep open so gateway blocks on build events until client disconnects.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    type WatchBuildStream =
+        tokio_stream::wrappers::ReceiverStream<Result<types::BuildEvent, Status>>;
+
+    async fn watch_build(
+        &self,
+        _request: Request<types::WatchBuildRequest>,
+    ) -> Result<Response<Self::WatchBuildStream>, Status> {
+        Err(Status::not_found("not implemented in mock"))
+    }
+
+    async fn query_build_status(
+        &self,
+        _request: Request<types::QueryBuildRequest>,
+    ) -> Result<Response<types::BuildStatus>, Status> {
+        Err(Status::not_found("not implemented in mock"))
+    }
+
+    async fn cancel_build(
+        &self,
+        request: Request<types::CancelBuildRequest>,
+    ) -> Result<Response<types::CancelBuildResponse>, Status> {
+        let req = request.into_inner();
+        self.cancel_calls
+            .write()
+            .unwrap()
+            .push((req.build_id, req.reason));
+        Ok(Response::new(types::CancelBuildResponse {
+            cancelled: true,
+        }))
+    }
+}
+
+// ============================================================================
+// spawn helpers
+// ============================================================================
+
+/// Spawn a MockStore on an ephemeral port. Returns `(store, addr, handle)`.
+pub async fn spawn_mock_store() -> (MockStore, SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let store = MockStore::new();
+    let store_clone = store.clone();
+    let handle = tokio::spawn(async move {
+        let incoming = TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(StoreServiceServer::new(store_clone))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("mock store server");
+    });
+    tokio::task::yield_now().await;
+    (store, addr, handle)
+}
+
+/// Spawn a MockScheduler on an ephemeral port. Returns `(scheduler, addr, handle)`.
+pub async fn spawn_mock_scheduler() -> (MockScheduler, SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let sched = MockScheduler::new();
+    let sched_clone = sched.clone();
+    let handle = tokio::spawn(async move {
+        let incoming = TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(SchedulerServiceServer::new(sched_clone))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("mock scheduler server");
+    });
+    tokio::task::yield_now().await;
+    (sched, addr, handle)
+}
