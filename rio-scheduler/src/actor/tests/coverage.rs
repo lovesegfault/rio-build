@@ -13,16 +13,18 @@ async fn test_keepgoing_false_fails_fast() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![
-                make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
-                make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
-            ],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false, // critical
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![
+                    make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
+                    make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
+                ],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false, // critical
+            },
             reply: reply_tx,
         })
         .await
@@ -75,16 +77,18 @@ async fn test_keepgoing_true_waits_all() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![
-                make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
-                make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
-            ],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: true, // critical
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![
+                    make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
+                    make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
+                ],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: true, // critical
+            },
             reply: reply_tx,
         })
         .await
@@ -171,20 +175,22 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![
-                make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
-                make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
-                make_test_node("cascadeC", "/nix/store/cascadeC.drv", "x86_64-linux"),
-            ],
-            edges: vec![
-                make_test_edge("/nix/store/cascadeA.drv", "/nix/store/cascadeB.drv"),
-                make_test_edge("/nix/store/cascadeB.drv", "/nix/store/cascadeC.drv"),
-            ],
-            options: BuildOptions::default(),
-            keep_going: true,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![
+                    make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
+                    make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
+                    make_test_node("cascadeC", "/nix/store/cascadeC.drv", "x86_64-linux"),
+                ],
+                edges: vec![
+                    make_test_edge("/nix/store/cascadeA.drv", "/nix/store/cascadeB.drv"),
+                    make_test_edge("/nix/store/cascadeB.drv", "/nix/store/cascadeC.drv"),
+                ],
+                options: BuildOptions::default(),
+                keep_going: true,
+            },
             reply: reply_tx,
         })
         .await
@@ -315,19 +321,21 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id: build2,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![
-                make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
-                make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
-            ],
-            edges: vec![make_test_edge(
-                "/nix/store/preparent.drv",
-                "/nix/store/preleaf.drv",
-            )],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id: build2,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![
+                    make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
+                    make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
+                ],
+                edges: vec![make_test_edge(
+                    "/nix/store/preparent.drv",
+                    "/nix/store/preleaf.drv",
+                )],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await
@@ -788,17 +796,19 @@ async fn test_dispatch_skips_ineligible_derivation() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id: build_arm,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node(
-                "arm-hash",
-                "/nix/store/arm-hash.drv",
-                "aarch64-linux",
-            )],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id: build_arm,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node(
+                    "arm-hash",
+                    "/nix/store/arm-hash.drv",
+                    "aarch64-linux",
+                )],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await
@@ -857,21 +867,23 @@ async fn test_build_options_propagated_to_worker() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![make_test_node(
-                "opts-hash",
-                "/nix/store/opts-hash.drv",
-                "x86_64-linux",
-            )],
-            edges: vec![],
-            options: BuildOptions {
-                max_silent_time: 60,
-                build_timeout: 300,
-                build_cores: 4,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node(
+                    "opts-hash",
+                    "/nix/store/opts-hash.drv",
+                    "x86_64-linux",
+                )],
+                edges: vec![],
+                options: BuildOptions {
+                    max_silent_time: 60,
+                    build_timeout: 300,
+                    build_cores: 4,
+                },
+                keep_going: false,
             },
-            keep_going: false,
             reply: reply_tx,
         })
         .await
@@ -1057,19 +1069,21 @@ async fn test_dependency_chain_releases_parent() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![
-                make_test_node("chainA", "/nix/store/chainA.drv", "x86_64-linux"),
-                make_test_node("chainB", "/nix/store/chainB.drv", "x86_64-linux"),
-            ],
-            edges: vec![make_test_edge(
-                "/nix/store/chainA.drv",
-                "/nix/store/chainB.drv",
-            )],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![
+                    make_test_node("chainA", "/nix/store/chainA.drv", "x86_64-linux"),
+                    make_test_node("chainB", "/nix/store/chainB.drv", "x86_64-linux"),
+                ],
+                edges: vec![make_test_edge(
+                    "/nix/store/chainA.drv",
+                    "/nix/store/chainB.drv",
+                )],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await

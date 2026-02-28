@@ -22,6 +22,9 @@ use rio_proto::types;
 // MockStore
 // ============================================================================
 
+/// `(PathInfo, NAR bytes)` — stored value type for [`MockStore::paths`].
+type StoredPath = (types::PathInfo, Vec<u8>);
+
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
 ///
 /// Records PutPath calls and supports prefix-match QueryPathInfo (for
@@ -29,8 +32,7 @@ use rio_proto::types;
 #[derive(Clone, Default)]
 pub struct MockStore {
     /// store_path -> (PathInfo, NAR bytes)
-    #[allow(clippy::type_complexity)]
-    pub paths: Arc<RwLock<HashMap<String, (types::PathInfo, Vec<u8>)>>>,
+    pub paths: Arc<RwLock<HashMap<String, StoredPath>>>,
     /// Every PutPath metadata received (for assertions on upload count/contents).
     pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
 }

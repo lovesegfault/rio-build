@@ -101,13 +101,15 @@ async fn test_scheduler_cache_check_skips_build() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![node],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![node],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await
@@ -170,13 +172,15 @@ async fn test_scheduler_cache_check_skipped_without_store() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![node],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![node],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await
@@ -316,13 +320,15 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes,
-            edges,
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes,
+                edges,
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await
@@ -478,16 +484,18 @@ async fn test_assign_send_failure_cleans_running_builds() {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class: PriorityClass::Scheduled,
-            nodes: vec![
-                make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
-                make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),
-            ],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![
+                    make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
+                    make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),
+                ],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await

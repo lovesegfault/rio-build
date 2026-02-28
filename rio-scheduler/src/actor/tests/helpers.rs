@@ -94,13 +94,15 @@ pub(crate) async fn merge_single_node(
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
-            build_id,
-            tenant_id: None,
-            priority_class,
-            nodes: vec![make_test_node(hash, path, "x86_64-linux")],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class,
+                nodes: vec![make_test_node(hash, path, "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
             reply: reply_tx,
         })
         .await

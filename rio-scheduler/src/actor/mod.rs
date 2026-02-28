@@ -43,17 +43,23 @@ const BUILD_EVENT_BUFFER_SIZE: usize = 1024;
 /// is dropped.
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Request payload for [`ActorCommand::MergeDag`].
+#[derive(Debug)]
+pub struct MergeDagRequest {
+    pub build_id: Uuid,
+    pub tenant_id: Option<String>,
+    pub priority_class: PriorityClass,
+    pub nodes: Vec<rio_proto::types::DerivationNode>,
+    pub edges: Vec<rio_proto::types::DerivationEdge>,
+    pub options: BuildOptions,
+    pub keep_going: bool,
+}
+
 /// Commands sent to the DAG actor.
 pub enum ActorCommand {
     /// Merge a new build's derivation DAG into the global graph.
     MergeDag {
-        build_id: Uuid,
-        tenant_id: Option<String>,
-        priority_class: PriorityClass,
-        nodes: Vec<rio_proto::types::DerivationNode>,
-        edges: Vec<rio_proto::types::DerivationEdge>,
-        options: BuildOptions,
-        keep_going: bool,
+        req: MergeDagRequest,
         reply:
             oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
     },
@@ -282,27 +288,9 @@ impl DagActor {
             self.update_backpressure(queue_len, capacity);
 
             match cmd {
-                ActorCommand::MergeDag {
-                    build_id,
-                    tenant_id,
-                    priority_class,
-                    nodes,
-                    edges,
-                    options,
-                    keep_going,
-                    reply,
-                } => {
-                    let result = self
-                        .handle_merge_dag(
-                            build_id,
-                            tenant_id,
-                            priority_class,
-                            nodes,
-                            edges,
-                            options,
-                            keep_going,
-                        )
-                        .await;
+                ActorCommand::MergeDag { req, reply } => {
+                    let build_id = req.build_id;
+                    let result = self.handle_merge_dag(req).await;
                     // If the reply channel was dropped (client disconnected during
                     // merge), the build is orphaned. Cancel it immediately.
                     if reply.send(result).is_err() {

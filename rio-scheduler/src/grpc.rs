@@ -13,7 +13,7 @@ use uuid::Uuid;
 use rio_proto::scheduler::scheduler_service_server::SchedulerService;
 use rio_proto::worker::worker_service_server::WorkerService;
 
-use crate::actor::{ActorCommand, ActorError, ActorHandle};
+use crate::actor::{ActorCommand, ActorError, ActorHandle, MergeDagRequest};
 use crate::state::BuildOptions;
 
 /// Shared scheduler state passed to gRPC handlers.
@@ -171,7 +171,7 @@ impl SchedulerService for SchedulerGrpc {
             build_cores: req.build_cores,
         };
 
-        let cmd = ActorCommand::MergeDag {
+        let req = MergeDagRequest {
             build_id,
             tenant_id: if req.tenant_id.is_empty() {
                 None
@@ -198,6 +198,9 @@ impl SchedulerService for SchedulerGrpc {
             edges: req.edges,
             options,
             keep_going: req.keep_going,
+        };
+        let cmd = ActorCommand::MergeDag {
+            req,
             reply: reply_tx,
         };
 
