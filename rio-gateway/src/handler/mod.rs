@@ -131,17 +131,6 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
 {
-    // Destructure for legibility — existing per-opcode handlers take
-    // individual fields, not the whole context.
-    let SessionContext {
-        store_client,
-        scheduler_client,
-        options,
-        temp_roots,
-        drv_cache,
-        has_seen_build_paths_with_results,
-        active_build_ids,
-    } = ctx;
     let mut stderr = StderrWriter::new(writer);
     let start = std::time::Instant::now();
 
@@ -152,81 +141,91 @@ where
 
     let result = match op {
         Some(WorkerOp::IsValidPath) => {
-            handle_is_valid_path(reader, &mut stderr, store_client).await
+            handle_is_valid_path(reader, &mut stderr, &mut ctx.store_client).await
         }
         Some(WorkerOp::AddToStore) => {
-            handle_add_to_store(reader, &mut stderr, store_client, drv_cache).await
+            handle_add_to_store(
+                reader,
+                &mut stderr,
+                &mut ctx.store_client,
+                &mut ctx.drv_cache,
+            )
+            .await
         }
         Some(WorkerOp::AddTextToStore) => {
-            handle_add_text_to_store(reader, &mut stderr, store_client, drv_cache).await
+            handle_add_text_to_store(
+                reader,
+                &mut stderr,
+                &mut ctx.store_client,
+                &mut ctx.drv_cache,
+            )
+            .await
         }
-        Some(WorkerOp::EnsurePath) => handle_ensure_path(reader, &mut stderr, store_client).await,
+        Some(WorkerOp::EnsurePath) => {
+            handle_ensure_path(reader, &mut stderr, &mut ctx.store_client).await
+        }
         Some(WorkerOp::QueryPathInfo) => {
-            handle_query_path_info(reader, &mut stderr, store_client).await
+            handle_query_path_info(reader, &mut stderr, &mut ctx.store_client).await
         }
         Some(WorkerOp::QueryValidPaths) => {
-            handle_query_valid_paths(reader, &mut stderr, store_client).await
+            handle_query_valid_paths(reader, &mut stderr, &mut ctx.store_client).await
         }
-        Some(WorkerOp::AddTempRoot) => handle_add_temp_root(reader, &mut stderr, temp_roots).await,
-        Some(WorkerOp::SetOptions) => handle_set_options(reader, &mut stderr, options).await,
+        Some(WorkerOp::AddTempRoot) => {
+            handle_add_temp_root(reader, &mut stderr, &mut ctx.temp_roots).await
+        }
+        Some(WorkerOp::SetOptions) => {
+            handle_set_options(reader, &mut stderr, &mut ctx.options).await
+        }
         Some(WorkerOp::NarFromPath) => {
-            handle_nar_from_path(reader, &mut stderr, store_client).await
+            handle_nar_from_path(reader, &mut stderr, &mut ctx.store_client).await
         }
         Some(WorkerOp::QueryPathFromHashPart) => {
-            handle_query_path_from_hash_part(reader, &mut stderr, store_client).await
+            handle_query_path_from_hash_part(reader, &mut stderr, &mut ctx.store_client).await
         }
         Some(WorkerOp::AddSignatures) => {
-            handle_add_signatures(reader, &mut stderr, store_client).await
+            handle_add_signatures(reader, &mut stderr, &mut ctx.store_client).await
         }
         Some(WorkerOp::QueryMissing) => {
-            handle_query_missing(reader, &mut stderr, store_client, drv_cache).await
+            handle_query_missing(
+                reader,
+                &mut stderr,
+                &mut ctx.store_client,
+                &mut ctx.drv_cache,
+            )
+            .await
         }
         Some(WorkerOp::AddToStoreNar) => {
-            handle_add_to_store_nar(reader, &mut stderr, store_client, drv_cache).await
+            handle_add_to_store_nar(
+                reader,
+                &mut stderr,
+                &mut ctx.store_client,
+                &mut ctx.drv_cache,
+            )
+            .await
         }
         Some(WorkerOp::AddMultipleToStore) => {
-            handle_add_multiple_to_store(reader, &mut stderr, store_client, drv_cache).await
+            handle_add_multiple_to_store(
+                reader,
+                &mut stderr,
+                &mut ctx.store_client,
+                &mut ctx.drv_cache,
+            )
+            .await
         }
         Some(WorkerOp::QueryDerivationOutputMap) => {
-            handle_query_derivation_output_map(reader, &mut stderr, store_client, drv_cache).await
-        }
-        Some(WorkerOp::BuildDerivation) => {
-            handle_build_derivation(
+            handle_query_derivation_output_map(
                 reader,
                 &mut stderr,
-                store_client,
-                scheduler_client,
-                options,
-                drv_cache,
-                has_seen_build_paths_with_results,
-                active_build_ids,
+                &mut ctx.store_client,
+                &mut ctx.drv_cache,
             )
             .await
         }
-        Some(WorkerOp::BuildPaths) => {
-            handle_build_paths(
-                reader,
-                &mut stderr,
-                store_client,
-                scheduler_client,
-                options,
-                drv_cache,
-                active_build_ids,
-            )
-            .await
-        }
+        Some(WorkerOp::BuildDerivation) => handle_build_derivation(reader, &mut stderr, ctx).await,
+        Some(WorkerOp::BuildPaths) => handle_build_paths(reader, &mut stderr, ctx).await,
         Some(WorkerOp::BuildPathsWithResults) => {
-            *has_seen_build_paths_with_results = true;
-            handle_build_paths_with_results(
-                reader,
-                &mut stderr,
-                store_client,
-                scheduler_client,
-                options,
-                drv_cache,
-                active_build_ids,
-            )
-            .await
+            ctx.has_seen_build_paths_with_results = true;
+            handle_build_paths_with_results(reader, &mut stderr, ctx).await
         }
         Some(WorkerOp::RegisterDrvOutput) => handle_register_drv_output(reader, &mut stderr).await,
         Some(WorkerOp::QueryRealisation) => handle_query_realisation(reader, &mut stderr).await,
