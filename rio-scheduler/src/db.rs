@@ -12,6 +12,35 @@ use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus};
 
+/// Assignment lifecycle status (assignments table).
+///
+/// Only `Pending` and `Completed` are currently set from Rust. The schema
+/// also supports `acknowledged`/`failed`/`cancelled` — reserved for phase2c
+/// worker-ack and distinct failure reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentStatus {
+    Pending,
+    Acknowledged,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AssignmentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Acknowledged => "acknowledged",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
 /// Database operations for the scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerDb {
@@ -349,11 +378,9 @@ impl SchedulerDb {
     pub async fn update_assignment_status(
         &self,
         derivation_id: Uuid,
-        status: &str,
+        status: AssignmentStatus,
     ) -> Result<(), sqlx::Error> {
-        let is_terminal = status == "completed" || status == "failed" || status == "cancelled";
-
-        if is_terminal {
+        if status.is_terminal() {
             sqlx::query(
                 r#"
                 UPDATE assignments
@@ -362,7 +389,7 @@ impl SchedulerDb {
                 "#,
             )
             .bind(derivation_id.to_string())
-            .bind(status)
+            .bind(status.as_str())
             .execute(&self.pool)
             .await?;
         } else {
@@ -374,7 +401,7 @@ impl SchedulerDb {
                 "#,
             )
             .bind(derivation_id.to_string())
-            .bind(status)
+            .bind(status.as_str())
             .execute(&self.pool)
             .await?;
         }

@@ -1,0 +1,612 @@
+//! DAG actor: single Tokio task owning all mutable scheduler state.
+//!
+//! All gRPC handlers communicate with the actor via an mpsc command channel.
+//! The actor processes commands serially, ensuring deterministic ordering
+//! and eliminating lock contention.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tonic::transport::Channel;
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
+
+use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::types::FindMissingPathsRequest;
+
+use crate::dag::DerivationDag;
+use crate::db::SchedulerDb;
+use crate::queue::ReadyQueue;
+use crate::state::{
+    BuildInfo, BuildOptions, BuildState, DerivationStatus, HEARTBEAT_TIMEOUT_SECS,
+    MAX_MISSED_HEARTBEATS, POISON_THRESHOLD, POISON_TTL, PriorityClass, RetryPolicy, WorkerState,
+};
+
+/// Channel capacity for the actor command channel.
+pub const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
+
+/// Backpressure: reject new work above this fraction of channel capacity.
+const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
+
+/// Backpressure: resume accepting work below this fraction.
+const BACKPRESSURE_LOW_WATERMARK: f64 = 0.60;
+
+/// Number of events to retain in each build's event buffer for late subscribers.
+const BUILD_EVENT_BUFFER_SIZE: usize = 1024;
+
+/// Delay before cleaning up terminal build state. Allows late WatchBuild
+/// subscribers to receive the terminal event before the broadcast sender
+/// is dropped.
+const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Commands sent to the DAG actor.
+pub enum ActorCommand {
+    /// Merge a new build's derivation DAG into the global graph.
+    MergeDag {
+        build_id: Uuid,
+        tenant_id: Option<String>,
+        priority_class: PriorityClass,
+        nodes: Vec<rio_proto::types::DerivationNode>,
+        edges: Vec<rio_proto::types::DerivationEdge>,
+        options: BuildOptions,
+        keep_going: bool,
+        reply:
+            oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
+    },
+
+    /// Process a completion report from a worker.
+    ProcessCompletion {
+        worker_id: String,
+        drv_hash: String,
+        result: rio_proto::types::BuildResult,
+    },
+
+    /// Cancel a build.
+    CancelBuild {
+        build_id: Uuid,
+        reason: String,
+        reply: oneshot::Sender<Result<bool, ActorError>>,
+    },
+
+    /// A worker opened a BuildExecution stream.
+    WorkerConnected {
+        worker_id: String,
+        stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
+    },
+
+    /// A worker's BuildExecution stream closed.
+    WorkerDisconnected { worker_id: String },
+
+    /// Periodic heartbeat from a worker.
+    Heartbeat {
+        worker_id: String,
+        system: String,
+        supported_features: Vec<String>,
+        max_builds: u32,
+        running_builds: Vec<String>,
+    },
+
+    /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
+    Tick,
+
+    /// Query build status.
+    QueryBuildStatus {
+        build_id: Uuid,
+        reply: oneshot::Sender<Result<rio_proto::types::BuildStatus, ActorError>>,
+    },
+
+    /// Subscribe to an existing build's events.
+    WatchBuild {
+        build_id: Uuid,
+        since_sequence: u64,
+        reply:
+            oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
+    },
+
+    /// Internal: clean up terminal build state (maps + DAG interest) after
+    /// a delay. Scheduled by complete_build/transition_build_to_failed/cancel.
+    CleanupTerminalBuild { build_id: Uuid },
+
+    /// Test-only: query worker states.
+    #[cfg(test)]
+    DebugQueryWorkers {
+        reply: oneshot::Sender<Vec<DebugWorkerInfo>>,
+    },
+
+    /// Test-only: query a derivation's state.
+    #[cfg(test)]
+    DebugQueryDerivation {
+        drv_hash: String,
+        reply: oneshot::Sender<Option<DebugDerivationInfo>>,
+    },
+}
+
+/// Test-only: snapshot of worker state for assertions.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct DebugWorkerInfo {
+    pub worker_id: String,
+    pub is_registered: bool,
+    pub system: Option<String>,
+    pub running_count: usize,
+    pub running_builds: Vec<String>,
+}
+
+/// Test-only: snapshot of derivation state for assertions.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct DebugDerivationInfo {
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub status: DerivationStatus,
+    pub retry_count: u32,
+    pub assigned_worker: Option<String>,
+    pub output_paths: Vec<String>,
+}
+
+/// Errors from the actor.
+#[derive(Debug, thiserror::Error)]
+pub enum ActorError {
+    #[error("build not found: {0}")]
+    BuildNotFound(Uuid),
+
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    #[error("channel send error")]
+    ChannelSend,
+
+    #[error("backpressure: actor queue is overloaded")]
+    Backpressure,
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+/// Read-only view of the actor's backpressure state.
+///
+/// Only the actor can toggle backpressure (it computes the 80%/60% hysteresis);
+/// handles can only observe. Wrapping `Arc<AtomicBool>` makes the read-only
+/// invariant compile-time: there's no `store()` method on this type.
+#[derive(Clone)]
+pub struct BackpressureReader(Arc<AtomicBool>);
+
+impl BackpressureReader {
+    pub(crate) fn new(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    /// Whether backpressure is currently active (hysteresis-aware).
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: simulate the actor toggling backpressure.
+    /// In production, only the actor's update_backpressure writes this.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, active: bool) {
+        self.0.store(active, Ordering::Relaxed);
+    }
+}
+
+/// The DAG actor state.
+pub struct DagActor {
+    /// The global derivation DAG.
+    dag: DerivationDag,
+    /// FIFO queue of ready derivation hashes.
+    ready_queue: ReadyQueue,
+    /// Active builds indexed by build_id.
+    builds: HashMap<Uuid, BuildInfo>,
+    /// Build event broadcast channels.
+    build_events: HashMap<Uuid, broadcast::Sender<rio_proto::types::BuildEvent>>,
+    /// Per-build sequence counters.
+    build_sequences: HashMap<Uuid, u64>,
+    /// Connected workers.
+    workers: HashMap<String, WorkerState>,
+    /// Retry policy.
+    retry_policy: RetryPolicy,
+    /// Database handle.
+    db: SchedulerDb,
+    /// Store service client for scheduler-side cache checks. `None` in tests
+    /// that don't need the store (cache check is then skipped).
+    store_client: Option<StoreServiceClient<Channel>>,
+    /// Whether backpressure is currently active. Shared with ActorHandle
+    /// so hysteresis (80%/60%) is honored by send() instead of a simple
+    /// threshold check. Arc<AtomicBool> for lock-free reads on the hot path.
+    backpressure_active: Arc<AtomicBool>,
+    /// Leader generation counter (for assignment tokens).
+    generation: i64,
+    /// Weak clone of the actor's own command sender, for scheduling delayed
+    /// internal commands (e.g., terminal build cleanup). Weak so the actor
+    /// doesn't prevent channel close when all external handles are dropped.
+    /// `None` if spawned via bare `run()` (no delayed scheduling).
+    self_tx: Option<mpsc::WeakSender<ActorCommand>>,
+}
+
+impl DagActor {
+    /// Create a new actor with the given database handle and optional store client.
+    ///
+    /// `store_client` is used for the scheduler-side cache check (closes the
+    /// TOCTOU window between the gateway's FindMissingPaths and DAG merge).
+    /// Pass `None` to skip this check (tests, or if the store is unavailable).
+    pub fn new(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
+        Self {
+            dag: DerivationDag::new(),
+            ready_queue: ReadyQueue::new(),
+            builds: HashMap::new(),
+            build_events: HashMap::new(),
+            build_sequences: HashMap::new(),
+            workers: HashMap::new(),
+            retry_policy: RetryPolicy::default(),
+            db,
+            store_client,
+            backpressure_active: Arc::new(AtomicBool::new(false)),
+            generation: 1,
+            self_tx: None,
+        }
+    }
+
+    /// Run the actor event loop. Consumes commands from the channel until it closes.
+    pub async fn run(mut self, mut rx: mpsc::Receiver<ActorCommand>) {
+        // No self_tx: cleanup is synchronous (test helpers don't pass a tx clone).
+        // Production (ActorHandle::spawn) uses run_with_self_tx.
+        self.run_inner(&mut rx).await;
+    }
+
+    /// Run the actor with a weak clone of its own sender for scheduling
+    /// delayed internal commands (terminal cleanup, etc.). The weak sender
+    /// ensures the actor doesn't keep itself alive after all handles drop.
+    pub async fn run_with_self_tx(
+        mut self,
+        mut rx: mpsc::Receiver<ActorCommand>,
+        self_tx: mpsc::WeakSender<ActorCommand>,
+    ) {
+        self.self_tx = Some(self_tx);
+        self.run_inner(&mut rx).await;
+    }
+
+    async fn run_inner(&mut self, rx: &mut mpsc::Receiver<ActorCommand>) {
+        info!("DAG actor started");
+
+        while let Some(cmd) = rx.recv().await {
+            // Check backpressure state
+            let queue_len = rx.len();
+            let capacity = rx.max_capacity();
+            self.update_backpressure(queue_len, capacity);
+
+            match cmd {
+                ActorCommand::MergeDag {
+                    build_id,
+                    tenant_id,
+                    priority_class,
+                    nodes,
+                    edges,
+                    options,
+                    keep_going,
+                    reply,
+                } => {
+                    let result = self
+                        .handle_merge_dag(
+                            build_id,
+                            tenant_id,
+                            priority_class,
+                            nodes,
+                            edges,
+                            options,
+                            keep_going,
+                        )
+                        .await;
+                    // If the reply channel was dropped (client disconnected during
+                    // merge), the build is orphaned. Cancel it immediately.
+                    if reply.send(result).is_err() {
+                        warn!(
+                            build_id = %build_id,
+                            "MergeDag reply receiver dropped, cancelling orphaned build"
+                        );
+                        if let Err(e) = self
+                            .handle_cancel_build(build_id, "client_disconnect_during_merge")
+                            .await
+                        {
+                            error!(build_id = %build_id, error = %e, "failed to cancel orphaned build");
+                        }
+                    }
+                }
+                ActorCommand::ProcessCompletion {
+                    worker_id,
+                    drv_hash,
+                    result,
+                } => {
+                    self.handle_completion(&worker_id, &drv_hash, result).await;
+                }
+                ActorCommand::CancelBuild {
+                    build_id,
+                    reason,
+                    reply,
+                } => {
+                    let result = self.handle_cancel_build(build_id, &reason).await;
+                    let _ = reply.send(result);
+                }
+                ActorCommand::WorkerConnected {
+                    worker_id,
+                    stream_tx,
+                } => {
+                    self.handle_worker_connected(worker_id, stream_tx);
+                }
+                ActorCommand::WorkerDisconnected { worker_id } => {
+                    self.handle_worker_disconnected(&worker_id).await;
+                }
+                ActorCommand::Heartbeat {
+                    worker_id,
+                    system,
+                    supported_features,
+                    max_builds,
+                    running_builds,
+                } => {
+                    self.handle_heartbeat(
+                        worker_id,
+                        system,
+                        supported_features,
+                        max_builds,
+                        running_builds,
+                    );
+                    // Dispatch on heartbeat: new capacity may be available
+                    self.dispatch_ready().await;
+                }
+                ActorCommand::Tick => {
+                    self.handle_tick().await;
+                }
+                ActorCommand::QueryBuildStatus { build_id, reply } => {
+                    let result = self.handle_query_build_status(build_id);
+                    let _ = reply.send(result);
+                }
+                ActorCommand::WatchBuild {
+                    build_id,
+                    // TODO(phase3a): since_sequence is for resuming after gateway reconnect
+                    // to a new leader. Phase 2a has no leader election; the broadcast
+                    // channel's 1024-event buffer provides limited late-subscriber replay.
+                    // Full resumption requires persistent event log + leader handoff.
+                    since_sequence: _,
+                    reply,
+                } => {
+                    let result = self.handle_watch_build(build_id);
+                    let _ = reply.send(result);
+                }
+                ActorCommand::CleanupTerminalBuild { build_id } => {
+                    self.handle_cleanup_terminal_build(build_id);
+                }
+                #[cfg(test)]
+                ActorCommand::DebugQueryWorkers { reply } => {
+                    let workers: Vec<_> = self
+                        .workers
+                        .values()
+                        .map(|w| DebugWorkerInfo {
+                            worker_id: w.worker_id.clone(),
+                            is_registered: w.is_registered(),
+                            system: w.system.clone(),
+                            running_count: w.running_builds.len(),
+                            running_builds: w.running_builds.iter().cloned().collect(),
+                        })
+                        .collect();
+                    let _ = reply.send(workers);
+                }
+                #[cfg(test)]
+                ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
+                    let info = self.dag.node(&drv_hash).map(|s| DebugDerivationInfo {
+                        drv_hash: s.drv_hash.clone(),
+                        drv_path: s.drv_path().to_string(),
+                        status: s.status(),
+                        retry_count: s.retry_count,
+                        assigned_worker: s.assigned_worker.clone(),
+                        output_paths: s.output_paths.clone(),
+                    });
+                    let _ = reply.send(info);
+                }
+            }
+        }
+
+        info!("DAG actor shutting down");
+    }
+
+    // -----------------------------------------------------------------------
+    // Backpressure
+    // -----------------------------------------------------------------------
+
+    fn update_backpressure(&mut self, queue_len: usize, capacity: usize) {
+        let fraction = queue_len as f64 / capacity as f64;
+        let was_active = self.backpressure_active.load(Ordering::Relaxed);
+
+        if !was_active && fraction >= BACKPRESSURE_HIGH_WATERMARK {
+            self.backpressure_active.store(true, Ordering::Relaxed);
+            warn!(
+                queue_len,
+                capacity,
+                "backpressure activated at {:.0}% capacity",
+                fraction * 100.0
+            );
+            metrics::counter!("rio_scheduler_queue_backpressure").increment(1);
+        } else if was_active && fraction <= BACKPRESSURE_LOW_WATERMARK {
+            self.backpressure_active.store(false, Ordering::Relaxed);
+            info!(
+                queue_len,
+                capacity, "backpressure deactivated, resuming normal operation"
+            );
+        }
+    }
+
+    /// Clone the shared backpressure flag as a read-only reader for wiring
+    /// into ActorHandle. The actor keeps the writable Arc<AtomicBool>.
+    pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
+        BackpressureReader::new(self.backpressure_active.clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared helpers (used across merge/completion/dispatch/build submodules)
+    // -----------------------------------------------------------------------
+
+    fn emit_build_event(&mut self, build_id: Uuid, event: rio_proto::types::build_event::Event) {
+        let seq = self.build_sequences.entry(build_id).or_insert(0);
+        *seq += 1;
+
+        let build_event = rio_proto::types::BuildEvent {
+            build_id: build_id.to_string(),
+            sequence: *seq,
+            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            event: Some(event),
+        };
+
+        if let Some(tx) = self.build_events.get(&build_id) {
+            // broadcast::send returns Err only if there are no receivers, which is fine
+            let _ = tx.send(build_event);
+        }
+    }
+
+    fn get_interested_builds(&self, drv_hash: &str) -> Vec<Uuid> {
+        self.dag
+            .node(drv_hash)
+            .map(|s| s.interested_builds.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn drv_hash_to_path(&self, drv_hash: &str) -> Option<String> {
+        self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
+    }
+
+    /// Whether any interested build for this derivation is interactive (IFD).
+    /// Interactive derivations get push_front on the ready queue.
+    fn should_prioritize(&self, drv_hash: &str) -> bool {
+        self.get_interested_builds(drv_hash).iter().any(|build_id| {
+            self.builds
+                .get(build_id)
+                .map(|b| b.priority_class.is_interactive())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Resolve a drv_path to its drv_hash via the DAG's reverse index.
+    /// Used by handle_completion since the gRPC layer receives CompletionReport
+    /// with drv_path, but the DAG is keyed by drv_hash.
+    fn drv_path_to_hash(&self, drv_path: &str) -> Option<String> {
+        self.dag.hash_for_path(drv_path).map(str::to_string)
+    }
+
+    fn find_db_id_by_path(&self, drv_path: &str) -> Option<Uuid> {
+        self.dag
+            .hash_for_path(drv_path)
+            .and_then(|h| self.dag.node(h))
+            .and_then(|s| s.db_id)
+    }
+}
+
+mod build;
+mod completion;
+mod dispatch;
+mod merge;
+mod worker;
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+/// Handle for sending commands to the actor.
+#[derive(Clone)]
+pub struct ActorHandle {
+    tx: mpsc::Sender<ActorCommand>,
+    /// Shared read-only backpressure flag with the actor. The actor computes
+    /// hysteresis (activate at 80%, deactivate at 60%) and writes to its
+    /// Arc<AtomicBool>; the handle reads it via this read-only view for
+    /// send() and is_backpressured(). Without hysteresis, the handle used a
+    /// simple threshold -> flapping under load near 80%.
+    backpressure: BackpressureReader,
+}
+
+impl ActorHandle {
+    /// Create a new actor handle and spawn the actor task.
+    ///
+    /// Returns the handle for sending commands.
+    pub fn spawn(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
+        let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
+        let actor = DagActor::new(db, store_client);
+        let backpressure = actor.backpressure_flag();
+        let self_tx = tx.downgrade();
+        rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
+        Self { tx, backpressure }
+    }
+
+    /// Legacy constructor without self_tx (kept for tests that manually spawn).
+    #[cfg(test)]
+    pub fn spawn_without_cleanup(
+        db: SchedulerDb,
+        store_client: Option<StoreServiceClient<Channel>>,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
+        let actor = DagActor::new(db, store_client);
+        let backpressure = actor.backpressure_flag();
+        tokio::spawn(actor.run(rx));
+        Self { tx, backpressure }
+    }
+
+    /// Whether the actor task is still alive. Returns false if the actor
+    /// panicked or exited (its receiver dropped, closing the channel).
+    ///
+    /// gRPC handlers should check this and return UNAVAILABLE if false.
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// Send a command to the actor, checking backpressure (with hysteresis).
+    pub async fn send(&self, cmd: ActorCommand) -> Result<(), ActorError> {
+        // Read the actor's hysteresis-aware backpressure flag, not a simple
+        // threshold. Activated at 80%, stays active until drained to 60%.
+        if self.backpressure.is_active() {
+            return Err(ActorError::Backpressure);
+        }
+        self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
+    }
+
+    /// Try to send a command without waiting (for fire-and-forget messages).
+    /// Distinguishes `Full` (transient, retry helps) from `Closed` (actor
+    /// panicked, permanent) so callers can choose retry vs fail-fast.
+    pub fn try_send(&self, cmd: ActorCommand) -> Result<(), ActorError> {
+        use tokio::sync::mpsc::error::TrySendError;
+        self.tx.try_send(cmd).map_err(|e| match e {
+            TrySendError::Full(_) => ActorError::Backpressure,
+            TrySendError::Closed(_) => ActorError::ChannelSend,
+        })
+    }
+
+    /// Check if the actor is under backpressure (hysteresis-aware).
+    pub fn is_backpressured(&self) -> bool {
+        self.backpressure.is_active()
+    }
+
+    /// Send a command without backpressure check (for worker lifecycle events).
+    pub async fn send_unchecked(&self, cmd: ActorCommand) -> Result<(), ActorError> {
+        self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
+    }
+
+    /// Test-only: query all worker states.
+    #[cfg(test)]
+    pub async fn debug_query_workers(&self) -> Result<Vec<DebugWorkerInfo>, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugQueryWorkers { reply: tx })
+            .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
+
+    /// Test-only: query a derivation's state.
+    #[cfg(test)]
+    pub async fn debug_query_derivation(
+        &self,
+        drv_hash: &str,
+    ) -> Result<Option<DebugDerivationInfo>, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugQueryDerivation {
+            drv_hash: drv_hash.to_string(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
+}

@@ -14,6 +14,112 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
+// ===========================================================================
+// Newtypes for type-safe identifiers
+// ===========================================================================
+
+/// Derivation hash newtype. The 32-char nixbase32 hash part of a .drv store path.
+///
+/// Distinct from `drv_path` (full `/nix/store/HASH-name.drv` string). Prevents
+/// accidental swaps — see the post-2a `drv_key` rename where `handle_completion`
+/// took a `drv_hash: String` that was sometimes actually a path.
+///
+/// Implements `Borrow<str>` so `HashMap<DrvHash, _>::get(&str)` works.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DrvHash(String);
+
+impl DrvHash {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for DrvHash {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl From<&str> for DrvHash {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+impl std::fmt::Display for DrvHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::ops::Deref for DrvHash {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+impl std::borrow::Borrow<str> for DrvHash {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+impl AsRef<str> for DrvHash {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Worker identifier newtype (e.g., `"worker-0"` or a UUID).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkerId(String);
+
+impl WorkerId {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for WorkerId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+impl From<&str> for WorkerId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+impl std::fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::ops::Deref for WorkerId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+impl std::borrow::Borrow<str> for WorkerId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+impl AsRef<str> for WorkerId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// State of a single derivation in the global DAG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DerivationStatus {
