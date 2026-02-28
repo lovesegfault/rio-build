@@ -86,15 +86,12 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                     "build progress"
                 );
             }
-            Some(types::build_event::Event::Completed(completed)) => {
-                return Ok(BuildEventOutcome::Completed {
-                    output_paths: completed.output_paths,
-                });
+            Some(types::build_event::Event::Completed(_)) => {
+                return Ok(BuildEventOutcome::Completed);
             }
             Some(types::build_event::Event::Failed(failed)) => {
                 return Ok(BuildEventOutcome::Failed {
                     error_message: failed.error_message,
-                    failed_derivation: failed.failed_derivation,
                 });
             }
             Some(types::build_event::Event::Cancelled(cancelled)) => {
@@ -118,17 +115,9 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
 
 /// Outcome of processing a build event stream.
 enum BuildEventOutcome {
-    Completed {
-        output_paths: Vec<String>,
-    },
-    Failed {
-        error_message: String,
-        #[allow(dead_code)] // Informational, may be used for error context in future
-        failed_derivation: String,
-    },
-    Cancelled {
-        reason: String,
-    },
+    Completed,
+    Failed { error_message: String },
+    Cancelled { reason: String },
 }
 
 /// Submit a build to the scheduler and process events, returning a BuildResult.
@@ -173,10 +162,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 "build started"
             );
         }
-        if let Some(types::build_event::Event::Completed(ref completed)) = ev.event {
+        if let Some(types::build_event::Event::Completed(_)) = ev.event {
             // Remove from active builds
             active_build_ids.remove(&build_id);
-            return Ok(build_result_from_completed(&completed.output_paths));
+            return Ok(BuildResult::success());
         }
         if let Some(types::build_event::Event::Failed(ref failed)) = ev.event {
             active_build_ids.remove(&build_id);
@@ -194,10 +183,8 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     active_build_ids.remove(&build_id);
 
     match outcome {
-        Ok(BuildEventOutcome::Completed { output_paths }) => {
-            Ok(build_result_from_completed(&output_paths))
-        }
-        Ok(BuildEventOutcome::Failed { error_message, .. }) => Ok(BuildResult::failure(
+        Ok(BuildEventOutcome::Completed) => Ok(BuildResult::success()),
+        Ok(BuildEventOutcome::Failed { error_message }) => Ok(BuildResult::failure(
             BuildStatus::MiscFailure,
             error_message,
         )),
@@ -210,20 +197,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             format!("build stream error: {e}"),
         )),
     }
-}
-
-fn build_result_from_completed(_output_paths: &[String]) -> BuildResult {
-    BuildResult::new(
-        BuildStatus::Built,
-        String::new(),
-        1, // timesBuilt
-        false,
-        0,
-        0,
-        None,
-        None,
-        Vec::new(),
-    )
 }
 
 /// wopBuildDerivation (36): Build a derivation via scheduler.
