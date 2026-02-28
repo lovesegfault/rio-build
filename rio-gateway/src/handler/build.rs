@@ -1,0 +1,645 @@
+//! Build event → STDERR translation and build opcode handlers.
+
+use super::*;
+
+/// Process a BuildEvent stream from the scheduler and translate events
+/// into STDERR protocol messages for the Nix client.
+///
+/// Returns the final BuildResult on success, or an error message on failure.
+async fn process_build_events<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
+    active_build_ids: &mut HashMap<String, u64>,
+) -> anyhow::Result<BuildEventOutcome> {
+    let mut drv_activity_ids: HashMap<String, u64> = HashMap::new();
+
+    while let Some(event) = event_stream
+        .message()
+        .await
+        .map_err(|e| anyhow::anyhow!("build event stream error: {e}"))?
+    {
+        // Update active_build_ids with latest sequence
+        if let Some(seq) = active_build_ids.get_mut(&event.build_id) {
+            *seq = event.sequence;
+        }
+
+        match event.event {
+            Some(types::build_event::Event::Log(log_batch)) => {
+                for line in &log_batch.lines {
+                    let text = String::from_utf8_lossy(line);
+                    stderr.log(&text).await?;
+                }
+            }
+            Some(types::build_event::Event::Derivation(drv_event)) => {
+                match drv_event.status {
+                    Some(types::derivation_event::Status::Started(_)) => {
+                        // start_activity auto-assigns the ID
+                        let aid = stderr
+                            .start_activity(
+                                ActivityType::Build,
+                                &format!("building '{}'", drv_event.derivation_path),
+                                0, // level
+                                0, // parent
+                            )
+                            .await?;
+                        drv_activity_ids.insert(drv_event.derivation_path.clone(), aid);
+                    }
+                    Some(types::derivation_event::Status::Completed(_)) => {
+                        if let Some(aid) = drv_activity_ids.remove(&drv_event.derivation_path) {
+                            stderr.stop_activity(aid).await?;
+                        }
+                    }
+                    Some(types::derivation_event::Status::Failed(ref failed)) => {
+                        if let Some(aid) = drv_activity_ids.remove(&drv_event.derivation_path) {
+                            stderr.stop_activity(aid).await?;
+                        }
+                        // Log failure via STDERR_NEXT
+                        stderr
+                            .log(&format!(
+                                "derivation '{}' failed: {}",
+                                drv_event.derivation_path, failed.error_message
+                            ))
+                            .await?;
+                    }
+                    Some(types::derivation_event::Status::Cached(_)) => {
+                        // No activity to start/stop for cached derivations
+                    }
+                    Some(types::derivation_event::Status::Queued(_)) => {
+                        // No STDERR message for queued state
+                    }
+                    None => {}
+                }
+            }
+            Some(types::build_event::Event::Started(started)) => {
+                debug!(
+                    total = started.total_derivations,
+                    cached = started.cached_derivations,
+                    "build started"
+                );
+            }
+            Some(types::build_event::Event::Progress(prog)) => {
+                debug!(
+                    completed = prog.completed,
+                    running = prog.running,
+                    queued = prog.queued,
+                    total = prog.total,
+                    "build progress"
+                );
+            }
+            Some(types::build_event::Event::Completed(completed)) => {
+                return Ok(BuildEventOutcome::Completed {
+                    output_paths: completed.output_paths,
+                });
+            }
+            Some(types::build_event::Event::Failed(failed)) => {
+                return Ok(BuildEventOutcome::Failed {
+                    error_message: failed.error_message,
+                    failed_derivation: failed.failed_derivation,
+                });
+            }
+            Some(types::build_event::Event::Cancelled(cancelled)) => {
+                return Ok(BuildEventOutcome::Cancelled {
+                    reason: cancelled.reason,
+                });
+            }
+            None => {}
+        }
+    }
+
+    // Stream ended without a terminal event (scheduler disconnected).
+    // Do NOT send STDERR_ERROR here: submit_and_process_build catches this
+    // Err and converts it to Ok(BuildResult::failure), which callers then
+    // send via STDERR_LAST + BuildResult. Sending STDERR_ERROR here first
+    // would produce an invalid STDERR_ERROR -> STDERR_LAST frame sequence.
+    Err(anyhow::anyhow!(
+        "build event stream ended unexpectedly (scheduler disconnected?)"
+    ))
+}
+
+/// Outcome of processing a build event stream.
+enum BuildEventOutcome {
+    Completed {
+        output_paths: Vec<String>,
+    },
+    Failed {
+        error_message: String,
+        #[allow(dead_code)] // Informational, may be used for error context in future
+        failed_derivation: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+}
+
+/// Submit a build to the scheduler and process events, returning a BuildResult.
+async fn submit_and_process_build<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    scheduler_client: &mut SchedulerServiceClient<Channel>,
+    request: types::SubmitBuildRequest,
+    active_build_ids: &mut HashMap<String, u64>,
+) -> anyhow::Result<BuildResult> {
+    let mut event_stream = rio_common::grpc::with_timeout(
+        "SubmitBuild",
+        DEFAULT_GRPC_TIMEOUT,
+        scheduler_client.submit_build(request),
+    )
+    .await?
+    .into_inner();
+
+    // Extract build_id from first event if available
+    // (the first event should be BuildStarted)
+    // We'll track the build_id as we process events
+
+    // Peek at first message to get build_id
+    let first = event_stream
+        .message()
+        .await
+        .map_err(|e| anyhow::anyhow!("build event stream error: {e}"))?;
+
+    let build_id = match &first {
+        Some(ev) => ev.build_id.clone(),
+        None => return Err(anyhow::anyhow!("empty build event stream")),
+    };
+
+    active_build_ids.insert(build_id.clone(), 0);
+
+    // Process the first event
+    if let Some(ev) = &first {
+        if let Some(types::build_event::Event::Started(ref started)) = ev.event {
+            debug!(
+                build_id = %build_id,
+                total = started.total_derivations,
+                cached = started.cached_derivations,
+                "build started"
+            );
+        }
+        if let Some(types::build_event::Event::Completed(ref completed)) = ev.event {
+            // Remove from active builds
+            active_build_ids.remove(&build_id);
+            return Ok(build_result_from_completed(&completed.output_paths));
+        }
+        if let Some(types::build_event::Event::Failed(ref failed)) = ev.event {
+            active_build_ids.remove(&build_id);
+            return Ok(BuildResult::failure(
+                BuildStatus::MiscFailure,
+                failed.error_message.clone(),
+            ));
+        }
+    }
+
+    // Process remaining events
+    let outcome = process_build_events(stderr, &mut event_stream, active_build_ids).await;
+
+    // Remove from active builds
+    active_build_ids.remove(&build_id);
+
+    match outcome {
+        Ok(BuildEventOutcome::Completed { output_paths }) => {
+            Ok(build_result_from_completed(&output_paths))
+        }
+        Ok(BuildEventOutcome::Failed { error_message, .. }) => Ok(BuildResult::failure(
+            BuildStatus::MiscFailure,
+            error_message,
+        )),
+        Ok(BuildEventOutcome::Cancelled { reason }) => Ok(BuildResult::failure(
+            BuildStatus::MiscFailure,
+            format!("build cancelled: {reason}"),
+        )),
+        Err(e) => Ok(BuildResult::failure(
+            BuildStatus::MiscFailure,
+            format!("build stream error: {e}"),
+        )),
+    }
+}
+
+fn build_result_from_completed(_output_paths: &[String]) -> BuildResult {
+    BuildResult::new(
+        BuildStatus::Built,
+        String::new(),
+        1, // timesBuilt
+        false,
+        0,
+        0,
+        None,
+        None,
+        Vec::new(),
+    )
+}
+
+/// wopBuildDerivation (36): Build a derivation via scheduler.
+///
+/// Receives an inline BasicDerivation (no inputDrvs). Recovers the full
+/// Derivation from drv_cache to reconstruct the DAG.
+#[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store_client: &mut StoreServiceClient<Channel>,
+    scheduler_client: &mut SchedulerServiceClient<Channel>,
+    options: &Option<ClientOptions>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+    has_seen_build_paths_with_results: &bool,
+    active_build_ids: &mut HashMap<String, u64>,
+) -> anyhow::Result<()> {
+    let drv_path_str = wire::read_string(reader).await?;
+    let basic_drv = match read_basic_derivation(reader).await {
+        Ok(v) => v,
+        Err(e) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildDerivation: failed to read BasicDerivation: {e}"),
+            )
+            .await;
+        }
+    };
+    let build_mode_val = match wire::read_u64(reader).await {
+        Ok(v) => v,
+        Err(e) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildDerivation: failed to read build mode: {e}"),
+            )
+            .await;
+        }
+    };
+    let _build_mode = match BuildMode::try_from(build_mode_val) {
+        Ok(m) => m,
+        Err(_) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildDerivation: unsupported build mode {build_mode_val}"),
+            )
+            .await;
+        }
+    };
+
+    debug!(
+        path = %drv_path_str,
+        platform = %basic_drv.platform(),
+        builder = %basic_drv.builder(),
+        "wopBuildDerivation"
+    );
+
+    // IFD detection: if we haven't seen wopBuildPathsWithResults on this session,
+    // this is likely an IFD or build-hook request
+    let is_ifd_hint = !has_seen_build_paths_with_results;
+
+    // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
+    // The .drv should have been uploaded via wopAddToStoreNar before this call.
+    let drv_path = match StorePath::parse(&drv_path_str) {
+        Ok(p) => p,
+        Err(e) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("invalid drv path '{drv_path_str}': {e}"),
+            )
+            .await;
+        }
+    };
+
+    // Try to get the full derivation with inputDrvs
+    let full_drv = resolve_derivation(&drv_path, store_client, drv_cache).await;
+
+    // Reconstruct the DAG
+    let (nodes, edges) = match &full_drv {
+        Ok(drv) => {
+            match translate::reconstruct_dag(&drv_path, drv, store_client, drv_cache).await {
+                Ok((n, e)) => (n, e),
+                Err(dag_err) => {
+                    warn!(error = %dag_err, "DAG reconstruction failed, using single-node DAG");
+                    (
+                        translate::single_node_from_basic(&drv_path_str, &basic_drv),
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            debug!(error = %e, "full derivation not available, using single-node DAG");
+            (
+                translate::single_node_from_basic(&drv_path_str, &basic_drv),
+                Vec::new(),
+            )
+        }
+    };
+
+    let priority_class = if is_ifd_hint {
+        "interactive".to_string()
+    } else {
+        "ci".to_string()
+    };
+
+    let request = translate::build_submit_request(nodes, edges, options, &priority_class);
+
+    let build_result =
+        match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "build submission failed");
+                BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
+            }
+        };
+
+    debug!(
+        status = ?build_result.status(),
+        error_msg = %build_result.error_msg(),
+        "wopBuildDerivation result"
+    );
+
+    stderr.finish().await?;
+    write_build_result(stderr.inner_mut(), &build_result).await?;
+    Ok(())
+}
+
+/// wopBuildPaths (9): Build a set of derivations.
+#[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store_client: &mut StoreServiceClient<Channel>,
+    scheduler_client: &mut SchedulerServiceClient<Channel>,
+    options: &Option<ClientOptions>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+    active_build_ids: &mut HashMap<String, u64>,
+) -> anyhow::Result<()> {
+    let raw_paths = wire::read_strings(reader).await?;
+    let build_mode_val = wire::read_u64(reader).await?;
+    let _build_mode = match BuildMode::try_from(build_mode_val) {
+        Ok(m) => m,
+        Err(_) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!("wopBuildPaths: unsupported build mode {build_mode_val}"),
+            )
+            .await;
+        }
+    };
+
+    debug!(count = raw_paths.len(), "wopBuildPaths");
+
+    // Collect all derivation paths and reconstruct a combined DAG
+    let mut all_nodes = Vec::new();
+    let mut all_edges = Vec::new();
+
+    for raw in &raw_paths {
+        let dp = match DerivedPath::parse(raw) {
+            Ok(dp) => dp,
+            Err(e) => stderr_err!(stderr, "invalid DerivedPath '{raw}': {e}"),
+        };
+
+        match &dp {
+            DerivedPath::Opaque(path) => {
+                match grpc_is_valid_path(store_client, path).await {
+                    Ok(true) => { /* exists, fine */ }
+                    Ok(false) => {
+                        stderr_err!(stderr, "path '{path}' is not valid and cannot be built");
+                    }
+                    Err(e) => return send_store_error(stderr, e).await,
+                }
+            }
+            DerivedPath::Built { drv, .. } => {
+                let drv_obj = match resolve_derivation(drv, store_client, drv_cache).await {
+                    Ok(d) => d,
+                    Err(e) => return send_store_error(stderr, e).await,
+                };
+
+                match translate::reconstruct_dag(drv, &drv_obj, store_client, drv_cache).await {
+                    Ok((nodes, edges)) => {
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                    }
+                    Err(e) => {
+                        return send_store_error(
+                            stderr,
+                            anyhow::anyhow!("DAG reconstruction failed for '{}': {e}", drv),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    if all_nodes.is_empty() {
+        // All paths were opaque and valid -- nothing to build
+        stderr.finish().await?;
+        wire::write_u64(stderr.inner_mut(), 1).await?;
+        return Ok(());
+    }
+
+    // Deduplicate nodes by drv_path
+    let mut seen: HashSet<String> = HashSet::new();
+    all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
+
+    let request = translate::build_submit_request(all_nodes, all_edges, options, "ci");
+
+    let build_result =
+        match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
+            Ok(r) => r,
+            Err(e) => stderr_err!(stderr, "build failed: {e}"),
+        };
+
+    if !build_result.status().is_success() {
+        stderr_err!(stderr, "build failed: {}", build_result.error_msg());
+    }
+
+    stderr.finish().await?;
+    wire::write_u64(stderr.inner_mut(), 1).await?;
+    Ok(())
+}
+
+/// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
+#[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    stderr: &mut StderrWriter<&mut W>,
+    store_client: &mut StoreServiceClient<Channel>,
+    scheduler_client: &mut SchedulerServiceClient<Channel>,
+    options: &Option<ClientOptions>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+    active_build_ids: &mut HashMap<String, u64>,
+) -> anyhow::Result<()> {
+    let raw_paths = wire::read_strings(reader).await?;
+    let build_mode_val = wire::read_u64(reader).await?;
+    let _build_mode = match BuildMode::try_from(build_mode_val) {
+        Ok(m) => m,
+        Err(_) => {
+            return send_store_error(
+                stderr,
+                anyhow::anyhow!(
+                    "wopBuildPathsWithResults: unsupported build mode {build_mode_val}"
+                ),
+            )
+            .await;
+        }
+    };
+
+    debug!(count = raw_paths.len(), "wopBuildPathsWithResults");
+
+    let mut results = Vec::new();
+
+    // Collect all derivation paths to build together
+    let mut all_nodes = Vec::new();
+    let mut all_edges = Vec::new();
+    let mut drv_indices: Vec<Option<usize>> = Vec::new(); // maps raw_paths index to build result
+    let mut opaque_results: HashMap<usize, BuildResult> = HashMap::new();
+    // Track idx → (drvPath, Derivation) for successful Built paths so we can
+    // populate builtOutputs per-derivation after the build completes.
+    // Without builtOutputs, the client can't map the derivation to its outputs
+    // and falls back to some NAR-based verification → "error: no sink".
+    let mut drv_for_idx: HashMap<usize, (String, Derivation)> = HashMap::new();
+
+    for (idx, raw) in raw_paths.iter().enumerate() {
+        let dp = match DerivedPath::parse(raw) {
+            Ok(dp) => dp,
+            Err(e) => {
+                opaque_results.insert(
+                    idx,
+                    BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!("invalid path '{raw}': {e}"),
+                    ),
+                );
+                drv_indices.push(None);
+                continue;
+            }
+        };
+
+        match &dp {
+            DerivedPath::Opaque(path) => {
+                let result = match grpc_is_valid_path(store_client, path).await {
+                    Ok(true) => BuildResult::new(
+                        BuildStatus::AlreadyValid,
+                        String::new(),
+                        0,
+                        false,
+                        0,
+                        0,
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    Ok(false) => BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        format!("path '{}' not valid", path),
+                    ),
+                    Err(e) => {
+                        BuildResult::failure(BuildStatus::MiscFailure, format!("store error: {e}"))
+                    }
+                };
+                opaque_results.insert(idx, result);
+                drv_indices.push(None);
+            }
+            DerivedPath::Built { drv, .. } => {
+                let drv_obj = match resolve_derivation(drv, store_client, drv_cache).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        opaque_results.insert(
+                            idx,
+                            BuildResult::failure(BuildStatus::MiscFailure, format!("{e}")),
+                        );
+                        drv_indices.push(None);
+                        continue;
+                    }
+                };
+
+                match translate::reconstruct_dag(drv, &drv_obj, store_client, drv_cache).await {
+                    Ok((nodes, edges)) => {
+                        all_nodes.extend(nodes);
+                        all_edges.extend(edges);
+                        drv_indices.push(Some(idx));
+                        drv_for_idx.insert(idx, (drv.to_string(), drv_obj));
+                    }
+                    Err(e) => {
+                        opaque_results.insert(
+                            idx,
+                            BuildResult::failure(BuildStatus::MiscFailure, format!("{e}")),
+                        );
+                        drv_indices.push(None);
+                    }
+                }
+            }
+        }
+    }
+
+    if !all_nodes.is_empty() {
+        // Deduplicate nodes
+        let mut seen: HashSet<String> = HashSet::new();
+        all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
+
+        let request = translate::build_submit_request(all_nodes, all_edges, options, "ci");
+
+        let build_result =
+            submit_and_process_build(stderr, scheduler_client, request, active_build_ids)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
+                    metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
+                        .increment(1);
+                    BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
+                });
+
+        // Apply the build result to all derivation paths, enriching each with
+        // its builtOutputs (drvHashModulo!outputName → Realisation JSON).
+        // Uses drv_cache as the resolver for hash_derivation_modulo's transitive deps.
+        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+        for (idx, _raw) in raw_paths.iter().enumerate() {
+            if let Some(opaque) = opaque_results.remove(&idx) {
+                results.push(opaque);
+            } else if build_result.status().is_success() {
+                if let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx) {
+                    let resolve =
+                        |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+                    match rio_nix::derivation::hash_derivation_modulo(
+                        drv_obj,
+                        drv_path,
+                        &resolve,
+                        &mut hash_cache,
+                    ) {
+                        Ok(hash) => {
+                            let hash_hex = hex::encode(hash);
+                            results.push(
+                                build_result
+                                    .clone()
+                                    .with_outputs_from_drv(drv_obj, &hash_hex),
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                drv_path = %drv_path,
+                                error = %e,
+                                "hash_derivation_modulo failed; builtOutputs will be empty"
+                            );
+                            results.push(build_result.clone());
+                        }
+                    }
+                } else {
+                    results.push(build_result.clone());
+                }
+            } else {
+                results.push(build_result.clone());
+            }
+        }
+    } else {
+        // All paths were opaque
+        for idx in 0..raw_paths.len() {
+            results.push(opaque_results.remove(&idx).unwrap_or_else(|| {
+                BuildResult::failure(BuildStatus::MiscFailure, "unknown path".to_string())
+            }));
+        }
+    }
+
+    stderr.finish().await?;
+    let w = stderr.inner_mut();
+
+    wire::write_u64(w, results.len() as u64).await?;
+    for (raw, result) in raw_paths.iter().zip(results.iter()) {
+        wire::write_string(w, raw).await?;
+        write_build_result(w, result).await?;
+    }
+
+    Ok(())
+}
