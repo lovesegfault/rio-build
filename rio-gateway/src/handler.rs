@@ -32,6 +32,24 @@ use crate::translate;
 
 const PROGRAM_NAME: &str = "rio-gateway";
 
+/// Send a formatted error via STDERR_ERROR and return Err.
+///
+/// Expands to: send the message to the client, then `return Err(anyhow!(msg))`.
+/// The same message is used for both the client-visible error and the internal
+/// anyhow error. Use inside `match ... { Err(e) => stderr_err!(stderr, "... {e}") }`.
+macro_rules! stderr_err {
+    ($stderr:expr, $($arg:tt)*) => {{
+        let __msg = format!($($arg)*);
+        $stderr
+            .error(&::rio_nix::protocol::stderr::StderrError::simple(
+                PROGRAM_NAME,
+                __msg.clone(),
+            ))
+            .await?;
+        return Err(::anyhow::anyhow!(__msg));
+    }};
+}
+
 /// Client build options received via wopSetOptions.
 ///
 /// Propagated to the scheduler via gRPC `SubmitBuildRequest`.
@@ -906,13 +924,7 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Ok(p) => p,
         Err(e) => {
             debug!(path = %path_str, error = %e, "invalid store path in wopNarFromPath");
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("invalid store path '{path_str}': {e}'"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("invalid store path '{path_str}': {e}"));
+            stderr_err!(stderr, "invalid store path '{path_str}': {e}");
         }
     };
 
@@ -928,13 +940,7 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("path '{}' is not valid", path_str),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!("path '{path_str}' is not valid"));
+                stderr_err!(stderr, "path '{path_str}' is not valid");
             }
             Ok(Err(e)) => {
                 return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath failed: {e}")).await;
@@ -1153,55 +1159,25 @@ async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Un
     debug!(path = %path_str, nar_size = nar_size, "wopAddToStoreNar");
 
     if nar_size > wire::MAX_FRAMED_TOTAL {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("nar_size {nar_size} exceeds maximum for {path_str}"),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("nar_size exceeds maximum"));
+        stderr_err!(stderr, "nar_size {nar_size} exceeds maximum for {path_str}");
     }
 
     // Validate store path
     let path = match StorePath::parse(&path_str) {
         Ok(p) => p,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("invalid store path '{path_str}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("invalid store path: {e}"));
-        }
+        Err(e) => stderr_err!(stderr, "invalid store path '{path_str}': {e}"),
     };
 
     // Validate narHash hex
     let nar_hash_bytes = match hex::decode(&nar_hash_str) {
         Ok(b) => b,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("invalid narHash hex '{nar_hash_str}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("invalid narHash hex: {e}"));
-        }
+        Err(e) => stderr_err!(stderr, "invalid narHash hex '{nar_hash_str}': {e}"),
     };
 
     // Read NAR data via framed stream
     let nar_data = match wire::read_framed_stream(reader).await {
         Ok(data) => data,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("failed to read framed NAR for '{path_str}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to read framed NAR: {e}"));
-        }
+        Err(e) => stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}"),
     };
 
     // Upload to store via gRPC
@@ -1330,28 +1306,12 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
     let dump_data = match wire::read_framed_stream(reader).await {
         Ok(data) => data,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("failed to read dump data for '{name}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to read dump data: {e}"));
-        }
+        Err(e) => stderr_err!(stderr, "failed to read dump data for '{name}': {e}"),
     };
 
     let (is_text, is_recursive, hash_algo) = match parse_cam_str(&cam_str) {
         Ok(v) => v,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("invalid content-address method '{cam_str}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("invalid content-address method: {e}"));
-        }
+        Err(e) => stderr_err!(stderr, "invalid content-address method '{cam_str}': {e}"),
     };
 
     let content_hash = NixHash::compute(hash_algo, &dump_data);
@@ -1360,45 +1320,28 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     for s in &references {
         match StorePath::parse(s) {
             Ok(p) => ref_paths.push(p),
-            Err(e) => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("invalid reference path '{s}' for wopAddToStore: {e}"),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!("invalid reference path '{s}': {e}"));
-            }
+            Err(e) => stderr_err!(
+                stderr,
+                "invalid reference path '{s}' for wopAddToStore: {e}"
+            ),
         }
     }
 
     let path = if is_text {
         match StorePath::make_text(&name, &content_hash, &ref_paths) {
             Ok(p) => p,
-            Err(e) => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("failed to compute text store path for '{name}': {e}"),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!("failed to compute text store path: {e}"));
-            }
+            Err(e) => stderr_err!(
+                stderr,
+                "failed to compute text store path for '{name}': {e}"
+            ),
         }
     } else {
         match StorePath::make_fixed_output(&name, &content_hash, is_recursive) {
             Ok(p) => p,
-            Err(e) => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("failed to compute fixed-output store path for '{name}': {e}"),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!(
-                    "failed to compute fixed-output store path: {e}"
-                ));
-            }
+            Err(e) => stderr_err!(
+                stderr,
+                "failed to compute fixed-output store path for '{name}': {e}"
+            ),
         }
     };
 
@@ -1411,13 +1354,7 @@ async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         };
         let mut buf = Vec::new();
         if let Err(e) = nar::serialize(&mut buf, &node) {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("failed to serialize NAR for '{name}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to serialize NAR: {e}"));
+            stderr_err!(stderr, "failed to serialize NAR for '{name}': {e}");
         }
         buf
     };
@@ -1492,28 +1429,20 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match StorePath::parse(s) {
             Ok(p) => ref_paths.push(p),
             Err(e) => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("invalid reference path '{s}' for wopAddTextToStore: {e}"),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!("invalid reference path '{s}': {e}"));
+                stderr_err!(
+                    stderr,
+                    "invalid reference path '{s}' for wopAddTextToStore: {e}"
+                );
             }
         }
     }
 
     let path = match StorePath::make_text(&name, &content_hash, &ref_paths) {
         Ok(p) => p,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("failed to compute text store path for '{name}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to compute text store path: {e}"));
-        }
+        Err(e) => stderr_err!(
+            stderr,
+            "failed to compute text store path for '{name}': {e}"
+        ),
     };
 
     let node = NarNode::Regular {
@@ -1522,13 +1451,7 @@ async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     };
     let mut nar_data = Vec::new();
     if let Err(e) = nar::serialize(&mut nar_data, &node) {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("failed to serialize NAR for '{name}': {e}"),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("failed to serialize NAR: {e}"));
+        stderr_err!(stderr, "failed to serialize NAR for '{name}': {e}");
     }
 
     let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar_data);
@@ -1614,15 +1537,10 @@ async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpi
 
     let stream_data = match wire::read_framed_stream(reader).await {
         Ok(data) => data,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("wopAddMultipleToStore: failed to read framed stream: {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("failed to read framed stream: {e}"));
-        }
+        Err(e) => stderr_err!(
+            stderr,
+            "wopAddMultipleToStore: failed to read framed stream: {e}"
+        ),
     };
 
     let mut cursor = std::io::Cursor::new(stream_data.as_slice());
@@ -1631,27 +1549,17 @@ async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpi
     // first (`readNum<uint64_t>(source)`) before the per-entry loop.
     let num_paths = match wire::read_u64(&mut cursor).await {
         Ok(n) => n,
-        Err(e) => {
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("wopAddMultipleToStore: missing num_paths prefix: {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("missing num_paths prefix: {e}"));
-        }
+        Err(e) => stderr_err!(
+            stderr,
+            "wopAddMultipleToStore: missing num_paths prefix: {e}"
+        ),
     };
     if num_paths > wire::MAX_COLLECTION_COUNT {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!(
-                    "wopAddMultipleToStore: num_paths {num_paths} exceeds MAX_COLLECTION_COUNT {}",
-                    wire::MAX_COLLECTION_COUNT
-                ),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!("num_paths {num_paths} exceeds maximum"));
+        stderr_err!(
+            stderr,
+            "wopAddMultipleToStore: num_paths {num_paths} exceeds MAX_COLLECTION_COUNT {}",
+            wire::MAX_COLLECTION_COUNT
+        );
     }
 
     debug!(
@@ -1690,13 +1598,7 @@ async fn handle_query_derivation_output_map<R: AsyncRead + Unpin, W: AsyncWrite 
         Ok(p) => p,
         Err(e) => {
             warn!(path = %drv_path_str, error = %e, "invalid store path");
-            stderr
-                .error(&StderrError::simple(
-                    PROGRAM_NAME,
-                    format!("invalid store path '{drv_path_str}': {e}"),
-                ))
-                .await?;
-            return Err(anyhow::anyhow!("invalid store path: {e}"));
+            stderr_err!(stderr, "invalid store path '{drv_path_str}': {e}");
         }
     };
 
@@ -1879,15 +1781,7 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     for raw in &raw_paths {
         let dp = match DerivedPath::parse(raw) {
             Ok(dp) => dp,
-            Err(e) => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("invalid DerivedPath '{raw}': {e}"),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!("invalid DerivedPath: {e}"));
-            }
+            Err(e) => stderr_err!(stderr, "invalid DerivedPath '{raw}': {e}"),
         };
 
         match &dp {
@@ -1895,13 +1789,7 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 match grpc_is_valid_path(store_client, path).await {
                     Ok(true) => { /* exists, fine */ }
                     Ok(false) => {
-                        stderr
-                            .error(&StderrError::simple(
-                                PROGRAM_NAME,
-                                format!("path '{}' is not valid and cannot be built", path),
-                            ))
-                            .await?;
-                        return Err(anyhow::anyhow!("invalid opaque path: {}", path));
+                        stderr_err!(stderr, "path '{path}' is not valid and cannot be built");
                     }
                     Err(e) => return send_store_error(stderr, e).await,
                 }
@@ -1945,28 +1833,11 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let build_result =
         match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
             Ok(r) => r,
-            Err(e) => {
-                stderr
-                    .error(&StderrError::simple(
-                        PROGRAM_NAME,
-                        format!("build failed: {e}"),
-                    ))
-                    .await?;
-                return Err(anyhow::anyhow!("build failed: {e}"));
-            }
+            Err(e) => stderr_err!(stderr, "build failed: {e}"),
         };
 
     if !build_result.status().is_success() {
-        stderr
-            .error(&StderrError::simple(
-                PROGRAM_NAME,
-                format!("build failed: {}", build_result.error_msg()),
-            ))
-            .await?;
-        return Err(anyhow::anyhow!(
-            "build failed: {}",
-            build_result.error_msg()
-        ));
+        stderr_err!(stderr, "build failed: {}", build_result.error_msg());
     }
 
     stderr.finish().await?;
