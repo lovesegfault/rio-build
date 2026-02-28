@@ -497,22 +497,19 @@ pub fn split_set_options(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
 pub fn assert_field_conformance(
     expected: &[ResponseField],
     actual: &[ResponseField],
-    skip: &[String],
+    skip: &[&str],
 ) {
     for fields in [expected, actual] {
-        for f in fields.iter().filter(|f| skip.iter().any(|s| s == f.name)) {
+        for f in fields.iter().filter(|f| skip.contains(&f.name)) {
             validate_skipped_field(f);
         }
     }
 
     let exp_filtered: Vec<_> = expected
         .iter()
-        .filter(|f| !skip.iter().any(|s| s == f.name))
+        .filter(|f| !skip.contains(&f.name))
         .collect();
-    let act_filtered: Vec<_> = actual
-        .iter()
-        .filter(|f| !skip.iter().any(|s| s == f.name))
-        .collect();
+    let act_filtered: Vec<_> = actual.iter().filter(|f| !skip.contains(&f.name)).collect();
 
     assert_eq!(
         exp_filtered.len(),
@@ -648,8 +645,7 @@ pub async fn build_query_path_info_bytes(path: &str) -> Vec<u8> {
 pub async fn build_query_valid_paths_bytes(paths: &[&str], substitute: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     wire::write_u64(&mut buf, 31).await.unwrap();
-    let owned: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
-    wire::write_strings(&mut buf, &owned).await.unwrap();
+    wire::write_strings(&mut buf, paths).await.unwrap();
     wire::write_bool(&mut buf, substitute).await.unwrap();
     buf
 }
@@ -664,8 +660,7 @@ pub async fn build_add_temp_root_bytes(path: &str) -> Vec<u8> {
 pub async fn build_query_missing_bytes(paths: &[&str]) -> Vec<u8> {
     let mut buf = Vec::new();
     wire::write_u64(&mut buf, 40).await.unwrap();
-    let owned: Vec<String> = paths.iter().map(|s| (*s).to_string()).collect();
-    wire::write_strings(&mut buf, &owned).await.unwrap();
+    wire::write_strings(&mut buf, paths).await.unwrap();
     buf
 }
 
@@ -687,7 +682,6 @@ pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> Vec<u8> {
     let mut buf = Vec::new();
     wire::write_u64(&mut buf, 37).await.unwrap();
     wire::write_string(&mut buf, path).await.unwrap();
-    let owned: Vec<String> = sigs.iter().map(|s| (*s).to_string()).collect();
-    wire::write_strings(&mut buf, &owned).await.unwrap();
+    wire::write_strings(&mut buf, sigs).await.unwrap();
     buf
 }

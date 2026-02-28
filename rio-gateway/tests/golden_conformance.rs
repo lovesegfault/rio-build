@@ -108,8 +108,6 @@ async fn run_live_conformance(
 
     let rio_response = gateway_response(&client_bytes, store).await;
 
-    let skip_strings: Vec<String> = skip.iter().map(|s| (*s).to_string()).collect();
-
     let (daemon_hs, daemon_rest) = golden::split_handshake(&daemon_response).await;
     let (rio_hs, rio_rest) = golden::split_handshake(&rio_response).await;
 
@@ -117,7 +115,7 @@ async fn run_live_conformance(
     let rio_hs_fields = golden::parse_handshake_fields(&rio_hs).await;
     golden::assert_fully_consumed(&daemon_hs, &daemon_hs_fields, "daemon handshake");
     golden::assert_fully_consumed(&rio_hs, &rio_hs_fields, "rio-gateway handshake");
-    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, &skip_strings);
+    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, skip);
 
     if !daemon_rest.is_empty() {
         let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
@@ -127,7 +125,7 @@ async fn run_live_conformance(
         let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
         golden::assert_fully_consumed(&daemon_so, &daemon_so_fields, "daemon SetOptions");
         golden::assert_fully_consumed(&rio_so, &rio_so_fields, "rio-gateway SetOptions");
-        golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, &skip_strings);
+        golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, skip);
 
         if !daemon_op.is_empty() {
             let daemon_op_stripped = golden::strip_stderr_activity(&daemon_op).await;
@@ -135,7 +133,7 @@ async fn run_live_conformance(
             let rio_op_fields = parse_opcode(&rio_op).await;
             golden::assert_fully_consumed(&daemon_op_stripped, &daemon_op_fields, "daemon opcode");
             golden::assert_fully_consumed(&rio_op, &rio_op_fields, "rio-gateway opcode");
-            golden::assert_field_conformance(&daemon_op_fields, &rio_op_fields, &skip_strings);
+            golden::assert_field_conformance(&daemon_op_fields, &rio_op_fields, skip);
         }
     }
 }
@@ -179,8 +177,7 @@ async fn test_golden_live_handshake() {
 
     let daemon_fields = golden::parse_handshake_fields(&daemon_response).await;
     let rio_fields = golden::parse_handshake_fields(&rio_response).await;
-    let skip: Vec<String> = SKIP_FIELDS.iter().map(|s| (*s).to_string()).collect();
-    golden::assert_field_conformance(&daemon_fields, &rio_fields, &skip);
+    golden::assert_field_conformance(&daemon_fields, &rio_fields, SKIP_FIELDS);
 }
 
 #[tokio::test]
@@ -300,21 +297,19 @@ async fn test_golden_live_nar_from_path() {
 
     let rio_response = gateway_response(&client_bytes, store).await;
 
-    let skip_strings: Vec<String> = SKIP_FIELDS.iter().map(|s| (*s).to_string()).collect();
-
     // Compare handshake
     let (daemon_hs, daemon_rest) = golden::split_handshake(&daemon_response).await;
     let (rio_hs, rio_rest) = golden::split_handshake(&rio_response).await;
     let daemon_hs_fields = golden::parse_handshake_fields(&daemon_hs).await;
     let rio_hs_fields = golden::parse_handshake_fields(&rio_hs).await;
-    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, &skip_strings);
+    golden::assert_field_conformance(&daemon_hs_fields, &rio_hs_fields, SKIP_FIELDS);
 
     // Compare SetOptions
     let (daemon_so, daemon_op) = golden::split_set_options(&daemon_rest);
     let (rio_so, rio_op) = golden::split_set_options(&rio_rest);
     let daemon_so_fields = golden::parse_set_options_fields(&daemon_so).await;
     let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
-    golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, &skip_strings);
+    golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, SKIP_FIELDS);
 
     // Compare NAR content. Both sides now use STDERR_LAST + raw NAR (rio-gateway
     // was fixed to match the daemon; see wopNarFromPath handler).

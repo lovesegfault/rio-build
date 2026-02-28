@@ -447,7 +447,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     let w = stderr.inner_mut();
 
     wire::write_strings(w, &will_build).await?;
-    wire::write_strings(w, &[]).await?; // willSubstitute: always empty
+    wire::write_strings(w, wire::NO_STRINGS).await?; // willSubstitute: always empty
     wire::write_strings(w, &unknown).await?;
     wire::write_u64(w, 0).await?; // downloadSize
     wire::write_u64(w, 0).await?; // narSize

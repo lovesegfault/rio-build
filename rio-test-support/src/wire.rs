@@ -26,8 +26,7 @@ pub async fn do_handshake(s: &mut DuplexStream) {
     );
     let _server_version = wire::read_u64(s).await.unwrap();
 
-    let features: Vec<String> = vec![];
-    wire::write_strings(s, &features).await.unwrap();
+    wire::write_strings(s, wire::NO_STRINGS).await.unwrap();
     s.flush().await.unwrap();
     let _server_features = wire::read_strings(s).await.unwrap();
 

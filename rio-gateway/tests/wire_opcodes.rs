@@ -427,13 +427,17 @@ async fn test_add_to_store_nar_accepts_valid() {
     wire::write_string(&mut h.stream, &hex::encode(hash))
         .await
         .unwrap();
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // references
     wire::write_u64(&mut h.stream, 0).await.unwrap(); // registration_time
     wire::write_u64(&mut h.stream, nar.len() as u64)
         .await
         .unwrap(); // nar_size
     wire::write_bool(&mut h.stream, false).await.unwrap(); // ultimate
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // sigs
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // sigs
     wire::write_string(&mut h.stream, "").await.unwrap(); // ca
     wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
     wire::write_bool(&mut h.stream, true).await.unwrap(); // dont_check_sigs
@@ -472,13 +476,17 @@ async fn test_add_to_store_nar_passes_declared_hash() {
     wire::write_string(&mut h.stream, &hex::encode(declared_hash))
         .await
         .unwrap();
-    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_u64(&mut h.stream, 0).await.unwrap();
     wire::write_u64(&mut h.stream, nar.len() as u64)
         .await
         .unwrap();
     wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_string(&mut h.stream, "").await.unwrap();
     wire::write_bool(&mut h.stream, false).await.unwrap();
     wire::write_bool(&mut h.stream, true).await.unwrap();
@@ -532,13 +540,17 @@ async fn test_add_multiple_to_store_batch() {
     wire::write_string(&mut inner, &hex::encode(hash_a))
         .await
         .unwrap();
-    wire::write_strings(&mut inner, &[]).await.unwrap(); // refs
+    wire::write_strings(&mut inner, wire::NO_STRINGS)
+        .await
+        .unwrap(); // refs
     wire::write_u64(&mut inner, 0).await.unwrap(); // regtime
     wire::write_u64(&mut inner, nar_a.len() as u64)
         .await
         .unwrap(); // nar_size
     wire::write_bool(&mut inner, false).await.unwrap(); // ultimate
-    wire::write_strings(&mut inner, &[]).await.unwrap(); // sigs
+    wire::write_strings(&mut inner, wire::NO_STRINGS)
+        .await
+        .unwrap(); // sigs
     wire::write_string(&mut inner, "").await.unwrap(); // ca
     // NAR: narSize plain bytes (NOT framed)
     inner.extend_from_slice(&nar_a);
@@ -550,13 +562,17 @@ async fn test_add_multiple_to_store_batch() {
     wire::write_string(&mut inner, &hex::encode(hash_b))
         .await
         .unwrap();
-    wire::write_strings(&mut inner, &[]).await.unwrap();
+    wire::write_strings(&mut inner, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_u64(&mut inner, 0).await.unwrap();
     wire::write_u64(&mut inner, nar_b.len() as u64)
         .await
         .unwrap();
     wire::write_bool(&mut inner, false).await.unwrap();
-    wire::write_strings(&mut inner, &[]).await.unwrap();
+    wire::write_strings(&mut inner, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_string(&mut inner, "").await.unwrap();
     inner.extend_from_slice(&nar_b);
 
@@ -594,14 +610,18 @@ async fn test_add_multiple_to_store_truncated_nar() {
     wire::write_string(&mut inner, &hex::encode(hash))
         .await
         .unwrap();
-    wire::write_strings(&mut inner, &[]).await.unwrap();
+    wire::write_strings(&mut inner, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_u64(&mut inner, 0).await.unwrap();
     // LIE about nar_size: claim more bytes than we actually send.
     wire::write_u64(&mut inner, nar.len() as u64 + 100)
         .await
         .unwrap();
     wire::write_bool(&mut inner, false).await.unwrap();
-    wire::write_strings(&mut inner, &[]).await.unwrap();
+    wire::write_strings(&mut inner, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_string(&mut inner, "").await.unwrap();
     inner.extend_from_slice(&nar); // actual NAR, 100 bytes short of claimed size
 
@@ -638,7 +658,7 @@ async fn test_add_signatures_stub_returns_success() {
     wire::write_string(&mut h.stream, TEST_PATH_A)
         .await
         .unwrap();
-    wire::write_strings(&mut h.stream, &["sig:fake".to_string()])
+    wire::write_strings(&mut h.stream, &["sig:fake"])
         .await
         .unwrap();
     h.stream.flush().await.unwrap();
@@ -990,7 +1010,9 @@ async fn test_add_text_to_store() {
     wire::write_string(&mut h.stream, "hello world")
         .await
         .unwrap(); // text
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // references
     h.stream.flush().await.unwrap();
 
     drain_stderr_until_last(&mut h.stream).await;
@@ -1025,7 +1047,9 @@ async fn test_add_to_store_text_method() {
     wire::write_string(&mut h.stream, "text:sha256")
         .await
         .unwrap(); // cam_str
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // references
     wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
     wire::write_framed_stream(&mut h.stream, content, 8192)
         .await
@@ -1079,7 +1103,9 @@ async fn test_add_to_store_fixed_flat() {
     wire::write_string(&mut h.stream, "fixed:sha256")
         .await
         .unwrap(); // cam_str (flat, no r:)
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // references
     wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
     wire::write_framed_stream(&mut h.stream, content, 8192)
         .await
@@ -1124,7 +1150,9 @@ async fn test_add_to_store_invalid_cam_str_returns_error() {
     wire::write_string(&mut h.stream, "bogus:sha256")
         .await
         .unwrap(); // INVALID cam_str
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // references
     wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
     // Handler reads framed stream BEFORE parsing cam_str, so we must send it.
     wire::write_framed_stream(&mut h.stream, b"data", 8192)
@@ -1169,7 +1197,9 @@ async fn test_build_derivation_basic_format() {
     wire::write_string(&mut h.stream, "").await.unwrap(); // hash
 
     // input_srcs
-    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap();
     // platform
     wire::write_string(&mut h.stream, "x86_64-linux")
         .await
@@ -1177,16 +1207,13 @@ async fn test_build_derivation_basic_format() {
     // builder
     wire::write_string(&mut h.stream, "/bin/sh").await.unwrap();
     // args
-    wire::write_strings(&mut h.stream, &["-c".into(), "echo hi".into()])
+    wire::write_strings(&mut h.stream, &["-c", "echo hi"])
         .await
         .unwrap();
     // env pairs
-    wire::write_string_pairs(
-        &mut h.stream,
-        &[("out".into(), "/nix/store/zzz-output".into())],
-    )
-    .await
-    .unwrap();
+    wire::write_string_pairs(&mut h.stream, &[("out", "/nix/store/zzz-output")])
+        .await
+        .unwrap();
 
     // build_mode
     wire::write_u64(&mut h.stream, 0).await.unwrap();
@@ -1257,12 +1284,9 @@ async fn test_query_valid_paths_filters_missing() {
     // TEST_PATH_MISSING is not seeded.
 
     wire::write_u64(&mut h.stream, 31).await.unwrap(); // wopQueryValidPaths
-    wire::write_strings(
-        &mut h.stream,
-        &[TEST_PATH_A.into(), TEST_PATH_MISSING.into()],
-    )
-    .await
-    .unwrap();
+    wire::write_strings(&mut h.stream, &[TEST_PATH_A, TEST_PATH_MISSING])
+        .await
+        .unwrap();
     wire::write_bool(&mut h.stream, false).await.unwrap(); // substitute
     h.stream.flush().await.unwrap();
 
@@ -1283,7 +1307,9 @@ async fn test_query_valid_paths_empty() {
     let mut h = TestHarness::setup().await;
 
     wire::write_u64(&mut h.stream, 31).await.unwrap();
-    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_bool(&mut h.stream, false).await.unwrap();
     h.stream.flush().await.unwrap();
 
@@ -1357,11 +1383,15 @@ async fn test_add_to_store_nar_invalid_path_returns_error() {
     wire::write_string(&mut h.stream, &hex::encode([0u8; 32]))
         .await
         .unwrap(); // narHash
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // references
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // references
     wire::write_u64(&mut h.stream, 0).await.unwrap(); // reg_time
     wire::write_u64(&mut h.stream, 100).await.unwrap(); // nar_size
     wire::write_bool(&mut h.stream, false).await.unwrap(); // ultimate
-    wire::write_strings(&mut h.stream, &[]).await.unwrap(); // sigs
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap(); // sigs
     wire::write_string(&mut h.stream, "").await.unwrap(); // ca
     wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
     wire::write_bool(&mut h.stream, true).await.unwrap(); // dontCheckSigs
@@ -1392,11 +1422,15 @@ async fn test_add_to_store_nar_oversized_returns_error() {
     wire::write_string(&mut h.stream, &hex::encode([0u8; 32]))
         .await
         .unwrap();
-    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_u64(&mut h.stream, 0).await.unwrap();
     wire::write_u64(&mut h.stream, u64::MAX).await.unwrap(); // nar_size HUGE
     wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_strings(&mut h.stream, &[]).await.unwrap();
+    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
+        .await
+        .unwrap();
     wire::write_string(&mut h.stream, "").await.unwrap();
     wire::write_bool(&mut h.stream, false).await.unwrap();
     wire::write_bool(&mut h.stream, true).await.unwrap();
@@ -1421,7 +1455,7 @@ async fn test_build_paths_with_results_invalid_derived_path() {
 
     wire::write_u64(&mut h.stream, 46).await.unwrap();
     // One invalid DerivedPath (unparseable).
-    wire::write_strings(&mut h.stream, &["garbage!not@a#path".into()])
+    wire::write_strings(&mut h.stream, &["garbage!not@a#path"])
         .await
         .unwrap();
     wire::write_u64(&mut h.stream, 0).await.unwrap(); // buildMode = Normal

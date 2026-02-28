@@ -25,8 +25,7 @@ async fn query_valid_paths(s: &mut DuplexStream, paths: &[&str]) -> Vec<String> 
     wire::write_u64(s, 31).await.unwrap(); // wopQueryValidPaths
 
     // Write paths as string collection
-    let path_strings: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
-    wire::write_strings(s, &path_strings).await.unwrap();
+    wire::write_strings(s, paths).await.unwrap();
 
     // Write substitute flag (bool = u64)
     wire::write_u64(s, 0).await.unwrap();
