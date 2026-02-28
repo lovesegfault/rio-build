@@ -77,7 +77,7 @@ where
                 debug!("client disconnected (EOF)");
 
                 // On disconnect, cancel all active builds
-                for (build_id, _) in &ctx.active_build_ids {
+                for build_id in ctx.active_build_ids.keys() {
                     debug!(build_id = %build_id, "cancelling build on disconnect");
                     let req = types::CancelBuildRequest {
                         build_id: build_id.clone(),
