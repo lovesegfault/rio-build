@@ -27,7 +27,7 @@ pub enum HashError {
 
     #[error("wrong digest length for {algo}: expected {expected}, got {got}")]
     WrongDigestLength {
-        algo: String,
+        algo: &'static str,
         expected: usize,
         got: usize,
     },
@@ -105,7 +105,7 @@ impl NixHash {
     pub fn new(algo: HashAlgo, digest: Vec<u8>) -> Result<Self, HashError> {
         if digest.len() != algo.digest_len() {
             return Err(HashError::WrongDigestLength {
-                algo: algo.as_str().to_string(),
+                algo: algo.as_str(),
                 expected: algo.digest_len(),
                 got: digest.len(),
             });

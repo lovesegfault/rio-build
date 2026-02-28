@@ -33,7 +33,7 @@ pub enum NarInfoError {
     InvalidFileSize(String),
 
     #[error("duplicate field: {0}")]
-    DuplicateField(String),
+    DuplicateField(&'static str),
 }
 
 /// Parsed narinfo metadata.
@@ -97,31 +97,31 @@ impl NarInfo {
             match key {
                 "StorePath" => {
                     if store_path.is_some() {
-                        return Err(NarInfoError::DuplicateField("StorePath".to_string()));
+                        return Err(NarInfoError::DuplicateField("StorePath"));
                     }
                     store_path = Some(value.to_string());
                 }
                 "URL" => {
                     if url.is_some() {
-                        return Err(NarInfoError::DuplicateField("URL".to_string()));
+                        return Err(NarInfoError::DuplicateField("URL"));
                     }
                     url = Some(value.to_string());
                 }
                 "Compression" => {
                     if compression.is_some() {
-                        return Err(NarInfoError::DuplicateField("Compression".to_string()));
+                        return Err(NarInfoError::DuplicateField("Compression"));
                     }
                     compression = Some(value.to_string());
                 }
                 "NarHash" => {
                     if nar_hash.is_some() {
-                        return Err(NarInfoError::DuplicateField("NarHash".to_string()));
+                        return Err(NarInfoError::DuplicateField("NarHash"));
                     }
                     nar_hash = Some(value.to_string());
                 }
                 "NarSize" => {
                     if nar_size.is_some() {
-                        return Err(NarInfoError::DuplicateField("NarSize".to_string()));
+                        return Err(NarInfoError::DuplicateField("NarSize"));
                     }
                     nar_size = Some(
                         value
@@ -131,7 +131,7 @@ impl NarInfo {
                 }
                 "References" => {
                     if refs_seen {
-                        return Err(NarInfoError::DuplicateField("References".to_string()));
+                        return Err(NarInfoError::DuplicateField("References"));
                     }
                     refs_seen = true;
                     if !value.is_empty() {
@@ -140,26 +140,26 @@ impl NarInfo {
                 }
                 "Deriver" => {
                     if deriver.is_some() {
-                        return Err(NarInfoError::DuplicateField("Deriver".to_string()));
+                        return Err(NarInfoError::DuplicateField("Deriver"));
                     }
                     deriver = Some(value.to_string());
                 }
                 "Sig" => sigs.push(value.to_string()),
                 "CA" => {
                     if ca.is_some() {
-                        return Err(NarInfoError::DuplicateField("CA".to_string()));
+                        return Err(NarInfoError::DuplicateField("CA"));
                     }
                     ca = Some(value.to_string());
                 }
                 "FileHash" => {
                     if file_hash.is_some() {
-                        return Err(NarInfoError::DuplicateField("FileHash".to_string()));
+                        return Err(NarInfoError::DuplicateField("FileHash"));
                     }
                     file_hash = Some(value.to_string());
                 }
                 "FileSize" => {
                     if file_size.is_some() {
-                        return Err(NarInfoError::DuplicateField("FileSize".to_string()));
+                        return Err(NarInfoError::DuplicateField("FileSize"));
                     }
                     file_size = Some(
                         value
@@ -759,7 +759,7 @@ CA: fixed:sha256:second
 ";
         let err = NarInfo::parse(text).unwrap_err();
         assert!(
-            matches!(err, NarInfoError::DuplicateField(ref f) if f == "CA"),
+            matches!(err, NarInfoError::DuplicateField(f) if f == "CA"),
             "expected DuplicateField(\"CA\"), got: {err:?}"
         );
     }
@@ -777,7 +777,7 @@ FileHash: sha256:second
 ";
         let err = NarInfo::parse(text).unwrap_err();
         assert!(
-            matches!(err, NarInfoError::DuplicateField(ref f) if f == "FileHash"),
+            matches!(err, NarInfoError::DuplicateField(f) if f == "FileHash"),
             "expected DuplicateField(\"FileHash\"), got: {err:?}"
         );
     }
