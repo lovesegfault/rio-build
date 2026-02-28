@@ -7,18 +7,20 @@ impl DagActor {
     // MergeDag
     // -----------------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, nodes, edges, options), fields(build_id = %build_id))]
+    #[instrument(skip(self, req), fields(build_id = %req.build_id))]
     pub(super) async fn handle_merge_dag(
         &mut self,
-        build_id: Uuid,
-        tenant_id: Option<String>,
-        priority_class: PriorityClass,
-        nodes: Vec<rio_proto::types::DerivationNode>,
-        edges: Vec<rio_proto::types::DerivationEdge>,
-        options: BuildOptions,
-        keep_going: bool,
+        req: MergeDagRequest,
     ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
+        let MergeDagRequest {
+            build_id,
+            tenant_id,
+            priority_class,
+            nodes,
+            edges,
+            options,
+            keep_going,
+        } = req;
         // rio_scheduler_builds_total is incremented at terminal transition
         // (complete_build/transition_build_to_failed/handle_cancel_build)
         // with an outcome label, so SLI queries can compute success rate.
@@ -212,9 +214,7 @@ impl DagActor {
                         {
                             error!(drv_hash = %drv_hash, error = %e, "failed to persist DependencyFailed status (build is Active; continuing)");
                         }
-                        if first_dep_failed.is_none() {
-                            first_dep_failed = Some(drv_hash.clone());
-                        }
+                        first_dep_failed.get_or_insert_with(|| drv_hash.clone());
                         debug!(
                             drv_hash = %drv_hash,
                             "dep already poisoned at merge; marking DependencyFailed"
@@ -300,18 +300,18 @@ impl DagActor {
                 } else {
                     DerivationStatus::Created
                 };
-                (
-                    node.drv_hash.clone(),
-                    node.drv_path.clone(),
-                    if node.pname.is_empty() {
+                crate::db::DerivationRow {
+                    drv_hash: node.drv_hash.clone(),
+                    drv_path: node.drv_path.clone(),
+                    pname: if node.pname.is_empty() {
                         None
                     } else {
                         Some(node.pname.clone())
                     },
-                    node.system.clone(),
+                    system: node.system.clone(),
                     status,
-                    node.required_features.clone(),
-                )
+                    required_features: node.required_features.clone(),
+                }
             })
             .collect();
 

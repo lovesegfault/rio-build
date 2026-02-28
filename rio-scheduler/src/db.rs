@@ -51,6 +51,17 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 const EMA_ALPHA: f64 = 0.3;
 
+/// Row for [`SchedulerDb::batch_upsert_derivations`].
+#[derive(Debug)]
+pub struct DerivationRow {
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub pname: Option<String>,
+    pub system: String,
+    pub status: DerivationStatus,
+    pub required_features: Vec<String>,
+}
+
 impl SchedulerDb {
     /// Create a new database handle from a connection pool.
     pub fn new(pool: PgPool) -> Self {
@@ -263,17 +274,9 @@ impl SchedulerDb {
     ///
     /// Uses QueryBuilder::push_values for multi-row INSERT. RETURNING includes
     /// drv_hash because PG doesn't guarantee RETURNING order matches input.
-    #[allow(clippy::type_complexity)]
     pub async fn batch_upsert_derivations(
         tx: &mut PgConnection,
-        rows: &[(
-            String,
-            String,
-            Option<String>,
-            String,
-            DerivationStatus,
-            Vec<String>,
-        )],
+        rows: &[DerivationRow],
     ) -> Result<HashMap<String, Uuid>, sqlx::Error> {
         if rows.is_empty() {
             return Ok(HashMap::new());
@@ -282,13 +285,13 @@ impl SchedulerDb {
         let mut qb = QueryBuilder::new(
             "INSERT INTO derivations (drv_hash, drv_path, pname, system, status, required_features) ",
         );
-        qb.push_values(rows, |mut b, (hash, path, pname, sys, status, feats)| {
-            b.push_bind(hash)
-                .push_bind(path)
-                .push_bind(pname)
-                .push_bind(sys)
-                .push_bind(status.as_str())
-                .push_bind(feats);
+        qb.push_values(rows, |mut b, row| {
+            b.push_bind(&row.drv_hash)
+                .push_bind(&row.drv_path)
+                .push_bind(&row.pname)
+                .push_bind(&row.system)
+                .push_bind(row.status.as_str())
+                .push_bind(&row.required_features);
         });
         qb.push(
             " ON CONFLICT (drv_hash) DO UPDATE SET updated_at = now() \
