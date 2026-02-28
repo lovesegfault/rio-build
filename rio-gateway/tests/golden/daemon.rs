@@ -107,7 +107,9 @@ async fn exchange_with_daemon_inner(
 
     // --- Handshake phase 2: features exchange ---
     let mut phase2 = Vec::new();
-    wire::write_strings(&mut phase2, &[]).await.unwrap();
+    wire::write_strings(&mut phase2, wire::NO_STRINGS)
+        .await
+        .unwrap();
     stream.write_all(&phase2).await?;
     stream.flush().await?;
     all_client.extend_from_slice(&phase2);

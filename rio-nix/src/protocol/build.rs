@@ -304,15 +304,15 @@ pub async fn write_basic_derivation<W: AsyncWrite + Unpin>(
         wire::write_string(w, output.hash()).await?;
     }
 
-    let input_srcs: Vec<String> = drv.input_srcs().iter().cloned().collect();
+    let input_srcs: Vec<&str> = drv.input_srcs().iter().map(String::as_str).collect();
     wire::write_strings(w, &input_srcs).await?;
     wire::write_string(w, drv.platform()).await?;
     wire::write_string(w, drv.builder()).await?;
     wire::write_strings(w, drv.args()).await?;
-    let env_pairs: Vec<(String, String)> = drv
+    let env_pairs: Vec<(&str, &str)> = drv
         .env()
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     wire::write_string_pairs(w, &env_pairs).await?;
 

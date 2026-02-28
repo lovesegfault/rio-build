@@ -247,7 +247,7 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // Phase 2: Feature exchange (protocol >= 1.38)
     if negotiated_version >= super::handshake::encode_version(1, 38) {
         // Send empty client features
-        wire::write_strings(writer, &[]).await?;
+        wire::write_strings(writer, wire::NO_STRINGS).await?;
         writer.flush().await.map_err(WireError::Io)?;
         // Read server features
         let _server_features = wire::read_strings(reader).await?;
@@ -305,7 +305,7 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // useSubstitutes
     wire::write_bool(writer, false).await?;
     // overrides (empty)
-    wire::write_string_pairs(writer, &[]).await?;
+    wire::write_string_pairs::<_, &str, &str>(writer, &[]).await?;
 
     writer.flush().await?;
 

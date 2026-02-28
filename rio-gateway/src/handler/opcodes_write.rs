@@ -268,7 +268,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     wire::write_u64(w, 0).await?;
     wire::write_u64(w, nar_size).await?;
     wire::write_bool(w, true).await?;
-    wire::write_strings(w, &[]).await?;
+    wire::write_strings(w, wire::NO_STRINGS).await?;
     wire::write_string(w, &ca).await?;
 
     Ok(())

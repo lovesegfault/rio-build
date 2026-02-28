@@ -198,15 +198,22 @@ pub async fn write_string<W: AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<(
     write_bytes(w, s.as_bytes()).await
 }
 
+/// Empty string slice, for callers of [`write_strings`] that need to send an
+/// empty collection without allocating (type inference aid).
+pub const NO_STRINGS: &[&str] = &[];
+
 /// Write a collection of UTF-8 strings.
-pub async fn write_strings<W: AsyncWrite + Unpin>(w: &mut W, items: &[String]) -> Result<()> {
+pub async fn write_strings<W: AsyncWrite + Unpin, S: AsRef<str>>(
+    w: &mut W,
+    items: &[S],
+) -> Result<()> {
     let count = items.len() as u64;
     if count > MAX_COLLECTION_COUNT {
         return Err(WireError::CollectionTooLarge(count));
     }
     write_u64(w, count).await?;
     for item in items {
-        write_string(w, item).await?;
+        write_string(w, item.as_ref()).await?;
     }
     Ok(())
 }
@@ -218,9 +225,9 @@ pub const MAX_FRAMED_TOTAL: u64 = 1024 * 1024 * 1024;
 pub const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Write a collection of key-value string pairs.
-pub async fn write_string_pairs<W: AsyncWrite + Unpin>(
+pub async fn write_string_pairs<W: AsyncWrite + Unpin, K: AsRef<str>, V: AsRef<str>>(
     w: &mut W,
-    pairs: &[(String, String)],
+    pairs: &[(K, V)],
 ) -> Result<()> {
     let count = pairs.len() as u64;
     if count > MAX_COLLECTION_COUNT {
@@ -228,8 +235,8 @@ pub async fn write_string_pairs<W: AsyncWrite + Unpin>(
     }
     write_u64(w, count).await?;
     for (key, value) in pairs {
-        write_string(w, key).await?;
-        write_string(w, value).await?;
+        write_string(w, key.as_ref()).await?;
+        write_string(w, value.as_ref()).await?;
     }
     Ok(())
 }
