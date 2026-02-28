@@ -4,8 +4,6 @@
 //! SSH server that speaks the Nix worker protocol.
 
 use clap::Parser;
-use rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
-use rio_proto::store::store_service_client::StoreServiceClient;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -55,21 +53,11 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(args.metrics_addr)?;
 
     // Connect to gRPC services
-    let max_msg = rio_proto::max_message_size();
+    info!(addr = %args.store_addr, "connecting to store service");
+    let store_client = rio_proto::client::connect_store(&args.store_addr).await?;
 
-    let store_endpoint = format!("http://{}", args.store_addr);
-    info!(addr = %store_endpoint, "connecting to store service");
-    let store_client = StoreServiceClient::connect(store_endpoint)
-        .await?
-        .max_decoding_message_size(max_msg)
-        .max_encoding_message_size(max_msg);
-
-    let scheduler_endpoint = format!("http://{}", args.scheduler_addr);
-    info!(addr = %scheduler_endpoint, "connecting to scheduler service");
-    let scheduler_client = SchedulerServiceClient::connect(scheduler_endpoint)
-        .await?
-        .max_decoding_message_size(max_msg)
-        .max_encoding_message_size(max_msg);
+    info!(addr = %args.scheduler_addr, "connecting to scheduler service");
+    let scheduler_client = rio_proto::client::connect_scheduler(&args.scheduler_addr).await?;
 
     // Load SSH keys
     let host_key = rio_gateway::load_or_generate_host_key(&args.host_key)?;

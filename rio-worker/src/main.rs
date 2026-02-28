@@ -10,15 +10,12 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::{RwLock, Semaphore, mpsc};
-use tonic::transport::Channel;
 use tracing::info;
 
-use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
     CompletionReport, WorkAssignmentAck, WorkerMessage, WorkerRegister, scheduler_message,
     worker_message,
 };
-use rio_proto::worker::worker_service_client::WorkerServiceClient;
 use rio_worker::{build_heartbeat_request, executor, fuse};
 
 #[derive(Parser, Debug)]
@@ -127,19 +124,8 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(args.metrics_addr)?;
 
     // Connect to gRPC services
-    let max_msg_size = rio_proto::max_message_size();
-
-    let store_endpoint = format!("http://{}", args.store_addr);
-    let store_channel = Channel::from_shared(store_endpoint)?.connect().await?;
-    let store_client = StoreServiceClient::new(store_channel)
-        .max_decoding_message_size(max_msg_size)
-        .max_encoding_message_size(max_msg_size);
-
-    let scheduler_endpoint = format!("http://{}", args.scheduler_addr);
-    let scheduler_channel = Channel::from_shared(scheduler_endpoint)?.connect().await?;
-    let mut scheduler_client = WorkerServiceClient::new(scheduler_channel)
-        .max_decoding_message_size(max_msg_size)
-        .max_encoding_message_size(max_msg_size);
+    let store_client = rio_proto::client::connect_store(&args.store_addr).await?;
+    let mut scheduler_client = rio_proto::client::connect_worker(&args.scheduler_addr).await?;
 
     info!(
         %worker_id,

@@ -3523,6 +3523,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3576,8 +3577,11 @@ dependencies = [
 name = "rio-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "prost",
  "prost-types",
+ "thiserror 2.0.18",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

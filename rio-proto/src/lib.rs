@@ -13,6 +13,8 @@ pub fn max_message_size() -> usize {
         .unwrap_or(DEFAULT_MAX_MESSAGE_SIZE)
 }
 
+pub mod client;
+
 // TODO(phase2b): add validated.rs with newtype wrappers around generated proto
 // types. Currently PathInfo.nar_hash: Vec<u8> and store_path: String propagate
 // unvalidated through the whole system, with checks only at the gRPC ingress.

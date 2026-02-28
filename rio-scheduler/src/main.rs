@@ -72,8 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // Connect to store for scheduler-side cache checks (closes TOCTOU between
     // gateway FindMissingPaths and DAG merge). Non-fatal if connect fails;
     // the actor will skip cache checks and log a warning.
-    let store_endpoint = format!("http://{}", args.store_addr);
-    let store_client = match connect_store(&store_endpoint).await {
+    let store_client = match rio_proto::client::connect_store(&args.store_addr).await {
         Ok(client) => {
             info!(store_addr = %args.store_addr, "connected to store for cache checks");
             Some(client)
@@ -140,19 +139,4 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
-}
-
-async fn connect_store(
-    endpoint: &str,
-) -> anyhow::Result<
-    rio_proto::store::store_service_client::StoreServiceClient<tonic::transport::Channel>,
-> {
-    let channel = tonic::transport::Channel::from_shared(endpoint.to_string())?
-        .connect()
-        .await?;
-    Ok(
-        rio_proto::store::store_service_client::StoreServiceClient::new(channel)
-            .max_decoding_message_size(rio_proto::max_message_size())
-            .max_encoding_message_size(rio_proto::max_message_size()),
-    )
 }
