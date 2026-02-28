@@ -7,7 +7,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -105,31 +104,13 @@ pub async fn setup_store_with_backend(
 
 /// Build a minimal valid NAR for a regular file with the given contents.
 pub fn make_nar(contents: &[u8]) -> Vec<u8> {
-    let node = rio_nix::nar::NarNode::Regular {
-        executable: false,
-        contents: contents.to_vec(),
-    };
-    let mut buf = Vec::new();
-    rio_nix::nar::serialize(&mut buf, &node).unwrap();
-    buf
+    rio_test_support::fixtures::make_nar(contents).0
 }
 
 /// Build a PathInfo for a store path with the given NAR content.
 /// Computes the nar_hash automatically.
 pub fn make_path_info(store_path: &str, nar: &[u8]) -> PathInfo {
-    let nar_hash = Sha256::digest(nar).to_vec();
-    PathInfo {
-        store_path: store_path.to_string(),
-        store_path_hash: Vec::new(),
-        deriver: String::new(),
-        nar_hash,
-        nar_size: nar.len() as u64,
-        references: vec![],
-        registration_time: 0,
-        ultimate: false,
-        signatures: vec![],
-        content_address: String::new(),
-    }
+    rio_test_support::fixtures::make_path_info_for_nar(store_path, nar)
 }
 
 /// Helper: upload a path via PutPath, sending metadata + one nar_chunk.

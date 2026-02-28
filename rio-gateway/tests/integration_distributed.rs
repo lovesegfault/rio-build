@@ -11,353 +11,13 @@
 //! 4. Perform: handshake -> wopSetOptions -> wopQueryValidPaths
 //! 5. Verify empty store returns all paths as missing (none valid)
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
 use rio_nix::protocol::stderr::STDERR_LAST;
 use rio_nix::protocol::wire;
-use rio_proto::scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
-use rio_proto::store::store_service_server::{StoreService, StoreServiceServer};
 use rio_proto::types;
+use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
+use rio_test_support::wire::{do_handshake, send_set_options};
 use tokio::io::{AsyncWriteExt, DuplexStream};
-use tonic::transport::Server;
-use tonic::{Request, Response, Status, Streaming};
-
-// ---------------------------------------------------------------------------
-// Mock StoreService (in-memory, no PostgreSQL)
-// ---------------------------------------------------------------------------
-
-/// In-memory store service that tracks paths without PostgreSQL.
-///
-/// FindMissingPaths returns all requested paths as missing (empty store).
-/// QueryPathInfo returns NOT_FOUND. PutPath accepts and stores in memory.
-struct MockStoreService {
-    /// Completed store paths: store_path -> PathInfo.
-    paths: Arc<RwLock<HashMap<String, types::PathInfo>>>,
-}
-
-impl MockStoreService {
-    fn new() -> Self {
-        Self {
-            paths: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-}
-
-#[tonic::async_trait]
-impl StoreService for MockStoreService {
-    async fn put_path(
-        &self,
-        request: Request<Streaming<types::PutPathRequest>>,
-    ) -> Result<Response<types::PutPathResponse>, Status> {
-        let mut stream = request.into_inner();
-
-        // Read first message: must be metadata
-        let first_msg = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("empty PutPath stream"))?;
-
-        let info = match first_msg.msg {
-            Some(types::put_path_request::Msg::Metadata(meta)) => meta
-                .info
-                .ok_or_else(|| Status::invalid_argument("missing PathInfo"))?,
-            _ => return Err(Status::invalid_argument("first message must be metadata")),
-        };
-
-        let store_path = info.store_path.clone();
-
-        // Drain remaining NAR chunks (we don't store the data in this mock)
-        while let Some(_msg) = stream.message().await? {}
-
-        // Record the path as complete
-        self.paths.write().unwrap().insert(store_path, info);
-
-        Ok(Response::new(types::PutPathResponse { created: true }))
-    }
-
-    type GetPathStream =
-        tokio_stream::wrappers::ReceiverStream<Result<types::GetPathResponse, Status>>;
-
-    async fn get_path(
-        &self,
-        request: Request<types::GetPathRequest>,
-    ) -> Result<Response<Self::GetPathStream>, Status> {
-        let store_path = request.into_inner().store_path;
-        let paths = self.paths.read().unwrap();
-
-        if let Some(info) = paths.get(&store_path) {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            let info = info.clone();
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(Ok(types::GetPathResponse {
-                        msg: Some(types::get_path_response::Msg::Info(info)),
-                    }))
-                    .await;
-            });
-            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-                rx,
-            )))
-        } else {
-            Err(Status::not_found(format!("path not found: {store_path}")))
-        }
-    }
-
-    async fn query_path_info(
-        &self,
-        request: Request<types::QueryPathInfoRequest>,
-    ) -> Result<Response<types::PathInfo>, Status> {
-        let store_path = request.into_inner().store_path;
-        let paths = self.paths.read().unwrap();
-
-        paths
-            .get(&store_path)
-            .cloned()
-            .map(Response::new)
-            .ok_or_else(|| Status::not_found(format!("path not found: {store_path}")))
-    }
-
-    async fn find_missing_paths(
-        &self,
-        request: Request<types::FindMissingPathsRequest>,
-    ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
-        let requested = request.into_inner().store_paths;
-        let paths = self.paths.read().unwrap();
-
-        let missing: Vec<String> = requested
-            .into_iter()
-            .filter(|p| !paths.contains_key(p))
-            .collect();
-
-        Ok(Response::new(types::FindMissingPathsResponse {
-            missing_paths: missing,
-        }))
-    }
-
-    async fn content_lookup(
-        &self,
-        _request: Request<types::ContentLookupRequest>,
-    ) -> Result<Response<types::ContentLookupResponse>, Status> {
-        Err(Status::unimplemented("not implemented in mock"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Mock SchedulerService (minimal stubs)
-// ---------------------------------------------------------------------------
-
-/// Minimal scheduler service that records RPC calls for test assertions.
-///
-/// SubmitBuild returns an event stream with the build_id in a Started event
-/// so the gateway tracks it. CancelBuild records the call for verification.
-struct MockSchedulerService {
-    /// Recorded CancelBuild calls: (build_id, reason).
-    cancel_calls: Arc<RwLock<Vec<(String, String)>>>,
-    /// Recorded SubmitBuild calls: build_id assigned.
-    submit_calls: Arc<RwLock<Vec<String>>>,
-}
-
-impl MockSchedulerService {
-    fn new() -> Self {
-        Self {
-            cancel_calls: Arc::new(RwLock::new(Vec::new())),
-            submit_calls: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-}
-
-#[tonic::async_trait]
-impl SchedulerService for MockSchedulerService {
-    type SubmitBuildStream =
-        tokio_stream::wrappers::ReceiverStream<Result<types::BuildEvent, Status>>;
-
-    async fn submit_build(
-        &self,
-        _request: Request<types::SubmitBuildRequest>,
-    ) -> Result<Response<Self::SubmitBuildStream>, Status> {
-        // Assign a fixed build_id so the test knows what to expect in CancelBuild.
-        let build_id = "test-build-0000-1111-2222-333333333333".to_string();
-        self.submit_calls.write().unwrap().push(build_id.clone());
-
-        // Return a stream that sends BuildStarted then stays open.
-        // Gateway will track the build_id from this event.
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(types::BuildEvent {
-                    build_id: build_id.clone(),
-                    sequence: 1,
-                    timestamp: None,
-                    event: Some(types::build_event::Event::Started(types::BuildStarted {
-                        total_derivations: 1,
-                        cached_derivations: 0,
-                    })),
-                }))
-                .await;
-            // Keep the channel alive so gateway blocks on build events
-            // until the client disconnects.
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            drop(tx);
-        });
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
-    }
-
-    type WatchBuildStream =
-        tokio_stream::wrappers::ReceiverStream<Result<types::BuildEvent, Status>>;
-
-    async fn watch_build(
-        &self,
-        _request: Request<types::WatchBuildRequest>,
-    ) -> Result<Response<Self::WatchBuildStream>, Status> {
-        Err(Status::not_found("mock: no builds to watch"))
-    }
-
-    async fn query_build_status(
-        &self,
-        _request: Request<types::QueryBuildRequest>,
-    ) -> Result<Response<types::BuildStatus>, Status> {
-        Err(Status::not_found("mock: no builds"))
-    }
-
-    async fn cancel_build(
-        &self,
-        request: Request<types::CancelBuildRequest>,
-    ) -> Result<Response<types::CancelBuildResponse>, Status> {
-        let req = request.into_inner();
-        self.cancel_calls
-            .write()
-            .unwrap()
-            .push((req.build_id, req.reason));
-        Ok(Response::new(types::CancelBuildResponse {
-            cancelled: true,
-        }))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------------------
-
-/// Start a mock gRPC store server on an ephemeral port.
-/// Returns the SocketAddr it's listening on plus the join handle.
-async fn start_mock_store() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock store");
-    let addr = listener.local_addr().unwrap();
-
-    let store_svc = MockStoreService::new();
-
-    let handle = tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        Server::builder()
-            .add_service(StoreServiceServer::new(store_svc))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock store server failed");
-    });
-
-    // Brief yield to let the server start accepting
-    tokio::task::yield_now().await;
-    (addr, handle)
-}
-
-/// Start a mock gRPC scheduler server on an ephemeral port.
-/// Returns the SocketAddr, join handle, and an Arc to the service for
-/// inspecting recorded RPC calls (submit_calls, cancel_calls).
-async fn start_mock_scheduler() -> (
-    SocketAddr,
-    tokio::task::JoinHandle<()>,
-    Arc<MockSchedulerService>,
-) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock scheduler");
-    let addr = listener.local_addr().unwrap();
-
-    let sched_svc = Arc::new(MockSchedulerService::new());
-    let sched_svc_clone = Arc::clone(&sched_svc);
-
-    let handle = tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        Server::builder()
-            .add_service(SchedulerServiceServer::from_arc(sched_svc_clone))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock scheduler server failed");
-    });
-
-    tokio::task::yield_now().await;
-    (addr, handle, sched_svc)
-}
-
-/// Perform the full Nix worker protocol handshake on a client stream.
-///
-/// Follows the same sequence as the real Nix client:
-/// 1. Send WORKER_MAGIC_1 + client version
-/// 2. Read WORKER_MAGIC_2 + server version
-/// 3. Exchange features
-/// 4. Read version string + trusted status + STDERR_LAST
-async fn do_handshake(s: &mut DuplexStream) {
-    // Phase 1: magic + version
-    wire::write_u64(s, WORKER_MAGIC_1).await.unwrap();
-    wire::write_u64(s, PROTOCOL_VERSION).await.unwrap();
-    s.flush().await.unwrap();
-
-    let magic2 = wire::read_u64(s).await.unwrap();
-    assert_eq!(
-        magic2, WORKER_MAGIC_2,
-        "server should reply with WORKER_MAGIC_2"
-    );
-    let _server_version = wire::read_u64(s).await.unwrap();
-
-    // Phase 2: feature exchange
-    let features: Vec<String> = vec![];
-    wire::write_strings(s, &features).await.unwrap();
-    s.flush().await.unwrap();
-    let _server_features = wire::read_strings(s).await.unwrap();
-
-    // Phase 3: obsolete CPU affinity + reserveSpace
-    wire::write_u64(s, 0).await.unwrap(); // obsolete CPU affinity
-    wire::write_u64(s, 0).await.unwrap(); // reserveSpace
-    s.flush().await.unwrap();
-
-    // Phase 3 response: version string + trusted
-    let _version = wire::read_string(s).await.unwrap();
-    let _trusted = wire::read_u64(s).await.unwrap();
-
-    // Phase 4: initial STDERR_LAST
-    let last = wire::read_u64(s).await.unwrap();
-    assert_eq!(last, STDERR_LAST, "handshake should end with STDERR_LAST");
-}
-
-/// Send wopSetOptions (opcode 19) with default/zero values.
-async fn send_set_options(s: &mut DuplexStream) {
-    wire::write_u64(s, 19).await.unwrap(); // wopSetOptions
-
-    // 12 fixed fields: keepFailed, keepGoing, tryFallback, verbosity,
-    // maxBuildJobs, maxSilentTime, obsolete_useBuildHook, verboseBuild,
-    // obsolete_logType, obsolete_printBuildTrace, buildCores, useSubstitutes
-    for _ in 0..12 {
-        wire::write_u64(s, 0).await.unwrap();
-    }
-
-    // String pairs count (overrides) = 0
-    wire::write_u64(s, 0).await.unwrap();
-    s.flush().await.unwrap();
-
-    // Read response: STDERR_LAST
-    let msg = wire::read_u64(s).await.unwrap();
-    assert_eq!(
-        msg, STDERR_LAST,
-        "wopSetOptions should end with STDERR_LAST"
-    );
-}
 
 /// Send wopQueryValidPaths (opcode 31) for the given paths.
 /// Returns the list of valid paths from the server response.
@@ -399,8 +59,8 @@ async fn test_distributed_handshake_query_empty_store() {
         .try_init();
 
     // Step 1: Start mock gRPC services
-    let (store_addr, store_handle) = start_mock_store().await;
-    let (sched_addr, sched_handle, _sched_svc) = start_mock_scheduler().await;
+    let (_store, store_addr, store_handle) = spawn_mock_store().await;
+    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
 
     // Step 2: Create gRPC clients
     let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
@@ -501,22 +161,12 @@ async fn test_distributed_query_with_populated_store() {
         .with_test_writer()
         .try_init();
 
-    let (_store_addr, store_handle) = start_mock_store().await;
-    let (sched_addr, sched_handle, _sched_svc) = start_mock_scheduler().await;
+    let (store, store_addr, store_handle) = spawn_mock_store().await;
+    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
 
-    // Pre-populate the mock store with one path by directly inserting
-    // into the shared map. We access it through a separate connection.
-    //
-    // We use a slightly different approach: create the mock store, populate
-    // it, then start the server.
-    store_handle.abort();
-
-    let mock_store = Arc::new(MockStoreService::new());
-
-    // Insert a test path
+    // Pre-populate the mock store with one path
     let test_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
-    mock_store.paths.write().unwrap().insert(
-        test_path.to_string(),
+    store.seed(
         types::PathInfo {
             store_path: test_path.to_string(),
             store_path_hash: vec![0u8; 32],
@@ -529,23 +179,8 @@ async fn test_distributed_query_with_populated_store() {
             signatures: vec![],
             content_address: String::new(),
         },
+        vec![],
     );
-
-    // Re-start store server with populated data
-    let store_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let store_addr = store_listener.local_addr().unwrap();
-    let store_svc_clone = Arc::clone(&mock_store);
-    let store_handle = tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(store_listener);
-        Server::builder()
-            .add_service(StoreServiceServer::from_arc(store_svc_clone))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock store server failed");
-    });
-    tokio::task::yield_now().await;
 
     let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
         format!("http://{store_addr}"),
@@ -623,8 +258,8 @@ async fn test_distributed_handshake_wire_sequence() {
         .with_test_writer()
         .try_init();
 
-    let (store_addr, store_handle) = start_mock_store().await;
-    let (sched_addr, sched_handle, _sched_svc) = start_mock_scheduler().await;
+    let (_store, store_addr, store_handle) = spawn_mock_store().await;
+    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
 
     let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
         format!("http://{store_addr}"),
@@ -776,8 +411,8 @@ async fn test_distributed_full_build_with_fuse() {
 /// clean handshake + setOptions + disconnect, no spurious CancelBuild.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_disconnect_without_active_build_no_cancel() {
-    let (store_addr, store_handle) = start_mock_store().await;
-    let (sched_addr, sched_handle, sched_svc) = start_mock_scheduler().await;
+    let (_store, store_addr, store_handle) = spawn_mock_store().await;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
 
     let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
         format!("http://{store_addr}"),
@@ -825,7 +460,7 @@ async fn test_disconnect_without_active_build_no_cancel() {
     .expect("test should complete in 10s");
 
     // No active builds at disconnect time -> no CancelBuild calls.
-    let cancels = sched_svc.cancel_calls.read().unwrap().clone();
+    let cancels = sched.cancel_calls.read().unwrap().clone();
     assert!(
         cancels.is_empty(),
         "disconnect without active builds should NOT call CancelBuild, got: {cancels:?}"
@@ -840,7 +475,7 @@ async fn test_disconnect_without_active_build_no_cancel() {
 /// scheduler client (unit-test style, verifies the mock records correctly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cancel_build_recorded_by_mock_scheduler() {
-    let (sched_addr, sched_handle, sched_svc) = start_mock_scheduler().await;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
 
     let mut scheduler_client =
         rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
@@ -858,7 +493,7 @@ async fn test_cancel_build_recorded_by_mock_scheduler() {
         .await
         .expect("cancel should succeed");
 
-    let cancels = sched_svc.cancel_calls.read().unwrap().clone();
+    let cancels = sched.cancel_calls.read().unwrap().clone();
     assert_eq!(cancels.len(), 1, "one CancelBuild call recorded");
     assert_eq!(cancels[0].0, "test-build-id");
     assert_eq!(cancels[0].1, "client_disconnect");
