@@ -74,8 +74,8 @@ pub struct SessionContext {
     /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
     /// is likely an IFD or build-hook request.
     pub has_seen_build_paths_with_results: bool,
-    /// Active build IDs for scheduler failover: (build_id, last_sequence).
-    pub active_build_ids: Vec<(String, u64)>,
+    /// Active build IDs for scheduler failover: build_id → last_sequence.
+    pub active_build_ids: HashMap<String, u64>,
 }
 
 impl SessionContext {
@@ -90,7 +90,7 @@ impl SessionContext {
             temp_roots: HashSet::new(),
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
-            active_build_ids: Vec::new(),
+            active_build_ids: HashMap::new(),
         }
     }
 }
@@ -445,28 +445,21 @@ pub(crate) async fn resolve_derivation(
 /// into STDERR protocol messages for the Nix client.
 ///
 /// Returns the final BuildResult on success, or an error message on failure.
-#[allow(unused_assignments, clippy::ptr_arg)]
 async fn process_build_events<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
-    active_build_ids: &mut Vec<(String, u64)>,
+    active_build_ids: &mut HashMap<String, u64>,
 ) -> anyhow::Result<BuildEventOutcome> {
     let mut drv_activity_ids: HashMap<String, u64> = HashMap::new();
-    let mut last_sequence: u64 = 0;
 
     while let Some(event) = event_stream
         .message()
         .await
         .map_err(|e| anyhow::anyhow!("build event stream error: {e}"))?
     {
-        last_sequence = event.sequence;
-
         // Update active_build_ids with latest sequence
-        if let Some(entry) = active_build_ids
-            .iter_mut()
-            .find(|(id, _)| *id == event.build_id)
-        {
-            entry.1 = last_sequence;
+        if let Some(seq) = active_build_ids.get_mut(&event.build_id) {
+            *seq = event.sequence;
         }
 
         match event.event {
@@ -582,7 +575,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     request: types::SubmitBuildRequest,
-    active_build_ids: &mut Vec<(String, u64)>,
+    active_build_ids: &mut HashMap<String, u64>,
 ) -> anyhow::Result<BuildResult> {
     let mut event_stream = rio_common::grpc::with_timeout(
         "SubmitBuild",
@@ -607,7 +600,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         None => return Err(anyhow::anyhow!("empty build event stream")),
     };
 
-    active_build_ids.push((build_id.clone(), 0));
+    active_build_ids.insert(build_id.clone(), 0);
 
     // Process the first event
     if let Some(ev) = &first {
@@ -621,11 +614,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         }
         if let Some(types::build_event::Event::Completed(ref completed)) = ev.event {
             // Remove from active builds
-            active_build_ids.retain(|(id, _)| *id != build_id);
+            active_build_ids.remove(&build_id);
             return Ok(build_result_from_completed(&completed.output_paths));
         }
         if let Some(types::build_event::Event::Failed(ref failed)) = ev.event {
-            active_build_ids.retain(|(id, _)| *id != build_id);
+            active_build_ids.remove(&build_id);
             return Ok(BuildResult::failure(
                 BuildStatus::MiscFailure,
                 failed.error_message.clone(),
@@ -637,7 +630,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     let outcome = process_build_events(stderr, &mut event_stream, active_build_ids).await;
 
     // Remove from active builds
-    active_build_ids.retain(|(id, _)| *id != build_id);
+    active_build_ids.remove(&build_id);
 
     match outcome {
         Ok(BuildEventOutcome::Completed { output_paths }) => {
@@ -1740,7 +1733,7 @@ async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     options: &Option<ClientOptions>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
     has_seen_build_paths_with_results: &bool,
-    active_build_ids: &mut Vec<(String, u64)>,
+    active_build_ids: &mut HashMap<String, u64>,
 ) -> anyhow::Result<()> {
     let drv_path_str = wire::read_string(reader).await?;
     let basic_drv = match read_basic_derivation(reader).await {
@@ -1862,7 +1855,7 @@ async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     options: &Option<ClientOptions>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
-    active_build_ids: &mut Vec<(String, u64)>,
+    active_build_ids: &mut HashMap<String, u64>,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
@@ -1991,7 +1984,7 @@ async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + U
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     options: &Option<ClientOptions>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
-    active_build_ids: &mut Vec<(String, u64)>,
+    active_build_ids: &mut HashMap<String, u64>,
 ) -> anyhow::Result<()> {
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
