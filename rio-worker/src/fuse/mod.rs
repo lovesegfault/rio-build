@@ -212,6 +212,44 @@ impl NixStoreFs {
         }
     }
 
+    // --- Lock-poison recovery helpers -----------------------------------
+    // All FUSE callbacks take &self and need interior mutability. Poison
+    // recovery (via into_inner) is safe here: the only state mutated under
+    // these locks is pure data (inode maps, open file handles). A poisoned
+    // lock means a panic mid-mutation left a partial entry — worst case is
+    // a stale inode or a leaked fd until the next forget/release.
+
+    fn inodes_read(&self) -> std::sync::RwLockReadGuard<'_, InodeMap> {
+        self.inodes.read().unwrap_or_else(|e| {
+            tracing::error!("inodes lock poisoned (read), recovering");
+            e.into_inner()
+        })
+    }
+
+    fn inodes_write(&self) -> std::sync::RwLockWriteGuard<'_, InodeMap> {
+        self.inodes.write().unwrap_or_else(|e| {
+            tracing::error!("inodes lock poisoned (write), recovering");
+            e.into_inner()
+        })
+    }
+
+    fn open_files_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<u64, File>> {
+        self.open_files.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn open_files_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<u64, File>> {
+        self.open_files.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn backing_state_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<u64, (File, BackingId)>> {
+        self.backing_state.write().unwrap_or_else(|e| {
+            tracing::error!("backing_state lock poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
     /// Get an existing persistent inode, or compute an ephemeral one.
     ///
     /// For readdir: we don't want to allocate persistent InodeMap entries
@@ -220,10 +258,7 @@ impl NixStoreFs {
     /// Otherwise, compute a deterministic hash-based ephemeral inode.
     /// Never inserts into the InodeMap.
     fn get_or_ephemeral_inode(&self, path: &Path) -> u64 {
-        let map = self.inodes.read().unwrap_or_else(|e| {
-            tracing::error!("inodes lock poisoned on read, recovering");
-            e.into_inner()
-        });
+        let map = self.inodes_read();
         map.get_existing(path)
             .unwrap_or_else(|| ephemeral_inode(path))
     }
@@ -233,23 +268,14 @@ impl NixStoreFs {
     /// lookup path. readdir should use get_or_ephemeral_inode (no persistent
     /// allocation; the kernel does not forget readdir-returned inodes).
     fn get_or_create_inode_for_lookup(&self, path: PathBuf) -> u64 {
-        let mut map = self.inodes.write().unwrap_or_else(|e| {
-            tracing::error!("inodes lock poisoned on write, recovering");
-            e.into_inner()
-        });
+        let mut map = self.inodes_write();
         let ino = map.get_or_create(path);
         map.increment_lookup(ino);
         ino
     }
 
     fn real_path(&self, ino: u64) -> Option<PathBuf> {
-        self.inodes
-            .read()
-            .unwrap_or_else(|e| {
-                tracing::error!("inodes lock poisoned on read, recovering");
-                e.into_inner()
-            })
-            .real_path(ino)
+        self.inodes_read().real_path(ino)
     }
 
     /// Extract the store path basename from an inode.
@@ -258,11 +284,7 @@ impl NixStoreFs {
     /// the mount point is the store path basename.
     fn store_basename_for_inode(&self, ino: u64) -> Option<String> {
         let path = self.real_path(ino)?;
-        let mount = self
-            .inodes
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .real_path(INodeNo::ROOT.0)?;
+        let mount = self.inodes_read().real_path(INodeNo::ROOT.0)?;
 
         let relative = path.strip_prefix(&mount).ok()?;
         let first_component = relative.components().next()?;
@@ -493,10 +515,7 @@ impl Filesystem for NixStoreFs {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        let mut map = self.inodes.write().unwrap_or_else(|e| {
-            tracing::error!("inodes lock poisoned on forget, recovering");
-            e.into_inner()
-        });
+        let mut map = self.inodes_write();
         if map.forget(ino.0, nlookup) {
             tracing::trace!(ino = ino.0, "forgot inode");
         }
@@ -751,19 +770,13 @@ impl Filesystem for NixStoreFs {
                         );
                     }
                     // Cache for standard read() path.
-                    self.open_files
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(fh, file);
+                    self.open_files_write().insert(fh, file);
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
             }
         } else {
             // Non-passthrough: cache the open file for read().
-            self.open_files
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(fh, file);
+            self.open_files_write().insert(fh, file);
             reply.opened(FileHandle(fh), FopenFlags::empty());
         }
     }
@@ -781,7 +794,7 @@ impl Filesystem for NixStoreFs {
     ) {
         // Use the file cached by open(). pread (read_at) is stateless,
         // so concurrent reads on the same fh are safe.
-        let files = self.open_files.read().unwrap_or_else(|e| e.into_inner());
+        let files = self.open_files_read();
         let Some(file) = files.get(&fh.0) else {
             // fh not in open_files — passthrough is handling it, or open()
             // was never called (shouldn't happen). Fall back to path-based.
@@ -826,17 +839,8 @@ impl Filesystem for NixStoreFs {
         reply: fuser::ReplyEmpty,
     ) {
         // Remove passthrough backing state and cached file handle on release.
-        self.backing_state
-            .write()
-            .unwrap_or_else(|e| {
-                tracing::error!("backing_state lock poisoned, recovering");
-                e.into_inner()
-            })
-            .remove(&fh.0);
-        self.open_files
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&fh.0);
+        self.backing_state_write().remove(&fh.0);
+        self.open_files_write().remove(&fh.0);
         reply.ok();
     }
 
@@ -901,14 +905,7 @@ impl Filesystem for NixStoreFs {
         }
         idx = idx.max(1);
         if offset < 2 {
-            let parent_ino = self
-                .inodes
-                .read()
-                .unwrap_or_else(|e| {
-                    tracing::error!("inodes lock poisoned on read, recovering");
-                    e.into_inner()
-                })
-                .parent_inode(&dir_path);
+            let parent_ino = self.inodes_read().parent_inode(&dir_path);
             if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") {
                 reply.ok();
                 return;
