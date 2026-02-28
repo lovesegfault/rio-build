@@ -316,15 +316,9 @@ pub(crate) async fn resolve_derivation(
         return Ok(cached.clone());
     }
 
-    let (_info, nar_data) = match grpc_get_path(store_client, &drv_path.to_string()).await? {
-        Some(r) => r,
-        None => {
-            return Err(anyhow::anyhow!(
-                "derivation '{}' not found in store",
-                drv_path
-            ));
-        }
-    };
+    let (_info, nar_data) = grpc_get_path(store_client, &drv_path.to_string())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("derivation '{}' not found in store", drv_path))?;
 
     let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
         .map_err(|e| anyhow::anyhow!("failed to extract .drv '{}' from NAR: {e}", drv_path))?;

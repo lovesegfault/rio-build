@@ -13,10 +13,10 @@ impl DagActor {
         build_id: Uuid,
         reason: &str,
     ) -> Result<bool, ActorError> {
-        let build = match self.builds.get(&build_id) {
-            Some(b) => b,
-            None => return Err(ActorError::BuildNotFound(build_id)),
-        };
+        let build = self
+            .builds
+            .get(&build_id)
+            .ok_or(ActorError::BuildNotFound(build_id))?;
 
         if build.state().is_terminal() {
             return Ok(false);

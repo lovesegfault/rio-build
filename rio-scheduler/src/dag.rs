@@ -34,7 +34,7 @@ pub struct MergeResult {
 }
 
 /// The global derivation DAG maintained by the actor.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DerivationDag {
     /// All derivation nodes, keyed by drv_hash.
     nodes: HashMap<DrvHash, DerivationState>,
@@ -53,12 +53,7 @@ pub struct DerivationDag {
 impl DerivationDag {
     /// Create an empty DAG.
     pub fn new() -> Self {
-        Self {
-            nodes: HashMap::new(),
-            children: HashMap::new(),
-            parents: HashMap::new(),
-            path_to_hash: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Look up a derivation state by hash.
@@ -147,25 +142,24 @@ impl DerivationDag {
         // Insert edges
         for edge in edges {
             // Edges reference drv_path; resolve to drv_hash
-            let parent_hash = match self.path_to_hash.get(edge.parent_drv_path.as_str()) {
-                Some(h) => h.clone(),
-                None => {
-                    tracing::warn!(
-                        parent_path = %edge.parent_drv_path,
-                        "edge references unknown parent drv_path, skipping"
-                    );
-                    continue;
-                }
+            let Some(parent_hash) = self
+                .path_to_hash
+                .get(edge.parent_drv_path.as_str())
+                .cloned()
+            else {
+                tracing::warn!(
+                    parent_path = %edge.parent_drv_path,
+                    "edge references unknown parent drv_path, skipping"
+                );
+                continue;
             };
-            let child_hash = match self.path_to_hash.get(edge.child_drv_path.as_str()) {
-                Some(h) => h.clone(),
-                None => {
-                    tracing::warn!(
-                        child_path = %edge.child_drv_path,
-                        "edge references unknown child drv_path, skipping"
-                    );
-                    continue;
-                }
+            let Some(child_hash) = self.path_to_hash.get(edge.child_drv_path.as_str()).cloned()
+            else {
+                tracing::warn!(
+                    child_path = %edge.child_drv_path,
+                    "edge references unknown child drv_path, skipping"
+                );
+                continue;
             };
 
             let inserted_child = self
@@ -328,9 +322,8 @@ impl DerivationDag {
 
     /// Check whether all dependencies of a derivation are completed.
     pub fn all_deps_completed(&self, drv_hash: &str) -> bool {
-        let children = match self.children.get(drv_hash) {
-            Some(c) => c,
-            None => return true, // No dependencies
+        let Some(children) = self.children.get(drv_hash) else {
+            return true; // No dependencies
         };
 
         children.iter().all(|child_hash| {
@@ -567,12 +560,6 @@ impl DerivationDag {
         }
 
         order
-    }
-}
-
-impl Default for DerivationDag {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
