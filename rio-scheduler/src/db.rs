@@ -3,7 +3,8 @@
 //! Synchronous writes: state transitions, assignment changes, build terminal status.
 //! Async/batched: build_history EMA updates.
 //!
-//! UUIDs are bound natively via the sqlx `uuid` feature (added for batch inserts).
+//! UUIDs are bound natively via the sqlx `uuid` feature — no `::uuid` casts or
+//! `.to_string()` conversions needed.
 
 use std::collections::HashMap;
 
@@ -75,10 +76,10 @@ impl SchedulerDb {
         sqlx::query(
             r#"
             INSERT INTO builds (build_id, tenant_id, requestor, status, priority_class)
-            VALUES ($1::uuid, $2::uuid, '', 'pending', $3)
+            VALUES ($1, $2::uuid, '', 'pending', $3)
             "#,
         )
-        .bind(build_id.to_string())
+        .bind(build_id)
         .bind(tenant_id)
         .bind(priority_class.as_str())
         .execute(&self.pool)
@@ -92,8 +93,8 @@ impl SchedulerDb {
     /// rollback to clean up the orphan build row if DB persistence fails
     /// after insert_build succeeded.
     pub async fn delete_build(&self, build_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM builds WHERE build_id = $1::uuid")
-            .bind(build_id.to_string())
+        sqlx::query("DELETE FROM builds WHERE build_id = $1")
+            .bind(build_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -113,24 +114,22 @@ impl SchedulerDb {
         };
 
         if now_col.is_empty() {
-            sqlx::query("UPDATE builds SET status = $2 WHERE build_id = $1::uuid")
-                .bind(build_id.to_string())
+            sqlx::query("UPDATE builds SET status = $2 WHERE build_id = $1")
+                .bind(build_id)
                 .bind(status.as_str())
                 .execute(&self.pool)
                 .await?;
         } else if now_col == "started_at" {
-            sqlx::query(
-                "UPDATE builds SET status = $2, started_at = now() WHERE build_id = $1::uuid",
-            )
-            .bind(build_id.to_string())
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("UPDATE builds SET status = $2, started_at = now() WHERE build_id = $1")
+                .bind(build_id)
+                .bind(status.as_str())
+                .execute(&self.pool)
+                .await?;
         } else {
             sqlx::query(
-                "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3 WHERE build_id = $1::uuid",
+                "UPDATE builds SET status = $2, finished_at = now(), error_summary = $3 WHERE build_id = $1",
             )
-            .bind(build_id.to_string())
+            .bind(build_id)
             .bind(status.as_str())
             .bind(error_summary)
             .execute(&self.pool)
@@ -155,12 +154,12 @@ impl SchedulerDb {
         status: DerivationStatus,
         required_features: &[String],
     ) -> Result<Uuid, sqlx::Error> {
-        let row: (String,) = sqlx::query_as(
+        let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO derivations (drv_hash, drv_path, pname, system, status, required_features)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (drv_hash) DO UPDATE SET updated_at = now()
-            RETURNING derivation_id::text
+            RETURNING derivation_id
             "#,
         )
         .bind(drv_hash)
@@ -172,12 +171,7 @@ impl SchedulerDb {
         .fetch_one(&self.pool)
         .await?;
 
-        let uuid = row
-            .0
-            .parse::<Uuid>()
-            .map_err(|e| sqlx::Error::Protocol(format!("invalid UUID from DB: {e}")))?;
-
-        Ok(uuid)
+        Ok(row.0)
     }
 
     /// Update a derivation's status.
@@ -224,12 +218,12 @@ impl SchedulerDb {
         sqlx::query(
             r#"
             INSERT INTO derivation_edges (parent_id, child_id)
-            VALUES ($1::uuid, $2::uuid)
+            VALUES ($1, $2)
             ON CONFLICT DO NOTHING
             "#,
         )
-        .bind(parent_id.to_string())
-        .bind(child_id.to_string())
+        .bind(parent_id)
+        .bind(child_id)
         .execute(&self.pool)
         .await?;
 
@@ -249,12 +243,12 @@ impl SchedulerDb {
         sqlx::query(
             r#"
             INSERT INTO build_derivations (build_id, derivation_id)
-            VALUES ($1::uuid, $2::uuid)
+            VALUES ($1, $2)
             ON CONFLICT DO NOTHING
             "#,
         )
-        .bind(build_id.to_string())
-        .bind(derivation_id.to_string())
+        .bind(build_id)
+        .bind(derivation_id)
         .execute(&self.pool)
         .await?;
 
@@ -353,25 +347,20 @@ impl SchedulerDb {
         worker_id: &str,
         generation: i64,
     ) -> Result<Uuid, sqlx::Error> {
-        let row: (String,) = sqlx::query_as(
+        let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO assignments (derivation_id, worker_id, generation, status)
-            VALUES ($1::uuid, $2, $3, 'pending')
-            RETURNING assignment_id::text
+            VALUES ($1, $2, $3, 'pending')
+            RETURNING assignment_id
             "#,
         )
-        .bind(derivation_id.to_string())
+        .bind(derivation_id)
         .bind(worker_id)
         .bind(generation)
         .fetch_one(&self.pool)
         .await?;
 
-        let uuid = row
-            .0
-            .parse::<Uuid>()
-            .map_err(|e| sqlx::Error::Protocol(format!("invalid UUID from DB: {e}")))?;
-
-        Ok(uuid)
+        Ok(row.0)
     }
 
     /// Update an assignment status.
@@ -385,10 +374,10 @@ impl SchedulerDb {
                 r#"
                 UPDATE assignments
                 SET status = $2, completed_at = now()
-                WHERE derivation_id = $1::uuid AND status IN ('pending', 'acknowledged')
+                WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')
                 "#,
             )
-            .bind(derivation_id.to_string())
+            .bind(derivation_id)
             .bind(status.as_str())
             .execute(&self.pool)
             .await?;
@@ -397,10 +386,10 @@ impl SchedulerDb {
                 r#"
                 UPDATE assignments
                 SET status = $2
-                WHERE derivation_id = $1::uuid AND status IN ('pending', 'acknowledged')
+                WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')
                 "#,
             )
-            .bind(derivation_id.to_string())
+            .bind(derivation_id)
             .bind(status.as_str())
             .execute(&self.pool)
             .await?;
