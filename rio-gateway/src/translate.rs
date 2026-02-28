@@ -168,7 +168,7 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
 pub fn build_submit_request(
     nodes: Vec<types::DerivationNode>,
     edges: Vec<types::DerivationEdge>,
-    options: &Option<ClientOptions>,
+    options: Option<&ClientOptions>,
     priority_class: &str,
 ) -> types::SubmitBuildRequest {
     let (max_silent_time, build_timeout, build_cores, keep_going) = match options {

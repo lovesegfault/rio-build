@@ -204,17 +204,20 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 /// Receives an inline BasicDerivation (no inputDrvs). Recovers the full
 /// Derivation from drv_cache to reconstruct the DAG.
 #[instrument(skip_all)]
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    scheduler_client: &mut SchedulerServiceClient<Channel>,
-    options: &Option<ClientOptions>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-    has_seen_build_paths_with_results: &bool,
-    active_build_ids: &mut HashMap<String, u64>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let SessionContext {
+        store_client,
+        scheduler_client,
+        options,
+        drv_cache,
+        has_seen_build_paths_with_results,
+        active_build_ids,
+        ..
+    } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
     let basic_drv = match read_basic_derivation(reader).await {
         Ok(v) => v,
@@ -256,7 +259,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     // IFD detection: if we haven't seen wopBuildPathsWithResults on this session,
     // this is likely an IFD or build-hook request
-    let is_ifd_hint = !has_seen_build_paths_with_results;
+    let is_ifd_hint = !*has_seen_build_paths_with_results;
 
     // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
     // The .drv should have been uploaded via wopAddToStoreNar before this call.
@@ -297,13 +300,9 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         }
     };
 
-    let priority_class = if is_ifd_hint {
-        "interactive".to_string()
-    } else {
-        "ci".to_string()
-    };
+    let priority_class = if is_ifd_hint { "interactive" } else { "ci" };
 
-    let request = translate::build_submit_request(nodes, edges, options, &priority_class);
+    let request = translate::build_submit_request(nodes, edges, options.as_ref(), priority_class);
 
     let build_result =
         match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
@@ -327,16 +326,19 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
 /// wopBuildPaths (9): Build a set of derivations.
 #[instrument(skip_all)]
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    scheduler_client: &mut SchedulerServiceClient<Channel>,
-    options: &Option<ClientOptions>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-    active_build_ids: &mut HashMap<String, u64>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let SessionContext {
+        store_client,
+        scheduler_client,
+        options,
+        drv_cache,
+        active_build_ids,
+        ..
+    } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
     let _build_mode = match BuildMode::try_from(build_mode_val) {
@@ -406,7 +408,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let mut seen: HashSet<String> = HashSet::new();
     all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
-    let request = translate::build_submit_request(all_nodes, all_edges, options, "ci");
+    let request = translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
 
     let build_result =
         match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
@@ -425,16 +427,19 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 
 /// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
 #[instrument(skip_all)]
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    store_client: &mut StoreServiceClient<Channel>,
-    scheduler_client: &mut SchedulerServiceClient<Channel>,
-    options: &Option<ClientOptions>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-    active_build_ids: &mut HashMap<String, u64>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    let SessionContext {
+        store_client,
+        scheduler_client,
+        options,
+        drv_cache,
+        active_build_ids,
+        ..
+    } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
     let _build_mode = match BuildMode::try_from(build_mode_val) {
@@ -543,7 +548,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         let mut seen: HashSet<String> = HashSet::new();
         all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
-        let request = translate::build_submit_request(all_nodes, all_edges, options, "ci");
+        let request = translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
 
         let build_result =
             submit_and_process_build(stderr, scheduler_client, request, active_build_ids)
