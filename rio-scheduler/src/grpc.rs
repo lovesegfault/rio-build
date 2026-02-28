@@ -79,20 +79,8 @@ impl SchedulerService for SchedulerGrpc {
         // become a DAG primary key, empty drv_path breaks the reverse
         // index, and empty system never matches any worker (derivation
         // stuck in Ready forever). Bound node count to protect memory.
-        if req.nodes.len() > rio_common::limits::MAX_DAG_NODES {
-            return Err(Status::invalid_argument(format!(
-                "too many nodes: {} (max {})",
-                req.nodes.len(),
-                rio_common::limits::MAX_DAG_NODES
-            )));
-        }
-        if req.edges.len() > rio_common::limits::MAX_DAG_EDGES {
-            return Err(Status::invalid_argument(format!(
-                "too many edges: {} (max {})",
-                req.edges.len(),
-                rio_common::limits::MAX_DAG_EDGES
-            )));
-        }
+        rio_common::grpc::check_bound("nodes", req.nodes.len(), rio_common::limits::MAX_DAG_NODES)?;
+        rio_common::grpc::check_bound("edges", req.edges.len(), rio_common::limits::MAX_DAG_EDGES)?;
         for node in &req.nodes {
             if node.drv_hash.is_empty() {
                 return Err(Status::invalid_argument("node drv_hash must be non-empty"));
@@ -510,20 +498,16 @@ impl WorkerService for SchedulerGrpc {
         // actor event loop during reconciliation with no backpressure signal.
         const MAX_HEARTBEAT_FEATURES: usize = 64;
         const MAX_HEARTBEAT_RUNNING_BUILDS: usize = 1000;
-        if req.supported_features.len() > MAX_HEARTBEAT_FEATURES {
-            return Err(Status::invalid_argument(format!(
-                "heartbeat supported_features has {} entries (max {})",
-                req.supported_features.len(),
-                MAX_HEARTBEAT_FEATURES
-            )));
-        }
-        if req.running_builds.len() > MAX_HEARTBEAT_RUNNING_BUILDS {
-            return Err(Status::invalid_argument(format!(
-                "heartbeat running_builds has {} entries (max {})",
-                req.running_builds.len(),
-                MAX_HEARTBEAT_RUNNING_BUILDS
-            )));
-        }
+        rio_common::grpc::check_bound(
+            "supported_features",
+            req.supported_features.len(),
+            MAX_HEARTBEAT_FEATURES,
+        )?;
+        rio_common::grpc::check_bound(
+            "running_builds",
+            req.running_builds.len(),
+            MAX_HEARTBEAT_RUNNING_BUILDS,
+        )?;
 
         let cmd = ActorCommand::Heartbeat {
             worker_id: req.worker_id.into(),

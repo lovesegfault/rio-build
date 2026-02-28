@@ -108,6 +108,20 @@ pub async fn with_timeout_status<T>(
     })?
 }
 
+/// Return `InvalidArgument` if `got > max`.
+///
+/// Standard bounds-check for untrusted collection sizes at gRPC boundaries.
+/// Dedupe for the `too many X: N (max M)` pattern that appears in every
+/// request handler that accepts repeated fields.
+pub fn check_bound(field: &str, got: usize, max: usize) -> Result<(), tonic::Status> {
+    if got > max {
+        return Err(tonic::Status::invalid_argument(format!(
+            "too many {field}: {got} (max {max})"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
