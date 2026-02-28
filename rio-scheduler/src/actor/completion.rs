@@ -37,13 +37,11 @@ impl DagActor {
         };
 
         // Find the derivation in the DAG
-        let current_status = match self.dag.node(drv_hash) {
-            Some(state) => state.status(),
-            None => {
-                warn!(drv_hash, "completion for unknown derivation, ignoring");
-                return;
-            }
+        let Some(state) = self.dag.node(drv_hash) else {
+            warn!(drv_hash, "completion for unknown derivation, ignoring");
+            return;
         };
+        let current_status = state.status();
 
         // Idempotency: completed -> completed is a no-op
         if current_status == DerivationStatus::Completed {
