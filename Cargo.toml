@@ -1,6 +1,5 @@
 [workspace]
 members = [
-  "rio-build",
   "rio-common",
   "rio-gateway",
   "rio-nix",
