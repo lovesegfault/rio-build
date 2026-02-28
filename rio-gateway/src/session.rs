@@ -76,7 +76,7 @@ where
             return Ok(());
         }
         Err(e) => {
-            metrics::counter!("rio_gateway_handshakes_total", "result" => "failed").increment(1);
+            metrics::counter!("rio_gateway_handshakes_total", "result" => "failure").increment(1);
             warn!(error = %e, "handshake failed");
             return Err(anyhow::anyhow!("handshake failed: {e}"));
         }

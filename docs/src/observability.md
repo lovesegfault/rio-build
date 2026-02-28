@@ -60,7 +60,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_gateway_connections_active` | Gauge | Currently active connections |
 | `rio_gateway_opcodes_total` | Counter | Protocol opcodes handled (labeled by opcode) |
 | `rio_gateway_opcode_duration_seconds` | Histogram | Per-opcode latency |
-| `rio_gateway_handshakes_total` | Counter | Protocol handshakes completed (labeled by result: success/rejected/failed) |
+| `rio_gateway_handshakes_total` | Counter | Protocol handshakes completed (labeled by result: success/rejected/failure) |
 | `rio_gateway_channels_active` | Gauge | Currently active SSH channels |
 | `rio_gateway_errors_total` | Counter | Protocol errors (labeled by type) |
 
@@ -70,7 +70,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rio_scheduler_builds_total` | Counter | Total builds at terminal state (labeled by `outcome`: `succeeded`/`failed`/`cancelled`) |
+| `rio_scheduler_builds_total` | Counter | Total builds at terminal state (labeled by `outcome`: `success`/`failure`/`cancelled`) |
 | `rio_scheduler_builds_active` | Gauge | Currently active builds |
 | `rio_scheduler_derivations_queued` | Gauge | Derivations waiting for assignment |
 | `rio_scheduler_derivations_running` | Gauge | Derivations currently building |

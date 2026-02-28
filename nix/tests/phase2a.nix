@@ -269,11 +269,11 @@ pkgs.testers.runNixOSTest {
     # ── Phase 6: Verification ─────────────────────────────────────────
     # Build succeeded (exit code already checked by succeed()).
 
-    # Scheduler: at least one build reached terminal succeeded.
-    # Metric format: `rio_scheduler_builds_total{outcome="succeeded"} N`
+    # Scheduler: at least one build reached terminal success.
+    # Metric format: `rio_scheduler_builds_total{outcome="success"} N`
     control.succeed(
         "curl -sf http://localhost:9091/metrics | "
-        "grep -E 'rio_scheduler_builds_total\\{outcome=\"succeeded\"\\} [1-9]'"
+        "grep -E 'rio_scheduler_builds_total\\{outcome=\"success\"\\} [1-9]'"
     )
 
     # Distribution: both workers executed at least one derivation.
