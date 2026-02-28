@@ -3492,29 +3492,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rio-build"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "hex",
- "metrics",
- "metrics-exporter-prometheus",
- "rio-nix",
- "russh",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "ssh-key",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "rio-common"
 version = "0.1.0"
 dependencies = [
