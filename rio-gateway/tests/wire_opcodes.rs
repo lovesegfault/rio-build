@@ -35,7 +35,6 @@ struct TestHarness {
     /// Mock store (pre-seed paths, inspect put_calls).
     store: MockStore,
     /// Mock scheduler (set outcome, inspect submit_calls).
-    #[allow(dead_code)] // used in Commit 22 build opcode tests
     scheduler: MockScheduler,
     /// Server task running run_protocol.
     server_task: tokio::task::JoinHandle<()>,

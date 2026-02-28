@@ -8,7 +8,6 @@ impl DagActor {
     // -----------------------------------------------------------------------
 
     /// Dispatch ready derivations to available workers (FIFO).
-    #[allow(clippy::while_let_loop)]
     pub(super) async fn dispatch_ready(&mut self) {
         // Drain the queue, dispatching eligible derivations and deferring
         // ineligible ones. Previously, `None => break` on the first ineligible
