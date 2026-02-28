@@ -21,7 +21,6 @@ tonic = { workspace = true }
 fuser = { workspace = true }
 sqlx = { workspace = true }
 nix = { workspace = true }
-bytes = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 clap = { workspace = true }
