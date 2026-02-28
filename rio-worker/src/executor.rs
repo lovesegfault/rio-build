@@ -24,6 +24,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use rio_nix::derivation::Derivation;
 use rio_nix::protocol::build::BuildMode;
 use rio_nix::protocol::client::{
@@ -35,6 +36,12 @@ use rio_proto::types::{
     BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, GetPathRequest,
     QueryPathInfoRequest, WorkAssignment, WorkerMessage, worker_message,
 };
+
+/// Max concurrent gRPC calls for input metadata/drv fetches.
+/// Bounds memory (each in-flight QueryPathInfo response is small; each
+/// GetPath .drv stream is typically <10 KB). 16 saturates a LAN without
+/// thundering the store.
+const MAX_PARALLEL_FETCHES: usize = 16;
 
 use crate::log_stream::LogBatcher;
 use crate::overlay;
@@ -157,14 +164,32 @@ pub async fn execute_build(
     // Each inputDrv's .drv file is already in rio-store (uploaded by the
     // gateway during SubmitBuild); fetch + parse to get output paths.
     let mut resolved_input_srcs = drv.input_srcs().clone();
-    // TODO(phase2b): fetch input drvs concurrently via buffer_unordered.
-    for (input_drv_path, output_names) in drv.input_drvs() {
-        let input_drv = fetch_drv_from_store(store_client, input_drv_path).await?;
-        for out in input_drv.outputs() {
-            if output_names.contains(out.name()) {
-                resolved_input_srcs.insert(out.path().to_string());
+    // Collect owned (path, names) pairs up-front so the async closures
+    // don't borrow from `drv` (which is not 'static inside spawn_monitored).
+    let input_drv_specs: Vec<(String, std::collections::BTreeSet<String>)> = drv
+        .input_drvs()
+        .iter()
+        .map(|(p, n)| (p.clone(), n.clone()))
+        .collect();
+    let fetched: Vec<Vec<String>> = stream::iter(input_drv_specs)
+        .map(|(path, names)| {
+            let mut client = store_client.clone();
+            async move {
+                let input_drv = fetch_drv_from_store(&mut client, &path).await?;
+                let matching: Vec<String> = input_drv
+                    .outputs()
+                    .iter()
+                    .filter(|out| names.contains(out.name()))
+                    .map(|out| out.path().to_string())
+                    .collect();
+                Ok::<_, ExecutorError>(matching)
             }
-        }
+        })
+        .buffer_unordered(MAX_PARALLEL_FETCHES)
+        .try_collect()
+        .await?;
+    for paths in fetched {
+        resolved_input_srcs.extend(paths);
     }
     let basic_drv = rio_nix::derivation::BasicDerivation::new(
         drv.outputs().to_vec(),
@@ -182,7 +207,7 @@ pub async fn execute_build(
     // compute_input_closure only seeds from drv.input_srcs() (static), so
     // we merge the resolved set in.
     let mut input_paths: Vec<String> = if assignment.input_paths.is_empty() {
-        compute_input_closure(store_client, &drv, drv_path).await?
+        compute_input_closure(&*store_client, &drv, drv_path).await?
     } else {
         assignment.input_paths.clone()
     };
@@ -202,7 +227,7 @@ pub async fn execute_build(
     // makeFallbackPath() (hash of "rewrite:<drvPath>:name:out" + zero hash),
     // but the builder's $out (from BasicDerivation env) is the REAL path →
     // output path mismatch → "builder failed to produce output path".
-    let synth_paths = fetch_input_metadata(store_client, &input_paths).await?;
+    let synth_paths = fetch_input_metadata(&*store_client, &input_paths).await?;
     let drv_outputs: Vec<SynthDrvOutput> = drv
         .outputs()
         .iter()
@@ -796,49 +821,40 @@ pub(crate) fn verify_fod_hashes(
 
 /// Fetch metadata for all input paths from the store.
 async fn fetch_input_metadata(
-    store_client: &mut StoreServiceClient<Channel>,
+    store_client: &StoreServiceClient<Channel>,
     input_paths: &[String],
 ) -> Result<Vec<SynthPathInfo>, ExecutorError> {
-    let mut synth_paths = Vec::with_capacity(input_paths.len());
-
-    // TODO(phase2b): parallelize via buffer_unordered. At 5ms RTT, 200 serial
-    // input paths add ~1s to every build before the daemon spawns.
-    for path in input_paths {
-        let request = QueryPathInfoRequest {
-            store_path: path.clone(),
-        };
-
-        match tokio::time::timeout(
-            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            store_client.query_path_info(request),
-        )
+    stream::iter(input_paths.iter().cloned())
+        .map(|path| {
+            let mut client = store_client.clone();
+            async move {
+                let request = QueryPathInfoRequest {
+                    store_path: path.clone(),
+                };
+                match rio_common::grpc::with_timeout_status(
+                    "QueryPathInfo",
+                    rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                    client.query_path_info(request),
+                )
+                .await
+                {
+                    Ok(response) => Ok(path_info_to_synth(&response.into_inner())),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "failed to fetch input path metadata"
+                        );
+                        Err(ExecutorError::MetadataFetch { path, source: e })
+                    }
+                }
+            }
+        })
+        // buffered (not unordered): preserves order, negligible cost for
+        // defensive compatibility with synth_db::generate_db.
+        .buffered(MAX_PARALLEL_FETCHES)
+        .try_collect()
         .await
-        {
-            Ok(Ok(response)) => {
-                let info = response.into_inner();
-                synth_paths.push(path_info_to_synth(&info));
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    "failed to fetch input path metadata"
-                );
-                return Err(ExecutorError::MetadataFetch {
-                    path: path.clone(),
-                    source: e,
-                });
-            }
-            Err(_) => {
-                return Err(ExecutorError::MetadataFetch {
-                    path: path.clone(),
-                    source: tonic::Status::deadline_exceeded("QueryPathInfo timed out"),
-                });
-            }
-        }
-    }
-
-    Ok(synth_paths)
 }
 
 /// Fetch a .drv file from the store and parse it.
@@ -907,73 +923,80 @@ async fn fetch_drv_from_store(
 /// QueryPathInfo. Paths not yet in the store (e.g., outputs of not-yet-built
 /// input drvs) are skipped — FUSE will lazy-fetch them at build time.
 async fn compute_input_closure(
-    store_client: &mut StoreServiceClient<Channel>,
+    store_client: &StoreServiceClient<Channel>,
     drv: &Derivation,
     drv_path: &str,
 ) -> Result<Vec<String>, ExecutorError> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::HashSet;
 
     let mut closure: HashSet<String> = HashSet::new();
-    let mut to_visit: VecDeque<String> = VecDeque::new();
+    let mut frontier: Vec<String> = Vec::new();
 
     // Seed: the .drv itself, its input_srcs, and input_drv paths.
     // nix-daemon needs to read the .drv; build needs srcs + dep outputs.
-    to_visit.push_back(drv_path.to_string());
-    for src in drv.input_srcs() {
-        to_visit.push_back(src.clone());
-    }
-    for input_drv in drv.input_drvs().keys() {
-        to_visit.push_back(input_drv.clone());
-    }
+    frontier.push(drv_path.to_string());
+    frontier.extend(drv.input_srcs().iter().cloned());
+    frontier.extend(drv.input_drvs().keys().cloned());
 
-    // BFS the reference graph. PathInfo.references gives runtime deps;
-    // for .drv files, references include all inputDrvs and inputSrcs.
-    // TODO(phase2b): process BFS layers concurrently. Serial RTT-bound for
-    // transitive closure of 100-500 paths = 0.5-2.5s per build.
-    while let Some(path) = to_visit.pop_front() {
-        if !closure.insert(path.clone()) {
-            continue; // already visited
+    // BFS by layer. Within each layer all queries are independent, so
+    // buffer_unordered. Layer count is typically 5-15 (dep depth).
+    while !frontier.is_empty() {
+        // Dedupe against closure BEFORE issuing RPCs.
+        let batch: Vec<String> = frontier
+            .drain(..)
+            .filter(|p| !closure.contains(p))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if batch.is_empty() {
+            break;
         }
 
-        let req = QueryPathInfoRequest {
-            store_path: path.clone(),
-        };
-        let info = match tokio::time::timeout(
-            rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            store_client.query_path_info(req),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp.into_inner(),
-            Ok(Err(e)) if e.code() == tonic::Code::NotFound => {
-                // Path not in store yet (output of a not-yet-built input drv).
-                // Remove it from the closure set (we inserted it above for
-                // dedup) so downstream fetch_input_metadata doesn't fail on it.
-                // FUSE will lazy-fetch it at build time if needed.
-                closure.remove(&path);
-                tracing::debug!(path = %path, "input path not in store; FUSE will lazy-fetch");
-                continue;
-            }
-            Ok(Err(e)) => {
-                return Err(ExecutorError::MetadataFetch {
-                    path: path.clone(),
-                    source: e,
-                });
-            }
-            Err(_) => {
-                return Err(ExecutorError::MetadataFetch {
-                    path: path.clone(),
-                    source: tonic::Status::deadline_exceeded(
-                        "QueryPathInfo timed out (closure BFS)",
-                    ),
-                });
-            }
-        };
+        // Fetch this layer concurrently. Each result is
+        // (path, Option<references>); None means NotFound.
+        let results: Vec<(String, Option<Vec<String>>)> = stream::iter(batch)
+            .map(|path| {
+                let mut client = store_client.clone();
+                async move {
+                    let req = QueryPathInfoRequest {
+                        store_path: path.clone(),
+                    };
+                    match rio_common::grpc::with_timeout_status(
+                        "QueryPathInfo",
+                        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+                        client.query_path_info(req),
+                    )
+                    .await
+                    {
+                        Ok(resp) => Ok((path, Some(resp.into_inner().references))),
+                        Err(e) if e.code() == tonic::Code::NotFound => {
+                            // Path not in store yet (output of a not-yet-built
+                            // input drv). FUSE will lazy-fetch at build time.
+                            tracing::debug!(path = %path, "input not in store; FUSE will lazy-fetch");
+                            Ok((path, None))
+                        }
+                        Err(e) => Err(ExecutorError::MetadataFetch {
+                            path: path.clone(),
+                            source: e,
+                        }),
+                    }
+                }
+            })
+            .buffer_unordered(MAX_PARALLEL_FETCHES)
+            .try_collect()
+            .await?;
 
-        for r in info.references {
-            if !closure.contains(&r) {
-                to_visit.push_back(r);
+        // Add found paths to closure, collect their refs for next layer.
+        for (path, refs) in results {
+            if let Some(references) = refs {
+                closure.insert(path);
+                for r in references {
+                    if !closure.contains(&r) {
+                        frontier.push(r);
+                    }
+                }
             }
+            // NotFound: do NOT add to closure (skip it entirely).
         }
     }
 

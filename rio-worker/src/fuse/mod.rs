@@ -166,6 +166,10 @@ pub struct NixStoreFs {
     passthrough: bool,
     /// Backing state for passthrough file handles.
     backing_state: RwLock<HashMap<u64, (File, BackingId)>>,
+    /// Open file handles for non-passthrough read(). Keyed by fh.
+    /// Lets read() use pread on a cached handle instead of open+seek+read
+    /// per chunk. Removed in release().
+    open_files: RwLock<HashMap<u64, File>>,
     /// Passthrough failure count.
     passthrough_failures: AtomicU64,
     /// LRU cache on local SSD.
@@ -201,6 +205,7 @@ impl NixStoreFs {
             next_fh: AtomicU64::new(1),
             passthrough,
             backing_state: RwLock::new(HashMap::new()),
+            open_files: RwLock::new(HashMap::new()),
             passthrough_failures: AtomicU64::new(0),
             cache,
             store_client,
@@ -661,7 +666,28 @@ impl Filesystem for NixStoreFs {
             return;
         };
 
-        // Ensure the containing store path is cached
+        // Fast path: if the symlink exists on disk, no need to touch the cache.
+        // lookup() already materialized the whole store-path tree on first
+        // access, so this is the common case.
+        match fs::read_link(&path) {
+            Ok(target) => {
+                reply.data(target.as_os_str().as_bytes());
+                return;
+            }
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    ino = ino.0,
+                    path = %path.display(),
+                    error = %e,
+                    "readlink failed"
+                );
+                reply.error(io_error_to_errno(&e));
+                return;
+            }
+            Err(_) => {} // ENOENT — fall through to ensure_cached
+        }
+
+        // Slow path: materialize then retry.
         if let Some(basename) = self.store_basename_for_inode(ino.0)
             && let Err(errno) = self.ensure_cached(&basename)
         {
@@ -676,7 +702,7 @@ impl Filesystem for NixStoreFs {
                     ino = ino.0,
                     path = %path.display(),
                     error = %e,
-                    "readlink failed"
+                    "readlink failed after ensure_cached"
                 );
                 reply.error(io_error_to_errno(&e));
             }
@@ -689,52 +715,82 @@ impl Filesystem for NixStoreFs {
             return;
         };
 
-        // Ensure the containing store path is cached
-        if let Some(basename) = self.store_basename_for_inode(ino.0)
-            && let Err(errno) = self.ensure_cached(&basename)
-        {
-            reply.error(errno);
-            return;
-        }
+        // Fast path: try to open directly. lookup() already materialized the
+        // store-path tree, so this is the common case and skips a gratuitous
+        // ensure_cached() SQLite write.
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Slow path: materialize then retry.
+                if let Some(basename) = self.store_basename_for_inode(ino.0)
+                    && let Err(errno) = self.ensure_cached(&basename)
+                {
+                    reply.error(errno);
+                    return;
+                }
+                match File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(
+                            ino = ino.0,
+                            path = %path.display(),
+                            error = %e,
+                            "open failed after ensure_cached"
+                        );
+                        reply.error(io_error_to_errno(&e));
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ino = ino.0,
+                    path = %path.display(),
+                    error = %e,
+                    "open failed"
+                );
+                reply.error(io_error_to_errno(&e));
+                return;
+            }
+        };
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
         if self.passthrough {
-            match File::open(&path) {
-                Ok(file) => match reply.open_backing(&file) {
-                    Ok(backing_id) => {
-                        reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &backing_id);
-                        self.backing_state
-                            .write()
-                            .unwrap_or_else(|e| {
-                                tracing::error!("backing_state lock poisoned, recovering");
-                                e.into_inner()
-                            })
-                            .insert(fh, (file, backing_id));
-                    }
-                    Err(e) => {
-                        let count = self.passthrough_failures.fetch_add(1, Ordering::Relaxed);
-                        if count == 0 {
-                            tracing::warn!(
-                                ino = ino.0,
-                                error = %e,
-                                "passthrough open_backing failed, falling back to standard read"
-                            );
-                        }
-                        reply.opened(FileHandle(fh), FopenFlags::empty());
-                    }
-                },
+            match reply.open_backing(&file) {
+                Ok(backing_id) => {
+                    reply.opened_passthrough(FileHandle(fh), FopenFlags::empty(), &backing_id);
+                    self.backing_state
+                        .write()
+                        .unwrap_or_else(|e| {
+                            tracing::error!("backing_state lock poisoned, recovering");
+                            e.into_inner()
+                        })
+                        .insert(fh, (file, backing_id));
+                }
                 Err(e) => {
-                    tracing::warn!(
-                        ino = ino.0,
-                        path = %path.display(),
-                        error = %e,
-                        "open failed"
-                    );
-                    reply.error(Errno::EIO);
+                    let count = self.passthrough_failures.fetch_add(1, Ordering::Relaxed);
+                    if count == 0 {
+                        tracing::warn!(
+                            ino = ino.0,
+                            error = %e,
+                            "passthrough open_backing failed, falling back to standard read"
+                        );
+                    }
+                    // Cache for standard read() path.
+                    self.open_files
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(fh, file);
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
             }
         } else {
+            // Non-passthrough: cache the open file for read().
+            self.open_files
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(fh, file);
             reply.opened(FileHandle(fh), FopenFlags::empty());
         }
     }
@@ -743,30 +799,45 @@ impl Filesystem for NixStoreFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some(path) = self.real_path(ino.0) else {
-            reply.error(Errno::ENOENT);
+        // Use the file cached by open(). pread (read_at) is stateless,
+        // so concurrent reads on the same fh are safe.
+        let files = self.open_files.read().unwrap_or_else(|e| e.into_inner());
+        let Some(file) = files.get(&fh.0) else {
+            // fh not in open_files — passthrough is handling it, or open()
+            // was never called (shouldn't happen). Fall back to path-based.
+            drop(files);
+            let Some(path) = self.real_path(ino.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            match File::open(&path).and_then(|f| read_file_range(&f, offset, size as usize)) {
+                Ok(data) => reply.data(&data),
+                Err(e) => {
+                    tracing::warn!(ino = ino.0, error = %e, "read fallback failed");
+                    reply.error(io_error_to_errno(&e));
+                }
+            }
             return;
         };
 
-        match read_file_range(&path, offset, size as usize) {
+        match read_file_range(file, offset, size as usize) {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 tracing::warn!(
                     ino = ino.0,
-                    path = %path.display(),
                     offset,
                     size,
                     error = %e,
                     "read failed"
                 );
-                reply.error(Errno::EIO);
+                reply.error(io_error_to_errno(&e));
             }
         }
     }
@@ -781,13 +852,17 @@ impl Filesystem for NixStoreFs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        // Remove BackingId on release to avoid leaking file handles
+        // Remove passthrough backing state and cached file handle on release.
         self.backing_state
             .write()
             .unwrap_or_else(|e| {
                 tracing::error!("backing_state lock poisoned, recovering");
                 e.into_inner()
             })
+            .remove(&fh.0);
+        self.open_files
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&fh.0);
         reply.ok();
     }
@@ -805,17 +880,32 @@ impl Filesystem for NixStoreFs {
             return;
         };
 
-        // Ensure the containing store path is cached
-        if ino.0 != INodeNo::ROOT.0
-            && let Some(basename) = self.store_basename_for_inode(ino.0)
-            && let Err(errno) = self.ensure_cached(&basename)
-        {
-            reply.error(errno);
-            return;
-        }
-
+        // Fast path: try read_dir directly. lookup() materialized the tree.
         let entries = match fs::read_dir(&dir_path) {
             Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Slow path: materialize then retry.
+                if ino.0 != INodeNo::ROOT.0
+                    && let Some(basename) = self.store_basename_for_inode(ino.0)
+                    && let Err(errno) = self.ensure_cached(&basename)
+                {
+                    reply.error(errno);
+                    return;
+                }
+                match fs::read_dir(&dir_path) {
+                    Ok(rd) => rd,
+                    Err(e) => {
+                        tracing::warn!(
+                            ino = ino.0,
+                            path = %dir_path.display(),
+                            error = %e,
+                            "readdir failed after ensure_cached"
+                        );
+                        reply.error(io_error_to_errno(&e));
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     ino = ino.0,
@@ -823,36 +913,50 @@ impl Filesystem for NixStoreFs {
                     error = %e,
                     "readdir failed"
                 );
-                reply.error(Errno::EIO);
+                reply.error(io_error_to_errno(&e));
                 return;
             }
         };
 
-        let mut all_entries: Vec<(u64, FileType, String)> = Vec::new();
-        all_entries.push((ino.0, FileType::Directory, ".".to_string()));
-        let parent_ino = self
-            .inodes
-            .read()
-            .unwrap_or_else(|e| {
-                tracing::error!("inodes lock poisoned on read, recovering");
-                e.into_inner()
-            })
-            .parent_inode(&dir_path);
-        all_entries.push((parent_ino, FileType::Directory, "..".to_string()));
+        // Stream entries directly to reply.add() with an offset counter,
+        // breaking early when the kernel's buffer fills. Previously collected
+        // ALL entries into a Vec then .skip(offset)'d — O(n) alloc per resume.
+        let mut idx: u64 = 0;
+        if offset < 1 && reply.add(ino, 1, FileType::Directory, ".") {
+            reply.ok();
+            return;
+        }
+        idx = idx.max(1);
+        if offset < 2 {
+            let parent_ino = self
+                .inodes
+                .read()
+                .unwrap_or_else(|e| {
+                    tracing::error!("inodes lock poisoned on read, recovering");
+                    e.into_inner()
+                })
+                .parent_inode(&dir_path);
+            if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+        }
+        idx = idx.max(2);
 
         for result in entries {
             let entry = match result {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!(
-                        ino = ino.0,
-                        error = %e,
-                        "skipping unreadable dir entry"
-                    );
+                    tracing::warn!(ino = ino.0, error = %e, "skipping unreadable dir entry");
                     continue;
                 }
             };
-            let name = entry.file_name().to_string_lossy().into_owned();
+            idx += 1;
+            if idx <= offset {
+                continue; // skip entries before resume point
+            }
+
+            let name = entry.file_name();
             let child_path = dir_path.join(&name);
 
             let kind = match entry.file_type() {
@@ -870,12 +974,8 @@ impl Filesystem for NixStoreFs {
             };
 
             let child_ino = self.get_or_ephemeral_inode(&child_path);
-            all_entries.push((child_ino, kind, name));
-        }
-
-        for (i, (entry_ino, kind, name)) in all_entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(*entry_ino), (i + 1) as u64, *kind, name) {
-                break;
+            if reply.add(INodeNo(child_ino), idx, kind, &name) {
+                break; // buffer full — kernel will re-call with offset
             }
         }
         reply.ok();

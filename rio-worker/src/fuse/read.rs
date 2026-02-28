@@ -4,15 +4,17 @@
 //! from the local SSD cache, fetching from `StoreService.GetPath` on
 //! cache miss.
 
-use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
 
 use fuser::Errno;
 
-/// Read a range of bytes from a file on disk.
-pub fn read_file_range(path: &Path, offset: u64, size: usize) -> io::Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
+/// Read a range of bytes from an open file using `pread` (stateless).
+///
+/// Using `read_at` (pread) instead of seek+read means concurrent `read()`
+/// calls on the same fh are safe — no shared file-position race.
+pub fn read_file_range(file: &File, offset: u64, size: usize) -> io::Result<Vec<u8>> {
     let meta = file.metadata()?;
     let file_size = meta.len();
 
@@ -22,9 +24,7 @@ pub fn read_file_range(path: &Path, offset: u64, size: usize) -> io::Result<Vec<
 
     let read_size = size.min((file_size - offset) as usize);
     let mut buf = vec![0u8; read_size];
-
-    file.seek(SeekFrom::Start(offset))?;
-    let n = file.read(&mut buf)?;
+    let n = file.read_at(&mut buf, offset)?;
     buf.truncate(n);
 
     Ok(buf)
@@ -47,18 +47,19 @@ mod tests {
     fn test_read_file_range_basic() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("data.bin");
-        fs::write(&file_path, b"hello world").unwrap();
+        std::fs::write(&file_path, b"hello world").unwrap();
+        let file = File::open(&file_path).unwrap();
 
-        let data = read_file_range(&file_path, 0, 5).unwrap();
+        let data = read_file_range(&file, 0, 5).unwrap();
         assert_eq!(&data, b"hello");
 
-        let data = read_file_range(&file_path, 6, 5).unwrap();
+        let data = read_file_range(&file, 6, 5).unwrap();
         assert_eq!(&data, b"world");
 
-        let data = read_file_range(&file_path, 100, 5).unwrap();
+        let data = read_file_range(&file, 100, 5).unwrap();
         assert!(data.is_empty());
 
-        let data = read_file_range(&file_path, 0, 100).unwrap();
+        let data = read_file_range(&file, 0, 100).unwrap();
         assert_eq!(&data, b"hello world");
     }
 
