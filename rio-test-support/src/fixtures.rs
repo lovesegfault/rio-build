@@ -18,6 +18,8 @@ pub fn make_nar(contents: &[u8]) -> (Vec<u8>, [u8; 32]) {
 }
 
 /// Build a `PathInfo` for a test store path with the given NAR bytes and hash.
+///
+/// Use when you already have the digest (e.g., from [`make_nar`]).
 pub fn make_path_info(store_path: &str, nar: &[u8], nar_hash: [u8; 32]) -> PathInfo {
     PathInfo {
         store_path: store_path.to_string(),
@@ -31,4 +33,13 @@ pub fn make_path_info(store_path: &str, nar: &[u8], nar_hash: [u8; 32]) -> PathI
         signatures: vec![],
         content_address: String::new(),
     }
+}
+
+/// Build a `PathInfo` computing the NAR hash from the NAR bytes.
+///
+/// Convenience wrapper over [`make_path_info`] for tests that don't need
+/// the hash separately.
+pub fn make_path_info_for_nar(store_path: &str, nar: &[u8]) -> PathInfo {
+    let digest: [u8; 32] = Sha256::digest(nar).into();
+    make_path_info(store_path, nar, digest)
 }
