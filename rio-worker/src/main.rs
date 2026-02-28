@@ -12,11 +12,8 @@ use clap::Parser;
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tracing::info;
 
-use rio_proto::types::{
-    CompletionReport, WorkAssignmentAck, WorkerMessage, WorkerRegister, scheduler_message,
-    worker_message,
-};
-use rio_worker::{build_heartbeat_request, executor, fuse};
+use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
+use rio_worker::{BuildSpawnContext, build_heartbeat_request, fuse, spawn_build_task};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -221,10 +218,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Shared context for spawning build tasks (clones done once per assignment
+    // inside spawn_build_task, not here).
+    let build_ctx = BuildSpawnContext {
+        store_client,
+        worker_id,
+        fuse_mount_point: args.fuse_mount_point,
+        overlay_base_dir: args.overlay_base_dir,
+        stream_tx,
+        running_builds,
+    };
+
     // Process incoming scheduler messages
     let mut build_stream = build_stream;
-    let fuse_mount_point = args.fuse_mount_point.clone();
-    let overlay_base_dir = args.overlay_base_dir.clone();
 
     while let Some(msg_result) = tokio_stream::StreamExt::next(&mut build_stream).await {
         // A worker without a live heartbeat is a liability (scheduler will
@@ -245,24 +251,10 @@ async fn main() -> anyhow::Result<()> {
 
         match msg.msg {
             Some(scheduler_message::Msg::Assignment(assignment)) => {
-                let drv_path = assignment.drv_path.clone();
-                let assignment_token = assignment.assignment_token.clone();
+                info!(drv_path = %assignment.drv_path, "received work assignment");
 
-                info!(drv_path = %drv_path, "received work assignment");
-
-                // Send ACK
-                let ack = WorkerMessage {
-                    msg: Some(worker_message::Msg::Ack(WorkAssignmentAck {
-                        drv_path: drv_path.clone(),
-                        assignment_token: assignment_token.clone(),
-                    })),
-                };
-                if let Err(e) = stream_tx.send(ack).await {
-                    tracing::error!(error = %e, "failed to send ACK");
-                    continue;
-                }
-
-                // Acquire semaphore permit for concurrent build control
+                // Acquire permit BEFORE ACKing: don't tell the scheduler we
+                // accepted work we can't immediately start.
                 let permit = match build_semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(e) => {
@@ -271,127 +263,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Spawn build task
-                let mut build_store_client = store_client.clone();
-                let build_worker_id = worker_id.clone();
-                let build_fuse_mount = fuse_mount_point.clone();
-                let build_overlay_dir = overlay_base_dir.clone();
-                let build_tx = stream_tx.clone();
-                let build_running = running_builds.clone();
-                let build_drv_path = assignment.drv_path.clone();
-
-                // Track this build as running (for heartbeat)
-                running_builds.write().await.insert(build_drv_path.clone());
-
-                // Clone for the outer panic handler before moving into the task.
-                let panic_tx = stream_tx.clone();
-                let panic_drv_path = assignment.drv_path.clone();
-                let panic_token = assignment.assignment_token.clone();
-
-                let handle = rio_common::task::spawn_monitored("build-executor", async move {
-                    let _permit = permit; // Hold permit until build completes
-
-                    // Remove from running_builds on task exit (success, failure, or panic)
-                    let _running_guard = scopeguard::guard((), move |()| {
-                        let rb = build_running.clone();
-                        let drv = build_drv_path.clone();
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            handle.spawn(async move {
-                                rb.write().await.remove(&drv);
-                            });
-                        }
-                    });
-
-                    let result = executor::execute_build(
-                        &assignment,
-                        &build_fuse_mount,
-                        &build_overlay_dir,
-                        &mut build_store_client,
-                        &build_worker_id,
-                        &build_tx,
-                    )
-                    .await;
-
-                    // Send CompletionReport
-                    let completion = match result {
-                        Ok(exec_result) => CompletionReport {
-                            drv_path: exec_result.drv_path,
-                            result: Some(exec_result.result),
-                            assignment_token: exec_result.assignment_token,
-                        },
-                        Err(e) => {
-                            tracing::error!(
-                                drv_path = %drv_path,
-                                error = %e,
-                                "build execution failed"
-                            );
-                            CompletionReport {
-                                drv_path,
-                                result: Some(rio_proto::types::BuildResult {
-                                    status:
-                                        rio_proto::types::BuildResultStatus::InfrastructureFailure
-                                            .into(),
-                                    error_msg: format!("{e}"),
-                                    ..Default::default()
-                                }),
-                                assignment_token,
-                            }
-                        }
-                    };
-
-                    // Record outcome for SLI dashboards. Ok(exec) doesn't mean
-                    // success — check the proto status. Err(ExecutorError) is
-                    // always infrastructure failure.
-                    let outcome = match &completion.result {
-                        Some(r)
-                            if r.status == rio_proto::types::BuildResultStatus::Built as i32 =>
-                        {
-                            "success"
-                        }
-                        _ => "failure",
-                    };
-                    metrics::counter!("rio_worker_builds_total", "outcome" => outcome).increment(1);
-
-                    let msg = WorkerMessage {
-                        msg: Some(worker_message::Msg::Completion(completion)),
-                    };
-                    if let Err(e) = build_tx.send(msg).await {
-                        tracing::error!(error = %e, "failed to send completion report");
-                    }
-                });
-
-                // If the build task panics, send InfrastructureFailure so the
-                // scheduler doesn't leave the derivation stuck in Running.
-                rio_common::task::spawn_monitored("build-panic-catcher", async move {
-                    if let Err(e) = handle.await
-                        && e.is_panic()
-                    {
-                        tracing::error!(
-                            drv_path = %panic_drv_path,
-                            "build task panicked; sending InfrastructureFailure to scheduler"
-                        );
-                        let completion = CompletionReport {
-                            drv_path: panic_drv_path.clone(),
-                            result: Some(rio_proto::types::BuildResult {
-                                status: rio_proto::types::BuildResultStatus::InfrastructureFailure
-                                    .into(),
-                                error_msg: "worker build task panicked".into(),
-                                ..Default::default()
-                            }),
-                            assignment_token: panic_token,
-                        };
-                        let msg = WorkerMessage {
-                            msg: Some(worker_message::Msg::Completion(completion)),
-                        };
-                        if let Err(e) = panic_tx.send(msg).await {
-                            tracing::error!(
-                                drv_path = %panic_drv_path,
-                                error = %e,
-                                "failed to send panic-completion report; derivation may be stuck in Running"
-                            );
-                        }
-                    }
-                });
+                spawn_build_task(assignment, permit, &build_ctx).await;
             }
             Some(scheduler_message::Msg::Cancel(cancel)) => {
                 tracing::warn!(

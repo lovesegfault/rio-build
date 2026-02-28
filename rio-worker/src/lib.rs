@@ -33,10 +33,17 @@ pub mod synth_db;
 pub mod upload;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use rio_proto::types::{HeartbeatRequest, ResourceUsage};
+use tokio::sync::{RwLock, mpsc};
+use tonic::transport::Channel;
+
+use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::types::{
+    CompletionReport, HeartbeatRequest, ResourceUsage, WorkAssignment, WorkAssignmentAck,
+    WorkerMessage, worker_message,
+};
 
 /// Build a heartbeat request, populating `running_builds` from the shared tracker.
 ///
@@ -57,6 +64,161 @@ pub async fn build_heartbeat_request(
         supported_features: Vec::new(),
         max_builds,
     }
+}
+
+/// Shared context for spawning build tasks.
+///
+/// Constructed once before the event loop to reduce per-assignment clone
+/// boilerplate. `spawn_build_task` clones only what each spawned task needs.
+#[derive(Clone)]
+pub struct BuildSpawnContext {
+    pub store_client: StoreServiceClient<Channel>,
+    pub worker_id: String,
+    pub fuse_mount_point: PathBuf,
+    pub overlay_base_dir: PathBuf,
+    pub stream_tx: mpsc::Sender<WorkerMessage>,
+    pub running_builds: Arc<RwLock<HashSet<String>>>,
+}
+
+/// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
+/// a panic-catcher.
+///
+/// Returns after spawning — does NOT block on build completion. The build runs
+/// in its own tokio task holding `permit`; it reports completion via
+/// `ctx.stream_tx` and drops the permit on exit (success, failure, or panic).
+pub async fn spawn_build_task(
+    assignment: WorkAssignment,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    ctx: &BuildSpawnContext,
+) {
+    let drv_path = assignment.drv_path.clone();
+    let assignment_token = assignment.assignment_token.clone();
+
+    // Send ACK
+    let ack = WorkerMessage {
+        msg: Some(worker_message::Msg::Ack(WorkAssignmentAck {
+            drv_path: drv_path.clone(),
+            assignment_token: assignment_token.clone(),
+        })),
+    };
+    if let Err(e) = ctx.stream_tx.send(ack).await {
+        tracing::error!(error = %e, "failed to send ACK");
+        return; // Permit drops, no build spawned.
+    }
+
+    // Track as running (for heartbeat).
+    ctx.running_builds.write().await.insert(drv_path.clone());
+
+    // Clone state needed by spawned tasks ('static lifetime).
+    let mut build_store_client = ctx.store_client.clone();
+    let build_worker_id = ctx.worker_id.clone();
+    let build_fuse_mount = ctx.fuse_mount_point.clone();
+    let build_overlay_dir = ctx.overlay_base_dir.clone();
+    let build_tx = ctx.stream_tx.clone();
+    let build_running = ctx.running_builds.clone();
+    let build_drv_path = drv_path.clone();
+
+    // Clone for the panic handler before moving into the task.
+    let panic_tx = ctx.stream_tx.clone();
+    let panic_drv_path = drv_path.clone();
+    let panic_token = assignment_token.clone();
+
+    let handle = rio_common::task::spawn_monitored("build-executor", async move {
+        let _permit = permit; // Hold permit until build completes
+
+        // Remove from running_builds on task exit (success, failure, or panic)
+        let _running_guard = scopeguard::guard((), move |()| {
+            let rb = build_running.clone();
+            let drv = build_drv_path.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    rb.write().await.remove(&drv);
+                });
+            }
+        });
+
+        let result = executor::execute_build(
+            &assignment,
+            &build_fuse_mount,
+            &build_overlay_dir,
+            &mut build_store_client,
+            &build_worker_id,
+            &build_tx,
+        )
+        .await;
+
+        // Send CompletionReport
+        let completion = match result {
+            Ok(exec_result) => CompletionReport {
+                drv_path: exec_result.drv_path,
+                result: Some(exec_result.result),
+                assignment_token: exec_result.assignment_token,
+            },
+            Err(e) => {
+                tracing::error!(
+                    drv_path = %drv_path,
+                    error = %e,
+                    "build execution failed"
+                );
+                CompletionReport {
+                    drv_path,
+                    result: Some(rio_proto::types::BuildResult {
+                        status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                        error_msg: format!("{e}"),
+                        ..Default::default()
+                    }),
+                    assignment_token,
+                }
+            }
+        };
+
+        // Record outcome for SLI dashboards. Ok(exec) doesn't mean success —
+        // check the proto status. Err(ExecutorError) is always infra failure.
+        let outcome = match &completion.result {
+            Some(r) if r.status == rio_proto::types::BuildResultStatus::Built as i32 => "success",
+            _ => "failure",
+        };
+        metrics::counter!("rio_worker_builds_total", "outcome" => outcome).increment(1);
+
+        let msg = WorkerMessage {
+            msg: Some(worker_message::Msg::Completion(completion)),
+        };
+        if let Err(e) = build_tx.send(msg).await {
+            tracing::error!(error = %e, "failed to send completion report");
+        }
+    });
+
+    // If the build task panics, send InfrastructureFailure so the scheduler
+    // doesn't leave the derivation stuck in Running.
+    rio_common::task::spawn_monitored("build-panic-catcher", async move {
+        if let Err(e) = handle.await
+            && e.is_panic()
+        {
+            tracing::error!(
+                drv_path = %panic_drv_path,
+                "build task panicked; sending InfrastructureFailure to scheduler"
+            );
+            let completion = CompletionReport {
+                drv_path: panic_drv_path.clone(),
+                result: Some(rio_proto::types::BuildResult {
+                    status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                    error_msg: "worker build task panicked".into(),
+                    ..Default::default()
+                }),
+                assignment_token: panic_token,
+            };
+            let msg = WorkerMessage {
+                msg: Some(worker_message::Msg::Completion(completion)),
+            };
+            if let Err(e) = panic_tx.send(msg).await {
+                tracing::error!(
+                    drv_path = %panic_drv_path,
+                    error = %e,
+                    "failed to send panic-completion report; derivation may be stuck in Running"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
