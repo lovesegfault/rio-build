@@ -11,11 +11,13 @@
 //! 4. Perform: handshake -> wopSetOptions -> wopQueryValidPaths
 //! 5. Verify empty store returns all paths as missing (none valid)
 
+mod common;
+
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
 use rio_nix::protocol::stderr::STDERR_LAST;
 use rio_nix::protocol::wire;
 use rio_proto::types;
-use rio_test_support::grpc::{spawn_mock_scheduler, spawn_mock_store};
+use rio_test_support::grpc::spawn_mock_scheduler;
 use rio_test_support::wire::{do_handshake, send_set_options};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 
@@ -52,100 +54,37 @@ async fn query_valid_paths(s: &mut DuplexStream, paths: &[&str]) -> Vec<String> 
 /// reported as invalid (not present).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_distributed_handshake_query_empty_store() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("rio_gateway=debug,rio_nix=debug")
-        .with_test_writer()
-        .try_init();
+    common::init_test_logging();
 
-    // Step 1: Start mock gRPC services
-    let (_store, store_addr, store_handle) = spawn_mock_store().await;
-    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+    let mut sess = common::GatewaySession::new().await;
 
-    // Step 2: Create gRPC clients
-    let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
-        format!("http://{store_addr}"),
+    // Run client protocol test directly (no need for a separate spawn since
+    // the server side is already running in sess.server_task).
+    let s = &mut sess.stream;
+
+    // Handshake
+    do_handshake(s).await;
+
+    // SetOptions
+    send_set_options(s).await;
+
+    // QueryValidPaths against empty store
+    let valid = query_valid_paths(
+        s,
+        &[
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
+        ],
     )
-    .await
-    .expect("connect to mock store");
+    .await;
 
-    let scheduler_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
-            "http://{sched_addr}"
-        ))
-        .await
-        .expect("connect to mock scheduler");
+    // Empty store: no paths should be valid
+    assert!(
+        valid.is_empty(),
+        "empty store should return no valid paths, got: {valid:?}"
+    );
 
-    // Step 3: Create duplex stream and run protocol session
-    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
-
-    let mut store_client_clone = store_client.clone();
-    let mut scheduler_client_clone = scheduler_client.clone();
-
-    let server_task = tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(server_stream);
-        let result = rio_gateway::session::run_protocol(
-            &mut reader,
-            &mut writer,
-            &mut store_client_clone,
-            &mut scheduler_client_clone,
-        )
-        .await;
-        // Session should end cleanly when client disconnects
-        if let Err(e) = &result {
-            // EOF is expected when client drops the stream
-            let is_eof = e
-                .downcast_ref::<rio_nix::protocol::wire::WireError>()
-                .is_some_and(|we| {
-                    matches!(
-                        we,
-                        rio_nix::protocol::wire::WireError::Io(io)
-                            if io.kind() == std::io::ErrorKind::UnexpectedEof
-                    )
-                });
-            if !is_eof {
-                panic!("unexpected server error: {e}");
-            }
-        }
-    });
-
-    // Step 4: Run client protocol test
-    let client_task = tokio::spawn(async move {
-        let mut s = client_stream;
-
-        // Handshake
-        do_handshake(&mut s).await;
-
-        // SetOptions
-        send_set_options(&mut s).await;
-
-        // QueryValidPaths against empty store
-        let valid = query_valid_paths(
-            &mut s,
-            &[
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
-                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
-            ],
-        )
-        .await;
-
-        // Empty store: no paths should be valid
-        assert!(
-            valid.is_empty(),
-            "empty store should return no valid paths, got: {valid:?}"
-        );
-
-        // Client drops the stream, causing EOF on server side
-        drop(s);
-    });
-
-    // Wait for both tasks
-    let (client_result, server_result) = tokio::join!(client_task, server_task);
-    client_result.expect("client task should not panic");
-    server_result.expect("server task should not panic");
-
-    // Cleanup
-    store_handle.abort();
-    sched_handle.abort();
+    // GatewaySession::drop handles cleanup.
 }
 
 /// Test that the gateway correctly reports paths as valid after they are
@@ -155,17 +94,13 @@ async fn test_distributed_handshake_query_empty_store() {
 /// wopQueryValidPaths returns it as valid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_distributed_query_with_populated_store() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("rio_gateway=debug,rio_nix=debug")
-        .with_test_writer()
-        .try_init();
+    common::init_test_logging();
 
-    let (store, store_addr, store_handle) = spawn_mock_store().await;
-    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+    let mut sess = common::GatewaySession::new().await;
 
     // Pre-populate the mock store with one path
     let test_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
-    store.seed(
+    sess.store.seed(
         types::PathInfo {
             store_path: test_path.to_string(),
             store_path_hash: vec![0u8; 32],
@@ -181,175 +116,88 @@ async fn test_distributed_query_with_populated_store() {
         vec![],
     );
 
-    let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
-        format!("http://{store_addr}"),
+    let s = &mut sess.stream;
+
+    do_handshake(s).await;
+    send_set_options(s).await;
+
+    // Query two paths: one present, one missing
+    let valid = query_valid_paths(
+        s,
+        &[
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
+        ],
     )
-    .await
-    .expect("connect to mock store");
+    .await;
 
-    let scheduler_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
-            "http://{sched_addr}"
-        ))
-        .await
-        .expect("connect to mock scheduler");
-
-    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
-
-    let mut store_client_clone = store_client.clone();
-    let mut scheduler_client_clone = scheduler_client.clone();
-
-    let server_task = tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(server_stream);
-        let _ = rio_gateway::session::run_protocol(
-            &mut reader,
-            &mut writer,
-            &mut store_client_clone,
-            &mut scheduler_client_clone,
-        )
-        .await;
-    });
-
-    let client_task = tokio::spawn(async move {
-        let mut s = client_stream;
-
-        do_handshake(&mut s).await;
-        send_set_options(&mut s).await;
-
-        // Query two paths: one present, one missing
-        let valid = query_valid_paths(
-            &mut s,
-            &[
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
-                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
-            ],
-        )
-        .await;
-
-        // Only the pre-populated path should be valid
-        assert_eq!(
-            valid.len(),
-            1,
-            "expected exactly 1 valid path, got: {valid:?}"
-        );
-        assert_eq!(
-            valid[0],
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
-        );
-
-        drop(s);
-    });
-
-    let (client_result, server_result) = tokio::join!(client_task, server_task);
-    client_result.expect("client task should not panic");
-    server_result.expect("server task should not panic");
-
-    store_handle.abort();
-    sched_handle.abort();
+    // Only the pre-populated path should be valid
+    assert_eq!(
+        valid.len(),
+        1,
+        "expected exactly 1 valid path, got: {valid:?}"
+    );
+    assert_eq!(
+        valid[0],
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
+    );
 }
 
 /// Test that handshake negotiation works correctly through the distributed
 /// gateway stack. Validates the exact wire sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_distributed_handshake_wire_sequence() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("rio_gateway=debug,rio_nix=debug")
-        .with_test_writer()
-        .try_init();
+    common::init_test_logging();
 
-    let (_store, store_addr, store_handle) = spawn_mock_store().await;
-    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+    let mut sess = common::GatewaySession::new().await;
+    let s = &mut sess.stream;
 
-    let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
-        format!("http://{store_addr}"),
-    )
-    .await
-    .expect("connect to mock store");
+    // Phase 1: Send client magic + version
+    wire::write_u64(s, WORKER_MAGIC_1).await.unwrap();
+    wire::write_u64(s, PROTOCOL_VERSION).await.unwrap();
+    s.flush().await.unwrap();
 
-    let scheduler_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
-            "http://{sched_addr}"
-        ))
-        .await
-        .expect("connect to mock scheduler");
+    // Read server magic
+    let magic2 = wire::read_u64(s).await.unwrap();
+    assert_eq!(magic2, WORKER_MAGIC_2, "server must send WORKER_MAGIC_2");
 
-    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+    // Read server version
+    let server_version = wire::read_u64(s).await.unwrap();
+    assert!(
+        server_version >= PROTOCOL_VERSION,
+        "server version should be >= our protocol version"
+    );
 
-    let mut store_clone = store_client.clone();
-    let mut sched_clone = scheduler_client.clone();
+    // Phase 2: Feature exchange
+    wire::write_strings(s, &Vec::<String>::new()).await.unwrap();
+    s.flush().await.unwrap();
 
-    let server_task = tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(server_stream);
-        let _ = rio_gateway::session::run_protocol(
-            &mut reader,
-            &mut writer,
-            &mut store_clone,
-            &mut sched_clone,
-        )
-        .await;
-    });
+    let server_features = wire::read_strings(s).await.unwrap();
+    // Server may return empty features, that's fine
+    assert!(
+        server_features.len() < 100,
+        "sanity check: features list is reasonable"
+    );
 
-    let client_task = tokio::spawn(async move {
-        let mut s = client_stream;
+    // Phase 3: Obsolete CPU affinity + reserveSpace
+    wire::write_u64(s, 0).await.unwrap();
+    wire::write_u64(s, 0).await.unwrap();
+    s.flush().await.unwrap();
 
-        // Phase 1: Send client magic + version
-        wire::write_u64(&mut s, WORKER_MAGIC_1).await.unwrap();
-        wire::write_u64(&mut s, PROTOCOL_VERSION).await.unwrap();
-        s.flush().await.unwrap();
+    // Read version string
+    let version_str = wire::read_string(s).await.unwrap();
+    assert!(
+        version_str.contains("rio-gateway"),
+        "version string should contain 'rio-gateway', got: {version_str}"
+    );
 
-        // Read server magic
-        let magic2 = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(magic2, WORKER_MAGIC_2, "server must send WORKER_MAGIC_2");
+    // Read trusted status
+    let trusted = wire::read_u64(s).await.unwrap();
+    assert!(trusted <= 1, "trusted should be 0 or 1");
 
-        // Read server version
-        let server_version = wire::read_u64(&mut s).await.unwrap();
-        assert!(
-            server_version >= PROTOCOL_VERSION,
-            "server version should be >= our protocol version"
-        );
-
-        // Phase 2: Feature exchange
-        wire::write_strings(&mut s, &Vec::<String>::new())
-            .await
-            .unwrap();
-        s.flush().await.unwrap();
-
-        let server_features = wire::read_strings(&mut s).await.unwrap();
-        // Server may return empty features, that's fine
-        assert!(
-            server_features.len() < 100,
-            "sanity check: features list is reasonable"
-        );
-
-        // Phase 3: Obsolete CPU affinity + reserveSpace
-        wire::write_u64(&mut s, 0).await.unwrap();
-        wire::write_u64(&mut s, 0).await.unwrap();
-        s.flush().await.unwrap();
-
-        // Read version string
-        let version_str = wire::read_string(&mut s).await.unwrap();
-        assert!(
-            version_str.contains("rio-gateway"),
-            "version string should contain 'rio-gateway', got: {version_str}"
-        );
-
-        // Read trusted status
-        let trusted = wire::read_u64(&mut s).await.unwrap();
-        assert!(trusted <= 1, "trusted should be 0 or 1");
-
-        // Phase 4: Initial STDERR_LAST
-        let last = wire::read_u64(&mut s).await.unwrap();
-        assert_eq!(last, STDERR_LAST, "handshake must end with STDERR_LAST");
-
-        drop(s);
-    });
-
-    let (client_result, server_result) = tokio::join!(client_task, server_task);
-    client_result.expect("client task should not panic");
-    server_result.expect("server task should not panic");
-
-    store_handle.abort();
-    sched_handle.abort();
+    // Phase 4: Initial STDERR_LAST
+    let last = wire::read_u64(s).await.unwrap();
+    assert_eq!(last, STDERR_LAST, "handshake must end with STDERR_LAST");
 }
 
 /// FUSE-dependent tests are marked `#[ignore]` since they require
@@ -410,63 +258,29 @@ async fn test_distributed_full_build_with_fuse() {
 /// clean handshake + setOptions + disconnect, no spurious CancelBuild.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_disconnect_without_active_build_no_cancel() {
-    let (_store, store_addr, store_handle) = spawn_mock_store().await;
-    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+    let mut sess = common::GatewaySession::new().await;
 
-    let store_client = rio_proto::store::store_service_client::StoreServiceClient::connect(
-        format!("http://{store_addr}"),
-    )
-    .await
-    .expect("connect to mock store");
-
-    let scheduler_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
-            "http://{sched_addr}"
-        ))
-        .await
-        .expect("connect to mock scheduler");
-
-    let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
-
-    let mut store_client_clone = store_client.clone();
-    let mut scheduler_client_clone = scheduler_client.clone();
-
-    let server_task = tokio::spawn(async move {
-        let (mut reader, mut writer) = tokio::io::split(server_stream);
-        let _ = rio_gateway::session::run_protocol(
-            &mut reader,
-            &mut writer,
-            &mut store_client_clone,
-            &mut scheduler_client_clone,
-        )
-        .await;
-    });
-
-    let client_task = tokio::spawn(async move {
-        let mut s = client_stream;
-        do_handshake(&mut s).await;
-        send_set_options(&mut s).await;
+    // Run the client protocol inline, then wait for server to observe EOF.
+    {
+        let s = &mut sess.stream;
+        do_handshake(s).await;
+        send_set_options(s).await;
         // Disconnect immediately — no build submitted.
-        drop(s);
-    });
+    }
+    // Replace stream with a fresh (unconnected) one to drop the client side
+    // and trigger EOF on the server. Then wait for server to finish.
+    sess.stream = tokio::io::duplex(1).0;
 
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let (cr, sr) = tokio::join!(client_task, server_task);
-        cr.expect("client ok");
-        sr.expect("server ok");
-    })
-    .await
-    .expect("test should complete in 10s");
+    tokio::time::timeout(std::time::Duration::from_secs(10), sess.join_server())
+        .await
+        .expect("server should finish within 10s");
 
     // No active builds at disconnect time -> no CancelBuild calls.
-    let cancels = sched.cancel_calls.read().unwrap().clone();
+    let cancels = sess.scheduler.cancel_calls.read().unwrap().clone();
     assert!(
         cancels.is_empty(),
         "disconnect without active builds should NOT call CancelBuild, got: {cancels:?}"
     );
-
-    store_handle.abort();
-    sched_handle.abort();
 }
 
 /// Verify CancelBuild infrastructure works: directly populate active_build_ids
@@ -474,6 +288,7 @@ async fn test_disconnect_without_active_build_no_cancel() {
 /// scheduler client (unit-test style, verifies the mock records correctly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cancel_build_recorded_by_mock_scheduler() {
+    // This test only needs the scheduler mock (no full session).
     let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
 
     let mut scheduler_client =
