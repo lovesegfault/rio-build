@@ -12,6 +12,9 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio-stream = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

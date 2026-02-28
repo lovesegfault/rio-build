@@ -13,16 +13,13 @@ use tonic::transport::Channel;
 
 use rio_nix::nar;
 use rio_proto::store::store_service_client::StoreServiceClient;
-use rio_proto::types::{PathInfo, PutPathMetadata, PutPathRequest, put_path_request};
+use rio_proto::types::PathInfo;
 
 /// Maximum number of upload retry attempts.
 const MAX_UPLOAD_RETRIES: u32 = 3;
 
 /// Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
-
-/// Maximum NAR chunk size for streaming upload (256 KB).
-const NAR_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Maximum concurrent output uploads. Bounds peak memory: each in-flight
 /// upload holds one full NAR in memory during the PutPath stream.
@@ -98,6 +95,7 @@ pub async fn upload_output(
     // Compute SHA-256
     let nar_hash = Sha256::digest(&nar_data).to_vec();
     let nar_size = nar_data.len() as u64;
+    let nar_data: std::sync::Arc<[u8]> = nar_data.into();
 
     tracing::info!(
         store_path = %store_path,
@@ -120,7 +118,15 @@ pub async fn upload_output(
             tokio::time::sleep(delay).await;
         }
 
-        match do_upload(store_client, &store_path, &nar_hash, nar_size, &nar_data).await {
+        match do_upload(
+            store_client,
+            &store_path,
+            &nar_hash,
+            nar_size,
+            nar_data.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
                 return Ok(UploadResult {
@@ -154,36 +160,22 @@ async fn do_upload(
     store_path: &str,
     nar_hash: &[u8],
     nar_size: u64,
-    nar_data: &[u8],
+    nar_data: std::sync::Arc<[u8]>,
 ) -> Result<(), tonic::Status> {
-    // Build the stream of PutPathRequest messages
-    let metadata_msg = PutPathRequest {
-        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(PathInfo {
-                store_path: store_path.to_string(),
-                nar_hash: nar_hash.to_vec(),
-                nar_size,
-                // Other fields will be populated by the store
-                ..Default::default()
-            }),
-        })),
+    let info = PathInfo {
+        store_path: store_path.to_string(),
+        nar_hash: nar_hash.to_vec(),
+        nar_size,
+        // Other fields will be populated by the store
+        ..Default::default()
     };
-
-    // Chunk the NAR data.
-    // TODO(phase2b): lazy chunk stream instead of eager Vec. Current approach
-    // materializes all chunks upfront: 4GiB NAR → ~8GiB peak (nar_data +
-    // messages Vec); MAX_PARALLEL_UPLOADS=4 → 32GiB worst case. Defeats gRPC
-    // backpressure. Use stream::unfold or Arc<[u8]>-based lazy iterator.
-    let mut messages = vec![metadata_msg];
-    for chunk in nar_data.chunks(NAR_CHUNK_SIZE) {
-        messages.push(PutPathRequest {
-            msg: Some(put_path_request::Msg::NarChunk(chunk.to_vec())),
-        });
-    }
-
-    let stream = tokio_stream::iter(messages);
-    store_client.put_path(stream).await?;
-
+    let stream = rio_proto::client::chunk_nar_for_put(info, nar_data);
+    rio_common::grpc::with_timeout_status(
+        "PutPath",
+        rio_common::grpc::GRPC_STREAM_TIMEOUT,
+        store_client.put_path(stream),
+    )
+    .await?;
     Ok(())
 }
 
@@ -254,6 +246,6 @@ mod tests {
     #[test]
     fn test_nar_chunk_size() {
         // Verify chunk size is reasonable
-        assert_eq!(NAR_CHUNK_SIZE, 256 * 1024);
+        assert_eq!(rio_proto::client::NAR_CHUNK_SIZE, 256 * 1024);
     }
 }

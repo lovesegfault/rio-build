@@ -33,7 +33,7 @@ use rio_nix::protocol::wire;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
     BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, GetPathRequest,
-    QueryPathInfoRequest, WorkAssignment, WorkerMessage, get_path_response, worker_message,
+    QueryPathInfoRequest, WorkAssignment, WorkerMessage, worker_message,
 };
 
 use crate::log_stream::LogBatcher;
@@ -864,30 +864,10 @@ async fn fetch_drv_from_store(
             .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}) failed: {e}")))?
             .into_inner();
 
-        let mut nar_data = Vec::new();
-        while let Some(msg) = stream.message().await.map_err(|e| {
-            ExecutorError::BuildFailed(format!("GetPath({drv_path}) stream error: {e}"))
-        })? {
-            match msg.msg {
-                Some(get_path_response::Msg::Info(_)) => {
-                    // .drv files are small; we don't need to pre-size from info.
-                }
-                Some(get_path_response::Msg::NarChunk(chunk)) => {
-                    let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                    if new_len > rio_common::limits::MAX_NAR_SIZE {
-                        return Err(ExecutorError::BuildFailed(format!(
-                            "NAR for {drv_path} exceeds MAX_NAR_SIZE ({} bytes, limit {})",
-                            new_len,
-                            rio_common::limits::MAX_NAR_SIZE
-                        )));
-                    }
-                    nar_data.extend_from_slice(&chunk);
-                }
-                None => {
-                    tracing::warn!("empty GetPathResponse message (possible proto mismatch)");
-                }
-            }
-        }
+        let (_info, nar_data) =
+            rio_proto::client::collect_nar_stream(&mut stream, rio_common::limits::MAX_NAR_SIZE)
+                .await
+                .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}): {e}")))?;
         Ok::<Vec<u8>, ExecutorError>(nar_data)
     })
     .await

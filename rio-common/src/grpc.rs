@@ -80,6 +80,34 @@ where
         .map_err(Into::into)
 }
 
+/// Like [`with_timeout`] but preserves `tonic::Status` for NotFound branching.
+///
+/// On timeout, returns `Status::deadline_exceeded(name)`. On inner error,
+/// passes the Status through unchanged — callers can still match
+/// `e.code() == Code::NotFound`.
+///
+/// # Example
+/// ```ignore
+/// match with_timeout_status(
+///     "QueryPathInfo",
+///     DEFAULT_GRPC_TIMEOUT,
+///     store_client.query_path_info(req),
+/// ).await {
+///     Ok(resp) => ...,
+///     Err(e) if e.code() == tonic::Code::NotFound => ...,
+///     Err(e) => return Err(e.into()),
+/// }
+/// ```
+pub async fn with_timeout_status<T>(
+    name: &'static str,
+    timeout: Duration,
+    fut: impl Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, tonic::Status> {
+    tokio::time::timeout(timeout, fut).await.map_err(|_| {
+        tonic::Status::deadline_exceeded(format!("'{name}' timed out after {timeout:?}"))
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +144,25 @@ mod tests {
             err.to_string().contains("slow-op") && err.to_string().contains("timed out"),
             "error should mention op name and timeout: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_timeout_status_preserves_not_found() {
+        let result = with_timeout_status("test", Duration::from_secs(1), async {
+            Err::<(), _>(tonic::Status::not_found("missing"))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_with_timeout_status_on_timeout() {
+        let result = with_timeout_status("slow", Duration::from_millis(10), async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<(), tonic::Status>(())
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
     }
 
     #[test]

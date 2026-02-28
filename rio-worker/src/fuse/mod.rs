@@ -350,42 +350,30 @@ impl NixStoreFs {
                 })?;
 
                 let mut stream = response.into_inner();
-                let mut nar_bytes = Vec::new();
-
-                while let Some(msg) = stream.message().await.map_err(|e| {
-                    tracing::warn!(
-                        store_path = %store_path,
-                        error = %e,
-                        "GetPath stream error"
-                    );
-                    Errno::EIO
-                })? {
-                    match msg.msg {
-                        Some(get_path_response::Msg::NarChunk(chunk)) => {
-                            let new_len =
-                                (nar_bytes.len() as u64).saturating_add(chunk.len() as u64);
-                            if new_len > rio_common::limits::MAX_NAR_SIZE {
-                                tracing::error!(
-                                    store_path = %store_path,
-                                    size = new_len,
-                                    limit = rio_common::limits::MAX_NAR_SIZE,
-                                    "NAR exceeds MAX_NAR_SIZE"
-                                );
-                                return Err(Errno::EFBIG);
-                            }
-                            nar_bytes.extend_from_slice(&chunk);
-                        }
-                        Some(get_path_response::Msg::Info(_)) => {
-                            // First message contains metadata; we already have it
-                        }
-                        None => {
-                            tracing::warn!(
-                                store_path = %store_path,
-                                "empty GetPathResponse message (possible proto mismatch)"
-                            );
-                        }
+                let (_info, nar_bytes) = rio_proto::client::collect_nar_stream(
+                    &mut stream,
+                    rio_common::limits::MAX_NAR_SIZE,
+                )
+                .await
+                .map_err(|e| match e {
+                    rio_proto::client::NarCollectError::SizeExceeded { got, limit } => {
+                        tracing::error!(
+                            store_path = %store_path,
+                            size = got,
+                            limit,
+                            "NAR exceeds MAX_NAR_SIZE"
+                        );
+                        Errno::EFBIG
                     }
-                }
+                    rio_proto::client::NarCollectError::Stream(status) => {
+                        tracing::warn!(
+                            store_path = %store_path,
+                            error = %status,
+                            "GetPath stream error"
+                        );
+                        Errno::EIO
+                    }
+                })?;
 
                 Ok::<Vec<u8>, Errno>(nar_bytes)
             };
@@ -498,9 +486,6 @@ fn dir_size_inner(path: &Path) -> io::Result<u64> {
     }
     Ok(total)
 }
-
-// We need this import for the match arms on GetPathResponse::Msg.
-use rio_proto::types::get_path_response;
 
 impl Filesystem for NixStoreFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {

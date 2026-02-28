@@ -224,11 +224,13 @@ async fn grpc_query_path_info(
     let req = types::QueryPathInfoRequest {
         store_path: store_path.to_string(),
     };
-    match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.query_path_info(req))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("gRPC QueryPathInfo timed out after {DEFAULT_GRPC_TIMEOUT:?}")
-        })? {
+    match rio_common::grpc::with_timeout_status(
+        "QueryPathInfo",
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.query_path_info(req),
+    )
+    .await
+    {
         Ok(resp) => Ok(Some(resp.into_inner())),
         Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
         Err(e) => Err(anyhow::anyhow!("gRPC QueryPathInfo failed: {e}")),
@@ -251,26 +253,14 @@ async fn grpc_put_path(
     info: types::PathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
-    let metadata_msg = types::PutPathRequest {
-        msg: Some(types::put_path_request::Msg::Metadata(
-            types::PutPathMetadata { info: Some(info) },
-        )),
-    };
-
-    // Send metadata first, then NAR data in chunks
-    let chunk_size = 64 * 1024;
-    let mut messages = vec![metadata_msg];
-    for chunk in nar_data.chunks(chunk_size) {
-        messages.push(types::PutPathRequest {
-            msg: Some(types::put_path_request::Msg::NarChunk(chunk.to_vec())),
-        });
-    }
-
-    let stream = tokio_stream::iter(messages);
-    let resp = tokio::time::timeout(GRPC_STREAM_TIMEOUT, store_client.put_path(stream))
-        .await
-        .map_err(|_| anyhow::anyhow!("gRPC PutPath timed out after {GRPC_STREAM_TIMEOUT:?}"))?
-        .map_err(|e| anyhow::anyhow!("gRPC PutPath failed: {e}"))?;
+    let nar: std::sync::Arc<[u8]> = nar_data.into();
+    let stream = rio_proto::client::chunk_nar_for_put(info, nar);
+    let resp = rio_common::grpc::with_timeout(
+        "PutPath",
+        GRPC_STREAM_TIMEOUT,
+        store_client.put_path(stream),
+    )
+    .await?;
 
     Ok(resp.into_inner().created)
 }
@@ -287,41 +277,21 @@ async fn grpc_get_path(
     let req = types::GetPathRequest {
         store_path: store_path.to_string(),
     };
-    let mut stream = match tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, store_client.get_path(req))
-        .await
-        .map_err(|_| anyhow::anyhow!("gRPC GetPath timed out after {DEFAULT_GRPC_TIMEOUT:?}"))?
+    let mut stream = match rio_common::grpc::with_timeout_status(
+        "GetPath",
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.get_path(req),
+    )
+    .await
     {
         Ok(resp) => resp.into_inner(),
         Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
         Err(e) => return Err(anyhow::anyhow!("gRPC GetPath failed: {e}")),
     };
 
-    let mut info = None;
-    let mut nar_data = Vec::new();
-
-    while let Some(msg) = stream
-        .message()
+    let (info, nar_data) = rio_proto::client::collect_nar_stream(&mut stream, MAX_NAR_SIZE)
         .await
-        .map_err(|e| anyhow::anyhow!("gRPC GetPath stream error: {e}"))?
-    {
-        match msg.msg {
-            Some(types::get_path_response::Msg::Info(i)) => {
-                info = Some(i);
-            }
-            Some(types::get_path_response::Msg::NarChunk(chunk)) => {
-                let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                if new_len > MAX_NAR_SIZE {
-                    return Err(anyhow::anyhow!(
-                        "NAR for {store_path} exceeds maximum {} bytes (received {}+)",
-                        MAX_NAR_SIZE,
-                        new_len
-                    ));
-                }
-                nar_data.extend_from_slice(&chunk);
-            }
-            None => {}
-        }
-    }
+        .map_err(|e| anyhow::anyhow!("gRPC GetPath for {store_path}: {e}"))?;
 
     match info {
         Some(i) => Ok(Some((i, nar_data))),
@@ -575,14 +545,13 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     request: types::SubmitBuildRequest,
     active_build_ids: &mut Vec<(String, u64)>,
 ) -> anyhow::Result<BuildResult> {
-    let mut event_stream =
-        tokio::time::timeout(DEFAULT_GRPC_TIMEOUT, scheduler_client.submit_build(request))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("gRPC SubmitBuild timed out after {DEFAULT_GRPC_TIMEOUT:?}")
-            })?
-            .map_err(|e| anyhow::anyhow!("gRPC SubmitBuild failed: {e}"))?
-            .into_inner();
+    let mut event_stream = rio_common::grpc::with_timeout(
+        "SubmitBuild",
+        DEFAULT_GRPC_TIMEOUT,
+        scheduler_client.submit_build(request),
+    )
+    .await?
+    .into_inner();
 
     // Extract build_id from first event if available
     // (the first event should be BuildStarted)
@@ -793,13 +762,12 @@ async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let req = types::FindMissingPathsRequest {
         store_paths: path_strs.clone(),
     };
-    let resp = tokio::time::timeout(
-        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+    let resp = rio_common::grpc::with_timeout(
+        "FindMissingPaths",
+        DEFAULT_GRPC_TIMEOUT,
         store_client.find_missing_paths(req),
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("gRPC FindMissingPaths timed out"))
-    .and_then(|r| r.map_err(|e| anyhow::anyhow!("gRPC FindMissingPaths failed: {e}")));
+    .await;
 
     let missing_set: HashSet<String> = match resp {
         Ok(r) => r.into_inner().missing_paths.into_iter().collect(),
@@ -948,34 +916,19 @@ async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
         };
 
-    let mut nar_data = Vec::new();
-    loop {
-        match stream.message().await {
-            Ok(Some(msg)) => match msg.msg {
-                Some(types::get_path_response::Msg::NarChunk(chunk)) => {
-                    let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                    if new_len > rio_common::limits::MAX_NAR_SIZE {
-                        return send_store_error(
-                            stderr,
-                            anyhow::anyhow!(
-                                "NAR for {path_str} exceeds MAX_NAR_SIZE ({new_len} > {})",
-                                rio_common::limits::MAX_NAR_SIZE
-                            ),
-                        )
-                        .await;
-                    }
-                    nar_data.extend_from_slice(&chunk);
-                }
-                Some(types::get_path_response::Msg::Info(_)) => {}
-                None => {}
-            },
-            Ok(None) => break,
+    let (_info, nar_data) =
+        match rio_proto::client::collect_nar_stream(&mut stream, rio_common::limits::MAX_NAR_SIZE)
+            .await
+        {
+            Ok(v) => v,
             Err(e) => {
-                return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath stream error: {e}"))
-                    .await;
+                return send_store_error(
+                    stderr,
+                    anyhow::anyhow!("gRPC GetPath for {path_str}: {e}"),
+                )
+                .await;
             }
-        }
-    }
+        };
 
     // STDERR_LAST first, then raw NAR bytes. Client's copyNAR reads until
     // the NAR's closing ')' sentinel — no length prefix.
