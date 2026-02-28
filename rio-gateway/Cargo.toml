@@ -17,21 +17,14 @@ rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
-async-trait = { workspace = true }
 tonic = { workspace = true }
 russh = { workspace = true }
 ssh-key = { workspace = true }
-bytes = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-serde_json = { workspace = true }
-prost-types = { workspace = true }
 
 [dev-dependencies]
 rio-test-support = { path = "../rio-test-support" }
@@ -41,4 +34,4 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
-tonic = { workspace = true }
+serde_json = { workspace = true }

@@ -49,11 +49,9 @@ metrics = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 rio-test-support = { path = "../rio-test-support" }
-rio-nix = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }

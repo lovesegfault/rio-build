@@ -3497,7 +3497,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
- "metrics",
  "metrics-exporter-prometheus",
  "tokio",
  "tonic",
@@ -3510,12 +3509,9 @@ name = "rio-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "bytes",
  "clap",
  "hex",
  "metrics",
- "prost-types",
  "rio-common",
  "rio-nix",
  "rio-proto",
@@ -3523,11 +3519,9 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sqlx",
  "ssh-key",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3609,7 +3603,6 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3636,7 +3629,6 @@ name = "rio-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "clap",
  "fuser",
  "futures-util",
@@ -5103,7 +5095,6 @@ checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
  "getrandom 0.4.1",
  "js-sys",
- "serde_core",
  "wasm-bindgen",
 ]
 
