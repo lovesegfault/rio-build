@@ -60,28 +60,67 @@ impl ClientOptions {
     }
 }
 
+/// Per-session mutable state, threaded through all opcode handlers.
+///
+/// Holds the gRPC clients and protocol-session-scoped state (options,
+/// temp roots, drv cache, build tracking). Constructed once per session
+/// in [`crate::session::run_protocol`].
+pub struct SessionContext {
+    pub store_client: StoreServiceClient<Channel>,
+    pub scheduler_client: SchedulerServiceClient<Channel>,
+    pub options: Option<ClientOptions>,
+    pub temp_roots: HashSet<StorePath>,
+    pub drv_cache: HashMap<StorePath, Derivation>,
+    /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
+    /// is likely an IFD or build-hook request.
+    pub has_seen_build_paths_with_results: bool,
+    /// Active build IDs for scheduler failover: (build_id, last_sequence).
+    pub active_build_ids: Vec<(String, u64)>,
+}
+
+impl SessionContext {
+    pub fn new(
+        store_client: StoreServiceClient<Channel>,
+        scheduler_client: SchedulerServiceClient<Channel>,
+    ) -> Self {
+        Self {
+            store_client,
+            scheduler_client,
+            options: None,
+            temp_roots: HashSet::new(),
+            drv_cache: HashMap::new(),
+            has_seen_build_paths_with_results: false,
+            active_build_ids: Vec::new(),
+        }
+    }
+}
+
 /// Dispatch an opcode to the appropriate handler.
 ///
 /// Returns `Ok(())` on success. On errors, sends `STDERR_ERROR` to the
 /// client and returns `Err`, which terminates the session.
 #[instrument(skip_all, fields(opcode))]
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_opcode<R, W>(
     opcode: u64,
     reader: &mut R,
     writer: &mut W,
-    store_client: &mut StoreServiceClient<Channel>,
-    scheduler_client: &mut SchedulerServiceClient<Channel>,
-    options: &mut Option<ClientOptions>,
-    temp_roots: &mut HashSet<StorePath>,
-    drv_cache: &mut HashMap<StorePath, Derivation>,
-    has_seen_build_paths_with_results: &mut bool,
-    active_build_ids: &mut Vec<(String, u64)>,
+    ctx: &mut SessionContext,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
 {
+    // Destructure for legibility — existing per-opcode handlers take
+    // individual fields, not the whole context.
+    let SessionContext {
+        store_client,
+        scheduler_client,
+        options,
+        temp_roots,
+        drv_cache,
+        has_seen_build_paths_with_results,
+        active_build_ids,
+    } = ctx;
     let mut stderr = StderrWriter::new(writer);
     let start = std::time::Instant::now();
 
