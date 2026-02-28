@@ -2103,7 +2103,7 @@ impl DagActor {
         );
 
         info!(build_id = %build_id, "build completed successfully");
-        metrics::counter!("rio_scheduler_builds_total", "outcome" => "succeeded").increment(1);
+        metrics::counter!("rio_scheduler_builds_total", "outcome" => "success").increment(1);
         self.schedule_terminal_cleanup(build_id);
         Ok(())
     }
@@ -2129,7 +2129,7 @@ impl DagActor {
                 failed_derivation,
             }),
         );
-        metrics::counter!("rio_scheduler_builds_total", "outcome" => "failed").increment(1);
+        metrics::counter!("rio_scheduler_builds_total", "outcome" => "failure").increment(1);
 
         self.schedule_terminal_cleanup(build_id);
         Ok(())
