@@ -1,9 +1,5 @@
 use super::*;
 
-// -----------------------------------------------------------------------
-// Group 10: Remaining coverage
-// -----------------------------------------------------------------------
-
 /// keepGoing=false: on PermanentFailure, the entire build fails immediately.
 #[tokio::test]
 async fn test_keepgoing_false_fails_fast() {
@@ -976,10 +972,6 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() {
         "stale heartbeat must not clobber scheduler's fresh assignment"
     );
 }
-
-// -----------------------------------------------------------------------
-// Step 8: Test coverage gaps
-// -----------------------------------------------------------------------
 
 /// T4: Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
 #[tokio::test]

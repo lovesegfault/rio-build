@@ -1,9 +1,10 @@
 //! NAR data validation utilities.
 //!
-//! Provides both buffered validation ([`validate_nar`]) and streaming validation
-//! via [`HashingReader`] + [`validate_nar_digest`]. Store implementations should
-//! prefer the streaming approach: wrap their incoming `AsyncRead` in a
+//! Provides streaming validation via [`HashingReader`] + [`validate_nar_digest`].
+//! Store implementations should wrap their incoming `AsyncRead` in a
 //! `HashingReader`, drain it, then call `validate_nar_digest` on the result.
+//! For callers that already have buffered data, use
+//! `validate_nar_digest(&NarDigest::from_bytes(data), ...)`.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -93,7 +94,7 @@ impl<R> HashingReader<R> {
     }
 
     /// Total bytes delivered to the caller so far.
-    #[allow(dead_code)] // used by tests; useful for diagnostics in future Store backends
+    #[cfg_attr(not(test), allow(dead_code))] // used by tests; useful for diagnostics in future Store backends
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
@@ -174,18 +175,6 @@ pub fn validate_nar_digest(
     Ok(())
 }
 
-/// Validate that NAR data matches the expected hash and size.
-///
-/// Convenience wrapper over [`validate_nar_digest`] for callers that already
-/// have the full NAR buffered.
-///
-/// Error messages contain the substrings "size mismatch" and "hash mismatch"
-/// respectively, which existing protocol tests assert on.
-#[allow(dead_code)] // used by tests; kept for future Store backends with buffered data
-pub fn validate_nar(data: &[u8], expected_hash: &[u8], expected_size: u64) -> anyhow::Result<()> {
-    validate_nar_digest(&NarDigest::from_bytes(data), expected_hash, expected_size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,38 +182,6 @@ mod tests {
 
     fn compute_sha256(data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
-    }
-
-    // --- validate_nar (existing tests, now delegating to validate_nar_digest) ---
-
-    #[test]
-    fn validate_nar_accepts_valid() {
-        let data = b"valid nar data";
-        let hash = compute_sha256(data);
-        assert!(validate_nar(data, &hash, data.len() as u64).is_ok());
-    }
-
-    #[test]
-    fn validate_nar_rejects_size_mismatch() {
-        let data = b"valid nar data";
-        let hash = compute_sha256(data);
-        let err = validate_nar(b"short", &hash, data.len() as u64).unwrap_err();
-        assert!(
-            err.to_string().contains("size mismatch"),
-            "expected 'size mismatch', got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_nar_rejects_hash_mismatch() {
-        let data = b"valid nar data";
-        // Build with the correct size but wrong hash
-        let wrong_hash = compute_sha256(b"wrong data");
-        let err = validate_nar(data, &wrong_hash, data.len() as u64).unwrap_err();
-        assert!(
-            err.to_string().contains("hash mismatch"),
-            "expected 'hash mismatch', got: {err}"
-        );
     }
 
     // --- validate_nar_digest ---
@@ -259,28 +216,6 @@ mod tests {
             err.to_string().contains("hash mismatch"),
             "expected 'hash mismatch', got: {err}"
         );
-    }
-
-    #[test]
-    fn validate_nar_delegates_to_digest() {
-        let data = b"delegation test data";
-        let hash = compute_sha256(data);
-        let digest = NarDigest::from_bytes(data);
-        // Both paths should produce the same result
-        assert_eq!(
-            validate_nar(data, &hash, data.len() as u64).is_ok(),
-            validate_nar_digest(&digest, &hash, data.len() as u64).is_ok()
-        );
-
-        // Also test the error case
-        let wrong_hash = compute_sha256(b"wrong");
-        let err1 = validate_nar(data, &wrong_hash, data.len() as u64)
-            .unwrap_err()
-            .to_string();
-        let err2 = validate_nar_digest(&digest, &wrong_hash, data.len() as u64)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(err1, err2);
     }
 
     // --- NarDigest ---

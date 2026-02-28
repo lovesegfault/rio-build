@@ -22,8 +22,6 @@ pub enum CacheError {
     Sqlite(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("NAR error: {0}")]
-    Nar(#[from] rio_nix::nar::NarError),
 }
 
 /// Per-path coordination for in-flight fetches.
@@ -84,15 +82,13 @@ impl Drop for FetchGuard<'_> {
     }
 }
 
-/// Metadata for a cached store path.
+/// Metadata for a cached store path (eviction candidate).
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     /// The store path basename (e.g. "abc...-hello-1.0").
     pub store_path: String,
     /// Size in bytes on disk.
     pub size_bytes: u64,
-    /// Unix timestamp of last access.
-    pub last_access: i64,
 }
 
 /// LRU cache manager backed by local SSD with SQLite metadata index.
@@ -197,6 +193,7 @@ impl Cache {
     /// from "index query failed". Treating DB errors as not-cached would
     /// trigger re-fetches for every FUSE op during a SQLite hiccup,
     /// saturating store bandwidth and masking the root cause.
+    #[cfg(test)]
     pub fn contains(&self, store_path: &str) -> Result<bool, CacheError> {
         let pool = &self.pool;
         self.runtime.block_on(async {
@@ -322,7 +319,6 @@ impl Cache {
                 Ok::<_, CacheError>(row.map(|(path, size)| CacheEntry {
                     store_path: path,
                     size_bytes: size as u64,
-                    last_access: 0,
                 }))
             })?;
 
