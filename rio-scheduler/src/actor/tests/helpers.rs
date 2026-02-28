@@ -110,6 +110,133 @@ pub(crate) async fn merge_single_node(
     reply_rx.await.unwrap().unwrap()
 }
 
+/// Merge a multi-node DAG with default options (tenant=None,
+/// priority=Scheduled, options=default). Generalization of [`merge_single_node`].
+/// Returns the broadcast receiver for build events.
+pub(crate) async fn merge_dag(
+    handle: &ActorHandle,
+    build_id: Uuid,
+    nodes: Vec<rio_proto::types::DerivationNode>,
+    edges: Vec<rio_proto::types::DerivationEdge>,
+    keep_going: bool,
+) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes,
+                edges,
+                options: BuildOptions::default(),
+                keep_going,
+            },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    reply_rx.await.unwrap().unwrap()
+}
+
+/// Query build status (unwraps the Result; panics on BuildNotFound).
+pub(crate) async fn query_status(
+    handle: &ActorHandle,
+    build_id: Uuid,
+) -> rio_proto::types::BuildStatus {
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::QueryBuildStatus {
+            build_id,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap()
+}
+
+/// Query build status, returning the raw Result (for tests that expect
+/// BuildNotFound).
+pub(crate) async fn try_query_status(
+    handle: &ActorHandle,
+    build_id: Uuid,
+) -> Result<rio_proto::types::BuildStatus, ActorError> {
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::QueryBuildStatus {
+            build_id,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
+/// Send a successful completion (Built) with a single `out` output.
+/// Uses a placeholder output_hash; override via inline construction if
+/// the test asserts on hash contents.
+pub(crate) async fn complete_success(
+    handle: &ActorHandle,
+    worker_id: &str,
+    drv_key: &str,
+    output_path: &str,
+) {
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: worker_id.into(),
+            drv_key: drv_key.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: output_path.into(),
+                    output_hash: vec![0u8; 32],
+                }],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+}
+
+/// Send a successful completion (Built) with NO built_outputs.
+/// Many tests don't care about output paths and just need the state transition.
+pub(crate) async fn complete_success_empty(handle: &ActorHandle, worker_id: &str, drv_key: &str) {
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: worker_id.into(),
+            drv_key: drv_key.into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+}
+
+/// Send a failed completion with the given status and error message.
+pub(crate) async fn complete_failure(
+    handle: &ActorHandle,
+    worker_id: &str,
+    drv_key: &str,
+    status: rio_proto::types::BuildResultStatus,
+    error_msg: &str,
+) {
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: worker_id.into(),
+            drv_key: drv_key.into(),
+            result: rio_proto::types::BuildResult {
+                status: status.into(),
+                error_msg: error_msg.into(),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+}
+
 /// Give the actor time to process commands.
 pub(crate) async fn settle() {
     tokio::time::sleep(Duration::from_millis(50)).await;
