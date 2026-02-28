@@ -212,7 +212,7 @@ async fn test_completion_resolves_drv_path_to_hash() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: drv_path.into(), // Note: PATH, not hash!
+            drv_key: drv_path.into(), // Note: PATH, not hash!
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 error_msg: String::new(),
@@ -373,7 +373,7 @@ async fn test_completion_infrastructure_failure_handled() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: drv_path.into(),
+            drv_key: drv_path.into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
                 error_msg: "worker sent CompletionReport with no result".into(),
@@ -436,7 +436,7 @@ async fn test_completion_with_extreme_timestamps() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: drv_path.into(),
+            drv_key: drv_path.into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 start_time: Some(prost_types::Timestamp {
@@ -541,7 +541,7 @@ async fn test_interactive_builds_pushed_to_front() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: "/nix/store/hash-normal.drv".into(),
+            drv_key: "/nix/store/hash-normal.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
@@ -604,7 +604,7 @@ async fn test_keepgoing_false_fails_fast() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: "/nix/store/hashA.drv".into(),
+            drv_key: "/nix/store/hashA.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
                 error_msg: "compile error".into(),
@@ -666,7 +666,7 @@ async fn test_keepgoing_true_waits_all() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: "/nix/store/hashX.drv".into(),
+            drv_key: "/nix/store/hashX.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
                 error_msg: "failed".into(),
@@ -697,7 +697,7 @@ async fn test_keepgoing_true_waits_all() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: "/nix/store/hashY.drv".into(),
+            drv_key: "/nix/store/hashY.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
@@ -780,7 +780,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "cascade-worker".into(),
-            drv_hash: "/nix/store/cascadeC.drv".into(),
+            drv_key: "/nix/store/cascadeC.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
                 error_msg: "compile error".into(),
@@ -860,7 +860,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "poison-worker".into(),
-            drv_hash: "/nix/store/preleaf.drv".into(),
+            drv_key: "/nix/store/preleaf.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
                 error_msg: "preleaf failed".into(),
@@ -959,7 +959,7 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "watch-worker".into(),
-            drv_hash: "/nix/store/watch-hash.drv".into(),
+            drv_key: "/nix/store/watch-hash.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
@@ -1030,7 +1030,7 @@ async fn test_terminal_build_cleanup_after_delay() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "cleanup-worker".into(),
-            drv_hash: drv_path.into(),
+            drv_key: drv_path.into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
@@ -1116,8 +1116,8 @@ async fn test_transient_retry_different_worker() {
     // Send TransientFailure from the first worker
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: first_worker.clone(),
-            drv_hash: "/nix/store/retry-hash.drv".into(),
+            worker_id: first_worker.clone().into(),
+            drv_key: "/nix/store/retry-hash.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
                 error_msg: "network hiccup".into(),
@@ -1173,7 +1173,7 @@ async fn test_transient_failure_max_retries_same_worker_poisons() {
         handle
             .send_unchecked(ActorCommand::ProcessCompletion {
                 worker_id: "flaky-worker".into(),
-                drv_hash: "/nix/store/maxretry-hash.drv".into(),
+                drv_key: "/nix/store/maxretry-hash.drv".into(),
                 result: rio_proto::types::BuildResult {
                     status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
                     error_msg: format!("attempt {attempt} failed"),
@@ -1310,7 +1310,7 @@ async fn test_watch_build_receives_events() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "watch-events-worker".into(),
-            drv_hash: "/nix/store/watch-events-hash.drv".into(),
+            drv_key: "/nix/store/watch-events-hash.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
@@ -1577,7 +1577,7 @@ async fn test_poison_threshold_after_distinct_workers() {
         handle
             .send_unchecked(ActorCommand::ProcessCompletion {
                 worker_id: (*worker).into(),
-                drv_hash: drv_path.into(),
+                drv_key: drv_path.into(),
                 result: rio_proto::types::BuildResult {
                     status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
                     error_msg: format!("failure {i}"),
@@ -1674,7 +1674,7 @@ async fn test_dependency_chain_releases_parent() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "chain-worker".into(),
-            drv_hash: "/nix/store/chainB.drv".into(),
+            drv_key: "/nix/store/chainB.drv".into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
@@ -1740,7 +1740,7 @@ async fn test_duplicate_completion_idempotent() {
         handle
             .send_unchecked(ActorCommand::ProcessCompletion {
                 worker_id: "idem-worker".into(),
-                drv_hash: drv_path.into(),
+                drv_key: drv_path.into(),
                 result: rio_proto::types::BuildResult {
                     status: rio_proto::types::BuildResultStatus::Built.into(),
                     ..Default::default()
@@ -2068,7 +2068,7 @@ async fn test_db_failure_during_completion_logged() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_hash: drv_path.into(),
+            drv_key: drv_path.into(),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {

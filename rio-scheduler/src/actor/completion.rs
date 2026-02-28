@@ -25,7 +25,7 @@ impl DagActor {
             });
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
-        let resolved_hash: String;
+        let resolved_hash: DrvHash;
         let drv_hash: &str = if self.dag.contains(drv_key) {
             drv_key
         } else if let Some(h) = self.drv_path_to_hash(drv_key) {
@@ -223,7 +223,7 @@ impl DagActor {
                     .update_derivation_status(ready_hash, DerivationStatus::Ready, None)
                     .await
                 {
-                    error!(drv_hash = ready_hash, error = %e, "failed to update status");
+                    error!(drv_hash = %ready_hash, error = %e, "failed to update status");
                 }
                 if prioritize {
                     self.ready_queue.push_front(ready_hash.clone());
@@ -242,7 +242,7 @@ impl DagActor {
 
     pub(super) async fn handle_transient_failure(&mut self, drv_hash: &str, worker_id: &str) {
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.failed_workers.insert(worker_id.to_string());
+            state.failed_workers.insert(worker_id.into());
 
             // Check poison threshold
             if state.failed_workers.len() >= POISON_THRESHOLD {
@@ -290,7 +290,7 @@ impl DagActor {
 
             // Schedule retry with backoff
             let backoff = self.retry_policy.backoff_duration(retry_count);
-            let drv_hash_owned = drv_hash.to_string();
+            let drv_hash_owned: DrvHash = drv_hash.into();
 
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 state.retry_count += 1;
@@ -415,8 +415,8 @@ impl DagActor {
     /// Without this, keepGoing builds with a poisoned leaf hang forever:
     /// parents stay Queued, so completed+failed never reaches total.
     pub(super) async fn cascade_dependency_failure(&mut self, poisoned_hash: &str) {
-        let mut to_visit: Vec<String> = self.dag.get_parents(poisoned_hash);
-        let mut visited: HashSet<String> = HashSet::new();
+        let mut to_visit: Vec<DrvHash> = self.dag.get_parents(poisoned_hash);
+        let mut visited: HashSet<DrvHash> = HashSet::new();
 
         while let Some(parent_hash) = to_visit.pop() {
             if !visited.insert(parent_hash.clone()) {

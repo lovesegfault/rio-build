@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use uuid::Uuid;
 
-use crate::state::{DerivationState, DerivationStatus};
+use crate::state::{DerivationState, DerivationStatus, DrvHash};
 
 /// Errors from DAG operations.
 #[derive(Debug, thiserror::Error)]
@@ -24,30 +24,30 @@ pub enum DagError {
 #[derive(Debug)]
 pub struct MergeResult {
     /// Hashes of nodes newly inserted by this merge (not pre-existing).
-    pub newly_inserted: HashSet<String>,
+    pub newly_inserted: HashSet<DrvHash>,
     /// Edges newly added by this merge as (parent_hash, child_hash) pairs.
-    pub new_edges: Vec<(String, String)>,
+    pub new_edges: Vec<(DrvHash, DrvHash)>,
     /// Hashes of pre-existing nodes that gained build_id interest.
     /// Rollback removes interest only from these (not from nodes where
     /// build_id was already present from a prior merge).
-    pub interest_added: Vec<String>,
+    pub interest_added: Vec<DrvHash>,
 }
 
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug)]
 pub struct DerivationDag {
     /// All derivation nodes, keyed by drv_hash.
-    nodes: HashMap<String, DerivationState>,
+    nodes: HashMap<DrvHash, DerivationState>,
     /// Forward edges: parent drv_hash -> set of child drv_hashes.
     /// A "parent" depends on its "children" (children must complete first).
-    children: HashMap<String, HashSet<String>>,
+    children: HashMap<DrvHash, HashSet<DrvHash>>,
     /// Reverse edges: child drv_hash -> set of parent drv_hashes.
     /// Used to find which derivations become ready when a child completes.
-    parents: HashMap<String, HashSet<String>>,
+    parents: HashMap<DrvHash, HashSet<DrvHash>>,
     /// Reverse index: drv_path -> drv_hash.
     /// Eliminates O(n) scans in completion handling (gRPC layer receives
     /// drv_path from workers but the DAG is keyed by drv_hash).
-    path_to_hash: HashMap<String, String>,
+    path_to_hash: HashMap<String, DrvHash>,
 }
 
 impl DerivationDag {
@@ -77,8 +77,8 @@ impl DerivationDag {
     }
 
     /// Look up a drv_hash by drv_path (O(1) via reverse index).
-    pub fn hash_for_path(&self, drv_path: &str) -> Option<&str> {
-        self.path_to_hash.get(drv_path).map(|s| s.as_str())
+    pub fn hash_for_path(&self, drv_path: &str) -> Option<&DrvHash> {
+        self.path_to_hash.get(drv_path)
     }
 
     /// Iterate all (drv_hash, state) pairs.
@@ -117,17 +117,17 @@ impl DerivationDag {
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
-        let mut new_edges: Vec<(String, String)> = Vec::new();
+        let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Track pre-existing nodes that gained interest in this merge, so
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
-        let mut interest_added: Vec<String> = Vec::new();
+        let mut interest_added: Vec<DrvHash> = Vec::new();
 
         // Insert or update nodes
         for node in nodes {
-            let drv_hash = &node.drv_hash;
+            let drv_hash: DrvHash = node.drv_hash.clone().into();
 
-            if let Some(existing) = self.nodes.get_mut(drv_hash) {
+            if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
                 if existing.interested_builds.insert(build_id) {
@@ -233,11 +233,11 @@ impl DerivationDag {
         // `color.insert(node.to_string(), ...)` inside the loop.
         struct Frame {
             node: String,
-            children: Vec<String>,
+            children: Vec<DrvHash>,
             next_child: usize,
         }
 
-        let children_of = |n: &str| -> Vec<String> {
+        let children_of = |n: &str| -> Vec<DrvHash> {
             self.children
                 .get(n)
                 .map(|set| set.iter().cloned().collect())
@@ -261,10 +261,10 @@ impl DerivationDag {
                     Some(2) => continue,    // already fully explored
                     _ => {
                         // Unvisited: push a new frame (descend).
-                        color.insert(child.clone(), 1);
+                        color.insert(child.to_string(), 1);
                         let grandchildren = children_of(&child);
                         stack.push(Frame {
-                            node: child,
+                            node: child.into_inner(),
                             children: grandchildren,
                             next_child: 0,
                         });
@@ -285,9 +285,9 @@ impl DerivationDag {
     /// this merge (but not from nodes where build_id was already present).
     pub(crate) fn rollback_merge(
         &mut self,
-        newly_inserted: &HashSet<String>,
-        new_edges: &[(String, String)],
-        interest_added: &[String],
+        newly_inserted: &HashSet<DrvHash>,
+        new_edges: &[(DrvHash, DrvHash)],
+        interest_added: &[DrvHash],
         build_id: Uuid,
     ) {
         // Remove newly-inserted edges
@@ -362,7 +362,7 @@ impl DerivationDag {
     }
 
     /// Get all parent drv_hashes that depend on the given child.
-    pub fn get_parents(&self, child_hash: &str) -> Vec<String> {
+    pub fn get_parents(&self, child_hash: &str) -> Vec<DrvHash> {
         self.parents
             .get(child_hash)
             .map(|p| p.iter().cloned().collect())
@@ -371,7 +371,7 @@ impl DerivationDag {
 
     /// Find all derivations that become ready (all deps completed) after a
     /// given derivation completes. Only returns derivations currently in Queued state.
-    pub fn find_newly_ready(&self, completed_hash: &str) -> Vec<String> {
+    pub fn find_newly_ready(&self, completed_hash: &str) -> Vec<DrvHash> {
         let mut ready = Vec::new();
 
         for parent_hash in self.get_parents(completed_hash) {
@@ -387,7 +387,7 @@ impl DerivationDag {
     }
 
     /// Get all derivation hashes involved in a build.
-    pub fn build_derivations(&self, build_id: Uuid) -> Vec<String> {
+    pub fn build_derivations(&self, build_id: Uuid) -> Vec<DrvHash> {
         self.nodes
             .iter()
             .filter(|(_, state)| state.interested_builds.contains(&build_id))
@@ -397,7 +397,7 @@ impl DerivationDag {
 
     /// Remove a build's interest from all its derivations.
     /// Returns derivation hashes that are now orphaned (no builds interested).
-    pub fn remove_build_interest(&mut self, build_id: Uuid) -> Vec<String> {
+    pub fn remove_build_interest(&mut self, build_id: Uuid) -> Vec<DrvHash> {
         let mut orphaned = Vec::new();
 
         for (hash, state) in &mut self.nodes {
@@ -457,8 +457,8 @@ impl DerivationDag {
     /// Returns lists of (drv_hash, new_status) transitions.
     pub fn compute_initial_states(
         &self,
-        newly_inserted: &HashSet<String>,
-    ) -> Vec<(String, DerivationStatus)> {
+        newly_inserted: &HashSet<DrvHash>,
+    ) -> Vec<(DrvHash, DerivationStatus)> {
         let mut transitions = Vec::new();
 
         for drv_hash in newly_inserted {
@@ -481,7 +481,7 @@ impl DerivationDag {
     }
 
     /// Find all leaf derivations (no dependencies) for a build.
-    pub fn find_leaves(&self, build_id: Uuid) -> Vec<String> {
+    pub fn find_leaves(&self, build_id: Uuid) -> Vec<DrvHash> {
         self.nodes
             .iter()
             .filter(|(_, state)| state.interested_builds.contains(&build_id))
@@ -496,7 +496,7 @@ impl DerivationDag {
 
     /// Find all root derivations (no parents) for a build.
     /// These are the top-level derivations the client actually wants built.
-    pub fn find_roots(&self, build_id: Uuid) -> Vec<String> {
+    pub fn find_roots(&self, build_id: Uuid) -> Vec<DrvHash> {
         self.nodes
             .iter()
             .filter(|(_, state)| state.interested_builds.contains(&build_id))
@@ -532,11 +532,15 @@ impl DerivationDag {
 
     /// Perform a topological walk from roots, yielding nodes in dependency order.
     /// This is BFS from leaves toward roots (Kahn's algorithm).
-    pub fn topological_order(&self) -> Vec<String> {
+    pub fn topological_order(&self) -> Vec<DrvHash> {
         // Compute dep counts: number of children (deps) for each node
         let mut dep_count: HashMap<&str, usize> = HashMap::new();
         for hash in self.nodes.keys() {
-            let count = self.children.get(hash).map(|c| c.len()).unwrap_or(0);
+            let count = self
+                .children
+                .get(hash.as_str())
+                .map(|c| c.len())
+                .unwrap_or(0);
             dep_count.insert(hash.as_str(), count);
         }
 
@@ -548,7 +552,7 @@ impl DerivationDag {
 
         let mut order = Vec::new();
         while let Some(hash) = queue.pop_front() {
-            order.push(hash.to_string());
+            order.push(hash.into());
             // For each parent that depends on this hash
             if let Some(parent_hashes) = self.parents.get(hash) {
                 for parent in parent_hashes {
@@ -663,8 +667,8 @@ mod tests {
 
         // Check parent/child relationships
         assert_eq!(dag.children["hashA"].len(), 2);
-        assert!(dag.get_parents("hashB").contains(&"hashA".to_string()));
-        assert!(dag.get_parents("hashC").contains(&"hashA".to_string()));
+        assert!(dag.get_parents("hashB").iter().any(|h| h == "hashA"));
+        assert!(dag.get_parents("hashC").iter().any(|h| h == "hashA"));
     }
 
     #[test]
@@ -720,7 +724,7 @@ mod tests {
             .newly_inserted;
 
         // Only parentP is newly inserted (leafP already existed).
-        assert_eq!(newly, HashSet::from(["parentP".to_string()]));
+        assert_eq!(newly, HashSet::from(["parentP".into()]));
         assert!(dag.any_dep_terminally_failed("parentP"));
 
         // compute_initial_states should return DependencyFailed for parentP.
@@ -972,8 +976,14 @@ mod tests {
             make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
         ];
         dag.merge(b1, &nodes, &[]).unwrap();
-        assert_eq!(dag.hash_for_path("/nix/store/a.drv"), Some("hashA"));
-        assert_eq!(dag.hash_for_path("/nix/store/b.drv"), Some("hashB"));
+        assert_eq!(
+            dag.hash_for_path("/nix/store/a.drv").map(|h| h.as_str()),
+            Some("hashA")
+        );
+        assert_eq!(
+            dag.hash_for_path("/nix/store/b.drv").map(|h| h.as_str()),
+            Some("hashB")
+        );
         assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
 
         // Cycle rollback: newly-inserted node's path entry must be removed.
@@ -992,7 +1002,7 @@ mod tests {
             "rollback must remove path index for newly-inserted node"
         );
         assert_eq!(
-            dag.hash_for_path("/nix/store/a.drv"),
+            dag.hash_for_path("/nix/store/a.drv").map(|h| h.as_str()),
             Some("hashA"),
             "rollback must preserve path index for pre-existing node"
         );
@@ -1027,7 +1037,10 @@ mod tests {
             "reap must remove path index for reaped node"
         );
         // B is not terminal, so it survives reaping.
-        assert_eq!(dag.hash_for_path("/nix/store/b.drv"), Some("hashB"));
+        assert_eq!(
+            dag.hash_for_path("/nix/store/b.drv").map(|h| h.as_str()),
+            Some("hashB")
+        );
     }
 
     /// Regression test for stack overflow in the recursive DFS cycle check.

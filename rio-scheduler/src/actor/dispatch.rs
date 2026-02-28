@@ -14,7 +14,7 @@ impl DagActor {
         // ineligible ones. Previously, `None => break` on the first ineligible
         // derivation blocked all subsequent work (e.g., an aarch64 drv at
         // queue head blocked all x86_64 dispatch).
-        let mut deferred: Vec<String> = Vec::new();
+        let mut deferred: Vec<DrvHash> = Vec::new();
         let mut dispatched_any = true;
 
         // Keep cycling until a full pass with no dispatches AND no stale removals.
@@ -101,7 +101,7 @@ impl DagActor {
                 metrics::histogram!("rio_scheduler_assignment_latency_seconds")
                     .record(latency.as_secs_f64());
             }
-            state.assigned_worker = Some(worker_id.to_string());
+            state.assigned_worker = Some(worker_id.into());
         }
 
         // Update DB (non-terminal: log failure, don't block dispatch)
@@ -126,7 +126,7 @@ impl DagActor {
 
         // Track on worker
         if let Some(worker) = self.workers.get_mut(worker_id) {
-            worker.running_builds.insert(drv_hash.to_string());
+            worker.running_builds.insert(drv_hash.into());
         }
 
         // Send WorkAssignment to worker via stream

@@ -58,7 +58,7 @@ impl DagActor {
             priority_class,
             keep_going,
             options,
-            nodes.iter().map(|n| n.drv_hash.clone()).collect(),
+            nodes.iter().map(|n| n.drv_hash.clone().into()).collect(),
         );
         self.builds.insert(build_id, build_info);
 
@@ -107,7 +107,7 @@ impl DagActor {
             };
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.transition(DerivationStatus::Completed) {
-                    warn!(drv_hash, error = %e, "cache-hit Created->Completed transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "cache-hit Created->Completed transition failed");
                     continue;
                 }
                 state.output_paths = node.expected_output_paths.clone();
@@ -120,7 +120,7 @@ impl DagActor {
                     .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
                     .await
                 {
-                    warn!(drv_hash, error = %e, "failed to persist cache-hit status");
+                    warn!(drv_hash = %drv_hash, error = %e, "failed to persist cache-hit status");
                 }
 
                 self.emit_build_event(
@@ -142,7 +142,7 @@ impl DagActor {
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
         // dependents will correctly be computed as Ready here.
-        let remaining_new: HashSet<String> = newly_inserted
+        let remaining_new: HashSet<DrvHash> = newly_inserted
             .iter()
             .filter(|h| !cached_hashes.contains(h.as_str()))
             .cloned()
@@ -159,7 +159,7 @@ impl DagActor {
         // Track whether any newly inserted node was immediately marked
         // DependencyFailed (because a dep is already poisoned). If so, the
         // build may need to fail (!keepGoing) or terminate early (keepGoing).
-        let mut first_dep_failed: Option<String> = None;
+        let mut first_dep_failed: Option<DrvHash> = None;
 
         for (drv_hash, target_status) in &initial_states {
             if let Some(state) = self.dag.node_mut(drv_hash) {
@@ -167,17 +167,17 @@ impl DagActor {
                     DerivationStatus::Ready => {
                         // Transition created -> queued -> ready
                         if let Err(e) = state.transition(DerivationStatus::Queued) {
-                            warn!(drv_hash, error = %e, "Created->Queued transition failed");
+                            warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
                         }
                         if let Err(e) = state.transition(DerivationStatus::Ready) {
-                            warn!(drv_hash, error = %e, "Queued->Ready transition failed");
+                            warn!(drv_hash = %drv_hash, error = %e, "Queued->Ready transition failed");
                         }
                         if let Err(e) = self
                             .db
                             .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
                             .await
                         {
-                            error!(drv_hash, error = %e, "failed to persist Ready status (build is Active; continuing)");
+                            error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status (build is Active; continuing)");
                         }
                         if is_interactive {
                             self.ready_queue.push_front(drv_hash.clone());
@@ -187,19 +187,19 @@ impl DagActor {
                     }
                     DerivationStatus::Queued => {
                         if let Err(e) = state.transition(DerivationStatus::Queued) {
-                            warn!(drv_hash, error = %e, "Created->Queued transition failed");
+                            warn!(drv_hash = %drv_hash, error = %e, "Created->Queued transition failed");
                         }
                         if let Err(e) = self
                             .db
                             .update_derivation_status(drv_hash, DerivationStatus::Queued, None)
                             .await
                         {
-                            error!(drv_hash, error = %e, "failed to persist Queued status (build is Active; continuing)");
+                            error!(drv_hash = %drv_hash, error = %e, "failed to persist Queued status (build is Active; continuing)");
                         }
                     }
                     DerivationStatus::DependencyFailed => {
                         if let Err(e) = state.transition(DerivationStatus::DependencyFailed) {
-                            warn!(drv_hash, error = %e, "Created->DependencyFailed transition failed");
+                            warn!(drv_hash = %drv_hash, error = %e, "Created->DependencyFailed transition failed");
                         }
                         if let Err(e) = self
                             .db
@@ -210,13 +210,13 @@ impl DagActor {
                             )
                             .await
                         {
-                            error!(drv_hash, error = %e, "failed to persist DependencyFailed status (build is Active; continuing)");
+                            error!(drv_hash = %drv_hash, error = %e, "failed to persist DependencyFailed status (build is Active; continuing)");
                         }
                         if first_dep_failed.is_none() {
                             first_dep_failed = Some(drv_hash.clone());
                         }
                         debug!(
-                            drv_hash,
+                            drv_hash = %drv_hash,
                             "dep already poisoned at merge; marking DependencyFailed"
                         );
                     }
@@ -227,7 +227,7 @@ impl DagActor {
 
         // Also handle nodes that already existed and are already completed
         for node in &nodes {
-            if !newly_inserted.contains(&node.drv_hash)
+            if !newly_inserted.contains(node.drv_hash.as_str())
                 && let Some(state) = self.dag.node(&node.drv_hash)
                 && state.status() == DerivationStatus::Completed
             {
@@ -287,7 +287,7 @@ impl DagActor {
         build_id: Uuid,
         nodes: &[rio_proto::types::DerivationNode],
         edges: &[rio_proto::types::DerivationEdge],
-        newly_inserted: &HashSet<String>,
+        newly_inserted: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
@@ -392,9 +392,9 @@ impl DagActor {
     /// RPC fails (non-fatal — we fall back to building).
     async fn check_cached_outputs(
         &self,
-        newly_inserted: &HashSet<String>,
+        newly_inserted: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
-    ) -> HashSet<String> {
+    ) -> HashSet<DrvHash> {
         let Some(store_client) = &self.store_client else {
             return HashSet::new();
         };
