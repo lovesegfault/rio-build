@@ -28,8 +28,6 @@ use nix::mount::{MntFlags, MsFlags};
 ///   - `work/`              — overlayfs workdir
 ///   - `merged/`            — overlayfs mountpoint, bind-mounted to /nix/store
 pub struct OverlayMount {
-    #[allow(dead_code)]
-    lower: PathBuf,
     upper: PathBuf,
     work: PathBuf,
     merged: PathBuf,
@@ -37,12 +35,6 @@ pub struct OverlayMount {
 }
 
 impl OverlayMount {
-    /// The lower layer path (the FUSE mount point).
-    #[allow(dead_code)]
-    pub fn lower_dir(&self) -> &Path {
-        &self.lower
-    }
-
     /// The upper root path under which outputs, synth DB, and nix.conf live.
     ///
     /// Note: the overlayfs `upperdir` is `{upper}/nix/store/`, not `{upper}/`.
@@ -52,12 +44,6 @@ impl OverlayMount {
     /// bind-mounted separately (not visible through the overlay).
     pub fn upper_dir(&self) -> &Path {
         &self.upper
-    }
-
-    /// The work directory used by overlayfs internally.
-    #[allow(dead_code)]
-    pub fn work_dir(&self) -> &Path {
-        &self.work
     }
 
     /// The merged view path where the overlay is mounted.
@@ -182,7 +168,6 @@ pub fn setup_overlay(
     .map_err(|e| anyhow::anyhow!("mount overlay failed: {e} (mount_data: {mount_data})"))?;
 
     Ok(OverlayMount {
-        lower: lower.to_path_buf(),
         upper,
         work,
         merged,
