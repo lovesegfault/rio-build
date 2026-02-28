@@ -3,6 +3,7 @@
 //! Both services run in the same scheduler binary. They communicate with the
 //! DAG actor via the `ActorHandle`.
 
+use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -49,6 +50,68 @@ impl SchedulerGrpc {
             ActorError::Internal(msg) => Status::internal(msg),
         }
     }
+
+    /// Send a command to the actor and await its oneshot reply, mapping
+    /// errors to Status. Combines the `send().await? + reply_rx.await??`
+    /// pattern that appears in every request handler.
+    async fn send_and_await<R>(
+        &self,
+        cmd: ActorCommand,
+        reply_rx: oneshot::Receiver<Result<R, ActorError>>,
+    ) -> Result<R, Status> {
+        self.actor
+            .send(cmd)
+            .await
+            .map_err(Self::actor_error_to_status)?;
+        reply_rx
+            .await
+            .map_err(|_| Status::internal("actor dropped reply channel"))?
+            .map_err(Self::actor_error_to_status)
+    }
+
+    /// Parse a build_id string into a Uuid with a standard error message.
+    fn parse_build_id(s: &str) -> Result<Uuid, Status> {
+        s.parse()
+            .map_err(|_| Status::invalid_argument("invalid build_id UUID"))
+    }
+}
+
+/// Bridge a `broadcast::Receiver<BuildEvent>` into a tonic streaming response.
+///
+/// On `Lagged`, sends `DATA_LOSS` so the client fails cleanly instead of
+/// silently hanging on a missed terminal event. Lagged means we permanently
+/// missed n events; if `BuildCompleted` was among them the client would hang
+/// forever waiting for a terminal event that will never arrive.
+fn bridge_build_events(
+    task_name: &'static str,
+    mut bcast: broadcast::Receiver<rio_proto::types::BuildEvent>,
+) -> ReceiverStream<Result<rio_proto::types::BuildEvent, Status>> {
+    let (tx, rx) = mpsc::channel(256);
+    rio_common::task::spawn_monitored(task_name, async move {
+        loop {
+            match bcast.recv().await {
+                Ok(event) => {
+                    if tx.send(Ok(event)).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        lagged = n,
+                        "build event subscriber lagged, some events lost"
+                    );
+                    let _ = tx
+                        .send(Err(Status::data_loss(format!(
+                            "missed {n} build events; re-subscribe via WatchBuild"
+                        ))))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,53 +201,12 @@ impl SchedulerService for SchedulerGrpc {
             reply: reply_tx,
         };
 
-        self.actor
-            .send(cmd)
-            .await
-            .map_err(Self::actor_error_to_status)?;
-
-        let broadcast_rx = reply_rx
-            .await
-            .map_err(|_| Status::internal("actor dropped reply channel"))?
-            .map_err(Self::actor_error_to_status)?;
-
-        // Bridge broadcast::Receiver to mpsc::Receiver for tonic streaming
-        let (tx, rx) = mpsc::channel(256);
-        let mut broadcast_rx = broadcast_rx;
-
-        rio_common::task::spawn_monitored("submit-build-bridge", async move {
-            loop {
-                match broadcast_rx.recv().await {
-                    Ok(event) => {
-                        if tx.send(Ok(event)).await.is_err() {
-                            break; // Client disconnected
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break; // Build terminal (sender dropped) or actor shut down
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(
-                            lagged = n,
-                            "build event subscriber lagged, some events lost"
-                        );
-                        // Lagged means we permanently missed n events. If
-                        // BuildCompleted was among them, the client would hang
-                        // forever. Send DATA_LOSS so the gateway fails cleanly
-                        // instead of silently hanging.
-                        let _ = tx
-                            .send(Err(Status::data_loss(format!(
-                                "missed {n} build events; re-subscribe via WatchBuild"
-                            ))))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        });
-
+        let bcast = self.send_and_await(cmd, reply_rx).await?;
         info!(build_id = %build_id, "build submitted");
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(bridge_build_events(
+            "submit-build-bridge",
+            bcast,
+        )))
     }
 
     type WatchBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
@@ -196,10 +218,7 @@ impl SchedulerService for SchedulerGrpc {
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
         self.check_actor_alive()?;
         let req = request.into_inner();
-        let build_id: Uuid = req
-            .build_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("invalid build_id UUID"))?;
+        let build_id = Self::parse_build_id(&req.build_id)?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -209,45 +228,11 @@ impl SchedulerService for SchedulerGrpc {
             reply: reply_tx,
         };
 
-        self.actor
-            .send(cmd)
-            .await
-            .map_err(Self::actor_error_to_status)?;
-
-        let broadcast_rx = reply_rx
-            .await
-            .map_err(|_| Status::internal("actor dropped reply channel"))?
-            .map_err(Self::actor_error_to_status)?;
-
-        // Bridge broadcast to mpsc
-        let (tx, rx) = mpsc::channel(256);
-        let mut broadcast_rx = broadcast_rx;
-
-        rio_common::task::spawn_monitored("watch-build-bridge", async move {
-            loop {
-                match broadcast_rx.recv().await {
-                    Ok(event) => {
-                        if tx.send(Ok(event)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "WatchBuild subscriber lagged, some events lost");
-                        // Send DATA_LOSS so the client fails cleanly instead
-                        // of silently hanging on a missed terminal event.
-                        let _ = tx
-                            .send(Err(Status::data_loss(format!(
-                                "missed {n} build events; re-subscribe via WatchBuild"
-                            ))))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        let bcast = self.send_and_await(cmd, reply_rx).await?;
+        Ok(Response::new(bridge_build_events(
+            "watch-build-bridge",
+            bcast,
+        )))
     }
 
     #[instrument(skip(self, request), fields(rpc = "QueryBuildStatus"))]
@@ -257,10 +242,7 @@ impl SchedulerService for SchedulerGrpc {
     ) -> Result<Response<rio_proto::types::BuildStatus>, Status> {
         self.check_actor_alive()?;
         let req = request.into_inner();
-        let build_id: Uuid = req
-            .build_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("invalid build_id UUID"))?;
+        let build_id = Self::parse_build_id(&req.build_id)?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -269,16 +251,7 @@ impl SchedulerService for SchedulerGrpc {
             reply: reply_tx,
         };
 
-        self.actor
-            .send(cmd)
-            .await
-            .map_err(Self::actor_error_to_status)?;
-
-        let status = reply_rx
-            .await
-            .map_err(|_| Status::internal("actor dropped reply channel"))?
-            .map_err(Self::actor_error_to_status)?;
-
+        let status = self.send_and_await(cmd, reply_rx).await?;
         Ok(Response::new(status))
     }
 
@@ -289,10 +262,7 @@ impl SchedulerService for SchedulerGrpc {
     ) -> Result<Response<rio_proto::types::CancelBuildResponse>, Status> {
         self.check_actor_alive()?;
         let req = request.into_inner();
-        let build_id: Uuid = req
-            .build_id
-            .parse()
-            .map_err(|_| Status::invalid_argument("invalid build_id UUID"))?;
+        let build_id = Self::parse_build_id(&req.build_id)?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -302,15 +272,7 @@ impl SchedulerService for SchedulerGrpc {
             reply: reply_tx,
         };
 
-        self.actor
-            .send(cmd)
-            .await
-            .map_err(Self::actor_error_to_status)?;
-
-        let cancelled = reply_rx
-            .await
-            .map_err(|_| Status::internal("actor dropped reply channel"))?
-            .map_err(Self::actor_error_to_status)?;
+        let cancelled = self.send_and_await(cmd, reply_rx).await?;
 
         Ok(Response::new(rio_proto::types::CancelBuildResponse {
             cancelled,
