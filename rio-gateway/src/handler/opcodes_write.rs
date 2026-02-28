@@ -47,17 +47,18 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
     };
 
     // Upload to store via gRPC
-    let info = make_proto_path_info(
-        &path_str,
-        &deriver_str,
-        &nar_hash_bytes,
+    let info = types::PathInfo {
+        store_path: path_str.clone(),
+        store_path_hash: Vec::new(),
+        deriver: deriver_str,
+        nar_hash: nar_hash_bytes,
         nar_size,
-        &references,
+        references,
         registration_time,
         ultimate,
-        &sigs,
-        &ca_str,
-    );
+        signatures: sigs,
+        content_address: ca_str,
+    };
 
     // Cache .drv before uploading (we have the NAR data buffered)
     try_cache_drv(&path, &nar_data, drv_cache);
@@ -136,17 +137,18 @@ async fn parse_add_multiple_entry(
     // Cache .drv before uploading
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = make_proto_path_info(
-        &path_str,
-        &deriver_str,
-        &nar_hash_bytes,
+    let info = types::PathInfo {
+        store_path: path_str.clone(),
+        store_path_hash: Vec::new(),
+        deriver: deriver_str,
+        nar_hash: nar_hash_bytes,
         nar_size,
-        &references,
+        references,
         registration_time,
         ultimate,
-        &sigs,
-        &ca_str,
-    );
+        signatures: sigs,
+        content_address: ca_str,
+    };
 
     grpc_put_path(store_client, info, nar_data)
         .await
@@ -241,17 +243,18 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = make_proto_path_info(
-        &path.to_string(),
-        "",
-        nar_hash.digest(),
+    let info = types::PathInfo {
+        store_path: path.to_string(),
+        store_path_hash: Vec::new(),
+        deriver: String::new(),
+        nar_hash: nar_hash.digest().to_vec(),
         nar_size,
-        &references,
-        0,
-        true,
-        &[],
-        &ca,
-    );
+        references: references.clone(),
+        registration_time: 0,
+        ultimate: true,
+        signatures: Vec::new(),
+        content_address: ca.clone(),
+    };
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
         return send_store_error(stderr, e).await;
@@ -330,17 +333,18 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = make_proto_path_info(
-        &path.to_string(),
-        "",
-        nar_hash.digest(),
+    let info = types::PathInfo {
+        store_path: path.to_string(),
+        store_path_hash: Vec::new(),
+        deriver: String::new(),
+        nar_hash: nar_hash.digest().to_vec(),
         nar_size,
-        &references,
-        0,
-        true,
-        &[],
-        &ca,
-    );
+        references,
+        registration_time: 0,
+        ultimate: true,
+        signatures: Vec::new(),
+        content_address: ca,
+    };
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
         return send_store_error(stderr, e).await;
