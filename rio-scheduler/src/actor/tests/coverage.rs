@@ -10,53 +10,32 @@ async fn test_keepgoing_false_fails_fast() {
 
     // Merge a two-node DAG with keepGoing=false
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![
-                    make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
-                    make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
-                ],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false, // critical
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _rx = reply_rx.await.unwrap().unwrap();
+    let _rx = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
+            make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
+        ],
+        vec![],
+        false, // keep_going=false (critical)
+    )
+    .await;
     settle().await;
 
     // Send PermanentFailure for hashA
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: "/nix/store/hashA.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
-                error_msg: "compile error".into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_failure(
+        &handle,
+        "test-worker",
+        "/nix/store/hashA.drv",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "compile error",
+    )
+    .await;
     settle().await;
 
     // Build should be Failed (not waiting for hashB)
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
@@ -74,53 +53,32 @@ async fn test_keepgoing_true_waits_all() {
 
     // Merge a two-node DAG with keepGoing=true
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![
-                    make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
-                    make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
-                ],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: true, // critical
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _rx = reply_rx.await.unwrap().unwrap();
+    let _rx = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
+            make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
+        ],
+        vec![],
+        true, // keep_going=true (critical)
+    )
+    .await;
     settle().await;
 
     // Send PermanentFailure for hashX
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: "/nix/store/hashX.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
-                error_msg: "failed".into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_failure(
+        &handle,
+        "test-worker",
+        "/nix/store/hashX.drv",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "failed",
+    )
+    .await;
     settle().await;
 
     // Build should still be Active (waiting for hashY)
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Active as i32,
@@ -128,29 +86,11 @@ async fn test_keepgoing_true_waits_all() {
     );
 
     // Complete hashY successfully
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: "/nix/store/hashY.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success_empty(&handle, "test-worker", "/nix/store/hashY.drv").await;
     settle().await;
 
     // Now build should be Failed (all resolved, one failed)
-    let (status_tx2, status_rx2) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx2,
-        })
-        .await
-        .unwrap();
-    let status2 = status_rx2.await.unwrap().unwrap();
+    let status2 = query_status(&handle, build_id).await;
     assert_eq!(
         status2.state,
         rio_proto::types::BuildState::Failed as i32,
@@ -172,30 +112,21 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
 
     // Chain: A depends on B depends on C. C is the leaf.
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![
-                    make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
-                    make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
-                    make_test_node("cascadeC", "/nix/store/cascadeC.drv", "x86_64-linux"),
-                ],
-                edges: vec![
-                    make_test_edge("/nix/store/cascadeA.drv", "/nix/store/cascadeB.drv"),
-                    make_test_edge("/nix/store/cascadeB.drv", "/nix/store/cascadeC.drv"),
-                ],
-                options: BuildOptions::default(),
-                keep_going: true,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _rx = reply_rx.await.unwrap().unwrap();
+    let _rx = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
+            make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
+            make_test_node("cascadeC", "/nix/store/cascadeC.drv", "x86_64-linux"),
+        ],
+        vec![
+            make_test_edge("/nix/store/cascadeA.drv", "/nix/store/cascadeB.drv"),
+            make_test_edge("/nix/store/cascadeB.drv", "/nix/store/cascadeC.drv"),
+        ],
+        true, // keep_going
+    )
+    .await;
     settle().await;
 
     // Sanity: C is the only Ready/Assigned derivation; A and B are Queued.
@@ -213,18 +144,14 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
     assert_eq!(info_b.status, DerivationStatus::Queued);
 
     // Poison C via PermanentFailure.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "cascade-worker".into(),
-            drv_key: "/nix/store/cascadeC.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
-                error_msg: "compile error".into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_failure(
+        &handle,
+        "cascade-worker",
+        "/nix/store/cascadeC.drv",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "compile error",
+    )
+    .await;
     settle().await;
 
     // B and A should now be DependencyFailed (cascaded transitively).
@@ -251,15 +178,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
 
     // Build should terminate as Failed (all 3 derivations resolved:
     // 1 Poisoned + 2 DependencyFailed counted in failed).
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
@@ -293,18 +212,14 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
     )
     .await;
     settle().await;
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "poison-worker".into(),
-            drv_key: "/nix/store/preleaf.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
-                error_msg: "preleaf failed".into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_failure(
+        &handle,
+        "poison-worker",
+        "/nix/store/preleaf.drv",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "preleaf failed",
+    )
+    .await;
     settle().await;
 
     // Verify preleaf is Poisoned.
@@ -318,29 +233,20 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
     // Build 2: new node depending on the poisoned preleaf.
     // keepGoing=false: build should fail immediately at merge.
     let build2 = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: build2,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![
-                    make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
-                    make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
-                ],
-                edges: vec![make_test_edge(
-                    "/nix/store/preparent.drv",
-                    "/nix/store/preleaf.drv",
-                )],
-                options: BuildOptions::default(),
-                keep_going: false,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _rx2 = reply_rx.await.unwrap().unwrap();
+    let _rx2 = merge_dag(
+        &handle,
+        build2,
+        vec![
+            make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
+            make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
+        ],
+        vec![make_test_edge(
+            "/nix/store/preparent.drv",
+            "/nix/store/preleaf.drv",
+        )],
+        false,
+    )
+    .await;
     settle().await;
 
     // preparent must be DependencyFailed (not stuck Queued).
@@ -356,15 +262,7 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
     );
 
     // Build 2 must be Failed (!keepGoing + dep failure).
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id: build2,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build2).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
@@ -394,17 +292,7 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
     .await;
     settle().await;
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "watch-worker".into(),
-            drv_key: "/nix/store/watch-hash.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success_empty(&handle, "watch-worker", "/nix/store/watch-hash.drv").await;
     settle().await;
 
     // Drop the original subscriber. The BuildCompleted event was already
@@ -465,29 +353,11 @@ async fn test_terminal_build_cleanup_after_delay() {
     .await;
     settle().await;
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "cleanup-worker".into(),
-            drv_key: drv_path.into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success_empty(&handle, "cleanup-worker", drv_path).await;
     settle().await;
 
     // Build should be Succeeded and still queryable.
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap();
+    let status = try_query_status(&handle, build_id).await;
     assert!(status.is_ok(), "build should be queryable before cleanup");
 
     // Directly inject the cleanup command (bypassing the 60s delay).
@@ -498,15 +368,7 @@ async fn test_terminal_build_cleanup_after_delay() {
     settle().await;
 
     // Build should now be gone (BuildNotFound).
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap();
+    let status = try_query_status(&handle, build_id).await;
     assert!(
         matches!(status, Err(ActorError::BuildNotFound(_))),
         "build should be cleaned up after delay, got {:?}",
@@ -552,18 +414,14 @@ async fn test_transient_retry_different_worker() {
     assert_eq!(info1.retry_count, 0);
 
     // Send TransientFailure from the first worker
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: first_worker.clone().into(),
-            drv_key: "/nix/store/retry-hash.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
-                error_msg: "network hiccup".into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_failure(
+        &handle,
+        &first_worker,
+        "/nix/store/retry-hash.drv",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "network hiccup",
+    )
+    .await;
     settle().await;
 
     // Should be retried: retry_count=1, possibly on a different worker
@@ -608,18 +466,14 @@ async fn test_transient_failure_max_retries_same_worker_poisons() {
     // Default RetryPolicy::max_retries = 2. Fail 3 times on same worker:
     // retry_count 0 -> 1 (retry), 1 -> 2 (retry), 2 >= 2 -> Poisoned.
     for attempt in 0..3 {
-        handle
-            .send_unchecked(ActorCommand::ProcessCompletion {
-                worker_id: "flaky-worker".into(),
-                drv_key: "/nix/store/maxretry-hash.drv".into(),
-                result: rio_proto::types::BuildResult {
-                    status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
-                    error_msg: format!("attempt {attempt} failed"),
-                    ..Default::default()
-                },
-            })
-            .await
-            .unwrap();
+        complete_failure(
+            &handle,
+            "flaky-worker",
+            "/nix/store/maxretry-hash.drv",
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            &format!("attempt {attempt} failed"),
+        )
+        .await;
         settle().await;
     }
 
@@ -669,15 +523,7 @@ async fn test_cancel_build_active_drains_derivations() {
     settle().await;
 
     // Build should be Cancelled.
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Cancelled as i32,
@@ -745,17 +591,12 @@ async fn test_watch_build_receives_events() {
     let mut watch_rx = reply_rx.await.unwrap().unwrap();
 
     // Complete the build; watcher should see BuildCompleted.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "watch-events-worker".into(),
-            drv_key: "/nix/store/watch-events-hash.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success_empty(
+        &handle,
+        "watch-events-worker",
+        "/nix/store/watch-events-hash.drv",
+    )
+    .await;
 
     let mut saw_completed = false;
     // Drain events with a timeout.
@@ -793,27 +634,18 @@ async fn test_dispatch_skips_ineligible_derivation() {
     // With the old `None => break`, the aarch64 drv at head would block
     // the x86_64 drv from being dispatched.
     let build_arm = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id: build_arm,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node(
-                    "arm-hash",
-                    "/nix/store/arm-hash.drv",
-                    "aarch64-linux",
-                )],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _rx = reply_rx.await.unwrap().unwrap();
+    let _rx = merge_dag(
+        &handle,
+        build_arm,
+        vec![make_test_node(
+            "arm-hash",
+            "/nix/store/arm-hash.drv",
+            "aarch64-linux",
+        )],
+        vec![],
+        false,
+    )
+    .await;
 
     let build_x86 = Uuid::new_v4();
     let _rx = merge_single_node(
@@ -1012,18 +844,14 @@ async fn test_poison_threshold_after_distinct_workers() {
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
     for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
-        handle
-            .send_unchecked(ActorCommand::ProcessCompletion {
-                worker_id: (*worker).into(),
-                drv_key: drv_path.into(),
-                result: rio_proto::types::BuildResult {
-                    status: rio_proto::types::BuildResultStatus::TransientFailure.into(),
-                    error_msg: format!("failure {i}"),
-                    ..Default::default()
-                },
-            })
-            .await
-            .unwrap();
+        complete_failure(
+            &handle,
+            worker,
+            drv_path,
+            rio_proto::types::BuildResultStatus::TransientFailure,
+            &format!("failure {i}"),
+        )
+        .await;
         settle().await;
     }
 
@@ -1040,15 +868,7 @@ async fn test_poison_threshold_after_distinct_workers() {
     );
 
     // Build should be Failed.
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
@@ -1066,29 +886,20 @@ async fn test_dependency_chain_releases_parent() {
 
     // A depends on B. B is Ready (leaf), A is Queued.
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![
-                    make_test_node("chainA", "/nix/store/chainA.drv", "x86_64-linux"),
-                    make_test_node("chainB", "/nix/store/chainB.drv", "x86_64-linux"),
-                ],
-                edges: vec![make_test_edge(
-                    "/nix/store/chainA.drv",
-                    "/nix/store/chainB.drv",
-                )],
-                options: BuildOptions::default(),
-                keep_going: false,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _rx = reply_rx.await.unwrap().unwrap();
+    let _rx = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_test_node("chainA", "/nix/store/chainA.drv", "x86_64-linux"),
+            make_test_node("chainB", "/nix/store/chainB.drv", "x86_64-linux"),
+        ],
+        vec![make_test_edge(
+            "/nix/store/chainA.drv",
+            "/nix/store/chainB.drv",
+        )],
+        false,
+    )
+    .await;
     settle().await;
 
     // B is dispatched first (leaf). A is Queued waiting for B.
@@ -1111,17 +922,7 @@ async fn test_dependency_chain_releases_parent() {
     assert_eq!(assigned_path, "/nix/store/chainB.drv");
 
     // Complete B.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "chain-worker".into(),
-            drv_key: "/nix/store/chainB.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success_empty(&handle, "chain-worker", "/nix/store/chainB.drv").await;
     settle().await;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
@@ -1177,30 +978,12 @@ async fn test_duplicate_completion_idempotent() {
 
     // Send completion TWICE.
     for _ in 0..2 {
-        handle
-            .send_unchecked(ActorCommand::ProcessCompletion {
-                worker_id: "idem-worker".into(),
-                drv_key: drv_path.into(),
-                result: rio_proto::types::BuildResult {
-                    status: rio_proto::types::BuildResultStatus::Built.into(),
-                    ..Default::default()
-                },
-            })
-            .await
-            .unwrap();
+        complete_success_empty(&handle, "idem-worker", drv_path).await;
         settle().await;
     }
 
     // completed_count should be 1, not 2.
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.completed_derivations, 1,
         "duplicate completion should not double-count"

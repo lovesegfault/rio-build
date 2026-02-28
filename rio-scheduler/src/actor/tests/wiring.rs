@@ -56,38 +56,13 @@ async fn test_completion_resolves_drv_path_to_hash() {
 
     // Worker should have received an assignment (derivation is ready, worker has capacity)
     // Now send completion using drv_PATH (mimics what grpc.rs does with report.drv_path)
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: drv_path.into(), // Note: PATH, not hash!
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                error_msg: String::new(),
-                times_built: 1,
-                start_time: None,
-                stop_time: None,
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: "/nix/store/xyz-foo".into(),
-                    output_hash: vec![0u8; 32],
-                }],
-            },
-        })
-        .await
-        .unwrap();
+    // Note: PATH, not hash — tests that grpc.rs drv_path resolves correctly.
+    complete_success(&handle, "test-worker", drv_path, "/nix/store/xyz-foo").await;
 
     settle().await;
 
     // Query build status — should be Succeeded (single derivation, completed)
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let status = reply_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
 
     assert_eq!(
         status.state,
@@ -217,18 +192,14 @@ async fn test_completion_infrastructure_failure_handled() {
 
     // Send completion with InfrastructureFailure (what gRPC layer sends
     // for None result)
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: drv_path.into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-                error_msg: "worker sent CompletionReport with no result".into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_failure(
+        &handle,
+        "test-worker",
+        drv_path,
+        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+        "worker sent CompletionReport with no result",
+    )
+    .await;
     settle().await;
 
     // The derivation should have gone through Failed -> Ready (retry) and
@@ -309,15 +280,7 @@ async fn test_completion_with_extreme_timestamps() {
     // If we got here, the actor didn't panic. Verify completion was processed
     // (build succeeded) and actor is still alive.
     assert!(handle.is_alive(), "actor must survive extreme timestamps");
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let status = reply_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
@@ -385,17 +348,7 @@ async fn test_interactive_builds_pushed_to_front() {
     settle().await;
 
     // Complete the first build to free worker capacity
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: "/nix/store/hash-normal.drv".into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success_empty(&handle, "test-worker", "/nix/store/hash-normal.drv").await;
     settle().await;
 
     // The next assignment should be the IFD derivation (was pushed to front)

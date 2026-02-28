@@ -98,23 +98,7 @@ async fn test_scheduler_cache_check_skips_build() {
     let mut node = make_test_node("cached-hash", "/nix/store/cached-hash.drv", "x86_64-linux");
     node.expected_output_paths = vec![cached_output.to_string()];
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![node],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _event_rx = reply_rx.await.unwrap().unwrap();
+    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
     settle().await;
 
     // Derivation should have gone Created → Completed (scheduler cache hit).
@@ -131,15 +115,7 @@ async fn test_scheduler_cache_check_skips_build() {
     assert_eq!(info.output_paths, vec![cached_output.to_string()]);
 
     // Build should be Succeeded (all 1 derivation cached).
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status = status_rx.await.unwrap().unwrap();
+    let status = query_status(&handle, build_id).await;
     assert_eq!(status.cached_derivations, 1);
     assert_eq!(
         status.completed_derivations, 1,
@@ -169,23 +145,7 @@ async fn test_scheduler_cache_check_skipped_without_store() {
     // expected_output_paths set but store client is None — should NOT short-circuit
     node.expected_output_paths = vec!["/nix/store/uncached-out".to_string()];
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![node],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _event_rx = reply_rx.await.unwrap().unwrap();
+    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
     settle().await;
 
     // Without store client, derivation should proceed normally to dispatch.
@@ -245,22 +205,7 @@ async fn test_db_failure_during_completion_logged() {
 
     // Send successful completion. DB write will fail but in-memory
     // transition should succeed.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            worker_id: "test-worker".into(),
-            drv_key: drv_path.into(),
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: "/nix/store/fake-output".into(),
-                    output_hash: vec![0u8; 32],
-                }],
-                ..Default::default()
-            },
-        })
-        .await
-        .unwrap();
+    complete_success(&handle, "test-worker", drv_path, "/nix/store/fake-output").await;
     settle().await;
 
     // In-memory state should have transitioned despite DB failure.
@@ -342,15 +287,7 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() {
 
     // The build must NOT be in the actor's maps (it was never inserted,
     // or it was rolled back). QueryBuildStatus should return NotFound.
-    let (status_tx, status_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::QueryBuildStatus {
-            build_id,
-            reply: status_tx,
-        })
-        .await
-        .unwrap();
-    let status_result = status_rx.await.unwrap();
+    let status_result = try_query_status(&handle, build_id).await;
     assert!(
         matches!(status_result, Err(ActorError::BuildNotFound(_))),
         "build should not be in actor maps after cyclic merge failure; got {status_result:?}"
@@ -481,26 +418,17 @@ async fn test_assign_send_failure_cleans_running_builds() {
     // First assignment succeeds (fills stream channel). Second try_send
     // fails (channel full) — this triggers the recovery path.
     let build_id = Uuid::new_v4();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::MergeDag {
-            req: MergeDagRequest {
-                build_id,
-                tenant_id: None,
-                priority_class: PriorityClass::Scheduled,
-                nodes: vec![
-                    make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
-                    make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),
-                ],
-                edges: vec![],
-                options: BuildOptions::default(),
-                keep_going: false,
-            },
-            reply: reply_tx,
-        })
-        .await
-        .unwrap();
-    let _event_rx = reply_rx.await.unwrap().unwrap();
+    let _event_rx = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
+            make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),
+        ],
+        vec![],
+        false,
+    )
+    .await;
     settle().await;
 
     // Worker should have EXACTLY 1 running build (the successful assign),
