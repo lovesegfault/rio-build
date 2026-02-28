@@ -26,20 +26,20 @@
 
 ## Post-Phase-2a Cleanup
 
-- [ ] Delete the `rio-build/` crate (phase-1 monolith, now dead code). Port unique tests first:
+- [x] Delete the `rio-build/` crate (phase-1 monolith, now dead code). Port unique tests first:
   - Golden conformance tests (`rio-build/tests/golden_conformance.rs`, 18 tests against real nix-daemon) → `rio-gateway/tests/`
   - Error-path tests from `direct_protocol.rs` not covered by `wire_opcodes.rs` (hash mismatch, unparseable paths, batch-continue-on-error)
-- [ ] Adopt `rio_common::grpc::with_timeout()` across 33 inline `tokio::time::timeout` sites (exists but unused)
-- [ ] Extract gRPC client connect helper to `rio-proto` (16 sites repeat `format!("http://{}") + connect + max_message_size`)
-- [ ] Extract test helpers to `rio-test-support`: `client_handshake()` (3×), `send_set_options()` (2×), mock gRPC services (~400 LOC duplicated in rio-gateway tests), `spawn_grpc_server()` (7×)
-- [ ] Parallelize worker input fetches (`fetch_input_metadata`, `compute_input_closure`, inputDrv resolution) via `buffer_unordered` — currently serial, adds 3-10s per build
-- [ ] Batch DB writes in scheduler `persist_merge_to_db` — currently 2N+E serial PG roundtrips, stalls actor ~3.5s for 1000-node DAG
-- [ ] Extract NAR-stream collect/chunk helpers (`collect_nar_stream`, `chunk_nar_for_put`) — duplicated 4× across gateway/worker/fuse
-- [ ] Split `rio-scheduler/src/actor.rs` (4760 lines) into `actor/{merge,completion,dispatch,worker,build,tests}.rs` submodules
-- [ ] Introduce `SessionContext` struct for `rio-gateway/src/handler.rs` (10-parameter `handle_opcode`; 5 `#[allow(too_many_arguments)]` in one file)
-- [ ] Migrate stringly-typed keys to newtypes: `DrvHash(String)`, `WorkerId(String)` in scheduler; `AssignmentStatus` enum in db.rs
-- [ ] Standardize metric outcome labels (worker uses `"success"`/`"failure"`, scheduler uses `"succeeded"`/`"failed"`)
-- [ ] FUSE hot-path wins: cache file handles in `read()` (currently opens per-chunk), stream `readdir` entries (currently buffers all), skip `ensure_cached` for children of materialized paths
+- [x] Adopt `rio_common::grpc::with_timeout()` across 33 inline `tokio::time::timeout` sites (exists but unused)
+- [x] Extract gRPC client connect helper to `rio-proto` (16 sites repeat `format!("http://{}") + connect + max_message_size`)
+- [x] Extract test helpers to `rio-test-support`: `client_handshake()` (3×), `send_set_options()` (2×), mock gRPC services (~400 LOC duplicated in rio-gateway tests), `spawn_grpc_server()` (7×)
+- [x] Parallelize worker input fetches (`fetch_input_metadata`, `compute_input_closure`, inputDrv resolution) via `buffer_unordered` — currently serial, adds 3-10s per build
+- [x] Batch DB writes in scheduler `persist_merge_to_db` — currently 2N+E serial PG roundtrips, stalls actor ~3.5s for 1000-node DAG
+- [x] Extract NAR-stream collect/chunk helpers (`collect_nar_stream`, `chunk_nar_for_put`) — duplicated 4× across gateway/worker/fuse
+- [x] Split `rio-scheduler/src/actor.rs` (4760 lines) into `actor/{merge,completion,dispatch,worker,build,tests}.rs` submodules
+- [x] Introduce `SessionContext` struct for `rio-gateway/src/handler.rs` (10-parameter `handle_opcode`; 5 `#[allow(too_many_arguments)]` in one file)
+- [x] Migrate stringly-typed keys to newtypes: `DrvHash(String)`, `WorkerId(String)` in scheduler; `AssignmentStatus` enum in db.rs
+- [x] Standardize metric outcome labels (worker uses `"success"`/`"failure"`, scheduler uses `"succeeded"`/`"failed"`)
+- [x] FUSE hot-path wins: cache file handles in `read()` (currently opens per-chunk), stream `readdir` entries (currently buffers all), skip `ensure_cached` for children of materialized paths
 
 ## Milestone
 
