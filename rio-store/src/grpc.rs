@@ -132,23 +132,19 @@ impl StoreService for StoreServiceImpl {
         }
         // Bound and validate references. Unbounded repeated fields from
         // untrusted input would be persisted to the DB without check.
-        if info.references.len() > rio_common::limits::MAX_REFERENCES {
-            return Err(Status::invalid_argument(format!(
-                "too many references: {} (max {})",
-                info.references.len(),
-                rio_common::limits::MAX_REFERENCES
-            )));
-        }
+        rio_common::grpc::check_bound(
+            "references",
+            info.references.len(),
+            rio_common::limits::MAX_REFERENCES,
+        )?;
         for r in &info.references {
             validate_store_path(r)?;
         }
-        if info.signatures.len() > rio_common::limits::MAX_SIGNATURES {
-            return Err(Status::invalid_argument(format!(
-                "too many signatures: {} (max {})",
-                info.signatures.len(),
-                rio_common::limits::MAX_SIGNATURES
-            )));
-        }
+        rio_common::grpc::check_bound(
+            "signatures",
+            info.signatures.len(),
+            rio_common::limits::MAX_SIGNATURES,
+        )?;
 
         // Compute store_path_hash if not provided
         let store_path_hash = if info.store_path_hash.is_empty() {
@@ -504,13 +500,7 @@ impl StoreService for StoreServiceImpl {
         let req = request.into_inner();
 
         // Bound request size to prevent DoS via huge path lists.
-        if req.store_paths.len() > MAX_BATCH_PATHS {
-            return Err(Status::invalid_argument(format!(
-                "too many paths: {} (max {})",
-                req.store_paths.len(),
-                MAX_BATCH_PATHS
-            )));
-        }
+        rio_common::grpc::check_bound("paths", req.store_paths.len(), MAX_BATCH_PATHS)?;
         // Validate each path format. Reject the whole batch on any malformed
         // path (client bug indicator).
         for p in &req.store_paths {
