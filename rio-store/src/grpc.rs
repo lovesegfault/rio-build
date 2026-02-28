@@ -26,8 +26,7 @@ use crate::backend::NarBackend;
 use crate::metadata;
 use crate::validate::{HashingReader, validate_nar_digest};
 
-/// NAR chunk size for streaming GetPath responses (64 KB).
-const NAR_CHUNK_SIZE: usize = 64 * 1024;
+use rio_proto::client::NAR_CHUNK_SIZE;
 
 use rio_common::limits::MAX_NAR_SIZE;
 
