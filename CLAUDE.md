@@ -175,7 +175,7 @@ When spawning `nix-daemon --stdio` for local build execution:
 - Never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` — use `.ok_or_else()`
 - Wrap all daemon communication in `tokio::time::timeout` (default: `DAEMON_BUILD_TIMEOUT`, configurable via `RIO_DAEMON_TIMEOUT_SECS`)
 - Always `daemon.kill().await` in both success and error paths
-- Use the shared `build_via_local_daemon` helper — don't duplicate the spawn+handshake+setOptions pattern
+- See `spawn_daemon_in_namespace` + `run_daemon_build` in `rio-worker/src/executor.rs` for the canonical pattern
 
 ## Observability Checklist
 
