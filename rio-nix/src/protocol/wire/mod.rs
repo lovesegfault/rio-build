@@ -53,31 +53,12 @@ pub fn padding_len(len: usize) -> usize {
 // Reading
 // ---------------------------------------------------------------------------
 
-/// Read a single byte.
-///
-/// **Note:** Nix wire protocol integers are ALWAYS u64, even for logically
-/// u8 values. This function is for non-protocol byte reading (e.g., NAR
-/// format tag bytes). Do not use for protocol integer fields.
-pub async fn read_u8<R: AsyncRead + Unpin>(r: &mut R) -> Result<u8> {
-    let mut buf = [0u8; 1];
-    r.read_exact(&mut buf).await?;
-    Ok(buf[0])
-}
-
 /// Read a little-endian u64.
 pub async fn read_u64<R: AsyncRead + Unpin>(r: &mut R) -> Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf).await?;
     Ok(u64::from_le_bytes(buf))
 }
-
-/// Read a little-endian i64.
-pub async fn read_i64<R: AsyncRead + Unpin>(r: &mut R) -> Result<i64> {
-    let mut buf = [0u8; 8];
-    r.read_exact(&mut buf).await?;
-    Ok(i64::from_le_bytes(buf))
-}
-
 /// Read a u64-encoded boolean (0 = false, nonzero = true).
 pub async fn read_bool<R: AsyncRead + Unpin>(r: &mut R) -> Result<bool> {
     Ok(read_u64(r).await? != 0)
@@ -148,23 +129,8 @@ pub async fn read_string_pairs<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<(S
 // Writing
 // ---------------------------------------------------------------------------
 
-/// Write a single byte.
-///
-/// **Note:** Nix wire protocol integers are ALWAYS u64. This function is
-/// for non-protocol byte writing only (e.g., NAR format).
-pub async fn write_u8<W: AsyncWrite + Unpin>(w: &mut W, val: u8) -> Result<()> {
-    w.write_all(&[val]).await?;
-    Ok(())
-}
-
 /// Write a little-endian u64.
 pub async fn write_u64<W: AsyncWrite + Unpin>(w: &mut W, val: u64) -> Result<()> {
-    w.write_all(&val.to_le_bytes()).await?;
-    Ok(())
-}
-
-/// Write a little-endian i64.
-pub async fn write_i64<W: AsyncWrite + Unpin>(w: &mut W, val: i64) -> Result<()> {
     w.write_all(&val.to_le_bytes()).await?;
     Ok(())
 }
