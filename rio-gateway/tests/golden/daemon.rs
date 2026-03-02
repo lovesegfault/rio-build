@@ -572,9 +572,13 @@ pub fn build_ca_test_path() -> String {
 pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
     use rio_nix::hash::{HashAlgo, NixHash};
 
-    // When running under the Nix flake check, fixture paths are known and
-    // simple (single file, no refs, no deriver). Compute metadata ourselves
-    // so we never call `nix path-info` (which needs writable /nix/var).
+    // In hermetic sandboxes (no /nix/var/nix/db), start_local_daemon()
+    // registers fixture paths via --load-db with NO deriver/sigs/ca —
+    // compute matching metadata here. Outside sandboxes (real db exists),
+    // the daemon symlinks the real db and knows the REAL deriver/sigs,
+    // so we must query via `nix path-info` to match. This condition
+    // mirrors the linked_db check in start_local_daemon().
+    let hermetic = !std::path::Path::new("/nix/var/nix/db").exists();
     let is_fixture = std::env::var("RIO_GOLDEN_TEST_PATH")
         .map(|p| p == store_path)
         .unwrap_or(false)
@@ -582,7 +586,7 @@ pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
             .map(|p| p == store_path)
             .unwrap_or(false);
 
-    if is_fixture {
+    if hermetic && is_fixture {
         let nar = dump_nar(store_path);
         let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar).to_sri();
         let nar_size = nar.len() as u64;
