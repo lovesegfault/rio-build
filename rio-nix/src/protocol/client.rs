@@ -190,7 +190,7 @@ const MAX_STDERR_MESSAGES: u64 = 100_000;
 /// Drain the STDERR loop until STDERR_LAST, discarding all messages.
 ///
 /// Returns `Ok(())` on STDERR_LAST, `Err` on STDERR_ERROR or I/O error.
-/// Aborts after [`MAX_STDERR_MESSAGES`] to prevent infinite loops.
+/// Aborts after `MAX_STDERR_MESSAGES` to prevent infinite loops.
 pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireError> {
     for _ in 0..MAX_STDERR_MESSAGES {
         match read_stderr_message(r).await? {

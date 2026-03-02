@@ -225,7 +225,7 @@ pub struct DagActor {
     store_client: Option<StoreServiceClient<Channel>>,
     /// Whether backpressure is currently active. Shared with ActorHandle
     /// so hysteresis (80%/60%) is honored by send() instead of a simple
-    /// threshold check. Arc<AtomicBool> for lock-free reads on the hot path.
+    /// threshold check. `Arc<AtomicBool>` for lock-free reads on the hot path.
     backpressure_active: Arc<AtomicBool>,
     /// Leader generation counter (for assignment tokens).
     generation: i64,
@@ -502,7 +502,7 @@ pub struct ActorHandle {
     tx: mpsc::Sender<ActorCommand>,
     /// Shared read-only backpressure flag with the actor. The actor computes
     /// hysteresis (activate at 80%, deactivate at 60%) and writes to its
-    /// Arc<AtomicBool>; the handle reads it via this read-only view for
+    /// `Arc<AtomicBool>`; the handle reads it via this read-only view for
     /// send() and is_backpressured(). Without hysteresis, the handle used a
     /// simple threshold -> flapping under load near 80%.
     backpressure: BackpressureReader,
