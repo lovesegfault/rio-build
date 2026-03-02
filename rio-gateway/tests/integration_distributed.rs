@@ -200,41 +200,6 @@ async fn test_distributed_handshake_wire_sequence() {
     assert_eq!(last, STDERR_LAST, "handshake must end with STDERR_LAST");
 }
 
-/// FUSE-dependent tests are marked `#[ignore]` since they require
-/// CAP_SYS_ADMIN which is not available in standard `cargo nextest` CI.
-///
-/// **The full end-to-end path IS now covered** by the NixOS VM test:
-///
-/// ```bash
-/// nix build .#checks.x86_64-linux.rio-milestone-vm
-/// ```
-///
-/// See `nix/tests/milestone.nix` and docs/src/phases/phase2a.md § Automated
-/// Validation. Four real VMs exercise gateway ssh-ng + scheduler dispatch +
-/// worker FUSE/overlay/CLONE_NEWNS + store PutPath, with Prometheus-metric
-/// assertions that both workers built derivations.
-///
-/// This `#[ignore]` stub is kept for local `cargo nextest run --ignored`
-/// debugging against a persistent PG; if you want end-to-end validation,
-/// use the VM test instead.
-#[tokio::test]
-#[ignore = "requires CAP_SYS_ADMIN; use nix/tests/milestone.nix VM test instead"]
-async fn test_distributed_full_build_with_fuse() {
-    let _db = rio_test_support::TestDb::new(&sqlx::migrate!("../migrations")).await;
-
-    if !std::path::Path::new("/dev/fuse").exists() {
-        panic!("/dev/fuse not available — this test requires CAP_SYS_ADMIN");
-    }
-    // The non-FUSE integration path is covered by test_distributed_submit_and_complete
-    // above (gateway -> scheduler -> worker gRPC flow with mock store).
-    // Full multi-process + FUSE coverage is in nix/tests/milestone.nix.
-    eprintln!(
-        "Full multi-process build with FUSE is covered by the NixOS VM test: \
-         `nix build .#checks.x86_64-linux.rio-milestone-vm`. \
-         See docs/src/phases/phase2a.md § Automated Validation."
-    );
-}
-
 // ---------------------------------------------------------------------------
 // T2: CancelBuild sent on SSH disconnect (8.2)
 // ---------------------------------------------------------------------------
