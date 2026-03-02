@@ -247,10 +247,7 @@ async fn test_nar_from_path_missing_returns_error() {
     h.stream.flush().await.unwrap();
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
-    assert!(
-        !err.message().is_empty(),
-        "error message should be non-empty"
-    );
+    assert!(!err.message.is_empty(), "error message should be non-empty");
 
     h.finish().await;
 }
@@ -268,9 +265,9 @@ async fn test_nar_from_path_invalid_path_returns_error() {
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("invalid store path"),
+        err.message.contains("invalid store path"),
         "error should mention invalid store path, got: {}",
-        err.message()
+        err.message
     );
 
     // Session must terminate after STDERR_ERROR (handler returns Err now).
@@ -350,7 +347,7 @@ async fn test_query_derivation_output_map_missing_drv() {
 
     // Missing .drv: STDERR_ERROR
     let err = drain_stderr_expecting_error(&mut h.stream).await;
-    assert!(!err.message().is_empty());
+    assert!(!err.message.is_empty());
 
     h.finish().await;
 }

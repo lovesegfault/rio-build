@@ -62,7 +62,7 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() {
     h.stream.flush().await.unwrap();
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
-    assert!(!err.message().is_empty());
+    assert!(!err.message.is_empty());
 
     h.finish().await;
 }
@@ -108,9 +108,9 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() {
     // would fail.
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("stream ended") || err.message().contains("disconnect"),
+        err.message.contains("stream ended") || err.message.contains("disconnect"),
         "error should mention stream ended / scheduler disconnect: {}",
-        err.message()
+        err.message
     );
 
     h.finish().await;

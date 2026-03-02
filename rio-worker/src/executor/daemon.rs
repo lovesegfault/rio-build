@@ -295,7 +295,7 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
         match read_stderr_message(reader).await? {
             StderrMessage::Last => break,
             StderrMessage::Error(e) => {
-                return misc_fail(e.message());
+                return misc_fail(&e.message);
             }
             StderrMessage::Next(msg) => {
                 if let Some(batch) = batcher.add_line(msg.into_bytes())

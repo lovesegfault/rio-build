@@ -13,11 +13,11 @@ async fn test_unknown_opcode_returns_stderr_error() {
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("99")
-            || err.message().to_lowercase().contains("unknown")
-            || err.message().to_lowercase().contains("unimplemented"),
+        err.message.contains("99")
+            || err.message.to_lowercase().contains("unknown")
+            || err.message.to_lowercase().contains("unimplemented"),
         "error should mention unknown/unimplemented opcode: {}",
-        err.message()
+        err.message
     );
 
     h.finish().await;
@@ -111,9 +111,9 @@ async fn test_version_too_old_sends_stderr_error() {
     // Server should now send STDERR_ERROR (version rejected before feature exchange)
     let err = drain_stderr_expecting_error(&mut client).await;
     assert!(
-        err.message().contains("1.37+"),
+        err.message.contains("1.37+"),
         "error should mention '1.37+', got: {}",
-        err.message()
+        err.message
     );
 
     drop(client);
