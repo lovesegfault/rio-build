@@ -162,7 +162,6 @@ impl NixHash {
     }
 
     /// Render in Nix colon format: `sha256:aabb...` (nixbase32 digest).
-    #[cfg(test)]
     pub fn to_colon(&self) -> String {
         format!("{}:{}", self.algo, nixbase32::encode(&self.digest))
     }
