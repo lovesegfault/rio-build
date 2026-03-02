@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// Build a `types::PathInfo` for a freshly-computed path (AddToStore/AddTextToStore).
+/// Uses defaults for fields not provided by the wire: deriver="", registration_time=0,
+/// ultimate=true, signatures=[].
+fn path_info_for_computed(
+    store_path: String,
+    nar_hash: Vec<u8>,
+    nar_size: u64,
+    references: Vec<String>,
+    content_address: String,
+) -> types::PathInfo {
+    types::PathInfo {
+        store_path,
+        store_path_hash: Vec::new(),
+        deriver: String::new(),
+        nar_hash,
+        nar_size,
+        references,
+        registration_time: 0,
+        ultimate: true,
+        signatures: Vec::new(),
+        content_address,
+    }
+}
+
+/// Parse reference path strings into `StorePath`s, formatting the first error with context.
+fn parse_reference_paths(refs: &[String], context: &str) -> anyhow::Result<Vec<StorePath>> {
+    refs.iter()
+        .map(|s| {
+            StorePath::parse(s)
+                .map_err(|e| anyhow::anyhow!("invalid reference path '{s}' for {context}: {e}"))
+        })
+        .collect()
+}
+
 /// wopAddToStoreNar (39): Receive a store path with NAR content via framed stream.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
@@ -184,16 +218,10 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 
     let content_hash = NixHash::compute(hash_algo, &dump_data);
 
-    let mut ref_paths = Vec::with_capacity(references.len());
-    for s in &references {
-        match StorePath::parse(s) {
-            Ok(p) => ref_paths.push(p),
-            Err(e) => stderr_err!(
-                stderr,
-                "invalid reference path '{s}' for wopAddToStore: {e}"
-            ),
-        }
-    }
+    let ref_paths = match parse_reference_paths(&references, "wopAddToStore") {
+        Ok(p) => p,
+        Err(e) => stderr_err!(stderr, "{e}"),
+    };
 
     let path = if is_text {
         match StorePath::make_text(&name, &content_hash, &ref_paths) {
@@ -243,18 +271,13 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = types::PathInfo {
-        store_path: path.to_string(),
-        store_path_hash: Vec::new(),
-        deriver: String::new(),
-        nar_hash: nar_hash.digest().to_vec(),
+    let info = path_info_for_computed(
+        path.to_string(),
+        nar_hash.digest().to_vec(),
         nar_size,
-        references: references.clone(),
-        registration_time: 0,
-        ultimate: true,
-        signatures: Vec::new(),
-        content_address: ca.clone(),
-    };
+        references.clone(),
+        ca.clone(),
+    );
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
         return send_store_error(stderr, e).await;
@@ -293,18 +316,10 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 
     let content_hash = NixHash::compute(HashAlgo::SHA256, text.as_bytes());
 
-    let mut ref_paths = Vec::with_capacity(references.len());
-    for s in &references {
-        match StorePath::parse(s) {
-            Ok(p) => ref_paths.push(p),
-            Err(e) => {
-                stderr_err!(
-                    stderr,
-                    "invalid reference path '{s}' for wopAddTextToStore: {e}"
-                );
-            }
-        }
-    }
+    let ref_paths = match parse_reference_paths(&references, "wopAddTextToStore") {
+        Ok(p) => p,
+        Err(e) => stderr_err!(stderr, "{e}"),
+    };
 
     let path = match StorePath::make_text(&name, &content_hash, &ref_paths) {
         Ok(p) => p,
@@ -333,18 +348,13 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = types::PathInfo {
-        store_path: path.to_string(),
-        store_path_hash: Vec::new(),
-        deriver: String::new(),
-        nar_hash: nar_hash.digest().to_vec(),
+    let info = path_info_for_computed(
+        path.to_string(),
+        nar_hash.digest().to_vec(),
         nar_size,
         references,
-        registration_time: 0,
-        ultimate: true,
-        signatures: Vec::new(),
-        content_address: ca,
-    };
+        ca,
+    );
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
         return send_store_error(stderr, e).await;
