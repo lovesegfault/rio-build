@@ -264,6 +264,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Send STDERR_WRITE with data (used by `wopNarFromPath` to send NAR chunks).
+    #[cfg(test)]
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), WireError> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_WRITE).await?;
@@ -273,6 +274,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Send STDERR_READ to request data from the client (used by `wopAddToStoreNar`).
+    #[cfg(test)]
     pub async fn read_request(&mut self, count: u64) -> Result<(), WireError> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_READ).await?;
@@ -326,6 +328,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     /// - 105 (Progress): [u64 done, u64 expected, u64 running, u64 failed]
     /// - 106 (SetExpected): [u64 type, u64 expected]
     /// - 107 (PostBuildLogLine): [string line]
+    #[cfg(test)]
     pub async fn result(
         &mut self,
         activity_id: u64,

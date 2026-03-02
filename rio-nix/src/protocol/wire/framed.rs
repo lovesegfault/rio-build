@@ -69,11 +69,13 @@ impl<R> FramedStreamReader<R> {
     }
 
     /// Total bytes delivered to the caller so far.
+    #[cfg(test)]
     pub fn total_bytes_read(&self) -> u64 {
         self.total_read
     }
 
     /// Whether the terminal frame sentinel has been reached.
+    #[cfg(test)]
     pub fn is_done(&self) -> bool {
         matches!(self.state, FramedState::Done)
     }
