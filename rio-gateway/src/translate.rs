@@ -301,7 +301,7 @@ mod tests {
 
         let root_drv = make_test_derivation(
             "/nix/store/aaa-root-out",
-            &[(&child_path.to_string(), &["out"])],
+            &[(child_path.as_str(), &["out"])],
         );
         let child_drv = make_test_derivation("/nix/store/bbb-child-out", &[]);
 
@@ -390,8 +390,8 @@ mod tests {
         let b_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
         let c_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
 
-        let a_drv = make_test_derivation("/nix/store/aaa-out", &[(&b_path.to_string(), &["out"])]);
-        let b_drv = make_test_derivation("/nix/store/bbb-out", &[(&c_path.to_string(), &["out"])]);
+        let a_drv = make_test_derivation("/nix/store/aaa-out", &[(b_path.as_str(), &["out"])]);
+        let b_drv = make_test_derivation("/nix/store/bbb-out", &[(c_path.as_str(), &["out"])]);
         let c_drv = make_test_derivation("/nix/store/ccc-out", &[]);
 
         let mut store = unreachable_store().await;
