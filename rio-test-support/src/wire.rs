@@ -63,7 +63,7 @@ pub async fn drain_stderr_until_last(s: &mut DuplexStream) -> Vec<StderrMessage>
         match read_stderr_message(s).await.unwrap() {
             StderrMessage::Last => return msgs,
             StderrMessage::Error(e) => {
-                panic!("unexpected STDERR_ERROR: {}", e.message());
+                panic!("unexpected STDERR_ERROR: {}", e.message);
             }
             other => msgs.push(other),
         }

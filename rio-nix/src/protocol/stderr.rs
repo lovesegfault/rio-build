@@ -21,25 +21,25 @@ pub const STDERR_RESULT: u64 = 0x52534c54;
 #[derive(Debug, Clone)]
 pub struct StderrError {
     /// Error type string, e.g. `"Error"` or `"nix::Interrupted"`.
-    error_type: String,
+    pub error_type: String,
     /// Error level (verbosity).
-    level: u64,
+    pub level: u64,
     /// Program name, e.g. `"rio-build"`.
-    name: String,
+    pub name: String,
     /// Human-readable error message.
-    message: String,
+    pub message: String,
     /// Optional source position.
-    position: Option<Position>,
+    pub position: Option<Position>,
     /// Stack trace entries.
-    traces: Vec<Trace>,
+    pub traces: Vec<Trace>,
 }
 
 /// A source code position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Position {
-    file: String,
-    line: u64,
-    column: u64,
+    pub file: String,
+    pub line: u64,
+    pub column: u64,
 }
 
 impl Position {
@@ -51,28 +51,13 @@ impl Position {
             column,
         }
     }
-
-    /// The source file path.
-    pub fn file(&self) -> &str {
-        &self.file
-    }
-
-    /// The line number.
-    pub fn line(&self) -> u64 {
-        self.line
-    }
-
-    /// The column number.
-    pub fn column(&self) -> u64 {
-        self.column
-    }
 }
 
 /// A stack trace entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
-    position: Option<Position>,
-    message: String,
+    pub position: Option<Position>,
+    pub message: String,
 }
 
 impl Trace {
@@ -82,16 +67,6 @@ impl Trace {
             position,
             message: message.into(),
         }
-    }
-
-    /// The optional source position.
-    pub fn position(&self) -> Option<&Position> {
-        self.position.as_ref()
-    }
-
-    /// The trace message.
-    pub fn message(&self) -> &str {
-        &self.message
     }
 }
 
@@ -118,36 +93,6 @@ impl StderrError {
     /// Create a simple error with no position and no traces.
     pub fn simple(name: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new("Error", 0, name, message, None, Vec::new())
-    }
-
-    /// The error type string, e.g. `"Error"` or `"nix::Interrupted"`.
-    pub fn error_type(&self) -> &str {
-        &self.error_type
-    }
-
-    /// The error level (verbosity).
-    pub fn level(&self) -> u64 {
-        self.level
-    }
-
-    /// The program name, e.g. `"rio-build"`.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The human-readable error message.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// The optional source position.
-    pub fn position(&self) -> Option<&Position> {
-        self.position.as_ref()
-    }
-
-    /// The stack trace entries.
-    pub fn traces(&self) -> &[Trace] {
-        &self.traces
     }
 }
 
@@ -233,9 +178,9 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     async fn write_position(&mut self, pos: Option<&Position>) -> Result<(), WireError> {
         if let Some(p) = pos {
             wire::write_u64(&mut self.writer, 1).await?; // havePos = true
-            wire::write_string(&mut self.writer, p.file()).await?;
-            wire::write_u64(&mut self.writer, p.line()).await?;
-            wire::write_u64(&mut self.writer, p.column()).await?;
+            wire::write_string(&mut self.writer, &p.file).await?;
+            wire::write_u64(&mut self.writer, p.line).await?;
+            wire::write_u64(&mut self.writer, p.column).await?;
         } else {
             wire::write_u64(&mut self.writer, 0).await?; // havePos = false
         }
@@ -247,16 +192,16 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_ERROR).await?;
 
-        wire::write_string(&mut self.writer, err.error_type()).await?;
-        wire::write_u64(&mut self.writer, err.level()).await?;
-        wire::write_string(&mut self.writer, err.name()).await?;
-        wire::write_string(&mut self.writer, err.message()).await?;
-        self.write_position(err.position()).await?;
+        wire::write_string(&mut self.writer, &err.error_type).await?;
+        wire::write_u64(&mut self.writer, err.level).await?;
+        wire::write_string(&mut self.writer, &err.name).await?;
+        wire::write_string(&mut self.writer, &err.message).await?;
+        self.write_position(err.position.as_ref()).await?;
 
-        wire::write_u64(&mut self.writer, err.traces().len() as u64).await?;
-        for trace in err.traces() {
-            self.write_position(trace.position()).await?;
-            wire::write_string(&mut self.writer, trace.message()).await?;
+        wire::write_u64(&mut self.writer, err.traces.len() as u64).await?;
+        for trace in &err.traces {
+            self.write_position(trace.position.as_ref()).await?;
+            wire::write_string(&mut self.writer, &trace.message).await?;
         }
 
         self.writer.flush().await?;

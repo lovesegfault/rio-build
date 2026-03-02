@@ -198,7 +198,7 @@ pub async fn drain_stderr<R: AsyncRead + Unpin>(r: &mut R) -> Result<(), WireErr
             StderrMessage::Error(e) => {
                 return Err(WireError::Io(std::io::Error::other(format!(
                     "daemon error: {}",
-                    e.message()
+                    e.message
                 ))));
             }
             StderrMessage::Read(_) => {
@@ -439,9 +439,9 @@ mod tests {
         let msg = read_stderr_message(&mut reader).await.unwrap();
         match msg {
             StderrMessage::Error(e) => {
-                assert_eq!(e.error_type(), "Error");
-                assert_eq!(e.name(), "test");
-                assert_eq!(e.message(), "something failed");
+                assert_eq!(e.error_type, "Error");
+                assert_eq!(e.name, "test");
+                assert_eq!(e.message, "something failed");
             }
             other => panic!("expected Error, got {other:?}"),
         }

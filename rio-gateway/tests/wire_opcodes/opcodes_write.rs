@@ -227,9 +227,9 @@ async fn test_add_multiple_to_store_truncated_nar() {
     // Handler should send STDERR_ERROR (not crash).
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("truncated"),
+        err.message.contains("truncated"),
         "expected 'truncated' in error, got: {}",
-        err.message()
+        err.message
     );
 
     // No PutPath calls should have been made.
@@ -439,9 +439,9 @@ async fn test_add_to_store_invalid_cam_str_returns_error() {
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("content-address method") || err.message().contains("bogus"),
+        err.message.contains("content-address method") || err.message.contains("bogus"),
         "error should mention invalid cam_str: {}",
-        err.message()
+        err.message
     );
 
     h.finish().await;
@@ -477,9 +477,9 @@ async fn test_add_to_store_nar_invalid_path_returns_error() {
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("invalid store path"),
+        err.message.contains("invalid store path"),
         "error should mention invalid path: {}",
-        err.message()
+        err.message
     );
 
     h.finish().await;
@@ -515,9 +515,9 @@ async fn test_add_to_store_nar_oversized_returns_error() {
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
-        err.message().contains("exceeds maximum"),
+        err.message.contains("exceeds maximum"),
         "error should mention size limit: {}",
-        err.message()
+        err.message
     );
 
     h.finish().await;
