@@ -20,8 +20,8 @@ Security-critical protocol parsers must be fuzz-tested:
 - `fuzz/narinfo_parser` --- narinfo text format parser
 - `fuzz/derivation_parser` --- `.drv` ATerm format parser (including `__structuredAttrs` with `__json`)
 - Run continuously via `cargo-fuzz` / `libFuzzer`:
-  - **PR tier:** 10s/target smoke run with seed corpus (`nix flake check` includes `checks.rio-fuzz-*`)
-  - **Nightly tier:** 10min/target deep run (`nix build .#fuzz-<target>`, explicitly invoked by nightly pipeline)
+  - **PR tier:** 30s/target smoke run with seed corpus (`nix flake check` includes `checks.fuzz-smoke-*`)
+  - **Nightly tier:** 10min/target deep run (`nix build .#fuzz-nightly-<target>`, or via `.#ci-slow` aggregate)
   - Corpus seeded from `rio-nix/fuzz/corpus/` (committed, regenerable via `gen-corpus.sh`)
 
 ## Unit Tests
@@ -80,12 +80,12 @@ Security-critical protocol parsers must be fuzz-tested:
 
 ## CI Pipeline Tiers
 
-| Tier | Trigger | Tests | Time Budget |
-|------|---------|-------|-------------|
-| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 10s fuzz smoke ×7 | < 5 min |
-| Merge | Every merge to main | + Integration tests with testcontainers (PostgreSQL, MinIO) | < 15 min |
-| Nightly | Scheduled | + Nix version compatibility, criterion benchmarks, 10min fuzz ×7 | < 60 min |
-| Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests, cargo-mutants on scheduler+store | Unbounded |
+| Tier | Trigger | Tests | Aggregate target | Time Budget |
+|------|---------|-------|------------------|-------------|
+| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 30s fuzz smoke ×7 | `.#ci-local-fast` | < 5 min |
+| Merge | Every merge to main | + Integration tests with testcontainers (PostgreSQL, MinIO), VM tests | `.#ci-fast` | < 15 min |
+| Nightly | Scheduled | + Nix version compatibility, criterion benchmarks, 10min fuzz ×7 | `.#ci-slow` | < 60 min |
+| Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests, cargo-mutants on scheduler+store | — | Unbounded |
 
 ## Test Environment
 

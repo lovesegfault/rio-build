@@ -62,7 +62,7 @@
 The Phase 1a milestones are validated by a NixOS VM test:
 
 ```bash
-nix build .#checks.x86_64-linux.rio-phase1a
+nix build .#checks.x86_64-linux.vm-phase1a
 ```
 
 Two VMs (gateway + client) exercise the read-only protocol path:
