@@ -19,7 +19,10 @@ Security-critical protocol parsers must be fuzz-tested:
 - `fuzz/nar_reader` --- NAR streaming reader with malformed input
 - `fuzz/narinfo_parser` --- narinfo text format parser
 - `fuzz/derivation_parser` --- `.drv` ATerm format parser (including `__structuredAttrs` with `__json`)
-- Run continuously via `cargo-fuzz` / `libFuzzer`, not just on PR
+- Run continuously via `cargo-fuzz` / `libFuzzer`:
+  - **PR tier:** 10s/target smoke run with seed corpus (`nix flake check` includes `checks.rio-fuzz-*`)
+  - **Nightly tier:** 10min/target deep run (`nix build .#fuzz-<target>`, explicitly invoked by nightly pipeline)
+  - Corpus seeded from `rio-nix/fuzz/corpus/` (committed, regenerable via `gen-corpus.sh`)
 
 ## Unit Tests
 
@@ -79,9 +82,9 @@ Security-critical protocol parsers must be fuzz-tested:
 
 | Tier | Trigger | Tests | Time Budget |
 |------|---------|-------|-------------|
-| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny | < 5 min |
+| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 10s fuzz smoke ×7 | < 5 min |
 | Merge | Every merge to main | + Integration tests with testcontainers (PostgreSQL, MinIO) | < 15 min |
-| Nightly | Scheduled | + Nix version compatibility, criterion benchmarks, fuzzing corpus refresh | < 60 min |
+| Nightly | Scheduled | + Nix version compatibility, criterion benchmarks, 10min fuzz ×7 | < 60 min |
 | Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests, cargo-mutants on scheduler+store | Unbounded |
 
 ## Test Environment

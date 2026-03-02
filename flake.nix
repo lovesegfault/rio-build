@@ -77,11 +77,42 @@
           cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           inherit (cargoToml.workspace.package) version;
 
-          # Rust toolchain from rust-toolchain.toml (single source of truth)
-          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          # --------------------------------------------------------------
+          # Rust toolchains
+          # --------------------------------------------------------------
+          #
+          # Stable: single source of truth for CI (clippy, nextest,
+          # workspace build, coverage, docs). Read from
+          # rust-toolchain.toml so `rustup` users and Nix users agree.
+          # Guarantees releases are stable-compatible.
+          rustStable = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
-          # Crane library for building Rust packages
-          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+          # Nightly: used by the default dev shell and fuzz builds.
+          # selectLatestNightlyWith auto-picks the most recent nightly
+          # that has all requested components, so we're never blocked on
+          # a bad nightly.
+          #
+          # NOTE: non-hermetic by design — bumping rust-overlay changes
+          # the nightly date and invalidates the fuzz-build cache. If
+          # this becomes a problem, pin to rust-bin.nightly."YYYY-MM-DD".
+          rustNightly = pkgs.rust-bin.selectLatestNightlyWith (
+            toolchain:
+            toolchain.default.override {
+              extensions = [
+                "rust-src"
+                "llvm-tools-preview"
+                "rustfmt"
+                "clippy"
+                "rust-analyzer"
+              ];
+            }
+          );
+
+          # Crane for CI: stable toolchain, reproducible.
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustStable;
+
+          # Crane for fuzz builds + default dev shell: nightly.
+          craneLibNightly = (inputs.crane.mkLib pkgs).overrideToolchain rustNightly;
 
           # Source root for filesets
           unfilteredRoot = ./.;
@@ -127,7 +158,7 @@
             ];
 
             RUST_BACKTRACE = "1";
-            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+            RUST_SRC_PATH = "${rustStable}/lib/rustlib/src/rust/library";
             PROTOC = "${pkgs.protobuf}/bin/protoc";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Where rio-test-support finds initdb/postgres (falls back to PATH).
@@ -145,6 +176,113 @@
               doCheck = false; # We'll run checks separately
             }
           );
+
+          # --------------------------------------------------------------
+          # Fuzz build pipeline
+          # --------------------------------------------------------------
+          #
+          # The fuzz crate (rio-nix/fuzz) is its own workspace root —
+          # excluded from the main workspace, has its own Cargo.lock, and
+          # needs nightly for libfuzzer-sys. It depends on rio-nix by
+          # path, so the source must include the full workspace Cargo.toml
+          # tree. We vendor from the fuzz-specific lockfile.
+
+          fuzzSrc = pkgs.lib.fileset.toSource {
+            root = unfilteredRoot;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources unfilteredRoot)
+              ./rio-nix/fuzz/Cargo.lock
+            ];
+          };
+
+          fuzzArgs = {
+            src = fuzzSrc;
+            strictDeps = true;
+            pname = "rio-fuzz";
+            version = "0.0.0";
+
+            cargoVendorDir = craneLibNightly.vendorCargoDeps {
+              cargoLock = ./rio-nix/fuzz/Cargo.lock;
+            };
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              cargo-fuzz
+            ];
+
+            buildInputs = with pkgs; [
+              openssl
+              llvmPackages.libclang.lib
+            ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          };
+
+          rustTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+
+          fuzzTargets = [
+            "wire_primitives"
+            "opcode_parsing"
+            "derivation_parsing"
+            "nar_parsing"
+            "derived_path_parsing"
+            "narinfo_parsing"
+            "build_result_parsing"
+          ];
+
+          # Compile all fuzz target binaries with sancov instrumentation.
+          # Expensive but cached by source hash; shared by both the 10s
+          # PR-tier checks and the 600s nightly runs.
+          #
+          # No dep-layer (cargoArtifacts=null): cargo-fuzz's sancov flags
+          # produce incompatible object files with a non-instrumented
+          # buildDepsOnly layer, so dep caching would be a pure miss.
+          rio-fuzz-build = craneLibNightly.mkCargoDerivation (
+            fuzzArgs
+            // {
+              pname = "rio-fuzz-build";
+              cargoArtifacts = null;
+
+              buildPhaseCargoCommand = ''
+                cd rio-nix/fuzz
+                cargo fuzz build --release
+              '';
+
+              doInstallCargoArtifacts = false;
+              installPhaseCommand = ''
+                mkdir -p $out/bin
+                for t in ${pkgs.lib.concatStringsSep " " fuzzTargets}; do
+                  cp target/${rustTarget}/release/$t $out/bin/
+                done
+              '';
+            }
+          );
+
+          # Per-target, per-time-budget fuzz run. Cheap runCommand
+          # wrapper over the prebuilt binary. The 10s and 600s variants
+          # share the same rio-fuzz-build.
+          mkFuzzCheck =
+            { target, maxTime }:
+            let
+              seedCorpus = ./rio-nix/fuzz/corpus + "/${target}";
+              hasCorpus = builtins.pathExists seedCorpus;
+            in
+            pkgs.runCommand "rio-fuzz-${target}-${toString maxTime}s" { } ''
+              workCorpus=$(mktemp -d)
+              ${pkgs.lib.optionalString hasCorpus ''
+                cp -r ${seedCorpus}/. "$workCorpus"/
+                chmod -R u+w "$workCorpus"
+              ''}
+              mkdir -p artifacts
+
+              ${rio-fuzz-build}/bin/${target} "$workCorpus" \
+                -max_total_time=${toString maxTime} \
+                -timeout=30 \
+                -print_final_stats=1 \
+                -artifact_prefix=artifacts/
+
+              echo "${target}: ${toString maxTime}s, no crashes" > $out
+            '';
         in
         {
           # Import rust-overlay
@@ -161,10 +299,11 @@
             programs = {
               nixfmt.enable = true;
 
-              # Rust formatting
+              # Rust formatting (stable rustfmt — nightly rustfmt can
+              # produce different output, and we want CI/dev parity here)
               rustfmt = {
                 enable = true;
-                package = rustToolchain;
+                package = rustStable;
               };
 
               # TOML formatting
@@ -176,7 +315,12 @@
           pre-commit = {
             check.enable = true;
 
-            settings.excludes = [ "docs/mermaid\\.min\\.js$" ];
+            settings.excludes = [
+              "docs/mermaid\\.min\\.js$"
+              # Fuzz corpus seeds are exact binary/text inputs; trailing
+              # newlines would change what the fuzzer sees.
+              "^rio-nix/fuzz/corpus/"
+            ];
 
             settings.hooks = {
               treefmt.enable = true;
@@ -192,43 +336,98 @@
             };
           };
 
-          # Development shell
-          devShells.default = craneLib.devShell {
-            inherit (config) checks;
+          # --------------------------------------------------------------
+          # Dev shells
+          # --------------------------------------------------------------
+          #
+          # Default = nightly so `cargo fuzz run` works out of the box.
+          # CI builds still use stable (see craneLib above), so if you
+          # write nightly-only code, checks.rio-clippy / rio-nextest will
+          # catch it.
+          #
+          # Use `nix develop .#stable` for strict CI-parity dev.
+          devShells =
+            let
+              shellPackages = with pkgs; [
+                # Cargo tools
+                cargo-edit
+                cargo-expand
+                cargo-fuzz # works in default (nightly) shell; errors on stable
+                cargo-nextest
+                cargo-outdated
+                cargo-watch
 
-            packages = with pkgs; [
-              # Cargo tools
-              cargo-edit
-              cargo-expand
-              cargo-nextest
-              cargo-outdated
-              cargo-watch
+                # Debugging tools
+                lldb
+                gdb
 
-              # Debugging tools
-              lldb
-              gdb
+                # Documentation
+                mdbook
+                mdbook-mermaid
 
-              # Documentation
-              mdbook
-              mdbook-mermaid
+                # Integration test deps
+                postgresql_18
 
-              # Integration test deps
-              postgresql_18
-            ];
+                # Formatting (nix fmt also works, but direct treefmt is handy)
+                config.treefmt.build.wrapper
+              ];
+              shellEnv = {
+                RUST_BACKTRACE = "1";
+                PROTOC = "${pkgs.protobuf}/bin/protoc";
+                LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+                PG_BIN = "${pkgs.postgresql_18}/bin";
+                shellHook = config.pre-commit.installationScript;
+              };
+            in
+            {
+              default = craneLibNightly.devShell (
+                shellEnv
+                // {
+                  inherit (config) checks;
+                  packages = shellPackages;
+                  RUST_SRC_PATH = "${rustNightly}/lib/rustlib/src/rust/library";
+                }
+              );
 
-            RUST_BACKTRACE = "1";
-            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-            PROTOC = "${pkgs.protobuf}/bin/protoc";
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            PG_BIN = "${pkgs.postgresql_18}/bin";
+              stable = craneLib.devShell (
+                shellEnv
+                // {
+                  inherit (config) checks;
+                  packages = shellPackages;
+                  RUST_SRC_PATH = "${rustStable}/lib/rustlib/src/rust/library";
+                }
+              );
+            };
 
-            shellHook = config.pre-commit.installationScript;
-          };
-
+          # --------------------------------------------------------------
           # Packages
-          packages.default = rio-workspace;
+          # --------------------------------------------------------------
+          packages = {
+            default = rio-workspace;
+            inherit rio-fuzz-build; # debug: nix build .#rio-fuzz-build
+          }
+          # Nightly-tier fuzz runs: 10 min/target. NOT in `checks` —
+          # explicitly invoked by the nightly pipeline, e.g.
+          #   nix build .#fuzz-wire_primitives
+          #
+          # TODO(phase3b): corpus persistence (S3 upload/download) so
+          # runs accumulate findings instead of discarding the work
+          # corpus at the end of each derivation.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            builtins.listToAttrs (
+              map (t: {
+                name = "fuzz-${t}";
+                value = mkFuzzCheck {
+                  target = t;
+                  maxTime = 600;
+                };
+              }) fuzzTargets
+            )
+          );
 
+          # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
+          # --------------------------------------------------------------
           checks = {
             # Build the workspace
             inherit rio-workspace;
@@ -282,6 +481,21 @@
               }
             );
           }
+          # PR-tier smoke fuzz: 10s/target with seed corpus.
+          # Linux-only (libFuzzer). Adds ~70s to `nix flake check`
+          # when parallelized. Compiled binaries shared with the
+          # nightly-tier packages via rio-fuzz-build.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            builtins.listToAttrs (
+              map (t: {
+                name = "rio-fuzz-${t}";
+                value = mkFuzzCheck {
+                  target = t;
+                  maxTime = 10;
+                };
+              }) fuzzTargets
+            )
+          )
           # Per-phase milestone VM tests (Linux-only: need KVM + NixOS VMs).
           # Each validates the corresponding phase milestone in docs/src/phases/.
           #

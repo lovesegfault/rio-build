@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-leaf","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello"],[("name","leaf"),("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-leaf"),("system","x86_64-linux")])

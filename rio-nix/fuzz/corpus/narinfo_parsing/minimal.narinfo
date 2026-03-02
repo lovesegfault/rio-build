@@ -1,0 +1,6 @@
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello
+URL: nar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nar.zst
+Compression: zstd
+NarHash: sha256:0000000000000000000000000000000000000000000000000000000000000000
+NarSize: 100
+References:
