@@ -24,8 +24,12 @@ use thiserror::Error;
 /// NAR magic header string.
 const NAR_MAGIC: &str = "nix-archive-1";
 
-/// Maximum allowed file content size (4 GiB) to prevent OOM.
-const MAX_CONTENT_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum allowed file content size for in-memory parsing. The parser
+/// eagerly allocates `vec![0u8; len]` before reading, so a tiny malicious
+/// input claiming a multi-GiB length would OOM the process before
+/// `read_exact` has a chance to fail. Large NARs should be streamed,
+/// not parsed into memory — this limit is intentionally conservative.
+const MAX_CONTENT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Maximum allowed NAR entry name length.
 const MAX_NAME_LEN: u64 = 256;
