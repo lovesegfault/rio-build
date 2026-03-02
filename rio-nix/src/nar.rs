@@ -92,23 +92,10 @@ pub enum NarNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarEntry {
     /// Entry name (filename, no path separators).
-    name: String,
+    pub name: String,
     /// The node this entry refers to.
-    node: NarNode,
+    pub node: NarNode,
 }
-
-impl NarEntry {
-    /// The entry name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The node.
-    pub fn node(&self) -> &NarNode {
-        &self.node
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Synchronous string encoding (same as wire format but using std::io)
 // ---------------------------------------------------------------------------
