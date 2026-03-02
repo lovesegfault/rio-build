@@ -185,7 +185,7 @@ pub enum ActorError {
 pub struct BackpressureReader(Arc<AtomicBool>);
 
 impl BackpressureReader {
-    pub(crate) fn new(flag: Arc<AtomicBool>) -> Self {
+    fn new(flag: Arc<AtomicBool>) -> Self {
         Self(flag)
     }
 

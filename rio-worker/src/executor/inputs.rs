@@ -19,7 +19,7 @@ use super::{ExecutorError, MAX_PARALLEL_FETCHES};
 /// For `r:sha256` (recursive): compare the upload's NAR hash against outputHash.
 /// For `sha256` (flat): read the file from the overlay upper layer, hash its
 /// contents directly, and compare.
-pub(crate) fn verify_fod_hashes(
+pub(super) fn verify_fod_hashes(
     drv: &Derivation,
     uploads: &[upload::UploadResult],
     overlay_upper: &Path,

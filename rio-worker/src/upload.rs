@@ -78,7 +78,7 @@ pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
 ///
 /// Serializes the path as a NAR, computes SHA-256, and streams via PutPath.
 /// Retries with exponential backoff up to `MAX_UPLOAD_RETRIES` times.
-pub async fn upload_output(
+async fn upload_output(
     store_client: &mut StoreServiceClient<Channel>,
     upper_dir: &Path,
     output_basename: &str,

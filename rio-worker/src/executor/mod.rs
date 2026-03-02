@@ -37,14 +37,15 @@ mod daemon;
 mod inputs;
 
 use daemon::{run_daemon_build, spawn_daemon_in_namespace};
-pub(crate) use inputs::verify_fod_hashes;
-use inputs::{compute_input_closure, fetch_drv_from_store, fetch_input_metadata};
+use inputs::{
+    compute_input_closure, fetch_drv_from_store, fetch_input_metadata, verify_fod_hashes,
+};
 
 /// Max concurrent gRPC calls for input metadata/drv fetches.
 /// Bounds memory (each in-flight QueryPathInfo response is small; each
 /// GetPath .drv stream is typically <10 KB). 16 saturates a LAN without
 /// thundering the store.
-pub(super) const MAX_PARALLEL_FETCHES: usize = 16;
+const MAX_PARALLEL_FETCHES: usize = 16;
 
 /// Worker nix.conf content for sandbox builds.
 const WORKER_NIX_CONF: &str = "\
