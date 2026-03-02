@@ -1,0 +1,6 @@
+# cargo fuzz writes SHA1-hex-named discoveries here during interactive
+# runs. We only commit hand-curated seeds (prefixed `seed-`).
+*
+!*/
+!.gitignore
+!seed-*

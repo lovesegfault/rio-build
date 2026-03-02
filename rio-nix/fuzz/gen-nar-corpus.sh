@@ -16,14 +16,14 @@ nar_tmp=$(mktemp -d)
 trap 'rm -rf "$nar_tmp"' EXIT
 
 mkdir -p "$nar_tmp/empty"
-nix-store --dump "$nar_tmp/empty" > corpus/nar_parsing/empty-dir.nar
+nix-store --dump "$nar_tmp/empty" > corpus/nar_parsing/seed-empty-dir.nar
 
 echo "hello world" > "$nar_tmp/hello.txt"
-nix-store --dump "$nar_tmp/hello.txt" > corpus/nar_parsing/single-file.nar
+nix-store --dump "$nar_tmp/hello.txt" > corpus/nar_parsing/seed-single-file.nar
 
 mkdir -p "$nar_tmp/nested/a/b"
 echo "deep" > "$nar_tmp/nested/a/b/c.txt"
 ln -s "a/b/c.txt" "$nar_tmp/nested/link"
-nix-store --dump "$nar_tmp/nested" > corpus/nar_parsing/nested-with-symlink.nar
+nix-store --dump "$nar_tmp/nested" > corpus/nar_parsing/seed-nested-with-symlink.nar
 
-echo "Regenerated $(ls corpus/nar_parsing | wc -l) NAR seeds."
+echo "Regenerated $(ls corpus/nar_parsing/seed-* | wc -l) NAR seeds."
