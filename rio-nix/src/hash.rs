@@ -162,6 +162,7 @@ impl NixHash {
     }
 
     /// Render in Nix colon format: `sha256:aabb...` (nixbase32 digest).
+    #[cfg(test)]
     pub fn to_colon(&self) -> String {
         format!("{}:{}", self.algo, nixbase32::encode(&self.digest))
     }
@@ -191,6 +192,7 @@ impl NixHash {
     /// This is used for store path fingerprinting (compress-hash in Nix).
     ///
     /// Only valid for SHA-256 hashes. Returns an error for other algorithms.
+    #[cfg(test)]
     pub fn truncate_for_store_path(&self) -> Result<[u8; 20], HashError> {
         if self.algo != HashAlgo::SHA256 {
             return Err(HashError::InvalidFormat(
