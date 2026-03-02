@@ -257,16 +257,11 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
             Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
                 stderr_err!(stderr, "path '{path_str}' is not valid");
             }
-            Ok(Err(e)) => {
-                return send_store_error(stderr, anyhow::anyhow!("gRPC GetPath failed: {e}")).await;
-            }
-            Err(_) => {
-                return send_store_error(
-                    stderr,
-                    anyhow::anyhow!("gRPC GetPath timed out after {DEFAULT_GRPC_TIMEOUT:?}"),
-                )
-                .await;
-            }
+            Ok(Err(e)) => stderr_err!(stderr, "gRPC GetPath failed: {e}"),
+            Err(_) => stderr_err!(
+                stderr,
+                "gRPC GetPath timed out after {DEFAULT_GRPC_TIMEOUT:?}"
+            ),
         };
 
     let (_info, nar_data) =
@@ -274,13 +269,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
             .await
         {
             Ok(v) => v,
-            Err(e) => {
-                return send_store_error(
-                    stderr,
-                    anyhow::anyhow!("gRPC GetPath for {path_str}: {e}"),
-                )
-                .await;
-            }
+            Err(e) => stderr_err!(stderr, "gRPC GetPath for {path_str}: {e}"),
         };
 
     // STDERR_LAST first, then raw NAR bytes. Client's copyNAR reads until
@@ -410,16 +399,11 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     .await
     {
         Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
-        Ok(Err(e)) => {
-            return send_store_error(stderr, anyhow::anyhow!("gRPC FindMissingPaths: {e}")).await;
-        }
-        Err(_) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!("gRPC FindMissingPaths timed out after {DEFAULT_GRPC_TIMEOUT:?}"),
-            )
-            .await;
-        }
+        Ok(Err(e)) => stderr_err!(stderr, "gRPC FindMissingPaths: {e}"),
+        Err(_) => stderr_err!(
+            stderr,
+            "gRPC FindMissingPaths timed out after {DEFAULT_GRPC_TIMEOUT:?}"
+        ),
     };
 
     let mut will_build = Vec::new();
