@@ -219,8 +219,11 @@ fn find_pg_bin() -> PathBuf {
 ///
 /// **Liveness protocol:** each bootstrap writes its process PID to
 /// `<dir>/owner.pid` immediately after creating the tempdir. A dir is stale
-/// iff that PID is dead (or the file is missing/corrupt — pre-fix dirs, or
-/// dirs whose owner crashed between mkdtemp and write).
+/// iff that PID is dead. A dir with no owner.pid is treated as an in-flight
+/// bootstrap (another test process is between mkdtemp and write) and left
+/// alone — reaping it races with the bootstrap's initdb and causes spurious
+/// ENOENT failures. In the Nix sandbox /tmp is fresh per build, so there
+/// are no pre-fix legacy dirs to worry about.
 ///
 /// Races with concurrent scanners are benign: `remove_dir_all` on an
 /// already-removed dir just returns ENOENT, which we ignore.
@@ -244,15 +247,26 @@ fn gc_stale_dirs() {
     }
 }
 
+/// A dir is stale only when we can positively identify its owner PID AND
+/// that PID is dead. Missing or unparseable owner.pid means another process
+/// is mid-bootstrap (between mkdtemp and the owner.pid write completing —
+/// `std::fs::write` is open(CREAT|TRUNC) then write(), so a concurrent
+/// reader may see an empty file). Reaping a mid-bootstrap dir races with
+/// initdb/postgres: the non-atomic remove_dir_all can delete sock/ or data/
+/// while they are being populated, causing ENOENT failures.
+///
+/// In the Nix sandbox /tmp is fresh per build, so the only way owner.pid
+/// is absent or empty is a live concurrent bootstrap.
 fn is_dir_stale(dir: &Path) -> bool {
-    let pid = match std::fs::read_to_string(dir.join("owner.pid")) {
+    match std::fs::read_to_string(dir.join("owner.pid")) {
         Ok(s) => match s.trim().parse::<i32>() {
-            Ok(pid) => pid,
-            Err(_) => return true, // corrupt — reap it
+            Ok(pid) => !pid_alive(pid),
+            // Empty or non-numeric: open()/write() race window. Leave alone.
+            Err(_) => false,
         },
-        Err(_) => return true, // missing — pre-fix dir, or mkdtemp/write race
-    };
-    !pid_alive(pid)
+        // Missing: mkdtemp/write race window. Leave alone.
+        Err(_) => false,
+    }
 }
 
 #[cfg(target_os = "linux")]
