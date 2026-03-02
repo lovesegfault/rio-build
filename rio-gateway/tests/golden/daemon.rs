@@ -468,13 +468,31 @@ async fn read_nar_from_stream(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std
     Ok(())
 }
 
-/// Build a test store path and return its full path string.
+/// Experimental features enabled for all `nix` CLI invocations in golden tests.
 ///
-/// Uses `builtins.toFile` which is a Nix built-in that doesn't depend on
-/// nixpkgs or NIX_PATH, making this portable across CI environments and
-/// flake-based setups.
+/// Test helpers call `nix eval`/`nix build` which require `nix-command`.
+/// Locally this is inherited from user nix.conf; in hermetic CI sandboxes
+/// there is no user config. Set via NIX_CONFIG so tests are self-hermetic.
+const NIX_CONFIG: &str = "experimental-features = nix-command flakes ca-derivations";
+
+/// Return the golden test store path.
+///
+/// In hermetic CI (Nix build sandboxes), `RIO_GOLDEN_TEST_PATH` is set by
+/// flake.nix to a `pkgs.writeText` path that is in the build's input closure
+/// — no `nix eval` needed, no writable /nix/var needed. Locally (outside
+/// `nix build .#nextest`), the env var is unset and we fall back to
+/// `nix eval` + `builtins.toFile`.
 pub fn build_test_path() -> String {
+    if let Ok(p) = std::env::var("RIO_GOLDEN_TEST_PATH") {
+        assert!(
+            std::path::Path::new(&p).exists(),
+            "RIO_GOLDEN_TEST_PATH={p} does not exist"
+        );
+        return p;
+    }
+
     let output = std::process::Command::new("nix")
+        .env("NIX_CONFIG", NIX_CONFIG)
         .args([
             "eval",
             "--raw",
@@ -485,7 +503,8 @@ pub fn build_test_path() -> String {
         .expect("nix eval must succeed");
     assert!(
         output.status.success(),
-        "nix eval failed: {}",
+        "nix eval failed: {}\n\
+         Hint: set RIO_GOLDEN_TEST_PATH to a precomputed store path to skip this step.",
         String::from_utf8_lossy(&output.stderr)
     );
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -496,17 +515,24 @@ pub fn build_test_path() -> String {
     path
 }
 
-/// Build a content-addressed (CA) test store path and return its full path string.
+/// Return the CA-addressed golden test store path.
 ///
-/// Uses a fixed-output derivation with `__contentAddressed = true`, which
-/// requires the `ca-derivations` experimental feature. The output path is
-/// determined by the content hash, not the derivation inputs.
+/// In hermetic CI, `RIO_GOLDEN_CA_PATH` is set by flake.nix to a
+/// fixed-output derivation path (FODs don't need ca-derivations, so this
+/// builds anywhere). Locally, fall back to building a CA derivation.
 pub fn build_ca_test_path() -> String {
+    if let Ok(p) = std::env::var("RIO_GOLDEN_CA_PATH") {
+        assert!(
+            std::path::Path::new(&p).exists(),
+            "RIO_GOLDEN_CA_PATH={p} does not exist"
+        );
+        return p;
+    }
+
     let output = std::process::Command::new("nix")
+        .env("NIX_CONFIG", NIX_CONFIG)
         .args([
             "build",
-            "--extra-experimental-features",
-            "ca-derivations",
             "--impure",
             "--no-link",
             "--print-out-paths",
@@ -525,7 +551,8 @@ pub fn build_ca_test_path() -> String {
         .expect("nix build (CA) must succeed");
     assert!(
         output.status.success(),
-        "nix build (CA) failed: {}",
+        "nix build (CA) failed: {}\n\
+         Hint: set RIO_GOLDEN_CA_PATH to a precomputed store path to skip this step.",
         String::from_utf8_lossy(&output.stderr)
     );
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -536,9 +563,63 @@ pub fn build_ca_test_path() -> String {
     path
 }
 
-/// Query path info from the real nix store via `nix path-info --json`.
+/// Compute path info for a store path from its NAR serialization.
+///
+/// Uses `nix-store --dump` (legacy command, no state dir needed — works in
+/// hermetic sandboxes) + in-process SHA-256. Our golden fixture paths have
+/// no deriver, no references, no signatures, so we leave those
+/// empty/default. The `ca` field is computed from the file content for FOD-
+/// style paths, or passed explicitly for paths where we know it.
+///
+/// If the env var fixtures are unset, falls back to `nix path-info --json`
+/// (needs working Nix state) for non-trivial paths the caller didn't
+/// precompute.
 pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
+    use rio_nix::hash::{HashAlgo, NixHash};
+
+    // When running under the Nix flake check, fixture paths are known and
+    // simple (single file, no refs, no deriver). Compute metadata ourselves
+    // so we never call `nix path-info` (which needs writable /nix/var).
+    let is_fixture = std::env::var("RIO_GOLDEN_TEST_PATH")
+        .map(|p| p == store_path)
+        .unwrap_or(false)
+        || std::env::var("RIO_GOLDEN_CA_PATH")
+            .map(|p| p == store_path)
+            .unwrap_or(false);
+
+    if is_fixture {
+        let nar = dump_nar(store_path);
+        let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar).to_sri();
+        let nar_size = nar.len() as u64;
+
+        // For FOD-style paths (our goldenCaPath), ca = "fixed:sha256:<nixbase32>"
+        // of the flat file content. For writeText paths (our goldenTestPath),
+        // Nix registers no ca (it's derivation-built, not CA-addressed).
+        let ca = if std::env::var("RIO_GOLDEN_CA_PATH").as_deref() == Ok(store_path) {
+            let content = std::fs::read(store_path).expect("read ca fixture content");
+            let flat_hash = NixHash::compute(HashAlgo::SHA256, &content);
+            Some(format!("fixed:{}", flat_hash.to_colon()))
+        } else {
+            None
+        };
+
+        return StorePathEntry {
+            path: store_path.to_string(),
+            deriver: None,
+            nar_hash,
+            references: vec![],
+            // reg_time is skipped in conformance comparisons anyway.
+            registration_time: 0,
+            nar_size,
+            ultimate: false,
+            sigs: vec![],
+            ca,
+        };
+    }
+
+    // Fallback: local dev path — use `nix path-info`.
     let output = std::process::Command::new("nix")
+        .env("NIX_CONFIG", NIX_CONFIG)
         .args(["path-info", "--json", store_path])
         .output()
         .expect("nix path-info must succeed");
@@ -558,57 +639,48 @@ pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
         .and_then(|v| v.as_object())
         .unwrap_or_else(|| panic!("unexpected JSON structure from nix path-info"));
 
-    let deriver = info
-        .get("deriver")
-        .and_then(|d| d.as_str())
-        .map(String::from);
-    let nar_hash = info
-        .get("narHash")
-        .and_then(|h| h.as_str())
-        .expect("narHash field")
-        .to_string();
-    let nar_size = info
-        .get("narSize")
-        .and_then(|n| n.as_u64())
-        .expect("narSize field");
-    let references: Vec<String> = info
-        .get("references")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let sigs: Vec<String> = info
-        .get("signatures")
-        .and_then(|s| s.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let ca = info.get("ca").and_then(|c| c.as_str()).map(String::from);
-    let registration_time = info
-        .get("registrationTime")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
-    let ultimate = info
-        .get("ultimate")
-        .and_then(|u| u.as_bool())
-        .unwrap_or(false);
-
     StorePathEntry {
         path: store_path.to_string(),
-        deriver,
-        nar_hash,
-        references,
-        registration_time,
-        nar_size,
-        ultimate,
-        sigs,
-        ca,
+        deriver: info
+            .get("deriver")
+            .and_then(|d| d.as_str())
+            .map(String::from),
+        nar_hash: info
+            .get("narHash")
+            .and_then(|h| h.as_str())
+            .expect("narHash field")
+            .to_string(),
+        nar_size: info
+            .get("narSize")
+            .and_then(|n| n.as_u64())
+            .expect("narSize field"),
+        references: info
+            .get("references")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sigs: info
+            .get("signatures")
+            .and_then(|s| s.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ca: info.get("ca").and_then(|c| c.as_str()).map(String::from),
+        registration_time: info
+            .get("registrationTime")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0),
+        ultimate: info
+            .get("ultimate")
+            .and_then(|u| u.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -641,25 +713,40 @@ impl Drop for DaemonGuard {
 
 /// Start a local nix-daemon on a temporary Unix socket.
 ///
-/// Uses the real store database by symlinking `/nix/var/nix/*` into a temp
-/// dir, then pointing `NIX_STATE_DIR` there. The daemon gets a fresh socket
-/// but can see all existing store paths.
+/// Outside sandboxes: symlinks `/nix/var/nix/*` into a temp dir so the
+/// daemon sees the real store db. Inside hermetic build sandboxes
+/// (nixbuild.net), `/nix/var/nix` doesn't exist — the symlink step is a
+/// no-op and the daemon starts with an empty db. We then register the
+/// golden fixture paths via `nix-store --register-validity` so queries
+/// find them.
 ///
 /// Enables `ca-derivations` experimental feature so golden tests can
 /// validate content-addressed workflows.
 pub fn start_local_daemon() -> (String, DaemonGuard) {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
-    // Symlink real store state into the temp dir (skip daemon-socket and gc-socket)
+    // Symlink real store state into the temp dir (skip daemon-socket and gc-socket).
+    // In hermetic sandboxes this loop is a no-op (/nix/var/nix absent).
     let real_state = std::path::Path::new("/nix/var/nix");
+    let mut linked_db = false;
     if let Ok(entries) = std::fs::read_dir(real_state) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str != "daemon-socket" && name_str != "gc-socket" {
                 let _ = std::os::unix::fs::symlink(entry.path(), temp_dir.path().join(&name));
+                if name_str == "db" {
+                    linked_db = true;
+                }
             }
         }
+    }
+
+    // No real db — hermetic sandbox. Register fixture paths so the daemon
+    // knows about them. Without this the daemon returns not-found for all
+    // queries and conformance comparisons fail.
+    if !linked_db {
+        register_fixture_paths(temp_dir.path());
     }
 
     let daemon_sock_dir = temp_dir.path().join("daemon-socket");
@@ -668,10 +755,7 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
 
     let mut child = std::process::Command::new("nix-daemon")
         .env("NIX_STATE_DIR", temp_dir.path())
-        .env(
-            "NIX_CONFIG",
-            "experimental-features = nix-command flakes ca-derivations",
-        )
+        .env("NIX_CONFIG", NIX_CONFIG)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -695,6 +779,71 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
     panic!(
         "nix-daemon did not create socket at {} within 5 seconds",
         socket.display()
+    );
+}
+
+/// Register golden fixture paths in a temp state dir's db.
+///
+/// Uses `nix-store --load-db` which reads the same newline-delimited
+/// format as `--dump-db` and writes directly to SQLite without touching
+/// the filesystem (no chown/chmod). `--register-validity` would try to
+/// canonicalize paths which fails on the read-only /nix/store in
+/// hermetic build sandboxes. Hash is raw hex (no algo prefix).
+fn register_fixture_paths(state_dir: &std::path::Path) {
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use std::io::Write;
+
+    let fixtures: Vec<String> = ["RIO_GOLDEN_TEST_PATH", "RIO_GOLDEN_CA_PATH"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect();
+    if fixtures.is_empty() {
+        return;
+    }
+
+    // nix-store --load-db expects per-path stanzas on stdin
+    // (same format as --dump-db output):
+    //   <path>\n<narHash raw-hex>\n<narSize>\n<deriver>\n<#refs>\n[refs...]
+    // Hash is raw hex WITHOUT algo prefix. See Nix src/libstore/globals.cc.
+    let mut reg = String::new();
+    for p in &fixtures {
+        let nar = dump_nar(p);
+        let nar_hash = NixHash::compute(HashAlgo::SHA256, &nar);
+        reg.push_str(p);
+        reg.push('\n');
+        reg.push_str(&nar_hash.to_hex()); // raw hex, no "sha256:" prefix
+        reg.push('\n');
+        reg.push_str(&nar.len().to_string());
+        reg.push('\n');
+        reg.push('\n'); // empty deriver
+        reg.push_str("0\n"); // 0 references
+    }
+
+    let mut child = std::process::Command::new("nix-store")
+        .env("NIX_STATE_DIR", state_dir)
+        .env("NIX_CONFIG", NIX_CONFIG)
+        // --load-db writes directly to SQLite without canonicalizing
+        // the store path (no chown/chmod). --register-validity would
+        // try to chown, which fails on the read-only /nix/store in
+        // hermetic build sandboxes.
+        .args(["--load-db"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn nix-store --load-db");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(reg.as_bytes())
+        .expect("write registration info");
+    let out = child.wait_with_output().expect("wait for nix-store");
+    assert!(
+        out.status.success(),
+        "nix-store --load-db failed:\nstdin:\n{reg}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
