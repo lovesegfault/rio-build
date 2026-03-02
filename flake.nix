@@ -231,7 +231,7 @@
           ];
 
           # Compile all fuzz target binaries with sancov instrumentation.
-          # Expensive but cached by source hash; shared by both the 10s
+          # Expensive but cached by source hash; shared by both the 30s
           # PR-tier checks and the 600s nightly runs.
           #
           # No dep-layer (cargoArtifacts=null): cargo-fuzz's sancov flags
@@ -259,7 +259,7 @@
           );
 
           # Per-target, per-time-budget fuzz run. Cheap runCommand
-          # wrapper over the prebuilt binary. The 10s and 600s variants
+          # wrapper over the prebuilt binary. The 30s and 600s variants
           # share the same rio-fuzz-build.
           mkFuzzCheck =
             { target, maxTime }:
@@ -275,11 +275,19 @@
               ''}
               mkdir -p artifacts
 
+              # -fork=N spawns N libFuzzer workers that share corpus.
+              # Workers write to fuzz-*.log; dump those on failure so
+              # crash stacks land in the Nix build log.
               ${rio-fuzz-build}/bin/${target} "$workCorpus" \
                 -max_total_time=${toString maxTime} \
                 -timeout=30 \
                 -print_final_stats=1 \
-                -artifact_prefix=artifacts/
+                -artifact_prefix=artifacts/ \
+                -fork=''${NIX_BUILD_CORES:-1} || {
+                  echo "--- worker logs ---"
+                  cat fuzz-*.log 2>/dev/null || true
+                  exit 1
+                }
 
               echo "${target}: ${toString maxTime}s, no crashes" > $out
             '';
@@ -481,9 +489,8 @@
               }
             );
           }
-          # PR-tier smoke fuzz: 10s/target with seed corpus.
-          # Linux-only (libFuzzer). Adds ~70s to `nix flake check`
-          # when parallelized. Compiled binaries shared with the
+          # PR-tier smoke fuzz: 30s/target with seed corpus.
+          # Linux-only (libFuzzer). Compiled binaries shared with the
           # nightly-tier packages via rio-fuzz-build.
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             builtins.listToAttrs (
@@ -491,7 +498,7 @@
                 name = "rio-fuzz-${t}";
                 value = mkFuzzCheck {
                   target = t;
-                  maxTime = 10;
+                  maxTime = 30;
                 };
               }) fuzzTargets
             )
