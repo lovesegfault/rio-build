@@ -556,6 +556,7 @@
                 # Debugging tools
                 lldb
                 gdb
+                lcov # `lcov --summary`/`--list` on the coverage output
 
                 # Documentation
                 mdbook
