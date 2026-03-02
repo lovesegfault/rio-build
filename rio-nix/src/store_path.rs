@@ -101,7 +101,10 @@ impl StorePath {
             .and_then(|r| r.strip_prefix('/'))
             .ok_or(StorePathError::InvalidPrefix)?;
 
-        if rest.len() < HASH_CHARS + 1 {
+        // nixbase32 is always ASCII, so any multi-byte UTF-8 in the hash
+        // region is already invalid — but we must check the char boundary
+        // before split_at, which panics on non-boundaries.
+        if rest.len() < HASH_CHARS + 1 || !rest.is_char_boundary(HASH_CHARS) {
             return Err(StorePathError::TooShort);
         }
 
