@@ -45,6 +45,25 @@ fuzz_target!(|data: &[u8]| {
                 // Reads a single hash-part string
                 let _ = wire::read_string(&mut cursor).await;
             }
+            WorkerOp::AddToStore => {
+                // Legacy CA import: name, camStr, refs (strings),
+                // repair bool, then framed NAR source
+                let _ = wire::read_string(&mut cursor).await;
+                let _ = wire::read_string(&mut cursor).await;
+                let _ = wire::read_strings(&mut cursor).await;
+                let _ = wire::read_bool(&mut cursor).await;
+                let _ = wire::read_framed_stream(&mut cursor).await;
+            }
+            WorkerOp::AddTextToStore => {
+                // Legacy text import: name, text, refs
+                let _ = wire::read_string(&mut cursor).await;
+                let _ = wire::read_string(&mut cursor).await;
+                let _ = wire::read_strings(&mut cursor).await;
+            }
+            WorkerOp::EnsurePath => {
+                // Reads a single store path string
+                let _ = wire::read_string(&mut cursor).await;
+            }
             WorkerOp::AddTempRoot => {
                 // Reads a single store path string
                 let _ = wire::read_string(&mut cursor).await;

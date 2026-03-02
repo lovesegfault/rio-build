@@ -1,0 +1,1 @@
+Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep","","")],[("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-input.drv",["out"])],["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src.sh"],"x86_64-linux","/bin/sh",["-c","echo"],[("name","dep"),("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep"),("system","x86_64-linux")])

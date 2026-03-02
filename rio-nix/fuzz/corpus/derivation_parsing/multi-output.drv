@@ -1,0 +1,1 @@
+Derive([("dev","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dev","",""),("lib","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib","",""),("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","multi"),("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out"),("system","x86_64-linux")])

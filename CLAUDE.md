@@ -11,7 +11,8 @@ rio-build is an early-stage Rust project. It uses a Nix flake-based development 
 The dev environment is managed by Nix. If you have direnv, it activates automatically via `.envrc`.
 
 ```bash
-# Enter the dev shell (if direnv isn't set up)
+# Enter the dev shell (if direnv isn't set up).
+# Default shell uses NIGHTLY Rust so cargo-fuzz works; use .#stable for CI parity.
 nix develop
 
 # Build
@@ -36,6 +37,9 @@ treefmt
 
 # Full CI-equivalent checks (clippy, tests, docs, coverage)
 nix flake check
+
+# Fuzz a parser (default shell is nightly, so this works directly)
+cd rio-nix/fuzz && cargo fuzz run wire_primitives
 ```
 
 ## Build System
@@ -49,7 +53,9 @@ nix flake check
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix flake check` | Run clippy, tests, doc check, and coverage |
+| `nix flake check` | Run clippy, tests, doc check, coverage, 10s fuzz smoke per target |
+| `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
+| `nix build .#fuzz-<target>` | 10-minute nightly-tier fuzz run |
 | `nix fmt` | Same as `treefmt` |
 
 ## Formatting
@@ -67,11 +73,32 @@ Pre-commit hooks run treefmt automatically on commit.
 - Clippy is configured with `--deny warnings` — all warnings must be fixed.
 - The `target/` directory is gitignored; Nix builds go to `result`/`result-*` (also gitignored).
 - Integration tests may need `nix` available in PATH (it's provided in the dev shell).
+- **Default dev shell uses nightly Rust** so `cargo fuzz` works directly. CI builds (clippy, nextest, workspace) use stable via `rust-toolchain.toml` — nightly-only code will be rejected by `nix flake check`. Use `nix develop .#stable` for CI-parity development.
 - **Always run cargo commands via `nix develop -c`** to ensure all dev shell dependencies (including fuse3) are available. E.g., `nix develop -c cargo nextest run`, `nix develop -c cargo clippy --all-targets -- --deny warnings`.
 - **Always run `nix develop -c cargo nextest run` before committing** to catch regressions early.
 - PostgreSQL integration tests bootstrap their own ephemeral postgres server (via `rio-test-support`) using `initdb`/`postgres` binaries from the dev shell. **No manual setup needed.** Tests panic (not skip) if postgres binaries are unavailable. Set `DATABASE_URL` to override with an external PG for debugging.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
 - Keep phase plan docs (`docs/src/phases/`) in sync: mark tasks `[x]` as they're completed.
+
+## Fuzzing
+
+Fuzz targets live in `rio-nix/fuzz/` (excluded from workspace, separate `Cargo.lock`). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
+
+```bash
+nix develop -c bash -c 'cd rio-nix/fuzz && cargo fuzz run wire_primitives'
+```
+
+CI equivalents:
+```bash
+nix build .#checks.x86_64-linux.rio-fuzz-wire_primitives  # 10s smoke (PR tier, in flake check)
+nix build .#fuzz-wire_primitives                          # 10min (nightly tier, explicit)
+```
+
+When adding a new parser, also add a fuzz target:
+1. Add a `[[bin]]` entry in `rio-nix/fuzz/Cargo.toml` + target file in `fuzz_targets/`
+2. Add seed inputs to `rio-nix/fuzz/corpus/<target>/` (NAR seeds: see `gen-nar-corpus.sh`)
+3. Add the target name to `fuzzTargets` in `flake.nix`
+4. If `rio-nix` deps changed, run `cd rio-nix/fuzz && cargo update -p rio-nix` (the fuzz lockfile is independent)
 
 ## Design Book
 

@@ -1,0 +1,12 @@
+StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello
+URL: nar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nar.zst
+Compression: zstd
+FileHash: sha256:deadbeef0000000000000000000000000000000000000000000000000000cafe
+FileSize: 5000
+NarHash: sha256:0000000000000000000000000000000000000000000000000000000000000000
+NarSize: 10000
+References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep2
+Deriver: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello.drv
+Sig: cache.example.org-1:aGVsbG93b3JsZA==
+Sig: cache.example.org-2:aGVsbG93b3JsZA==
+CA: fixed:sha256:abcdef0000000000000000000000000000000000000000000000000000000000
