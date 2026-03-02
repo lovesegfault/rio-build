@@ -223,29 +223,6 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> anyhow::Result<
 
     Ok(row.map(|r| r.into_path_info()))
 }
-
-/// Query path info by store path hash. Only returns completed paths.
-#[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn query_path_info_by_hash(
-    pool: &PgPool,
-    store_path_hash: &[u8],
-) -> anyhow::Result<Option<PathInfo>> {
-    let row: Option<NarinfoRow> = sqlx::query_as(
-        r#"
-        SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n."references", n.signatures, n.ca
-        FROM narinfo n
-        INNER JOIN nar_blobs b ON n.store_path_hash = b.store_path_hash
-        WHERE n.store_path_hash = $1 AND b.status = 'complete'
-        "#,
-    )
-    .bind(store_path_hash)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|r| r.into_path_info()))
-}
-
 /// Batch check which store paths are missing (not in the store with `status='complete'`).
 ///
 /// Only paths with `nar_blobs.status = 'complete'` are considered present.
