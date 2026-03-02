@@ -25,6 +25,20 @@ use super::ExecutorError;
 /// This bounds the blast radius of a stuck daemon before the build timeout kicks in.
 pub(super) const DAEMON_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bind-mount `src` onto `target` (no propagation). Async-signal-safe:
+/// `nix::mount::mount` is a direct syscall wrapper, `std::io::Error::from(Errno)`
+/// stores only an i32. Safe to call from `pre_exec`.
+fn bind_mount(src: &Path, target: &str) -> std::io::Result<()> {
+    mount(
+        Some(src),
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(std::io::Error::from)
+}
+
 /// Spawn `nix-daemon --stdio` in a private mount namespace with the overlay
 /// bind-mounted at canonical paths.
 ///
@@ -134,35 +148,10 @@ pub(super) async fn spawn_daemon_in_namespace(
                 )
                 .map_err(std::io::Error::from)?;
 
-                // Bind overlay merged → /nix/store
-                mount(
-                    Some(merged.as_path()),
-                    "/nix/store",
-                    None::<&str>,
-                    MsFlags::MS_BIND,
-                    None::<&str>,
-                )
-                .map_err(std::io::Error::from)?;
-
-                // Bind synthetic DB → /nix/var/nix/db
-                mount(
-                    Some(upper_db.as_path()),
-                    "/nix/var/nix/db",
-                    None::<&str>,
-                    MsFlags::MS_BIND,
-                    None::<&str>,
-                )
-                .map_err(std::io::Error::from)?;
-
-                // Bind nix.conf dir → /etc/nix
-                mount(
-                    Some(upper_conf.as_path()),
-                    "/etc/nix",
-                    None::<&str>,
-                    MsFlags::MS_BIND,
-                    None::<&str>,
-                )
-                .map_err(std::io::Error::from)?;
+                // Bind overlay merged → /nix/store, synthetic DB, nix.conf dir
+                bind_mount(&merged, "/nix/store")?;
+                bind_mount(&upper_db, "/nix/var/nix/db")?;
+                bind_mount(&upper_conf, "/etc/nix")?;
 
                 Ok(())
             });
