@@ -82,7 +82,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
     };
 
-    let info = match grpc_query_path_info(store_client, &path.to_string()).await {
+    let info = match grpc_query_path_info(store_client, path.as_str()).await {
         Ok(info) => info,
         Err(e) => return send_store_error(stderr, e).await,
     };

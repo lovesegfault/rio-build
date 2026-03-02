@@ -287,7 +287,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     stderr.finish().await?;
     let w = stderr.inner_mut();
 
-    wire::write_string(w, &path.to_string()).await?;
+    wire::write_string(w, path.as_str()).await?;
     wire::write_string(w, "").await?;
     wire::write_string(w, &nar_hash.to_hex()).await?;
     wire::write_strings(w, &references).await?;
@@ -361,7 +361,7 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     }
 
     stderr.finish().await?;
-    wire::write_string(stderr.inner_mut(), &path.to_string()).await?;
+    wire::write_string(stderr.inner_mut(), path.as_str()).await?;
 
     Ok(())
 }

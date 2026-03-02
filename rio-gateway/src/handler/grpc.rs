@@ -17,7 +17,7 @@ pub(super) async fn grpc_is_valid_path(
     store_client: &mut StoreServiceClient<Channel>,
     path: &StorePath,
 ) -> anyhow::Result<bool> {
-    Ok(grpc_query_path_info(store_client, &path.to_string())
+    Ok(grpc_query_path_info(store_client, path.as_str())
         .await?
         .is_some())
 }

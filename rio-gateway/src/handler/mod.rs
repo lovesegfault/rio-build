@@ -302,7 +302,7 @@ pub(crate) async fn resolve_derivation(
         return Ok(cached.clone());
     }
 
-    let (_info, nar_data) = grpc_get_path(store_client, &drv_path.to_string())
+    let (_info, nar_data) = grpc_get_path(store_client, drv_path.as_str())
         .await?
         .ok_or_else(|| anyhow::anyhow!("derivation '{}' not found in store", drv_path))?;
 

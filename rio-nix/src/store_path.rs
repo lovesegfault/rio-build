@@ -66,10 +66,14 @@ impl fmt::Debug for StorePathHash {
 
 /// A parsed Nix store path.
 #[must_use]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct StorePath {
     hash: StorePathHash,
     name: String,
+    /// Full path string (`/nix/store/{hash}-{name}`). Cached for zero-cost
+    /// `as_str()` / `Display` — avoids re-running `nixbase32::encode` on every
+    /// `.to_string()` call.
+    full: String,
 }
 
 impl StorePath {
@@ -81,6 +85,11 @@ impl StorePath {
     /// The name component of the store path.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The full path as a string slice (`/nix/store/{hash}-{name}`).
+    pub fn as_str(&self) -> &str {
+        &self.full
     }
 }
 
@@ -114,7 +123,8 @@ impl StorePath {
 
         Ok(StorePath {
             hash: StorePathHash(hash),
-            name: remainder.to_string(),
+            name: remainder.to_owned(),
+            full: s.to_owned(),
         })
     }
 
@@ -140,9 +150,11 @@ impl StorePath {
         for (i, &byte) in digest.iter().enumerate() {
             compressed[i % HASH_BYTES] ^= byte;
         }
+        let hash_part = nixbase32::encode(&compressed);
         Ok(StorePath {
             hash: StorePathHash(compressed),
-            name: name.to_string(),
+            name: name.to_owned(),
+            full: format!("{STORE_DIR}/{hash_part}-{name}"),
         })
     }
 
@@ -192,7 +204,7 @@ impl StorePath {
         let mut type_str = "text".to_string();
         for r in references {
             type_str.push(':');
-            type_str.push_str(&r.to_string());
+            type_str.push_str(r.as_str());
         }
 
         let fingerprint = format!(
@@ -213,7 +225,59 @@ impl std::str::FromStr for StorePath {
 
 impl fmt::Display for StorePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}-{}", STORE_DIR, self.hash_part(), self.name)
+        f.write_str(&self.full)
+    }
+}
+
+// --- Ergonomic string-like impls (match string_newtype! pattern) ---
+
+impl std::ops::Deref for StorePath {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.full
+    }
+}
+
+impl AsRef<str> for StorePath {
+    fn as_ref(&self) -> &str {
+        &self.full
+    }
+}
+
+impl std::borrow::Borrow<str> for StorePath {
+    fn borrow(&self) -> &str {
+        &self.full
+    }
+}
+
+impl PartialEq for StorePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.full == other.full
+    }
+}
+impl Eq for StorePath {}
+
+impl std::hash::Hash for StorePath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.full.hash(state);
+    }
+}
+
+impl PartialEq<str> for StorePath {
+    fn eq(&self, other: &str) -> bool {
+        self.full == other
+    }
+}
+
+impl PartialEq<&str> for StorePath {
+    fn eq(&self, other: &&str) -> bool {
+        self.full == *other
+    }
+}
+
+impl PartialEq<String> for StorePath {
+    fn eq(&self, other: &String) -> bool {
+        self.full == *other
     }
 }
 
