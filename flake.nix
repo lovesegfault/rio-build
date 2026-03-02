@@ -293,6 +293,30 @@
             '';
 
           # --------------------------------------------------------------
+          # Golden conformance test fixtures
+          # --------------------------------------------------------------
+          #
+          # Precomputed store paths for live-daemon golden tests. In hermetic
+          # sandboxes (nixbuild.net), `nix eval`/`nix build` fail because
+          # /nix/var is read-only. Building these as nativeCheckInputs makes
+          # them available in the sandbox store; env vars tell the tests
+          # where they are. Tests compute narHash/narSize themselves via
+          # `nix-store --dump` (legacy, no state dir needed). Locally, tests
+          # fall back to `nix eval` if the env var is unset.
+          goldenTestPath = pkgs.writeText "rio-golden-test" "golden test data\n";
+
+          # CA-path fixture: fixed-output derivation with a known flat hash.
+          # FODs don't need the ca-derivations experimental feature, so this
+          # builds on any Nix. Its ca field (`fixed:sha256:...`) is what the
+          # query_path_from_hash_part_ca test validates.
+          # Hash is sha256("ca-golden-test-data") in SRI format.
+          goldenCaPath = pkgs.runCommand "rio-ca-golden" {
+            outputHashMode = "flat";
+            outputHashAlgo = "sha256";
+            outputHash = "sha256-ZofhPTz/XO99Dn3kQMcBaG3vHoMFiD9kHTTtuvf2KNM=";
+          } "echo -n ca-golden-test-data > $out";
+
+          # --------------------------------------------------------------
           # Check derivations (extracted so checks and aggregates share them)
           # --------------------------------------------------------------
           cargoChecks = {
@@ -313,6 +337,11 @@
                   openssh
                   postgresql_18
                 ];
+                # Golden fixture paths. String interpolation puts them in
+                # the build closure so they're in the sandbox store; tests
+                # read the env var to find them (see golden/daemon.rs).
+                RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+                RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
               }
             );
             doc = craneLib.cargoDoc (commonArgs // { inherit cargoArtifacts; });
@@ -331,6 +360,8 @@
                     openssh
                     postgresql_18
                   ]);
+                RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+                RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
               }
             );
           };
