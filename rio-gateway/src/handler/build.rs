@@ -219,35 +219,17 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         ..
     } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
-    let basic_drv = match read_basic_derivation(reader).await {
-        Ok(v) => v,
-        Err(e) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!("wopBuildDerivation: failed to read BasicDerivation: {e}"),
-            )
-            .await;
-        }
+    let Ok(basic_drv) = read_basic_derivation(reader).await else {
+        stderr_err!(stderr, "wopBuildDerivation: failed to read BasicDerivation");
     };
-    let build_mode_val = match wire::read_u64(reader).await {
-        Ok(v) => v,
-        Err(e) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!("wopBuildDerivation: failed to read build mode: {e}"),
-            )
-            .await;
-        }
+    let Ok(build_mode_val) = wire::read_u64(reader).await else {
+        stderr_err!(stderr, "wopBuildDerivation: failed to read build mode");
     };
-    let _build_mode = match BuildMode::try_from(build_mode_val) {
-        Ok(m) => m,
-        Err(_) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!("wopBuildDerivation: unsupported build mode {build_mode_val}"),
-            )
-            .await;
-        }
+    let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
+        stderr_err!(
+            stderr,
+            "wopBuildDerivation: unsupported build mode {build_mode_val}"
+        );
     };
 
     debug!(
@@ -265,13 +247,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // The .drv should have been uploaded via wopAddToStoreNar before this call.
     let drv_path = match StorePath::parse(&drv_path_str) {
         Ok(p) => p,
-        Err(e) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!("invalid drv path '{drv_path_str}': {e}"),
-            )
-            .await;
-        }
+        Err(e) => stderr_err!(stderr, "invalid drv path '{drv_path_str}': {e}"),
     };
 
     // Try to get the full derivation with inputDrvs
@@ -341,15 +317,11 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
-    let _build_mode = match BuildMode::try_from(build_mode_val) {
-        Ok(m) => m,
-        Err(_) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!("wopBuildPaths: unsupported build mode {build_mode_val}"),
-            )
-            .await;
-        }
+    let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
+        stderr_err!(
+            stderr,
+            "wopBuildPaths: unsupported build mode {build_mode_val}"
+        );
     };
 
     debug!(count = raw_paths.len(), "wopBuildPaths");
@@ -385,13 +357,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
                         all_nodes.extend(nodes);
                         all_edges.extend(edges);
                     }
-                    Err(e) => {
-                        return send_store_error(
-                            stderr,
-                            anyhow::anyhow!("DAG reconstruction failed for '{}': {e}", drv),
-                        )
-                        .await;
-                    }
+                    Err(e) => stderr_err!(stderr, "DAG reconstruction failed for '{drv}': {e}"),
                 }
             }
         }
@@ -442,17 +408,11 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
     let build_mode_val = wire::read_u64(reader).await?;
-    let _build_mode = match BuildMode::try_from(build_mode_val) {
-        Ok(m) => m,
-        Err(_) => {
-            return send_store_error(
-                stderr,
-                anyhow::anyhow!(
-                    "wopBuildPathsWithResults: unsupported build mode {build_mode_val}"
-                ),
-            )
-            .await;
-        }
+    let Ok(_build_mode) = BuildMode::try_from(build_mode_val) else {
+        stderr_err!(
+            stderr,
+            "wopBuildPathsWithResults: unsupported build mode {build_mode_val}"
+        );
     };
 
     debug!(count = raw_paths.len(), "wopBuildPathsWithResults");
