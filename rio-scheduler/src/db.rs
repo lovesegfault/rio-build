@@ -154,37 +154,6 @@ impl SchedulerDb {
     // Derivation operations
     // -----------------------------------------------------------------------
 
-    /// Insert a new derivation, returning the assigned derivation_id as a string.
-    /// Uses ON CONFLICT to handle deduplication by drv_hash.
-    pub async fn upsert_derivation(
-        &self,
-        drv_hash: &str,
-        drv_path: &str,
-        pname: Option<&str>,
-        system: &str,
-        status: DerivationStatus,
-        required_features: &[String],
-    ) -> Result<Uuid, sqlx::Error> {
-        let row: (Uuid,) = sqlx::query_as(
-            r#"
-            INSERT INTO derivations (drv_hash, drv_path, pname, system, status, required_features)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (drv_hash) DO UPDATE SET updated_at = now()
-            RETURNING derivation_id
-            "#,
-        )
-        .bind(drv_hash)
-        .bind(drv_path)
-        .bind(pname)
-        .bind(system)
-        .bind(status.as_str())
-        .bind(required_features)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(row.0)
-    }
-
     /// Update a derivation's status.
     pub async fn update_derivation_status(
         &self,
@@ -219,28 +188,6 @@ impl SchedulerDb {
 
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Edge operations
-    // -----------------------------------------------------------------------
-
-    /// Insert a derivation edge.
-    pub async fn insert_edge(&self, parent_id: Uuid, child_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            INSERT INTO derivation_edges (parent_id, child_id)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(parent_id)
-        .bind(child_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Build-derivation mapping
     // -----------------------------------------------------------------------
