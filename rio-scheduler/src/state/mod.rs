@@ -645,6 +645,19 @@ pub const MAX_MISSED_HEARTBEATS: u32 = 3;
 mod tests {
     use super::*;
 
+    fn dummy_node() -> rio_proto::types::DerivationNode {
+        rio_proto::types::DerivationNode {
+            drv_hash: "h".into(),
+            drv_path: "/nix/store/h.drv".into(),
+            pname: String::new(),
+            system: "x86_64-linux".into(),
+            required_features: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
+            expected_output_paths: vec![],
+        }
+    }
+
     #[test]
     fn test_derivation_valid_transitions() {
         use DerivationStatus::*;
@@ -743,16 +756,7 @@ mod tests {
 
     #[test]
     fn test_reset_to_ready() {
-        let node = rio_proto::types::DerivationNode {
-            drv_hash: "h".into(),
-            drv_path: "/nix/store/h.drv".into(),
-            pname: String::new(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-        };
+        let node = dummy_node();
 
         // Assigned -> Ready: direct valid transition
         let mut state = DerivationState::from_node(&node);
@@ -782,16 +786,7 @@ mod tests {
 
     #[test]
     fn test_reset_from_poison() {
-        let node = rio_proto::types::DerivationNode {
-            drv_hash: "h".into(),
-            drv_path: "/nix/store/h.drv".into(),
-            pname: String::new(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-        };
+        let node = dummy_node();
 
         let mut state = DerivationState::from_node(&node);
         state.set_status_for_test(DerivationStatus::Poisoned);

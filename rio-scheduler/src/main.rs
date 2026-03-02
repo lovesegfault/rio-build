@@ -45,8 +45,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let log_format = rio_common::observability::log_format_from_env();
-    rio_common::observability::init_logging(log_format, None)?;
+    rio_common::observability::init_from_env()?;
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(

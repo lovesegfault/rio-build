@@ -94,8 +94,7 @@ fn detect_system() -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let log_format = rio_common::observability::log_format_from_env();
-    rio_common::observability::init_logging(log_format, None)?;
+    rio_common::observability::init_from_env()?;
 
     // worker_id uniquely identifies this worker to the scheduler. Two workers
     // with the same ID would steal each other's builds via heartbeat merging.
