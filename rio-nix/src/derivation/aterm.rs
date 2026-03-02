@@ -330,49 +330,7 @@ impl Derivation {
         out.push(']');
         out.push(',');
 
-        // inputSrcs
-        out.push('[');
-        for (i, src) in self.input_srcs.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            write_aterm_string(&mut out, src);
-        }
-        out.push(']');
-        out.push(',');
-
-        // platform, builder
-        write_aterm_string(&mut out, &self.platform);
-        out.push(',');
-        write_aterm_string(&mut out, &self.builder);
-        out.push(',');
-
-        // args
-        out.push('[');
-        for (i, arg) in self.args.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            write_aterm_string(&mut out, arg);
-        }
-        out.push(']');
-        out.push(',');
-
-        // env
-        out.push('[');
-        for (i, (key, value)) in self.env.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('(');
-            write_aterm_string(&mut out, key);
-            out.push(',');
-            write_aterm_string(&mut out, value);
-            out.push(')');
-        }
-        out.push(']');
-
-        out.push(')');
+        self.write_aterm_tail(&mut out);
         out
     }
 
@@ -449,47 +407,59 @@ impl Derivation {
         out.push(']');
         out.push(',');
 
-        // inputSrcs, platform, builder, args, env -- identical to to_aterm()
+        self.write_aterm_tail(&mut out);
+        Ok(out)
+    }
+}
+
+impl Derivation {
+    /// Write the shared tail of a `Derive(...)` term: inputSrcs, platform,
+    /// builder, args, env, and the closing `)`. Used by both [`Self::to_aterm`]
+    /// and [`Self::to_aterm_modulo`] — the tail is byte-identical between them.
+    fn write_aterm_tail(&self, out: &mut String) {
+        // inputSrcs
         out.push('[');
         for (i, src) in self.input_srcs.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            write_aterm_string(&mut out, src);
+            write_aterm_string(out, src);
         }
         out.push(']');
         out.push(',');
 
-        write_aterm_string(&mut out, &self.platform);
+        // platform, builder
+        write_aterm_string(out, &self.platform);
         out.push(',');
-        write_aterm_string(&mut out, &self.builder);
+        write_aterm_string(out, &self.builder);
         out.push(',');
 
+        // args
         out.push('[');
         for (i, arg) in self.args.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            write_aterm_string(&mut out, arg);
+            write_aterm_string(out, arg);
         }
         out.push(']');
         out.push(',');
 
+        // env
         out.push('[');
         for (i, (key, value)) in self.env.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push('(');
-            write_aterm_string(&mut out, key);
+            write_aterm_string(out, key);
             out.push(',');
-            write_aterm_string(&mut out, value);
+            write_aterm_string(out, value);
             out.push(')');
         }
         out.push(']');
 
-        out.push(')');
-        Ok(out)
+        out.push(')'); // close Derive(
     }
 }
 
