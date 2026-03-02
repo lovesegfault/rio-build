@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
+use sqlx::postgres::PgPoolOptions;
 use tempfile::TempDir;
 
 /// Process-global postgres server. Lazily initialized on first [`TestDb::new`].
@@ -123,7 +124,12 @@ impl PgServer {
         writeln!(conf, "fsync = off").unwrap();
         writeln!(conf, "synchronous_commit = off").unwrap();
         writeln!(conf, "full_page_writes = off").unwrap();
-        writeln!(conf, "max_connections = 100").unwrap();
+        // High connection limit: under cargo test (llvm-cov), all tests
+        // share this ONE server via the PG static. With ~80 concurrent
+        // tests each holding 2-5 connections, the old limit (100) caused
+        // 30s acquire_timeout waits and apparent test hangs. nextest
+        // doesn't hit this — each test process has its own PG server.
+        writeln!(conf, "max_connections = 500").unwrap();
         std::fs::write(&conf_path, conf).expect("failed to write postgresql.conf");
 
         // Spawn postgres as a direct child. On Linux, PR_SET_PDEATHSIG ensures
@@ -344,8 +350,12 @@ impl TestDb {
                 .as_nanos()
         );
 
-        // Create the database via an admin connection.
-        let admin_pool = PgPool::connect(&admin_url)
+        // Create the database via a single-connection admin pool. Under
+        // cargo test (llvm-cov), many TestDb::new calls run concurrently
+        // against the shared PG server — keep transient admin usage minimal.
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
             .await
             .expect("failed to connect to test postgres admin database");
         sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
@@ -354,9 +364,13 @@ impl TestDb {
             .expect("failed to create test database");
         admin_pool.close().await;
 
-        // Connect to the new database and migrate.
+        // Connect to the new database and migrate. Small pool: tests
+        // rarely need >2-3 concurrent queries, and the sqlx default (10)
+        // multiplied across ~80 concurrent tests exhausts PG connections.
         let test_url = replace_db_name(&admin_url, &db_name);
-        let pool = PgPool::connect(&test_url)
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&test_url)
             .await
             .expect("failed to connect to test database");
         migrator
@@ -384,7 +398,19 @@ impl Drop for TestDb {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let Ok(admin_pool) = PgPool::connect(&admin_url).await else {
+                // Short acquire_timeout: under cargo test (llvm-cov) many
+                // tests share the PG static and may exhaust connections.
+                // Drop is best-effort cleanup — if we can't connect within
+                // 2s, give up and leak the database rather than blocking
+                // the test for sqlx's default 30s. Under nextest (one PG
+                // server per process) there's no contention so this always
+                // succeeds fast.
+                let Ok(admin_pool) = PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(2))
+                    .connect(&admin_url)
+                    .await
+                else {
                     return;
                 };
                 // Kick any lingering connections, then drop.
@@ -400,8 +426,7 @@ impl Drop for TestDb {
                 admin_pool.close().await;
             });
         });
-        // Best-effort: wait for cleanup so test output isn't interleaved, but
-        // don't block forever.
+        // Wait for cleanup (bounded by the 2s acquire_timeout above).
         let _ = handle.join();
     }
 }
