@@ -53,7 +53,7 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix flake check` | Run clippy, tests, doc check, coverage, 10s fuzz smoke per target |
+| `nix flake check` | Run clippy, tests, doc check, coverage, 30s fuzz smoke per target |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#fuzz-<target>` | 10-minute nightly-tier fuzz run |
 | `nix fmt` | Same as `treefmt` |
@@ -90,7 +90,7 @@ nix develop -c bash -c 'cd rio-nix/fuzz && cargo fuzz run wire_primitives'
 
 CI equivalents:
 ```bash
-nix build .#checks.x86_64-linux.rio-fuzz-wire_primitives  # 10s smoke (PR tier, in flake check)
+nix build .#checks.x86_64-linux.rio-fuzz-wire_primitives  # 30s smoke (PR tier, in flake check)
 nix build .#fuzz-wire_primitives                          # 10min (nightly tier, explicit)
 ```
 
