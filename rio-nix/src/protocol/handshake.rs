@@ -84,6 +84,7 @@ pub enum HandshakeError {
 /// 9. Write STDERR_LAST (u64); flush
 ///
 /// On error, the caller should send `STDERR_ERROR` and close the connection.
+#[cfg(test)]
 pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     version_string: &str,
