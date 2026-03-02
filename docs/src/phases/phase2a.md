@@ -32,7 +32,7 @@
 The milestone is validated by a NixOS VM test:
 
 ```bash
-nix build .#checks.x86_64-linux.rio-phase2a
+nix build .#checks.x86_64-linux.vm-phase2a
 ```
 
 Four VMs (control + 2 workers + client) exercise the full distributed path:
@@ -55,7 +55,7 @@ integration tests never could.
 For interactive debugging:
 
 ```bash
-nix build .#checks.x86_64-linux.rio-phase2a.driverInteractive
+nix build .#checks.x86_64-linux.vm-phase2a.driverInteractive
 ./result/bin/nixos-test-driver
 >>> start_all(); control.shell_interact()
 ```

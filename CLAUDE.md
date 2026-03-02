@@ -53,10 +53,24 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix flake check` | Run clippy, tests, doc check, coverage, 30s fuzz smoke per target |
+| `nix build .#ci-local-fast` | Full local validation: build, clippy, nextest, doc, coverage, pre-commit, 30s fuzz smoke ×7 |
+| `nix build .#ci-local-slow` | Same as `ci-local-fast` but with 10-min fuzz instead of 30s smoke |
+| `nix build .#ci-fast` / `.#ci-slow` | Same as `ci-local-*` plus VM tests (Linux+KVM only — typically via `nix-build-remote`) |
+| `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 30s fuzz smoke, VM tests) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
-| `nix build .#fuzz-<target>` | 10-minute nightly-tier fuzz run |
+| `nix build .#fuzz-nightly-<target>` | 10-minute nightly-tier fuzz run for a single target |
 | `nix fmt` | Same as `treefmt` |
+
+### CI aggregate targets
+
+Single-target validation bundles — build one of these instead of remembering individual checks:
+
+|                | 30s fuzz smoke | 10min fuzz nightly |
+|----------------|----------------|--------------------|
+| **no VM tests** | `ci-local-fast` | `ci-local-slow` |
+| **with VM tests** | `ci-fast` | `ci-slow` |
+
+The VM-including aggregates need KVM — use `nix-build-remote -- .#ci-slow`. On non-Linux, `ci-local-*` degrades to cargo checks + pre-commit only (fuzz is Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
 
 ## Formatting
 
@@ -90,8 +104,8 @@ nix develop -c bash -c 'cd rio-nix/fuzz && cargo fuzz run wire_primitives'
 
 CI equivalents:
 ```bash
-nix build .#checks.x86_64-linux.rio-fuzz-wire_primitives  # 30s smoke (PR tier, in flake check)
-nix build .#fuzz-wire_primitives                          # 10min (nightly tier, explicit)
+nix build .#checks.x86_64-linux.fuzz-smoke-wire_primitives  # 30s smoke (PR tier, in flake check)
+nix build .#fuzz-nightly-wire_primitives                    # 10min (nightly tier, explicit)
 ```
 
 When adding a new parser, also add a fuzz target:

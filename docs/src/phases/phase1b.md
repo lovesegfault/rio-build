@@ -36,7 +36,7 @@
 The Phase 1b milestone is validated by a NixOS VM test:
 
 ```bash
-nix build .#checks.x86_64-linux.rio-phase1b
+nix build .#checks.x86_64-linux.vm-phase1b
 ```
 
 Three VMs (control + 1 worker + client) exercise the single-node build path:

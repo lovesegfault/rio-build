@@ -43,8 +43,8 @@ cargo clippy --all-targets -- --deny warnings
 # Format (runs rustfmt + nixfmt + taplo via treefmt)
 nix fmt
 
-# Full CI-equivalent checks (clippy, tests, docs, coverage)
-nix flake check
+# Full local validation (build, clippy, nextest, doc, coverage, pre-commit, 30s fuzz smoke)
+nix build .#ci-local-fast
 ```
 
 ## Code Style
@@ -59,7 +59,7 @@ nix flake check
 1. **Branch from `main`**, name branches descriptively (e.g., `feat/nar-streaming`, `fix/handshake-padding`)
 2. **Keep PRs focused** --- one logical change per PR
 3. **Write tests** for new functionality. Protocol parsers must include property-based tests (`proptest`)
-4. **Run `nix flake check`** before opening a PR --- this is what CI runs
+4. **Run `nix build .#ci-local-fast`** before opening a PR --- this bundles all local validation
 5. **Update docs** if your change affects the design or configuration
 
 ## Project Structure
