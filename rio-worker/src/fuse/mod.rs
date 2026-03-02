@@ -173,7 +173,7 @@ impl NixStoreFs {
 }
 
 /// Build the FUSE mount configuration.
-pub fn make_fuse_config(n_threads: u32) -> Config {
+fn make_fuse_config(n_threads: u32) -> Config {
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::RO,
