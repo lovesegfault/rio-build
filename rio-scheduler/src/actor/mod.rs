@@ -258,14 +258,6 @@ impl DagActor {
             self_tx: None,
         }
     }
-
-    /// Run the actor event loop. Consumes commands from the channel until it closes.
-    pub async fn run(mut self, mut rx: mpsc::Receiver<ActorCommand>) {
-        // No self_tx: cleanup is synchronous (test helpers don't pass a tx clone).
-        // Production (ActorHandle::spawn) uses run_with_self_tx.
-        self.run_inner(&mut rx).await;
-    }
-
     /// Run the actor with a weak clone of its own sender for scheduling
     /// delayed internal commands (terminal cleanup, etc.). The weak sender
     /// ensures the actor doesn't keep itself alive after all handles drop.
@@ -529,20 +521,6 @@ impl ActorHandle {
         rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
         Self { tx, backpressure }
     }
-
-    /// Legacy constructor without self_tx (kept for tests that manually spawn).
-    #[cfg(test)]
-    pub fn spawn_without_cleanup(
-        db: SchedulerDb,
-        store_client: Option<StoreServiceClient<Channel>>,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-        let actor = DagActor::new(db, store_client);
-        let backpressure = actor.backpressure_flag();
-        tokio::spawn(actor.run(rx));
-        Self { tx, backpressure }
-    }
-
     /// Whether the actor task is still alive. Returns false if the actor
     /// panicked or exited (its receiver dropped, closing the channel).
     ///

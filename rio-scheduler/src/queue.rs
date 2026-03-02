@@ -64,12 +64,6 @@ impl ReadyQueue {
         self.members.remove(h.as_str());
         Some(h)
     }
-
-    /// Peek at the front of the queue without removing.
-    pub fn peek(&self) -> Option<&str> {
-        self.queue.front().map(|s| s.as_str())
-    }
-
     /// Remove a specific derivation hash from the queue (e.g., on cancellation).
     /// O(1) for the "not present" case (HashSet check); O(n) for the
     /// present case (VecDeque position scan).
@@ -97,17 +91,6 @@ impl ReadyQueue {
     /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
-    }
-
-    /// Drain all items from the queue.
-    pub fn drain(&mut self) -> impl Iterator<Item = DrvHash> + '_ {
-        self.members.clear();
-        self.queue.drain(..)
-    }
-
-    /// Iterate over all items in the queue without removing them.
-    pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.queue.iter().map(|s| s.as_str())
     }
 }
 
@@ -207,9 +190,12 @@ mod tests {
         }
         assert_eq!(q.len(), 5_000);
 
-        // Drain the rest; invariant checked in len() and at end.
-        let drained: Vec<_> = q.drain().collect();
-        assert_eq!(drained.len(), 5_000);
+        // Pop the rest; invariant checked in len() and at end.
+        let mut drained = 0;
+        while q.pop_front().is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, 5_000);
         assert!(q.is_empty());
     }
 }

@@ -5,7 +5,7 @@
 //! store path; CA: modular derivation hash). Each node tracks which builds
 //! are interested in it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -84,11 +84,6 @@ impl DerivationDag {
     /// Iterate all derivation states (without keys).
     pub fn iter_values(&self) -> impl Iterator<Item = &DerivationState> {
         self.nodes.values()
-    }
-
-    /// Number of derivation nodes.
-    pub fn node_count(&self) -> usize {
-        self.nodes.len()
     }
 
     /// Merge a set of nodes and edges from a new build into the global DAG.
@@ -472,21 +467,6 @@ impl DerivationDag {
 
         transitions
     }
-
-    /// Find all leaf derivations (no dependencies) for a build.
-    pub fn find_leaves(&self, build_id: Uuid) -> Vec<DrvHash> {
-        self.nodes
-            .iter()
-            .filter(|(_, state)| state.interested_builds.contains(&build_id))
-            .filter(|(hash, _)| {
-                self.children
-                    .get(hash.as_str())
-                    .is_none_or(|c| c.is_empty())
-            })
-            .map(|(hash, _)| hash.clone())
-            .collect()
-    }
-
     /// Find all root derivations (no parents) for a build.
     /// These are the top-level derivations the client actually wants built.
     pub fn find_roots(&self, build_id: Uuid) -> Vec<DrvHash> {
@@ -521,45 +501,6 @@ impl DerivationDag {
         }
 
         summary
-    }
-
-    /// Perform a topological walk from roots, yielding nodes in dependency order.
-    /// This is BFS from leaves toward roots (Kahn's algorithm).
-    pub fn topological_order(&self) -> Vec<DrvHash> {
-        // Compute dep counts: number of children (deps) for each node
-        let mut dep_count: HashMap<&str, usize> = HashMap::new();
-        for hash in self.nodes.keys() {
-            let count = self
-                .children
-                .get(hash.as_str())
-                .map(|c| c.len())
-                .unwrap_or(0);
-            dep_count.insert(hash.as_str(), count);
-        }
-
-        let mut queue: VecDeque<&str> = dep_count
-            .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(&hash, _)| hash)
-            .collect();
-
-        let mut order = Vec::new();
-        while let Some(hash) = queue.pop_front() {
-            order.push(hash.into());
-            // For each parent that depends on this hash
-            if let Some(parent_hashes) = self.parents.get(hash) {
-                for parent in parent_hashes {
-                    if let Some(count) = dep_count.get_mut(parent.as_str()) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            queue.push_back(parent.as_str());
-                        }
-                    }
-                }
-            }
-        }
-
-        order
     }
 }
 

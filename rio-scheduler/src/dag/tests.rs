@@ -174,32 +174,6 @@ fn test_find_newly_ready() {
     assert_eq!(ready, vec!["hashA".to_string()]);
 }
 
-#[test]
-fn test_topological_order() {
-    let mut dag = DerivationDag::new();
-    let build_id = Uuid::new_v4();
-    // C depends on B, B depends on A
-    let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
-        make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
-    ];
-    let edges = vec![
-        make_edge("/nix/store/c.drv", "/nix/store/b.drv"),
-        make_edge("/nix/store/b.drv", "/nix/store/a.drv"),
-    ];
-
-    dag.merge(build_id, &nodes, &edges).unwrap();
-    let order = dag.topological_order();
-
-    // A must come before B, B before C
-    let pos_a = order.iter().position(|h| h == "hashA").unwrap();
-    let pos_b = order.iter().position(|h| h == "hashB").unwrap();
-    let pos_c = order.iter().position(|h| h == "hashC").unwrap();
-    assert!(pos_a < pos_b);
-    assert!(pos_b < pos_c);
-}
-
 // -----------------------------------------------------------------------
 // Group 2: Cycle detection
 // -----------------------------------------------------------------------
