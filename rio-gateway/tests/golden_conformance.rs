@@ -99,7 +99,7 @@ async fn run_live_conformance(
     skip: &[&str],
     parse_opcode: OpcodeFieldParser,
 ) {
-    let socket = golden::daemon::shared_daemon_socket();
+    let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
 
     let (client_bytes, daemon_response) =
         golden::daemon::exchange_with_daemon(&socket, opcode_bytes)
@@ -140,7 +140,7 @@ async fn run_live_conformance(
 
 #[tokio::test]
 async fn test_golden_live_handshake() {
-    let socket = golden::daemon::shared_daemon_socket();
+    let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
     let (_store, store_addr, _sh) = spawn_mock_store().await;
     let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await;
 
@@ -287,7 +287,7 @@ async fn test_golden_live_nar_from_path() {
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let socket = golden::daemon::shared_daemon_socket();
+    let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
 
     let op = golden::build_nar_from_path_bytes(&test_path).await;
     let (client_bytes, daemon_response) =
