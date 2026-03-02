@@ -5,7 +5,6 @@
 //! client and server byte streams for comparison against rio-build.
 
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -24,22 +23,18 @@ enum PostLastRead {
     Nar,
 }
 
-/// Shared daemon instance across all tests.
+/// Start a fresh nix-daemon for this test.
 ///
-/// Uses `LazyLock` so the daemon is started at most once, even when
-/// tests run in parallel. The `Mutex<Option<DaemonGuard>>` keeps the
-/// guard alive for the lifetime of the test process.
-static SHARED_DAEMON: LazyLock<(String, Mutex<Option<DaemonGuard>>)> = LazyLock::new(|| {
-    let (socket, guard) = get_daemon_socket_inner();
-    (socket, Mutex::new(guard))
-});
-
-/// Get the shared daemon socket path.
+/// Each call starts a NEW daemon — no static, no sharing across tests.
+/// This ensures isolation under both nextest (each test in its own process)
+/// AND cargo test (all tests share a process). The previous LazyLock-based
+/// sharing caused test interdependence under cargo test: add_signatures
+/// mutates the daemon's db, and query_path_info then sees the mutation.
 ///
-/// This is the preferred entry point for tests. The daemon is started
-/// once and reused across all tests in the process.
-pub fn shared_daemon_socket() -> String {
-    SHARED_DAEMON.0.clone()
+/// The caller must bind the returned guard (`let (socket, _guard) = ...;`)
+/// to keep the daemon alive for the duration of the test.
+pub fn fresh_daemon_socket() -> (String, Option<DaemonGuard>) {
+    get_daemon_socket_inner()
 }
 
 /// Perform an interactive protocol exchange with the nix-daemon.
@@ -854,8 +849,7 @@ fn register_fixture_paths(state_dir: &std::path::Path) {
 /// `ca-derivations` is enabled). Respects `NIX_DAEMON_SOCKET` as an
 /// explicit override for CI environments that manage their own daemon.
 ///
-/// Prefer [`shared_daemon_socket`] for tests — it ensures only one daemon
-/// is started even when tests run in parallel.
+/// Called via [`fresh_daemon_socket`].
 fn get_daemon_socket_inner() -> (String, Option<DaemonGuard>) {
     if let Ok(s) = std::env::var("NIX_DAEMON_SOCKET") {
         if Path::new(&s).exists() {
