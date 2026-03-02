@@ -208,7 +208,7 @@ impl SchedulerService for MockScheduler {
         request: Request<types::SubmitBuildRequest>,
     ) -> Result<Response<Self::SubmitBuildStream>, Status> {
         let req = request.into_inner();
-        self.submit_calls.write().unwrap().push(req.clone());
+        self.submit_calls.write().unwrap().push(req);
 
         let outcome = self.outcome.read().unwrap().clone();
         if let Some(code) = outcome.submit_error {

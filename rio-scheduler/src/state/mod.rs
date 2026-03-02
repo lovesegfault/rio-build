@@ -50,8 +50,7 @@ impl DerivationStatus {
         // Idempotent no-ops
         if self == to {
             match self {
-                Self::Completed => return Ok(()),
-                Self::Poisoned => return Ok(()),
+                Self::Completed | Self::Poisoned => return Ok(()),
                 Self::DependencyFailed => return Ok(()),
                 _ => {
                     return Err(TransitionError::Invalid {
@@ -335,13 +334,9 @@ impl DerivationState {
     /// Create a new derivation state from a proto DerivationNode.
     pub fn from_node(node: &rio_proto::types::DerivationNode) -> Self {
         Self {
-            drv_hash: node.drv_hash.clone().into(),
+            drv_hash: node.drv_hash.as_str().into(),
             drv_path: node.drv_path.clone(),
-            pname: if node.pname.is_empty() {
-                None
-            } else {
-                Some(node.pname.clone())
-            },
+            pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
             system: node.system.clone(),
             required_features: node.required_features.clone(),
             output_names: node.output_names.clone(),

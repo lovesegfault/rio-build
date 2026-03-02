@@ -60,7 +60,7 @@ impl DagActor {
             priority_class,
             keep_going,
             options,
-            nodes.iter().map(|n| n.drv_hash.clone().into()).collect(),
+            nodes.iter().map(|n| n.drv_hash.as_str().into()).collect(),
         );
         self.builds.insert(build_id, build_info);
 
@@ -155,8 +155,7 @@ impl DagActor {
         let is_interactive = self
             .builds
             .get(&build_id)
-            .map(|b| b.priority_class.is_interactive())
-            .unwrap_or(false);
+            .is_some_and(|b| b.priority_class.is_interactive());
 
         // Track whether any newly inserted node was immediately marked
         // DependencyFailed (because a dep is already poisoned). If so, the
@@ -303,11 +302,7 @@ impl DagActor {
                 crate::db::DerivationRow {
                     drv_hash: node.drv_hash.clone(),
                     drv_path: node.drv_path.clone(),
-                    pname: if node.pname.is_empty() {
-                        None
-                    } else {
-                        Some(node.pname.clone())
-                    },
+                    pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
                     system: node.system.clone(),
                     status,
                     required_features: node.required_features.clone(),

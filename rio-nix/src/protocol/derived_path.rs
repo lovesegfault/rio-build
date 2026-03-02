@@ -173,7 +173,7 @@ mod tests {
                             &["out".to_string(), "dev".to_string()]
                         );
                     }
-                    _ => panic!("expected Names"),
+                    OutputSpec::All => panic!("expected Names"),
                 }
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
@@ -189,7 +189,7 @@ mod tests {
                 OutputSpec::Names(output_names) => {
                     assert_eq!(output_names.names(), &["out".to_string()]);
                 }
-                _ => panic!("expected Names"),
+                OutputSpec::All => panic!("expected Names"),
             },
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
@@ -253,7 +253,7 @@ mod tests {
                 // "out!extra" is treated as a single output name (with ! in it)
                 match &outputs {
                     OutputSpec::Names(names) => assert_eq!(names.names(), &["out!extra"]),
-                    _ => panic!("expected Names"),
+                    OutputSpec::All => panic!("expected Names"),
                 }
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn output_spec_names_rejects_empty_name() {
         assert!(matches!(
-            OutputSpec::names(vec!["".to_string()]),
+            OutputSpec::names(vec![String::new()]),
             Err(DerivedPathError::EmptyOutputName)
         ));
     }
@@ -294,7 +294,7 @@ mod tests {
                     &["out".to_string(), "dev".to_string()]
                 );
             }
-            _ => panic!("expected Names"),
+            OutputSpec::All => panic!("expected Names"),
         }
     }
 

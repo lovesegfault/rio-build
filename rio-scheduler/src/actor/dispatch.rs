@@ -66,7 +66,7 @@ impl DagActor {
             }
 
             // Re-queue deferred derivations at the front, preserving order.
-            for hash in deferred.drain(..).rev() {
+            for hash in std::mem::take(&mut deferred).into_iter().rev() {
                 self.ready_queue.push_front(hash);
             }
         }

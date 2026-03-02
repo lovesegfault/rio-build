@@ -121,7 +121,7 @@ impl SchedulerDb {
         let now_col = match status {
             BuildState::Active => "started_at",
             BuildState::Succeeded | BuildState::Failed | BuildState::Cancelled => "finished_at",
-            _ => "",
+            BuildState::Pending => "",
         };
 
         if now_col.is_empty() {

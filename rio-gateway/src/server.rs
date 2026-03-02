@@ -242,13 +242,10 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let command = match String::from_utf8(data.to_vec()) {
-            Ok(s) => s,
-            Err(_) => {
-                warn!(channel = ?channel_id, "rejecting exec request: command is not valid UTF-8");
-                session.channel_failure(channel_id)?;
-                return Ok(());
-            }
+        let Ok(command) = String::from_utf8(data.to_vec()) else {
+            warn!(channel = ?channel_id, "rejecting exec request: command is not valid UTF-8");
+            session.channel_failure(channel_id)?;
+            return Ok(());
         };
         info!(channel = ?channel_id, command = %command, "exec request");
 

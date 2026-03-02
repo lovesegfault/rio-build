@@ -9,7 +9,7 @@ impl DagActor {
 
     pub(super) fn handle_worker_connected(
         &mut self,
-        worker_id: WorkerId,
+        worker_id: &WorkerId,
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
     ) {
         info!(worker_id = %worker_id, "worker stream connected");
@@ -74,7 +74,7 @@ impl DagActor {
 
     pub(super) fn handle_heartbeat(
         &mut self,
-        worker_id: WorkerId,
+        worker_id: &WorkerId,
         system: String,
         supported_features: Vec<String>,
         max_builds: u32,

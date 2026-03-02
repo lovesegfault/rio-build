@@ -398,7 +398,6 @@ pub async fn execute_build(
             rio_nix::protocol::build::BuildStatus::TransientFailure => {
                 BuildResultStatus::TransientFailure
             }
-            rio_nix::protocol::build::BuildStatus::TimedOut => BuildResultStatus::PermanentFailure,
             _ => BuildResultStatus::PermanentFailure,
         };
 

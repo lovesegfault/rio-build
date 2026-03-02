@@ -51,8 +51,7 @@ impl PgServer {
 
     fn admin_url(&self) -> &str {
         match self {
-            Self::Ephemeral { admin_url, .. } => admin_url,
-            Self::External { admin_url } => admin_url,
+            Self::Ephemeral { admin_url, .. } | Self::External { admin_url } => admin_url,
         }
     }
 
@@ -263,8 +262,7 @@ fn pid_alive(pid: i32) -> bool {
     // Signal 0: probe existence without actually signalling.
     // ESRCH = no such process; EPERM = exists but not ours (still alive).
     match kill(Pid::from_raw(pid), None) {
-        Ok(_) => true,
-        Err(nix::errno::Errno::EPERM) => true,
+        Ok(_) | Err(nix::errno::Errno::EPERM) => true,
         Err(_) => false,
     }
 }
@@ -372,9 +370,8 @@ impl Drop for TestDb {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let admin_pool = match PgPool::connect(&admin_url).await {
-                    Ok(p) => p,
-                    Err(_) => return,
+                let Ok(admin_pool) = PgPool::connect(&admin_url).await else {
+                    return;
                 };
                 // Kick any lingering connections, then drop.
                 let _ = sqlx::query(&format!(
