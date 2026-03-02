@@ -602,6 +602,20 @@
           packages = {
             default = rio-workspace;
             fuzz-build = rio-fuzz-build; # debug: nix build .#fuzz-build
+
+            # HTML coverage report generated from the lcov tracefile.
+            # The lcov file embeds sandbox-local source paths; strip the
+            # build-dir prefix and run genhtml from the real source root
+            # so the report shows annotated code. View: `xdg-open result/index.html`.
+            coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
+              ${pkgs.lcov}/bin/lcov \
+                --substitute 's|^/nix/var/nix/builds/[^/]*/source/||' \
+                --extract ${cargoChecks.coverage} 'rio-*' \
+                --output-file $TMPDIR/cleaned.lcov
+              cd ${commonArgs.src}
+              ${pkgs.lcov}/bin/genhtml $TMPDIR/cleaned.lcov \
+                --output-directory $out
+            '';
           }
           # 10-minute nightly fuzz runs — NOT in checks, explicitly invoked
           # by the nightly pipeline. Shares rio-fuzz-build with the smoke
