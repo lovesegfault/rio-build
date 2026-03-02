@@ -12,37 +12,30 @@ use tracing::debug;
 
 use super::NarBackend;
 
-/// Inner state protected by `RwLock`.
-struct Inner {
-    blobs: HashMap<String, Bytes>,
-}
-
 /// In-memory NAR blob storage backend.
 ///
 /// Suitable for unit tests and development. Not for production use (no
 /// persistence, bounded by process memory).
 pub struct MemoryBackend {
-    inner: RwLock<Inner>,
+    inner: RwLock<HashMap<String, Bytes>>,
 }
 
 impl MemoryBackend {
     /// Create an empty in-memory backend.
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(Inner {
-                blobs: HashMap::new(),
-            }),
+            inner: RwLock::new(HashMap::new()),
         }
     }
 
-    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Bytes>> {
         self.inner.read().unwrap_or_else(|e| {
             tracing::warn!("MemoryBackend: recovering from poisoned read lock");
             e.into_inner()
         })
     }
 
-    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Bytes>> {
         self.inner.write().unwrap_or_else(|e| {
             tracing::warn!("MemoryBackend: recovering from poisoned write lock");
             e.into_inner()
@@ -54,7 +47,7 @@ impl MemoryBackend {
     /// GetPath's HashingReader integrity check fires DATA_LOSS.
     /// MemoryBackend is already test-only, so no cfg guard.
     pub fn corrupt_for_test(&self, key: &str, new_data: Bytes) {
-        self.write_inner().blobs.insert(key.to_string(), new_data);
+        self.write_inner().insert(key.to_string(), new_data);
     }
 }
 
@@ -69,23 +62,23 @@ impl NarBackend for MemoryBackend {
     async fn put(&self, sha256_hex: &str, data: Bytes) -> anyhow::Result<String> {
         let key = format!("{sha256_hex}.nar");
         debug!(key = %key, size = data.len(), "MemoryBackend: storing NAR blob");
-        self.write_inner().blobs.insert(key.clone(), data);
+        self.write_inner().insert(key.clone(), data);
         Ok(key)
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<Box<dyn AsyncRead + Send + Unpin>>> {
-        let data = self.read_inner().blobs.get(key).cloned();
+        let data = self.read_inner().get(key).cloned();
         Ok(data.map(|b| Box::new(std::io::Cursor::new(b)) as Box<dyn AsyncRead + Send + Unpin>))
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
         debug!(key = %key, "MemoryBackend: deleting NAR blob");
-        self.write_inner().blobs.remove(key);
+        self.write_inner().remove(key);
         Ok(())
     }
 
     async fn exists(&self, key: &str) -> anyhow::Result<bool> {
-        Ok(self.read_inner().blobs.contains_key(key))
+        Ok(self.read_inner().contains_key(key))
     }
 }
 

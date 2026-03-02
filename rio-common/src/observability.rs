@@ -95,3 +95,9 @@ pub fn log_format_from_env() -> LogFormat {
         Err(_) => LogFormat::default(),
     }
 }
+
+/// Initialize logging from `RIO_LOG_FORMAT` env var (default: JSON).
+/// Convenience wrapper for `init_logging(log_format_from_env(), None)`.
+pub fn init_from_env() -> anyhow::Result<()> {
+    init_logging(log_format_from_env(), None)
+}
