@@ -9,9 +9,6 @@
 //! - Client reads the STDERR loop (log messages, activities, errors)
 //! - Client sends opcodes and reads results
 
-use super::build::{
-    BuildMode, BuildResult, BuildStatus, read_build_result, write_basic_derivation,
-};
 use super::handshake::{
     HandshakeError, HandshakeResult, PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2,
 };
@@ -21,7 +18,6 @@ use super::stderr::{
     STDERR_START_ACTIVITY, STDERR_STOP_ACTIVITY, STDERR_WRITE, StderrError,
 };
 use super::wire::{self, WireError};
-use crate::derivation::BasicDerivation;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// A message received from the daemon during the STDERR loop.
@@ -313,75 +309,6 @@ pub async fn client_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     drain_stderr(reader).await?;
 
     Ok(())
-}
-
-/// Send `wopBuildDerivation` to the local daemon and collect the result.
-///
-/// The caller should process STDERR messages (forwarding logs to the
-/// remote client) by calling `read_stderr_message` in a loop. This
-/// function is a convenience that drains STDERR and returns only the
-/// `BuildResult`.
-///
-/// For log forwarding, use the lower-level `send_build_derivation` +
-/// `read_stderr_message` loop instead.
-pub async fn client_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    reader: &mut R,
-    writer: &mut W,
-    drv_path: &str,
-    basic_drv: &BasicDerivation,
-    build_mode: BuildMode,
-) -> Result<BuildResult, WireError> {
-    // Send opcode
-    wire::write_u64(writer, WorkerOp::BuildDerivation as u64).await?;
-    wire::write_string(writer, drv_path).await?;
-
-    // Send BasicDerivation
-    write_basic_derivation(writer, basic_drv).await?;
-
-    // Send buildMode
-    wire::write_u64(writer, build_mode as u64).await?;
-    writer.flush().await?;
-
-    // Read STDERR loop until STDERR_LAST (bounded to prevent infinite loops)
-    const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
-    let mut msg_count: u64 = 0;
-    loop {
-        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
-            return Err(WireError::Io(std::io::Error::other(
-                "exceeded maximum STDERR messages during build",
-            )));
-        }
-        msg_count += 1;
-        match read_stderr_message(reader).await? {
-            StderrMessage::Last => break,
-            StderrMessage::Error(e) => {
-                return Ok(BuildResult::failure(
-                    BuildStatus::MiscFailure,
-                    e.message().to_string(),
-                ));
-            }
-            StderrMessage::Next(msg) => {
-                tracing::debug!(target: "nix-daemon", "{}", msg);
-            }
-            StderrMessage::Read(_) => {
-                return Ok(BuildResult::failure(
-                    BuildStatus::MiscFailure,
-                    "daemon sent STDERR_READ, not supported for build forwarding".to_string(),
-                ));
-            }
-            StderrMessage::Write(data) => {
-                tracing::debug!(
-                    target: "nix-daemon",
-                    len = data.len(),
-                    "discarding STDERR_WRITE data during build"
-                );
-            }
-            _ => {} // discard activity messages
-        }
-    }
-
-    // Read BuildResult
-    read_build_result(reader).await
 }
 
 #[cfg(test)]

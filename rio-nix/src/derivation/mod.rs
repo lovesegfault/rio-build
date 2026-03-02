@@ -118,7 +118,7 @@ impl DerivationOutput {
 /// A full Nix derivation parsed from a `.drv` file.
 ///
 /// Contains `input_drvs` (dependency DAG edges) which are NOT present in the
-/// wire format's `BasicDerivation`. Use [`Derivation::to_basic`] to strip them.
+/// wire format's `BasicDerivation`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derivation {
     /// Output definitions.
@@ -141,6 +141,7 @@ impl Derivation {
     /// Convert to a `BasicDerivation` by stripping `input_drvs`.
     ///
     /// Cannot fail since a valid `Derivation` always has at least one output.
+    #[cfg(test)]
     pub fn to_basic(&self) -> BasicDerivation {
         BasicDerivation::new(
             self.outputs.clone(),
