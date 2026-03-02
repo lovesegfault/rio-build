@@ -10,12 +10,12 @@ pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrati
 
 /// Set up an actor with the given PgPool and return (handle, task).
 /// The caller should drop the handle to shut down the actor.
-pub(crate) async fn setup_actor(pool: sqlx::PgPool) -> (ActorHandle, tokio::task::JoinHandle<()>) {
-    setup_actor_with_store(pool, None).await
+pub(crate) fn setup_actor(pool: sqlx::PgPool) -> (ActorHandle, tokio::task::JoinHandle<()>) {
+    setup_actor_with_store(pool, None)
 }
 
 /// Set up an actor with an optional store client for cache-check tests.
-pub(crate) async fn setup_actor_with_store(
+pub(crate) fn setup_actor_with_store(
     pool: sqlx::PgPool,
     store_client: Option<StoreServiceClient<Channel>>,
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
@@ -245,7 +245,7 @@ pub(crate) async fn settle() {
 #[tokio::test]
 async fn test_actor_starts_and_stops() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, task) = setup_actor(db.pool.clone()).await;
+    let (handle, task) = setup_actor(db.pool.clone());
     settle().await;
     // Query should succeed (actor is running)
     let workers = handle.debug_query_workers().await.unwrap();
@@ -263,7 +263,7 @@ async fn test_actor_starts_and_stops() {
 #[tokio::test]
 async fn test_actor_is_alive_detection() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, task) = setup_actor(db.pool.clone()).await;
+    let (handle, task) = setup_actor(db.pool.clone());
     settle().await;
 
     // Actor should be alive after spawn.

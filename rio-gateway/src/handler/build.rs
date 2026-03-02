@@ -477,7 +477,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     Err(e) => {
                         opaque_results.insert(
                             idx,
-                            BuildResult::failure(BuildStatus::MiscFailure, format!("{e}")),
+                            BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
                         );
                         drv_indices.push(None);
                         continue;
@@ -494,7 +494,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     Err(e) => {
                         opaque_results.insert(
                             idx,
-                            BuildResult::failure(BuildStatus::MiscFailure, format!("{e}")),
+                            BuildResult::failure(BuildStatus::MiscFailure, e.to_string()),
                         );
                         drv_indices.push(None);
                     }

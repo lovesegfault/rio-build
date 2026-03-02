@@ -81,7 +81,7 @@ impl DagActor {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, worker_id)
                     .await;
             }
-            _ => {
+            rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
                     drv_hash,
                     status = result.status,
@@ -284,7 +284,7 @@ impl DagActor {
         };
 
         if should_retry {
-            let retry_count = self.dag.node(drv_hash).map(|s| s.retry_count).unwrap_or(0);
+            let retry_count = self.dag.node(drv_hash).map_or(0, |s| s.retry_count);
 
             // Schedule retry with backoff
             let backoff = self.retry_policy.backoff_duration(retry_count);

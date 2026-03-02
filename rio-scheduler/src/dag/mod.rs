@@ -115,7 +115,7 @@ impl DerivationDag {
 
         // Insert or update nodes
         for node in nodes {
-            let drv_hash: DrvHash = node.drv_hash.clone().into();
+            let drv_hash: DrvHash = node.drv_hash.as_str().into();
 
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
@@ -489,8 +489,7 @@ impl DerivationDag {
             summary.total += 1;
             match state.status() {
                 DerivationStatus::Completed => summary.completed += 1,
-                DerivationStatus::Running => summary.running += 1,
-                DerivationStatus::Assigned => summary.running += 1,
+                DerivationStatus::Running | DerivationStatus::Assigned => summary.running += 1,
                 DerivationStatus::Failed
                 | DerivationStatus::Poisoned
                 | DerivationStatus::DependencyFailed => summary.failed += 1,

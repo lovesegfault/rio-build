@@ -630,9 +630,7 @@ mod tests {
             ) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
-                    let pairs: Vec<(String, String)> = pairs.into_iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect();
+                    let pairs: Vec<(String, String)> = pairs;
                     let mut buf = Vec::new();
                     write_string_pairs(&mut buf, &pairs).await.unwrap();
                     let mut reader = Cursor::new(buf);

@@ -604,7 +604,7 @@ mod tests {
         // Fetch; the other should WaitFor and be woken promptly (not after
         // the old 1.4s backoff).
         let (c1, f1) = (cache.clone(), fetch_count.clone());
-        let (c2, f2) = (cache.clone(), fetch_count.clone());
+        let (c2, f2) = (cache, fetch_count.clone());
 
         let t1 = std::thread::spawn(move || do_claim(&c1, &f1));
         let t2 = std::thread::spawn(move || do_claim(&c2, &f2));

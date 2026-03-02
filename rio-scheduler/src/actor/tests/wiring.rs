@@ -10,7 +10,7 @@ use super::*;
 #[tokio::test]
 async fn test_worker_registers_via_stream_and_heartbeat() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
 
     let _stream_rx = connect_worker(&handle, "test-worker-1", "x86_64-linux", 2).await;
     settle().await;
@@ -34,7 +34,7 @@ async fn test_worker_registers_via_stream_and_heartbeat() {
 #[tokio::test]
 async fn test_completion_resolves_drv_path_to_hash() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
 
     // Register a worker
     let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
@@ -86,7 +86,7 @@ async fn test_completion_resolves_drv_path_to_hash() {
 #[tokio::test]
 async fn test_worker_disconnect_running_derivation() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
 
     // Register a worker
     let mut stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
@@ -173,7 +173,7 @@ async fn test_worker_disconnect_running_derivation() {
 #[tokio::test]
 async fn test_completion_infrastructure_failure_handled() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
 
     let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
 
@@ -232,7 +232,7 @@ async fn test_completion_infrastructure_failure_handled() {
 #[tokio::test]
 async fn test_completion_with_extreme_timestamps() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
 
     let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
 
@@ -296,7 +296,7 @@ async fn test_completion_with_extreme_timestamps() {
 #[tokio::test]
 async fn test_interactive_builds_pushed_to_front() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
 
     // Worker with capacity for 1 build at a time
     let mut stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;

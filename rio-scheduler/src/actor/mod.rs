@@ -317,7 +317,7 @@ impl DagActor {
                     worker_id,
                     stream_tx,
                 } => {
-                    self.handle_worker_connected(worker_id, stream_tx);
+                    self.handle_worker_connected(&worker_id, stream_tx);
                 }
                 ActorCommand::WorkerDisconnected { worker_id } => {
                     self.handle_worker_disconnected(&worker_id).await;
@@ -330,7 +330,7 @@ impl DagActor {
                     running_builds,
                 } => {
                     self.handle_heartbeat(
-                        worker_id,
+                        &worker_id,
                         system,
                         supported_features,
                         max_builds,
@@ -468,8 +468,7 @@ impl DagActor {
         self.get_interested_builds(drv_hash).iter().any(|build_id| {
             self.builds
                 .get(build_id)
-                .map(|b| b.priority_class.is_interactive())
-                .unwrap_or(false)
+                .is_some_and(|b| b.priority_class.is_interactive())
         })
     }
 

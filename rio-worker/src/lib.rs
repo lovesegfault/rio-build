@@ -52,7 +52,7 @@ pub async fn build_heartbeat_request(
     worker_id: &str,
     system: &str,
     max_builds: u32,
-    running: &Arc<RwLock<HashSet<String>>>,
+    running: &RwLock<HashSet<String>>,
 ) -> HeartbeatRequest {
     let current: Vec<String> = running.read().await.iter().cloned().collect();
     HeartbeatRequest {
@@ -129,7 +129,7 @@ pub async fn spawn_build_task(
         // Remove from running_builds on task exit (success, failure, or panic)
         let _running_guard = scopeguard::guard((), move |()| {
             let rb = build_running.clone();
-            let drv = build_drv_path.clone();
+            let drv = build_drv_path;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     rb.write().await.remove(&drv);
@@ -164,7 +164,7 @@ pub async fn spawn_build_task(
                     drv_path,
                     result: Some(rio_proto::types::BuildResult {
                         status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-                        error_msg: format!("{e}"),
+                        error_msg: e.to_string(),
                         ..Default::default()
                     }),
                     assignment_token,

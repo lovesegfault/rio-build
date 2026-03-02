@@ -133,13 +133,10 @@ pub(super) async fn fetch_drv_from_store(
     .await
     .map_err(|e| ExecutorError::BuildFailed(format!("GetPath({drv_path}): {e}")))?;
 
-    let nar_data = match result {
-        Some((_, nar)) => nar,
-        None => {
-            return Err(ExecutorError::BuildFailed(format!(
-                ".drv not found in store: {drv_path}"
-            )));
-        }
+    let Some((_, nar_data)) = result else {
+        return Err(ExecutorError::BuildFailed(format!(
+            ".drv not found in store: {drv_path}"
+        )));
     };
 
     Derivation::parse_from_nar(&nar_data)
@@ -178,8 +175,8 @@ pub(super) async fn compute_input_closure(
     // buffer_unordered. Layer count is typically 5-15 (dep depth).
     while !frontier.is_empty() {
         // Dedupe against closure BEFORE issuing RPCs.
-        let batch: Vec<String> = frontier
-            .drain(..)
+        let batch: Vec<String> = std::mem::take(&mut frontier)
+            .into_iter()
             .filter(|p| !closure.contains(p))
             .collect::<HashSet<_>>()
             .into_iter()

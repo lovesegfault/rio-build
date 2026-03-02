@@ -165,7 +165,7 @@ mod tests {
         let root = PathBuf::from("/nix/store");
         let mut map = InodeMap::new(root);
         let p = PathBuf::from("/nix/store/abc-hello");
-        let ino = map.get_or_create(p.clone());
+        let ino = map.get_or_create(p);
         map.increment_lookup(ino);
         map.increment_lookup(ino);
         // nlookup = 2; forget(1) -> nlookup = 1, not removed

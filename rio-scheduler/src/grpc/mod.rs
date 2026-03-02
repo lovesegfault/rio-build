@@ -332,7 +332,7 @@ impl WorkerService for SchedulerGrpc {
         // Register the worker stream with the actor (blocking send — must not drop).
         self.actor
             .send_unchecked(ActorCommand::WorkerConnected {
-                worker_id: worker_id.clone().into(),
+                worker_id: worker_id.as_str().into(),
                 stream_tx: actor_tx,
             })
             .await

@@ -228,16 +228,13 @@ impl StoreService for StoreServiceImpl {
         // nar_size is already bounded by MAX_NAR_SIZE (4 GiB) above, which
         // fits in usize on 64-bit. try_from is defensive for 32-bit platforms
         // where MAX_NAR_SIZE (4_294_967_296) exceeds u32::MAX (4_294_967_295).
-        let capacity = match usize::try_from(info.nar_size) {
-            Ok(c) => c,
-            Err(_) => {
-                // Practically unreachable on 64-bit (MAX_NAR_SIZE check above),
-                // but clean up defensively.
-                self.abort_upload(&store_path_hash).await;
-                return Err(Status::invalid_argument(
-                    "nar_size too large for this platform",
-                ));
-            }
+        let Ok(capacity) = usize::try_from(info.nar_size) else {
+            // Practically unreachable on 64-bit (MAX_NAR_SIZE check above),
+            // but clean up defensively.
+            self.abort_upload(&store_path_hash).await;
+            return Err(Status::invalid_argument(
+                "nar_size too large for this platform",
+            ));
         };
         let mut nar_data = Vec::with_capacity(capacity);
         loop {

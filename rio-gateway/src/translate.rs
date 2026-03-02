@@ -248,7 +248,7 @@ mod tests {
 
     /// Spin up a mock store that fails all RPCs (lazy connect to dead port).
     /// Used to verify reconstruct_dag fails hard on unresolvable inputDrvs.
-    async fn unreachable_store() -> StoreServiceClient<tonic::transport::Channel> {
+    fn unreachable_store() -> StoreServiceClient<tonic::transport::Channel> {
         // Lazy channel to a dead port — any RPC will fail.
         let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
         StoreServiceClient::new(channel)
@@ -281,7 +281,7 @@ mod tests {
         let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
         let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[]);
 
-        let mut store = unreachable_store().await;
+        let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
         let (nodes, edges) = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache)
@@ -305,7 +305,7 @@ mod tests {
         );
         let child_drv = make_test_derivation("/nix/store/bbb-child-out", &[]);
 
-        let mut store = unreachable_store().await;
+        let mut store = unreachable_store();
         // Pre-populate cache so resolve_derivation finds the child without gRPC.
         let mut cache = HashMap::new();
         cache.insert(child_path.clone(), child_drv);
@@ -337,7 +337,7 @@ mod tests {
         let root_drv =
             make_test_derivation("/nix/store/aaa-root-out", &[(missing_child, &["out"])]);
 
-        let mut store = unreachable_store().await;
+        let mut store = unreachable_store();
         let mut cache = HashMap::new(); // child NOT in cache
 
         let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
@@ -366,7 +366,7 @@ mod tests {
 
         let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[(bogus_child, &["out"])]);
 
-        let mut store = unreachable_store().await;
+        let mut store = unreachable_store();
         let mut cache = HashMap::new();
 
         let result = reconstruct_dag(&root_path, &root_drv, &mut store, &mut cache).await;
@@ -394,7 +394,7 @@ mod tests {
         let b_drv = make_test_derivation("/nix/store/bbb-out", &[(c_path.as_str(), &["out"])]);
         let c_drv = make_test_derivation("/nix/store/ccc-out", &[]);
 
-        let mut store = unreachable_store().await;
+        let mut store = unreachable_store();
         let mut cache = HashMap::new();
         cache.insert(b_path.clone(), b_drv);
         cache.insert(c_path.clone(), c_drv);

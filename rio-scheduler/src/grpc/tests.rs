@@ -18,7 +18,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_build_execution_stream_end_to_end() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _actor_task) = setup_actor(db.pool.clone()).await;
+    let (handle, _actor_task) = setup_actor(db.pool.clone());
 
     // Spin up in-process gRPC server (SchedulerService + WorkerService).
     let grpc = SchedulerGrpc::new(handle.clone());
@@ -82,7 +82,7 @@ async fn test_build_execution_stream_end_to_end() {
 
     // Submit a build via SchedulerService.
     let submit_req = rio_proto::types::SubmitBuildRequest {
-        tenant_id: "".into(),
+        tenant_id: String::new(),
         priority_class: "scheduled".into(),
         nodes: vec![make_test_node(
             "e2e-hash",
@@ -121,7 +121,7 @@ async fn test_build_execution_stream_end_to_end() {
                     drv_path: work.drv_path.clone(),
                     result: Some(rio_proto::types::BuildResult {
                         status: rio_proto::types::BuildResultStatus::Built.into(),
-                        error_msg: "".into(),
+                        error_msg: String::new(),
                         times_built: 1,
                         start_time: None,
                         stop_time: None,
@@ -166,7 +166,7 @@ async fn test_build_execution_stream_end_to_end() {
 #[tokio::test]
 async fn test_submit_build_rejects_empty_drv_hash() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
@@ -193,7 +193,7 @@ async fn test_submit_build_rejects_empty_drv_hash() {
 #[tokio::test]
 async fn test_submit_build_rejects_empty_drv_path() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
@@ -216,7 +216,7 @@ async fn test_submit_build_rejects_empty_drv_path() {
 #[tokio::test]
 async fn test_submit_build_rejects_empty_system() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
@@ -245,7 +245,7 @@ async fn test_submit_build_rejects_empty_system() {
 #[tokio::test]
 async fn test_submit_build_rejects_invalid_priority_class() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
@@ -271,7 +271,7 @@ async fn test_submit_build_rejects_invalid_priority_class() {
 #[tokio::test]
 async fn test_submit_build_rejects_invalid_tenant_id() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
@@ -297,7 +297,7 @@ async fn test_submit_build_rejects_invalid_tenant_id() {
 #[tokio::test]
 async fn test_submit_build_rejects_too_many_edges() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     // Construct MAX_DAG_EDGES+1 edges. Content doesn't matter — rejection
@@ -332,7 +332,7 @@ async fn test_submit_build_rejects_too_many_edges() {
 #[tokio::test]
 async fn test_heartbeat_rejects_too_many_running_builds() {
     let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone()).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
     let too_many: Vec<String> = (0..1001).map(|i| format!("/nix/store/{i}.drv")).collect();
