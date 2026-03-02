@@ -81,3 +81,96 @@ pub async fn drain_stderr_expecting_error(s: &mut DuplexStream) -> StderrError {
         }
     }
 }
+
+/// Build a `Vec<u8>` by sequentially writing Nix wire primitives.
+/// Each `kind: value` pair expands to `wire::write_<kind>(&mut buf, value).await.unwrap();`.
+/// Must be called from async context.
+///
+/// # Kinds
+/// - `u64: n` — `write_u64`
+/// - `string: s` — `write_string`
+/// - `strings: slice` — `write_strings`
+/// - `bool: b` — `write_bool`
+/// - `bytes: slice` — `write_bytes`
+/// - `framed: slice` — `write_framed_stream` (8 KiB chunks, 0-terminated)
+/// - `raw: slice` — `extend_from_slice` (only valid for `Vec<u8>` sinks)
+///
+/// # Example
+/// ```ignore
+/// let buf = wire_bytes![u64: 39, string: "/nix/store/...", bool: true];
+/// ```
+#[macro_export]
+macro_rules! wire_bytes {
+    ($( $kind:ident : $val:expr ),* $(,)?) => {{
+        #[allow(unused_mut)]
+        let mut __buf: Vec<u8> = Vec::new();
+        $( $crate::wire_bytes!(@write (&mut __buf), $kind, $val); )*
+        __buf
+    }};
+    (@write $buf:expr, u64, $v:expr) => {
+        ::rio_nix::protocol::wire::write_u64($buf, $v).await.unwrap()
+    };
+    (@write $buf:expr, string, $v:expr) => {
+        ::rio_nix::protocol::wire::write_string($buf, $v).await.unwrap()
+    };
+    (@write $buf:expr, strings, $v:expr) => {
+        ::rio_nix::protocol::wire::write_strings($buf, $v).await.unwrap()
+    };
+    (@write $buf:expr, bool, $v:expr) => {
+        ::rio_nix::protocol::wire::write_bool($buf, $v).await.unwrap()
+    };
+    (@write $buf:expr, bytes, $v:expr) => {
+        ::rio_nix::protocol::wire::write_bytes($buf, $v).await.unwrap()
+    };
+    (@write $buf:expr, framed, $v:expr) => {
+        ::rio_nix::protocol::wire::write_framed_stream($buf, $v, 8192).await.unwrap()
+    };
+    (@write $buf:expr, raw, $v:expr) => {
+        { let __b: &mut Vec<u8> = $buf; __b.extend_from_slice($v); }
+    };
+}
+
+/// Write wire primitives directly to a stream (e.g., `&mut h.stream`),
+/// then flush. The `raw:` kind is NOT supported — use `wire_bytes!` for
+/// building intermediate `Vec<u8>` buffers with raw payloads.
+///
+/// # Example
+/// ```ignore
+/// wire_send!(&mut h.stream; u64: 39, string: path, bool: true);
+/// ```
+#[macro_export]
+macro_rules! wire_send {
+    ($stream:expr; $( $kind:ident : $val:expr ),* $(,)?) => {{
+        let __s = $stream;
+        $( $crate::wire_bytes!(@write __s, $kind, $val); )*
+        ::tokio::io::AsyncWriteExt::flush(__s).await.unwrap();
+    }};
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn wire_bytes_macro_roundtrip() {
+        use rio_nix::protocol::wire;
+        let buf = crate::wire_bytes![
+            u64: 42,
+            string: "hello",
+            bool: true,
+            strings: &["a", "b"],
+            bytes: b"raw",
+            raw: b"extra",
+        ];
+        let mut cur = std::io::Cursor::new(buf);
+        assert_eq!(wire::read_u64(&mut cur).await.unwrap(), 42);
+        assert_eq!(wire::read_string(&mut cur).await.unwrap(), "hello");
+        assert!(wire::read_bool(&mut cur).await.unwrap());
+        assert_eq!(wire::read_strings(&mut cur).await.unwrap(), vec!["a", "b"]);
+        assert_eq!(wire::read_bytes(&mut cur).await.unwrap(), b"raw");
+        // raw: bytes are appended verbatim (no length prefix)
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut cur, &mut rest)
+            .await
+            .unwrap();
+        assert_eq!(rest, b"extra");
+    }
+}
