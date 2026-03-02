@@ -142,14 +142,8 @@ pub(super) async fn fetch_drv_from_store(
         }
     };
 
-    let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
-        .map_err(|e| ExecutorError::BuildFailed(format!("failed to extract .drv from NAR: {e}")))?;
-
-    let drv_text = String::from_utf8(drv_bytes)
-        .map_err(|e| ExecutorError::BuildFailed(format!(".drv is not valid UTF-8: {e}")))?;
-
-    Derivation::parse(&drv_text)
-        .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))
+    Derivation::parse_from_nar(&nar_data)
+        .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse .drv from NAR: {e}")))
 }
 
 /// Compute the input closure for a derivation by querying the store.

@@ -46,6 +46,12 @@ pub enum DerivationError {
 
     #[error("derivation graph too deep at '{0}' (max {MAX_HASH_RECURSION_DEPTH} levels)")]
     RecursionLimitExceeded(String),
+
+    #[error("NAR extraction failed: {0}")]
+    NarExtract(String),
+
+    #[error("derivation content is not valid UTF-8: {0}")]
+    InvalidUtf8(String),
 }
 
 /// Maximum recursion depth for `hash_derivation_modulo` (DoS prevention).
@@ -152,6 +158,17 @@ impl Derivation {
             self.env.clone(),
         )
         .expect("Derivation always has outputs")
+    }
+
+    /// Parse a derivation from NAR bytes containing a single `.drv` file.
+    ///
+    /// Equivalent to: `extract_single_file(nar)` → UTF-8 decode → [`Derivation::parse`].
+    pub fn parse_from_nar(nar_data: &[u8]) -> Result<Self, DerivationError> {
+        let drv_bytes = crate::nar::extract_single_file(nar_data)
+            .map_err(|e| DerivationError::NarExtract(e.to_string()))?;
+        let drv_text = String::from_utf8(drv_bytes)
+            .map_err(|e| DerivationError::InvalidUtf8(e.to_string()))?;
+        Self::parse(&drv_text)
     }
 
     /// The derivation outputs.

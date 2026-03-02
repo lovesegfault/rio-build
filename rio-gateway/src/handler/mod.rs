@@ -280,27 +280,13 @@ fn try_cache_drv(
     if !path.is_derivation() {
         return;
     }
-    let drv_bytes = match rio_nix::nar::extract_single_file(nar_data) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(path = %path, error = %e, "failed to extract .drv from NAR");
-            return;
-        }
-    };
-    let drv_text = match String::from_utf8(drv_bytes) {
-        Ok(text) => text,
-        Err(e) => {
-            warn!(path = %path, error = %e, "failed to decode .drv as UTF-8");
-            return;
-        }
-    };
-    match Derivation::parse(&drv_text) {
+    match Derivation::parse_from_nar(nar_data) {
         Ok(drv) => {
             debug!(path = %path, "cached parsed derivation");
             drv_cache.insert(path.clone(), drv);
         }
         Err(e) => {
-            warn!(path = %path, error = %e, "failed to parse .drv ATerm");
+            warn!(path = %path, error = %e, "failed to parse .drv from NAR");
         }
     }
 }
@@ -320,13 +306,7 @@ pub(crate) async fn resolve_derivation(
         .await?
         .ok_or_else(|| anyhow::anyhow!("derivation '{}' not found in store", drv_path))?;
 
-    let drv_bytes = rio_nix::nar::extract_single_file(&nar_data)
-        .map_err(|e| anyhow::anyhow!("failed to extract .drv '{}' from NAR: {e}", drv_path))?;
-
-    let drv_text = String::from_utf8(drv_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid UTF-8 in .drv '{}': {e}", drv_path))?;
-
-    let drv = Derivation::parse(&drv_text)
+    let drv = Derivation::parse_from_nar(&nar_data)
         .map_err(|e| anyhow::anyhow!("failed to parse .drv '{}': {e}", drv_path))?;
 
     drv_cache.insert(drv_path.clone(), drv.clone());
