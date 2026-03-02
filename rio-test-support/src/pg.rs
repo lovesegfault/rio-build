@@ -316,7 +316,7 @@ fn replace_db_name(url: &str, new_db: &str) -> String {
 
 /// Per-test isolated database handle.
 ///
-/// Each instance creates a fresh database on the shared [`PgServer`], runs the
+/// Each instance creates a fresh database on the shared server, runs the
 /// provided migrations, and drops the database on `Drop`.
 ///
 /// # Panics
