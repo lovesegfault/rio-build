@@ -454,71 +454,72 @@ mod tests {
 
     /// Cache sync methods use `block_on`, so tests create the cache in async
     /// context then exercise the sync methods via `spawn_blocking`.
-    async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> Arc<Cache> {
-        Arc::new(Cache::new(cache_dir, max_size_gb).await.unwrap())
+    async fn make_cache(cache_dir: PathBuf, max_size_gb: u64) -> anyhow::Result<Arc<Cache>> {
+        Ok(Arc::new(Cache::new(cache_dir, max_size_gb).await?))
     }
 
     #[tokio::test]
-    async fn test_cache_new_creates_dir_and_db() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_cache_new_creates_dir_and_db() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let cache_dir = dir.path().join("cache");
 
-        let cache = make_cache(cache_dir.clone(), 1).await;
+        let cache = make_cache(cache_dir.clone(), 1).await?;
         assert!(cache_dir.exists());
         assert!(cache_dir.join("cache_index.sqlite").exists());
 
-        let size = tokio::task::spawn_blocking(move || cache.total_size().unwrap())
-            .await
-            .unwrap();
+        let size = tokio::task::spawn_blocking(move || cache.total_size()).await??;
         assert_eq!(size, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_cache_insert_and_contains() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = make_cache(dir.path().join("cache"), 1).await;
+    async fn test_cache_insert_and_contains() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
 
-        tokio::task::spawn_blocking(move || {
-            assert!(!cache.contains("abc-hello-1.0").unwrap());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            assert!(!cache.contains("abc-hello-1.0")?);
 
-            cache.insert("abc-hello-1.0", 1024).unwrap();
-            assert!(cache.contains("abc-hello-1.0").unwrap());
-            assert_eq!(cache.total_size().unwrap(), 1024);
+            cache.insert("abc-hello-1.0", 1024)?;
+            assert!(cache.contains("abc-hello-1.0")?);
+            assert_eq!(cache.total_size()?, 1024);
+            Ok(())
         })
-        .await
-        .unwrap();
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_cache_get_path() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_cache_get_path() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let cache_dir = dir.path().join("cache");
-        let cache = make_cache(cache_dir.clone(), 1).await;
+        let cache = make_cache(cache_dir.clone(), 1).await?;
 
-        tokio::task::spawn_blocking(move || {
-            assert!(cache.get_path("abc-hello-1.0").unwrap().is_none());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            assert!(cache.get_path("abc-hello-1.0")?.is_none());
 
-            cache.insert("abc-hello-1.0", 512).unwrap();
-            let path = cache.get_path("abc-hello-1.0").unwrap().unwrap();
+            cache.insert("abc-hello-1.0", 512)?;
+            let path = cache.get_path("abc-hello-1.0")?.expect("just inserted");
             assert_eq!(path, cache_dir.join("abc-hello-1.0"));
+            Ok(())
         })
-        .await
-        .unwrap();
+        .await??;
+        Ok(())
     }
 
     /// get_and_touch must update last_access in a single DB roundtrip.
     #[tokio::test]
-    async fn test_get_and_touch_updates_last_access() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = make_cache(dir.path().join("cache"), 1).await;
+    async fn test_get_and_touch_updates_last_access() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
         let pool = cache.pool.clone();
 
-        tokio::task::spawn_blocking(move || {
-            cache.insert("touch-path", 100).unwrap();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            cache.insert("touch-path", 100)?;
             // Wait 1s so last_access changes detectably.
             std::thread::sleep(std::time::Duration::from_millis(1100));
 
-            let found = cache.get_and_touch("touch-path").unwrap();
+            let found = cache.get_and_touch("touch-path")?;
             assert!(found, "inserted path should be found");
 
             // Verify last_access was updated (should be >= now - 1s).
@@ -527,8 +528,7 @@ mod tests {
                     .bind("touch-path")
                     .fetch_one(&pool)
                     .await
-                    .unwrap()
-            });
+            })?;
             let now = super::unix_now();
             assert!(
                 (now - last_access).abs() <= 1,
@@ -537,19 +537,20 @@ mod tests {
             );
 
             // Nonexistent path: returns false, no error.
-            assert!(!cache.get_and_touch("no-such-path").unwrap());
+            assert!(!cache.get_and_touch("no-such-path")?);
+            Ok(())
         })
-        .await
-        .unwrap();
+        .await??;
+        Ok(())
     }
 
     /// DB errors from contains()/get_path() must propagate, not be treated
     /// as "not cached". Otherwise a SQLite hiccup would trigger re-fetches
     /// for every FUSE op, saturating store bandwidth and masking root cause.
     #[tokio::test]
-    async fn test_cache_db_error_propagates() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = make_cache(dir.path().join("cache"), 1).await;
+    async fn test_cache_db_error_propagates() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
 
         // Close the pool to force DB errors on all subsequent queries.
         let pool = cache.pool.clone();
@@ -586,13 +587,18 @@ mod tests {
                 "evict_if_needed() on closed pool should return Err, got {result:?}"
             );
         })
-        .await
-        .unwrap();
+        .await?;
+        Ok(())
     }
 
     /// Insert a row with an explicit last_access (bypasses insert()'s `now`).
     /// Tests use this to create "old" entries that are eviction-eligible.
-    fn raw_insert(cache: &Cache, store_path: &str, size_bytes: i64, last_access: i64) {
+    fn raw_insert(
+        cache: &Cache,
+        store_path: &str,
+        size_bytes: i64,
+        last_access: i64,
+    ) -> anyhow::Result<()> {
         let pool = cache.pool.clone();
         cache.runtime.block_on(async {
             sqlx::query(
@@ -603,27 +609,28 @@ mod tests {
             .bind(size_bytes)
             .bind(last_access)
             .execute(&pool)
-            .await
-            .unwrap();
-        });
+            .await?;
+            anyhow::Ok(())
+        })
     }
 
     #[tokio::test]
-    async fn test_cache_eviction() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_cache_eviction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         // 0 GB max to force eviction
-        let cache = make_cache(dir.path().join("cache"), 0).await;
+        let cache = make_cache(dir.path().join("cache"), 0).await?;
 
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // last_access = 1 (ancient) — well outside the grace window.
-            raw_insert(&cache, "old-path", 100, 1);
-            raw_insert(&cache, "new-path", 200, 2);
+            raw_insert(&cache, "old-path", 100, 1)?;
+            raw_insert(&cache, "new-path", 200, 2)?;
 
-            let freed = cache.evict_if_needed().unwrap();
+            let freed = cache.evict_if_needed()?;
             assert!(freed > 0);
+            Ok(())
         })
-        .await
-        .unwrap();
+        .await??;
+        Ok(())
     }
 
     /// The TOCTOU fix: an entry touched within the grace window must NOT be
@@ -632,36 +639,33 @@ mod tests {
     /// path that `evict_if_needed()` (running concurrently on another FUSE
     /// thread) then deleted from disk before the caller could open it.
     #[tokio::test]
-    async fn test_evict_skips_recently_touched() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_evict_skips_recently_touched() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         // 0 GB max to force eviction of anything eligible.
-        let cache = make_cache(dir.path().join("cache"), 0).await;
+        let cache = make_cache(dir.path().join("cache"), 0).await?;
 
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // cold-path: ancient last_access, eviction-eligible.
-            raw_insert(&cache, "cold-path", 100, 1);
+            raw_insert(&cache, "cold-path", 100, 1)?;
             // hot-path: insert via the public API (stamps last_access = now),
             // then touch it (stamps again) — both well within grace.
-            cache.insert("hot-path", 200).unwrap();
-            let touched = cache.get_and_touch("hot-path").unwrap();
+            cache.insert("hot-path", 200)?;
+            let touched = cache.get_and_touch("hot-path")?;
             assert!(touched, "hot-path should be found");
 
             // Pre-check: both in the index.
-            assert!(cache.contains("cold-path").unwrap());
-            assert!(cache.contains("hot-path").unwrap());
-            assert_eq!(cache.total_size().unwrap(), 300);
+            assert!(cache.contains("cold-path")?);
+            assert!(cache.contains("hot-path")?);
+            assert_eq!(cache.total_size()?, 300);
 
             // Evict. Only cold-path is outside grace; hot-path is protected.
-            let freed = cache.evict_if_needed().unwrap();
+            let freed = cache.evict_if_needed()?;
             assert_eq!(freed, 100, "should free exactly cold-path (100 bytes)");
 
             // cold-path gone, hot-path stays.
+            assert!(!cache.contains("cold-path")?, "cold-path should be evicted");
             assert!(
-                !cache.contains("cold-path").unwrap(),
-                "cold-path should be evicted"
-            );
-            assert!(
-                cache.contains("hot-path").unwrap(),
+                cache.contains("hot-path")?,
                 "hot-path should survive eviction (within grace window)"
             );
 
@@ -669,21 +673,22 @@ mod tests {
             // evict_if_needed() should be a no-op — hot-path is STILL in grace.
             // This proves the loop doesn't spin infinitely when all remaining
             // entries are protected.
-            let freed2 = cache.evict_if_needed().unwrap();
+            let freed2 = cache.evict_if_needed()?;
             assert_eq!(
                 freed2, 0,
                 "second eviction should free nothing (hot-path still in grace)"
             );
-            assert!(cache.contains("hot-path").unwrap());
+            assert!(cache.contains("hot-path")?);
+            Ok(())
         })
-        .await
-        .unwrap();
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_inflight_claim_and_notify() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = make_cache(dir.path().join("cache"), 1).await;
+    async fn test_inflight_claim_and_notify() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
 
         // First claim should succeed.
         let FetchClaim::Fetch(guard) = cache.try_start_fetch("abc-path") else {
@@ -702,15 +707,16 @@ mod tests {
         let FetchClaim::Fetch(_) = cache.try_start_fetch("abc-path") else {
             panic!("should be able to re-claim after guard drop");
         };
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_inflight_concurrent_wait() {
+    async fn test_inflight_concurrent_wait() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Instant;
 
-        let dir = tempfile::tempdir().unwrap();
-        let cache = make_cache(dir.path().join("cache"), 1).await;
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
         let fetch_count = Arc::new(AtomicU32::new(0));
 
         // Two threads race to fetch the same path. Exactly one should get
@@ -722,7 +728,7 @@ mod tests {
         let t1 = std::thread::spawn(move || do_claim(&c1, &f1));
         let t2 = std::thread::spawn(move || do_claim(&c2, &f2));
 
-        let (d1, d2) = (t1.join().unwrap(), t2.join().unwrap());
+        let (d1, d2) = (t1.join().expect("thread"), t2.join().expect("thread"));
 
         // Exactly one fetch happened.
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
@@ -749,12 +755,13 @@ mod tests {
             }
             start.elapsed()
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_inflight_wait_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = make_cache(dir.path().join("cache"), 1).await;
+    async fn test_inflight_wait_timeout() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
 
         // Claim the fetch but never drop the guard.
         let FetchClaim::Fetch(guard) = cache.try_start_fetch("stuck-path") else {
@@ -770,25 +777,26 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(100));
 
         drop(guard);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_tmp_cleanup_on_init() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_tmp_cleanup_on_init() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let cache_dir = dir.path().to_path_buf();
 
         // Create a stale tmp dir that mimics an interrupted extraction.
         let stale_tmp = cache_dir.join("abc-hello.tmp-deadbeef12345678");
-        std::fs::create_dir_all(&stale_tmp).unwrap();
-        std::fs::write(stale_tmp.join("partial_file"), b"incomplete").unwrap();
+        std::fs::create_dir_all(&stale_tmp)?;
+        std::fs::write(stale_tmp.join("partial_file"), b"incomplete")?;
         assert!(stale_tmp.exists());
 
         // Also create a legitimate (non-tmp) entry to verify it's NOT removed.
         let real_entry = cache_dir.join("def-world");
-        std::fs::create_dir_all(&real_entry).unwrap();
+        std::fs::create_dir_all(&real_entry)?;
 
         // Cache::new should clean the stale tmp dir but leave the real entry.
-        let _cache = Cache::new(cache_dir, 10).await.unwrap();
+        let _cache = Cache::new(cache_dir, 10).await?;
         assert!(
             !stale_tmp.exists(),
             "stale tmp dir should be removed on init"
@@ -797,5 +805,6 @@ mod tests {
             real_entry.exists(),
             "real cache entries must not be removed"
         );
+        Ok(())
     }
 }

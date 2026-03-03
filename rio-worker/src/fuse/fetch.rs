@@ -211,28 +211,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dir_size() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "hello").unwrap();
-        fs::write(dir.path().join("b.txt"), "world!").unwrap();
-        fs::create_dir(dir.path().join("sub")).unwrap();
-        fs::write(dir.path().join("sub/c.txt"), "nested").unwrap();
+    fn test_dir_size() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "hello")?;
+        fs::write(dir.path().join("b.txt"), "world!")?;
+        fs::create_dir(dir.path().join("sub"))?;
+        fs::write(dir.path().join("sub/c.txt"), "nested")?;
 
         let size = dir_size(dir.path());
         // 5 + 6 + 6 = 17 bytes of file content
         assert_eq!(size, 17);
+        Ok(())
     }
 
     /// Symlinks contribute 0 (they're not regular files, not dirs).
     /// Covers the `!meta.is_dir() → Ok(0)` branch.
     #[test]
-    fn test_dir_size_symlink_contributes_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("real.txt"), "hello").unwrap(); // 5 bytes
-        std::os::unix::fs::symlink("real.txt", dir.path().join("link")).unwrap();
+    fn test_dir_size_symlink_contributes_zero() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("real.txt"), "hello")?; // 5 bytes
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link"))?;
 
         // 5 bytes from real.txt; link contributes 0.
         assert_eq!(dir_size(dir.path()), 5);
+        Ok(())
     }
 
     /// Nonexistent path → 0 (logged at warn!, not panic). Covers the Err arm

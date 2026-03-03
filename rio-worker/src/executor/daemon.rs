@@ -428,7 +428,7 @@ mod tests {
     /// Nix protocol (handshake failure), and that the caller's always-kill
     /// pattern leaves no leaked process.
     #[tokio::test]
-    async fn test_daemon_killed_on_handshake_failure() {
+    async fn test_daemon_killed_on_handshake_failure() -> anyhow::Result<()> {
         // Spawn a process that closes stdout immediately (causing handshake
         // read to get EOF fast) but keeps running. `sh -c 'exec >&-; sleep 1000'`
         // closes stdout (FD 1) then sleeps.
@@ -444,8 +444,7 @@ mod tests {
 
         // Minimal basic derivation for the test
         let output =
-            rio_nix::derivation::DerivationOutput::new("out", "/nix/store/test-out", "", "")
-                .unwrap();
+            rio_nix::derivation::DerivationOutput::new("out", "/nix/store/test-out", "", "")?;
         let basic_drv = rio_nix::derivation::BasicDerivation::new(
             vec![output],
             Default::default(),
@@ -453,8 +452,7 @@ mod tests {
             "/bin/sh".into(),
             vec![],
             Default::default(),
-        )
-        .unwrap();
+        )?;
         let batcher = LogBatcher::new("test.drv".into(), "test-worker".into());
         let (log_tx, _log_rx) = mpsc::channel(4);
 
@@ -487,6 +485,7 @@ mod tests {
         let proc_path = format!("/proc/{pid}");
         let alive = std::path::Path::new(&proc_path).exists();
         assert!(!alive, "daemon process should be dead after kill + wait");
+        Ok(())
     }
 
     /// Verify that DAEMON_SETUP_TIMEOUT is shorter than the default daemon
@@ -510,10 +509,10 @@ mod tests {
     use rio_nix::protocol::stderr::{STDERR_READ, STDERR_WRITE, StderrError, StderrWriter};
 
     /// Serialize a BuildResult to wire bytes.
-    async fn build_result_bytes(r: &BuildResult) -> Vec<u8> {
+    async fn build_result_bytes(r: &BuildResult) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
-        write_build_result(&mut buf, r).await.unwrap();
-        buf
+        write_build_result(&mut buf, r).await?;
+        Ok(buf)
     }
 
     /// Run read_build_stderr_loop against a Cursor of `input` bytes with a
@@ -546,15 +545,15 @@ mod tests {
 
     /// Happy path: STDERR_NEXT ×2, STDERR_LAST, BuildResult{Built}.
     #[tokio::test]
-    async fn test_stderr_loop_next_then_success() {
+    async fn test_stderr_loop_next_then_success() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
-            w.log("line1").await.unwrap();
-            w.log("line2").await.unwrap();
-            w.finish().await.unwrap();
+            w.log("line1").await?;
+            w.log("line2").await?;
+            w.finish().await?;
         }
-        buf.extend(build_result_bytes(&BuildResult::success()).await);
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         let (result, batches) = run_loop(buf).await;
         let br = result.expect("loop should succeed");
@@ -562,19 +561,19 @@ mod tests {
         // The loop now owns the batcher and does a final flush after
         // STDERR_LAST, so both lines are deterministically in `batches`.
         assert_eq!(count_log_lines(&batches), 2);
+        Ok(())
     }
 
     /// Daemon sends STDERR_ERROR → loop returns Ok(MiscFailure), NOT Err.
     /// This is how build-time errors (compile failures etc.) propagate.
     #[tokio::test]
-    async fn test_stderr_loop_daemon_error_returns_misc_failure() {
+    async fn test_stderr_loop_daemon_error_returns_misc_failure() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
-            w.log("compiling").await.unwrap();
+            w.log("compiling").await?;
             w.error(&StderrError::simple("Build", "compile error: missing ;"))
-                .await
-                .unwrap();
+                .await?;
             // NO finish() — STDERR_ERROR terminates the loop.
         }
 
@@ -582,14 +581,15 @@ mod tests {
         let br = result.expect("daemon error is Ok(failure), not Err");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert_eq!(br.error_msg, "compile error: missing ;");
+        Ok(())
     }
 
     /// STDERR_READ is not supported in build-stderr context → MiscFailure.
     #[tokio::test]
-    async fn test_stderr_loop_read_not_supported() {
+    async fn test_stderr_loop_read_not_supported() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_READ).await.unwrap();
-        wire::write_u64(&mut buf, 42).await.unwrap();
+        wire::write_u64(&mut buf, STDERR_READ).await?;
+        wire::write_u64(&mut buf, 42).await?;
 
         let (result, _) = run_loop(buf).await;
         let br = result.expect("STDERR_READ is Ok(failure), not Err");
@@ -599,12 +599,13 @@ mod tests {
             "error_msg: {}",
             br.error_msg
         );
+        Ok(())
     }
 
     /// Log channel closed mid-build → MiscFailure. The scheduler stream is
     /// gone so there's no way to report completion anyway.
     #[tokio::test]
-    async fn test_stderr_loop_log_channel_closed_returns_failure() {
+    async fn test_stderr_loop_log_channel_closed_returns_failure() -> anyhow::Result<()> {
         // Feed enough STDERR_NEXT to force a batch flush (MAX_BATCH_LINES=64).
         // The 65th add_line returns Some(batch); send_batch fails because rx
         // is dropped.
@@ -612,7 +613,7 @@ mod tests {
         {
             let mut w = StderrWriter::new(&mut buf);
             for i in 0..65 {
-                w.log(&format!("line {i}")).await.unwrap();
+                w.log(&format!("line {i}")).await?;
             }
         }
 
@@ -629,11 +630,12 @@ mod tests {
             "got: {}",
             br.error_msg
         );
+        Ok(())
     }
 
     /// Activity/Write/Result messages are silently discarded.
     #[tokio::test]
-    async fn test_stderr_loop_discards_activity_and_write() {
+    async fn test_stderr_loop_discards_activity_and_write() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
@@ -644,32 +646,30 @@ mod tests {
                     0,
                     0,
                 )
-                .await
-                .unwrap();
-            w.stop_activity(aid).await.unwrap();
+                .await?;
+            w.stop_activity(aid).await?;
         }
         // STDERR_WRITE (raw, StderrWriter doesn't have a generic write)
-        wire::write_u64(&mut buf, STDERR_WRITE).await.unwrap();
-        wire::write_bytes(&mut buf, b"some data").await.unwrap();
+        wire::write_u64(&mut buf, STDERR_WRITE).await?;
+        wire::write_bytes(&mut buf, b"some data").await?;
         // STDERR_RESULT: activity_id + result_type + 0 fields
-        wire::write_u64(&mut buf, rio_nix::protocol::stderr::STDERR_RESULT)
-            .await
-            .unwrap();
-        wire::write_u64(&mut buf, 1).await.unwrap(); // activity_id
-        wire::write_u64(&mut buf, 0).await.unwrap(); // result_type
-        wire::write_u64(&mut buf, 0).await.unwrap(); // field count
+        wire::write_u64(&mut buf, rio_nix::protocol::stderr::STDERR_RESULT).await?;
+        wire::write_u64(&mut buf, 1).await?; // activity_id
+        wire::write_u64(&mut buf, 0).await?; // result_type
+        wire::write_u64(&mut buf, 0).await?; // field count
         // STDERR_LAST + success
         {
             let mut w = StderrWriter::new(&mut buf);
-            w.finish().await.unwrap();
+            w.finish().await?;
         }
-        buf.extend(build_result_bytes(&BuildResult::success()).await);
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         let (result, batches) = run_loop(buf).await;
         let br = result.expect("should succeed");
         assert_eq!(br.status, BuildStatus::Built);
         // None of these messages produce log lines.
         assert_eq!(count_log_lines(&batches), 0);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -686,7 +686,7 @@ mod tests {
     /// `maybe_flush()` checks `std::time::Instant`, which does NOT advance
     /// under paused tokio-time.
     #[tokio::test(start_paused = true)]
-    async fn test_silent_period_triggers_flush() {
+    async fn test_silent_period_triggers_flush() -> anyhow::Result<()> {
         let (mut write_half, read_half) = tokio::io::duplex(4096);
         let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
         let (log_tx, mut log_rx) = mpsc::channel(8);
@@ -698,7 +698,7 @@ mod tests {
         // Send exactly one STDERR_NEXT line, then go silent.
         {
             let mut w = StderrWriter::new(&mut write_half);
-            w.log("line before silence").await.unwrap();
+            w.log("line before silence").await?;
         }
         // Let the reader task drain the channel and the main loop add_line().
         // Under paused time, auto-advance doesn't kick in while tasks are
@@ -733,17 +733,17 @@ mod tests {
         // Cleanup: send STDERR_LAST + BuildResult so the loop terminates cleanly.
         {
             let mut w = StderrWriter::new(&mut write_half);
-            w.finish().await.unwrap();
+            w.finish().await?;
         }
         write_half
-            .write_all(&build_result_bytes(&BuildResult::success()).await)
-            .await
-            .unwrap();
+            .write_all(&build_result_bytes(&BuildResult::success()).await?)
+            .await?;
         drop(write_half); // EOF
 
-        let result = loop_handle.await.unwrap();
+        let result = loop_handle.await?;
         let br = result.expect("loop should complete successfully");
         assert_eq!(br.status, BuildStatus::Built);
+        Ok(())
     }
 
     /// Cancel-safety: a STDERR message that arrives in two halves (partial
@@ -756,7 +756,7 @@ mod tests {
     /// future alive across ticks — only `msg_rx.recv()` is cancelled, and
     /// mpsc recv is cancel-safe.
     #[tokio::test(start_paused = true)]
-    async fn test_reader_not_desynced_across_tick() {
+    async fn test_reader_not_desynced_across_tick() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::STDERR_NEXT;
 
         let (mut write_half, read_half) = tokio::io::duplex(4096);
@@ -769,8 +769,8 @@ mod tests {
         // Write the first 4 bytes of the STDERR_NEXT u64 tag. This leaves
         // the reader task blocked mid-read_u64.
         let tag_bytes = STDERR_NEXT.to_le_bytes();
-        write_half.write_all(&tag_bytes[..4]).await.unwrap();
-        write_half.flush().await.unwrap();
+        write_half.write_all(&tag_bytes[..4]).await?;
+        write_half.flush().await?;
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
@@ -790,12 +790,10 @@ mod tests {
         // Now send the REST of the tag + the payload. If the protocol is
         // intact, the reader task completes read_stderr_message() and pushes
         // a Next("intact-payload") onto msg_rx.
-        write_half.write_all(&tag_bytes[4..]).await.unwrap();
+        write_half.write_all(&tag_bytes[4..]).await?;
         // STDERR_NEXT payload is a length-prefixed string (u64 len + bytes + padding)
-        wire::write_string(&mut write_half, "intact-payload")
-            .await
-            .unwrap();
-        write_half.flush().await.unwrap();
+        wire::write_string(&mut write_half, "intact-payload").await?;
+        write_half.flush().await?;
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
@@ -821,34 +819,34 @@ mod tests {
         // Cleanup.
         {
             let mut w = StderrWriter::new(&mut write_half);
-            w.finish().await.unwrap();
+            w.finish().await?;
         }
         write_half
-            .write_all(&build_result_bytes(&BuildResult::success()).await)
-            .await
-            .unwrap();
+            .write_all(&build_result_bytes(&BuildResult::success()).await?)
+            .await?;
         drop(write_half);
 
-        let result = loop_handle.await.unwrap();
+        let result = loop_handle.await?;
         let br = result.expect("loop should complete successfully after reassembly");
         assert_eq!(br.status, BuildStatus::Built);
+        Ok(())
     }
 
     /// The final flush (inside the loop, after STDERR_LAST) must drain any
     /// partial batch. Previously this was the caller's job (executor/mod.rs);
     /// now the loop owns the batcher.
     #[tokio::test]
-    async fn test_final_flush_after_last() {
+    async fn test_final_flush_after_last() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
             // 3 lines < 64: these stay in the partial batch until final flush.
-            w.log("tail-1").await.unwrap();
-            w.log("tail-2").await.unwrap();
-            w.log("tail-3").await.unwrap();
-            w.finish().await.unwrap();
+            w.log("tail-1").await?;
+            w.log("tail-2").await?;
+            w.log("tail-3").await?;
+            w.finish().await?;
         }
-        buf.extend(build_result_bytes(&BuildResult::success()).await);
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
 
         let (result, batches) = run_loop(buf).await;
         result.expect("should succeed");
@@ -860,5 +858,6 @@ mod tests {
             3,
             "final flush should drain the 3-line partial batch"
         );
+        Ok(())
     }
 }

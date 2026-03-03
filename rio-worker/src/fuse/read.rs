@@ -44,23 +44,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_read_file_range_basic() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_read_file_range_basic() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let file_path = dir.path().join("data.bin");
-        std::fs::write(&file_path, b"hello world").unwrap();
-        let file = File::open(&file_path).unwrap();
+        std::fs::write(&file_path, b"hello world")?;
+        let file = File::open(&file_path)?;
 
-        let data = read_file_range(&file, 0, 5).unwrap();
+        let data = read_file_range(&file, 0, 5)?;
         assert_eq!(&data, b"hello");
 
-        let data = read_file_range(&file, 6, 5).unwrap();
+        let data = read_file_range(&file, 6, 5)?;
         assert_eq!(&data, b"world");
 
-        let data = read_file_range(&file, 100, 5).unwrap();
+        let data = read_file_range(&file, 100, 5)?;
         assert!(data.is_empty());
 
-        let data = read_file_range(&file, 0, 100).unwrap();
+        let data = read_file_range(&file, 0, 100)?;
         assert_eq!(&data, b"hello world");
+        Ok(())
     }
 
     #[test]
