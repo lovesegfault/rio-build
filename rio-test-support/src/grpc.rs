@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio_stream::wrappers::TcpListenerStream;
@@ -35,6 +36,11 @@ pub struct MockStore {
     pub paths: Arc<RwLock<HashMap<String, StoredPath>>>,
     /// Every PutPath metadata received (for assertions on upload count/contents).
     pub put_calls: Arc<RwLock<Vec<types::PathInfo>>>,
+    /// If > 0, put_path decrements and returns Unavailable. For retry tests.
+    pub fail_next_puts: Arc<AtomicU32>,
+    /// If true, find_missing_paths returns Unavailable. For scheduler
+    /// cache-check error-path tests.
+    pub fail_find_missing: Arc<AtomicBool>,
 }
 
 impl MockStore {
@@ -55,6 +61,17 @@ impl StoreService for MockStore {
         &self,
         request: Request<Streaming<types::PutPathRequest>>,
     ) -> Result<Response<types::PutPathResponse>, Status> {
+        // Injected failure for retry tests. fetch_update returns Err when
+        // the closure returns None (counter is 0) — i.e., no failure to inject.
+        if self
+            .fail_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::unavailable("mock: injected put failure"));
+        }
         let mut stream = request.into_inner();
         let first = stream
             .message()
@@ -137,6 +154,9 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
+        if self.fail_find_missing.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("mock: injected find_missing failure"));
+        }
         let requested = request.into_inner().store_paths;
         let paths = self.paths.read().unwrap();
         let missing: Vec<String> = requested
@@ -175,6 +195,10 @@ pub struct MockSchedulerOutcome {
     /// If set, the stream is closed immediately after BuildStarted (no
     /// terminal event). Simulates scheduler disconnect mid-build.
     pub close_stream_early: bool,
+    /// If Some, send these events verbatim (ignoring the bool flags above)
+    /// then close the stream. Empty build_id / zero sequence are
+    /// auto-populated so tests only need to set the `event` oneof.
+    pub scripted_events: Option<Vec<types::BuildEvent>>,
 }
 
 /// Mock scheduler that records SubmitBuild + CancelBuild calls and has a
@@ -215,8 +239,30 @@ impl SchedulerService for MockScheduler {
             return Err(Status::new(code, "mock scheduler error"));
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
         let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
+
+        // Scripted mode: send events verbatim, auto-fill build_id/sequence, close.
+        if let Some(events) = outcome.scripted_events {
+            tokio::spawn(async move {
+                for (seq, mut ev) in events.into_iter().enumerate() {
+                    if ev.build_id.is_empty() {
+                        ev.build_id = build_id.clone();
+                    }
+                    if ev.sequence == 0 {
+                        ev.sequence = seq as u64;
+                    }
+                    if tx.send(Ok(ev)).await.is_err() {
+                        return;
+                    }
+                }
+                // tx drops → stream ends
+            });
+            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )));
+        }
+
         tokio::spawn(async move {
             let _ = tx
                 .send(Ok(types::BuildEvent {
