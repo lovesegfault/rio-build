@@ -91,6 +91,17 @@ pub struct CacheEntry {
     pub size_bytes: u64,
 }
 
+/// Grace period (seconds) protecting recently-touched entries from eviction.
+///
+/// `get_and_touch()` atomically stamps `last_access = now` BEFORE returning
+/// a cached path to the caller. The eviction query filters out entries with
+/// `last_access >= now - EVICT_GRACE_SECS`, so any entry returned by
+/// `get_path()` has at least this long before it becomes an eviction
+/// candidate — plenty of time for the caller's subsequent `open()` /
+/// `symlink_metadata()` syscall. This closes the TOCTOU where eviction
+/// raced the caller's open without adding a syscall to the hot path.
+const EVICT_GRACE_SECS: i64 = 5;
+
 /// LRU cache manager backed by local SSD with SQLite metadata index.
 ///
 /// Thread-safe: uses a connection pool for concurrent access. FUSE callbacks
@@ -230,11 +241,12 @@ impl Cache {
     /// Get the full filesystem path for a cached store path.
     ///
     /// Returns `Ok(None)` if the path is not cached, `Err` on index failure.
-    // TODO(phase2b): TOCTOU with evict_if_needed — DB says cached but disk
-    // may have evicted between this check and caller's open. In practice
-    // eviction is rare and the caller's symlink_metadata/open failure falls
-    // back to re-fetch anyway (slower but correct). Proper fix: RCU-style
-    // claim-before-evict or disk existence check here (adds syscall to hot path).
+    ///
+    /// An entry returned by this function is protected from eviction for
+    /// [`EVICT_GRACE_SECS`] (5s): `get_and_touch()` stamps `last_access = now`
+    /// atomically in the same DB roundtrip, and `evict_if_needed()` filters
+    /// `last_access < now - grace`. The caller's subsequent open/stat has the
+    /// full grace window before eviction can select this entry.
     pub fn get_path(&self, store_path: &str) -> Result<Option<PathBuf>, CacheError> {
         if self.get_and_touch(store_path)? {
             Ok(Some(self.cache_dir.join(store_path)))
@@ -293,7 +305,13 @@ impl Cache {
     }
 
     /// Evict least-recently-used entries until total size is under the limit.
+    ///
+    /// Entries with `last_access >= now - EVICT_GRACE_SECS` are skipped —
+    /// they're either in active use or just returned by `get_path()`. If all
+    /// entries are within grace and total is still over limit, breaks and lets
+    /// the next insert retry (this is transient, not drift).
     pub fn evict_if_needed(&self) -> Result<u64, CacheError> {
+        let grace_cutoff = unix_now() - EVICT_GRACE_SECS;
         let mut freed = 0u64;
 
         loop {
@@ -306,8 +324,10 @@ impl Cache {
             let entry: Option<CacheEntry> = self.runtime.block_on(async {
                 let row: Option<(String, i64)> = sqlx::query_as(
                     "SELECT store_path, size_bytes FROM cached_paths
+                     WHERE last_access < ?1
                      ORDER BY last_access ASC LIMIT 1",
                 )
+                .bind(grace_cutoff)
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| {
@@ -323,14 +343,34 @@ impl Cache {
             })?;
 
             let Some(entry) = entry else {
-                // total > max but no rows — index inconsistent with total.
-                // Break to avoid infinite loop; accounting will self-correct
-                // on next insert.
-                tracing::warn!(
-                    total,
-                    max = self.max_size_bytes,
-                    "cache total exceeds limit but no entries to evict; accounting drift"
-                );
+                // total > max but nothing evictable. Two cases:
+                //   (a) All entries are within the grace window (transient —
+                //       just inserted or just touched; retry on next insert).
+                //   (b) Index has rows but none match the filter AND none are
+                //       hot (accounting drift; self-corrects on next insert).
+                // Distinguish by counting hot entries.
+                let hot: i64 = self.runtime.block_on(async {
+                    sqlx::query_scalar("SELECT COUNT(*) FROM cached_paths WHERE last_access >= ?1")
+                        .bind(grace_cutoff)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap_or(0)
+                });
+                if hot > 0 {
+                    tracing::debug!(
+                        total,
+                        max = self.max_size_bytes,
+                        hot_entries = hot,
+                        grace_secs = EVICT_GRACE_SECS,
+                        "cache over limit but all remaining entries within grace; will retry on next insert"
+                    );
+                } else {
+                    tracing::warn!(
+                        total,
+                        max = self.max_size_bytes,
+                        "cache total exceeds limit but no entries to evict; accounting drift"
+                    );
+                }
                 break;
             };
 
@@ -550,6 +590,24 @@ mod tests {
         .unwrap();
     }
 
+    /// Insert a row with an explicit last_access (bypasses insert()'s `now`).
+    /// Tests use this to create "old" entries that are eviction-eligible.
+    fn raw_insert(cache: &Cache, store_path: &str, size_bytes: i64, last_access: i64) {
+        let pool = cache.pool.clone();
+        cache.runtime.block_on(async {
+            sqlx::query(
+                "INSERT OR REPLACE INTO cached_paths (store_path, size_bytes, last_access)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(store_path)
+            .bind(size_bytes)
+            .bind(last_access)
+            .execute(&pool)
+            .await
+            .unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn test_cache_eviction() {
         let dir = tempfile::tempdir().unwrap();
@@ -557,11 +615,66 @@ mod tests {
         let cache = make_cache(dir.path().join("cache"), 0).await;
 
         tokio::task::spawn_blocking(move || {
-            cache.insert("old-path", 100).unwrap();
-            cache.insert("new-path", 200).unwrap();
+            // last_access = 1 (ancient) — well outside the grace window.
+            raw_insert(&cache, "old-path", 100, 1);
+            raw_insert(&cache, "new-path", 200, 2);
 
             let freed = cache.evict_if_needed().unwrap();
             assert!(freed > 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The TOCTOU fix: an entry touched within the grace window must NOT be
+    /// evicted, even when the cache is over limit. An entry outside the grace
+    /// window IS evicted. This closes the race where `get_path()` returned a
+    /// path that `evict_if_needed()` (running concurrently on another FUSE
+    /// thread) then deleted from disk before the caller could open it.
+    #[tokio::test]
+    async fn test_evict_skips_recently_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        // 0 GB max to force eviction of anything eligible.
+        let cache = make_cache(dir.path().join("cache"), 0).await;
+
+        tokio::task::spawn_blocking(move || {
+            // cold-path: ancient last_access, eviction-eligible.
+            raw_insert(&cache, "cold-path", 100, 1);
+            // hot-path: insert via the public API (stamps last_access = now),
+            // then touch it (stamps again) — both well within grace.
+            cache.insert("hot-path", 200).unwrap();
+            let touched = cache.get_and_touch("hot-path").unwrap();
+            assert!(touched, "hot-path should be found");
+
+            // Pre-check: both in the index.
+            assert!(cache.contains("cold-path").unwrap());
+            assert!(cache.contains("hot-path").unwrap());
+            assert_eq!(cache.total_size().unwrap(), 300);
+
+            // Evict. Only cold-path is outside grace; hot-path is protected.
+            let freed = cache.evict_if_needed().unwrap();
+            assert_eq!(freed, 100, "should free exactly cold-path (100 bytes)");
+
+            // cold-path gone, hot-path stays.
+            assert!(
+                !cache.contains("cold-path").unwrap(),
+                "cold-path should be evicted"
+            );
+            assert!(
+                cache.contains("hot-path").unwrap(),
+                "hot-path should survive eviction (within grace window)"
+            );
+
+            // Total is now 200. Still over the 0-byte limit, but the next
+            // evict_if_needed() should be a no-op — hot-path is STILL in grace.
+            // This proves the loop doesn't spin infinitely when all remaining
+            // entries are protected.
+            let freed2 = cache.evict_if_needed().unwrap();
+            assert_eq!(
+                freed2, 0,
+                "second eviction should free nothing (hot-path still in grace)"
+            );
+            assert!(cache.contains("hot-path").unwrap());
         })
         .await
         .unwrap();
