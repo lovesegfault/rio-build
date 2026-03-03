@@ -120,6 +120,22 @@ pub enum ActorCommand {
     /// a delay. Scheduled by complete_build/transition_build_to_failed/cancel.
     CleanupTerminalBuild { build_id: Uuid },
 
+    /// Forward a log batch to interested gateways via `emit_build_event`.
+    ///
+    /// Sent by the BuildExecution recv task via `try_send` (NOT
+    /// `send_unchecked`) — under backpressure this drops, which is
+    /// intentional: the ring buffer (written directly by the recv task,
+    /// not through here) still has the lines, so AdminService.GetBuildLogs
+    /// can serve them even if the live gateway feed missed some.
+    /// Fire-and-forget; no reply.
+    ///
+    /// `drv_path` not `drv_hash` because that's what BuildLogBatch carries.
+    /// The actor resolves it via `drv_path_to_hash` (DAG reverse index).
+    ForwardLogBatch {
+        drv_path: String,
+        batch: rio_proto::types::BuildLogBatch,
+    },
+
     /// Test-only: query worker states.
     #[cfg(test)]
     DebugQueryWorkers {
@@ -360,6 +376,33 @@ impl DagActor {
                 }
                 ActorCommand::CleanupTerminalBuild { build_id } => {
                     self.handle_cleanup_terminal_build(build_id);
+                }
+                ActorCommand::ForwardLogBatch { drv_path, batch } => {
+                    // Resolve drv_path → drv_hash → interested_builds, then
+                    // emit BuildEvent::Log on each build's broadcast channel.
+                    // The gateway already handles Event::Log (handler/build.rs
+                    // :27-32) — it translates to STDERR_NEXT for the Nix client.
+                    //
+                    // Unknown drv_path → drop silently. Two legitimate cases:
+                    // (a) batch arrived after CleanupTerminalBuild removed the
+                    //     DAG entry (race between worker stream and actor loop
+                    //     — the build is done, gateway already saw Completed,
+                    //     late log lines are irrelevant);
+                    // (b) malformed batch from a buggy worker. Neither warrants
+                    //     a warn!() — (a) is expected, (b) would spam.
+                    if let Some(hash) = self.drv_path_to_hash(&drv_path) {
+                        for build_id in self.get_interested_builds(&hash) {
+                            // batch.clone(): BuildLogBatch has Vec<Vec<u8>> so
+                            // this is a deep copy. For 64 lines × 100 bytes
+                            // that's ~6.5KB × N interested builds. Typically
+                            // N=1 (one gateway per build). If profiling ever
+                            // shows this hot, Arc<BuildLogBatch> in BuildEvent.
+                            self.emit_build_event(
+                                build_id,
+                                rio_proto::types::build_event::Event::Log(batch.clone()),
+                            );
+                        }
+                    }
                 }
                 #[cfg(test)]
                 ActorCommand::DebugQueryWorkers { reply } => {
