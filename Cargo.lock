@@ -3696,6 +3696,7 @@ dependencies = [
 name = "rio-nix"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "hex",
  "proptest",
@@ -3780,6 +3781,7 @@ dependencies = [
 name = "rio-test-support"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "nix 0.31.1",
  "rio-nix",
  "rio-proto",
