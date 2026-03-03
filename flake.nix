@@ -440,6 +440,7 @@
           #   vm-phase1a — 2 VMs: read-only opcodes (path-info, store ls)
           #   vm-phase1b — 3 VMs: single-worker end-to-end build
           #   vm-phase2a — 4 VMs: distributed build across 2+ workers
+          #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Jaeger
           vmTests = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             let
               vmTestArgs = {
@@ -451,7 +452,15 @@
               vm-phase1a = import ./nix/tests/phase1a.nix vmTestArgs;
               vm-phase1b = import ./nix/tests/phase1b.nix vmTestArgs;
               vm-phase2a = import ./nix/tests/phase2a.nix vmTestArgs;
+              vm-phase2b = import ./nix/tests/phase2b.nix vmTestArgs;
             }
+          );
+
+          # Container images (Linux-only — dockerTools uses Linux VM
+          # namespaces for layering). Worker image includes nix + fuse3
+          # + util-linux + passwd stubs; others are minimal.
+          dockerImages = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            import ./nix/docker.nix { inherit pkgs rio-workspace; }
           );
 
           # --------------------------------------------------------------
@@ -645,6 +654,25 @@
           packages = {
             default = rio-workspace;
             fuzz-build = rio-fuzz-build; # debug: nix build .#fuzz-build
+          }
+          # Container images: docker-{gateway,scheduler,store,worker}
+          # plus a linkFarm aggregate at `.#dockerImages` (milestone
+          # target per docs/src/phases/phase2b.md:46).
+          # Linux-only — optionalAttrs means these simply don't exist
+          # on Darwin, rather than failing evaluation.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            docker-gateway = dockerImages.gateway;
+            docker-scheduler = dockerImages.scheduler;
+            docker-store = dockerImages.store;
+            docker-worker = dockerImages.worker;
+            dockerImages = pkgs.linkFarm "rio-docker-images" (
+              pkgs.lib.mapAttrsToList (name: drv: {
+                name = "${name}.tar.gz";
+                path = drv;
+              }) dockerImages
+            );
+          }
+          // {
 
             # HTML coverage report generated from the lcov tracefile.
             # The lcov file embeds sandbox-local source paths; strip the
