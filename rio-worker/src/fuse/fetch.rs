@@ -222,4 +222,24 @@ mod tests {
         // 5 + 6 + 6 = 17 bytes of file content
         assert_eq!(size, 17);
     }
+
+    /// Symlinks contribute 0 (they're not regular files, not dirs).
+    /// Covers the `!meta.is_dir() → Ok(0)` branch.
+    #[test]
+    fn test_dir_size_symlink_contributes_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real.txt"), "hello").unwrap(); // 5 bytes
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link")).unwrap();
+
+        // 5 bytes from real.txt; link contributes 0.
+        assert_eq!(dir_size(dir.path()), 5);
+    }
+
+    /// Nonexistent path → 0 (logged at warn!, not panic). Covers the Err arm
+    /// in the outer dir_size wrapper.
+    #[test]
+    fn test_dir_size_nonexistent_path_returns_zero() {
+        let size = dir_size(Path::new("/nonexistent/rio-test-dir-size-xyz"));
+        assert_eq!(size, 0);
+    }
 }
