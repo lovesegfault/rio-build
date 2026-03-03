@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("../migrations").run(&pool).await?;
     info!("database migrations applied");
 
-    let db = SchedulerDb::new(pool);
+    let db = SchedulerDb::new(pool.clone());
 
     // Connect to store for scheduler-side cache checks (closes TOCTOU between
     // gateway FindMissingPaths and DAG merge). Non-fatal if connect fails;
@@ -138,12 +138,49 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Shared log ring buffers. Written by the BuildExecution recv task
+    // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
+    let log_buffers = std::sync::Arc::new(rio_scheduler::logs::LogBuffers::new());
+
+    // Log flusher: gzip → S3 PUT → PG insert. Optional — only if
+    // RIO_LOG_S3_BUCKET is set. Without it, logs are ring-buffer-only
+    // (lost on scheduler restart, but still live-servable while running).
+    let log_flush_tx = match &cfg.log_s3_bucket {
+        Some(bucket) => {
+            let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .load()
+                .await;
+            let s3 = aws_sdk_s3::Client::new(&aws_cfg);
+            let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
+            let flusher = rio_scheduler::logs::LogFlusher::new(
+                s3,
+                bucket.clone(),
+                cfg.log_s3_prefix.clone(),
+                pool,
+                log_buffers.clone(),
+            );
+            let _flusher_handle = flusher.spawn(flush_rx);
+            info!(bucket = %bucket, prefix = %cfg.log_s3_prefix, "log flusher spawned");
+            Some(flush_tx)
+        }
+        None => {
+            tracing::warn!(
+                "RIO_LOG_S3_BUCKET not set; build logs will be ring-buffer-only \
+                 (lost on scheduler restart)"
+            );
+            None
+        }
+    };
+
     // Spawn the DAG actor
-    let actor = ActorHandle::spawn(db, store_client);
+    let actor = ActorHandle::spawn(db, store_client, log_flush_tx);
     info!("DAG actor spawned");
 
-    // Create gRPC service
-    let grpc_service = SchedulerGrpc::new(actor.clone());
+    // Create gRPC service. It gets its own LogBuffers Arc — same underlying
+    // DashMap as the flusher's. SchedulerGrpc::new creates a SEPARATE one
+    // internally, which would break everything (flusher draining the wrong
+    // buffer). So inject the shared one.
+    let grpc_service = SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers);
 
     // Start periodic tick task
     let tick_actor = actor.clone();

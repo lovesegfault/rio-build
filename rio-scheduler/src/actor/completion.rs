@@ -208,6 +208,13 @@ impl DagActor {
             );
         }
 
+        // Trigger log flush AFTER the Completed event has gone out. By the
+        // time the gateway sees Completed, the ring buffer still has the full
+        // log (flusher hasn't drained yet — it's async on a separate task).
+        // So AdminService.GetBuildLogs can serve from the ring buffer in the
+        // gap between Completed and the S3 upload landing.
+        self.trigger_log_flush(drv_hash, interested_builds.clone());
+
         // Release downstream: find newly ready derivations.
         // Interactive (IFD) derivations go to the front of the queue.
         let newly_ready = self.dag.find_newly_ready(drv_hash);
@@ -379,6 +386,13 @@ impl DagActor {
 
         // Propagate failure to interested builds
         let interested_builds = self.get_interested_builds(drv_hash);
+
+        // Flush logs for failed builds too — the failure's log is often the
+        // most useful log (compile errors, test output). Do this BEFORE
+        // handle_derivation_failure below, which may transition builds to
+        // terminal and schedule cleanup.
+        self.trigger_log_flush(drv_hash, interested_builds.clone());
+
         for build_id in interested_builds {
             // Emit failure event
             self.emit_build_event(

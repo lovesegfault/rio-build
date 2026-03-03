@@ -33,6 +33,10 @@ pub struct SchedulerGrpc {
 
 impl SchedulerGrpc {
     /// Create a new gRPC service with the given actor handle.
+    ///
+    /// This makes a FRESH `LogBuffers`. For production (where the flusher
+    /// needs the same buffers), use [`with_log_buffers`](Self::with_log_buffers)
+    /// instead. This constructor is kept for tests where no flusher runs.
     pub fn new(actor: ActorHandle) -> Self {
         Self {
             actor,
@@ -40,9 +44,16 @@ impl SchedulerGrpc {
         }
     }
 
-    /// Access the shared log ring buffers. Exposed for `AdminService` (C9)
-    /// and the S3 flusher (C8), which are constructed in main.rs separately
-    /// from `SchedulerGrpc` but need the same buffers.
+    /// Create with an externally-owned `LogBuffers`. Production `main.rs`
+    /// uses this so the LogFlusher (separate task) drains the SAME buffers
+    /// that the BuildExecution recv task writes to. If you use `new()` in
+    /// production, the flusher would drain an unrelated empty DashMap
+    /// forever while the real logs pile up here — a silent total log loss.
+    pub fn with_log_buffers(actor: ActorHandle, log_buffers: Arc<LogBuffers>) -> Self {
+        Self { actor, log_buffers }
+    }
+
+    /// Access the shared log ring buffers. Exposed for `AdminService` (C9).
     pub fn log_buffers(&self) -> Arc<LogBuffers> {
         self.log_buffers.clone()
     }

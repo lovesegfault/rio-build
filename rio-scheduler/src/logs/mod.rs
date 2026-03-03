@@ -26,6 +26,9 @@ use std::collections::VecDeque;
 use dashmap::DashMap;
 use rio_proto::types::BuildLogBatch;
 
+mod flush;
+pub use flush::{FlushRequest, LogFlusher};
+
 /// Max lines retained per derivation. Beyond this, oldest lines are evicted.
 ///
 /// Sizing: 100k lines × ~100 bytes/line (typical build output) ≈ 10 MiB per
@@ -145,10 +148,43 @@ impl LogBuffers {
         self.buffers.remove(drv_path);
     }
 
-    /// Number of active buffers. For tests + metrics.
-    #[cfg(test)]
+    /// Number of active buffers. For metrics + flusher periodic-scan skip.
     pub fn active_count(&self) -> usize {
         self.buffers.len()
+    }
+
+    /// Snapshot all currently-buffered drv_paths (keys only, no lines).
+    ///
+    /// For the periodic flush. Snapshotting keys first (under DashMap's
+    /// per-shard read locks) then draining each (under per-key write lock)
+    /// avoids holding a shard lock across the slow S3 PUT. If a new
+    /// drv_path starts buffering between the snapshot and the drain, it
+    /// gets picked up on the NEXT periodic tick — no correctness issue.
+    pub(crate) fn active_keys(&self) -> Vec<String> {
+        self.buffers.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Non-consuming clone of a buffer's contents (for periodic snapshot flush).
+    ///
+    /// Unlike `drain`, this does NOT remove the buffer — the derivation is
+    /// still running, live serving via the ring buffer must continue, and
+    /// the on-completion flush will drain+upload the final state. This
+    /// means periodic snapshots upload an ever-growing prefix of the same
+    /// log (wasteful in S3 PUTs, but bounded: at most one per 30s per active
+    /// derivation, and the spec explicitly accepts that tradeoff at
+    /// `observability.md:38-40`).
+    pub(crate) fn snapshot(&self, drv_path: &str) -> Option<(u64, u64, Vec<Vec<u8>>)> {
+        let buf = self.buffers.get(drv_path)?;
+        let line_count = buf.len() as u64;
+        let mut total_bytes = 0u64;
+        let lines: Vec<Vec<u8>> = buf
+            .iter()
+            .map(|(_n, bytes)| {
+                total_bytes += bytes.len() as u64;
+                bytes.clone()
+            })
+            .collect();
+        Some((line_count, total_bytes, lines))
     }
 }
 
