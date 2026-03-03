@@ -11,7 +11,7 @@
 //!   - drain_stderr_expecting_error: consumes STDERR messages expecting STDERR_ERROR
 //!   - Per-opcode tests: happy path + error path for each
 
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::DuplexStream;
 use tonic::transport::Channel;
 
 use rio_nix::protocol::wire;
@@ -24,6 +24,7 @@ use rio_test_support::grpc::{
 use rio_test_support::wire::{
     do_handshake, drain_stderr_expecting_error, drain_stderr_until_last, send_set_options,
 };
+use rio_test_support::{wire_bytes, wire_send};
 
 // ===========================================================================
 // Test Harness

@@ -8,8 +8,7 @@ use super::*;
 async fn test_unknown_opcode_returns_stderr_error() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 99).await.unwrap(); // unknown opcode
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 99); // unknown opcode
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
@@ -31,21 +30,22 @@ async fn test_set_options_standalone() {
     let mut h = TestHarness::setup().await;
 
     // Send a second SetOptions with different values.
-    wire::write_u64(&mut h.stream, 19).await.unwrap(); // wopSetOptions
-    wire::write_bool(&mut h.stream, true).await.unwrap(); // keepFailed
-    wire::write_bool(&mut h.stream, true).await.unwrap(); // keepGoing
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // tryFallback
-    wire::write_u64(&mut h.stream, 5).await.unwrap(); // verbosity
-    wire::write_u64(&mut h.stream, 4).await.unwrap(); // maxBuildJobs
-    wire::write_u64(&mut h.stream, 600).await.unwrap(); // maxSilentTime
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // useBuildHook
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // verboseBuild
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // logType
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // printBuildTrace
-    wire::write_u64(&mut h.stream, 8).await.unwrap(); // buildCores
-    wire::write_bool(&mut h.stream, true).await.unwrap(); // useSubstitutes
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // overrides count
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 19,                                 // wopSetOptions
+        bool: true,                              // keepFailed
+        bool: true,                              // keepGoing
+        bool: false,                             // tryFallback
+        u64: 5,                                  // verbosity
+        u64: 4,                                  // maxBuildJobs
+        u64: 600,                                // maxSilentTime
+        bool: false,                             // useBuildHook
+        u64: 0,                                  // verboseBuild
+        u64: 0,                                  // logType
+        u64: 0,                                  // printBuildTrace
+        u64: 8,                                  // buildCores
+        bool: true,                              // useSubstitutes
+        u64: 0,                                  // overrides count
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     // SetOptions has no result data.
@@ -99,9 +99,10 @@ async fn test_version_too_old_sends_stderr_error() {
     });
 
     // Phase 1: send magic + old version (1.32 = 0x120)
-    wire::write_u64(&mut client, WORKER_MAGIC_1).await.unwrap();
-    wire::write_u64(&mut client, 0x120).await.unwrap();
-    client.flush().await.unwrap();
+    wire_send!(&mut client;
+        u64: WORKER_MAGIC_1,
+        u64: 0x120,
+    );
 
     // Read server magic + server version
     let magic2 = wire::read_u64(&mut client).await.unwrap();
@@ -133,38 +134,22 @@ async fn test_multi_opcode_sequence() {
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
     // Op 1: IsValidPath (found)
-    wire::write_u64(&mut h.stream, 1).await.unwrap();
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_A);
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), 1, "found");
 
     // Op 2: IsValidPath (not found)
-    wire::write_u64(&mut h.stream, 1).await.unwrap();
-    wire::write_string(&mut h.stream, TEST_PATH_MISSING)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_MISSING);
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), 0, "missing");
 
     // Op 3: AddTempRoot
-    wire::write_u64(&mut h.stream, 11).await.unwrap();
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 11, string: TEST_PATH_A);
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), 1);
 
     // Op 4: QueryPathFromHashPart (found — prefix match)
-    wire::write_u64(&mut h.stream, 29).await.unwrap();
-    wire::write_string(&mut h.stream, "00000000000000000000000000000000")
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 29, string: "00000000000000000000000000000000");
     assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
     let path = wire::read_string(&mut h.stream).await.unwrap();
     assert_eq!(path, TEST_PATH_A);

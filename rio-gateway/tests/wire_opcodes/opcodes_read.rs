@@ -10,11 +10,10 @@ async fn test_is_valid_path_exists() {
     let (nar, hash) = make_nar(b"hello");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
-    wire::write_u64(&mut h.stream, 1).await.unwrap(); // wopIsValidPath
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 1,                             // wopIsValidPath
+        string: TEST_PATH_A,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let valid = wire::read_bool(&mut h.stream).await.unwrap();
@@ -27,11 +26,10 @@ async fn test_is_valid_path_exists() {
 async fn test_is_valid_path_missing() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 1).await.unwrap(); // wopIsValidPath
-    wire::write_string(&mut h.stream, TEST_PATH_MISSING)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 1,                             // wopIsValidPath
+        string: TEST_PATH_MISSING,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let valid = wire::read_bool(&mut h.stream).await.unwrap();
@@ -50,11 +48,10 @@ async fn test_ensure_path_exists() {
     let (nar, hash) = make_nar(b"ensure");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
-    wire::write_u64(&mut h.stream, 10).await.unwrap(); // wopEnsurePath
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 10,                            // wopEnsurePath
+        string: TEST_PATH_A,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let result = wire::read_u64(&mut h.stream).await.unwrap();
@@ -69,11 +66,10 @@ async fn test_ensure_path_exists() {
 async fn test_ensure_path_stub_always_succeeds() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 10).await.unwrap(); // wopEnsurePath
-    wire::write_string(&mut h.stream, TEST_PATH_MISSING)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 10,                            // wopEnsurePath
+        string: TEST_PATH_MISSING,
+    );
 
     // Phase 2a stub: always STDERR_LAST + 1, even for missing paths.
     drain_stderr_until_last(&mut h.stream).await;
@@ -94,11 +90,10 @@ async fn test_query_path_info_exists() {
     let info = make_path_info(TEST_PATH_A, &nar, hash);
     h.store.seed(info, nar.clone());
 
-    wire::write_u64(&mut h.stream, 26).await.unwrap(); // wopQueryPathInfo
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 26,                            // wopQueryPathInfo
+        string: TEST_PATH_A,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -125,11 +120,10 @@ async fn test_query_path_info_exists() {
 async fn test_query_path_info_missing_returns_invalid() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 26).await.unwrap(); // wopQueryPathInfo
-    wire::write_string(&mut h.stream, TEST_PATH_MISSING)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 26,                            // wopQueryPathInfo
+        string: TEST_PATH_MISSING,
+    );
 
     // QueryPathInfo for missing path returns STDERR_LAST + valid=false
     // (not STDERR_ERROR — the Nix protocol uses valid=false here).
@@ -153,9 +147,7 @@ async fn test_query_path_from_hash_part_found() {
     // Hash part is the 32-char basename prefix
     let hash_part = "00000000000000000000000000000000";
 
-    wire::write_u64(&mut h.stream, 29).await.unwrap(); // wopQueryPathFromHashPart
-    wire::write_string(&mut h.stream, hash_part).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 29, string: hash_part); // wopQueryPathFromHashPart
 
     drain_stderr_until_last(&mut h.stream).await;
     let result = wire::read_string(&mut h.stream).await.unwrap();
@@ -168,11 +160,10 @@ async fn test_query_path_from_hash_part_found() {
 async fn test_query_path_from_hash_part_not_found() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 29).await.unwrap(); // wopQueryPathFromHashPart
-    wire::write_string(&mut h.stream, "11111111111111111111111111111111")
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 29,                            // wopQueryPathFromHashPart
+        string: "11111111111111111111111111111111",
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let result = wire::read_string(&mut h.stream).await.unwrap();
@@ -189,11 +180,7 @@ async fn test_query_path_from_hash_part_not_found() {
 async fn test_add_temp_root() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 11).await.unwrap(); // wopAddTempRoot
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 11, string: TEST_PATH_A); // wopAddTempRoot
 
     drain_stderr_until_last(&mut h.stream).await;
     let result = wire::read_u64(&mut h.stream).await.unwrap();
@@ -213,11 +200,10 @@ async fn test_nar_from_path_streams_chunks() {
     h.store
         .seed(make_path_info(TEST_PATH_A, &nar, hash), nar.clone());
 
-    wire::write_u64(&mut h.stream, 38).await.unwrap(); // wopNarFromPath
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 38,                            // wopNarFromPath
+        string: TEST_PATH_A,
+    );
 
     // NarFromPath: STDERR_LAST first, then RAW NAR bytes (NOT STDERR_WRITE).
     // Nix client: processStderr(ex) with no sink → copyNAR(from, sink).
@@ -240,11 +226,10 @@ async fn test_nar_from_path_streams_chunks() {
 async fn test_nar_from_path_missing_returns_error() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 38).await.unwrap(); // wopNarFromPath
-    wire::write_string(&mut h.stream, TEST_PATH_MISSING)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 38,                            // wopNarFromPath
+        string: TEST_PATH_MISSING,
+    );
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(!err.message.is_empty(), "error message should be non-empty");
@@ -257,11 +242,10 @@ async fn test_nar_from_path_invalid_path_returns_error() {
     let mut h = TestHarness::setup().await;
 
     // Send a string that fails StorePath::parse (no /nix/store/ prefix).
-    wire::write_u64(&mut h.stream, 38).await.unwrap(); // wopNarFromPath
-    wire::write_string(&mut h.stream, "not-a-valid-store-path")
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 38,                            // wopNarFromPath
+        string: "not-a-valid-store-path",
+    );
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
@@ -278,11 +262,10 @@ async fn test_nar_from_path_invalid_path_returns_error() {
 async fn test_query_realisation_stub_returns_empty() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 43).await.unwrap(); // wopQueryRealisation
-    wire::write_string(&mut h.stream, "sha256:abc!out")
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 43,                            // wopQueryRealisation
+        string: "sha256:abc!out",
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let count = wire::read_u64(&mut h.stream).await.unwrap();
@@ -302,11 +285,10 @@ async fn test_query_missing_reports_will_build() {
     // is missing from store, the handler reports it in willBuild.
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
 
-    wire::write_u64(&mut h.stream, 40).await.unwrap(); // wopQueryMissing
-    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 40,                            // wopQueryMissing
+        strings: &[format!("{drv_path}!out")],
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -336,14 +318,10 @@ async fn test_query_missing_reports_will_build() {
 async fn test_query_derivation_output_map_missing_drv() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 41).await.unwrap();
-    wire::write_string(
-        &mut h.stream,
-        "/nix/store/11111111111111111111111111111111-missing.drv",
-    )
-    .await
-    .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 41,
+        string: "/nix/store/11111111111111111111111111111111-missing.drv",
+    );
 
     // Missing .drv: STDERR_ERROR
     let err = drain_stderr_expecting_error(&mut h.stream).await;
@@ -364,9 +342,7 @@ async fn test_query_derivation_output_map_found() {
     h.store
         .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
 
-    wire::write_u64(&mut h.stream, 41).await.unwrap();
-    wire::write_string(&mut h.stream, drv_path).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream; u64: 41, string: drv_path);
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -413,12 +389,11 @@ async fn test_query_valid_paths_filters_missing() {
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
     // TEST_PATH_MISSING is not seeded.
 
-    wire::write_u64(&mut h.stream, 31).await.unwrap(); // wopQueryValidPaths
-    wire::write_strings(&mut h.stream, &[TEST_PATH_A, TEST_PATH_MISSING])
-        .await
-        .unwrap();
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // substitute
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 31,                            // wopQueryValidPaths
+        strings: &[TEST_PATH_A, TEST_PATH_MISSING],
+        bool: false,                        // substitute
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let valid = wire::read_strings(&mut h.stream).await.unwrap();
@@ -436,12 +411,11 @@ async fn test_query_valid_paths_filters_missing() {
 async fn test_query_valid_paths_empty() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 31).await.unwrap();
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_bool(&mut h.stream, false).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 31,
+        strings: wire::NO_STRINGS,
+        bool: false,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let valid = wire::read_strings(&mut h.stream).await.unwrap();
@@ -456,11 +430,10 @@ async fn test_query_valid_paths_empty() {
 async fn test_is_valid_path_garbage_returns_false() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 1).await.unwrap();
-    wire::write_string(&mut h.stream, "garbage-not-a-store-path")
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 1,
+        string: "garbage-not-a-store-path",
+    );
 
     // Should NOT receive STDERR_ERROR — just STDERR_LAST + false.
     drain_stderr_until_last(&mut h.stream).await;

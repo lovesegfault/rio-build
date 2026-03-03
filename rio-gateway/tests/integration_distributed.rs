@@ -19,19 +19,13 @@ use rio_nix::protocol::wire;
 use rio_proto::types;
 use rio_test_support::grpc::spawn_mock_scheduler;
 use rio_test_support::wire::{do_handshake, send_set_options};
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use rio_test_support::wire_send;
+use tokio::io::DuplexStream;
 
 /// Send wopQueryValidPaths (opcode 31) for the given paths.
 /// Returns the list of valid paths from the server response.
 async fn query_valid_paths(s: &mut DuplexStream, paths: &[&str]) -> Vec<String> {
-    wire::write_u64(s, 31).await.unwrap(); // wopQueryValidPaths
-
-    // Write paths as string collection
-    wire::write_strings(s, paths).await.unwrap();
-
-    // Write substitute flag (bool = u64)
-    wire::write_u64(s, 0).await.unwrap();
-    s.flush().await.unwrap();
+    wire_send!(s; u64: 31, strings: paths, u64: 0); // wopQueryValidPaths, paths, substitute=false
 
     // Read response: STDERR_LAST + valid paths
     let msg = wire::read_u64(s).await.unwrap();
@@ -153,9 +147,7 @@ async fn test_distributed_handshake_wire_sequence() {
     let s = &mut sess.stream;
 
     // Phase 1: Send client magic + version
-    wire::write_u64(s, WORKER_MAGIC_1).await.unwrap();
-    wire::write_u64(s, PROTOCOL_VERSION).await.unwrap();
-    s.flush().await.unwrap();
+    wire_send!(s; u64: WORKER_MAGIC_1, u64: PROTOCOL_VERSION);
 
     // Read server magic
     let magic2 = wire::read_u64(s).await.unwrap();
@@ -169,8 +161,7 @@ async fn test_distributed_handshake_wire_sequence() {
     );
 
     // Phase 2: Feature exchange
-    wire::write_strings(s, &Vec::<String>::new()).await.unwrap();
-    s.flush().await.unwrap();
+    wire_send!(s; strings: &Vec::<String>::new());
 
     let server_features = wire::read_strings(s).await.unwrap();
     // Server may return empty features, that's fine
@@ -180,9 +171,7 @@ async fn test_distributed_handshake_wire_sequence() {
     );
 
     // Phase 3: Obsolete CPU affinity + reserveSpace
-    wire::write_u64(s, 0).await.unwrap();
-    wire::write_u64(s, 0).await.unwrap();
-    s.flush().await.unwrap();
+    wire_send!(s; u64: 0, u64: 0);
 
     // Read version string
     let version_str = wire::read_string(s).await.unwrap();

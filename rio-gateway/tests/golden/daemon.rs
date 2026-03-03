@@ -80,17 +80,14 @@ async fn exchange_with_daemon_inner(
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1};
     use rio_nix::protocol::wire;
+    use rio_test_support::wire_bytes;
 
     let mut stream = UnixStream::connect(socket_path).await?;
     let mut all_client = Vec::new();
     let mut all_server = Vec::new();
 
     // --- Handshake phase 1: magic + version ---
-    let mut phase1 = Vec::new();
-    wire::write_u64(&mut phase1, WORKER_MAGIC_1).await.unwrap();
-    wire::write_u64(&mut phase1, PROTOCOL_VERSION)
-        .await
-        .unwrap();
+    let phase1 = wire_bytes![u64: WORKER_MAGIC_1, u64: PROTOCOL_VERSION];
     stream.write_all(&phase1).await?;
     stream.flush().await?;
     all_client.extend_from_slice(&phase1);
@@ -101,10 +98,7 @@ async fn exchange_with_daemon_inner(
     all_server.extend_from_slice(&srv_phase1);
 
     // --- Handshake phase 2: features exchange ---
-    let mut phase2 = Vec::new();
-    wire::write_strings(&mut phase2, wire::NO_STRINGS)
-        .await
-        .unwrap();
+    let phase2 = wire_bytes![strings: wire::NO_STRINGS];
     stream.write_all(&phase2).await?;
     stream.flush().await?;
     all_client.extend_from_slice(&phase2);
@@ -127,10 +121,8 @@ async fn exchange_with_daemon_inner(
         }
     }
 
-    // --- Handshake phase 3: post-handshake ---
-    let mut phase3 = Vec::new();
-    wire::write_u64(&mut phase3, 0).await.unwrap(); // CPU affinity
-    wire::write_u64(&mut phase3, 0).await.unwrap(); // reserveSpace
+    // --- Handshake phase 3: CPU affinity + reserveSpace ---
+    let phase3 = wire_bytes![u64: 0, u64: 0];
     stream.write_all(&phase3).await?;
     stream.flush().await?;
     all_client.extend_from_slice(&phase3);
@@ -155,12 +147,10 @@ async fn exchange_with_daemon_inner(
     // values — it accepts and discards them. Testing non-default options would
     // only validate the parsing/discarding path, which is already covered by
     // direct protocol tests (test_set_options_with_overrides).
-    let mut set_opts = Vec::new();
-    wire::write_u64(&mut set_opts, 19).await.unwrap();
-    for _ in 0..12 {
-        wire::write_u64(&mut set_opts, 0).await.unwrap();
-    }
-    wire::write_u64(&mut set_opts, 0).await.unwrap(); // empty overrides
+    let set_opts = wire_bytes![
+        u64: 19, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+        u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+    ];
     stream.write_all(&set_opts).await?;
     stream.flush().await?;
     all_client.extend_from_slice(&set_opts);
