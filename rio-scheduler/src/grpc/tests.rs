@@ -440,3 +440,74 @@ async fn test_bridge_build_events_lagged_sends_data_loss() {
     // Stream should then end (bridge task broke out of the loop).
     assert!(stream.next().await.is_none());
 }
+
+/// UUID v7 build_ids are time-ordered: two submissions ~apart in time
+/// produce lexicographically ordered IDs. This is the property we rely
+/// on for S3 log key prefix-scanning and PG index locality.
+///
+/// We don't assert strict monotonicity within the same millisecond —
+/// v7's counter field handles that, but testing it requires contriving
+/// >1 call per ms which is flaky. Instead: sleep > 1ms between
+/// submissions and assert lexicographic order. This tests the property
+/// we actually care about (chronological ordering at human timescales),
+/// not the RFC's intra-ms counter edge case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new(handle);
+
+    let mk_req = |tag: &str| rio_proto::types::SubmitBuildRequest {
+        tenant_id: String::new(),
+        priority_class: String::new(),
+        nodes: vec![make_test_node(tag, "x86_64-linux")],
+        edges: vec![],
+        max_silent_time: 0,
+        build_timeout: 0,
+        build_cores: 0,
+        keep_going: false,
+    };
+
+    // First submission.
+    let mut s1 = grpc
+        .submit_build(tonic::Request::new(mk_req("v7-first")))
+        .await?
+        .into_inner();
+    let id1 = s1.next().await.expect("first event").expect("ok").build_id;
+
+    // > 1ms gap guarantees a different v7 timestamp prefix. 2ms is
+    // plenty; tokio's time granularity is ~1ms on most systems.
+    tokio::time::sleep(Duration::from_millis(2)).await;
+
+    // Second submission.
+    let mut s2 = grpc
+        .submit_build(tonic::Request::new(mk_req("v7-second")))
+        .await?
+        .into_inner();
+    let id2 = s2.next().await.expect("first event").expect("ok").build_id;
+
+    // v7 IDs sort lexicographically by creation time. The string
+    // representation is the canonical UUID format (8-4-4-4-12 hex
+    // with lowercase a-f), and lex-order on that matches timestamp
+    // order for v7 (the timestamp is in the high bits).
+    assert!(
+        id1 < id2,
+        "v7 build_ids should be time-ordered: {id1} should sort before {id2}"
+    );
+
+    // Also verify they parse as v7 (version nibble = 7). The version
+    // is the first nibble of the third hyphen-delimited group.
+    let parse = |s: &str| -> Uuid { s.parse().expect("valid UUID") };
+    assert_eq!(
+        parse(&id1).get_version_num(),
+        7,
+        "build_id should be UUID v7"
+    );
+    assert_eq!(
+        parse(&id2).get_version_num(),
+        7,
+        "build_id should be UUID v7"
+    );
+
+    Ok(())
+}
