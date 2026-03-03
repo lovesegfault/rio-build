@@ -644,3 +644,89 @@ async fn test_find_missing_paths_rejects_oversized_batch() {
 
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Error-branch coverage: internal_error, blob-missing paths
+// ---------------------------------------------------------------------------
+
+/// internal_error() must NOT leak sqlx/Postgres details to the client.
+/// Server logs the full error; client sees only "storage operation failed".
+#[tokio::test]
+async fn test_internal_error_hides_sqlx_details() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+
+    // Close the pool so the next DB query fails with a sqlx::Error::PoolClosed.
+    db.pool.close().await;
+
+    let result = client
+        .query_path_info(QueryPathInfoRequest {
+            store_path: "/nix/store/00000000000000000000000000000000-valid-name".into(),
+        })
+        .await;
+
+    let status = result.expect_err("should fail on closed pool");
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert_eq!(
+        status.message(),
+        "storage operation failed",
+        "message must be generic, not leak DB details"
+    );
+    // Belt-and-suspenders: no substring from common sqlx errors.
+    assert!(!status.message().to_lowercase().contains("sqlx"));
+    assert!(!status.message().to_lowercase().contains("postgres"));
+    assert!(!status.message().to_lowercase().contains("pool"));
+
+    server.abort();
+}
+
+// Note: the "NAR blob not found for" branch (grpc.rs:369-372) is defense-
+// in-depth for a race between query_path_info and get_blob_key (both do the
+// same INNER JOIN narinfo/nar_blobs with status='complete'). Not normally
+// reachable; no test.
+
+/// GetPath with nar_blobs row present but blob missing from backend.
+/// This is the data-loss scenario: metadata says it's there, backend lost it.
+#[tokio::test]
+async fn test_get_path_backend_blob_missing() {
+    use rio_proto::types::GetPathRequest;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store(db.pool.clone()).await;
+
+    let store_path = "/nix/store/33333333333333333333333333333333-backend-missing";
+    let nar = make_nar(b"content").0;
+    let info = make_path_info_for_nar(store_path, &nar);
+    put_path(&mut client, info, nar).await.unwrap();
+
+    // Delete the blob from the backend so metadata says it's there but
+    // backend.get() returns None. This is the data-loss scenario.
+    use rio_store::backend::NarBackend;
+    let blob_key: String = sqlx::query_scalar(
+        "SELECT b.blob_key FROM nar_blobs b JOIN narinfo n \
+         ON b.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(store_path)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    backend
+        .delete(&blob_key)
+        .await
+        .expect("delete from backend");
+
+    let result = client
+        .get_path(GetPathRequest {
+            store_path: store_path.into(),
+        })
+        .await;
+    let status = result.expect_err("should be NotFound");
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert!(
+        status.message().contains("NAR blob missing from backend"),
+        "got: {}",
+        status.message()
+    );
+
+    server.abort();
+}
