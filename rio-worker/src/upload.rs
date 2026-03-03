@@ -277,7 +277,7 @@ mod tests {
         StoreServiceClient<Channel>,
         tokio::task::JoinHandle<()>,
     ) {
-        let (store, addr, handle) = spawn_mock_store().await;
+        let (store, addr, handle) = spawn_mock_store().await.unwrap();
         let client = rio_proto::client::connect_store(&addr.to_string())
             .await
             .expect("connect to mock store");

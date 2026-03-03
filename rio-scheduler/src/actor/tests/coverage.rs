@@ -1295,7 +1295,7 @@ async fn test_check_cached_outputs_store_error_non_fatal() {
     use std::sync::atomic::Ordering;
 
     let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, addr, _store_h) = spawn_mock_store().await;
+    let (store, addr, _store_h) = spawn_mock_store().await.unwrap();
     store.fail_find_missing.store(true, Ordering::SeqCst);
 
     let store_client = rio_proto::client::connect_store(&addr.to_string())
