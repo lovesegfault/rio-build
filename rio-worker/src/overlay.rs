@@ -14,6 +14,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nix::mount::{MntFlags, MsFlags};
 
@@ -32,6 +34,10 @@ pub struct OverlayMount {
     work: PathBuf,
     merged: PathBuf,
     mounted: bool,
+    /// Shared worker-lifetime counter. Incremented in `Drop` when teardown
+    /// fails (alongside the `rio_worker_overlay_teardown_failures_total`
+    /// metric) so `execute_build` can refuse new work after N leaks.
+    leak_counter: Arc<AtomicUsize>,
 }
 
 impl OverlayMount {
@@ -50,6 +56,19 @@ impl OverlayMount {
     pub fn merged_dir(&self) -> &Path {
         &self.merged
     }
+
+    /// Construct an `OverlayMount` with `mounted=true` but no real mount.
+    /// Test-only: used to drive the `Drop` path without `CAP_SYS_ADMIN`.
+    #[cfg(test)]
+    pub(crate) fn new_for_leak_test(leak_counter: Arc<AtomicUsize>) -> Self {
+        Self {
+            upper: PathBuf::from("/nonexistent-upper"),
+            work: PathBuf::from("/nonexistent-work"),
+            merged: PathBuf::from("/nonexistent-merged"),
+            mounted: true,
+            leak_counter,
+        }
+    }
 }
 
 impl Drop for OverlayMount {
@@ -61,11 +80,14 @@ impl Drop for OverlayMount {
                     error = %e,
                     "failed to teardown overlay in Drop (mount leaked)"
                 );
-                // Centralize the metric here so it fires regardless of exit
-                // path (explicit teardown, ?-early-return, panic unwinding).
-                // The explicit teardown_overlay() call sets mounted=false on
-                // success, so this block only runs on Drop for error/panic paths.
+                // Centralize BOTH the metric and the leak counter here so
+                // they fire regardless of exit path (explicit teardown,
+                // ?-early-return, panic unwinding). teardown_overlay() sets
+                // mounted=false on success, so this block only runs when
+                // teardown actually failed. execute_build reads the counter
+                // at entry to refuse new work after N leaks.
                 metrics::counter!("rio_worker_overlay_teardown_failures_total").increment(1);
+                self.leak_counter.fetch_add(1, Ordering::Relaxed);
             }
             self.mounted = false;
         }
@@ -100,6 +122,7 @@ pub fn setup_overlay(
     lower: &Path,
     base_dir: &Path,
     build_id: &str,
+    leak_counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<OverlayMount> {
     const HOST_STORE: &str = "/nix/store";
     anyhow::ensure!(
@@ -172,6 +195,7 @@ pub fn setup_overlay(
         work,
         merged,
         mounted: true,
+        leak_counter,
     })
 }
 
@@ -231,6 +255,49 @@ mod tests {
         assert_eq!(db_dir, dir.path().join("nix/var/nix/db"));
     }
 
+    /// Verify the leak counter increments exactly when teardown fails in Drop.
+    /// We construct with `mounted=true` and paths that aren't real mounts;
+    /// `umount2` will fail → Drop's error branch fires → counter increments.
+    #[test]
+    fn test_leak_counter_increments_on_drop_failure() {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Scope so Drop runs at the closing brace.
+        {
+            let _mount = OverlayMount::new_for_leak_test(counter.clone());
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                0,
+                "counter should not increment until Drop"
+            );
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "counter should increment exactly once when Drop's teardown fails"
+        );
+    }
+
+    /// Verify the counter does NOT increment when `mounted=false` (i.e., after
+    /// a successful explicit teardown_overlay() or if setup never completed).
+    #[test]
+    fn test_leak_counter_no_increment_when_unmounted() {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        {
+            let mut mount = OverlayMount::new_for_leak_test(counter.clone());
+            // Simulate successful explicit teardown.
+            mount.mounted = false;
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "counter should not increment when mounted=false at Drop"
+        );
+    }
+
     #[test]
     fn test_overlay_mount_paths() {
         let base = PathBuf::from("/tmp/overlays");
@@ -254,14 +321,18 @@ mod tests {
         );
     }
 
+    fn dummy_counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
     #[test]
     fn test_setup_overlay_rejects_bad_build_id() {
         let dir = tempfile::tempdir().unwrap();
         let lower = dir.path();
 
-        assert!(setup_overlay(lower, dir.path(), "").is_err());
-        assert!(setup_overlay(lower, dir.path(), "foo/bar").is_err());
-        assert!(setup_overlay(lower, dir.path(), "foo\0bar").is_err());
+        assert!(setup_overlay(lower, dir.path(), "", dummy_counter()).is_err());
+        assert!(setup_overlay(lower, dir.path(), "foo/bar", dummy_counter()).is_err());
+        assert!(setup_overlay(lower, dir.path(), "foo\0bar", dummy_counter()).is_err());
     }
 
     #[test]
@@ -273,7 +344,7 @@ mod tests {
         let base = dir.path().join("base");
         std::fs::create_dir_all(&lower).unwrap();
 
-        let Err(e) = setup_overlay(&lower, &base, "test-build") else {
+        let Err(e) = setup_overlay(&lower, &base, "test-build", dummy_counter()) else {
             panic!("expected setup_overlay to fail when upper and lower share a filesystem");
         };
         let msg = e.to_string();
@@ -292,7 +363,7 @@ mod tests {
         std::fs::create_dir_all(&lower).unwrap();
 
         // Fails at st_dev check (post-mkdir, pre-mount).
-        let _ = setup_overlay(&lower, &base, "test-build");
+        let _ = setup_overlay(&lower, &base, "test-build", dummy_counter());
 
         // Overlayfs upperdir should have been created at upper/nix/store/,
         // NOT just upper/. This is critical for upload.rs which scans
