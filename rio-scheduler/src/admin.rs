@@ -227,6 +227,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GetBuildLogsRequest>,
     ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
         // Validate: need at least derivation_path. build_id is needed only

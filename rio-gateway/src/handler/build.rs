@@ -127,6 +127,17 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashMap<String, u64>,
 ) -> anyhow::Result<BuildResult> {
+    // Trace propagation: gateway is the trace ROOT (no incoming
+    // traceparent from the SSH client — Nix doesn't speak W3C trace
+    // context). The span enclosing this call (the per-opcode #[instrument]
+    // in handle_opcode) is the top of the trace. Inject its context into
+    // the outgoing gRPC metadata so the scheduler's SubmitBuild span
+    // becomes a child, and everything downstream (actor, store, worker)
+    // chains off that. This is THE hop that makes distributed tracing
+    // work — without it, scheduler spans are orphaned root traces.
+    let mut request = tonic::Request::new(request);
+    rio_proto::interceptor::inject_current(request.metadata_mut());
+
     let mut event_stream = rio_common::grpc::with_timeout(
         "SubmitBuild",
         DEFAULT_GRPC_TIMEOUT,

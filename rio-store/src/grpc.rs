@@ -92,6 +92,7 @@ impl StoreService for StoreServiceImpl {
         &self,
         request: Request<Streaming<PutPathRequest>>,
     ) -> Result<Response<PutPathResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let start = std::time::Instant::now();
         let mut stream = request.into_inner();
 
@@ -352,6 +353,7 @@ impl StoreService for StoreServiceImpl {
         &self,
         request: Request<GetPathRequest>,
     ) -> Result<Response<Self::GetPathStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
@@ -473,6 +475,7 @@ impl StoreService for StoreServiceImpl {
         &self,
         request: Request<QueryPathInfoRequest>,
     ) -> Result<Response<PathInfo>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
         validate_store_path(&req.store_path)?;
@@ -493,6 +496,7 @@ impl StoreService for StoreServiceImpl {
         &self,
         request: Request<FindMissingPathsRequest>,
     ) -> Result<Response<FindMissingPathsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
         // Bound request size to prevent DoS via huge path lists.
