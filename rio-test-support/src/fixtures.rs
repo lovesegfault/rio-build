@@ -35,7 +35,8 @@ pub fn make_nar(contents: &[u8]) -> (Vec<u8>, [u8; 32]) {
         contents: contents.to_vec(),
     };
     let mut buf = Vec::new();
-    rio_nix::nar::serialize(&mut buf, &node).unwrap();
+    // Vec<u8> impl Write never fails; the Result is for real I/O sinks.
+    rio_nix::nar::serialize(&mut buf, &node).expect("NAR serialize to Vec is infallible");
     let digest: [u8; 32] = Sha256::digest(&buf).into();
     (buf, digest)
 }

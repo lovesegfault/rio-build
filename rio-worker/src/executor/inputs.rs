@@ -396,7 +396,7 @@ mod tests {
     }
 
     async fn spawn_and_connect() -> (MockStore, StoreServiceClient<Channel>) {
-        let (store, addr, _h) = spawn_mock_store().await;
+        let (store, addr, _h) = spawn_mock_store().await.unwrap();
         let client = rio_proto::client::connect_store(&addr.to_string())
             .await
             .expect("connect to mock store");

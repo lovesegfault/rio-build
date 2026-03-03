@@ -233,7 +233,7 @@ async fn test_disconnect_without_active_build_no_cancel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cancel_build_recorded_by_mock_scheduler() {
     // This test only needs the scheduler mock (no full session).
-    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
 
     let mut scheduler_client =
         rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(

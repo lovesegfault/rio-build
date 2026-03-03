@@ -360,9 +360,10 @@ impl SchedulerService for MockScheduler {
 // ============================================================================
 
 /// Spawn a MockStore on an ephemeral port. Returns `(store, addr, handle)`.
-pub async fn spawn_mock_store() -> (MockStore, SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+pub async fn spawn_mock_store()
+-> anyhow::Result<(MockStore, SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let store = MockStore::new();
     let store_clone = store.clone();
     let handle = tokio::spawn(async move {
@@ -374,13 +375,14 @@ pub async fn spawn_mock_store() -> (MockStore, SocketAddr, tokio::task::JoinHand
             .expect("mock store server");
     });
     tokio::task::yield_now().await;
-    (store, addr, handle)
+    Ok((store, addr, handle))
 }
 
 /// Spawn a MockScheduler on an ephemeral port. Returns `(scheduler, addr, handle)`.
-pub async fn spawn_mock_scheduler() -> (MockScheduler, SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+pub async fn spawn_mock_scheduler()
+-> anyhow::Result<(MockScheduler, SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let sched = MockScheduler::new();
     let sched_clone = sched.clone();
     let handle = tokio::spawn(async move {
@@ -392,5 +394,5 @@ pub async fn spawn_mock_scheduler() -> (MockScheduler, SocketAddr, tokio::task::
             .expect("mock scheduler server");
     });
     tokio::task::yield_now().await;
-    (sched, addr, handle)
+    Ok((sched, addr, handle))
 }

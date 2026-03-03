@@ -70,8 +70,8 @@ async fn test_set_options_standalone() {
 async fn test_version_too_old_sends_stderr_error() {
     use rio_nix::protocol::handshake::{WORKER_MAGIC_1, WORKER_MAGIC_2};
 
-    let (_store, store_addr, store_handle) = spawn_mock_store().await;
-    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+    let (_store, store_addr, store_handle) = spawn_mock_store().await.unwrap();
+    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
 
     let store_channel = Channel::from_shared(format!("http://{store_addr}"))
         .unwrap()

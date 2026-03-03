@@ -29,8 +29,8 @@ pub struct GatewaySession {
 impl GatewaySession {
     /// Spawn mocks + run_protocol. Ready to send opcodes on `.stream`.
     pub async fn new() -> Self {
-        let (store, store_addr, store_handle) = spawn_mock_store().await;
-        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+        let (store, store_addr, store_handle) = spawn_mock_store().await.unwrap();
+        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
 
         let store_client = rio_proto::client::connect_store(&store_addr.to_string())
             .await

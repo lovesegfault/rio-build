@@ -48,8 +48,8 @@ impl TestHarness {
     /// Start mock gRPC servers, spawn run_protocol, and perform handshake +
     /// setOptions. Returns a harness with a ready-to-use client stream.
     async fn setup() -> Self {
-        let (store, store_addr, store_handle) = spawn_mock_store().await;
-        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await;
+        let (store, store_addr, store_handle) = spawn_mock_store().await.unwrap();
+        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
 
         // Connect gRPC clients
         let store_channel = Channel::from_shared(format!("http://{store_addr}"))

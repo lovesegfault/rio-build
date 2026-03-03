@@ -25,7 +25,7 @@ use rio_test_support::grpc::{MockStore, spawn_mock_scheduler, spawn_mock_store};
 async fn gateway_response(client_bytes: &[u8], store: MockStore) -> Vec<u8> {
     // Spawn mock gRPC servers for this store + a dummy scheduler
     let store_addr = spawn_store_for(store).await;
-    let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await;
+    let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await.unwrap();
 
     let mut store_client = rio_proto::client::connect_store(&store_addr.to_string())
         .await
@@ -141,8 +141,8 @@ async fn run_live_conformance(
 #[tokio::test]
 async fn test_golden_live_handshake() {
     let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
-    let (_store, store_addr, _sh) = spawn_mock_store().await;
-    let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await;
+    let (_store, store_addr, _sh) = spawn_mock_store().await.unwrap();
+    let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await.unwrap();
 
     let (client_bytes, daemon_response) = golden::daemon::exchange_with_daemon(&socket, None)
         .await
