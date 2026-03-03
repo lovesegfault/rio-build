@@ -422,4 +422,192 @@ mod tests {
             assert_eq!(parsed, state);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Direct DB integration tests via TestDb
+    // -----------------------------------------------------------------------
+
+    use rio_test_support::TestDb;
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
+    #[test]
+    fn test_assignment_status_as_str_exhaustive() {
+        assert_eq!(AssignmentStatus::Pending.as_str(), "pending");
+        assert_eq!(AssignmentStatus::Acknowledged.as_str(), "acknowledged");
+        assert_eq!(AssignmentStatus::Completed.as_str(), "completed");
+        assert_eq!(AssignmentStatus::Failed.as_str(), "failed");
+        assert_eq!(AssignmentStatus::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn test_assignment_status_is_terminal() {
+        assert!(!AssignmentStatus::Pending.is_terminal());
+        assert!(!AssignmentStatus::Acknowledged.is_terminal());
+        assert!(AssignmentStatus::Completed.is_terminal());
+        assert!(AssignmentStatus::Failed.is_terminal());
+        assert!(AssignmentStatus::Cancelled.is_terminal());
+    }
+
+    /// Upsert a single derivation and return its db_id. Helper for tests
+    /// that need a valid derivation_id foreign key.
+    async fn insert_test_derivation(db: &SchedulerDb, drv_hash: &str) -> Uuid {
+        let mut tx = db.pool.begin().await.unwrap();
+        let row = DerivationRow {
+            drv_hash: drv_hash.into(),
+            drv_path: format!("/nix/store/{drv_hash}-test.drv"),
+            pname: Some("test-pkg".into()),
+            system: "x86_64-linux".into(),
+            status: DerivationStatus::Created,
+            required_features: vec![],
+        };
+        let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        *ids.get(drv_hash).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_insert_build_derivation_idempotent() {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let build_id = Uuid::new_v4();
+        db.insert_build(build_id, None, crate::state::PriorityClass::Scheduled)
+            .await
+            .unwrap();
+        let drv_id = insert_test_derivation(&db, "aaa").await;
+
+        // Call twice — ON CONFLICT DO NOTHING should make the second call a no-op.
+        db.insert_build_derivation(build_id, drv_id).await.unwrap();
+        db.insert_build_derivation(build_id, drv_id).await.unwrap();
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM build_derivations WHERE build_id = $1")
+                .bind(build_id)
+                .fetch_one(&test_db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "ON CONFLICT should prevent duplicate");
+    }
+
+    /// BuildState::Pending has now_col="" → no timestamp column touched.
+    #[tokio::test]
+    async fn test_update_build_status_pending_no_timestamps() {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let build_id = Uuid::new_v4();
+        db.insert_build(build_id, None, crate::state::PriorityClass::Scheduled)
+            .await
+            .unwrap();
+
+        // Insert starts at 'pending'. Transition to Active then back to Pending
+        // (unusual but valid at the DB layer — the state machine rejects it,
+        // but this is testing the raw SQL branch).
+        db.update_build_status(build_id, BuildState::Active, None)
+            .await
+            .unwrap();
+        db.update_build_status(build_id, BuildState::Pending, None)
+            .await
+            .unwrap();
+
+        // Query timestamp as Option<String> via text cast to avoid adding a
+        // chrono dep just for test assertions.
+        let (status, finished_at): (String, Option<String>) =
+            sqlx::query_as("SELECT status, finished_at::text FROM builds WHERE build_id = $1")
+                .bind(build_id)
+                .fetch_one(&test_db.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending");
+        // Pending transition does NOT set finished_at (the now_col="" branch).
+        assert!(finished_at.is_none());
+    }
+
+    /// Non-terminal status (Acknowledged) → completed_at stays NULL.
+    #[tokio::test]
+    async fn test_update_assignment_status_acknowledged_no_completed_at() {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let drv_id = insert_test_derivation(&db, "bbb").await;
+        db.insert_assignment(drv_id, "worker-1", 1).await.unwrap();
+
+        db.update_assignment_status(drv_id, AssignmentStatus::Acknowledged)
+            .await
+            .unwrap();
+
+        let (status, completed_at): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, completed_at::text FROM assignments WHERE derivation_id = $1",
+        )
+        .bind(drv_id)
+        .fetch_one(&test_db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "acknowledged");
+        assert!(completed_at.is_none(), "non-terminal → completed_at NULL");
+    }
+
+    /// Terminal status (Completed) → completed_at = now().
+    #[tokio::test]
+    async fn test_update_assignment_status_completed_sets_completed_at() {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let drv_id = insert_test_derivation(&db, "ccc").await;
+        db.insert_assignment(drv_id, "worker-1", 1).await.unwrap();
+
+        db.update_assignment_status(drv_id, AssignmentStatus::Completed)
+            .await
+            .unwrap();
+
+        let (status, completed_at): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, completed_at::text FROM assignments WHERE derivation_id = $1",
+        )
+        .bind(drv_id)
+        .fetch_one(&test_db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "completed");
+        assert!(completed_at.is_some(), "terminal → completed_at set");
+    }
+
+    /// EMA: first insert uses the duration directly; second update blends.
+    /// ema = old * (1-ALPHA) + new * ALPHA = 10 * 0.7 + 20 * 0.3 = 13.
+    #[tokio::test]
+    async fn test_update_build_history_ema_accumulates() {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        db.update_build_history("hello", "x86_64-linux", 10.0)
+            .await
+            .unwrap();
+        let (ema1, count1): (f64, i32) = sqlx::query_as(
+            "SELECT ema_duration_secs, sample_count FROM build_history \
+             WHERE pname = 'hello' AND system = 'x86_64-linux'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .unwrap();
+        assert!((ema1 - 10.0).abs() < 0.001, "first insert: ema={ema1}");
+        assert_eq!(count1, 1);
+
+        db.update_build_history("hello", "x86_64-linux", 20.0)
+            .await
+            .unwrap();
+        let (ema2, count2): (f64, i32) = sqlx::query_as(
+            "SELECT ema_duration_secs, sample_count FROM build_history \
+             WHERE pname = 'hello' AND system = 'x86_64-linux'",
+        )
+        .fetch_one(&test_db.pool)
+        .await
+        .unwrap();
+        let expected = 10.0 * (1.0 - EMA_ALPHA) + 20.0 * EMA_ALPHA;
+        assert!(
+            (ema2 - expected).abs() < 0.001,
+            "second update: expected {expected}, got {ema2}"
+        );
+        assert_eq!(count2, 2);
+    }
 }
