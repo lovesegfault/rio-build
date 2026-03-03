@@ -17,6 +17,7 @@ use crate::types::{
     GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest,
     QueryPathInfoRequest, get_path_response, put_path_request,
 };
+use crate::validated::ValidatedPathInfo;
 
 /// Unified chunk size for NAR streaming (256 KiB).
 ///
@@ -83,6 +84,8 @@ pub enum NarCollectError {
     Stream(#[from] tonic::Status),
     #[error("NAR exceeds maximum size: {got} > {limit}")]
     SizeExceeded { got: u64, limit: u64 },
+    #[error("store returned malformed PathInfo: {0}")]
+    Validation(#[from] crate::validated::PathInfoValidationError),
 }
 
 impl NarCollectError {
@@ -130,12 +133,12 @@ pub async fn collect_nar_stream(
 /// sliced on demand as tonic polls, keeping at most a few chunks in
 /// flight at once.
 pub fn chunk_nar_for_put(
-    info: PathInfo,
+    info: ValidatedPathInfo,
     nar: Arc<[u8]>,
 ) -> impl Stream<Item = PutPathRequest> + Send + 'static {
     let metadata = PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info),
+            info: Some(info.into()),
         })),
     };
 
@@ -156,18 +159,25 @@ pub fn chunk_nar_for_put(
 
 /// QueryPathInfo with timeout. Returns `None` if the store reports NotFound.
 ///
-/// Collapses the common `match { Ok => Some, NotFound => None, Err => Err }`
-/// pattern. On timeout, returns `Status::deadline_exceeded`.
+/// Validates the returned `PathInfo` — a malformed response (bad store
+/// path, wrong-length nar_hash, bad reference) is propagated as an error,
+/// not silently passed through. Collapses the common
+/// `match { Ok => Some, NotFound => None, Err => Err }` pattern.
 pub async fn query_path_info_opt(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     timeout: Duration,
-) -> Result<Option<PathInfo>, tonic::Status> {
+) -> Result<Option<ValidatedPathInfo>, tonic::Status> {
     let req = QueryPathInfoRequest {
         store_path: store_path.to_string(),
     };
     match tokio::time::timeout(timeout, client.query_path_info(req)).await {
-        Ok(Ok(resp)) => Ok(Some(resp.into_inner())),
+        Ok(Ok(resp)) => {
+            let validated = ValidatedPathInfo::try_from(resp.into_inner()).map_err(|e| {
+                tonic::Status::internal(format!("store returned malformed PathInfo: {e}"))
+            })?;
+            Ok(Some(validated))
+        }
         Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(None),
         Ok(Err(status)) => Err(status),
         Err(_) => Err(tonic::Status::deadline_exceeded(format!(
@@ -186,7 +196,7 @@ pub async fn get_path_nar(
     store_path: &str,
     timeout: Duration,
     max_nar_size: u64,
-) -> Result<Option<(PathInfo, Vec<u8>)>, NarCollectError> {
+) -> Result<Option<(ValidatedPathInfo, Vec<u8>)>, NarCollectError> {
     let req = GetPathRequest {
         store_path: store_path.to_string(),
     };
@@ -197,7 +207,13 @@ pub async fn get_path_nar(
             Err(status) => return Err(NarCollectError::Stream(status)),
         };
         let (info, nar) = collect_nar_stream(&mut stream, max_nar_size).await?;
-        Ok(info.map(|i| (i, nar)))
+        match info {
+            Some(raw) => {
+                let validated = ValidatedPathInfo::try_from(raw)?;
+                Ok(Some((validated, nar)))
+            }
+            None => Ok(None),
+        }
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(r) => r,

@@ -13,7 +13,7 @@ use tonic::transport::Channel;
 
 use rio_nix::nar;
 use rio_proto::store::store_service_client::StoreServiceClient;
-use rio_proto::types::PathInfo;
+use rio_proto::validated::ValidatedPathInfo;
 
 /// Maximum number of upload retry attempts.
 const MAX_UPLOAD_RETRIES: u32 = 3;
@@ -93,14 +93,14 @@ async fn upload_output(
     })?;
 
     // Compute SHA-256
-    let nar_hash = Sha256::digest(&nar_data).to_vec();
+    let nar_hash: [u8; 32] = Sha256::digest(&nar_data).into();
     let nar_size = nar_data.len() as u64;
     let nar_data: std::sync::Arc<[u8]> = nar_data.into();
 
     tracing::info!(
         store_path = %store_path,
         nar_size,
-        nar_hash = %hex::encode(&nar_hash),
+        nar_hash = %hex::encode(nar_hash),
         "uploading output"
     );
 
@@ -121,7 +121,7 @@ async fn upload_output(
         match do_upload(
             store_client,
             &store_path,
-            &nar_hash,
+            nar_hash,
             nar_size,
             nar_data.clone(),
         )
@@ -131,7 +131,7 @@ async fn upload_output(
                 metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
                 return Ok(UploadResult {
                     store_path,
-                    nar_hash,
+                    nar_hash: nar_hash.to_vec(),
                     nar_size,
                 });
             }
@@ -155,19 +155,34 @@ async fn upload_output(
 }
 
 /// Perform a single upload attempt via PutPath streaming RPC.
+///
+/// `store_path` comes from `scan_new_outputs` which reads directory entries
+/// under `{upper}/nix/store/` — these are nix-daemon-generated paths, but
+/// we parse defensively: a bug in our overlay setup could leave garbage here.
 async fn do_upload(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
-    nar_hash: &[u8],
+    nar_hash: [u8; 32],
     nar_size: u64,
     nar_data: std::sync::Arc<[u8]>,
 ) -> Result<(), tonic::Status> {
-    let info = PathInfo {
-        store_path: store_path.to_string(),
-        nar_hash: nar_hash.to_vec(),
+    let parsed_path = rio_nix::store_path::StorePath::parse(store_path).map_err(|e| {
+        tonic::Status::invalid_argument(format!(
+            "output store path {store_path:?} from overlay upper is malformed: {e}"
+        ))
+    })?;
+    let info = ValidatedPathInfo {
+        store_path: parsed_path,
+        nar_hash,
         nar_size,
-        // Other fields will be populated by the store
-        ..Default::default()
+        // Other fields populated by the store server.
+        store_path_hash: Vec::new(),
+        deriver: None,
+        references: Vec::new(),
+        registration_time: 0,
+        ultimate: false,
+        signatures: Vec::new(),
+        content_address: None,
     };
     let stream = rio_proto::client::chunk_nar_for_put(info, nar_data);
     rio_common::grpc::with_timeout_status(
@@ -253,6 +268,7 @@ mod tests {
     // gRPC upload tests via MockStore
     // -----------------------------------------------------------------------
 
+    use rio_test_support::fixtures::test_store_basename;
     use rio_test_support::grpc::{MockStore, spawn_mock_store};
     use std::sync::atomic::Ordering;
 
@@ -280,15 +296,16 @@ mod tests {
     #[tokio::test]
     async fn test_upload_output_success() {
         let (store, mut client, _h) = spawn_and_connect().await;
-        let tmp = make_output_file("abc-hello", b"hello world");
+        let basename = test_store_basename("hello");
+        let tmp = make_output_file(&basename, b"hello world");
 
-        let result = upload_output(&mut client, tmp.path(), "abc-hello")
+        let result = upload_output(&mut client, tmp.path(), &basename)
             .await
             .expect("upload should succeed");
 
-        assert_eq!(result.store_path, "/nix/store/abc-hello");
+        assert_eq!(result.store_path, format!("/nix/store/{basename}"));
         // Hash must match SHA-256 of the NAR serialization.
-        let expected_nar = nar::dump_path(&tmp.path().join("nix/store/abc-hello")).unwrap();
+        let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename)).unwrap();
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
         assert_eq!(result.nar_hash, expected_hash.to_vec());
         assert_eq!(result.nar_size, expected_nar.len() as u64);
@@ -296,7 +313,7 @@ mod tests {
         // MockStore should have recorded exactly one PutPath call.
         let puts = store.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1);
-        assert_eq!(puts[0].store_path, "/nix/store/abc-hello");
+        assert_eq!(puts[0].store_path, format!("/nix/store/{basename}"));
     }
 
     /// Retry with exponential backoff — first 2 attempts fail, 3rd succeeds.
@@ -306,13 +323,14 @@ mod tests {
     async fn test_upload_output_retries_then_succeeds() {
         let (store, mut client, _h) = spawn_and_connect().await;
         store.fail_next_puts.store(2, Ordering::SeqCst);
-        let tmp = make_output_file("abc-retry", b"retry me");
+        let basename = test_store_basename("retry");
+        let tmp = make_output_file(&basename, b"retry me");
 
-        let result = upload_output(&mut client, tmp.path(), "abc-retry")
+        let result = upload_output(&mut client, tmp.path(), &basename)
             .await
             .expect("upload should succeed on 3rd attempt");
 
-        assert_eq!(result.store_path, "/nix/store/abc-retry");
+        assert_eq!(result.store_path, format!("/nix/store/{basename}"));
         // Only the successful attempt records the put.
         assert_eq!(store.put_calls.read().unwrap().len(), 1);
         // All injected failures should have been consumed.
@@ -326,9 +344,10 @@ mod tests {
         store
             .fail_next_puts
             .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
-        let tmp = make_output_file("abc-exhaust", b"never uploads");
+        let basename = test_store_basename("exhaust");
+        let tmp = make_output_file(&basename, b"never uploads");
 
-        let err = upload_output(&mut client, tmp.path(), "abc-exhaust")
+        let err = upload_output(&mut client, tmp.path(), &basename)
             .await
             .expect_err("upload should exhaust retries");
 
@@ -347,9 +366,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir).unwrap();
-        fs::write(store_dir.join("aaa-one"), b"one").unwrap();
-        fs::write(store_dir.join("bbb-two"), b"two").unwrap();
-        fs::write(store_dir.join("ccc-three"), b"three").unwrap();
+        let (b1, b2, b3) = (
+            test_store_basename("one"),
+            test_store_basename("two"),
+            test_store_basename("three"),
+        );
+        fs::write(store_dir.join(&b1), b"one").unwrap();
+        fs::write(store_dir.join(&b2), b"two").unwrap();
+        fs::write(store_dir.join(&b3), b"three").unwrap();
 
         let results = upload_all_outputs(&client, tmp.path())
             .await
@@ -359,9 +383,9 @@ mod tests {
         // Result order is NOT guaranteed (buffer_unordered). Collect to set.
         let paths: std::collections::HashSet<_> =
             results.iter().map(|r| r.store_path.clone()).collect();
-        assert!(paths.contains("/nix/store/aaa-one"));
-        assert!(paths.contains("/nix/store/bbb-two"));
-        assert!(paths.contains("/nix/store/ccc-three"));
+        assert!(paths.contains(&format!("/nix/store/{b1}")));
+        assert!(paths.contains(&format!("/nix/store/{b2}")));
+        assert!(paths.contains(&format!("/nix/store/{b3}")));
         assert_eq!(store.put_calls.read().unwrap().len(), 3);
     }
 

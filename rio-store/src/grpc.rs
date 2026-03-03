@@ -21,6 +21,7 @@ use rio_proto::types::{
     GetChunkResponse, GetPathRequest, GetPathResponse, PathInfo, PutChunkRequest, PutChunkResponse,
     PutPathRequest, PutPathResponse, QueryPathInfoRequest, get_path_response, put_path_request,
 };
+use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::NarBackend;
 use crate::metadata;
@@ -114,14 +115,20 @@ impl StoreService for StoreServiceImpl {
             }
         };
 
-        // Validate required fields
-        validate_store_path(&info.store_path)?;
-        if info.nar_hash.len() != 32 {
-            return Err(Status::invalid_argument(format!(
-                "nar_hash must be 32 bytes (SHA-256), got {}",
-                info.nar_hash.len()
-            )));
-        }
+        // Bound repeated fields BEFORE validation (TryFrom validates each
+        // reference's syntax but doesn't bound the count; an attacker could
+        // send 10M valid references and we'd parse them all before failing).
+        rio_common::grpc::check_bound(
+            "references",
+            info.references.len(),
+            rio_common::limits::MAX_REFERENCES,
+        )?;
+        rio_common::grpc::check_bound(
+            "signatures",
+            info.signatures.len(),
+            rio_common::limits::MAX_SIGNATURES,
+        )?;
+
         // Bound nar_size BEFORE allocation. A malicious client declaring
         // nar_size=u64::MAX would otherwise attempt a huge Vec::with_capacity.
         if info.nar_size > MAX_NAR_SIZE {
@@ -130,32 +137,23 @@ impl StoreService for StoreServiceImpl {
                 info.nar_size, MAX_NAR_SIZE
             )));
         }
-        // Bound and validate references. Unbounded repeated fields from
-        // untrusted input would be persisted to the DB without check.
-        rio_common::grpc::check_bound(
-            "references",
-            info.references.len(),
-            rio_common::limits::MAX_REFERENCES,
-        )?;
-        for r in &info.references {
-            validate_store_path(r)?;
-        }
-        rio_common::grpc::check_bound(
-            "signatures",
-            info.signatures.len(),
-            rio_common::limits::MAX_SIGNATURES,
-        )?;
+
+        // Centralized validation: store_path parses, nar_hash is 32 bytes,
+        // each reference parses. Previously this was 3 separate inline checks
+        // that parsed StorePath and threw away the result.
+        let info = ValidatedPathInfo::try_from(info)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // Compute store_path_hash if not provided
         let store_path_hash = if info.store_path_hash.is_empty() {
-            compute_store_path_hash(&info.store_path)
+            compute_store_path_hash(info.store_path.as_str())
         } else {
             info.store_path_hash.clone()
         };
-        let sha256_hex = hex::encode(&info.nar_hash);
+        let sha256_hex = hex::encode(info.nar_hash);
 
         debug!(
-            store_path = %info.store_path,
+            store_path = %info.store_path.as_str(),
             nar_size = info.nar_size,
             sha256 = %sha256_hex,
             "PutPath: received metadata"
@@ -164,7 +162,7 @@ impl StoreService for StoreServiceImpl {
         // Step 2: Check idempotency — if path already complete, return success
         match metadata::check_complete(&self.pool, &store_path_hash).await {
             Ok(Some(_)) => {
-                debug!(store_path = %info.store_path, "PutPath: path already complete, returning success");
+                debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete, returning success");
                 // Drain remaining stream messages (protocol contract)
                 drain_stream(&mut stream).await;
                 metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
@@ -316,8 +314,9 @@ impl StoreService for StoreServiceImpl {
             }
         };
 
-        // Step 6: Complete upload — update narinfo + flip status to 'complete'
-        let full_info = PathInfo {
+        // Step 6: Complete upload — update narinfo + flip status to 'complete'.
+        // `info` is already ValidatedPathInfo; just fill in the computed hash.
+        let full_info = ValidatedPathInfo {
             store_path_hash,
             ..info
         };
@@ -332,7 +331,7 @@ impl StoreService for StoreServiceImpl {
             return Err(internal_error("PutPath: complete_upload", e));
         }
 
-        debug!(store_path = %full_info.store_path, "PutPath: upload completed successfully");
+        debug!(store_path = %full_info.store_path.as_str(), "PutPath: upload completed successfully");
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::histogram!("rio_store_put_path_duration_seconds")
             .record(start.elapsed().as_secs_f64());
@@ -381,14 +380,14 @@ impl StoreService for StoreServiceImpl {
                 Status::not_found(format!("NAR blob missing from backend: {blob_key}"))
             })?;
 
-        let expected_hash = info.nar_hash.clone();
+        let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
 
         // Stream response via a channel
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
-        // Send metadata as first message
-        let info_clone = info;
+        // Send metadata as first message (convert back to raw PathInfo for the wire)
+        let info_raw: PathInfo = info.into();
         rio_common::task::spawn_monitored("get-path-stream", async move {
             // Bound the entire streaming task. A stalled backend read or a
             // slow-consuming client can otherwise keep this task alive forever,
@@ -397,7 +396,7 @@ impl StoreService for StoreServiceImpl {
                 // First message: PathInfo
                 if tx
                     .send(Ok(GetPathResponse {
-                        msg: Some(get_path_response::Msg::Info(info_clone)),
+                        msg: Some(get_path_response::Msg::Info(info_raw)),
                     }))
                     .await
                     .is_err()
@@ -483,7 +482,7 @@ impl StoreService for StoreServiceImpl {
             .map_err(|e| internal_error("QueryPathInfo: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
-        Ok(Response::new(info))
+        Ok(Response::new(info.into()))
     }
 
     /// Batch check which paths are missing from the store.

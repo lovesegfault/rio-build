@@ -45,7 +45,9 @@ pub fn seed_mock_store_from(store: &MockStore, entries: &[StorePathEntry]) {
             .unwrap_or_else(|e| panic!("invalid nar_hash '{}': {e}", entry.nar_hash));
         let nar_data = daemon::dump_nar(&entry.path);
 
-        let info = rio_proto::types::PathInfo {
+        // Golden fixtures are real nix paths, so TryFrom should always succeed.
+        // If it doesn't, the fixture is corrupt — panic loudly.
+        let raw = rio_proto::types::PathInfo {
             store_path: entry.path.clone(),
             store_path_hash: vec![],
             deriver: entry.deriver.clone().unwrap_or_default(),
@@ -57,6 +59,8 @@ pub fn seed_mock_store_from(store: &MockStore, entries: &[StorePathEntry]) {
             signatures: entry.sigs.clone(),
             content_address: entry.ca.clone().unwrap_or_default(),
         };
+        let info = rio_proto::validated::ValidatedPathInfo::try_from(raw)
+            .unwrap_or_else(|e| panic!("golden fixture {} is malformed: {e}", entry.path));
         store.seed(info, nar_data);
     }
 }

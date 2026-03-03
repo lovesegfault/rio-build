@@ -6,7 +6,7 @@
 //! Phase 2a uses full NARs (no chunking), so `nar_blobs` tracks the storage
 //! key and upload status for each NAR blob.
 
-use rio_proto::types::PathInfo;
+use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
@@ -81,11 +81,19 @@ pub async fn insert_uploading(
 /// been fully written and SHA-256 verified do we flip the status and populate
 /// the narinfo row with real metadata. This ensures `QueryPathInfo` never
 /// returns metadata for incomplete uploads.
-#[instrument(skip(pool, info), fields(store_path = %info.store_path))]
-pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> anyhow::Result<()> {
+#[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
+pub async fn complete_upload(
+    pool: &PgPool,
+    info: &ValidatedPathInfo,
+    blob_key: &str,
+) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    // Update narinfo with full metadata
+    // Update narinfo with full metadata. StorePath::to_string() clones the
+    // cached `full` field (cheap). nar_hash.as_slice() on [u8;32] is free.
+    let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
+    let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+    let ca_str = info.content_address.as_deref();
     let narinfo_result = sqlx::query(
         r#"
         UPDATE narinfo SET
@@ -99,12 +107,12 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
         "#,
     )
     .bind(&info.store_path_hash)
-    .bind(&info.deriver)
-    .bind(&info.nar_hash)
+    .bind(deriver_str)
+    .bind(info.nar_hash.as_slice())
     .bind(info.nar_size as i64)
-    .bind(&info.references)
+    .bind(&refs_str)
     .bind(&info.signatures)
-    .bind(&info.content_address)
+    .bind(ca_str)
     .execute(&mut *tx)
     .await?;
 
@@ -113,7 +121,7 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
     if narinfo_result.rows_affected() == 0 {
         anyhow::bail!(
             "complete_upload: narinfo placeholder missing for {} (concurrently deleted?)",
-            info.store_path
+            info.store_path.as_str()
         );
     }
 
@@ -135,13 +143,13 @@ pub async fn complete_upload(pool: &PgPool, info: &PathInfo, blob_key: &str) -> 
     if blobs_result.rows_affected() == 0 {
         anyhow::bail!(
             "complete_upload: nar_blobs placeholder missing for {} (concurrently deleted?)",
-            info.store_path
+            info.store_path.as_str()
         );
     }
 
     tx.commit().await?;
 
-    debug!(store_path = %info.store_path, "upload completed");
+    debug!(store_path = %info.store_path.as_str(), "upload completed");
     Ok(())
 }
 
@@ -207,7 +215,10 @@ pub async fn check_complete(
 /// in `nar_blobs` to exclude the placeholder narinfo rows created by
 /// `insert_uploading`.
 #[instrument(skip(pool))]
-pub async fn query_path_info(pool: &PgPool, store_path: &str) -> anyhow::Result<Option<PathInfo>> {
+pub async fn query_path_info(
+    pool: &PgPool,
+    store_path: &str,
+) -> anyhow::Result<Option<ValidatedPathInfo>> {
     let row: Option<NarinfoRow> = sqlx::query_as(
         r#"
         SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
@@ -221,7 +232,12 @@ pub async fn query_path_info(pool: &PgPool, store_path: &str) -> anyhow::Result<
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| r.into_path_info()))
+    // DB-egress validation: before this commit, a malformed row (garbage
+    // store_path, wrong-length nar_hash) propagated silently through the
+    // whole system. Now it's caught here at the trust boundary.
+    row.map(|r| r.try_into_validated())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("malformed narinfo row for {store_path}: {e}"))
 }
 /// Batch check which store paths are missing (not in the store with `status='complete'`).
 ///
@@ -298,8 +314,12 @@ struct NarinfoRow {
 }
 
 impl NarinfoRow {
-    fn into_path_info(self) -> PathInfo {
-        PathInfo {
+    fn try_into_validated(self) -> Result<ValidatedPathInfo, PathInfoValidationError> {
+        // Build the raw PathInfo first, then delegate to TryFrom. Keeps the
+        // validation logic centralized in rio-proto::validated instead of
+        // duplicating it here.
+        use rio_proto::types::PathInfo;
+        ValidatedPathInfo::try_from(PathInfo {
             store_path: self.store_path,
             store_path_hash: self.store_path_hash,
             deriver: self.deriver.unwrap_or_default(),
@@ -314,6 +334,6 @@ impl NarinfoRow {
             ultimate: false,
             signatures: self.signatures,
             content_address: self.ca.unwrap_or_default(),
-        }
+        })
     }
 }

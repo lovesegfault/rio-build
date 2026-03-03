@@ -1,28 +1,32 @@
 //! Write opcode handlers (add-to-store, add-text, add-multiple).
 
 use super::*;
+use rio_proto::validated::ValidatedPathInfo;
 
-/// Build a `types::PathInfo` for a freshly-computed path (AddToStore/AddTextToStore).
-/// Uses defaults for fields not provided by the wire: deriver="", registration_time=0,
-/// ultimate=true, signatures=[].
+/// Build a `ValidatedPathInfo` for a freshly-computed path (AddToStore/AddTextToStore).
+/// Uses defaults for fields not provided by the wire: deriver=None,
+/// registration_time=0, ultimate=true, signatures=[].
+///
+/// Takes pre-parsed `StorePath` and `Vec<StorePath>` references — callers
+/// already parse these (they were being thrown away before this commit).
 fn path_info_for_computed(
-    store_path: String,
-    nar_hash: Vec<u8>,
+    store_path: StorePath,
+    nar_hash: [u8; 32],
     nar_size: u64,
-    references: Vec<String>,
+    references: Vec<StorePath>,
     content_address: String,
-) -> types::PathInfo {
-    types::PathInfo {
+) -> ValidatedPathInfo {
+    ValidatedPathInfo {
         store_path,
         store_path_hash: Vec::new(),
-        deriver: String::new(),
+        deriver: None,
         nar_hash,
         nar_size,
         references,
         registration_time: 0,
         ultimate: true,
         signatures: Vec::new(),
-        content_address,
+        content_address: Some(content_address),
     }
 }
 
@@ -80,8 +84,14 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         Err(e) => stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}"),
     };
 
-    // Upload to store via gRPC
-    let info = types::PathInfo {
+    // Build raw PathInfo and validate via TryFrom. This catches:
+    //   - bad reference paths (wire gives us unvalidated strings)
+    //   - nar_hash wrong length (hex-decode succeeded but result isn't 32 bytes)
+    // We already parsed `path` above (it's a valid StorePath), so the
+    // store_path field can't fail — we pass the string form and re-parse
+    // inside TryFrom for code uniformity rather than constructing
+    // ValidatedPathInfo piecewise here.
+    let raw_info = types::PathInfo {
         store_path: path_str.clone(),
         store_path_hash: Vec::new(),
         deriver: deriver_str,
@@ -92,6 +102,10 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         ultimate,
         signatures: sigs,
         content_address: ca_str,
+    };
+    let info = match ValidatedPathInfo::try_from(raw_info) {
+        Ok(v) => v,
+        Err(e) => stderr_err!(stderr, "wopAddToStoreNar for '{path_str}': {e}"),
     };
 
     // Cache .drv before uploading (we have the NAR data buffered)
@@ -171,7 +185,7 @@ async fn parse_add_multiple_entry(
     // Cache .drv before uploading
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = types::PathInfo {
+    let raw_info = types::PathInfo {
         store_path: path_str.clone(),
         store_path_hash: Vec::new(),
         deriver: deriver_str,
@@ -183,6 +197,8 @@ async fn parse_add_multiple_entry(
         signatures: sigs,
         content_address: ca_str,
     };
+    let info = ValidatedPathInfo::try_from(raw_info)
+        .map_err(|e| anyhow::anyhow!("entry '{path_str}': {e}"))?;
 
     grpc_put_path(store_client, info, nar_data)
         .await
@@ -271,13 +287,14 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
 
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = path_info_for_computed(
-        path.to_string(),
-        nar_hash.digest().to_vec(),
-        nar_size,
-        references.clone(),
-        ca.clone(),
-    );
+    // nar_hash is SHA-256 -> exactly 32 bytes. The try_into cannot fail in
+    // practice (NixHash::compute(SHA256, ..) always yields 32 bytes) but we
+    // check anyway rather than .unwrap() on a security-relevant field.
+    let nar_hash_32: [u8; 32] = match nar_hash.digest().try_into() {
+        Ok(h) => h,
+        Err(_) => stderr_err!(stderr, "internal: SHA-256 digest wrong length"),
+    };
+    let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca.clone());
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
         return send_store_error(stderr, e).await;
@@ -348,13 +365,11 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
 
     try_cache_drv(&path, &nar_data, drv_cache);
 
-    let info = path_info_for_computed(
-        path.to_string(),
-        nar_hash.digest().to_vec(),
-        nar_size,
-        references,
-        ca,
-    );
+    let nar_hash_32: [u8; 32] = match nar_hash.digest().try_into() {
+        Ok(h) => h,
+        Err(_) => stderr_err!(stderr, "internal: SHA-256 digest wrong length"),
+    };
+    let info = path_info_for_computed(path.clone(), nar_hash_32, nar_size, ref_paths, ca);
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
         return send_store_error(stderr, e).await;

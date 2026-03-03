@@ -18,6 +18,7 @@ use tonic::{Request, Response, Status, Streaming};
 use rio_proto::scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
 use rio_proto::store::store_service_server::{StoreService, StoreServiceServer};
 use rio_proto::types;
+use rio_proto::validated::ValidatedPathInfo;
 
 // ============================================================================
 // MockStore
@@ -49,9 +50,16 @@ impl MockStore {
     }
 
     /// Seed a path into the store. For tests that want a pre-populated store.
-    pub fn seed(&self, info: types::PathInfo, nar: Vec<u8>) {
-        let store_path = info.store_path.clone();
-        self.paths.write().unwrap().insert(store_path, (info, nar));
+    ///
+    /// Takes `ValidatedPathInfo` (matching what test fixtures produce) and
+    /// converts to raw `PathInfo` internally — MockStore mocks the wire layer,
+    /// which speaks raw proto types.
+    pub fn seed(&self, info: ValidatedPathInfo, nar: Vec<u8>) {
+        let store_path = info.store_path.to_string();
+        self.paths
+            .write()
+            .unwrap()
+            .insert(store_path, (info.into(), nar));
     }
 }
 
