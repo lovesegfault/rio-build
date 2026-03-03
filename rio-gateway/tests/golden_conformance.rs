@@ -353,7 +353,7 @@ async fn test_golden_live_query_path_from_hash_part_found() -> anyhow::Result<()
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let sp = rio_nix::store_path::StorePath::parse(&test_path).unwrap();
+    let sp = rio_nix::store_path::StorePath::parse(&test_path)?;
     let hash_part = sp.hash_part();
 
     let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
@@ -371,7 +371,7 @@ async fn test_golden_live_query_path_from_hash_part_ca() -> anyhow::Result<()> {
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let sp = rio_nix::store_path::StorePath::parse(&test_path).unwrap();
+    let sp = rio_nix::store_path::StorePath::parse(&test_path)?;
     let hash_part = sp.hash_part();
 
     let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
