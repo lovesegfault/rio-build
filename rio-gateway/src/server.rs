@@ -400,12 +400,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// Generate a fresh ed25519 public key line for authorized_keys fixtures.
-    fn make_valid_pubkey_line() -> String {
-        PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-            .unwrap()
+    fn make_valid_pubkey_line() -> anyhow::Result<String> {
+        Ok(PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?
             .public_key()
-            .to_openssh()
-            .unwrap()
+            .to_openssh()?)
     }
 
     // -----------------------------------------------------------------------
@@ -413,36 +411,39 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_load_authorized_keys_valid_with_comments_and_blanks() {
-        let key1 = make_valid_pubkey_line();
-        let key2 = make_valid_pubkey_line();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), format!("# comment line\n\n{key1}\n{key2}\n")).unwrap();
+    fn test_load_authorized_keys_valid_with_comments_and_blanks() -> anyhow::Result<()> {
+        let key1 = make_valid_pubkey_line()?;
+        let key2 = make_valid_pubkey_line()?;
+        let tmp = tempfile::NamedTempFile::new()?;
+        std::fs::write(tmp.path(), format!("# comment line\n\n{key1}\n{key2}\n"))?;
 
         let keys = load_authorized_keys(tmp.path()).expect("should load");
         assert_eq!(keys.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_load_authorized_keys_skips_invalid_entry() {
-        let key1 = make_valid_pubkey_line();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), format!("{key1}\nthis is not a valid ssh key\n")).unwrap();
+    fn test_load_authorized_keys_skips_invalid_entry() -> anyhow::Result<()> {
+        let key1 = make_valid_pubkey_line()?;
+        let tmp = tempfile::NamedTempFile::new()?;
+        std::fs::write(tmp.path(), format!("{key1}\nthis is not a valid ssh key\n"))?;
 
         let keys = load_authorized_keys(tmp.path()).expect("should load");
         assert_eq!(keys.len(), 1, "invalid line should be skipped");
+        Ok(())
     }
 
     #[test]
-    fn test_load_authorized_keys_all_invalid_bails() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "garbage line 1\ngarbage line 2\n").unwrap();
+    fn test_load_authorized_keys_all_invalid_bails() -> anyhow::Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        std::fs::write(tmp.path(), "garbage line 1\ngarbage line 2\n")?;
 
         let err = load_authorized_keys(tmp.path()).expect_err("should bail");
         assert!(
             err.to_string().contains("no valid authorized keys"),
             "got: {err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -457,8 +458,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_load_or_generate_host_key_generates_and_persists() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_load_or_generate_host_key_generates_and_persists() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let key_path = tmp.path().join("subdir/host_key");
 
         // First call: generates and writes
@@ -470,16 +471,17 @@ mod tests {
         let k2 = load_or_generate_host_key(&key_path).expect("should load");
         let fp2 = k2.public_key().fingerprint(Default::default());
         assert_eq!(fp1.to_string(), fp2.to_string(), "same key on reload");
+        Ok(())
     }
 
     #[test]
-    fn test_load_or_generate_host_key_loads_existing() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_load_or_generate_host_key_loads_existing() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let key_path = tmp.path().join("host_key");
 
         // Write a key manually
-        let orig = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        std::fs::write(&key_path, orig.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        let orig = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+        std::fs::write(&key_path, orig.to_openssh(ssh_key::LineEnding::LF)?)?;
         let orig_fp = orig.public_key().fingerprint(Default::default());
 
         let loaded = load_or_generate_host_key(&key_path).expect("should load");
@@ -490,17 +492,18 @@ mod tests {
                 .to_string(),
             orig_fp.to_string()
         );
+        Ok(())
     }
 
     /// When the directory is unwritable, the key is still generated (ephemeral)
     /// but NOT persisted. The function returns Ok and logs a warning.
     #[test]
-    fn test_load_or_generate_host_key_unwritable_dir_ephemeral() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn test_load_or_generate_host_key_unwritable_dir_ephemeral() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         // Make the tempdir read-only so write fails. The key_path itself
         // doesn't exist so create_dir_all won't hit the read-only perms
         // (parent already exists) but fs::write will.
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555))?;
         let key_path = tmp.path().join("host_key");
 
         let result = load_or_generate_host_key(&key_path);
@@ -513,5 +516,6 @@ mod tests {
             !key_path.exists(),
             "key should NOT be persisted (write failed)"
         );
+        Ok(())
     }
 }

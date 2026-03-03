@@ -52,7 +52,7 @@ pub fn fresh_daemon_socket() -> (String, Option<DaemonGuard>) {
 pub async fn exchange_with_daemon(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
-) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     exchange_with_daemon_inner(
         socket_path,
         opcode_bytes,
@@ -68,7 +68,7 @@ pub async fn exchange_with_daemon(
 pub async fn exchange_with_daemon_nar(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
-) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     exchange_with_daemon_inner(socket_path, opcode_bytes, PostLastRead::Nar).await
 }
 
@@ -77,7 +77,7 @@ async fn exchange_with_daemon_inner(
     socket_path: &str,
     opcode_bytes: Option<&[u8]>,
     post_last: PostLastRead,
-) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1};
     use rio_nix::protocol::wire;
     use rio_test_support::wire_bytes;

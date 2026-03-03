@@ -47,22 +47,18 @@ struct TestHarness {
 impl TestHarness {
     /// Start mock gRPC servers, spawn run_protocol, and perform handshake +
     /// setOptions. Returns a harness with a ready-to-use client stream.
-    async fn setup() -> Self {
-        let (store, store_addr, store_handle) = spawn_mock_store().await.unwrap();
-        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
+    async fn setup() -> anyhow::Result<Self> {
+        let (store, store_addr, store_handle) = spawn_mock_store().await?;
+        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
         // Connect gRPC clients
-        let store_channel = Channel::from_shared(format!("http://{store_addr}"))
-            .unwrap()
+        let store_channel = Channel::from_shared(format!("http://{store_addr}"))?
             .connect()
-            .await
-            .expect("connect to mock store");
+            .await?;
         let mut store_client = StoreServiceClient::new(store_channel);
-        let sched_channel = Channel::from_shared(format!("http://{sched_addr}"))
-            .unwrap()
+        let sched_channel = Channel::from_shared(format!("http://{sched_addr}"))?
             .connect()
-            .await
-            .expect("connect to mock scheduler");
+            .await?;
         let mut scheduler_client = SchedulerServiceClient::new(sched_channel);
 
         // Duplex stream: client side stays here, server side goes to run_protocol
@@ -107,10 +103,10 @@ impl TestHarness {
             sched_handle,
         };
 
-        do_handshake(&mut h.stream).await;
-        send_set_options(&mut h.stream).await;
+        do_handshake(&mut h.stream).await?;
+        send_set_options(&mut h.stream).await?;
 
-        h
+        Ok(h)
     }
 
     /// Finish the session: drop the client stream (EOF), await server task.

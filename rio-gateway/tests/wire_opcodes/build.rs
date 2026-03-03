@@ -6,8 +6,8 @@ use super::*;
 
 /// wopBuildPaths (9): reads strings(paths) + u64(build_mode), writes u64(1).
 #[tokio::test]
-async fn test_build_paths_success() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_success() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         send_completed: true,
         ..Default::default()
@@ -27,8 +27,8 @@ async fn test_build_paths_success() {
         u64: 0,                                  // build_mode = Normal
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
-    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
 
     // Verify scheduler received the submit request.
@@ -36,12 +36,13 @@ async fn test_build_paths_success() {
     assert_eq!(submits.len(), 1, "scheduler should receive one SubmitBuild");
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopBuildPaths with scheduler error: should send STDERR_ERROR.
 #[tokio::test]
-async fn test_build_paths_scheduler_error_returns_stderr_error() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         submit_error: Some(tonic::Code::Unavailable),
         ..Default::default()
@@ -59,10 +60,11 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() {
         u64: 0,
     );
 
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(!err.message.is_empty());
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopBuildPaths when the scheduler stream closes without a terminal event
@@ -79,8 +81,8 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() {
 /// one AND the handler sent another, the test harness's handler_task would
 /// fail or the stream would desync.
 #[tokio::test]
-async fn test_build_paths_stream_closed_without_terminal_single_error() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         close_stream_early: true,
         ..Default::default()
@@ -103,7 +105,7 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() {
     // drain_stderr_expecting_error reads one STDERR_ERROR and stops; if there
     // were two, the leftover bytes would desync the stream and h.finish()
     // would fail.
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("stream ended") || err.message.contains("disconnect"),
         "error should mention stream ended / scheduler disconnect: {}",
@@ -111,13 +113,14 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopBuildPathsWithResults (46): reads strings + build_mode, writes
 /// u64(count) + per-entry (string:DerivedPath, BuildResult).
 #[tokio::test]
-async fn test_build_paths_with_results_keyed_format() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         send_completed: true,
         ..Default::default()
@@ -136,44 +139,45 @@ async fn test_build_paths_with_results_keyed_format() {
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
 
     // KeyedBuildResult: u64(count) + per-entry (string:path, BuildResult)
-    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1, "one DerivedPath requested, one result");
 
     // DerivedPath echoed back
-    let path = wire::read_string(&mut h.stream).await.unwrap();
+    let path = wire::read_string(&mut h.stream).await?;
     assert_eq!(path, derived_path, "DerivedPath should be echoed back");
 
     // BuildResult: status + errorMsg + timesBuilt + isNonDeterministic +
     // startTime + stopTime + cpuUser(tag+val) + cpuSystem(tag+val) +
     // builtOutputs(count + per-output pair)
-    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    let status = wire::read_u64(&mut h.stream).await?;
     assert_eq!(status, 0, "BuildStatus::Built = 0");
-    let _error_msg = wire::read_string(&mut h.stream).await.unwrap();
-    let _times_built = wire::read_u64(&mut h.stream).await.unwrap();
-    let _is_non_det = wire::read_bool(&mut h.stream).await.unwrap();
-    let _start_time = wire::read_u64(&mut h.stream).await.unwrap();
-    let _stop_time = wire::read_u64(&mut h.stream).await.unwrap();
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    let _times_built = wire::read_u64(&mut h.stream).await?;
+    let _is_non_det = wire::read_bool(&mut h.stream).await?;
+    let _start_time = wire::read_u64(&mut h.stream).await?;
+    let _stop_time = wire::read_u64(&mut h.stream).await?;
     // cpuUser: tag + optional value
-    let cpu_user_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    let cpu_user_tag = wire::read_u64(&mut h.stream).await?;
     if cpu_user_tag == 1 {
-        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+        let _val = wire::read_u64(&mut h.stream).await?;
     }
     // cpuSystem: tag + optional value
-    let cpu_system_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    let cpu_system_tag = wire::read_u64(&mut h.stream).await?;
     if cpu_system_tag == 1 {
-        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+        let _val = wire::read_u64(&mut h.stream).await?;
     }
     // builtOutputs
-    let built_outputs_count = wire::read_u64(&mut h.stream).await.unwrap();
+    let built_outputs_count = wire::read_u64(&mut h.stream).await?;
     for _ in 0..built_outputs_count {
-        let _drv_output_id = wire::read_string(&mut h.stream).await.unwrap();
-        let _realisation_json = wire::read_string(&mut h.stream).await.unwrap();
+        let _drv_output_id = wire::read_string(&mut h.stream).await?;
+        let _realisation_json = wire::read_string(&mut h.stream).await?;
     }
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopBuildDerivation (36): reads drv_path + BasicDerivation + build_mode,
@@ -181,8 +185,8 @@ async fn test_build_paths_with_results_keyed_format() {
 /// per-output(name, path, hash_algo, hash) + input_srcs + platform + builder +
 /// args + env_pairs.
 #[tokio::test]
-async fn test_build_derivation_basic_format() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         send_completed: true,
         ..Default::default()
@@ -215,11 +219,11 @@ async fn test_build_derivation_basic_format() {
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
 
     // BuildResult: status + errorMsg + timesBuilt + isNonDet + start + stop +
     // cpuUser(tag+val?) + cpuSystem(tag+val?) + builtOutputs
-    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    let status = wire::read_u64(&mut h.stream).await?;
     // Mock sent send_completed: true, so status should be Built (0), not
     // just "any valid status". Previously: assert!(status <= 14) accepted
     // failures as passing.
@@ -227,35 +231,36 @@ async fn test_build_derivation_basic_format() {
         status, 0,
         "status should be Built (0) since mock sent completed, got {status}"
     );
-    let error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    let error_msg = wire::read_string(&mut h.stream).await?;
     assert!(error_msg.is_empty(), "error_msg should be empty on success");
-    let _times_built = wire::read_u64(&mut h.stream).await.unwrap();
-    let _is_non_det = wire::read_bool(&mut h.stream).await.unwrap();
-    let _start_time = wire::read_u64(&mut h.stream).await.unwrap();
-    let _stop_time = wire::read_u64(&mut h.stream).await.unwrap();
-    let cpu_user_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    let _times_built = wire::read_u64(&mut h.stream).await?;
+    let _is_non_det = wire::read_bool(&mut h.stream).await?;
+    let _start_time = wire::read_u64(&mut h.stream).await?;
+    let _stop_time = wire::read_u64(&mut h.stream).await?;
+    let cpu_user_tag = wire::read_u64(&mut h.stream).await?;
     if cpu_user_tag == 1 {
-        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+        let _val = wire::read_u64(&mut h.stream).await?;
     }
-    let cpu_system_tag = wire::read_u64(&mut h.stream).await.unwrap();
+    let cpu_system_tag = wire::read_u64(&mut h.stream).await?;
     if cpu_system_tag == 1 {
-        let _val = wire::read_u64(&mut h.stream).await.unwrap();
+        let _val = wire::read_u64(&mut h.stream).await?;
     }
-    let built_outputs_count = wire::read_u64(&mut h.stream).await.unwrap();
+    let built_outputs_count = wire::read_u64(&mut h.stream).await?;
     for _ in 0..built_outputs_count {
-        let _drv_output_id = wire::read_string(&mut h.stream).await.unwrap();
-        let _realisation_json = wire::read_string(&mut h.stream).await.unwrap();
+        let _drv_output_id = wire::read_string(&mut h.stream).await?;
+        let _realisation_json = wire::read_string(&mut h.stream).await?;
     }
 
     h.finish().await;
+    Ok(())
 }
 
 /// BuildPathsWithResults (46) with an invalid build mode should still return
 /// results (not STDERR_ERROR) — the handler treats unknown modes as Normal.
 /// But invalid DerivedPath strings DO cause per-entry failures.
 #[tokio::test]
-async fn test_build_paths_with_results_invalid_derived_path() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_with_results_invalid_derived_path() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
         u64: 46,
@@ -267,38 +272,39 @@ async fn test_build_paths_with_results_invalid_derived_path() {
     // Per CLAUDE.md: "per-entry errors in batch opcodes push
     // BuildResult::failure and continue, not abort". So we should get
     // STDERR_LAST + a failed BuildResult, not STDERR_ERROR.
-    drain_stderr_until_last(&mut h.stream).await;
-    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1, "should get one result for one input path");
-    let _path = wire::read_string(&mut h.stream).await.unwrap();
+    let _path = wire::read_string(&mut h.stream).await?;
     // BuildResult: first field is status (u64).
-    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    let status = wire::read_u64(&mut h.stream).await?;
     // Should be a failure status (NOT Built=0).
     assert_ne!(
         status, 0,
         "invalid DerivedPath should produce failure status"
     );
     // Drain remaining BuildResult fields.
-    let _err_msg = wire::read_string(&mut h.stream).await.unwrap();
-    let _times = wire::read_u64(&mut h.stream).await.unwrap();
-    let _nondet = wire::read_bool(&mut h.stream).await.unwrap();
-    let _start = wire::read_u64(&mut h.stream).await.unwrap();
-    let _stop = wire::read_u64(&mut h.stream).await.unwrap();
-    let tag1 = wire::read_u64(&mut h.stream).await.unwrap();
+    let _err_msg = wire::read_string(&mut h.stream).await?;
+    let _times = wire::read_u64(&mut h.stream).await?;
+    let _nondet = wire::read_bool(&mut h.stream).await?;
+    let _start = wire::read_u64(&mut h.stream).await?;
+    let _stop = wire::read_u64(&mut h.stream).await?;
+    let tag1 = wire::read_u64(&mut h.stream).await?;
     if tag1 == 1 {
-        let _ = wire::read_u64(&mut h.stream).await.unwrap();
+        let _ = wire::read_u64(&mut h.stream).await?;
     }
-    let tag2 = wire::read_u64(&mut h.stream).await.unwrap();
+    let tag2 = wire::read_u64(&mut h.stream).await?;
     if tag2 == 1 {
-        let _ = wire::read_u64(&mut h.stream).await.unwrap();
+        let _ = wire::read_u64(&mut h.stream).await?;
     }
-    let outputs = wire::read_u64(&mut h.stream).await.unwrap();
+    let outputs = wire::read_u64(&mut h.stream).await?;
     for _ in 0..outputs {
-        let _ = wire::read_string(&mut h.stream).await.unwrap();
-        let _ = wire::read_string(&mut h.stream).await.unwrap();
+        let _ = wire::read_string(&mut h.stream).await?;
+        let _ = wire::read_string(&mut h.stream).await?;
     }
 
     h.finish().await;
+    Ok(())
 }
 
 // ===========================================================================
@@ -351,8 +357,8 @@ async fn collect_stderr_frames(stream: &mut tokio::io::DuplexStream) -> Vec<Stde
 
 /// BuildLogBatch lines become STDERR_NEXT frames.
 #[tokio::test]
-async fn test_build_paths_log_events_become_stderr_next() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
             ev(build_event::Event::Started(types::BuildStarted {
@@ -390,16 +396,17 @@ async fn test_build_paths_log_events_become_stderr_next() {
     assert_eq!(logs, vec!["building foo", "linking"]);
 
     // Opcode 9 response: u64(1) on success
-    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1);
     h.finish().await;
+    Ok(())
 }
 
 /// DerivationEvent{Started -> Completed} maps to STDERR_START_ACTIVITY /
 /// STDERR_STOP_ACTIVITY with matching IDs.
 #[tokio::test]
-async fn test_build_paths_derivation_lifecycle_activities() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     let target = "/nix/store/aaa-activity-test.drv".to_string();
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
@@ -458,14 +465,15 @@ async fn test_build_paths_derivation_lifecycle_activities() {
         other => panic!("expected StopActivity, got {other:?}"),
     }
 
-    let _ = wire::read_u64(&mut h.stream).await.unwrap();
+    let _ = wire::read_u64(&mut h.stream).await?;
     h.finish().await;
+    Ok(())
 }
 
 /// DerivationEvent::Failed stops the activity AND emits a STDERR_NEXT log line.
 #[tokio::test]
-async fn test_build_paths_derivation_failed_emits_log_and_stop() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     let target = "/nix/store/bbb-failed.drv".to_string();
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
@@ -528,13 +536,14 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// BuildCancelled returns a BuildResult with MiscFailure + reason in error_msg.
 /// Use opcode 46 (BuildPathsWithResults) so we can read the BuildResult back.
 #[tokio::test]
-async fn test_build_paths_with_results_cancelled_outcome() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
             ev(build_event::Event::Started(types::BuildStarted {
@@ -555,13 +564,13 @@ async fn test_build_paths_with_results_cancelled_outcome() {
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
     // KeyedBuildResult: count, then (DerivedPath, BuildResult) per entry.
-    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1);
-    let _derived_path = wire::read_string(&mut h.stream).await.unwrap();
-    let status = wire::read_u64(&mut h.stream).await.unwrap();
-    let error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    let _derived_path = wire::read_string(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    let error_msg = wire::read_string(&mut h.stream).await?;
     // BuildStatus::MiscFailure = 9
     assert_eq!(status, 9, "MiscFailure");
     assert!(
@@ -570,12 +579,13 @@ async fn test_build_paths_with_results_cancelled_outcome() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// Progress + Derivation{Cached,Queued} are silent — no STDERR frames.
 #[tokio::test]
-async fn test_build_paths_silent_events_no_stderr() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_silent_events_no_stderr() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
             ev(build_event::Event::Started(types::BuildStarted {
@@ -622,14 +632,15 @@ async fn test_build_paths_silent_events_no_stderr() {
         frames.is_empty(),
         "silent events should emit no stderr frames, got: {frames:?}"
     );
-    let _ = wire::read_u64(&mut h.stream).await.unwrap();
+    let _ = wire::read_u64(&mut h.stream).await?;
     h.finish().await;
+    Ok(())
 }
 
 /// First event is Completed (no Started) → short-circuit return.
 #[tokio::test]
-async fn test_build_paths_first_event_completed_short_circuit() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_first_event_completed_short_circuit() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
@@ -646,16 +657,17 @@ async fn test_build_paths_first_event_completed_short_circuit() {
         u64: 0,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
-    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1, "success");
     h.finish().await;
+    Ok(())
 }
 
 /// First event is Failed (no Started) → short-circuit failure.
 #[tokio::test]
-async fn test_build_paths_first_event_failed_short_circuit() {
-    let mut h = TestHarness::setup().await;
+async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Failed(types::BuildFailed {
             error_message: "instant fail".into(),
@@ -672,7 +684,8 @@ async fn test_build_paths_first_event_failed_short_circuit() {
     );
 
     // opcode 9 sends STDERR_ERROR on failure
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(err.message.contains("instant fail"), "got: {}", err.message);
     h.finish().await;
+    Ok(())
 }

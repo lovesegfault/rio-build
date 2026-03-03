@@ -22,17 +22,14 @@ use rio_test_support::grpc::{MockStore, spawn_mock_scheduler, spawn_mock_store};
 ///
 /// Spawns a MockStore + MockScheduler, connects gRPC clients, and runs
 /// `session::run_protocol` on a Cursor reader + duplex writer.
-async fn gateway_response(client_bytes: &[u8], store: MockStore) -> Vec<u8> {
+async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Result<Vec<u8>> {
     // Spawn mock gRPC servers for this store + a dummy scheduler
-    let store_addr = spawn_store_for(store).await;
-    let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await.unwrap();
+    let store_addr = spawn_store_for(store).await?;
+    let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await?;
 
-    let mut store_client = rio_proto::client::connect_store(&store_addr.to_string())
-        .await
-        .expect("connect mock store");
-    let mut scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string())
-        .await
-        .expect("connect mock scheduler");
+    let mut store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
+    let mut scheduler_client =
+        rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
 
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
 
@@ -51,22 +48,20 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> Vec<u8> {
 
     let mut response = Vec::new();
     let mut reader = tokio::io::BufReader::new(response_reader);
-    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut response)
-        .await
-        .unwrap();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut response).await?;
 
-    proto_task.await.unwrap();
-    response
+    proto_task.await?;
+    Ok(response)
 }
 
 /// Spawn a pre-populated MockStore and return its address.
-async fn spawn_store_for(store: MockStore) -> std::net::SocketAddr {
+async fn spawn_store_for(store: MockStore) -> anyhow::Result<std::net::SocketAddr> {
     use rio_proto::store::store_service_server::StoreServiceServer;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     tokio::spawn(async move {
         let incoming = TcpListenerStream::new(listener);
         Server::builder()
@@ -76,7 +71,7 @@ async fn spawn_store_for(store: MockStore) -> std::net::SocketAddr {
             .expect("mock store server");
     });
     tokio::task::yield_now().await;
-    addr
+    Ok(addr)
 }
 
 // ============================================================================
@@ -98,7 +93,7 @@ async fn run_live_conformance(
     store: MockStore,
     skip: &[&str],
     parse_opcode: OpcodeFieldParser,
-) {
+) -> anyhow::Result<()> {
     let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
 
     let (client_bytes, daemon_response) =
@@ -106,7 +101,7 @@ async fn run_live_conformance(
             .await
             .expect("daemon exchange failed");
 
-    let rio_response = gateway_response(&client_bytes, store).await;
+    let rio_response = gateway_response(&client_bytes, store).await?;
 
     let (daemon_hs, daemon_rest) = golden::split_handshake(&daemon_response).await;
     let (rio_hs, rio_rest) = golden::split_handshake(&rio_response).await;
@@ -136,24 +131,22 @@ async fn run_live_conformance(
             golden::assert_field_conformance(&daemon_op_fields, &rio_op_fields, skip);
         }
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_handshake() {
+async fn test_golden_live_handshake() -> anyhow::Result<()> {
     let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
-    let (_store, store_addr, _sh) = spawn_mock_store().await.unwrap();
-    let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await.unwrap();
+    let (_store, store_addr, _sh) = spawn_mock_store().await?;
+    let (_sched, sched_addr, _sch) = spawn_mock_scheduler().await?;
 
     let (client_bytes, daemon_response) = golden::daemon::exchange_with_daemon(&socket, None)
         .await
         .expect("daemon exchange failed");
 
-    let mut store_client = rio_proto::client::connect_store(&store_addr.to_string())
-        .await
-        .unwrap();
-    let mut scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string())
-        .await
-        .unwrap();
+    let mut store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
+    let mut scheduler_client =
+        rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
 
     let (response_reader, response_writer) = tokio::io::duplex(256 * 1024);
     let client_data = client_bytes.clone();
@@ -170,118 +163,124 @@ async fn test_golden_live_handshake() {
     });
     let mut rio_response = Vec::new();
     let mut reader = tokio::io::BufReader::new(response_reader);
-    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut rio_response)
-        .await
-        .unwrap();
-    proto_task.await.unwrap();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut rio_response).await?;
+    proto_task.await?;
 
     let daemon_fields = golden::parse_handshake_fields(&daemon_response).await;
     let rio_fields = golden::parse_handshake_fields(&rio_response).await;
     golden::assert_field_conformance(&daemon_fields, &rio_fields, SKIP_FIELDS);
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_is_valid_path_found() {
+async fn test_golden_live_is_valid_path_found() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let op = golden::build_is_valid_path_bytes(&test_path).await;
+    let op = golden::build_is_valid_path_bytes(&test_path).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_is_valid_path_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_is_valid_path_not_found() {
+async fn test_golden_live_is_valid_path_not_found() -> anyhow::Result<()> {
     let store = MockStore::new();
     let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
 
-    let op = golden::build_is_valid_path_bytes(nonexistent).await;
+    let op = golden::build_is_valid_path_bytes(nonexistent).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_is_valid_path_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_path_info() {
+async fn test_golden_live_query_path_info() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let op = golden::build_query_path_info_bytes(&test_path).await;
+    let op = golden::build_query_path_info_bytes(&test_path).await?;
 
     // Also skip reg_time — mock store uses the JSON-queried time
     let skip: &[&str] = &["version_string", "trusted", "reg_time"];
     run_live_conformance(Some(&op), store, skip, |data| {
         Box::pin(golden::parse_query_path_info_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_path_info_not_found() {
+async fn test_golden_live_query_path_info_not_found() -> anyhow::Result<()> {
     let store = MockStore::new();
     let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
 
-    let op = golden::build_query_path_info_bytes(nonexistent).await;
+    let op = golden::build_query_path_info_bytes(nonexistent).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_path_info_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_valid_paths() {
+async fn test_golden_live_query_valid_paths() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
     let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
-    let op = golden::build_query_valid_paths_bytes(&[&test_path, nonexistent], false).await;
+    let op = golden::build_query_valid_paths_bytes(&[&test_path, nonexistent], false).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_valid_paths_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_add_temp_root() {
+async fn test_golden_live_add_temp_root() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let store = MockStore::new();
 
-    let op = golden::build_add_temp_root_bytes(&test_path).await;
+    let op = golden::build_add_temp_root_bytes(&test_path).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_add_temp_root_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_missing() {
+async fn test_golden_live_query_missing() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
     let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
-    let op = golden::build_query_missing_bytes(&[&test_path, nonexistent]).await;
+    let op = golden::build_query_missing_bytes(&[&test_path, nonexistent]).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_missing_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 /// NarFromPath golden test. Documents the wire-format: rio-gateway sends
 /// STDERR_LAST then raw NAR bytes (matching nix-daemon); the old rio-build
 /// monolith used STDERR_WRITE chunks.
 #[tokio::test]
-async fn test_golden_live_nar_from_path() {
+async fn test_golden_live_nar_from_path() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
@@ -289,13 +288,13 @@ async fn test_golden_live_nar_from_path() {
 
     let (socket, _daemon_guard) = golden::daemon::fresh_daemon_socket();
 
-    let op = golden::build_nar_from_path_bytes(&test_path).await;
+    let op = golden::build_nar_from_path_bytes(&test_path).await?;
     let (client_bytes, daemon_response) =
         golden::daemon::exchange_with_daemon_nar(&socket, Some(&op))
             .await
             .expect("daemon exchange failed");
 
-    let rio_response = gateway_response(&client_bytes, store).await;
+    let rio_response = gateway_response(&client_bytes, store).await?;
 
     // Compare handshake
     let (daemon_hs, daemon_rest) = golden::split_handshake(&daemon_response).await;
@@ -331,22 +330,24 @@ async fn test_golden_live_nar_from_path() {
         daemon_nar.bytes.len(),
         rio_nar.bytes.len()
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_path_from_hash_part_not_found() {
+async fn test_golden_live_query_path_from_hash_part_not_found() -> anyhow::Result<()> {
     let store = MockStore::new();
     let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    let op = golden::build_query_path_from_hash_part_bytes(hash_part).await;
+    let op = golden::build_query_path_from_hash_part_bytes(hash_part).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_path_from_hash_part_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_path_from_hash_part_found() {
+async fn test_golden_live_query_path_from_hash_part_found() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
@@ -355,15 +356,16 @@ async fn test_golden_live_query_path_from_hash_part_found() {
     let sp = rio_nix::store_path::StorePath::parse(&test_path).unwrap();
     let hash_part = sp.hash_part();
 
-    let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await;
+    let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_path_from_hash_part_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_query_path_from_hash_part_ca() {
+async fn test_golden_live_query_path_from_hash_part_ca() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_ca_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
@@ -372,23 +374,26 @@ async fn test_golden_live_query_path_from_hash_part_ca() {
     let sp = rio_nix::store_path::StorePath::parse(&test_path).unwrap();
     let hash_part = sp.hash_part();
 
-    let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await;
+    let op = golden::build_query_path_from_hash_part_bytes(&hash_part).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_path_from_hash_part_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_golden_live_add_signatures() {
+async fn test_golden_live_add_signatures() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
     let path_info = golden::daemon::query_path_info_json(&test_path);
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let op = golden::build_add_signatures_bytes(&test_path, &["cache.example.com:fakesig1"]).await;
+    let op =
+        golden::build_add_signatures_bytes(&test_path, &["cache.example.com:fakesig1"]).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_add_signatures_fields(data))
     })
-    .await;
+    .await?;
+    Ok(())
 }

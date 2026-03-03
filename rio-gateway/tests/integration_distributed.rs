@@ -24,17 +24,17 @@ use tokio::io::DuplexStream;
 
 /// Send wopQueryValidPaths (opcode 31) for the given paths.
 /// Returns the list of valid paths from the server response.
-async fn query_valid_paths(s: &mut DuplexStream, paths: &[&str]) -> Vec<String> {
+async fn query_valid_paths(s: &mut DuplexStream, paths: &[&str]) -> anyhow::Result<Vec<String>> {
     wire_send!(s; u64: 31, strings: paths, u64: 0); // wopQueryValidPaths, paths, substitute=false
 
     // Read response: STDERR_LAST + valid paths
-    let msg = wire::read_u64(s).await.unwrap();
+    let msg = wire::read_u64(s).await?;
     assert_eq!(
         msg, STDERR_LAST,
         "wopQueryValidPaths should send STDERR_LAST before result"
     );
 
-    wire::read_strings(s).await.unwrap()
+    Ok(wire::read_strings(s).await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -47,20 +47,20 @@ async fn query_valid_paths(s: &mut DuplexStream, paths: &[&str]) -> Vec<String> 
 /// mock gRPC store service. With an empty store, all queried paths should be
 /// reported as invalid (not present).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_distributed_handshake_query_empty_store() {
+async fn test_distributed_handshake_query_empty_store() -> anyhow::Result<()> {
     common::init_test_logging();
 
-    let mut sess = common::GatewaySession::new().await;
+    let mut sess = common::GatewaySession::new().await?;
 
     // Run client protocol test directly (no need for a separate spawn since
     // the server side is already running in sess.server_task).
     let s = &mut sess.stream;
 
     // Handshake
-    do_handshake(s).await;
+    do_handshake(s).await?;
 
     // SetOptions
-    send_set_options(s).await;
+    send_set_options(s).await?;
 
     // QueryValidPaths against empty store
     let valid = query_valid_paths(
@@ -70,7 +70,7 @@ async fn test_distributed_handshake_query_empty_store() {
             "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
         ],
     )
-    .await;
+    .await?;
 
     // Empty store: no paths should be valid
     assert!(
@@ -79,6 +79,7 @@ async fn test_distributed_handshake_query_empty_store() {
     );
 
     // GatewaySession::drop handles cleanup.
+    Ok(())
 }
 
 /// Test that the gateway correctly reports paths as valid after they are
@@ -87,10 +88,10 @@ async fn test_distributed_handshake_query_empty_store() {
 /// This test pre-populates the mock store with a path, then verifies
 /// wopQueryValidPaths returns it as valid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_distributed_query_with_populated_store() {
+async fn test_distributed_query_with_populated_store() -> anyhow::Result<()> {
     common::init_test_logging();
 
-    let mut sess = common::GatewaySession::new().await;
+    let mut sess = common::GatewaySession::new().await?;
 
     // Pre-populate the mock store with one path
     let test_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
@@ -102,8 +103,8 @@ async fn test_distributed_query_with_populated_store() {
 
     let s = &mut sess.stream;
 
-    do_handshake(s).await;
-    send_set_options(s).await;
+    do_handshake(s).await?;
+    send_set_options(s).await?;
 
     // Query two paths: one present, one missing
     let valid = query_valid_paths(
@@ -113,7 +114,7 @@ async fn test_distributed_query_with_populated_store() {
             "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
         ],
     )
-    .await;
+    .await?;
 
     // Only the pre-populated path should be valid
     assert_eq!(
@@ -125,26 +126,27 @@ async fn test_distributed_query_with_populated_store() {
         valid[0],
         "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
     );
+    Ok(())
 }
 
 /// Test that handshake negotiation works correctly through the distributed
 /// gateway stack. Validates the exact wire sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_distributed_handshake_wire_sequence() {
+async fn test_distributed_handshake_wire_sequence() -> anyhow::Result<()> {
     common::init_test_logging();
 
-    let mut sess = common::GatewaySession::new().await;
+    let mut sess = common::GatewaySession::new().await?;
     let s = &mut sess.stream;
 
     // Phase 1: Send client magic + version
     wire_send!(s; u64: WORKER_MAGIC_1, u64: PROTOCOL_VERSION);
 
     // Read server magic
-    let magic2 = wire::read_u64(s).await.unwrap();
+    let magic2 = wire::read_u64(s).await?;
     assert_eq!(magic2, WORKER_MAGIC_2, "server must send WORKER_MAGIC_2");
 
     // Read server version
-    let server_version = wire::read_u64(s).await.unwrap();
+    let server_version = wire::read_u64(s).await?;
     assert!(
         server_version >= PROTOCOL_VERSION,
         "server version should be >= our protocol version"
@@ -153,7 +155,7 @@ async fn test_distributed_handshake_wire_sequence() {
     // Phase 2: Feature exchange
     wire_send!(s; strings: &Vec::<String>::new());
 
-    let server_features = wire::read_strings(s).await.unwrap();
+    let server_features = wire::read_strings(s).await?;
     // Server may return empty features, that's fine
     assert!(
         server_features.len() < 100,
@@ -164,19 +166,20 @@ async fn test_distributed_handshake_wire_sequence() {
     wire_send!(s; u64: 0, u64: 0);
 
     // Read version string
-    let version_str = wire::read_string(s).await.unwrap();
+    let version_str = wire::read_string(s).await?;
     assert!(
         version_str.contains("rio-gateway"),
         "version string should contain 'rio-gateway', got: {version_str}"
     );
 
     // Read trusted status
-    let trusted = wire::read_u64(s).await.unwrap();
+    let trusted = wire::read_u64(s).await?;
     assert!(trusted <= 1, "trusted should be 0 or 1");
 
     // Phase 4: Initial STDERR_LAST
-    let last = wire::read_u64(s).await.unwrap();
+    let last = wire::read_u64(s).await?;
     assert_eq!(last, STDERR_LAST, "handshake must end with STDERR_LAST");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -201,14 +204,14 @@ async fn test_distributed_handshake_wire_sequence() {
 /// complex in-test. This test verifies the mechanism more directly: after a
 /// clean handshake + setOptions + disconnect, no spurious CancelBuild.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_disconnect_without_active_build_no_cancel() {
-    let mut sess = common::GatewaySession::new().await;
+async fn test_disconnect_without_active_build_no_cancel() -> anyhow::Result<()> {
+    let mut sess = common::GatewaySession::new().await?;
 
     // Run the client protocol inline, then wait for server to observe EOF.
     {
         let s = &mut sess.stream;
-        do_handshake(s).await;
-        send_set_options(s).await;
+        do_handshake(s).await?;
+        send_set_options(s).await?;
         // Disconnect immediately — no build submitted.
     }
     // Replace stream with a fresh (unconnected) one to drop the client side
@@ -225,15 +228,16 @@ async fn test_disconnect_without_active_build_no_cancel() {
         cancels.is_empty(),
         "disconnect without active builds should NOT call CancelBuild, got: {cancels:?}"
     );
+    Ok(())
 }
 
 /// Verify CancelBuild infrastructure works: directly populate active_build_ids
 /// via session-internal state simulation by calling cancel_build via the
 /// scheduler client (unit-test style, verifies the mock records correctly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_cancel_build_recorded_by_mock_scheduler() {
+async fn test_cancel_build_recorded_by_mock_scheduler() -> anyhow::Result<()> {
     // This test only needs the scheduler mock (no full session).
-    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
+    let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
     let mut scheduler_client =
         rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
@@ -257,4 +261,5 @@ async fn test_cancel_build_recorded_by_mock_scheduler() {
     assert_eq!(cancels[0].1, "client_disconnect");
 
     sched_handle.abort();
+    Ok(())
 }

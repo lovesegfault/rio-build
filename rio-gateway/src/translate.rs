@@ -200,24 +200,23 @@ mod tests {
 
     use rio_nix::derivation::DerivationOutput;
 
-    fn make_basic_drv(env: BTreeMap<String, String>) -> BasicDerivation {
-        let output = DerivationOutput::new("out", "/nix/store/test-out", "", "").unwrap();
-        BasicDerivation::new(
+    fn make_basic_drv(env: BTreeMap<String, String>) -> anyhow::Result<BasicDerivation> {
+        let output = DerivationOutput::new("out", "/nix/store/test-out", "", "")?;
+        Ok(BasicDerivation::new(
             vec![output],
             BTreeSet::new(),
             "x86_64-linux".into(),
             "/bin/sh".into(),
             vec![],
             env,
-        )
-        .unwrap()
+        )?)
     }
 
     #[test]
-    fn test_single_node_extracts_features() {
+    fn test_single_node_extracts_features() -> anyhow::Result<()> {
         let mut env = BTreeMap::new();
         env.insert("requiredSystemFeatures".into(), "kvm big-parallel".into());
-        let drv = make_basic_drv(env);
+        let drv = make_basic_drv(env)?;
 
         let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
         assert_eq!(nodes.len(), 1);
@@ -226,14 +225,16 @@ mod tests {
             vec!["kvm".to_string(), "big-parallel".to_string()],
             "requiredSystemFeatures should be extracted from BasicDerivation env"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_single_node_no_features() {
-        let drv = make_basic_drv(BTreeMap::new());
+    fn test_single_node_no_features() -> anyhow::Result<()> {
+        let drv = make_basic_drv(BTreeMap::new())?;
         let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].required_features.is_empty());
+        Ok(())
     }
 
     // -------------------------------------------------------------------
