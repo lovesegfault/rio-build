@@ -259,125 +259,134 @@ mod tests {
     use std::io::Cursor;
 
     /// Helper: write to buffer then read back.
-    async fn roundtrip_bytes(data: &[u8]) -> Vec<u8> {
+    async fn roundtrip_bytes(data: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
-        write_bytes(&mut buf, data).await.unwrap();
+        write_bytes(&mut buf, data).await?;
         let mut reader = Cursor::new(buf);
-        read_bytes(&mut reader).await.unwrap()
+        Ok(read_bytes(&mut reader).await?)
     }
 
-    async fn roundtrip_string(s: &str) -> String {
+    async fn roundtrip_string(s: &str) -> anyhow::Result<String> {
         let mut buf = Vec::new();
-        write_string(&mut buf, s).await.unwrap();
+        write_string(&mut buf, s).await?;
         let mut reader = Cursor::new(buf);
-        read_string(&mut reader).await.unwrap()
+        Ok(read_string(&mut reader).await?)
     }
 
     #[tokio::test]
-    async fn test_u64_roundtrip() {
+    async fn test_u64_roundtrip() -> anyhow::Result<()> {
         for val in [0u64, 1, 42, u64::MAX, 0x6e697863] {
             let mut buf = Vec::new();
-            write_u64(&mut buf, val).await.unwrap();
+            write_u64(&mut buf, val).await?;
             assert_eq!(buf.len(), 8);
             let mut reader = Cursor::new(buf);
-            assert_eq!(read_u64(&mut reader).await.unwrap(), val);
+            assert_eq!(read_u64(&mut reader).await?, val);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_bool_roundtrip() {
+    async fn test_bool_roundtrip() -> anyhow::Result<()> {
         for val in [true, false] {
             let mut buf = Vec::new();
-            write_bool(&mut buf, val).await.unwrap();
+            write_bool(&mut buf, val).await?;
             let mut reader = Cursor::new(buf);
-            assert_eq!(read_bool(&mut reader).await.unwrap(), val);
+            assert_eq!(read_bool(&mut reader).await?, val);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_empty_string() {
-        let result = roundtrip_bytes(b"").await;
+    async fn test_empty_string() -> anyhow::Result<()> {
+        let result = roundtrip_bytes(b"").await?;
         assert!(result.is_empty());
 
         // Verify wire format: just u64(0), nothing else
         let mut buf = Vec::new();
-        write_bytes(&mut buf, b"").await.unwrap();
+        write_bytes(&mut buf, b"").await?;
         assert_eq!(buf.len(), 8); // just the length field
         assert_eq!(buf, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_string_padding() {
+    async fn test_string_padding() -> anyhow::Result<()> {
         // String of length 1: needs 7 bytes padding
-        let result = roundtrip_bytes(b"x").await;
+        let result = roundtrip_bytes(b"x").await?;
         assert_eq!(result, b"x");
 
         // Verify total wire size: 8 (len) + 1 (data) + 7 (pad) = 16
         let mut buf = Vec::new();
-        write_bytes(&mut buf, b"x").await.unwrap();
+        write_bytes(&mut buf, b"x").await?;
         assert_eq!(buf.len(), 16);
 
         // String of length 8: no padding needed
         let mut buf = Vec::new();
-        write_bytes(&mut buf, b"12345678").await.unwrap();
+        write_bytes(&mut buf, b"12345678").await?;
         assert_eq!(buf.len(), 16); // 8 (len) + 8 (data) + 0 (pad)
 
         // String of length 9: needs 7 bytes padding
         let mut buf = Vec::new();
-        write_bytes(&mut buf, b"123456789").await.unwrap();
+        write_bytes(&mut buf, b"123456789").await?;
         assert_eq!(buf.len(), 24); // 8 (len) + 9 (data) + 7 (pad)
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_string_boundary_lengths() {
+    async fn test_string_boundary_lengths() -> anyhow::Result<()> {
         for len in [0, 1, 7, 8, 9, 15, 16, 17, 100] {
             let data = vec![b'A'; len];
-            let result = roundtrip_bytes(&data).await;
+            let result = roundtrip_bytes(&data).await?;
             assert_eq!(result, data, "roundtrip failed for len={len}");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_utf8_string_roundtrip() {
+    async fn test_utf8_string_roundtrip() -> anyhow::Result<()> {
         let cases = ["", "hello", "hello world", "/nix/store/abc-hello-2.12.1"];
         for s in cases {
-            let result = roundtrip_string(s).await;
+            let result = roundtrip_string(s).await?;
             assert_eq!(result, s);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_strings_collection() {
+    async fn test_strings_collection() -> anyhow::Result<()> {
         let items = vec![
             "hello".to_string(),
             "world".to_string(),
             "/nix/store/abc".to_string(),
         ];
         let mut buf = Vec::new();
-        write_strings(&mut buf, &items).await.unwrap();
+        write_strings(&mut buf, &items).await?;
         let mut reader = Cursor::new(buf);
-        let result = read_strings(&mut reader).await.unwrap();
+        let result = read_strings(&mut reader).await?;
         assert_eq!(result, items);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_empty_collection() {
+    async fn test_empty_collection() -> anyhow::Result<()> {
         let items: Vec<String> = vec![];
         let mut buf = Vec::new();
-        write_strings(&mut buf, &items).await.unwrap();
+        write_strings(&mut buf, &items).await?;
         let mut reader = Cursor::new(buf);
-        let result = read_strings(&mut reader).await.unwrap();
+        let result = read_strings(&mut reader).await?;
         assert!(result.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_string_too_long() {
+    async fn test_string_too_long() -> anyhow::Result<()> {
         // Craft a buffer with a huge length field
         let mut buf = Vec::new();
-        write_u64(&mut buf, MAX_STRING_LEN + 1).await.unwrap();
+        write_u64(&mut buf, MAX_STRING_LEN + 1).await?;
         let mut reader = Cursor::new(buf);
         let result = read_bytes(&mut reader).await;
         assert!(matches!(result, Err(WireError::StringTooLong(_))));
+        Ok(())
     }
 
     #[tokio::test]
@@ -391,12 +400,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collection_too_large() {
+    async fn test_collection_too_large() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        write_u64(&mut buf, MAX_COLLECTION_COUNT + 1).await.unwrap();
+        write_u64(&mut buf, MAX_COLLECTION_COUNT + 1).await?;
         let mut reader = Cursor::new(buf);
         let result = read_strings(&mut reader).await;
         assert!(matches!(result, Err(WireError::CollectionTooLarge(_))));
+        Ok(())
     }
 
     #[tokio::test]
@@ -415,123 +425,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_string_truncated_body() {
+    async fn test_read_string_truncated_body() -> anyhow::Result<()> {
         // Length says 10 bytes, but only 5 available
         let mut buf = Vec::new();
-        write_u64(&mut buf, 10).await.unwrap();
+        write_u64(&mut buf, 10).await?;
         buf.extend_from_slice(b"hello"); // only 5 of 10 bytes
         let mut reader = Cursor::new(buf);
         let result = read_string(&mut reader).await;
         assert!(result.is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_string_missing_padding() {
+    async fn test_read_string_missing_padding() -> anyhow::Result<()> {
         // 3-byte string needs 5 bytes padding, but we only provide the string
         let mut buf = Vec::new();
-        write_u64(&mut buf, 3).await.unwrap();
+        write_u64(&mut buf, 3).await?;
         buf.extend_from_slice(b"abc"); // no padding
         let mut reader = Cursor::new(buf);
         let result = read_bytes(&mut reader).await;
         assert!(result.is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_string_invalid_utf8() {
+    async fn test_read_string_invalid_utf8() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        write_u64(&mut buf, 4).await.unwrap();
+        write_u64(&mut buf, 4).await?;
         buf.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC]); // invalid UTF-8
         buf.extend_from_slice(&[0, 0, 0, 0]); // padding
         let mut reader = Cursor::new(buf);
         let result = read_string(&mut reader).await;
         assert!(matches!(result, Err(WireError::InvalidUtf8(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_string_pairs_too_large() {
+    async fn test_string_pairs_too_large() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        write_u64(&mut buf, MAX_COLLECTION_COUNT + 1).await.unwrap();
+        write_u64(&mut buf, MAX_COLLECTION_COUNT + 1).await?;
         let mut reader = Cursor::new(buf);
         let result = read_string_pairs(&mut reader).await;
         assert!(matches!(result, Err(WireError::CollectionTooLarge(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_strings_truncated_elements() {
+    async fn test_read_strings_truncated_elements() -> anyhow::Result<()> {
         // Says 3 elements, but only provides data for 1
         let mut buf = Vec::new();
-        write_u64(&mut buf, 3).await.unwrap();
-        write_string(&mut buf, "first").await.unwrap();
+        write_u64(&mut buf, 3).await?;
+        write_string(&mut buf, "first").await?;
         // missing 2nd and 3rd elements
         let mut reader = Cursor::new(buf);
         let result = read_strings(&mut reader).await;
         assert!(result.is_err());
+        Ok(())
     }
 
     // Framed stream tests
 
     #[tokio::test]
-    async fn test_framed_stream_empty() {
+    async fn test_framed_stream_empty() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        write_framed_stream(&mut buf, b"", 64).await.unwrap();
+        write_framed_stream(&mut buf, b"", 64).await?;
 
         // Should just be u64(0) sentinel
         assert_eq!(buf.len(), 8);
 
         let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await.unwrap();
+        let result = read_framed_stream(&mut reader).await?;
         assert!(result.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_stream_single_chunk() {
+    async fn test_framed_stream_single_chunk() -> anyhow::Result<()> {
         let data = b"hello framed world";
         let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 1024).await.unwrap();
+        write_framed_stream(&mut buf, data, 1024).await?;
 
         let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await.unwrap();
+        let result = read_framed_stream(&mut reader).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_stream_multiple_chunks() {
+    async fn test_framed_stream_multiple_chunks() -> anyhow::Result<()> {
         let data = b"abcdefghijklmnopqrstuvwxyz";
         let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 10).await.unwrap();
+        write_framed_stream(&mut buf, data, 10).await?;
 
         // Should have 3 frames: 10 + 10 + 6 + sentinel
         let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await.unwrap();
+        let result = read_framed_stream(&mut reader).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_stream_no_padding() {
+    async fn test_framed_stream_no_padding() -> anyhow::Result<()> {
         // Verify that framed stream data is NOT padded (unlike string encoding)
         let data = b"abc"; // 3 bytes, would need 5 bytes padding in string format
         let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 1024).await.unwrap();
+        write_framed_stream(&mut buf, data, 1024).await?;
 
         // Expected: u64(3) + "abc" + u64(0) = 8 + 3 + 8 = 19 bytes
         // If it were padded like strings, it would be 8 + 3 + 5 + 8 = 24 bytes
         assert_eq!(buf.len(), 19, "framed stream should not pad chunk data");
 
         let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await.unwrap();
+        let result = read_framed_stream(&mut reader).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_stream_chunk_size_1() {
+    async fn test_framed_stream_chunk_size_1() -> anyhow::Result<()> {
         let data = b"test";
         let mut buf = Vec::new();
-        write_framed_stream(&mut buf, data, 1).await.unwrap();
+        write_framed_stream(&mut buf, data, 1).await?;
 
         // 4 frames of 1 byte each + sentinel
         let mut reader = Cursor::new(buf);
-        let result = read_framed_stream(&mut reader).await.unwrap();
+        let result = read_framed_stream(&mut reader).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     // Property-based tests
@@ -547,9 +567,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_u64(&mut buf, val).await.unwrap();
+                    write_u64(&mut buf, val).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_u64(&mut reader).await.unwrap();
+                    let result = read_u64(&mut reader).await?;
                     prop_assert_eq!(result, val);
                     Ok(())
                 })?;
@@ -560,9 +580,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_bytes(&mut buf, &data).await.unwrap();
+                    write_bytes(&mut buf, &data).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_bytes(&mut reader).await.unwrap();
+                    let result = read_bytes(&mut reader).await?;
                     prop_assert_eq!(result, data);
                     Ok(())
                 })?;
@@ -573,9 +593,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_bool(&mut buf, val).await.unwrap();
+                    write_bool(&mut buf, val).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_bool(&mut reader).await.unwrap();
+                    let result = read_bool(&mut reader).await?;
                     prop_assert_eq!(result, val);
                     Ok(())
                 })?;
@@ -586,9 +606,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_string(&mut buf, &s).await.unwrap();
+                    write_string(&mut buf, &s).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_string(&mut reader).await.unwrap();
+                    let result = read_string(&mut reader).await?;
                     prop_assert_eq!(result, s);
                     Ok(())
                 })?;
@@ -599,9 +619,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_string(&mut buf, &s).await.unwrap();
+                    write_string(&mut buf, &s).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_string(&mut reader).await.unwrap();
+                    let result = read_string(&mut reader).await?;
                     prop_assert_eq!(result, s);
                     Ok(())
                 })?;
@@ -613,9 +633,9 @@ mod tests {
                 rt.block_on(async {
                     let items: Vec<String> = items.into_iter().collect();
                     let mut buf = Vec::new();
-                    write_strings(&mut buf, &items).await.unwrap();
+                    write_strings(&mut buf, &items).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_strings(&mut reader).await.unwrap();
+                    let result = read_strings(&mut reader).await?;
                     prop_assert_eq!(result, items);
                     Ok(())
                 })?;
@@ -632,9 +652,9 @@ mod tests {
                 rt.block_on(async {
                     let pairs: Vec<(String, String)> = pairs;
                     let mut buf = Vec::new();
-                    write_string_pairs(&mut buf, &pairs).await.unwrap();
+                    write_string_pairs(&mut buf, &pairs).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_string_pairs(&mut reader).await.unwrap();
+                    let result = read_string_pairs(&mut reader).await?;
                     prop_assert_eq!(result, pairs);
                     Ok(())
                 })?;
@@ -648,9 +668,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_framed_stream(&mut buf, &data, chunk_size).await.unwrap();
+                    write_framed_stream(&mut buf, &data, chunk_size).await?;
                     let mut reader = Cursor::new(buf);
-                    let result = read_framed_stream(&mut reader).await.unwrap();
+                    let result = read_framed_stream(&mut reader).await?;
                     prop_assert_eq!(result, data);
                     Ok(())
                 })?;
@@ -664,7 +684,7 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_framed_stream(&mut buf, &data, chunk_size).await.unwrap();
+                    write_framed_stream(&mut buf, &data, chunk_size).await?;
                     let reader = FramedStreamReader::new(
                         Cursor::new(buf),
                         MAX_FRAMED_TOTAL,
@@ -674,8 +694,7 @@ mod tests {
                         &mut tokio::io::BufReader::new(reader),
                         &mut result,
                     )
-                    .await
-                    .unwrap();
+                    .await?;
                     prop_assert_eq!(result, data);
                     Ok(())
                 })?;

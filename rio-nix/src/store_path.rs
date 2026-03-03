@@ -409,25 +409,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_valid_store_path() {
+    fn test_parse_valid_store_path() -> anyhow::Result<()> {
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
-        let sp = StorePath::parse(path).unwrap();
+        let sp = StorePath::parse(path)?;
         assert_eq!(sp.name, "hello-2.12.1");
         assert!(!sp.is_derivation());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_derivation_path() {
+    fn test_parse_derivation_path() -> anyhow::Result<()> {
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1.drv";
-        let sp = StorePath::parse(path).unwrap();
+        let sp = StorePath::parse(path)?;
         assert!(sp.is_derivation());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_roundtrip() {
+    fn test_parse_roundtrip() -> anyhow::Result<()> {
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
-        let sp = StorePath::parse(path).unwrap();
+        let sp = StorePath::parse(path)?;
         assert_eq!(sp.to_string(), path);
+        Ok(())
     }
 
     #[test]
@@ -465,12 +468,13 @@ mod tests {
     }
 
     #[test]
-    fn test_nixbase32_roundtrip() {
+    fn test_nixbase32_roundtrip() -> anyhow::Result<()> {
         let data = vec![0u8; 20]; // 20 zero bytes
         let encoded = nixbase32::encode(&data);
         assert_eq!(encoded.len(), 32); // ceil(20*8/5) = 32
-        let decoded = nixbase32::decode(&encoded).unwrap();
+        let decoded = nixbase32::decode(&encoded)?;
         assert_eq!(decoded, data);
+        Ok(())
     }
 
     #[test]
@@ -507,9 +511,9 @@ mod tests {
     /// 10× 3-line blocks at 0% each in lcov (Deref, AsRef, Borrow,
     /// PartialEq×3, FromStr, Hash, StorePathHash::as_bytes + Debug).
     #[test]
-    fn test_string_like_trait_impls() {
+    fn test_string_like_trait_impls() -> anyhow::Result<()> {
         let full = "/nix/store/7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y-hello-2.12.1";
-        let p = StorePath::parse(full).unwrap();
+        let p = StorePath::parse(full)?;
 
         // Deref<Target=str>
         let s: &str = &p;
@@ -525,7 +529,7 @@ mod tests {
         // PartialEq<String>
         assert_eq!(p, full.to_string());
         // FromStr
-        let p2: StorePath = full.parse().unwrap();
+        let p2: StorePath = full.parse()?;
         assert_eq!(p, p2);
         // Hash + Borrow<str> → HashSet lookup by &str works
         let mut set = std::collections::HashSet::new();
@@ -537,18 +541,20 @@ mod tests {
         let dbg = format!("{:?}", p.hash());
         assert!(dbg.starts_with("StorePathHash("));
         assert!(dbg.contains("7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y"));
+        Ok(())
     }
 
     /// make_text with non-empty references exercises the ref-append loop.
     #[test]
-    fn test_make_text_with_references() {
-        let r1 = StorePath::parse("/nix/store/00000000000000000000000000000000-ref1").unwrap();
-        let r2 = StorePath::parse("/nix/store/11111111111111111111111111111111-ref2").unwrap();
-        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32]).unwrap();
-        let p = StorePath::make_text("mytext", &hash, &[r1, r2]).unwrap();
+    fn test_make_text_with_references() -> anyhow::Result<()> {
+        let r1 = StorePath::parse("/nix/store/00000000000000000000000000000000-ref1")?;
+        let r2 = StorePath::parse("/nix/store/11111111111111111111111111111111-ref2")?;
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+        let p = StorePath::make_text("mytext", &hash, &[r1, r2])?;
         // Exact hash is tested elsewhere (golden conformance); here we just
         // verify the function succeeds with multiple refs.
         assert_eq!(p.name(), "mytext");
+        Ok(())
     }
 
     #[test]
@@ -574,7 +580,7 @@ mod tests {
             #[test]
             fn nixbase32_roundtrip(data in proptest::collection::vec(any::<u8>(), 1..=32)) {
                 let encoded = nixbase32::encode(&data);
-                let decoded = nixbase32::decode(&encoded).unwrap();
+                let decoded = nixbase32::decode(&encoded)?;
                 prop_assert_eq!(decoded, data);
             }
         }

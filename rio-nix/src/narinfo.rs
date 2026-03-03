@@ -390,7 +390,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_with_ca() {
+    fn parse_with_ca() -> anyhow::Result<()> {
         let text = "\
 StorePath: /nix/store/abc-test
 URL: nar/abc.nar.zst
@@ -400,12 +400,13 @@ NarSize: 100
 References:
 CA: fixed:sha256:abcdef
 ";
-        let info = NarInfo::parse(text).unwrap();
+        let info = NarInfo::parse(text)?;
         assert_eq!(info.ca(), Some("fixed:sha256:abcdef"));
+        Ok(())
     }
 
     #[test]
-    fn parse_multiple_sigs() {
+    fn parse_multiple_sigs() -> anyhow::Result<()> {
         let text = "\
 StorePath: /nix/store/abc-test
 URL: nar/abc.nar.zst
@@ -416,14 +417,15 @@ References:
 Sig: key1:sig1
 Sig: key2:sig2
 ";
-        let info = NarInfo::parse(text).unwrap();
+        let info = NarInfo::parse(text)?;
         assert_eq!(info.sigs().len(), 2);
         assert_eq!(info.sigs()[0], "key1:sig1");
         assert_eq!(info.sigs()[1], "key2:sig2");
+        Ok(())
     }
 
     #[test]
-    fn parse_with_file_hash_and_size() {
+    fn parse_with_file_hash_and_size() -> anyhow::Result<()> {
         let text = "\
 StorePath: /nix/store/abc-test
 URL: nar/abc.nar.zst
@@ -434,9 +436,10 @@ NarHash: sha256:0000
 NarSize: 10000
 References:
 ";
-        let info = NarInfo::parse(text).unwrap();
+        let info = NarInfo::parse(text)?;
         assert_eq!(info.file_hash(), Some("sha256:deadbeef"));
         assert_eq!(info.file_size(), Some(5000));
+        Ok(())
     }
 
     #[test]
@@ -521,7 +524,7 @@ Deriver: second.drv
     }
 
     #[test]
-    fn builder_constructs_valid_narinfo() {
+    fn builder_constructs_valid_narinfo() -> anyhow::Result<()> {
         let info = NarInfoBuilder::new(
             "/nix/store/abc-test",
             "nar/abc.nar.zst",
@@ -533,8 +536,7 @@ Deriver: second.drv
         .deriver("xyz-test.drv")
         .sig("key:sig")
         .ca("fixed:sha256:beef")
-        .build()
-        .unwrap();
+        .build()?;
 
         assert_eq!(info.store_path(), "/nix/store/abc-test");
         assert_eq!(info.references(), &["abc-dep"]);
@@ -544,12 +546,13 @@ Deriver: second.drv
 
         // Verify it roundtrips
         let serialized = info.serialize();
-        let reparsed = NarInfo::parse(&serialized).unwrap();
+        let reparsed = NarInfo::parse(&serialized)?;
         assert_eq!(info, reparsed);
+        Ok(())
     }
 
     #[test]
-    fn serialize_omits_empty_optional_fields() {
+    fn serialize_omits_empty_optional_fields() -> anyhow::Result<()> {
         let info = NarInfoBuilder::new(
             "/nix/store/abc-test",
             "nar/abc.nar.zst",
@@ -557,8 +560,7 @@ Deriver: second.drv
             "sha256:0000",
             100,
         )
-        .build()
-        .unwrap();
+        .build()?;
 
         let text = info.serialize();
         assert!(!text.contains("Deriver:"));
@@ -566,10 +568,11 @@ Deriver: second.drv
         assert!(!text.contains("CA:"));
         assert!(!text.contains("FileHash:"));
         assert!(!text.contains("FileSize:"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_minimal_narinfo() {
+    fn test_parse_minimal_narinfo() -> anyhow::Result<()> {
         let text = "\
 StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test
 URL: nar/test.nar.zst
@@ -577,7 +580,7 @@ Compression: zstd
 NarHash: sha256:abc123
 NarSize: 12345
 ";
-        let info = NarInfo::parse(text).unwrap();
+        let info = NarInfo::parse(text)?;
 
         assert_eq!(
             info.store_path(),
@@ -593,10 +596,11 @@ NarSize: 12345
         assert!(info.ca().is_none());
         assert!(info.file_hash().is_none());
         assert!(info.file_size().is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_full_narinfo() {
+    fn test_parse_full_narinfo() -> anyhow::Result<()> {
         let text = "\
 StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2
 URL: nar/full-test.nar.zst
@@ -610,7 +614,7 @@ CA: fixed:sha256:cafebabe
 FileHash: sha256:f00dcafe
 FileSize: 54321
 ";
-        let info = NarInfo::parse(text).unwrap();
+        let info = NarInfo::parse(text)?;
 
         assert_eq!(
             info.store_path(),
@@ -635,10 +639,11 @@ FileSize: 54321
         assert_eq!(info.ca(), Some("fixed:sha256:cafebabe"));
         assert_eq!(info.file_hash(), Some("sha256:f00dcafe"));
         assert_eq!(info.file_size(), Some(54321));
+        Ok(())
     }
 
     #[test]
-    fn test_roundtrip_narinfo() {
+    fn test_roundtrip_narinfo() -> anyhow::Result<()> {
         let original = NarInfoBuilder::new(
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-roundtrip",
             "nar/roundtrip.nar.zst",
@@ -656,11 +661,10 @@ FileSize: 54321
         .ca("fixed:sha256:cafef00d")
         .file_hash("sha256:compressed123")
         .file_size(8000)
-        .build()
-        .unwrap();
+        .build()?;
 
         let serialized = original.serialize();
-        let reparsed = NarInfo::parse(&serialized).unwrap();
+        let reparsed = NarInfo::parse(&serialized)?;
 
         assert_eq!(original.store_path(), reparsed.store_path());
         assert_eq!(original.url(), reparsed.url());
@@ -674,6 +678,7 @@ FileSize: 54321
         assert_eq!(original.file_hash(), reparsed.file_hash());
         assert_eq!(original.file_size(), reparsed.file_size());
         assert_eq!(original, reparsed);
+        Ok(())
     }
 
     #[test]
@@ -805,9 +810,9 @@ FileHash: sha256:second
                         .file_size(file_size_val);
                 }
 
-                let original = builder.build().unwrap();
+                let original = builder.build()?;
                 let serialized = original.serialize();
-                let reparsed = NarInfo::parse(&serialized).unwrap();
+                let reparsed = NarInfo::parse(&serialized)?;
 
                 prop_assert_eq!(&original, &reparsed);
             }

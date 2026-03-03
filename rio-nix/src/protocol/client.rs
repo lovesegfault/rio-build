@@ -319,7 +319,7 @@ mod tests {
 
     /// Test client handshake against our own server handshake.
     #[tokio::test]
-    async fn client_handshake_against_server() {
+    async fn client_handshake_against_server() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(8192);
 
         let server_handle = tokio::spawn(async move {
@@ -328,20 +328,21 @@ mod tests {
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        let client_result = client_handshake(&mut cr, &mut cw).await.unwrap();
+        let client_result = client_handshake(&mut cr, &mut cw).await?;
 
-        let server_result = server_handle.await.unwrap().unwrap();
+        let server_result = server_handle.await??;
 
         assert_eq!(
             client_result.negotiated_version(),
             server_result.negotiated_version()
         );
         assert!(client_result.negotiated_version() >= MIN_CLIENT_VERSION);
+        Ok(())
     }
 
     /// Test client handshake with 1.37 server (no feature exchange).
     #[tokio::test]
-    async fn client_handshake_v137_server() {
+    async fn client_handshake_v137_server() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(8192);
         let server_version = encode_version(1, 37);
 
@@ -350,49 +351,49 @@ mod tests {
             let (mut sr, mut sw) = tokio::io::split(server_stream);
 
             // Read client MAGIC_1
-            let magic = wire::read_u64(&mut sr).await.unwrap();
+            let magic = wire::read_u64(&mut sr).await?;
             assert_eq!(magic, WORKER_MAGIC_1);
 
             // Send MAGIC_2 + version
-            wire::write_u64(&mut sw, WORKER_MAGIC_2).await.unwrap();
-            wire::write_u64(&mut sw, server_version).await.unwrap();
-            sw.flush().await.unwrap();
+            wire::write_u64(&mut sw, WORKER_MAGIC_2).await?;
+            wire::write_u64(&mut sw, server_version).await?;
+            sw.flush().await?;
 
             // Read client version
-            let _client_version = wire::read_u64(&mut sr).await.unwrap();
+            let _client_version = wire::read_u64(&mut sr).await?;
 
             // NO feature exchange for 1.37
 
             // Read affinity + reserveSpace
-            let _affinity = wire::read_u64(&mut sr).await.unwrap();
-            let _reserve = wire::read_u64(&mut sr).await.unwrap();
+            let _affinity = wire::read_u64(&mut sr).await?;
+            let _reserve = wire::read_u64(&mut sr).await?;
 
             // Send version string + trusted
-            wire::write_string(&mut sw, "test-daemon 1.37")
-                .await
-                .unwrap();
-            wire::write_u64(&mut sw, 1).await.unwrap();
-            sw.flush().await.unwrap();
+            wire::write_string(&mut sw, "test-daemon 1.37").await?;
+            wire::write_u64(&mut sw, 1).await?;
+            sw.flush().await?;
 
             // Send STDERR_LAST
-            wire::write_u64(&mut sw, STDERR_LAST).await.unwrap();
-            sw.flush().await.unwrap();
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        let result = client_handshake(&mut cr, &mut cw).await.unwrap();
+        let result = client_handshake(&mut cr, &mut cw).await?;
 
         assert_eq!(result.negotiated_version(), server_version);
-        server_handle.await.unwrap();
+        server_handle.await??;
+        Ok(())
     }
 
     /// Test reading STDERR messages.
     #[tokio::test]
-    async fn read_stderr_messages() {
+    async fn read_stderr_messages() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
-            w.log("building foo").await.unwrap();
+            w.log("building foo").await?;
             let _id = w
                 .start_activity(
                     crate::protocol::stderr::ActivityType::Build,
@@ -400,43 +401,42 @@ mod tests {
                     0,
                     0,
                 )
-                .await
-                .unwrap();
-            w.stop_activity(1).await.unwrap();
-            w.finish().await.unwrap();
+                .await?;
+            w.stop_activity(1).await?;
+            w.finish().await?;
         }
 
         let mut reader = std::io::Cursor::new(buf);
         // Read NEXT
-        let msg = read_stderr_message(&mut reader).await.unwrap();
+        let msg = read_stderr_message(&mut reader).await?;
         assert!(matches!(msg, StderrMessage::Next(ref s) if s == "building foo"));
 
         // Read START_ACTIVITY
-        let msg = read_stderr_message(&mut reader).await.unwrap();
+        let msg = read_stderr_message(&mut reader).await?;
         assert!(matches!(msg, StderrMessage::StartActivity { id: 1, .. }));
 
         // Read STOP_ACTIVITY
-        let msg = read_stderr_message(&mut reader).await.unwrap();
+        let msg = read_stderr_message(&mut reader).await?;
         assert!(matches!(msg, StderrMessage::StopActivity { id: 1 }));
 
         // Read LAST
-        let msg = read_stderr_message(&mut reader).await.unwrap();
+        let msg = read_stderr_message(&mut reader).await?;
         assert!(matches!(msg, StderrMessage::Last));
+        Ok(())
     }
 
     /// Test reading STDERR_ERROR.
     #[tokio::test]
-    async fn read_stderr_error_message() {
+    async fn read_stderr_error_message() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
             w.error(&StderrError::simple("test", "something failed"))
-                .await
-                .unwrap();
+                .await?;
         }
 
         let mut reader = std::io::Cursor::new(buf);
-        let msg = read_stderr_message(&mut reader).await.unwrap();
+        let msg = read_stderr_message(&mut reader).await?;
         match msg {
             StderrMessage::Error(e) => {
                 assert_eq!(e.error_type, "Error");
@@ -445,6 +445,7 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -452,46 +453,42 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_read_stderr_read_variant() {
+    async fn test_read_stderr_read_variant() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_READ).await.unwrap();
-        wire::write_u64(&mut buf, 1024).await.unwrap();
+        wire::write_u64(&mut buf, STDERR_READ).await?;
+        wire::write_u64(&mut buf, 1024).await?;
 
-        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
-            .await
-            .unwrap();
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf)).await?;
         assert!(matches!(msg, StderrMessage::Read(1024)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_stderr_write_variant() {
+    async fn test_read_stderr_write_variant() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_WRITE).await.unwrap();
-        wire::write_bytes(&mut buf, b"payload").await.unwrap();
+        wire::write_u64(&mut buf, STDERR_WRITE).await?;
+        wire::write_bytes(&mut buf, b"payload").await?;
 
-        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
-            .await
-            .unwrap();
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf)).await?;
         assert!(matches!(msg, StderrMessage::Write(ref d) if d == b"payload"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_stderr_result_variant_with_fields() {
+    async fn test_read_stderr_result_variant_with_fields() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_RESULT).await.unwrap();
-        wire::write_u64(&mut buf, 42).await.unwrap(); // activity_id
-        wire::write_u64(&mut buf, 7).await.unwrap(); // result_type
-        wire::write_u64(&mut buf, 2).await.unwrap(); // field count
+        wire::write_u64(&mut buf, STDERR_RESULT).await?;
+        wire::write_u64(&mut buf, 42).await?; // activity_id
+        wire::write_u64(&mut buf, 7).await?; // result_type
+        wire::write_u64(&mut buf, 2).await?; // field count
         // Field 0: Int(123)
-        wire::write_u64(&mut buf, 0).await.unwrap(); // field_type = Int
-        wire::write_u64(&mut buf, 123).await.unwrap();
+        wire::write_u64(&mut buf, 0).await?; // field_type = Int
+        wire::write_u64(&mut buf, 123).await?;
         // Field 1: String("hi")
-        wire::write_u64(&mut buf, 1).await.unwrap(); // field_type = String
-        wire::write_string(&mut buf, "hi").await.unwrap();
+        wire::write_u64(&mut buf, 1).await?; // field_type = String
+        wire::write_string(&mut buf, "hi").await?;
 
-        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
-            .await
-            .unwrap();
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf)).await?;
         match msg {
             StderrMessage::Result {
                 activity_id,
@@ -506,42 +503,37 @@ mod tests {
             }
             other => panic!("expected Result, got {other:?}"),
         }
+        Ok(())
     }
 
     /// Full STDERR_ERROR with position + traces — exercises the have_pos
     /// branch (124-131) and the trace loop (139-151).
     #[tokio::test]
-    async fn test_read_stderr_error_with_position_and_traces() {
+    async fn test_read_stderr_error_with_position_and_traces() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_ERROR).await.unwrap();
-        wire::write_string(&mut buf, "Error").await.unwrap(); // error_type
-        wire::write_u64(&mut buf, 1).await.unwrap(); // level
-        wire::write_string(&mut buf, "nix::EvalError")
-            .await
-            .unwrap(); // name
-        wire::write_string(&mut buf, "undefined variable")
-            .await
-            .unwrap(); // message
+        wire::write_u64(&mut buf, STDERR_ERROR).await?;
+        wire::write_string(&mut buf, "Error").await?; // error_type
+        wire::write_u64(&mut buf, 1).await?; // level
+        wire::write_string(&mut buf, "nix::EvalError").await?; // name
+        wire::write_string(&mut buf, "undefined variable").await?; // message
         // Position: have_pos=1, file/line/column
-        wire::write_u64(&mut buf, 1).await.unwrap();
-        wire::write_string(&mut buf, "default.nix").await.unwrap();
-        wire::write_u64(&mut buf, 10).await.unwrap();
-        wire::write_u64(&mut buf, 5).await.unwrap();
+        wire::write_u64(&mut buf, 1).await?;
+        wire::write_string(&mut buf, "default.nix").await?;
+        wire::write_u64(&mut buf, 10).await?;
+        wire::write_u64(&mut buf, 5).await?;
         // Traces: count=2
-        wire::write_u64(&mut buf, 2).await.unwrap();
+        wire::write_u64(&mut buf, 2).await?;
         // Trace 0: with position
-        wire::write_u64(&mut buf, 1).await.unwrap();
-        wire::write_string(&mut buf, "lib.nix").await.unwrap();
-        wire::write_u64(&mut buf, 3).await.unwrap();
-        wire::write_u64(&mut buf, 1).await.unwrap();
-        wire::write_string(&mut buf, "while calling").await.unwrap();
+        wire::write_u64(&mut buf, 1).await?;
+        wire::write_string(&mut buf, "lib.nix").await?;
+        wire::write_u64(&mut buf, 3).await?;
+        wire::write_u64(&mut buf, 1).await?;
+        wire::write_string(&mut buf, "while calling").await?;
         // Trace 1: no position
-        wire::write_u64(&mut buf, 0).await.unwrap();
-        wire::write_string(&mut buf, "from CLI").await.unwrap();
+        wire::write_u64(&mut buf, 0).await?;
+        wire::write_string(&mut buf, "from CLI").await?;
 
-        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
-            .await
-            .unwrap();
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf)).await?;
         match msg {
             StderrMessage::Error(e) => {
                 assert_eq!(e.message, "undefined variable");
@@ -557,67 +549,68 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_stderr_unknown_message_type() {
+    async fn test_read_stderr_unknown_message_type() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, 0xDEADBEEF).await.unwrap();
+        wire::write_u64(&mut buf, 0xDEADBEEF).await?;
 
         let err = read_stderr_message(&mut std::io::Cursor::new(buf))
             .await
             .expect_err("unknown type should error");
         assert!(err.to_string().contains("unknown STDERR message type"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_result_fields_unknown_field_type() {
+    async fn test_read_result_fields_unknown_field_type() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_RESULT).await.unwrap();
-        wire::write_u64(&mut buf, 1).await.unwrap(); // activity_id
-        wire::write_u64(&mut buf, 0).await.unwrap(); // result_type
-        wire::write_u64(&mut buf, 1).await.unwrap(); // field count
-        wire::write_u64(&mut buf, 99).await.unwrap(); // field_type = invalid
+        wire::write_u64(&mut buf, STDERR_RESULT).await?;
+        wire::write_u64(&mut buf, 1).await?; // activity_id
+        wire::write_u64(&mut buf, 0).await?; // result_type
+        wire::write_u64(&mut buf, 1).await?; // field count
+        wire::write_u64(&mut buf, 99).await?; // field_type = invalid
 
         let err = read_stderr_message(&mut std::io::Cursor::new(buf))
             .await
             .expect_err("unknown field type should error");
         assert!(err.to_string().contains("unknown result field type"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_result_fields_too_large() {
+    async fn test_read_result_fields_too_large() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_RESULT).await.unwrap();
-        wire::write_u64(&mut buf, 1).await.unwrap();
-        wire::write_u64(&mut buf, 0).await.unwrap();
-        wire::write_u64(&mut buf, wire::MAX_COLLECTION_COUNT + 1)
-            .await
-            .unwrap(); // field count > max
+        wire::write_u64(&mut buf, STDERR_RESULT).await?;
+        wire::write_u64(&mut buf, 1).await?;
+        wire::write_u64(&mut buf, 0).await?;
+        wire::write_u64(&mut buf, wire::MAX_COLLECTION_COUNT + 1).await?; // field count > max
 
         let err = read_stderr_message(&mut std::io::Cursor::new(buf))
             .await
             .expect_err("oversized count should error");
         assert!(matches!(err, WireError::CollectionTooLarge(_)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_stderr_error_traces_too_large() {
+    async fn test_read_stderr_error_traces_too_large() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_ERROR).await.unwrap();
-        wire::write_string(&mut buf, "Error").await.unwrap();
-        wire::write_u64(&mut buf, 0).await.unwrap(); // level
-        wire::write_string(&mut buf, "name").await.unwrap();
-        wire::write_string(&mut buf, "msg").await.unwrap();
-        wire::write_u64(&mut buf, 0).await.unwrap(); // have_pos
-        wire::write_u64(&mut buf, wire::MAX_COLLECTION_COUNT + 1)
-            .await
-            .unwrap(); // trace_count > max
+        wire::write_u64(&mut buf, STDERR_ERROR).await?;
+        wire::write_string(&mut buf, "Error").await?;
+        wire::write_u64(&mut buf, 0).await?; // level
+        wire::write_string(&mut buf, "name").await?;
+        wire::write_string(&mut buf, "msg").await?;
+        wire::write_u64(&mut buf, 0).await?; // have_pos
+        wire::write_u64(&mut buf, wire::MAX_COLLECTION_COUNT + 1).await?; // trace_count > max
 
         let err = read_stderr_message(&mut std::io::Cursor::new(buf))
             .await
             .expect_err("oversized trace count should error");
         assert!(matches!(err, WireError::CollectionTooLarge(_)));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -625,14 +618,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_drain_stderr_daemon_error_aborts() {
+    async fn test_drain_stderr_daemon_error_aborts() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         {
             let mut w = StderrWriter::new(&mut buf);
-            w.log("doing stuff").await.unwrap();
-            w.error(&StderrError::simple("Build", "oh no"))
-                .await
-                .unwrap();
+            w.log("doing stuff").await?;
+            w.error(&StderrError::simple("Build", "oh no")).await?;
         }
 
         let err = drain_stderr(&mut std::io::Cursor::new(buf))
@@ -640,13 +631,14 @@ mod tests {
             .expect_err("drain should error on STDERR_ERROR");
         assert!(err.to_string().contains("daemon error"));
         assert!(err.to_string().contains("oh no"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_drain_stderr_unexpected_read_aborts() {
+    async fn test_drain_stderr_unexpected_read_aborts() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        wire::write_u64(&mut buf, STDERR_READ).await.unwrap();
-        wire::write_u64(&mut buf, 10).await.unwrap();
+        wire::write_u64(&mut buf, STDERR_READ).await?;
+        wire::write_u64(&mut buf, 10).await?;
 
         let err = drain_stderr(&mut std::io::Cursor::new(buf))
             .await
@@ -655,6 +647,7 @@ mod tests {
             err.to_string()
                 .contains("unexpected STDERR_READ during drain")
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -664,59 +657,60 @@ mod tests {
     /// client_set_options wire layout round-trip. Field order and values
     /// per Nix src/libstore/daemon.cc case SetOptions.
     #[tokio::test]
-    async fn test_client_set_options_roundtrip() {
+    async fn test_client_set_options_roundtrip() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(8192);
 
         let server = tokio::spawn(async move {
             let (mut sr, mut sw) = tokio::io::split(server_stream);
             // Opcode
-            let op = wire::read_u64(&mut sr).await.unwrap();
+            let op = wire::read_u64(&mut sr).await?;
             assert_eq!(op, WorkerOp::SetOptions as u64);
             // 13 fields in the exact order the client sends them
-            let keep_failed = wire::read_bool(&mut sr).await.unwrap();
-            let keep_going = wire::read_bool(&mut sr).await.unwrap();
-            let try_fallback = wire::read_bool(&mut sr).await.unwrap();
+            let keep_failed = wire::read_bool(&mut sr).await?;
+            let keep_going = wire::read_bool(&mut sr).await?;
+            let try_fallback = wire::read_bool(&mut sr).await?;
             assert!(!keep_failed && !keep_going && !try_fallback);
-            let verbosity = wire::read_u64(&mut sr).await.unwrap();
+            let verbosity = wire::read_u64(&mut sr).await?;
             assert_eq!(verbosity, 0);
-            let max_build_jobs = wire::read_u64(&mut sr).await.unwrap();
+            let max_build_jobs = wire::read_u64(&mut sr).await?;
             assert_eq!(max_build_jobs, 1);
-            let max_silent_time = wire::read_u64(&mut sr).await.unwrap();
+            let max_silent_time = wire::read_u64(&mut sr).await?;
             assert_eq!(max_silent_time, 0);
-            let obsolete_use_build_hook = wire::read_u64(&mut sr).await.unwrap();
+            let obsolete_use_build_hook = wire::read_u64(&mut sr).await?;
             assert_eq!(obsolete_use_build_hook, 1);
-            let verbose_build = wire::read_bool(&mut sr).await.unwrap();
+            let verbose_build = wire::read_bool(&mut sr).await?;
             assert!(!verbose_build);
-            let _obsolete_log_type = wire::read_u64(&mut sr).await.unwrap();
-            let _obsolete_print_build_trace = wire::read_u64(&mut sr).await.unwrap();
-            let build_cores = wire::read_u64(&mut sr).await.unwrap();
+            let _obsolete_log_type = wire::read_u64(&mut sr).await?;
+            let _obsolete_print_build_trace = wire::read_u64(&mut sr).await?;
+            let build_cores = wire::read_u64(&mut sr).await?;
             assert_eq!(build_cores, 0);
-            let use_substitutes = wire::read_bool(&mut sr).await.unwrap();
+            let use_substitutes = wire::read_bool(&mut sr).await?;
             assert!(!use_substitutes);
-            let overrides = wire::read_string_pairs(&mut sr).await.unwrap();
+            let overrides = wire::read_string_pairs(&mut sr).await?;
             assert!(overrides.is_empty());
             // Send STDERR_LAST to unblock the client's drain_stderr.
-            wire::write_u64(&mut sw, STDERR_LAST).await.unwrap();
-            sw.flush().await.unwrap();
+            wire::write_u64(&mut sw, STDERR_LAST).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
-        client_set_options(&mut cr, &mut cw)
-            .await
-            .expect("set_options should succeed");
-        server.await.unwrap();
+        client_set_options(&mut cr, &mut cw).await?;
+        server.await??;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_client_handshake_bad_magic() {
+    async fn test_client_handshake_bad_magic() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(64);
 
         let server = tokio::spawn(async move {
             let (mut sr, mut sw) = tokio::io::split(server_stream);
             // Read client MAGIC_1 then send WRONG magic.
-            let _m1 = wire::read_u64(&mut sr).await.unwrap();
-            wire::write_u64(&mut sw, 0xBADC0FFE).await.unwrap();
-            sw.flush().await.unwrap();
+            let _m1 = wire::read_u64(&mut sr).await?;
+            wire::write_u64(&mut sw, 0xBADC0FFE).await?;
+            sw.flush().await?;
+            anyhow::Ok(())
         });
 
         let (mut cr, mut cw) = tokio::io::split(client_stream);
@@ -724,6 +718,7 @@ mod tests {
             .await
             .expect_err("bad magic should fail handshake");
         assert!(matches!(err, HandshakeError::InvalidMagic(0xBADC0FFE)));
-        server.await.unwrap();
+        server.await??;
+        Ok(())
     }
 }

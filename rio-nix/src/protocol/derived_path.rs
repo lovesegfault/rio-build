@@ -134,21 +134,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_opaque() {
+    fn parse_opaque() -> anyhow::Result<()> {
         let path_str = make_path("hello-2.12.1");
-        let dp = DerivedPath::parse(&path_str).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
         match dp {
             DerivedPath::Opaque(p) => {
                 assert_eq!(p.name(), "hello-2.12.1");
             }
             DerivedPath::Built { .. } => panic!("expected Opaque"),
         }
+        Ok(())
     }
 
     #[test]
-    fn parse_built_all_outputs() {
+    fn parse_built_all_outputs() -> anyhow::Result<()> {
         let path_str = format!("{}!*", make_path("hello-2.12.1.drv"));
-        let dp = DerivedPath::parse(&path_str).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
         match dp {
             DerivedPath::Built { drv, outputs } => {
                 assert!(drv.is_derivation());
@@ -157,12 +158,13 @@ mod tests {
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
+        Ok(())
     }
 
     #[test]
-    fn parse_built_explicit_outputs() {
+    fn parse_built_explicit_outputs() -> anyhow::Result<()> {
         let path_str = format!("{}!out,dev", make_path("hello-2.12.1.drv"));
-        let dp = DerivedPath::parse(&path_str).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
         match dp {
             DerivedPath::Built { drv, outputs } => {
                 assert!(drv.is_derivation());
@@ -178,12 +180,13 @@ mod tests {
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
+        Ok(())
     }
 
     #[test]
-    fn parse_built_single_output() {
+    fn parse_built_single_output() -> anyhow::Result<()> {
         let path_str = format!("{}!out", make_path("hello-2.12.1.drv"));
-        let dp = DerivedPath::parse(&path_str).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
         match dp {
             DerivedPath::Built { outputs, .. } => match &outputs {
                 OutputSpec::Names(output_names) => {
@@ -193,6 +196,7 @@ mod tests {
             },
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
+        Ok(())
     }
 
     #[test]
@@ -233,21 +237,22 @@ mod tests {
     }
 
     #[test]
-    fn store_path_extracts_correctly() {
+    fn store_path_extracts_correctly() -> anyhow::Result<()> {
         let opaque_str = make_path("hello-2.12.1");
-        let opaque = DerivedPath::parse(&opaque_str).unwrap();
+        let opaque = DerivedPath::parse(&opaque_str)?;
         assert_eq!(opaque.store_path().name(), "hello-2.12.1");
 
         let built_str = format!("{}!*", make_path("hello-2.12.1.drv"));
-        let built = DerivedPath::parse(&built_str).unwrap();
+        let built = DerivedPath::parse(&built_str)?;
         assert_eq!(built.store_path().name(), "hello-2.12.1.drv");
+        Ok(())
     }
 
     #[test]
-    fn parse_multiple_bang_separators() {
+    fn parse_multiple_bang_separators() -> anyhow::Result<()> {
         // split_once('!') means only the first '!' is the separator
         let path_str = format!("{}!out!extra", make_path("hello.drv"));
-        let dp = DerivedPath::parse(&path_str).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
         match dp {
             DerivedPath::Built { outputs, .. } => {
                 // "out!extra" is treated as a single output name (with ! in it)
@@ -258,6 +263,7 @@ mod tests {
             }
             DerivedPath::Opaque(_) => panic!("expected Built"),
         }
+        Ok(())
     }
 
     #[test]
@@ -285,8 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn output_spec_names_accepts_valid() {
-        let spec = OutputSpec::names(vec!["out".to_string(), "dev".to_string()]).unwrap();
+    fn output_spec_names_accepts_valid() -> anyhow::Result<()> {
+        let spec = OutputSpec::names(vec!["out".to_string(), "dev".to_string()])?;
         match &spec {
             OutputSpec::Names(output_names) => {
                 assert_eq!(
@@ -296,30 +302,34 @@ mod tests {
             }
             OutputSpec::All => panic!("expected Names"),
         }
+        Ok(())
     }
 
     #[test]
-    fn display_roundtrip_opaque() {
+    fn display_roundtrip_opaque() -> anyhow::Result<()> {
         let path_str = make_path("hello-2.12.1");
-        let dp = DerivedPath::parse(&path_str).unwrap();
-        let roundtripped = DerivedPath::parse(&dp.to_string()).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
+        let roundtripped = DerivedPath::parse(&dp.to_string())?;
         assert_eq!(dp, roundtripped);
+        Ok(())
     }
 
     #[test]
-    fn display_roundtrip_built_all() {
+    fn display_roundtrip_built_all() -> anyhow::Result<()> {
         let path_str = format!("{}!*", make_path("hello.drv"));
-        let dp = DerivedPath::parse(&path_str).unwrap();
-        let roundtripped = DerivedPath::parse(&dp.to_string()).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
+        let roundtripped = DerivedPath::parse(&dp.to_string())?;
         assert_eq!(dp, roundtripped);
+        Ok(())
     }
 
     #[test]
-    fn display_roundtrip_built_named() {
+    fn display_roundtrip_built_named() -> anyhow::Result<()> {
         let path_str = format!("{}!out,dev,lib", make_path("hello.drv"));
-        let dp = DerivedPath::parse(&path_str).unwrap();
-        let roundtripped = DerivedPath::parse(&dp.to_string()).unwrap();
+        let dp = DerivedPath::parse(&path_str)?;
+        let roundtripped = DerivedPath::parse(&dp.to_string())?;
         assert_eq!(dp, roundtripped);
+        Ok(())
     }
 
     mod proptests {
@@ -332,13 +342,13 @@ mod tests {
 
             let opaque = name_re.prop_map(|n| {
                 let path_str = format!("/nix/store/{VALID_HASH}-{n}");
-                DerivedPath::Opaque(StorePath::parse(&path_str).unwrap())
+                DerivedPath::Opaque(StorePath::parse(&path_str).expect("generated to be valid"))
             });
 
             let built_all = name_re.prop_map(|n| {
                 let path_str = format!("/nix/store/{VALID_HASH}-{n}.drv");
                 DerivedPath::Built {
-                    drv: StorePath::parse(&path_str).unwrap(),
+                    drv: StorePath::parse(&path_str).expect("generated to be valid"),
                     outputs: OutputSpec::All,
                 }
             });
@@ -349,7 +359,7 @@ mod tests {
                     OutputSpec::names(output_names)
                         .ok()
                         .map(|outputs| DerivedPath::Built {
-                            drv: StorePath::parse(&path_str).unwrap(),
+                            drv: StorePath::parse(&path_str).expect("generated to be valid"),
                             outputs,
                         })
                 });
@@ -362,7 +372,7 @@ mod tests {
             #[test]
             fn derived_path_roundtrip(dp in arb_derived_path()) {
                 let s = dp.to_string();
-                let roundtripped = DerivedPath::parse(&s).unwrap();
+                let roundtripped = DerivedPath::parse(&s)?;
                 prop_assert_eq!(dp, roundtripped);
             }
         }
