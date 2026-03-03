@@ -28,6 +28,32 @@ pub(crate) fn setup_actor_with_store(
     (ActorHandle { tx, backpressure }, task)
 }
 
+/// Bootstrap an ephemeral PG + actor. The returned `TestDb` MUST be held
+/// for the test duration — `TestDb::Drop` tears down the database.
+/// Most callers: `let (_db, handle, _task) = setup().await;`
+pub(crate) async fn setup() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>) {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, task) = setup_actor(db.pool.clone());
+    (db, handle, task)
+}
+
+/// Bootstrap PG + actor + one fully-registered worker.
+/// Returns the scheduler→worker message receiver alongside the standard triple.
+pub(crate) async fn setup_with_worker(
+    worker_id: &str,
+    system: &str,
+    max_builds: u32,
+) -> (
+    TestDb,
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+    mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+) {
+    let (db, handle, task) = setup().await;
+    let rx = connect_worker(&handle, worker_id, system, max_builds).await;
+    (db, handle, task, rx)
+}
+
 /// Create a minimal test DerivationNode.
 pub(crate) fn make_test_node(
     hash: &str,

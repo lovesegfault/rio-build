@@ -9,10 +9,8 @@ use super::*;
 /// Validates that stream + heartbeat with the same worker_id registers correctly.
 #[tokio::test]
 async fn test_worker_registers_via_stream_and_heartbeat() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "test-worker-1", "x86_64-linux", 2).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("test-worker-1", "x86_64-linux", 2).await;
     settle().await;
 
     let workers = handle.debug_query_workers().await.unwrap();
@@ -33,11 +31,8 @@ async fn test_worker_registers_via_stream_and_heartbeat() {
 /// and the build stays Active forever.
 #[tokio::test]
 async fn test_completion_resolves_drv_path_to_hash() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    // Register a worker
-    let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 2).await;
 
     // Merge a single-node DAG
     let build_id = Uuid::new_v4();
@@ -85,11 +80,8 @@ async fn test_completion_resolves_drv_path_to_hash() {
 /// increment retry_count.
 #[tokio::test]
 async fn test_worker_disconnect_running_derivation() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    // Register a worker
-    let mut stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 1).await;
 
     // Merge a single-node DAG (worker will get it assigned)
     let build_id = Uuid::new_v4();
@@ -172,10 +164,8 @@ async fn test_worker_disconnect_running_derivation() {
 /// so this verifies the full path.
 #[tokio::test]
 async fn test_completion_infrastructure_failure_handled() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-fail-hash";
@@ -231,10 +221,8 @@ async fn test_completion_infrastructure_failure_handled() {
 /// not panic the actor with integer overflow in the EMA duration computation.
 #[tokio::test]
 async fn test_completion_with_extreme_timestamps() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "extreme-ts-hash";
@@ -295,11 +283,9 @@ async fn test_completion_with_extreme_timestamps() {
 /// Interactive (IFD) builds should jump to the front of the ready queue.
 #[tokio::test]
 async fn test_interactive_builds_pushed_to_front() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
     // Worker with capacity for 1 build at a time
-    let mut stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 1).await;
 
     // Merge a "scheduled" build first (should go to back of queue)
     let build_normal = Uuid::new_v4();
