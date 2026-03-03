@@ -20,13 +20,12 @@ async fn test_build_paths_success() {
     h.store
         .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
 
-    wire::write_u64(&mut h.stream, 9).await.unwrap(); // wopBuildPaths
-    // DerivedPath format: "drv_path!output_name" for Built paths
-    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // build_mode = Normal
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        // DerivedPath format: "drv_path!output_name" for Built paths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,                                  // build_mode = Normal
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let result = wire::read_u64(&mut h.stream).await.unwrap();
@@ -54,12 +53,11 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() {
     h.store
         .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
 
-    wire::write_u64(&mut h.stream, 9).await.unwrap(); // wopBuildPaths
-    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(!err.message.is_empty());
@@ -94,12 +92,11 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() {
     h.store
         .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
 
-    wire::write_u64(&mut h.stream, 9).await.unwrap(); // wopBuildPaths
-    wire::write_strings(&mut h.stream, &[format!("{drv_path}!out")])
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
 
     // For opcode 9: caller (handle_build_paths) sends STDERR_ERROR on failure.
     // process_build_events must NOT also have sent one (that's the b2d3863 fix).
@@ -133,12 +130,11 @@ async fn test_build_paths_with_results_keyed_format() {
         .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
 
     let derived_path = format!("{drv_path}!out");
-    wire::write_u64(&mut h.stream, 46).await.unwrap(); // wopBuildPathsWithResults
-    wire::write_strings(&mut h.stream, std::slice::from_ref(&derived_path))
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -194,40 +190,30 @@ async fn test_build_derivation_basic_format() {
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
 
-    wire::write_u64(&mut h.stream, 36).await.unwrap(); // wopBuildDerivation
-    wire::write_string(&mut h.stream, drv_path).await.unwrap(); // drv path
-
-    // BasicDerivation: outputs
-    wire::write_u64(&mut h.stream, 1).await.unwrap(); // 1 output
-    wire::write_string(&mut h.stream, "out").await.unwrap(); // name
-    wire::write_string(&mut h.stream, "/nix/store/zzz-output")
-        .await
-        .unwrap(); // path
-    wire::write_string(&mut h.stream, "").await.unwrap(); // hash_algo (input-addressed)
-    wire::write_string(&mut h.stream, "").await.unwrap(); // hash
-
-    // input_srcs
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    // platform
-    wire::write_string(&mut h.stream, "x86_64-linux")
-        .await
-        .unwrap();
-    // builder
-    wire::write_string(&mut h.stream, "/bin/sh").await.unwrap();
-    // args
-    wire::write_strings(&mut h.stream, &["-c", "echo hi"])
-        .await
-        .unwrap();
-    // env pairs
-    wire::write_string_pairs(&mut h.stream, &[("out", "/nix/store/zzz-output")])
-        .await
-        .unwrap();
-
-    // build_mode
-    wire::write_u64(&mut h.stream, 0).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,                        // drv path
+        // BasicDerivation: outputs
+        u64: 1,                                  // 1 output
+        string: "out",                           // name
+        string: "/nix/store/zzz-output",         // path
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        // input_srcs
+        strings: wire::NO_STRINGS,
+        // platform
+        string: "x86_64-linux",
+        // builder
+        string: "/bin/sh",
+        // args
+        strings: &["-c", "echo hi"],
+        // env pairs (count + flat key/value strings; no string_pairs kind)
+        u64: 1,
+        string: "out",
+        string: "/nix/store/zzz-output",
+        // build_mode
+        u64: 0,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -271,13 +257,12 @@ async fn test_build_derivation_basic_format() {
 async fn test_build_paths_with_results_invalid_derived_path() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 46).await.unwrap();
-    // One invalid DerivedPath (unparseable).
-    wire::write_strings(&mut h.stream, &["garbage!not@a#path"])
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // buildMode = Normal
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 46,
+        // One invalid DerivedPath (unparseable).
+        strings: &["garbage!not@a#path"],
+        u64: 0,                                  // buildMode = Normal
+    );
 
     // Per CLAUDE.md: "per-entry errors in batch opcodes push
     // BuildResult::failure and continue, not abort". So we should get

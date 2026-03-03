@@ -9,8 +9,8 @@ use std::io::Cursor;
 
 use rio_nix::hash::NixHash;
 use rio_nix::protocol::stderr::STDERR_WRITE;
-use rio_nix::protocol::wire;
 use rio_test_support::grpc::MockStore;
+use rio_test_support::wire_bytes;
 
 /// A single named field from a protocol response, stored as raw bytes.
 #[derive(Debug)]
@@ -629,59 +629,33 @@ pub fn assert_fully_consumed(data: &[u8], fields: &[ResponseField], context: &st
 // ---------------------------------------------------------------------------
 
 pub async fn build_is_valid_path_bytes(path: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 1).await.unwrap();
-    wire::write_string(&mut buf, path).await.unwrap();
-    buf
+    wire_bytes![u64: 1, string: path]
 }
 
 pub async fn build_query_path_info_bytes(path: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 26).await.unwrap();
-    wire::write_string(&mut buf, path).await.unwrap();
-    buf
+    wire_bytes![u64: 26, string: path]
 }
 
 pub async fn build_query_valid_paths_bytes(paths: &[&str], substitute: bool) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 31).await.unwrap();
-    wire::write_strings(&mut buf, paths).await.unwrap();
-    wire::write_bool(&mut buf, substitute).await.unwrap();
-    buf
+    wire_bytes![u64: 31, strings: paths, bool: substitute]
 }
 
 pub async fn build_add_temp_root_bytes(path: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 11).await.unwrap();
-    wire::write_string(&mut buf, path).await.unwrap();
-    buf
+    wire_bytes![u64: 11, string: path]
 }
 
 pub async fn build_query_missing_bytes(paths: &[&str]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 40).await.unwrap();
-    wire::write_strings(&mut buf, paths).await.unwrap();
-    buf
+    wire_bytes![u64: 40, strings: paths]
 }
 
 pub async fn build_nar_from_path_bytes(path: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 38).await.unwrap();
-    wire::write_string(&mut buf, path).await.unwrap();
-    buf
+    wire_bytes![u64: 38, string: path]
 }
 
 pub async fn build_query_path_from_hash_part_bytes(hash_part: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 29).await.unwrap();
-    wire::write_string(&mut buf, hash_part).await.unwrap();
-    buf
+    wire_bytes![u64: 29, string: hash_part]
 }
 
 pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    wire::write_u64(&mut buf, 37).await.unwrap();
-    wire::write_string(&mut buf, path).await.unwrap();
-    wire::write_strings(&mut buf, sigs).await.unwrap();
-    buf
+    wire_bytes![u64: 37, string: path, strings: sigs]
 }

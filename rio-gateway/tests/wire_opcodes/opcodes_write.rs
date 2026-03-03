@@ -9,34 +9,22 @@ async fn test_add_to_store_nar_accepts_valid() {
     let mut h = TestHarness::setup().await;
     let (nar, hash) = make_nar(b"add-to-store-nar");
 
-    wire::write_u64(&mut h.stream, 39).await.unwrap(); // wopAddToStoreNar
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap(); // path
-    wire::write_string(&mut h.stream, "").await.unwrap(); // deriver
-    // narHash is hex-encoded SHA-256 (no algorithm prefix!)
-    wire::write_string(&mut h.stream, &hex::encode(hash))
-        .await
-        .unwrap();
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // references
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // registration_time
-    wire::write_u64(&mut h.stream, nar.len() as u64)
-        .await
-        .unwrap(); // nar_size
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // ultimate
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // sigs
-    wire::write_string(&mut h.stream, "").await.unwrap(); // ca
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
-    wire::write_bool(&mut h.stream, true).await.unwrap(); // dont_check_sigs
-    // Framed NAR data: chunks of u64(len)+data, terminated by u64(0)
-    wire::write_framed_stream(&mut h.stream, &nar, 8192)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 39,                           // wopAddToStoreNar
+        string: TEST_PATH_A,               // path
+        string: "",                        // deriver
+        // narHash is hex-encoded SHA-256 (no algorithm prefix!)
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,         // references
+        u64: 0,                            // registration_time
+        u64: nar.len() as u64,             // nar_size
+        bool: false,                       // ultimate
+        strings: wire::NO_STRINGS,         // sigs
+        string: "",                        // ca
+        bool: false, bool: true,           // repair, dont_check_sigs
+        // Framed NAR data: chunks of u64(len)+data, terminated by u64(0)
+        framed: &nar,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     // AddToStoreNar has no result data after STDERR_LAST.
@@ -59,32 +47,20 @@ async fn test_add_to_store_nar_passes_declared_hash() {
     let (nar, _actual_hash) = make_nar(b"trust-test");
     let declared_hash = [0xABu8; 32]; // deliberately different from actual
 
-    wire::write_u64(&mut h.stream, 39).await.unwrap();
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    wire::write_string(&mut h.stream, "").await.unwrap();
-    wire::write_string(&mut h.stream, &hex::encode(declared_hash))
-        .await
-        .unwrap();
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap();
-    wire::write_u64(&mut h.stream, nar.len() as u64)
-        .await
-        .unwrap();
-    wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_string(&mut h.stream, "").await.unwrap();
-    wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_bool(&mut h.stream, true).await.unwrap();
-    wire::write_framed_stream(&mut h.stream, &nar, 8192)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 39,
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(declared_hash),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        bool: false, bool: true,
+        framed: &nar,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -120,61 +96,41 @@ async fn test_add_multiple_to_store_batch() {
     // Previous test wrote NO count prefix + inner-framed NAR, matching a buggy
     // parser rather than the spec. Fixed after VM test caught it running real
     // `nix copy --to ssh-ng://`.
-    let mut inner = Vec::new();
-
-    // Count prefix
-    wire::write_u64(&mut inner, 2).await.unwrap();
-
-    // Entry 1
-    wire::write_string(&mut inner, TEST_PATH_A).await.unwrap();
-    wire::write_string(&mut inner, "").await.unwrap(); // deriver
-    wire::write_string(&mut inner, &hex::encode(hash_a))
-        .await
-        .unwrap();
-    wire::write_strings(&mut inner, wire::NO_STRINGS)
-        .await
-        .unwrap(); // refs
-    wire::write_u64(&mut inner, 0).await.unwrap(); // regtime
-    wire::write_u64(&mut inner, nar_a.len() as u64)
-        .await
-        .unwrap(); // nar_size
-    wire::write_bool(&mut inner, false).await.unwrap(); // ultimate
-    wire::write_strings(&mut inner, wire::NO_STRINGS)
-        .await
-        .unwrap(); // sigs
-    wire::write_string(&mut inner, "").await.unwrap(); // ca
-    // NAR: narSize plain bytes (NOT framed)
-    inner.extend_from_slice(&nar_a);
-
-    // Entry 2
     let test_path_b = "/nix/store/22222222222222222222222222222222-multi-b";
-    wire::write_string(&mut inner, test_path_b).await.unwrap();
-    wire::write_string(&mut inner, "").await.unwrap();
-    wire::write_string(&mut inner, &hex::encode(hash_b))
-        .await
-        .unwrap();
-    wire::write_strings(&mut inner, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_u64(&mut inner, 0).await.unwrap();
-    wire::write_u64(&mut inner, nar_b.len() as u64)
-        .await
-        .unwrap();
-    wire::write_bool(&mut inner, false).await.unwrap();
-    wire::write_strings(&mut inner, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_string(&mut inner, "").await.unwrap();
-    inner.extend_from_slice(&nar_b);
+    let inner = wire_bytes![
+        u64: 2,                            // Count prefix
+        // Entry 1
+        string: TEST_PATH_A,
+        string: "",                        // deriver
+        string: &hex::encode(hash_a),
+        strings: wire::NO_STRINGS,         // refs
+        u64: 0,                            // regtime
+        u64: nar_a.len() as u64,           // nar_size
+        bool: false,                       // ultimate
+        strings: wire::NO_STRINGS,         // sigs
+        string: "",                        // ca
+        // NAR: narSize plain bytes (NOT framed)
+        raw: &nar_a,
+        // Entry 2
+        string: test_path_b,
+        string: "",
+        string: &hex::encode(hash_b),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_b.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_b,
+    ];
 
     // Send opcode + outer framing
-    wire::write_u64(&mut h.stream, 44).await.unwrap(); // wopAddMultipleToStore
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
-    wire::write_bool(&mut h.stream, true).await.unwrap(); // dont_check_sigs
-    wire::write_framed_stream(&mut h.stream, &inner, 8192)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 44,                           // wopAddMultipleToStore
+        bool: false,                       // repair
+        bool: true,                        // dont_check_sigs
+        framed: &inner,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -194,35 +150,27 @@ async fn test_add_multiple_to_store_truncated_nar() {
     let mut h = TestHarness::setup().await;
     let (nar, hash) = make_nar(b"truncated");
 
-    let mut inner = Vec::new();
-    wire::write_u64(&mut inner, 1).await.unwrap(); // num_paths
-    wire::write_string(&mut inner, TEST_PATH_A).await.unwrap();
-    wire::write_string(&mut inner, "").await.unwrap();
-    wire::write_string(&mut inner, &hex::encode(hash))
-        .await
-        .unwrap();
-    wire::write_strings(&mut inner, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_u64(&mut inner, 0).await.unwrap();
-    // LIE about nar_size: claim more bytes than we actually send.
-    wire::write_u64(&mut inner, nar.len() as u64 + 100)
-        .await
-        .unwrap();
-    wire::write_bool(&mut inner, false).await.unwrap();
-    wire::write_strings(&mut inner, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_string(&mut inner, "").await.unwrap();
-    inner.extend_from_slice(&nar); // actual NAR, 100 bytes short of claimed size
+    let inner = wire_bytes![
+        u64: 1,                            // num_paths
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        // LIE about nar_size: claim more bytes than we actually send.
+        u64: nar.len() as u64 + 100,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar,                         // actual NAR, 100 bytes short of claimed size
+    ];
 
-    wire::write_u64(&mut h.stream, 44).await.unwrap();
-    wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_bool(&mut h.stream, true).await.unwrap();
-    wire::write_framed_stream(&mut h.stream, &inner, 8192)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
 
     // Handler should send STDERR_ERROR (not crash).
     let err = drain_stderr_expecting_error(&mut h.stream).await;
@@ -245,14 +193,11 @@ async fn test_add_multiple_to_store_truncated_nar() {
 async fn test_add_signatures_stub_returns_success() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 37).await.unwrap(); // wopAddSignatures
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    wire::write_strings(&mut h.stream, &["sig:fake"])
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 37,                           // wopAddSignatures
+        string: TEST_PATH_A,
+        strings: &["sig:fake"],
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let result = wire::read_u64(&mut h.stream).await.unwrap();
@@ -266,11 +211,10 @@ async fn test_register_drv_output_stub_reads_and_returns() {
     let mut h = TestHarness::setup().await;
 
     let realisation_json = r#"{"id":"sha256:abc!out","outPath":"/nix/store/xyz","signatures":[],"dependentRealisations":{}}"#;
-    wire::write_u64(&mut h.stream, 42).await.unwrap(); // wopRegisterDrvOutput
-    wire::write_string(&mut h.stream, realisation_json)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 42,                           // wopRegisterDrvOutput
+        string: realisation_json,
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     // RegisterDrvOutput stub has no result data.
@@ -282,15 +226,12 @@ async fn test_register_drv_output_stub_reads_and_returns() {
 async fn test_add_text_to_store() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 8).await.unwrap(); // wopAddTextToStore
-    wire::write_string(&mut h.stream, "my-text").await.unwrap(); // name
-    wire::write_string(&mut h.stream, "hello world")
-        .await
-        .unwrap(); // text
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // references
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 8,                            // wopAddTextToStore
+        string: "my-text",                 // name
+        string: "hello world",             // text
+        strings: wire::NO_STRINGS,         // references
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
     let path = wire::read_string(&mut h.stream).await.unwrap();
@@ -317,21 +258,14 @@ async fn test_add_to_store_text_method() {
 
     let content = b"hello from text method";
 
-    wire::write_u64(&mut h.stream, 7).await.unwrap(); // wopAddToStore
-    wire::write_string(&mut h.stream, "text-test")
-        .await
-        .unwrap(); // name
-    wire::write_string(&mut h.stream, "text:sha256")
-        .await
-        .unwrap(); // cam_str
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // references
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
-    wire::write_framed_stream(&mut h.stream, content, 8192)
-        .await
-        .unwrap(); // dump data
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 7,                            // wopAddToStore
+        string: "text-test",               // name
+        string: "text:sha256",             // cam_str
+        strings: wire::NO_STRINGS,         // references
+        bool: false,                       // repair
+        framed: content,                   // dump data
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -373,21 +307,14 @@ async fn test_add_to_store_fixed_flat() {
 
     let content = b"raw file content for flat fixed-output";
 
-    wire::write_u64(&mut h.stream, 7).await.unwrap(); // wopAddToStore
-    wire::write_string(&mut h.stream, "flat-test")
-        .await
-        .unwrap(); // name
-    wire::write_string(&mut h.stream, "fixed:sha256")
-        .await
-        .unwrap(); // cam_str (flat, no r:)
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // references
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
-    wire::write_framed_stream(&mut h.stream, content, 8192)
-        .await
-        .unwrap(); // dump data (raw, not NAR)
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 7,                            // wopAddToStore
+        string: "flat-test",               // name
+        string: "fixed:sha256",            // cam_str (flat, no r:)
+        strings: wire::NO_STRINGS,         // references
+        bool: false,                       // repair
+        framed: content,                   // dump data (raw, not NAR)
+    );
 
     drain_stderr_until_last(&mut h.stream).await;
 
@@ -422,20 +349,15 @@ async fn test_add_to_store_fixed_flat() {
 async fn test_add_to_store_invalid_cam_str_returns_error() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 7).await.unwrap(); // wopAddToStore
-    wire::write_string(&mut h.stream, "bad-test").await.unwrap(); // name
-    wire::write_string(&mut h.stream, "bogus:sha256")
-        .await
-        .unwrap(); // INVALID cam_str
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // references
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
-    // Handler reads framed stream BEFORE parsing cam_str, so we must send it.
-    wire::write_framed_stream(&mut h.stream, b"data", 8192)
-        .await
-        .unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 7,                            // wopAddToStore
+        string: "bad-test",                // name
+        string: "bogus:sha256",            // INVALID cam_str
+        strings: wire::NO_STRINGS,         // references
+        bool: false,                       // repair
+        // Handler reads framed stream BEFORE parsing cam_str, so we must send it.
+        framed: b"data",
+    );
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
@@ -452,28 +374,20 @@ async fn test_add_to_store_invalid_cam_str_returns_error() {
 async fn test_add_to_store_nar_invalid_path_returns_error() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 39).await.unwrap();
-    wire::write_string(&mut h.stream, "not-a-valid-store-path")
-        .await
-        .unwrap(); // path — INVALID
-    wire::write_string(&mut h.stream, "").await.unwrap(); // deriver
-    wire::write_string(&mut h.stream, &hex::encode([0u8; 32]))
-        .await
-        .unwrap(); // narHash
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // references
-    wire::write_u64(&mut h.stream, 0).await.unwrap(); // reg_time
-    wire::write_u64(&mut h.stream, 100).await.unwrap(); // nar_size
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // ultimate
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap(); // sigs
-    wire::write_string(&mut h.stream, "").await.unwrap(); // ca
-    wire::write_bool(&mut h.stream, false).await.unwrap(); // repair
-    wire::write_bool(&mut h.stream, true).await.unwrap(); // dontCheckSigs
-    // No framed data — handler should error before reading it.
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 39,
+        string: "not-a-valid-store-path",  // path — INVALID
+        string: "",                        // deriver
+        string: &hex::encode([0u8; 32]),   // narHash
+        strings: wire::NO_STRINGS,         // references
+        u64: 0,                            // reg_time
+        u64: 100,                          // nar_size
+        bool: false,                       // ultimate
+        strings: wire::NO_STRINGS,         // sigs
+        string: "",                        // ca
+        bool: false, bool: true,           // repair, dontCheckSigs
+        // No framed data — handler should error before reading it.
+    );
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(
@@ -491,27 +405,19 @@ async fn test_add_to_store_nar_invalid_path_returns_error() {
 async fn test_add_to_store_nar_oversized_returns_error() {
     let mut h = TestHarness::setup().await;
 
-    wire::write_u64(&mut h.stream, 39).await.unwrap();
-    wire::write_string(&mut h.stream, TEST_PATH_A)
-        .await
-        .unwrap();
-    wire::write_string(&mut h.stream, "").await.unwrap(); // deriver
-    wire::write_string(&mut h.stream, &hex::encode([0u8; 32]))
-        .await
-        .unwrap();
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_u64(&mut h.stream, 0).await.unwrap();
-    wire::write_u64(&mut h.stream, u64::MAX).await.unwrap(); // nar_size HUGE
-    wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_strings(&mut h.stream, wire::NO_STRINGS)
-        .await
-        .unwrap();
-    wire::write_string(&mut h.stream, "").await.unwrap();
-    wire::write_bool(&mut h.stream, false).await.unwrap();
-    wire::write_bool(&mut h.stream, true).await.unwrap();
-    h.stream.flush().await.unwrap();
+    wire_send!(&mut h.stream;
+        u64: 39,
+        string: TEST_PATH_A,
+        string: "",                        // deriver
+        string: &hex::encode([0u8; 32]),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: u64::MAX,                     // nar_size HUGE
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        bool: false, bool: true,
+    );
 
     let err = drain_stderr_expecting_error(&mut h.stream).await;
     assert!(

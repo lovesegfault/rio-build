@@ -7,7 +7,7 @@ use rio_nix::protocol::client::{StderrMessage, read_stderr_message};
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
 use rio_nix::protocol::stderr::{STDERR_LAST, StderrError};
 use rio_nix::protocol::wire;
-use tokio::io::{AsyncWriteExt, DuplexStream};
+use tokio::io::DuplexStream;
 
 /// Perform the client side of the Nix worker protocol handshake.
 ///
@@ -15,9 +15,7 @@ use tokio::io::{AsyncWriteExt, DuplexStream};
 /// sends obsolete-affinity/reserve-space placeholders, reads version-string +
 /// trusted flag + STDERR_LAST.
 pub async fn do_handshake(s: &mut DuplexStream) {
-    wire::write_u64(s, WORKER_MAGIC_1).await.unwrap();
-    wire::write_u64(s, PROTOCOL_VERSION).await.unwrap();
-    s.flush().await.unwrap();
+    crate::wire_send!(s; u64: WORKER_MAGIC_1, u64: PROTOCOL_VERSION);
 
     let magic2 = wire::read_u64(s).await.unwrap();
     assert_eq!(
@@ -26,13 +24,10 @@ pub async fn do_handshake(s: &mut DuplexStream) {
     );
     let _server_version = wire::read_u64(s).await.unwrap();
 
-    wire::write_strings(s, wire::NO_STRINGS).await.unwrap();
-    s.flush().await.unwrap();
+    crate::wire_send!(s; strings: wire::NO_STRINGS);
     let _server_features = wire::read_strings(s).await.unwrap();
 
-    wire::write_u64(s, 0).await.unwrap(); // obsolete CPU affinity
-    wire::write_u64(s, 0).await.unwrap(); // reserveSpace
-    s.flush().await.unwrap();
+    crate::wire_send!(s; u64: 0, u64: 0); // obsolete CPU affinity, reserveSpace
 
     let _version = wire::read_string(s).await.unwrap();
     let _trusted = wire::read_u64(s).await.unwrap();
@@ -43,12 +38,11 @@ pub async fn do_handshake(s: &mut DuplexStream) {
 
 /// Send wopSetOptions (19) with all-zero values and empty overrides.
 pub async fn send_set_options(s: &mut DuplexStream) {
-    wire::write_u64(s, 19).await.unwrap(); // wopSetOptions
-    for _ in 0..12 {
-        wire::write_u64(s, 0).await.unwrap();
-    }
-    wire::write_u64(s, 0).await.unwrap(); // overrides count = 0
-    s.flush().await.unwrap();
+    // 14 u64 zeros: opcode(19) + 12 option fields + overrides count(0)
+    crate::wire_send!(s;
+        u64: 19, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+        u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+    );
 
     let msg = wire::read_u64(s).await.unwrap();
     assert_eq!(msg, STDERR_LAST, "setOptions should end with STDERR_LAST");
@@ -141,7 +135,9 @@ macro_rules! wire_bytes {
 #[macro_export]
 macro_rules! wire_send {
     ($stream:expr; $( $kind:ident : $val:expr ),* $(,)?) => {{
-        let __s = $stream;
+        // Reborrow to support `&mut T` bindings (`s: &mut Stream`) without
+        // consuming them. For `&mut h.stream`-style call sites this is a no-op.
+        let __s: &mut _ = &mut *$stream;
         $( $crate::wire_bytes!(@write __s, $kind, $val); )*
         ::tokio::io::AsyncWriteExt::flush(__s).await.unwrap();
     }};
