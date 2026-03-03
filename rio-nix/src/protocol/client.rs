@@ -446,4 +446,284 @@ mod tests {
             other => panic!("expected Error, got {other:?}"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // STDERR variant coverage: READ, WRITE, RESULT, unknown, bounds
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_stderr_read_variant() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_READ).await.unwrap();
+        wire::write_u64(&mut buf, 1024).await.unwrap();
+
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .unwrap();
+        assert!(matches!(msg, StderrMessage::Read(1024)));
+    }
+
+    #[tokio::test]
+    async fn test_read_stderr_write_variant() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_WRITE).await.unwrap();
+        wire::write_bytes(&mut buf, b"payload").await.unwrap();
+
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .unwrap();
+        assert!(matches!(msg, StderrMessage::Write(ref d) if d == b"payload"));
+    }
+
+    #[tokio::test]
+    async fn test_read_stderr_result_variant_with_fields() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_RESULT).await.unwrap();
+        wire::write_u64(&mut buf, 42).await.unwrap(); // activity_id
+        wire::write_u64(&mut buf, 7).await.unwrap(); // result_type
+        wire::write_u64(&mut buf, 2).await.unwrap(); // field count
+        // Field 0: Int(123)
+        wire::write_u64(&mut buf, 0).await.unwrap(); // field_type = Int
+        wire::write_u64(&mut buf, 123).await.unwrap();
+        // Field 1: String("hi")
+        wire::write_u64(&mut buf, 1).await.unwrap(); // field_type = String
+        wire::write_string(&mut buf, "hi").await.unwrap();
+
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .unwrap();
+        match msg {
+            StderrMessage::Result {
+                activity_id,
+                result_type,
+                fields,
+            } => {
+                assert_eq!(activity_id, 42);
+                assert_eq!(result_type, 7);
+                assert_eq!(fields.len(), 2);
+                assert!(matches!(fields[0], ResultField::Int(123)));
+                assert!(matches!(&fields[1], ResultField::String(s) if s == "hi"));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    /// Full STDERR_ERROR with position + traces — exercises the have_pos
+    /// branch (124-131) and the trace loop (139-151).
+    #[tokio::test]
+    async fn test_read_stderr_error_with_position_and_traces() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_ERROR).await.unwrap();
+        wire::write_string(&mut buf, "Error").await.unwrap(); // error_type
+        wire::write_u64(&mut buf, 1).await.unwrap(); // level
+        wire::write_string(&mut buf, "nix::EvalError")
+            .await
+            .unwrap(); // name
+        wire::write_string(&mut buf, "undefined variable")
+            .await
+            .unwrap(); // message
+        // Position: have_pos=1, file/line/column
+        wire::write_u64(&mut buf, 1).await.unwrap();
+        wire::write_string(&mut buf, "default.nix").await.unwrap();
+        wire::write_u64(&mut buf, 10).await.unwrap();
+        wire::write_u64(&mut buf, 5).await.unwrap();
+        // Traces: count=2
+        wire::write_u64(&mut buf, 2).await.unwrap();
+        // Trace 0: with position
+        wire::write_u64(&mut buf, 1).await.unwrap();
+        wire::write_string(&mut buf, "lib.nix").await.unwrap();
+        wire::write_u64(&mut buf, 3).await.unwrap();
+        wire::write_u64(&mut buf, 1).await.unwrap();
+        wire::write_string(&mut buf, "while calling").await.unwrap();
+        // Trace 1: no position
+        wire::write_u64(&mut buf, 0).await.unwrap();
+        wire::write_string(&mut buf, "from CLI").await.unwrap();
+
+        let msg = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .unwrap();
+        match msg {
+            StderrMessage::Error(e) => {
+                assert_eq!(e.message, "undefined variable");
+                let pos = e.position.expect("should have position");
+                assert_eq!(pos.file, "default.nix");
+                assert_eq!(pos.line, 10);
+                assert_eq!(pos.column, 5);
+                assert_eq!(e.traces.len(), 2);
+                assert!(e.traces[0].position.is_some());
+                assert_eq!(e.traces[0].message, "while calling");
+                assert!(e.traces[1].position.is_none());
+                assert_eq!(e.traces[1].message, "from CLI");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_stderr_unknown_message_type() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, 0xDEADBEEF).await.unwrap();
+
+        let err = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("unknown type should error");
+        assert!(err.to_string().contains("unknown STDERR message type"));
+    }
+
+    #[tokio::test]
+    async fn test_read_result_fields_unknown_field_type() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_RESULT).await.unwrap();
+        wire::write_u64(&mut buf, 1).await.unwrap(); // activity_id
+        wire::write_u64(&mut buf, 0).await.unwrap(); // result_type
+        wire::write_u64(&mut buf, 1).await.unwrap(); // field count
+        wire::write_u64(&mut buf, 99).await.unwrap(); // field_type = invalid
+
+        let err = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("unknown field type should error");
+        assert!(err.to_string().contains("unknown result field type"));
+    }
+
+    #[tokio::test]
+    async fn test_read_result_fields_too_large() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_RESULT).await.unwrap();
+        wire::write_u64(&mut buf, 1).await.unwrap();
+        wire::write_u64(&mut buf, 0).await.unwrap();
+        wire::write_u64(&mut buf, wire::MAX_COLLECTION_COUNT + 1)
+            .await
+            .unwrap(); // field count > max
+
+        let err = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("oversized count should error");
+        assert!(matches!(err, WireError::CollectionTooLarge(_)));
+    }
+
+    #[tokio::test]
+    async fn test_read_stderr_error_traces_too_large() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_ERROR).await.unwrap();
+        wire::write_string(&mut buf, "Error").await.unwrap();
+        wire::write_u64(&mut buf, 0).await.unwrap(); // level
+        wire::write_string(&mut buf, "name").await.unwrap();
+        wire::write_string(&mut buf, "msg").await.unwrap();
+        wire::write_u64(&mut buf, 0).await.unwrap(); // have_pos
+        wire::write_u64(&mut buf, wire::MAX_COLLECTION_COUNT + 1)
+            .await
+            .unwrap(); // trace_count > max
+
+        let err = read_stderr_message(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("oversized trace count should error");
+        assert!(matches!(err, WireError::CollectionTooLarge(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // drain_stderr error paths
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_drain_stderr_daemon_error_aborts() {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.log("doing stuff").await.unwrap();
+            w.error(&StderrError::simple("Build", "oh no"))
+                .await
+                .unwrap();
+        }
+
+        let err = drain_stderr(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("drain should error on STDERR_ERROR");
+        assert!(err.to_string().contains("daemon error"));
+        assert!(err.to_string().contains("oh no"));
+    }
+
+    #[tokio::test]
+    async fn test_drain_stderr_unexpected_read_aborts() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_READ).await.unwrap();
+        wire::write_u64(&mut buf, 10).await.unwrap();
+
+        let err = drain_stderr(&mut std::io::Cursor::new(buf))
+            .await
+            .expect_err("STDERR_READ during drain should abort");
+        assert!(
+            err.to_string()
+                .contains("unexpected STDERR_READ during drain")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // client_set_options + client_handshake error path
+    // -----------------------------------------------------------------------
+
+    /// client_set_options wire layout round-trip. Field order and values
+    /// per Nix src/libstore/daemon.cc case SetOptions.
+    #[tokio::test]
+    async fn test_client_set_options_roundtrip() {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            // Opcode
+            let op = wire::read_u64(&mut sr).await.unwrap();
+            assert_eq!(op, WorkerOp::SetOptions as u64);
+            // 13 fields in the exact order the client sends them
+            let keep_failed = wire::read_bool(&mut sr).await.unwrap();
+            let keep_going = wire::read_bool(&mut sr).await.unwrap();
+            let try_fallback = wire::read_bool(&mut sr).await.unwrap();
+            assert!(!keep_failed && !keep_going && !try_fallback);
+            let verbosity = wire::read_u64(&mut sr).await.unwrap();
+            assert_eq!(verbosity, 0);
+            let max_build_jobs = wire::read_u64(&mut sr).await.unwrap();
+            assert_eq!(max_build_jobs, 1);
+            let max_silent_time = wire::read_u64(&mut sr).await.unwrap();
+            assert_eq!(max_silent_time, 0);
+            let obsolete_use_build_hook = wire::read_u64(&mut sr).await.unwrap();
+            assert_eq!(obsolete_use_build_hook, 1);
+            let verbose_build = wire::read_bool(&mut sr).await.unwrap();
+            assert!(!verbose_build);
+            let _obsolete_log_type = wire::read_u64(&mut sr).await.unwrap();
+            let _obsolete_print_build_trace = wire::read_u64(&mut sr).await.unwrap();
+            let build_cores = wire::read_u64(&mut sr).await.unwrap();
+            assert_eq!(build_cores, 0);
+            let use_substitutes = wire::read_bool(&mut sr).await.unwrap();
+            assert!(!use_substitutes);
+            let overrides = wire::read_string_pairs(&mut sr).await.unwrap();
+            assert!(overrides.is_empty());
+            // Send STDERR_LAST to unblock the client's drain_stderr.
+            wire::write_u64(&mut sw, STDERR_LAST).await.unwrap();
+            sw.flush().await.unwrap();
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        client_set_options(&mut cr, &mut cw)
+            .await
+            .expect("set_options should succeed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_handshake_bad_magic() {
+        let (client_stream, server_stream) = tokio::io::duplex(64);
+
+        let server = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(server_stream);
+            // Read client MAGIC_1 then send WRONG magic.
+            let _m1 = wire::read_u64(&mut sr).await.unwrap();
+            wire::write_u64(&mut sw, 0xBADC0FFE).await.unwrap();
+            sw.flush().await.unwrap();
+        });
+
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let err = client_handshake(&mut cr, &mut cw)
+            .await
+            .expect_err("bad magic should fail handshake");
+        assert!(matches!(err, HandshakeError::InvalidMagic(0xBADC0FFE)));
+        server.await.unwrap();
+    }
 }
