@@ -152,11 +152,16 @@ pub(crate) fn bridge_build_events(
 impl SchedulerService for SchedulerGrpc {
     type SubmitBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
 
-    #[instrument(skip(self, request), fields(rpc = "SubmitBuild"))]
+    #[instrument(skip(self, request), fields(rpc = "SubmitBuild", build_id = tracing::field::Empty))]
     async fn submit_build(
         &self,
         request: Request<rio_proto::types::SubmitBuildRequest>,
     ) -> Result<Response<Self::SubmitBuildStream>, Status> {
+        // Link into the gateway's trace BEFORE doing anything else. The
+        // #[instrument] span is already entered by the time we're here;
+        // link_parent stitches it to the client's trace_id. Everything
+        // below (actor calls, DB writes, store RPCs) inherits this span.
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let req = request.into_inner();
 
@@ -260,6 +265,9 @@ impl SchedulerService for SchedulerGrpc {
         };
 
         let bcast = self.send_and_await(cmd, reply_rx).await?;
+        // Record build_id on the span (declared Empty in #[instrument]).
+        // Per observability.md:204 this is a required structured-log field.
+        tracing::Span::current().record("build_id", build_id.to_string());
         info!(build_id = %build_id, "build submitted");
         Ok(Response::new(bridge_build_events(
             "submit-build-bridge",
@@ -274,6 +282,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -298,6 +307,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::QueryBuildRequest>,
     ) -> Result<Response<rio_proto::types::BuildStatus>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -318,6 +328,7 @@ impl SchedulerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::CancelBuildRequest>,
     ) -> Result<Response<rio_proto::types::CancelBuildResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -351,6 +362,7 @@ impl WorkerService for SchedulerGrpc {
         &self,
         request: Request<tonic::Streaming<rio_proto::types::WorkerMessage>>,
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let mut stream = request.into_inner();
 
@@ -531,6 +543,7 @@ impl WorkerService for SchedulerGrpc {
         &self,
         request: Request<rio_proto::types::HeartbeatRequest>,
     ) -> Result<Response<rio_proto::types::HeartbeatResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let req = request.into_inner();
 
