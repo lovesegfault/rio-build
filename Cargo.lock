@@ -3945,6 +3945,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "prost-types",
+ "rio-common",
  "rio-nix",
  "thiserror 2.0.18",
  "tokio",

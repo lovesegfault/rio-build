@@ -28,6 +28,8 @@ tracing-opentelemetry = { workspace = true }
 # Interceptor roundtrip test needs a real (non-noop) tracer to get
 # non-zero trace IDs, and the W3C propagator to register.
 opentelemetry_sdk = { workspace = true }
+# Contract tests check rio-common limits + check_bound.
+rio-common = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
