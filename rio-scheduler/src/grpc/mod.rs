@@ -39,7 +39,7 @@ impl SchedulerGrpc {
     }
 
     /// Convert an ActorError to a tonic Status.
-    fn actor_error_to_status(err: ActorError) -> Status {
+    pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         match err {
             ActorError::BuildNotFound(id) => Status::not_found(format!("build not found: {id}")),
             ActorError::Backpressure => {
@@ -70,7 +70,7 @@ impl SchedulerGrpc {
     }
 
     /// Parse a build_id string into a Uuid with a standard error message.
-    fn parse_build_id(s: &str) -> Result<Uuid, Status> {
+    pub(crate) fn parse_build_id(s: &str) -> Result<Uuid, Status> {
         s.parse()
             .map_err(|_| Status::invalid_argument("invalid build_id UUID"))
     }
@@ -82,7 +82,7 @@ impl SchedulerGrpc {
 /// silently hanging on a missed terminal event. Lagged means we permanently
 /// missed n events; if `BuildCompleted` was among them the client would hang
 /// forever waiting for a terminal event that will never arrive.
-fn bridge_build_events(
+pub(crate) fn bridge_build_events(
     task_name: &'static str,
     mut bcast: broadcast::Receiver<rio_proto::types::BuildEvent>,
 ) -> ReceiverStream<Result<rio_proto::types::BuildEvent, Status>> {

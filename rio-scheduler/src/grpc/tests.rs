@@ -360,3 +360,87 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
         status.message()
     );
 }
+
+// ===========================================================================
+// Error-mapping + bridge coverage
+// ===========================================================================
+
+/// Each ActorError variant maps to the expected tonic::Code.
+#[test]
+fn test_actor_error_to_status_all_arms() {
+    use tonic::Code;
+    let cases = [
+        (
+            ActorError::BuildNotFound(Uuid::nil()),
+            Code::NotFound,
+            "build not found",
+        ),
+        (
+            ActorError::Backpressure,
+            Code::ResourceExhausted,
+            "overloaded",
+        ),
+        (ActorError::ChannelSend, Code::Internal, "unavailable"),
+        (
+            ActorError::Database(sqlx::Error::PoolClosed),
+            Code::Internal,
+            "database",
+        ),
+        (ActorError::Internal("boom".into()), Code::Internal, "boom"),
+    ];
+    for (err, expected_code, expected_substr) in cases {
+        let status = SchedulerGrpc::actor_error_to_status(err);
+        assert_eq!(status.code(), expected_code);
+        assert!(
+            status.message().contains(expected_substr),
+            "expected '{expected_substr}' in '{}'",
+            status.message()
+        );
+    }
+}
+
+#[test]
+fn test_parse_build_id_invalid() {
+    let err = SchedulerGrpc::parse_build_id("not-a-uuid").expect_err("should reject");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("invalid build_id"));
+}
+
+#[test]
+fn test_parse_build_id_valid() {
+    let id = Uuid::new_v4();
+    let parsed = SchedulerGrpc::parse_build_id(&id.to_string()).expect("should parse");
+    assert_eq!(parsed, id);
+}
+
+/// When a broadcast receiver lags (permanently misses events), the bridge
+/// sends DATA_LOSS and stops. Without this, a missed BuildCompleted would
+/// leave the client hanging forever.
+#[tokio::test]
+async fn test_bridge_build_events_lagged_sends_data_loss() {
+    // Capacity 1 + send 3 before receiver subscribes → lag guaranteed.
+    let (tx, _keepalive_rx) = broadcast::channel(1);
+    let rx = tx.subscribe();
+    // Fill the channel past capacity so rx is lagged.
+    for i in 0..3u64 {
+        let _ = tx.send(rio_proto::types::BuildEvent {
+            build_id: format!("build-{i}"),
+            sequence: i,
+            timestamp: None,
+            event: None,
+        });
+    }
+
+    let mut stream = bridge_build_events("test-bridge", rx);
+    // First poll: the bridge task's first recv() hits Lagged.
+    let first = stream.next().await.expect("should yield one item");
+    let status = first.expect_err("should be DATA_LOSS");
+    assert_eq!(status.code(), tonic::Code::DataLoss);
+    assert!(
+        status.message().contains("missed"),
+        "got: {}",
+        status.message()
+    );
+    // Stream should then end (bridge task broke out of the loop).
+    assert!(stream.next().await.is_none());
+}
