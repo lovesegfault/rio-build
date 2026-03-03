@@ -1017,3 +1017,406 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() {
         "worker with fresh heartbeat should survive Tick"
     );
 }
+
+// ===========================================================================
+// Poison-TTL expiry (POISON_TTL is cfg(test)-shadowed to 100ms in state/mod.rs)
+// ===========================================================================
+
+/// A poisoned derivation is reset to Created after POISON_TTL elapses and
+/// a Tick is processed. Covers actor/worker.rs:178-201 (poison-expiry loop)
+/// and state/mod.rs:reset_from_poison.
+#[tokio::test]
+async fn test_tick_expires_poisoned_derivation() {
+    let (_db, handle, _task, _rx) = setup_with_worker("poison-ttl-worker", "x86_64-linux", 1).await;
+
+    // Merge, dispatch, poison via PermanentFailure.
+    let build_id = Uuid::new_v4();
+    let _evt_rx = merge_single_node(
+        &handle,
+        build_id,
+        "poison-ttl-hash",
+        "/nix/store/poison-ttl.drv",
+        PriorityClass::Scheduled,
+    )
+    .await;
+    settle().await;
+
+    complete_failure(
+        &handle,
+        "poison-ttl-worker",
+        "/nix/store/poison-ttl.drv",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "permanent",
+    )
+    .await;
+    settle().await;
+
+    // Verify poisoned.
+    let pre = handle
+        .debug_query_derivation("poison-ttl-hash")
+        .await
+        .unwrap()
+        .expect("derivation exists");
+    assert_eq!(pre.status, DerivationStatus::Poisoned);
+
+    // Wait past the cfg(test) POISON_TTL (100ms).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Tick processes the expiry.
+    handle.send_unchecked(ActorCommand::Tick).await.unwrap();
+    settle().await;
+
+    let post = handle
+        .debug_query_derivation("poison-ttl-hash")
+        .await
+        .unwrap()
+        .expect("derivation still exists");
+    assert_eq!(
+        post.status,
+        DerivationStatus::Created,
+        "poisoned derivation should be reset after TTL expiry"
+    );
+}
+
+// ===========================================================================
+// DB fault-injection suite for actor/completion.rs error branches
+// ===========================================================================
+//
+// Pattern: setup normally so merge + dispatch succeed, then close the PG
+// pool, then trigger the code path under test. DB writes fail; assert the
+// actor logs the error and does NOT corrupt in-memory state.
+// TestDb::Drop uses a fresh admin connection so closing the test pool here
+// doesn't break cleanup.
+
+/// After pool close, a successful completion still transitions in-memory
+/// state, but update_build_history logs an error. Also exercises the
+/// derivation-status and assignment-status DB-error branches.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_completion_db_fault_build_history_logged() {
+    let (db, handle, _task, _rx) = setup_with_worker("fault-worker", "x86_64-linux", 1).await;
+
+    // Use a node with pname so update_build_history is called.
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("fault-hash", "/nix/store/fault.drv", "x86_64-linux");
+    node.pname = "fault-pkg".into();
+    let _evt_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
+    settle().await;
+
+    // Close pool AFTER merge/dispatch so only completion DB writes fail.
+    db.pool.close().await;
+
+    // Success with start/stop times so the EMA branch is reached.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "fault-worker".into(),
+            drv_key: "/nix/store/fault.drv".into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 100,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 110,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    settle().await;
+
+    // In-memory state should have transitioned despite all DB write failures.
+    let post = handle
+        .debug_query_derivation("fault-hash")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(post.status, DerivationStatus::Completed);
+
+    // The three DB-error branches should all have logged.
+    assert!(
+        logs_contain("failed to update derivation status"),
+        "derivation status DB failure should be logged"
+    );
+    assert!(
+        logs_contain("failed to update build history EMA"),
+        "build_history EMA DB failure should be logged"
+    );
+}
+
+/// Transient failure with pool closed: retry-persist logs error.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_transient_failure_db_fault_retry_persist_logged() {
+    let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux", 1).await;
+
+    let build_id = Uuid::new_v4();
+    let _evt_rx = merge_single_node(
+        &handle,
+        build_id,
+        "tfault-hash",
+        "/nix/store/tfault.drv",
+        PriorityClass::Scheduled,
+    )
+    .await;
+    settle().await;
+
+    db.pool.close().await;
+
+    complete_failure(
+        &handle,
+        "tfault-worker",
+        "/nix/store/tfault.drv",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "flaky network",
+    )
+    .await;
+    settle().await;
+
+    // Transient with retry_count < max → should hit the retry-persist branches.
+    assert!(
+        logs_contain("failed to persist Failed status") || logs_contain("failed to persist retry"),
+        "transient-failure DB write failure should be logged"
+    );
+}
+
+/// 2-node chain: B completes, A becomes newly-ready. Pool closed →
+/// the newly-ready DB update fails and logs.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_newly_ready_db_fault_status_persist_logged() {
+    let (db, handle, _task, _rx) = setup_with_worker("nrfault-worker", "x86_64-linux", 1).await;
+
+    // A depends on B (edge parent=A, child=B — B must complete first).
+    let build_id = Uuid::new_v4();
+    let _evt_rx = merge_dag(
+        &handle,
+        build_id,
+        vec![
+            make_test_node("nrA", "/nix/store/nrA.drv", "x86_64-linux"),
+            make_test_node("nrB", "/nix/store/nrB.drv", "x86_64-linux"),
+        ],
+        vec![make_test_edge("/nix/store/nrA.drv", "/nix/store/nrB.drv")],
+        false,
+    )
+    .await;
+    settle().await;
+
+    db.pool.close().await;
+
+    // Complete B → A becomes newly-ready.
+    complete_success(
+        &handle,
+        "nrfault-worker",
+        "/nix/store/nrB.drv",
+        "/nix/store/out-B",
+    )
+    .await;
+    settle().await;
+
+    // A should be Ready in-memory (transition succeeds); DB write logged.
+    let a = handle.debug_query_derivation("nrA").await.unwrap().unwrap();
+    // A may have been dispatched immediately (Ready → Assigned). Either is fine.
+    assert!(
+        matches!(
+            a.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "A should be ready-ish after B completes, got {:?}",
+        a.status
+    );
+    assert!(
+        logs_contain("failed to update status"),
+        "newly-ready DB write failure should be logged"
+    );
+}
+
+/// Interactive builds get push_front on the ready queue. After a dependency
+/// completes, an Interactive build's newly-ready derivation dispatches
+/// BEFORE already-queued Scheduled derivations.
+#[tokio::test]
+async fn test_interactive_priority_push_front() {
+    // Worker with 1 slot so dispatch order is observable.
+    let (_db, handle, _task, mut worker_rx) =
+        setup_with_worker("prio-worker", "x86_64-linux", 1).await;
+
+    // Build 1: Scheduled, 2 independent leaves (Q, R). Both queue immediately.
+    // Only 1 dispatches (worker has 1 slot); the other stays queued.
+    let build1 = Uuid::new_v4();
+    let _rx1 = merge_dag(
+        &handle,
+        build1,
+        vec![
+            make_test_node("prioQ", "/nix/store/prioQ.drv", "x86_64-linux"),
+            make_test_node("prioR", "/nix/store/prioR.drv", "x86_64-linux"),
+        ],
+        vec![],
+        false,
+    )
+    .await;
+    settle().await;
+
+    // Build 2: Interactive, 2-node chain A → B. B is a leaf, A blocked.
+    let build2 = Uuid::new_v4();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id: build2,
+                tenant_id: None,
+                priority_class: PriorityClass::Interactive,
+                nodes: vec![
+                    make_test_node("prioA", "/nix/store/prioA.drv", "x86_64-linux"),
+                    make_test_node("prioB", "/nix/store/prioB.drv", "x86_64-linux"),
+                ],
+                edges: vec![make_test_edge(
+                    "/nix/store/prioA.drv",
+                    "/nix/store/prioB.drv",
+                )],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let _rx2 = reply_rx.await.unwrap().unwrap();
+    settle().await;
+
+    // Drain the first assignment (one of Q/R/B — whichever dispatched first).
+    // We don't care which; we only care what happens AFTER we complete it
+    // in a way that makes A newly-ready.
+    //
+    // Strategy: complete EVERYTHING currently assigned with success until
+    // prioB is completed. Then A becomes newly-ready with push_front, and
+    // the NEXT dispatch should be A (not a leftover Q/R).
+    let mut seen_paths = Vec::new();
+    for _ in 0..4 {
+        // Receive one assignment.
+        let Some(msg) = worker_rx.recv().await else {
+            break;
+        };
+        let Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) = msg.msg else {
+            continue;
+        };
+        let path = a.drv_path.clone();
+        seen_paths.push(path.clone());
+        // Complete it.
+        complete_success(&handle, "prio-worker", &path, "/nix/store/out").await;
+        settle().await;
+        // If we just completed B, the NEXT dispatch should be A (push_front).
+        if path == "/nix/store/prioB.drv" {
+            let next = worker_rx.recv().await.expect("should get next assignment");
+            let Some(rio_proto::types::scheduler_message::Msg::Assignment(next_a)) = next.msg
+            else {
+                panic!("expected Assignment");
+            };
+            assert_eq!(
+                next_a.drv_path, "/nix/store/prioA.drv",
+                "Interactive newly-ready A should dispatch before queued Scheduled work. \
+                 Dispatch history: {seen_paths:?}"
+            );
+            return;
+        }
+    }
+    panic!("never dispatched prioB within 4 completions. Dispatch history: {seen_paths:?}");
+}
+
+// ===========================================================================
+// actor/merge.rs cleanup + cache-check error paths
+// ===========================================================================
+
+/// When DB persistence fails mid-merge, cleanup_failed_merge rolls back
+/// all in-memory state. The build_id should be unknown afterward.
+#[tokio::test]
+async fn test_merge_db_failure_rolls_back_memory() {
+    let (db, handle, _task) = setup().await;
+
+    // Close pool BEFORE merge so insert_build fails immediately.
+    db.pool.close().await;
+
+    let build_id = Uuid::new_v4();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node(
+                    "rollback",
+                    "/nix/store/rb.drv",
+                    "x86_64-linux",
+                )],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let reply = reply_rx.await.unwrap();
+
+    // Merge should have failed.
+    assert!(
+        matches!(reply, Err(ActorError::Database(_))),
+        "expected Database error, got {reply:?}"
+    );
+
+    // And the build should NOT exist in memory (rollback worked).
+    let status_result = try_query_status(&handle, build_id).await;
+    assert!(
+        matches!(status_result, Err(ActorError::BuildNotFound(_))),
+        "rolled-back build should be NotFound, got {status_result:?}"
+    );
+}
+
+/// check_cached_outputs store error is non-fatal: merge proceeds with
+/// empty-set result (everything assumed uncached).
+#[tokio::test]
+async fn test_check_cached_outputs_store_error_non_fatal() {
+    use rio_test_support::grpc::spawn_mock_store;
+    use std::sync::atomic::Ordering;
+
+    let test_db = TestDb::new(&MIGRATOR).await;
+    let (store, addr, _store_h) = spawn_mock_store().await;
+    store.fail_find_missing.store(true, Ordering::SeqCst);
+
+    let store_client = rio_proto::client::connect_store(&addr.to_string())
+        .await
+        .unwrap();
+    let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
+
+    // Merge with expected_output_paths set so check_cached_outputs runs.
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("cache-err", "/nix/store/ce.drv", "x86_64-linux");
+    node.expected_output_paths = vec!["/nix/store/expected-out".into()];
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![node],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+            },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+
+    // Merge should SUCCEED despite the store error.
+    let reply = reply_rx.await.unwrap();
+    assert!(reply.is_ok(), "store error should be non-fatal: {reply:?}");
+
+    // Build should exist and be Active.
+    let status = query_status(&handle, build_id).await;
+    assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
+}

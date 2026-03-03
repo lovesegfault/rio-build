@@ -634,7 +634,12 @@ impl RetryPolicy {
 pub const POISON_THRESHOLD: usize = 3;
 
 /// Poison TTL: duration after which a poisoned derivation is reset to created.
+/// 24h in production. Short in tests so poison-expiry can be observed without
+/// clock manipulation (`std::time::Instant` can't be faked).
+#[cfg(not(test))]
 pub const POISON_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+#[cfg(test)]
+pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Heartbeat interval and timeout constants.
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
