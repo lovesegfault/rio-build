@@ -250,27 +250,27 @@ mod hash_derivation_modulo_tests {
         let drv_hash_hex = hex::encode(hash);
 
         let result = BuildResult::success().with_outputs_from_drv(&drv, &drv_hash_hex);
-        assert_eq!(result.status(), BuildStatus::Built);
-        assert_eq!(result.built_outputs().len(), 3);
+        assert_eq!(result.status, BuildStatus::Built);
+        assert_eq!(result.built_outputs.len(), 3);
 
         // Outputs should be in derivation order with correct IDs and paths
         assert_eq!(
-            result.built_outputs()[0].drv_output_id,
+            result.built_outputs[0].drv_output_id,
             format!("sha256:{drv_hash_hex}!dev")
         );
-        assert_eq!(result.built_outputs()[0].out_path, "/nix/store/abc-dev");
+        assert_eq!(result.built_outputs[0].out_path, "/nix/store/abc-dev");
 
         assert_eq!(
-            result.built_outputs()[1].drv_output_id,
+            result.built_outputs[1].drv_output_id,
             format!("sha256:{drv_hash_hex}!lib")
         );
-        assert_eq!(result.built_outputs()[1].out_path, "/nix/store/abc-lib");
+        assert_eq!(result.built_outputs[1].out_path, "/nix/store/abc-lib");
 
         assert_eq!(
-            result.built_outputs()[2].drv_output_id,
+            result.built_outputs[2].drv_output_id,
             format!("sha256:{drv_hash_hex}!out")
         );
-        assert_eq!(result.built_outputs()[2].out_path, "/nix/store/abc-out");
+        assert_eq!(result.built_outputs[2].out_path, "/nix/store/abc-out");
     }
 
     #[test]
@@ -494,13 +494,13 @@ mod hash_derivation_modulo_tests {
 
         let result = BuildResult::success().with_outputs_from_drv(&drv, &drv_hash_hex);
 
-        assert_eq!(result.status(), BuildStatus::Built);
-        assert_eq!(result.built_outputs().len(), 1);
+        assert_eq!(result.status, BuildStatus::Built);
+        assert_eq!(result.built_outputs.len(), 1);
         assert_eq!(
-            result.built_outputs()[0].drv_output_id,
+            result.built_outputs[0].drv_output_id,
             format!("sha256:{drv_hash_hex}!out")
         );
-        assert_eq!(result.built_outputs()[0].out_path, "/nix/store/xyz-fixed");
+        assert_eq!(result.built_outputs[0].out_path, "/nix/store/xyz-fixed");
     }
 
     #[test]
