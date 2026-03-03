@@ -16,7 +16,7 @@ use rio_nix::protocol::client::{
 use rio_nix::protocol::wire;
 use rio_proto::types::{WorkerMessage, worker_message};
 
-use crate::log_stream::LogBatcher;
+use crate::log_stream::{BATCH_TIMEOUT, LogBatcher};
 use crate::overlay;
 
 use super::ExecutorError;
@@ -177,14 +177,14 @@ pub(super) async fn run_daemon_build(
     drv_path: &str,
     basic_drv: &rio_nix::derivation::BasicDerivation,
     build_timeout: Duration,
-    batcher: &mut LogBatcher,
+    batcher: LogBatcher,
     log_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Result<BuildResult, ExecutorError> {
     let mut stdin = daemon
         .stdin
         .take()
         .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdin".into()))?;
-    let mut stdout = daemon
+    let stdout = daemon
         .stdout
         .take()
         .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdout".into()))?;
@@ -192,15 +192,21 @@ pub(super) async fn run_daemon_build(
     // Handshake + setOptions + send build — all bounded by DAEMON_SETUP_TIMEOUT.
     // Previously only the handshake was timed out; a stuck setOptions or
     // a stalled write would hang until build_timeout (potentially hours).
+    // We need &mut access to stdout for the setup sequence (handshake reads
+    // the daemon's version etc.), but read_build_stderr_loop takes stdout by
+    // value for its owned reader task. So: put stdout in an Option, borrow
+    // mutably for setup, then take() it for the loop.
+    let mut stdout = Some(stdout);
     tokio::time::timeout(DAEMON_SETUP_TIMEOUT, async {
-        let handshake_result = client_handshake(&mut stdout, &mut stdin).await?;
+        let stdout_ref = stdout.as_mut().expect("taken only once, after this block");
+        let handshake_result = client_handshake(stdout_ref, &mut stdin).await?;
 
         tracing::debug!(
             version = handshake_result.negotiated_version(),
             "daemon handshake complete"
         );
 
-        client_set_options(&mut stdout, &mut stdin).await?;
+        client_set_options(stdout_ref, &mut stdin).await?;
 
         wire::write_u64(
             &mut stdin,
@@ -219,10 +225,14 @@ pub(super) async fn run_daemon_build(
     .await
     .map_err(|_| ExecutorError::DaemonSetup("daemon setup sequence timed out".into()))??;
 
-    // Read STDERR loop with log streaming (build may run for a long time)
-    let build_result = tokio::time::timeout(build_timeout, async {
-        read_build_stderr_loop(&mut stdout, batcher, log_tx).await
-    })
+    // Read STDERR loop with log streaming (build may run for a long time).
+    // stdout is moved into the loop's owned reader task; we don't need it
+    // back because the loop itself reads BuildResult after STDERR_LAST.
+    let stdout = stdout.take().expect("borrowed above, not yet taken");
+    let build_result = tokio::time::timeout(
+        build_timeout,
+        read_build_stderr_loop(stdout, batcher, log_tx),
+    )
     .await
     .map_err(|_| ExecutorError::BuildFailed("build timed out".into()))??;
 
@@ -231,15 +241,32 @@ pub(super) async fn run_daemon_build(
 
 /// Read the STDERR loop from the daemon, streaming logs via the batcher.
 ///
-/// If the log channel closes during the build, returns an InfrastructureFailure —
-/// the scheduler stream is gone, so there's no way to report completion anyway.
-async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
-    batcher: &mut LogBatcher,
+/// The reader is spawned into an owned task that pushes each parsed
+/// `StderrMessage` onto an mpsc channel. The main loop `select!`s on that
+/// channel and a `BATCH_TIMEOUT` interval, so a partial batch is flushed
+/// during silent build periods (previously it was held until the next
+/// STDERR message arrived, which for a quiet 60s compile meant the gateway
+/// saw nothing — build appeared hung).
+///
+/// This approach is cancel-safe: wrapping `read_stderr_message()` directly
+/// in `tokio::time::timeout` would drop the read future mid-u64-read,
+/// leaving partial bytes consumed from the daemon's stdout pipe and
+/// desyncing the Nix STDERR protocol. Spawning the reader into an owned
+/// task means the read future is never cancelled; only the `recv()` side
+/// of the channel is — and `mpsc::Receiver::recv()` is cancel-safe.
+///
+/// If the log channel closes during the build, returns `MiscFailure` —
+/// the scheduler stream is gone, so there's no way to report completion
+/// anyway.
+async fn read_build_stderr_loop<R>(
+    reader: R,
+    mut batcher: LogBatcher,
     log_tx: &mpsc::Sender<WorkerMessage>,
-) -> Result<BuildResult, wire::WireError> {
+) -> Result<BuildResult, wire::WireError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     const MAX_BUILD_STDERR_MESSAGES: u64 = 10_000_000;
-    let mut msg_count: u64 = 0;
 
     /// Helper: send a log batch. Returns false if the channel is closed.
     async fn send_batch(
@@ -252,71 +279,141 @@ async fn read_build_stderr_loop<R: tokio::io::AsyncRead + Unpin>(
         log_tx.send(msg).await.is_ok()
     }
 
-    let misc_fail = |m: &str| {
-        Ok(BuildResult::failure(
-            BuildStatus::MiscFailure,
-            m.to_string(),
-        ))
-    };
+    let misc_fail = |m: &str| BuildResult::failure(BuildStatus::MiscFailure, m.to_string());
 
-    loop {
-        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
-            return Err(wire::WireError::Io(std::io::Error::other(
-                "exceeded maximum STDERR messages during build",
-            )));
-        }
-        msg_count += 1;
-
-        // Check for timeout-based flush.
-        //
-        // TODO(phase2b): honor the 100ms BATCH_TIMEOUT during silent periods.
-        // Currently maybe_flush() only fires once per stderr message, so a
-        // build that's silent for 60s (common: long compile that buffers
-        // stdout) won't flush its partial batch until the next STDERR_NEXT
-        // or STDERR_LAST arrives. The observability spec's "64 lines / 100ms"
-        // guarantee is NOT upheld during quiet periods.
-        //
-        // The obvious fix (tokio::time::timeout around read_stderr_message)
-        // is UNSAFE: dropping the read future mid-u64-read leaves partial
-        // bytes consumed from the daemon stdout pipe; the next read desyncs
-        // the Nix STDERR protocol. Safe fixes:
-        //   (a) Spawn read_stderr_message into an owned task that pushes to
-        //       a mpsc channel (cancel-safe); select! on rx.recv() + interval.
-        //   (b) Fused-future pattern: hold the pinned read future across
-        //       select! iterations, only recreate on completion.
-        // Both require reworking the &mut R borrow. Impact is user-visible
-        // log latency (build appears hung), not correctness.
-        if let Some(batch) = batcher.maybe_flush()
-            && !send_batch(log_tx, batch).await
-        {
-            return misc_fail("log channel closed during build (scheduler stream gone)");
-        }
-
-        match read_stderr_message(reader).await? {
-            StderrMessage::Last => break,
-            StderrMessage::Error(e) => {
-                return misc_fail(&e.message);
+    // Spawn the owned reader task. It reads one StderrMessage at a time and
+    // pushes to `msg_tx`. Terminal messages (Last, Error, wire Err) break the
+    // loop after being pushed, so the task returns the reader for the caller's
+    // post-loop read_build_result(). Backpressure: channel has a small buffer;
+    // if the main loop falls behind (shouldn't — it does little work per msg),
+    // the reader task naturally blocks on send().
+    let (msg_tx, mut msg_rx) = mpsc::channel::<Result<StderrMessage, wire::WireError>>(32);
+    let reader_task = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            let msg = read_stderr_message(&mut reader).await;
+            let is_terminal = matches!(
+                &msg,
+                Ok(StderrMessage::Last) | Ok(StderrMessage::Error(_)) | Err(_)
+            );
+            // If the main loop has exited (receiver dropped), stop reading.
+            // Otherwise push and continue unless this was a terminal message.
+            if msg_tx.send(msg).await.is_err() || is_terminal {
+                break;
             }
-            StderrMessage::Next(msg) => {
-                if let Some(batch) = batcher.add_line(msg.into_bytes())
-                    && !send_batch(log_tx, batch).await
-                {
-                    return misc_fail("log channel closed during build (scheduler stream gone)");
+        }
+        reader
+    });
+
+    // Abort guard: if the main loop early-returns (misc_fail paths, channel
+    // closed, msg-count bound), the reader task would otherwise leak, blocked
+    // forever on read() of the daemon's stdout. scopeguard::guard runs on all
+    // exit paths including panic. `.abort()` on a completed task is a no-op.
+    let reader_abort = reader_task.abort_handle();
+    let _abort_guard = scopeguard::guard((), move |()| reader_abort.abort());
+
+    let mut flush_tick = tokio::time::interval(BATCH_TIMEOUT);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately; consume it so the first real flush waits
+    // the full interval.
+    flush_tick.tick().await;
+
+    let mut msg_count: u64 = 0;
+
+    // Outcome of the select! loop. Ok(None) = saw STDERR_LAST, proceed to
+    // read BuildResult. Ok(Some(fail)) = return that failure without reading
+    // BuildResult. Err(e) = wire error, propagate.
+    let outcome: Result<Option<BuildResult>, wire::WireError> = loop {
+        tokio::select! {
+            // `biased` prioritizes the message arm over the tick arm when
+            // both are ready. Under heavy log spew we want to drain messages
+            // before doing a tick-driven flush (the 64-line batch-full
+            // trigger in add_line already handles chatty builds).
+            biased;
+
+            maybe = msg_rx.recv() => {
+                match maybe {
+                    Some(Ok(StderrMessage::Last)) => break Ok(None),
+                    Some(Ok(StderrMessage::Error(e))) => break Ok(Some(misc_fail(&e.message))),
+                    Some(Ok(StderrMessage::Next(line))) => {
+                        msg_count += 1;
+                        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
+                            break Err(wire::WireError::Io(std::io::Error::other(
+                                "exceeded maximum STDERR messages during build",
+                            )));
+                        }
+                        if let Some(batch) = batcher.add_line(line.into_bytes())
+                            && !send_batch(log_tx, batch).await
+                        {
+                            break Ok(Some(misc_fail(
+                                "log channel closed during build (scheduler stream gone)",
+                            )));
+                        }
+                    }
+                    Some(Ok(StderrMessage::Read(_))) => {
+                        break Ok(Some(misc_fail("daemon sent STDERR_READ, not supported")));
+                    }
+                    // Activity/progress messages we explicitly don't care about.
+                    Some(Ok(
+                        StderrMessage::Write(_)
+                        | StderrMessage::StartActivity { .. }
+                        | StderrMessage::StopActivity { .. }
+                        | StderrMessage::Result { .. },
+                    )) => {}
+                    Some(Err(e)) => break Err(e),
+                    None => {
+                        // Reader task exited without a terminal message (it
+                        // dropped msg_tx). This means the main loop dropped
+                        // msg_rx first (can't happen here) or the task
+                        // panicked. Treat as a protocol error.
+                        break Err(wire::WireError::Io(std::io::Error::other(
+                            "stderr reader task exited without terminal message",
+                        )));
+                    }
                 }
             }
-            StderrMessage::Read(_) => {
-                return misc_fail("daemon sent STDERR_READ, not supported");
+
+            _ = flush_tick.tick() => {
+                // The interval itself IS the 100ms gate: if a tick fired and
+                // there's anything pending, flush unconditionally. (We don't
+                // use batcher.maybe_flush() here — that checks against
+                // std::time::Instant, which doesn't advance under tokio's
+                // paused-time test mode. The tick already proved 100ms of
+                // tokio-time elapsed.)
+                if batcher.has_pending() && !send_batch(log_tx, batcher.flush()).await {
+                    break Ok(Some(misc_fail(
+                        "log channel closed during build (scheduler stream gone)",
+                    )));
+                }
             }
-            // Activity/progress messages we explicitly don't care about.
-            StderrMessage::Write(_)
-            | StderrMessage::StartActivity { .. }
-            | StderrMessage::StopActivity { .. }
-            | StderrMessage::Result { .. } => {}
         }
+    };
+
+    // Final flush: the loop owns the batcher now (caller moved it in), so
+    // any partial batch must be drained here. Best-effort — the build
+    // result is already determined; if the log channel is closed, just drop.
+    if batcher.has_pending() {
+        let _ = send_batch(log_tx, batcher.flush()).await;
     }
 
-    // Read BuildResult
-    rio_nix::protocol::build::read_build_result(reader).await
+    // Terminal-message paths (Last/Error) fell through here: recover the reader
+    // so we can read the BuildResult that follows STDERR_LAST. For the other
+    // outcomes (misc_fail, wire Err), the abort guard fires on return and
+    // cleans up the reader task; we don't need the reader back.
+    match outcome? {
+        Some(fail) => Ok(fail),
+        None => {
+            // Reader task has already returned (it pushed STDERR_LAST and
+            // broke its loop). `.await` here does not block; it just
+            // collects the return value.
+            let mut reader = reader_task.await.map_err(|e| {
+                wire::WireError::Io(std::io::Error::other(format!(
+                    "stderr reader task join failed: {e}"
+                )))
+            })?;
+            rio_nix::protocol::build::read_build_result(&mut reader).await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,7 +455,7 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let mut batcher = LogBatcher::new("test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new("test.drv".into(), "test-worker".into());
         let (log_tx, _log_rx) = mpsc::channel(4);
 
         // run_daemon_build should fail quickly (handshake reads EOF from closed stdout).
@@ -369,7 +466,7 @@ mod tests {
                 "/nix/store/test.drv",
                 &basic_drv,
                 Duration::from_secs(5),
-                &mut batcher,
+                batcher,
                 &log_tx,
             ),
         )
@@ -407,6 +504,8 @@ mod tests {
     // read_build_stderr_loop — pure async, no daemon process needed
     // -----------------------------------------------------------------------
 
+    use tokio::io::AsyncWriteExt;
+
     use rio_nix::protocol::build::write_build_result;
     use rio_nix::protocol::stderr::{STDERR_READ, STDERR_WRITE, StderrError, StderrWriter};
 
@@ -422,10 +521,10 @@ mod tests {
     async fn run_loop(
         input: Vec<u8>,
     ) -> (Result<BuildResult, wire::WireError>, Vec<WorkerMessage>) {
-        let mut batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
         let (tx, mut rx) = mpsc::channel(128);
-        let mut cursor = std::io::Cursor::new(input);
-        let result = read_build_stderr_loop(&mut cursor, &mut batcher, &tx).await;
+        let cursor = std::io::Cursor::new(input);
+        let result = read_build_stderr_loop(cursor, batcher, &tx).await;
         drop(tx);
         let mut batches = Vec::new();
         while let Some(m) = rx.recv().await {
@@ -460,12 +559,9 @@ mod tests {
         let (result, batches) = run_loop(buf).await;
         let br = result.expect("loop should succeed");
         assert_eq!(br.status, BuildStatus::Built);
-        // 2 lines may or may not have been flushed during the loop (depends on
-        // timing threshold). They're either in batches here or still pending
-        // in the batcher (which run_loop drops). The key assertion is the
-        // loop consumed them without error. For a deterministic line-count
-        // check, see the channel-closed test below which forces a flush.
-        assert!(count_log_lines(&batches) <= 2);
+        // The loop now owns the batcher and does a final flush after
+        // STDERR_LAST, so both lines are deterministically in `batches`.
+        assert_eq!(count_log_lines(&batches), 2);
     }
 
     /// Daemon sends STDERR_ERROR → loop returns Ok(MiscFailure), NOT Err.
@@ -520,12 +616,12 @@ mod tests {
             }
         }
 
-        let mut batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
         let (tx, rx) = mpsc::channel(1);
         drop(rx); // channel closed before loop starts
-        let mut cursor = std::io::Cursor::new(buf);
+        let cursor = std::io::Cursor::new(buf);
 
-        let result = read_build_stderr_loop(&mut cursor, &mut batcher, &tx).await;
+        let result = read_build_stderr_loop(cursor, batcher, &tx).await;
         let br = result.expect("channel-closed is Ok(failure)");
         assert_eq!(br.status, BuildStatus::MiscFailure);
         assert!(
@@ -574,5 +670,195 @@ mod tests {
         assert_eq!(br.status, BuildStatus::Built);
         // None of these messages produce log lines.
         assert_eq!(count_log_lines(&batches), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel-safety + silent-period flush (the C4 fix)
+    // -----------------------------------------------------------------------
+
+    /// A build that goes silent for >100ms MUST flush its partial batch via
+    /// the interval tick, not wait for the next STDERR message. This is the
+    /// observability spec's "64 lines / 100ms" guarantee.
+    ///
+    /// Uses `start_paused = true` + `tokio::io::duplex` so the flush tick
+    /// fires deterministically under paused tokio-time. The tick arm uses
+    /// `has_pending() + flush()` (not `maybe_flush()`) specifically because
+    /// `maybe_flush()` checks `std::time::Instant`, which does NOT advance
+    /// under paused tokio-time.
+    #[tokio::test(start_paused = true)]
+    async fn test_silent_period_triggers_flush() {
+        let (mut write_half, read_half) = tokio::io::duplex(4096);
+        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let (log_tx, mut log_rx) = mpsc::channel(8);
+
+        // Spawn the loop. It will read from read_half (which we write to).
+        let loop_handle =
+            tokio::spawn(async move { read_build_stderr_loop(read_half, batcher, &log_tx).await });
+
+        // Send exactly one STDERR_NEXT line, then go silent.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.log("line before silence").await.unwrap();
+        }
+        // Let the reader task drain the channel and the main loop add_line().
+        // Under paused time, auto-advance doesn't kick in while tasks are
+        // ready to run, so yield a few times to let the mpsc drain.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Before the tick: no batch yet (1 line < 64, and no tick fired yet).
+        assert!(
+            log_rx.try_recv().is_err(),
+            "no batch should be sent before BATCH_TIMEOUT elapses"
+        );
+
+        // Advance past BATCH_TIMEOUT. The interval tick fires, the tick arm
+        // sees has_pending() → flush() → send_batch.
+        tokio::time::advance(BATCH_TIMEOUT + Duration::from_millis(10)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // After the tick: batch with our one line should have arrived.
+        let msg = log_rx
+            .try_recv()
+            .expect("batch should be flushed by the interval tick during silence");
+        let Some(worker_message::Msg::LogBatch(batch)) = msg.msg else {
+            panic!("expected LogBatch, got {:?}", msg.msg);
+        };
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(batch.lines[0], b"line before silence");
+
+        // Cleanup: send STDERR_LAST + BuildResult so the loop terminates cleanly.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.finish().await.unwrap();
+        }
+        write_half
+            .write_all(&build_result_bytes(&BuildResult::success()).await)
+            .await
+            .unwrap();
+        drop(write_half); // EOF
+
+        let result = loop_handle.await.unwrap();
+        let br = result.expect("loop should complete successfully");
+        assert_eq!(br.status, BuildStatus::Built);
+    }
+
+    /// Cancel-safety: a STDERR message that arrives in two halves (partial
+    /// write, tick fires, rest of write) must NOT desync the protocol.
+    ///
+    /// This is the core cancel-safety proof: the naive approach of wrapping
+    /// `read_stderr_message()` in `tokio::time::timeout` would drop the read
+    /// future after consuming the first 4 bytes of the u64 tag, leaving the
+    /// pipe at a non-message-boundary. The owned-task approach keeps the read
+    /// future alive across ticks — only `msg_rx.recv()` is cancelled, and
+    /// mpsc recv is cancel-safe.
+    #[tokio::test(start_paused = true)]
+    async fn test_reader_not_desynced_across_tick() {
+        use rio_nix::protocol::stderr::STDERR_NEXT;
+
+        let (mut write_half, read_half) = tokio::io::duplex(4096);
+        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let (log_tx, mut log_rx) = mpsc::channel(8);
+
+        let loop_handle =
+            tokio::spawn(async move { read_build_stderr_loop(read_half, batcher, &log_tx).await });
+
+        // Write the first 4 bytes of the STDERR_NEXT u64 tag. This leaves
+        // the reader task blocked mid-read_u64.
+        let tag_bytes = STDERR_NEXT.to_le_bytes();
+        write_half.write_all(&tag_bytes[..4]).await.unwrap();
+        write_half.flush().await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Tick fires mid-read. In the BUGGY timeout-wrap approach, this would
+        // cancel the read future; the 4 already-consumed bytes are gone, and
+        // the NEXT read_u64 starts from byte 5 of the original message →
+        // garbage tag → protocol desync. In the owned-task approach, the
+        // read future is NOT cancelled; only msg_rx.recv() is.
+        tokio::time::advance(BATCH_TIMEOUT + Duration::from_millis(10)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        // No batch (nothing pending — we haven't gotten a full Next yet).
+        assert!(log_rx.try_recv().is_err());
+
+        // Now send the REST of the tag + the payload. If the protocol is
+        // intact, the reader task completes read_stderr_message() and pushes
+        // a Next("intact-payload") onto msg_rx.
+        write_half.write_all(&tag_bytes[4..]).await.unwrap();
+        // STDERR_NEXT payload is a length-prefixed string (u64 len + bytes + padding)
+        wire::write_string(&mut write_half, "intact-payload")
+            .await
+            .unwrap();
+        write_half.flush().await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // One more tick to flush the single line.
+        tokio::time::advance(BATCH_TIMEOUT + Duration::from_millis(10)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        let msg = log_rx.try_recv().expect(
+            "protocol should be intact: partial-then-complete write across a tick must not desync",
+        );
+        let Some(worker_message::Msg::LogBatch(batch)) = msg.msg else {
+            panic!("expected LogBatch, got {:?}", msg.msg);
+        };
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(
+            batch.lines[0], b"intact-payload",
+            "payload reassembled correctly across the mid-read tick"
+        );
+
+        // Cleanup.
+        {
+            let mut w = StderrWriter::new(&mut write_half);
+            w.finish().await.unwrap();
+        }
+        write_half
+            .write_all(&build_result_bytes(&BuildResult::success()).await)
+            .await
+            .unwrap();
+        drop(write_half);
+
+        let result = loop_handle.await.unwrap();
+        let br = result.expect("loop should complete successfully after reassembly");
+        assert_eq!(br.status, BuildStatus::Built);
+    }
+
+    /// The final flush (inside the loop, after STDERR_LAST) must drain any
+    /// partial batch. Previously this was the caller's job (executor/mod.rs);
+    /// now the loop owns the batcher.
+    #[tokio::test]
+    async fn test_final_flush_after_last() {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            // 3 lines < 64: these stay in the partial batch until final flush.
+            w.log("tail-1").await.unwrap();
+            w.log("tail-2").await.unwrap();
+            w.log("tail-3").await.unwrap();
+            w.finish().await.unwrap();
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await);
+
+        let (result, batches) = run_loop(buf).await;
+        result.expect("should succeed");
+        // The 3 lines MUST be in the batches (final flush fired).
+        // Previously, with caller-side flush, run_loop's dropped batcher
+        // meant these were silently lost in this test harness.
+        assert_eq!(
+            count_log_lines(&batches),
+            3,
+            "final flush should drain the 3-line partial batch"
+        );
     }
 }

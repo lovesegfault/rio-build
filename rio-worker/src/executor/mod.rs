@@ -27,7 +27,6 @@ use rio_nix::derivation::Derivation;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types::{
     BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, WorkAssignment, WorkerMessage,
-    worker_message,
 };
 
 use crate::log_stream::LogBatcher;
@@ -307,16 +306,9 @@ pub async fn execute_build(
 
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // Previously, any `?` between spawn and kill leaked the daemon process.
-    let mut batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string());
-    let build_result = run_daemon_build(
-        &mut daemon,
-        drv_path,
-        &basic_drv,
-        timeout,
-        &mut batcher,
-        log_tx,
-    )
-    .await;
+    let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string());
+    let build_result =
+        run_daemon_build(&mut daemon, drv_path, &basic_drv, timeout, batcher, log_tx).await;
 
     // ALWAYS kill the daemon, regardless of success/failure.
     if let Err(e) = daemon.kill().await {
@@ -329,16 +321,8 @@ pub async fn execute_build(
         Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
     }
 
-    // Flush any remaining log lines (best-effort: build result is already determined)
-    if batcher.has_pending() {
-        let batch = batcher.flush();
-        let msg = WorkerMessage {
-            msg: Some(worker_message::Msg::LogBatch(batch)),
-        };
-        if log_tx.send(msg).await.is_err() {
-            tracing::warn!("log channel closed during final flush");
-        }
-    }
+    // (Final log flush happens inside read_build_stderr_loop, which now
+    // owns the batcher.)
 
     // NOW propagate any daemon error (after kill).
     let build_result = build_result?;

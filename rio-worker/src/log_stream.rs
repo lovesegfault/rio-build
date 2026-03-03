@@ -12,7 +12,7 @@ use rio_proto::types::BuildLogBatch;
 const MAX_BATCH_LINES: usize = 64;
 
 /// Maximum time to wait before flushing a partial batch.
-const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Log batcher that collects log lines and emits `BuildLogBatch` messages.
 pub struct LogBatcher {
