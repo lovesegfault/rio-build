@@ -387,11 +387,158 @@ fn serialize_node(w: &mut impl Write, node: &NarNode) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Serialize a filesystem path to NAR bytes (equivalent to `nix-store --dump`).
+///
+/// Loads every file's contents into memory while building the [`NarNode`]
+/// tree. For a 4 GiB output, that's 4 GiB for the tree + 4 GiB for the
+/// serialized Vec = 8 GiB peak. Use [`dump_path_streaming`] when writing
+/// directly to a sink (e.g., the worker's upload pipeline) to avoid this.
 pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
     let node = node_from_path(path)?;
     let mut buf = Vec::new();
     serialize(&mut buf, &node)?;
     Ok(buf)
+}
+
+/// Serialize a filesystem path directly to a `Write` sink, reading file
+/// contents in 256 KiB chunks without buffering the full tree in memory.
+///
+/// **Byte-identical output to [`dump_path`]** — only the memory profile
+/// differs. Directory structure (names, order, symlinks) is still traversed
+/// in-memory (negligible: ~bytes per entry); only file CONTENTS are streamed.
+///
+/// Returns total bytes written (= the NAR's on-wire size, what `nar_size`
+/// should be set to).
+///
+/// # Read-during-write detection
+///
+/// If a file shrinks between the `symlink_metadata()` call that reads its
+/// length and the `read()` loop that copies its contents, the NAR would be
+/// corrupted: the wire format is `u64:len | len bytes | padding`, so a
+/// short read leaves garbage in the byte positions the reader expects to
+/// be content. We detect this (read returns 0 before `remaining` hits 0)
+/// and fail with a clear error. The overlay upper dir is frozen post-build,
+/// so in practice this only catches filesystem bugs or a misconfigured
+/// worker that mounts a still-mutating path.
+pub fn dump_path_streaming(path: &std::path::Path, w: &mut impl Write) -> Result<u64> {
+    let mut counter = CountingWriter::new(w);
+    write_str(&mut counter, NAR_MAGIC)?;
+    stream_node(&mut counter, path)?;
+    Ok(counter.written)
+}
+
+/// Wraps an `impl Write` and counts bytes written. Used to return the NAR's
+/// total byte size without a second pass.
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, written: 0 }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streaming analogue of `serialize_node(node_from_path(path))`. Walks
+/// the filesystem and writes NAR framing directly, reading file contents
+/// in 256 KiB chunks.
+fn stream_node(w: &mut impl Write, path: &std::path::Path) -> Result<()> {
+    /// Chunk size for file content reads. Matches `NAR_CHUNK_SIZE` in
+    /// rio-proto (256 KiB) so the worker's channel sink can forward
+    /// most reads as single gRPC chunks without re-buffering.
+    const STREAM_CHUNK: usize = 256 * 1024;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    write_str(w, "(")?;
+    write_str(w, "type")?;
+
+    if metadata.is_symlink() {
+        let target = std::fs::read_link(path)?;
+        let target = target.into_os_string().into_string().map_err(|os_str| {
+            NarError::Io(io::Error::other(format!(
+                "symlink target is not valid UTF-8: {os_str:?}"
+            )))
+        })?;
+        write_str(w, "symlink")?;
+        write_str(w, "target")?;
+        write_str(w, &target)?;
+    } else if metadata.is_dir() {
+        write_str(w, "directory")?;
+        // Collect + sort entries for deterministic output (same as
+        // node_from_path — NAR requires sorted entries).
+        let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().into_string().map_err(|os_str| {
+                NarError::Io(io::Error::other(format!(
+                    "directory entry name is not valid UTF-8: {os_str:?}"
+                )))
+            })?;
+            write_str(w, "entry")?;
+            write_str(w, "(")?;
+            write_str(w, "name")?;
+            write_str(w, &name)?;
+            write_str(w, "node")?;
+            stream_node(w, &entry.path())?;
+            write_str(w, ")")?;
+        }
+    } else {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = metadata.permissions().mode() & 0o111 != 0;
+        let len = metadata.len();
+
+        write_str(w, "regular")?;
+        if executable {
+            write_str(w, "executable")?;
+            write_str(w, "")?;
+        }
+        write_str(w, "contents")?;
+
+        // THE POINT: length prefix first, then stream contents in chunks.
+        // `write_bytes` would need the whole thing in a slice; we unfold it.
+        write_u64(w, len)?;
+        let mut f = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; STREAM_CHUNK];
+        let mut remaining = len;
+        while remaining > 0 {
+            let to_read = (STREAM_CHUNK as u64).min(remaining) as usize;
+            let n = f.read(&mut buf[..to_read])?;
+            if n == 0 {
+                // Short read — file shrank between symlink_metadata and now.
+                // See function docs. The NAR is already corrupt at this
+                // point (we wrote `len` as the length prefix, but can't
+                // provide that many bytes). Fail loud.
+                return Err(NarError::Io(io::Error::other(format!(
+                    "file {path:?} truncated during dump: expected {len} bytes, \
+                     short read at {} ({} remaining). Is the overlay upper \
+                     being mutated?",
+                    len - remaining,
+                    remaining
+                ))));
+            }
+            w.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
+        // NAR padding to 8-byte boundary (same as write_bytes).
+        let pad = padding_len(len as usize);
+        if pad > 0 {
+            w.write_all(&[0u8; 8][..pad])?;
+        }
+    }
+
+    write_str(w, ")")?;
+    Ok(())
 }
 
 /// Build a [`NarNode`] tree from a filesystem path.
@@ -887,6 +1034,87 @@ mod tests {
         let nar2 = dump_path(&dst)?;
 
         assert_eq!(nar1, nar2, "NAR roundtrip not byte-identical");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // dump_path_streaming byte-identity to dump_path
+    // -----------------------------------------------------------------------
+
+    /// THE correctness invariant for dump_path_streaming: byte-identical
+    /// output to dump_path. If this ever diverges, every uploaded NAR is
+    /// corrupt — the store would see a different SHA-256 than a
+    /// `nix-store --dump` of the same path, and cache hits would never
+    /// materialize correctly.
+    #[test]
+    fn streaming_byte_identical_to_eager() -> anyhow::Result<()> {
+        let src_dir = tempfile::TempDir::new()?;
+        let src = src_dir.path();
+
+        // Cover all three NarNode types.
+        std::fs::create_dir(src.join("sub"))?;
+        std::fs::write(src.join("file.txt"), "hello streaming\n")?;
+        std::fs::write(src.join("sub/inner.txt"), b"nested content")?;
+        std::os::unix::fs::symlink("file.txt", src.join("link"))?;
+        // Empty file — edge case for the chunk loop (0 iterations).
+        std::fs::write(src.join("empty"), b"")?;
+        // Executable bit.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(src.join("script.sh"), "#!/bin/sh\necho hi\n")?;
+            std::fs::set_permissions(
+                src.join("script.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+        }
+
+        let eager = dump_path(src)?;
+        let mut streamed = Vec::new();
+        let written = dump_path_streaming(src, &mut streamed)?;
+
+        assert_eq!(
+            eager, streamed,
+            "dump_path_streaming MUST be byte-identical to dump_path"
+        );
+        assert_eq!(
+            written,
+            eager.len() as u64,
+            "returned byte count should match actual bytes written"
+        );
+        Ok(())
+    }
+
+    /// Same invariant over a larger file (> STREAM_CHUNK = 256 KiB) to
+    /// exercise the multi-iteration chunk loop.
+    #[test]
+    fn streaming_byte_identical_large_file() -> anyhow::Result<()> {
+        let src_dir = tempfile::TempDir::new()?;
+        let src = src_dir.path();
+
+        // 600 KiB — forces at least 3 chunk-loop iterations.
+        let big: Vec<u8> = (0..600 * 1024).map(|i| (i % 256) as u8).collect();
+        std::fs::write(src.join("big.bin"), &big)?;
+
+        let eager = dump_path(src)?;
+        let mut streamed = Vec::new();
+        let written = dump_path_streaming(src, &mut streamed)?;
+
+        assert_eq!(eager, streamed, "large file byte-identity");
+        assert_eq!(written, eager.len() as u64);
+        Ok(())
+    }
+
+    /// Single regular file (not a directory) — dump of the file itself.
+    #[test]
+    fn streaming_byte_identical_single_file() -> anyhow::Result<()> {
+        let src_dir = tempfile::TempDir::new()?;
+        let f = src_dir.path().join("single");
+        std::fs::write(&f, b"just one file")?;
+
+        let eager = dump_path(&f)?;
+        let mut streamed = Vec::new();
+        dump_path_streaming(&f, &mut streamed)?;
+        assert_eq!(eager, streamed);
         Ok(())
     }
 }

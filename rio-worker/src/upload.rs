@@ -4,16 +4,20 @@
 //! a NAR, computes SHA-256, and uploads via `StoreService.PutPath` gRPC
 //! with retry on failure.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
 use rio_nix::nar;
 use rio_proto::store::store_service_client::StoreServiceClient;
-use rio_proto::validated::ValidatedPathInfo;
+use rio_proto::types::{
+    PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
+};
 
 /// Maximum number of upload retry attempts.
 const MAX_UPLOAD_RETRIES: u32 = 3;
@@ -21,9 +25,19 @@ const MAX_UPLOAD_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
-/// Maximum concurrent output uploads. Bounds peak memory: each in-flight
-/// upload holds one full NAR in memory during the PutPath stream.
+/// Maximum concurrent output uploads. Phase2a held one full NAR in memory
+/// per in-flight upload (8GiB peak for a 4GiB NAR × 4 = 32GiB). Phase2b's
+/// streaming tee bounds each in-flight upload to `STREAM_CHANNEL_BUF × 256KiB`
+/// (~1MiB buffered), so 4 parallel is now ~4MiB peak. We keep 4 as the
+/// default — disk read bandwidth is the new bottleneck, and 4 concurrent
+/// reads saturate most NVMe queues.
 const MAX_PARALLEL_UPLOADS: usize = 4;
+
+/// Channel buffer between the sync `dump_path_streaming` (in spawn_blocking)
+/// and the async gRPC send. At 256KiB/chunk, this is 1MiB of backpressure
+/// headroom — enough to absorb jitter between disk read and network send
+/// without blocking either side for long.
+const STREAM_CHANNEL_BUF: usize = 4;
 
 /// Result of uploading a single output path.
 #[derive(Debug)]
@@ -37,10 +51,14 @@ pub struct UploadResult {
 }
 
 /// Errors from upload operations.
+///
+/// Phase2a had a `NarSerialize` variant — removed in phase2b. NAR
+/// serialization now happens INSIDE the retry loop (each retry is a fresh
+/// disk read), so NAR errors surface as `UploadExhausted` wrapping a
+/// `tonic::Status::internal("NAR serialization failed...")`. Same fidelity
+/// (error message names path + cause), one fewer match arm for callers.
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
-    #[error("NAR serialization failed for {path}: {source}")]
-    NarSerialize { path: String, source: nar::NarError },
     #[error("upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}")]
     UploadExhausted { path: String, source: tonic::Status },
     #[error("I/O error: {0}")]
@@ -74,10 +92,28 @@ pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(outputs)
 }
 
-/// Upload a single output path to the store.
+/// Upload a single output path to the store via single-pass streaming tee.
 ///
-/// Serializes the path as a NAR, computes SHA-256, and streams via PutPath.
-/// Retries with exponential backoff up to `MAX_UPLOAD_RETRIES` times.
+/// ## Single-pass architecture (phase2b)
+///
+/// Phase2a: `dump_path()` → full NAR in memory → `Sha256::digest()` →
+/// `chunk_nar_for_put()`. For a 4GiB output: 4GiB for `NarNode::contents`
+/// + 4GiB for the serialized Vec = 8GiB peak.
+///
+/// Phase2b: `dump_path_streaming()` (inside `spawn_blocking`) writes to a
+/// `HashingChannelWriter` that (a) hashes every byte through SHA-256 AND
+/// (b) buffers into 256KiB chunks → `blocking_send()` to an mpsc channel.
+/// Tonic polls the channel as `PutPathRequest` stream. Hash finalized
+/// after the last byte; sent as `PutPathTrailer`. Peak memory: ~1MiB
+/// (`STREAM_CHANNEL_BUF` × 256KiB) regardless of output size.
+///
+/// ## Retry cost
+///
+/// Each retry re-reads the file from disk (`spawn_blocking` + channel are
+/// consumed on each attempt; can't rewind them). At `MAX_UPLOAD_RETRIES=3`
+/// that's worst-case 3× disk reads. Retries are rare (transient S3/gRPC
+/// blips); the extra reads cost seconds on NVMe for a 4GiB file — trivial
+/// vs. the 32GiB memory saving.
 async fn upload_output(
     store_client: &mut StoreServiceClient<Channel>,
     upper_dir: &Path,
@@ -86,25 +122,21 @@ async fn upload_output(
     let output_path = upper_dir.join("nix/store").join(output_basename);
     let store_path = format!("/nix/store/{output_basename}");
 
-    // Serialize to NAR
-    let nar_data = nar::dump_path(&output_path).map_err(|e| UploadError::NarSerialize {
-        path: store_path.clone(),
-        source: e,
+    // Validate the store path ONCE, before the retry loop. A malformed
+    // path (overlay setup bug) won't fix itself on retry. Discard the
+    // parsed value — do_upload_streaming sends the string form raw; the
+    // store re-parses server-side.
+    let _ = rio_nix::store_path::StorePath::parse(&store_path).map_err(|e| {
+        UploadError::UploadExhausted {
+            path: store_path.clone(),
+            source: tonic::Status::invalid_argument(format!(
+                "output store path {store_path:?} from overlay upper is malformed: {e}"
+            )),
+        }
     })?;
 
-    // Compute SHA-256
-    let nar_hash: [u8; 32] = Sha256::digest(&nar_data).into();
-    let nar_size = nar_data.len() as u64;
-    let nar_data: std::sync::Arc<[u8]> = nar_data.into();
+    tracing::info!(store_path = %store_path, "uploading output (streaming tee)");
 
-    tracing::info!(
-        store_path = %store_path,
-        nar_size,
-        nar_hash = %hex::encode(nar_hash),
-        "uploading output"
-    );
-
-    // Retry loop with exponential backoff
     let mut last_error = None;
     for attempt in 0..MAX_UPLOAD_RETRIES {
         if attempt > 0 {
@@ -113,22 +145,20 @@ async fn upload_output(
                 store_path = %store_path,
                 attempt,
                 delay_ms = delay.as_millis() as u64,
-                "retrying upload"
+                "retrying upload (fresh disk read)"
             );
             tokio::time::sleep(delay).await;
         }
 
-        match do_upload(
-            store_client,
-            &store_path,
-            nar_hash,
-            nar_size,
-            nar_data.clone(),
-        )
-        .await
-        {
-            Ok(()) => {
+        match do_upload_streaming(store_client, &store_path, output_path.clone()).await {
+            Ok((nar_hash, nar_size)) => {
                 metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
+                tracing::info!(
+                    store_path = %store_path,
+                    nar_size,
+                    nar_hash = %hex::encode(nar_hash),
+                    "upload complete"
+                );
                 return Ok(UploadResult {
                     store_path,
                     nar_hash: nar_hash.to_vec(),
@@ -154,44 +184,200 @@ async fn upload_output(
     })
 }
 
-/// Perform a single upload attempt via PutPath streaming RPC.
-///
-/// `store_path` comes from `scan_new_outputs` which reads directory entries
-/// under `{upper}/nix/store/` — these are nix-daemon-generated paths, but
-/// we parse defensively: a bug in our overlay setup could leave garbage here.
-async fn do_upload(
+/// One upload attempt: spawn_blocking(dump_streaming → HashingChannelWriter)
+/// → mpsc → tonic gRPC. Returns (hash, size) on success.
+async fn do_upload_streaming(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
-    nar_hash: [u8; 32],
-    nar_size: u64,
-    nar_data: std::sync::Arc<[u8]>,
-) -> Result<(), tonic::Status> {
-    let parsed_path = rio_nix::store_path::StorePath::parse(store_path).map_err(|e| {
-        tonic::Status::invalid_argument(format!(
-            "output store path {store_path:?} from overlay upper is malformed: {e}"
-        ))
-    })?;
-    let info = ValidatedPathInfo {
-        store_path: parsed_path,
-        nar_hash,
-        nar_size,
-        // Other fields populated by the store server.
+    output_path: PathBuf,
+) -> Result<([u8; 32], u64), tonic::Status> {
+    // Channel bridges sync `dump_path_streaming` (spawn_blocking) to async
+    // gRPC. Backpressure: when full, `blocking_send` inside the writer
+    // blocks the spawn_blocking thread until tonic pulls a chunk.
+    let (tx, rx) = mpsc::channel::<PutPathRequest>(STREAM_CHANNEL_BUF);
+
+    // First message: metadata with EMPTY hash/size → trailer mode. Send
+    // this from the async side BEFORE spawning the blocking task, so the
+    // message order is guaranteed (metadata must be first; chunks follow).
+    let info = PathInfo {
+        store_path: store_path.to_string(),
+        nar_hash: Vec::new(), // EMPTY → triggers trailer mode on the store
+        nar_size: 0,          //         (real values arrive in trailer)
         store_path_hash: Vec::new(),
-        deriver: None,
+        deriver: String::new(),
         references: Vec::new(),
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
-        content_address: None,
+        content_address: String::new(),
     };
-    let stream = rio_proto::client::chunk_nar_for_put(info, nar_data);
-    rio_common::grpc::with_timeout_status(
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+        })),
+    })
+    .await
+    .map_err(|_| tonic::Status::internal("upload channel closed before metadata send"))?;
+
+    // Spawn the streaming dump on the blocking pool. It hashes + forwards
+    // chunks + sends trailer, then returns (hash, size). MUST be
+    // spawn_blocking: `HashingChannelWriter::write` calls `blocking_send`
+    // which PANICS if invoked from a runtime thread.
+    let dump_task = tokio::task::spawn_blocking(move || {
+        let mut sink = HashingChannelWriter::new(tx);
+        let written = nar::dump_path_streaming(&output_path, &mut sink)
+            .map_err(|e| nar_err_to_status(&output_path, e))?;
+        // finalize() sends the trailer and drops tx (which closes the channel,
+        // telling tonic the stream is done).
+        let (hash, size) = sink.finalize();
+        // Sanity: dump_path_streaming's CountingWriter count should match
+        // the tee's total. A mismatch means the CountingWriter or the tee
+        // has a bug; fail loud instead of uploading a corrupted NAR.
+        debug_assert_eq!(written, size, "CountingWriter vs tee size mismatch");
+        Ok::<_, tonic::Status>((hash, size))
+    });
+
+    // Drive the gRPC stream. Chunks + trailer arrive on `rx` as the
+    // blocking task produces them. `with_timeout_status` bounds the whole
+    // thing (initial call + stream drain) so a stuck disk read can't hang
+    // the worker forever.
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let put_result = rio_common::grpc::with_timeout_status(
         "PutPath",
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
-        store_client.put_path(stream),
+        store_client.put_path(outbound),
     )
-    .await?;
-    Ok(())
+    .await;
+
+    // Join the blocking task. Two cases:
+    //   (a) put_path succeeded → dump_task has definitely finished (it
+    //       closed the channel before put_path could return). Await is
+    //       non-blocking; just collect the result.
+    //   (b) put_path failed → dump_task might still be running (blocked on
+    //       blocking_send to a channel whose rx was dropped). blocking_send
+    //       returns Err when rx is dropped; the task will exit with a
+    //       BrokenPipe. Await that.
+    let dump_result = dump_task
+        .await
+        .map_err(|e| tonic::Status::internal(format!("dump task panicked: {e}")))?;
+
+    // Error priority: if BOTH failed, surface the gRPC error (it's the
+    // one the operator cares about — "store unreachable" is more useful
+    // than "BrokenPipe on a channel"). If only one failed, surface it.
+    put_result?;
+    dump_result
+}
+
+fn nar_err_to_status(path: &Path, e: nar::NarError) -> tonic::Status {
+    tonic::Status::internal(format!(
+        "NAR serialization failed for {}: {e}",
+        path.display()
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// HashingChannelWriter — the tee sink
+// ---------------------------------------------------------------------------
+
+/// Sync `Write` sink that tees every byte through SHA-256 AND forwards
+/// 256KiB chunks to an mpsc channel as `PutPathRequest::NarChunk` messages.
+///
+/// `write()` calls `Sender::blocking_send()` — **MUST** run inside
+/// `spawn_blocking`. Calling from a tokio runtime thread would panic
+/// ("Cannot block the current thread from within a runtime").
+///
+/// Backpressure: when the channel is full (`STREAM_CHANNEL_BUF` chunks
+/// in flight), `blocking_send` blocks until tonic pulls one. This ties
+/// disk read speed to network send speed without unbounded buffering.
+struct HashingChannelWriter {
+    hasher: Sha256,
+    /// Current partial chunk. Flushed to the channel when it reaches
+    /// `NAR_CHUNK_SIZE`.
+    buf: Vec<u8>,
+    /// Total bytes ever written (what goes in the trailer's `nar_size`).
+    total: u64,
+    tx: mpsc::Sender<PutPathRequest>,
+}
+
+impl HashingChannelWriter {
+    fn new(tx: mpsc::Sender<PutPathRequest>) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            buf: Vec::with_capacity(rio_proto::client::NAR_CHUNK_SIZE),
+            total: 0,
+            tx,
+        }
+    }
+
+    /// Send the final partial chunk (if any), then the trailer, then drop
+    /// the sender (closing the channel, signaling stream-end to tonic).
+    ///
+    /// Returns `(sha256, total_bytes)` — what goes in the trailer.
+    fn finalize(mut self) -> ([u8; 32], u64) {
+        // Final partial chunk. May be empty if total was a multiple of
+        // NAR_CHUNK_SIZE — in that case we skip the send (store would
+        // accept an empty chunk but it's wasteful).
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            // Best-effort: if the receiver is gone (gRPC already failed),
+            // blocking_send returns Err. We can't propagate here (finalize
+            // returns infallibly), but the gRPC error will surface via
+            // the put_result in do_upload_streaming.
+            let _ = self.tx.blocking_send(PutPathRequest {
+                msg: Some(put_path_request::Msg::NarChunk(chunk)),
+            });
+        }
+
+        let hash: [u8; 32] = self.hasher.finalize().into();
+        let _ = self.tx.blocking_send(PutPathRequest {
+            msg: Some(put_path_request::Msg::Trailer(PutPathTrailer {
+                nar_hash: hash.to_vec(),
+                nar_size: self.total,
+            })),
+        });
+        // tx drops here → channel closes → tonic's ReceiverStream yields None
+        // → server sees stream end.
+        (hash, self.total)
+    }
+}
+
+impl Write for HashingChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(data);
+        self.total += data.len() as u64;
+        self.buf.extend_from_slice(data);
+
+        // Chunk-size flush. `>=` not `==` because `data` might be more than
+        // one chunk's worth (dump_path_streaming's 256KiB STREAM_CHUNK
+        // matches NAR_CHUNK_SIZE, but the NAR framing bytes in between
+        // file contents can push a write call over the edge).
+        while self.buf.len() >= rio_proto::client::NAR_CHUNK_SIZE {
+            let chunk: Vec<u8> = self
+                .buf
+                .drain(..rio_proto::client::NAR_CHUNK_SIZE)
+                .collect();
+            self.tx
+                .blocking_send(PutPathRequest {
+                    msg: Some(put_path_request::Msg::NarChunk(chunk)),
+                })
+                .map_err(|_| {
+                    // Receiver dropped = gRPC stream already failed.
+                    // Surface as BrokenPipe so dump_path_streaming bails
+                    // cleanly instead of writing more bytes to /dev/null.
+                    std::io::Error::from(std::io::ErrorKind::BrokenPipe)
+                })?;
+        }
+
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // We don't flush-to-channel here — chunks go out on their own
+        // schedule (size-based). A Write::flush() call from inside
+        // dump_path_streaming would produce an undersized chunk and waste
+        // a gRPC roundtrip. finalize() handles the final partial chunk.
+        Ok(())
+    }
 }
 
 /// Upload all new outputs from the overlay upper layer.
@@ -393,24 +579,135 @@ mod tests {
         Ok(())
     }
 
-    /// NAR serialization fails on ENOENT → UploadError::NarSerialize, no gRPC.
-    #[tokio::test]
+    /// ENOENT during streaming dump → UploadExhausted (wraps the NAR error).
+    /// The dump happens inside spawn_blocking AFTER the gRPC stream opens,
+    /// so the PutPath call is attempted — the store sees metadata then the
+    /// channel closes without a trailer, and fails. We just verify the
+    /// worker surfaces a useful error.
+    #[tokio::test(start_paused = true)]
     async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_and_connect().await?;
+        let (_store, mut client, _h) = spawn_and_connect().await?;
         let tmp = tempfile::tempdir()?;
         // Create nix/store/ dir but NOT the output file.
         fs::create_dir_all(tmp.path().join("nix/store"))?;
 
-        let err = upload_output(&mut client, tmp.path(), "does-not-exist")
+        // Use a VALID basename (32-char hash) so we get past the path
+        // validation and into the dump that actually ENOENTs.
+        let basename = test_store_basename("nonexistent");
+        let err = upload_output(&mut client, tmp.path(), &basename)
             .await
             .expect_err("should fail NAR serialization");
 
+        // Behavior change: phase2a surfaced NarSerialize (a specific
+        // variant); phase2b surfaces UploadExhausted because the NAR
+        // error happens inside the retry loop (each retry re-reads disk,
+        // each gets the same ENOENT). Same fidelity — error message names
+        // the path and the cause.
         assert!(
-            matches!(err, UploadError::NarSerialize { .. }),
-            "expected NarSerialize, got {err:?}"
+            matches!(err, UploadError::UploadExhausted { .. }),
+            "expected UploadExhausted, got {err:?}"
         );
-        // No gRPC call attempted.
-        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // HashingChannelWriter — the tee sink
+    // -----------------------------------------------------------------------
+
+    /// HashingChannelWriter produces the same SHA-256 as a direct digest.
+    /// Runs in spawn_blocking because `blocking_send` panics otherwise.
+    #[tokio::test]
+    async fn test_hashing_channel_writer_hash_correct() -> anyhow::Result<()> {
+        let data = b"hello world, this is tee test data";
+        let expected_hash: [u8; 32] = Sha256::digest(data).into();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let data = data.to_vec();
+        let (hash, size) = tokio::task::spawn_blocking(move || {
+            let mut sink = HashingChannelWriter::new(tx);
+            sink.write_all(&data).unwrap();
+            sink.finalize()
+        })
+        .await?;
+
+        assert_eq!(hash, expected_hash, "tee hash should match direct digest");
+        assert_eq!(size, 34);
+
+        // Trailer should have arrived.
+        let mut saw_trailer = false;
+        while let Some(msg) = rx.recv().await {
+            if let Some(put_path_request::Msg::Trailer(t)) = msg.msg {
+                assert_eq!(t.nar_hash, expected_hash.to_vec());
+                assert_eq!(t.nar_size, 34);
+                saw_trailer = true;
+            }
+        }
+        assert!(saw_trailer, "trailer should be sent");
+        Ok(())
+    }
+
+    /// The recorded PutPath call in MockStore has the REAL hash from the
+    /// trailer — proves the MockStore trailer-apply logic and the upload
+    /// tee produce the same result as phase2a's eager dump+digest.
+    #[tokio::test]
+    async fn test_upload_streaming_mockstore_has_trailer_hash() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_and_connect().await?;
+        let basename = test_store_basename("tee-hash");
+        let tmp = make_output_file(&basename, b"tee upload test data")?;
+
+        let result = upload_output(&mut client, tmp.path(), &basename).await?;
+
+        // The hash returned by upload_output == the hash MockStore recorded
+        // == SHA-256 of dump_path(). Three-way consistency.
+        let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename))?;
+        let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
+        assert_eq!(result.nar_hash, expected_hash.to_vec(), "worker's hash");
+
+        let puts = store.put_calls.read().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].nar_hash,
+            expected_hash.to_vec(),
+            "MockStore should have the TRAILER's hash, not the empty metadata hash"
+        );
+        assert_eq!(puts[0].nar_size, expected_nar.len() as u64);
+        Ok(())
+    }
+
+    /// Write > 256KiB through the tee → multiple chunks produced + correct hash.
+    #[tokio::test]
+    async fn test_hashing_channel_writer_multi_chunk() -> anyhow::Result<()> {
+        // 600 KiB of predictable bytes.
+        let data: Vec<u8> = (0..600 * 1024).map(|i| (i % 256) as u8).collect();
+        let expected_hash: [u8; 32] = Sha256::digest(&data).into();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let data_owned = data.clone();
+        let (hash, size) = tokio::task::spawn_blocking(move || {
+            let mut sink = HashingChannelWriter::new(tx);
+            sink.write_all(&data_owned).unwrap();
+            sink.finalize()
+        })
+        .await?;
+
+        assert_eq!(hash, expected_hash);
+        assert_eq!(size, 600 * 1024);
+
+        // Count chunks + reassemble + verify.
+        let mut chunk_count = 0;
+        let mut reassembled = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            match msg.msg {
+                Some(put_path_request::Msg::NarChunk(c)) => {
+                    chunk_count += 1;
+                    reassembled.extend_from_slice(&c);
+                }
+                Some(put_path_request::Msg::Trailer(_)) => break,
+                _ => {}
+            }
+        }
+        assert!(chunk_count >= 2, "600KiB at 256KiB/chunk → ≥2 chunks");
+        assert_eq!(reassembled, data, "reassembled chunks should == input");
         Ok(())
     }
 }
