@@ -300,3 +300,379 @@ async fn test_build_paths_with_results_invalid_derived_path() {
 
     h.finish().await;
 }
+
+// ===========================================================================
+// process_build_events coverage via scripted MockScheduler
+// ===========================================================================
+//
+// These tests exercise handler/build.rs:process_build_events, which translates
+// the full BuildEvent oneof into STDERR frames. Before these tests, only the
+// three coarse outcomes (Completed/Failed/stream-closed) were covered; the
+// per-event match arms (Log, Derivation lifecycle, Progress, Cancelled) had
+// zero coverage. Scripted events let us hit every arm.
+
+use rio_nix::protocol::client::{StderrMessage, read_stderr_message};
+use rio_proto::types::{self, build_event};
+
+/// Build a BuildEvent wrapping just the oneof; MockScheduler auto-fills
+/// build_id and sequence.
+fn ev(e: build_event::Event) -> types::BuildEvent {
+    types::BuildEvent {
+        build_id: String::new(),
+        sequence: 0,
+        timestamp: None,
+        event: Some(e),
+    }
+}
+
+/// Seed a minimal .drv and return its store path. Every scripted-event test
+/// needs this so translate::reconstruct_dag has something to resolve.
+fn seed_minimal_drv(h: &TestHarness) -> &'static str {
+    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
+    let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
+    h.store
+        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+    drv_path
+}
+
+/// Collect all stderr messages until STDERR_LAST.
+async fn collect_stderr_frames(stream: &mut tokio::io::DuplexStream) -> Vec<StderrMessage> {
+    let mut frames = Vec::new();
+    loop {
+        let msg = read_stderr_message(stream).await.expect("read stderr");
+        if matches!(msg, StderrMessage::Last) {
+            break;
+        }
+        frames.push(msg);
+    }
+    frames
+}
+
+/// BuildLogBatch lines become STDERR_NEXT frames.
+#[tokio::test]
+async fn test_build_paths_log_events_become_stderr_next() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Log(types::BuildLogBatch {
+                derivation_path: String::new(),
+                worker_id: String::new(),
+                lines: vec![b"building foo".to_vec(), b"linking".to_vec()],
+                first_line_number: 0,
+            })),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9, // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let logs: Vec<&str> = frames
+        .iter()
+        .filter_map(|m| match m {
+            StderrMessage::Next(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(logs, vec!["building foo", "linking"]);
+
+    // Opcode 9 response: u64(1) on success
+    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(result, 1);
+    h.finish().await;
+}
+
+/// DerivationEvent{Started -> Completed} maps to STDERR_START_ACTIVITY /
+/// STDERR_STOP_ACTIVITY with matching IDs.
+#[tokio::test]
+async fn test_build_paths_derivation_lifecycle_activities() {
+    let mut h = TestHarness::setup().await;
+    let target = "/nix/store/aaa-activity-test.drv".to_string();
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: target.clone(),
+                status: Some(types::derivation_event::Status::Started(
+                    types::DerivationStarted {
+                        worker_id: "w1".into(),
+                    },
+                )),
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: target.clone(),
+                status: Some(types::derivation_event::Status::Completed(
+                    types::DerivationCompleted {
+                        output_paths: vec![],
+                    },
+                )),
+            })),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    // Expect exactly [StartActivity, StopActivity] in order with matching IDs.
+    assert_eq!(frames.len(), 2, "frames: {frames:?}");
+    let start_id = match &frames[0] {
+        StderrMessage::StartActivity {
+            id,
+            activity_type,
+            text,
+            ..
+        } => {
+            assert_eq!(*activity_type, 106, "ActivityType::Build");
+            assert!(text.contains("aaa-activity-test.drv"));
+            *id
+        }
+        other => panic!("expected StartActivity, got {other:?}"),
+    };
+    match &frames[1] {
+        StderrMessage::StopActivity { id } => assert_eq!(*id, start_id),
+        other => panic!("expected StopActivity, got {other:?}"),
+    }
+
+    let _ = wire::read_u64(&mut h.stream).await.unwrap();
+    h.finish().await;
+}
+
+/// DerivationEvent::Failed stops the activity AND emits a STDERR_NEXT log line.
+#[tokio::test]
+async fn test_build_paths_derivation_failed_emits_log_and_stop() {
+    let mut h = TestHarness::setup().await;
+    let target = "/nix/store/bbb-failed.drv".to_string();
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: target.clone(),
+                status: Some(types::derivation_event::Status::Started(
+                    types::DerivationStarted {
+                        worker_id: "w1".into(),
+                    },
+                )),
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: target.clone(),
+                status: Some(types::derivation_event::Status::Failed(
+                    types::DerivationFailed {
+                        error_message: "boom".into(),
+                        status: types::BuildResultStatus::PermanentFailure.into(),
+                    },
+                )),
+            })),
+            ev(build_event::Event::Failed(types::BuildFailed {
+                error_message: "build failed".into(),
+                failed_derivation: target.clone(),
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // Failed -> opcode 9 sends STDERR_ERROR. Before that: Start, Stop, Next(log).
+    let mut saw_start = false;
+    let mut saw_stop = false;
+    let mut saw_failed_log = false;
+    loop {
+        let msg = read_stderr_message(&mut h.stream)
+            .await
+            .expect("read stderr");
+        match msg {
+            StderrMessage::StartActivity { .. } => saw_start = true,
+            StderrMessage::StopActivity { .. } => saw_stop = true,
+            StderrMessage::Next(s) if s.contains("failed: boom") => saw_failed_log = true,
+            StderrMessage::Error(_) => break,
+            StderrMessage::Last => panic!("unexpected LAST before ERROR"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_start && saw_stop && saw_failed_log,
+        "start={saw_start} stop={saw_stop} failed_log={saw_failed_log}"
+    );
+
+    h.finish().await;
+}
+
+/// BuildCancelled returns a BuildResult with MiscFailure + reason in error_msg.
+/// Use opcode 46 (BuildPathsWithResults) so we can read the BuildResult back.
+#[tokio::test]
+async fn test_build_paths_with_results_cancelled_outcome() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Cancelled(types::BuildCancelled {
+                reason: "user abort".into(),
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46, // wopBuildPathsWithResults
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await;
+    // KeyedBuildResult: count, then (DerivedPath, BuildResult) per entry.
+    let count = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(count, 1);
+    let _derived_path = wire::read_string(&mut h.stream).await.unwrap();
+    let status = wire::read_u64(&mut h.stream).await.unwrap();
+    let error_msg = wire::read_string(&mut h.stream).await.unwrap();
+    // BuildStatus::MiscFailure = 9
+    assert_eq!(status, 9, "MiscFailure");
+    assert!(
+        error_msg.contains("build cancelled") && error_msg.contains("user abort"),
+        "error_msg: {error_msg}"
+    );
+
+    h.finish().await;
+}
+
+/// Progress + Derivation{Cached,Queued} are silent — no STDERR frames.
+#[tokio::test]
+async fn test_build_paths_silent_events_no_stderr() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 3,
+                cached_derivations: 1,
+            })),
+            ev(build_event::Event::Progress(types::BuildProgress {
+                completed: 1,
+                running: 1,
+                queued: 1,
+                total: 3,
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: "/nix/store/cached.drv".into(),
+                status: Some(types::derivation_event::Status::Cached(
+                    types::DerivationCached {
+                        output_paths: vec![],
+                    },
+                )),
+            })),
+            ev(build_event::Event::Derivation(types::DerivationEvent {
+                derivation_path: "/nix/store/queued.drv".into(),
+                status: Some(types::derivation_event::Status::Queued(
+                    types::DerivationQueued {},
+                )),
+            })),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // First frame MUST be STDERR_LAST — none of the silent events emit anything.
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    assert!(
+        frames.is_empty(),
+        "silent events should emit no stderr frames, got: {frames:?}"
+    );
+    let _ = wire::read_u64(&mut h.stream).await.unwrap();
+    h.finish().await;
+}
+
+/// First event is Completed (no Started) → short-circuit return.
+#[tokio::test]
+async fn test_build_paths_first_event_completed_short_circuit() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
+                output_paths: vec!["/nix/store/cached".into()],
+            },
+        ))]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await;
+    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    assert_eq!(result, 1, "success");
+    h.finish().await;
+}
+
+/// First event is Failed (no Started) → short-circuit failure.
+#[tokio::test]
+async fn test_build_paths_first_event_failed_short_circuit() {
+    let mut h = TestHarness::setup().await;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![ev(build_event::Event::Failed(types::BuildFailed {
+            error_message: "instant fail".into(),
+            failed_derivation: String::new(),
+        }))]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // opcode 9 sends STDERR_ERROR on failure
+    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    assert!(err.message.contains("instant fail"), "got: {}", err.message);
+    h.finish().await;
+}
