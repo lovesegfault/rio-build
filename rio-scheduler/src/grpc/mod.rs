@@ -3,6 +3,8 @@
 //! Both services run in the same scheduler binary. They communicate with the
 //! DAG actor via the `ActorHandle`.
 
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -14,18 +16,35 @@ use rio_proto::scheduler::scheduler_service_server::SchedulerService;
 use rio_proto::worker::worker_service_server::WorkerService;
 
 use crate::actor::{ActorCommand, ActorError, ActorHandle, MergeDagRequest};
+use crate::logs::LogBuffers;
 use crate::state::BuildOptions;
 
 /// Shared scheduler state passed to gRPC handlers.
 #[derive(Clone)]
 pub struct SchedulerGrpc {
     actor: ActorHandle,
+    /// Per-derivation log ring buffers. Written directly by the
+    /// BuildExecution recv task (bypasses the actor), read by
+    /// AdminService.GetBuildLogs and drained by the S3 flusher on
+    /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
+    /// and all handlers + the spawned recv tasks need the same buffers.
+    log_buffers: Arc<LogBuffers>,
 }
 
 impl SchedulerGrpc {
     /// Create a new gRPC service with the given actor handle.
     pub fn new(actor: ActorHandle) -> Self {
-        Self { actor }
+        Self {
+            actor,
+            log_buffers: Arc::new(LogBuffers::new()),
+        }
+    }
+
+    /// Access the shared log ring buffers. Exposed for `AdminService` (C9)
+    /// and the S3 flusher (C8), which are constructed in main.rs separately
+    /// from `SchedulerGrpc` but need the same buffers.
+    pub fn log_buffers(&self) -> Arc<LogBuffers> {
+        self.log_buffers.clone()
     }
 
     /// Check if the actor is alive; return UNAVAILABLE if dead (panicked).
@@ -374,6 +393,7 @@ impl WorkerService for SchedulerGrpc {
 
         // Spawn a task to read worker messages and forward to the actor
         let actor_for_recv = self.actor.clone();
+        let log_buffers = self.log_buffers.clone();
         let worker_id_for_recv = worker_id.clone();
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {
@@ -440,14 +460,32 @@ impl WorkerService for SchedulerGrpc {
                                 break;
                             }
                         }
-                        rio_proto::types::worker_message::Msg::LogBatch(_log) => {
-                            // PHASE 2B FEATURE ANCHOR (phase2b.md task 1): this is
-                            // where the log streaming pipeline plugs in. Scheduler-
-                            // side: per-derivation ring buffer for live serving,
-                            // async S3 flush on completion, rate limiting. Worker-
-                            // side batching (64 lines / 100ms, cancel-safe select!)
-                            // is already wired — batches arrive here but are
-                            // currently dropped.
+                        rio_proto::types::worker_message::Msg::LogBatch(log) => {
+                            // Two-step: buffer (never blocks on actor), then forward.
+                            //
+                            // 1. Ring buffer write — direct, no actor involvement.
+                            //    This is the durability path: even if the actor is
+                            //    backpressured or the gateway stream lags, the lines
+                            //    land here and are serveable via AdminService.
+                            log_buffers.push(&log);
+
+                            // 2. Gateway forward — via actor (it owns the
+                            //    drv_path→hash→interested_builds resolution and the
+                            //    broadcast senders). `try_send`, NOT send_unchecked:
+                            //    if the actor channel is backpressured (80% full,
+                            //    hysteresis), we drop the gateway-forward. The ring
+                            //    buffer already has the lines; the gateway misses
+                            //    *live* logs but can still get them via AdminService.
+                            //
+                            //    This is the opposite tradeoff from ProcessCompletion
+                            //    (which MUST use send_unchecked — a dropped completion
+                            //    leaves a derivation stuck Running forever). A dropped
+                            //    log batch is a degraded-mode nuisance, not a hang.
+                            let drv_path = log.derivation_path.clone();
+                            let _ = actor_for_recv.try_send(ActorCommand::ForwardLogBatch {
+                                drv_path,
+                                batch: log,
+                            });
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
                             // PHASE 2B FEATURE ANCHOR (phase2b.md task 3):

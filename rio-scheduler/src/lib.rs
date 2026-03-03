@@ -22,5 +22,6 @@ pub mod actor;
 pub mod dag;
 pub mod db;
 pub mod grpc;
+pub mod logs;
 pub mod queue;
 pub mod state;
