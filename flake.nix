@@ -345,21 +345,52 @@
               }
             );
             doc = craneLib.cargoDoc (commonArgs // { inherit cargoArtifacts; });
-            coverage = craneLib.cargoLlvmCov (
+            # Coverage via `cargo llvm-cov nextest` (NOT `cargo llvm-cov test`).
+            #
+            # Root cause of the previous flakiness: `cargo test` runs all
+            # tests in a single process with --test-threads=NCPU. Scheduler
+            # tests share ONE ephemeral PG server via `static PG: OnceLock`
+            # (rio-test-support/src/pg.rs). Under ~56-way parallelism +
+            # llvm-cov instrumentation overhead on nixbuild.net, that PG
+            # server saturates on query execution (not connection count —
+            # max_connections=500 is plenty). `test_scheduler_cache_check_
+            # skips_build` is uniquely vulnerable: it does a gRPC
+            # FindMissingPaths call INSIDE the actor's serial event loop
+            # with a 30s timeout (merge.rs:412). The in-process store's
+            # handler does a PG query → stalls → 30s elapses → timeout →
+            # cache check returns empty → derivation stays Created →
+            # assertion expecting Completed fails at ~35s total.
+            #
+            # nextest's per-test-process model eliminates this structurally:
+            # each test gets its OWN PG server (own `PG` static). This is
+            # why the `nextest` check above never flaked. cargoNextest with
+            # `withLlvmCov = true` runs `cargo llvm-cov nextest` under the
+            # hood — same isolation, plus coverage.
+            coverage = craneLib.cargoNextest (
               commonArgs
               // {
                 inherit cargoArtifacts;
+                withLlvmCov = true;
+                cargoNextestExtraArgs = "--no-tests=warn";
+                # crane's cargoNextest does `mkdir -p $out` in buildPhase, so
+                # $out is a directory. The old cargoLlvmCov wrote lcov to $out
+                # directly (a file). lcov consumers downstream (lcov --summary
+                # in the dev shell) need updating to $out/lcov.info.
+                cargoLlvmCovExtraArgs = "--lcov --output-path $out/lcov.info";
+                # cargoNextest runs tests in checkPhase (vs cargoLlvmCov
+                # which used buildPhase), so nativeCheckInputs is correct
+                # here — matching the plain `nextest` check above.
+                nativeCheckInputs = with pkgs; [
+                  inputs.nix.packages.${system}.default
+                  openssh
+                  postgresql_18
+                ];
+                # We don't need deps-caching output from this derivation;
+                # the plain nextest check already provides that. llvm-cov's
+                # instrumented artifacts also don't usefully seed non-cov
+                # downstream builds.
+                doInstallCargoArtifacts = false;
                 dontFixup = true;
-                # cargoLlvmCov runs tests during the build phase (not check
-                # phase), so nativeCheckInputs won't be available. Use
-                # nativeBuildInputs.
-                nativeBuildInputs =
-                  (commonArgs.nativeBuildInputs or [ ])
-                  ++ (with pkgs; [
-                    inputs.nix.packages.${system}.default
-                    openssh
-                    postgresql_18
-                  ]);
                 RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
                 RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
               }
