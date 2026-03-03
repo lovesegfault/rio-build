@@ -481,59 +481,63 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn roundtrip_regular_file() {
+    fn roundtrip_regular_file() -> anyhow::Result<()> {
         let node = NarNode::Regular {
             executable: false,
             contents: b"hello world\n".to_vec(),
         };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(parsed, node);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_executable_file() {
+    fn roundtrip_executable_file() -> anyhow::Result<()> {
         let node = NarNode::Regular {
             executable: true,
             contents: b"#!/bin/sh\necho hello\n".to_vec(),
         };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(parsed, node);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_symlink() {
+    fn roundtrip_symlink() -> anyhow::Result<()> {
         let node = NarNode::Symlink {
             target: "file.txt".to_string(),
         };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(parsed, node);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_empty_directory() {
+    fn roundtrip_empty_directory() -> anyhow::Result<()> {
         let node = NarNode::Directory { entries: vec![] };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(parsed, node);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_directory_with_entries() {
+    fn roundtrip_directory_with_entries() -> anyhow::Result<()> {
         let node = NarNode::Directory {
             entries: vec![
                 NarEntry {
@@ -565,38 +569,40 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(parsed, node);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_empty_file() {
+    fn roundtrip_empty_file() -> anyhow::Result<()> {
         let node = NarNode::Regular {
             executable: false,
             contents: vec![],
         };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(parsed, node);
+        Ok(())
     }
 
     #[test]
-    fn parse_empty_regular_no_contents() {
+    fn parse_empty_regular_no_contents() -> anyhow::Result<()> {
         // NAR allows empty regular files without a "contents" field:
         // nix-archive-1 ( type regular )
         let mut buf = Vec::new();
-        write_str(&mut buf, "nix-archive-1").unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "type").unwrap();
-        write_str(&mut buf, "regular").unwrap();
-        write_str(&mut buf, ")").unwrap();
+        write_str(&mut buf, "nix-archive-1")?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "type")?;
+        write_str(&mut buf, "regular")?;
+        write_str(&mut buf, ")")?;
 
-        let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+        let parsed = parse(&mut Cursor::new(&buf))?;
         assert_eq!(
             parsed,
             NarNode::Regular {
@@ -604,90 +610,95 @@ mod tests {
                 contents: vec![],
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn extract_single_file_works() {
+    fn extract_single_file_works() -> anyhow::Result<()> {
         let node = NarNode::Regular {
             executable: false,
             contents: b"drv content here".to_vec(),
         };
 
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
-        let content = extract_single_file(&buf).unwrap();
+        let content = extract_single_file(&buf)?;
         assert_eq!(content, b"drv content here");
+        Ok(())
     }
 
     #[test]
-    fn extract_single_file_rejects_directory() {
+    fn extract_single_file_rejects_directory() -> anyhow::Result<()> {
         let node = NarNode::Directory { entries: vec![] };
         let mut buf = Vec::new();
-        serialize(&mut buf, &node).unwrap();
+        serialize(&mut buf, &node)?;
 
         let result = extract_single_file(&buf);
         assert!(matches!(result, Err(NarError::NotSingleFile)));
+        Ok(())
     }
 
     #[test]
-    fn rejects_invalid_magic() {
+    fn rejects_invalid_magic() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        write_str(&mut buf, "not-nar-magic").unwrap();
+        write_str(&mut buf, "not-nar-magic")?;
         let result = parse(&mut Cursor::new(&buf));
         assert!(matches!(result, Err(NarError::InvalidMagic(_))));
+        Ok(())
     }
 
     #[test]
-    fn rejects_unknown_node_type() {
+    fn rejects_unknown_node_type() -> anyhow::Result<()> {
         let mut buf = Vec::new();
-        write_str(&mut buf, NAR_MAGIC).unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "type").unwrap();
-        write_str(&mut buf, "fifo").unwrap();
+        write_str(&mut buf, NAR_MAGIC)?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "type")?;
+        write_str(&mut buf, "fifo")?;
 
         let result = parse(&mut Cursor::new(&buf));
         assert!(matches!(result, Err(NarError::UnknownNodeType(ref t)) if t == "fifo"));
+        Ok(())
     }
 
     #[test]
-    fn rejects_unsorted_directory_entries() {
+    fn rejects_unsorted_directory_entries() -> anyhow::Result<()> {
         // Construct NAR bytes with directory entries in reverse order ("z" before "a")
         let mut buf = Vec::new();
-        write_str(&mut buf, NAR_MAGIC).unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "type").unwrap();
-        write_str(&mut buf, "directory").unwrap();
+        write_str(&mut buf, NAR_MAGIC)?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "type")?;
+        write_str(&mut buf, "directory")?;
 
         // First entry: "z_file"
-        write_str(&mut buf, "entry").unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "name").unwrap();
-        write_str(&mut buf, "z_file").unwrap();
-        write_str(&mut buf, "node").unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "type").unwrap();
-        write_str(&mut buf, "regular").unwrap();
-        write_str(&mut buf, "contents").unwrap();
-        write_bytes(&mut buf, b"z content").unwrap();
-        write_str(&mut buf, ")").unwrap(); // close node
-        write_str(&mut buf, ")").unwrap(); // close entry
+        write_str(&mut buf, "entry")?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "name")?;
+        write_str(&mut buf, "z_file")?;
+        write_str(&mut buf, "node")?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "type")?;
+        write_str(&mut buf, "regular")?;
+        write_str(&mut buf, "contents")?;
+        write_bytes(&mut buf, b"z content")?;
+        write_str(&mut buf, ")")?; // close node
+        write_str(&mut buf, ")")?; // close entry
 
         // Second entry: "a_file" (out of order!)
-        write_str(&mut buf, "entry").unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "name").unwrap();
-        write_str(&mut buf, "a_file").unwrap();
-        write_str(&mut buf, "node").unwrap();
-        write_str(&mut buf, "(").unwrap();
-        write_str(&mut buf, "type").unwrap();
-        write_str(&mut buf, "regular").unwrap();
-        write_str(&mut buf, "contents").unwrap();
-        write_bytes(&mut buf, b"a content").unwrap();
-        write_str(&mut buf, ")").unwrap(); // close node
-        write_str(&mut buf, ")").unwrap(); // close entry
+        write_str(&mut buf, "entry")?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "name")?;
+        write_str(&mut buf, "a_file")?;
+        write_str(&mut buf, "node")?;
+        write_str(&mut buf, "(")?;
+        write_str(&mut buf, "type")?;
+        write_str(&mut buf, "regular")?;
+        write_str(&mut buf, "contents")?;
+        write_bytes(&mut buf, b"a content")?;
+        write_str(&mut buf, ")")?; // close node
+        write_str(&mut buf, ")")?; // close entry
 
-        write_str(&mut buf, ")").unwrap(); // close directory
+        write_str(&mut buf, ")")?; // close directory
 
         let result = parse(&mut Cursor::new(&buf));
         assert!(
@@ -695,6 +706,7 @@ mod tests {
                      if prev == "z_file" && cur == "a_file"),
             "expected UnsortedEntries error, got: {result:?}"
         );
+        Ok(())
     }
 
     mod proptests {
@@ -749,9 +761,9 @@ mod tests {
             #[test]
             fn nar_roundtrip(node in arb_nar_node()) {
                 let mut buf = Vec::new();
-                serialize(&mut buf, &node).unwrap();
+                serialize(&mut buf, &node)?;
 
-                let parsed = parse(&mut Cursor::new(&buf)).unwrap();
+                let parsed = parse(&mut Cursor::new(&buf))?;
                 prop_assert_eq!(parsed, node);
             }
         }
@@ -759,16 +771,16 @@ mod tests {
 
     /// Compare our NAR output against `nix-store --dump` for a single file.
     #[test]
-    fn golden_single_file() {
+    fn golden_single_file() -> anyhow::Result<()> {
         let drv_path = "/nix/store/3543bymzsssf34hrlchksl28apr3gfyc-simple-test.drv";
 
         // Check if path exists (test may run without this specific path)
         if !std::path::Path::new(drv_path).exists() {
             eprintln!("skipping golden_single_file: {drv_path} not found");
-            return;
+            return Ok(());
         }
 
-        let our_nar = dump_path(std::path::Path::new(drv_path)).unwrap();
+        let our_nar = dump_path(std::path::Path::new(drv_path))?;
 
         let nix_output = std::process::Command::new("nix-store")
             .args(["--dump", drv_path])
@@ -778,7 +790,7 @@ mod tests {
             Ok(o) if o.status.success() => o,
             _ => {
                 eprintln!("skipping golden_single_file: nix-store not available");
-                return;
+                return Ok(());
             }
         };
 
@@ -786,29 +798,30 @@ mod tests {
             our_nar, nix_output.stdout,
             "NAR output differs from nix-store --dump"
         );
+        Ok(())
     }
 
     /// Compare our NAR output against `nix-store --dump` for a directory.
     #[test]
-    fn golden_directory() {
-        let tmpdir = tempfile::TempDir::new().unwrap();
+    fn golden_directory() -> anyhow::Result<()> {
+        let tmpdir = tempfile::TempDir::new()?;
         let root = tmpdir.path();
 
         // Create a directory structure
-        std::fs::create_dir(root.join("subdir")).unwrap();
-        std::fs::write(root.join("a_file.txt"), "hello world\n").unwrap();
-        std::fs::write(root.join("subdir/nested.txt"), "nested\n").unwrap();
-        std::os::unix::fs::symlink("a_file.txt", root.join("b_link")).unwrap();
+        std::fs::create_dir(root.join("subdir"))?;
+        std::fs::write(root.join("a_file.txt"), "hello world\n")?;
+        std::fs::write(root.join("subdir/nested.txt"), "nested\n")?;
+        std::os::unix::fs::symlink("a_file.txt", root.join("b_link"))?;
 
         // Make a file executable
         let script_path = root.join("c_script.sh");
-        std::fs::write(&script_path, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(&script_path, "#!/bin/sh\necho hi\n")?;
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
         }
 
-        let our_nar = dump_path(root).unwrap();
+        let our_nar = dump_path(root)?;
 
         let nix_output = std::process::Command::new("nix-store")
             .args(["--dump", &root.to_string_lossy()])
@@ -818,7 +831,7 @@ mod tests {
             Ok(o) if o.status.success() => o,
             _ => {
                 eprintln!("skipping golden_directory: nix-store not available");
-                return;
+                return Ok(());
             }
         };
 
@@ -845,33 +858,35 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     /// Roundtrip via filesystem: dump → parse → extract → dump again.
     #[test]
-    fn filesystem_roundtrip() {
-        let src_dir = tempfile::TempDir::new().unwrap();
+    fn filesystem_roundtrip() -> anyhow::Result<()> {
+        let src_dir = tempfile::TempDir::new()?;
         let src = src_dir.path();
 
-        std::fs::create_dir(src.join("sub")).unwrap();
-        std::fs::write(src.join("file.txt"), "content\n").unwrap();
-        std::fs::write(src.join("sub/inner.txt"), "inner\n").unwrap();
-        std::os::unix::fs::symlink("file.txt", src.join("link")).unwrap();
+        std::fs::create_dir(src.join("sub"))?;
+        std::fs::write(src.join("file.txt"), "content\n")?;
+        std::fs::write(src.join("sub/inner.txt"), "inner\n")?;
+        std::os::unix::fs::symlink("file.txt", src.join("link"))?;
 
         // Dump → NAR bytes
-        let nar1 = dump_path(src).unwrap();
+        let nar1 = dump_path(src)?;
 
         // Parse NAR
-        let node = parse(&mut Cursor::new(&nar1)).unwrap();
+        let node = parse(&mut Cursor::new(&nar1))?;
 
         // Extract to new directory
-        let dst_dir = tempfile::TempDir::new().unwrap();
+        let dst_dir = tempfile::TempDir::new()?;
         let dst = dst_dir.path().join("extracted");
-        extract_to_path(&node, &dst).unwrap();
+        extract_to_path(&node, &dst)?;
 
         // Dump again
-        let nar2 = dump_path(&dst).unwrap();
+        let nar2 = dump_path(&dst)?;
 
         assert_eq!(nar1, nar2, "NAR roundtrip not byte-identical");
+        Ok(())
     }
 }

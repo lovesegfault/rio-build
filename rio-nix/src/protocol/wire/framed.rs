@@ -195,52 +195,53 @@ mod tests {
     // FramedStreamReader tests
 
     /// Helper: write framed stream, then read back via FramedStreamReader.
-    async fn framed_reader_roundtrip(data: &[u8], chunk_size: usize) -> Vec<u8> {
+    async fn framed_reader_roundtrip(data: &[u8], chunk_size: usize) -> anyhow::Result<Vec<u8>> {
         let mut wire_buf = Vec::new();
-        write_framed_stream(&mut wire_buf, data, chunk_size)
-            .await
-            .unwrap();
+        write_framed_stream(&mut wire_buf, data, chunk_size).await?;
         let reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
         let mut result = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::BufReader::new(reader), &mut result)
-            .await
-            .unwrap();
-        result
+            .await?;
+        Ok(result)
     }
 
     #[tokio::test]
-    async fn test_framed_reader_single_frame() {
+    async fn test_framed_reader_single_frame() -> anyhow::Result<()> {
         let data = b"hello framed world";
-        let result = framed_reader_roundtrip(data, 1024).await;
+        let result = framed_reader_roundtrip(data, 1024).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_reader_multi_frame() {
+    async fn test_framed_reader_multi_frame() -> anyhow::Result<()> {
         let data = b"abcdefghijklmnopqrstuvwxyz";
-        let result = framed_reader_roundtrip(data, 10).await;
+        let result = framed_reader_roundtrip(data, 10).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_reader_empty_stream() {
+    async fn test_framed_reader_empty_stream() -> anyhow::Result<()> {
         // Just the u64(0) sentinel
-        let result = framed_reader_roundtrip(b"", 64).await;
+        let result = framed_reader_roundtrip(b"", 64).await?;
         assert!(result.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_reader_chunk_size_1() {
+    async fn test_framed_reader_chunk_size_1() -> anyhow::Result<()> {
         let data = b"test";
-        let result = framed_reader_roundtrip(data, 1).await;
+        let result = framed_reader_roundtrip(data, 1).await?;
         assert_eq!(result, data);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_reader_frame_too_large() {
+    async fn test_framed_reader_frame_too_large() -> anyhow::Result<()> {
         // Construct a wire buffer with a frame larger than MAX_FRAME_SIZE
         let mut wire_buf = Vec::new();
-        write_u64(&mut wire_buf, MAX_FRAME_SIZE + 1).await.unwrap();
+        write_u64(&mut wire_buf, MAX_FRAME_SIZE + 1).await?;
         let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
         let mut result = Vec::new();
         let err = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut result)
@@ -250,19 +251,20 @@ mod tests {
             err.to_string().contains("frame size"),
             "expected 'frame size' in error, got: {err}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_reader_total_too_large() {
+    async fn test_framed_reader_total_too_large() -> anyhow::Result<()> {
         // Create a stream that would exceed max_total (set low for testing)
         let mut wire_buf = Vec::new();
         // Frame 1: 10 bytes
-        write_u64(&mut wire_buf, 10).await.unwrap();
+        write_u64(&mut wire_buf, 10).await?;
         wire_buf.extend_from_slice(&[0u8; 10]);
         // Frame 2: 10 bytes — would make total 20, exceeding max_total=15
-        write_u64(&mut wire_buf, 10).await.unwrap();
+        write_u64(&mut wire_buf, 10).await?;
         wire_buf.extend_from_slice(&[0u8; 10]);
-        write_u64(&mut wire_buf, 0).await.unwrap(); // sentinel
+        write_u64(&mut wire_buf, 0).await?; // sentinel
 
         let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), 15);
         let mut result = Vec::new();
@@ -273,15 +275,16 @@ mod tests {
             err.to_string().contains("total size"),
             "expected 'total size' in error, got: {err}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_framed_reader_small_buf_reads() {
+    async fn test_framed_reader_small_buf_reads() -> anyhow::Result<()> {
         // Test that the reader works correctly with small read buffer sizes
         // by reading one byte at a time
         let data = b"hello";
         let mut wire_buf = Vec::new();
-        write_framed_stream(&mut wire_buf, data, 3).await.unwrap();
+        write_framed_stream(&mut wire_buf, data, 3).await?;
 
         let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
         let mut result = Vec::new();
@@ -296,6 +299,7 @@ mod tests {
         assert_eq!(result, data);
         assert!(reader.is_done());
         assert_eq!(reader.total_bytes_read(), data.len() as u64);
+        Ok(())
     }
 
     #[tokio::test]
@@ -315,10 +319,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_framed_reader_eof_mid_data() {
+    async fn test_framed_reader_eof_mid_data() -> anyhow::Result<()> {
         // Header says 10 bytes, but only 5 available
         let mut wire_buf = Vec::new();
-        write_u64(&mut wire_buf, 10).await.unwrap();
+        write_u64(&mut wire_buf, 10).await?;
         wire_buf.extend_from_slice(&[0u8; 5]); // only 5 of 10
         let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
         let mut result = Vec::new();
@@ -330,6 +334,7 @@ mod tests {
             err.to_string().contains("mid-frame data"),
             "expected 'mid-frame data', got: {err}"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -345,22 +350,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_framed_reader_accessors() {
+    async fn test_framed_reader_accessors() -> anyhow::Result<()> {
         let data = b"test data here";
         let mut wire_buf = Vec::new();
-        write_framed_stream(&mut wire_buf, data, 5).await.unwrap();
+        write_framed_stream(&mut wire_buf, data, 5).await?;
 
         let mut reader = FramedStreamReader::new(Cursor::new(wire_buf), MAX_FRAMED_TOTAL);
         assert!(!reader.is_done());
         assert_eq!(reader.total_bytes_read(), 0);
 
         let mut result = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut result)
-            .await
-            .unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut result).await?;
 
         assert!(reader.is_done());
         assert_eq!(reader.total_bytes_read(), data.len() as u64);
+        Ok(())
     }
 
     #[tokio::test]

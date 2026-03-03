@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_result_roundtrip() {
+    async fn build_result_roundtrip() -> anyhow::Result<()> {
         let result = BuildResult {
             status: BuildStatus::Built,
             times_built: 1,
@@ -463,32 +463,34 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        write_build_result(&mut buf, &result).await.unwrap();
+        write_build_result(&mut buf, &result).await?;
 
         let mut reader = Cursor::new(buf);
-        let parsed = read_build_result(&mut reader).await.unwrap();
+        let parsed = read_build_result(&mut reader).await?;
         assert_eq!(parsed, result);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_result_failure_roundtrip() {
+    async fn build_result_failure_roundtrip() -> anyhow::Result<()> {
         let result = BuildResult::failure(BuildStatus::PermanentFailure, "build failed: exit 1");
 
         let mut buf = Vec::new();
-        write_build_result(&mut buf, &result).await.unwrap();
+        write_build_result(&mut buf, &result).await?;
 
         let mut reader = Cursor::new(buf);
-        let parsed = read_build_result(&mut reader).await.unwrap();
+        let parsed = read_build_result(&mut reader).await?;
         assert_eq!(parsed.status, BuildStatus::PermanentFailure);
         assert_eq!(parsed.error_msg, "build failed: exit 1");
         assert!(parsed.built_outputs.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn basic_derivation_roundtrip() {
+    async fn basic_derivation_roundtrip() -> anyhow::Result<()> {
         let outputs = vec![
-            DerivationOutput::new("out", "/nix/store/abc-hello", "", "").unwrap(),
-            DerivationOutput::new("dev", "/nix/store/def-hello-dev", "", "").unwrap(),
+            DerivationOutput::new("out", "/nix/store/abc-hello", "", "")?,
+            DerivationOutput::new("dev", "/nix/store/def-hello-dev", "", "")?,
         ];
         let input_srcs: std::collections::BTreeSet<String> =
             ["/nix/store/ghi-source.sh".to_string()]
@@ -511,14 +513,13 @@ mod tests {
             builder.clone(),
             args.clone(),
             env_map.clone(),
-        )
-        .unwrap();
+        )?;
 
         let mut buf = Vec::new();
-        write_basic_derivation(&mut buf, &drv).await.unwrap();
+        write_basic_derivation(&mut buf, &drv).await?;
 
         let mut reader = Cursor::new(buf);
-        let r_drv = read_basic_derivation(&mut reader).await.unwrap();
+        let r_drv = read_basic_derivation(&mut reader).await?;
 
         assert_eq!(r_drv.outputs(), outputs);
         assert_eq!(*r_drv.input_srcs(), input_srcs);
@@ -526,6 +527,7 @@ mod tests {
         assert_eq!(r_drv.builder(), builder);
         assert_eq!(r_drv.args(), args);
         assert_eq!(*r_drv.env(), env_map);
+        Ok(())
     }
 
     mod proptests {
@@ -594,7 +596,8 @@ mod tests {
                 prop_oneof![Just(String::new()), "[0-9a-f]{64}"],
             )
                 .prop_map(|(name, path, hash_algo, hash)| {
-                    DerivationOutput::new(name, path, hash_algo, hash).unwrap()
+                    DerivationOutput::new(name, path, hash_algo, hash)
+                        .expect("generated to be valid")
                 })
         }
 
@@ -605,9 +608,9 @@ mod tests {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
                     let mut buf = Vec::new();
-                    write_build_result(&mut buf, &result).await.unwrap();
+                    write_build_result(&mut buf, &result).await?;
                     let mut reader = Cursor::new(buf);
-                    let parsed = read_build_result(&mut reader).await.unwrap();
+                    let parsed = read_build_result(&mut reader).await?;
                     prop_assert_eq!(parsed, result);
                     Ok(())
                 })?;
@@ -627,11 +630,11 @@ mod tests {
             ) {
                 let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
                 rt.block_on(async {
-                    let drv = BasicDerivation::new(outputs, input_srcs, platform, builder, args, env_map).unwrap();
+                    let drv = BasicDerivation::new(outputs, input_srcs, platform, builder, args, env_map)?;
                     let mut buf = Vec::new();
-                    write_basic_derivation(&mut buf, &drv).await.unwrap();
+                    write_basic_derivation(&mut buf, &drv).await?;
                     let mut reader = Cursor::new(buf);
-                    let r_drv = read_basic_derivation(&mut reader).await.unwrap();
+                    let r_drv = read_basic_derivation(&mut reader).await?;
                     prop_assert_eq!(r_drv.outputs(), drv.outputs());
                     prop_assert_eq!(r_drv.input_srcs(), drv.input_srcs());
                     prop_assert_eq!(r_drv.platform(), drv.platform());

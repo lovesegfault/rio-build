@@ -218,12 +218,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_algo_parse() {
-        assert_eq!("sha256".parse::<HashAlgo>().unwrap(), HashAlgo::SHA256);
-        assert_eq!("SHA256".parse::<HashAlgo>().unwrap(), HashAlgo::SHA256);
-        assert_eq!("sha512".parse::<HashAlgo>().unwrap(), HashAlgo::SHA512);
-        assert_eq!("sha1".parse::<HashAlgo>().unwrap(), HashAlgo::SHA1);
+    fn test_algo_parse() -> anyhow::Result<()> {
+        assert_eq!("sha256".parse::<HashAlgo>()?, HashAlgo::SHA256);
+        assert_eq!("SHA256".parse::<HashAlgo>()?, HashAlgo::SHA256);
+        assert_eq!("sha512".parse::<HashAlgo>()?, HashAlgo::SHA512);
+        assert_eq!("sha1".parse::<HashAlgo>()?, HashAlgo::SHA1);
         assert!("md5".parse::<HashAlgo>().is_err());
+        Ok(())
     }
 
     #[test]
@@ -258,27 +259,29 @@ mod tests {
     }
 
     #[test]
-    fn test_colon_format_roundtrip() {
+    fn test_colon_format_roundtrip() -> anyhow::Result<()> {
         let hash = NixHash::compute(HashAlgo::SHA256, b"hello");
         let colon = hash.to_colon();
         assert!(colon.starts_with("sha256:"));
-        let parsed = NixHash::parse_colon(&colon).unwrap();
+        let parsed = NixHash::parse_colon(&colon)?;
         assert_eq!(parsed, hash);
+        Ok(())
     }
 
     #[test]
-    fn test_sri_format_roundtrip() {
+    fn test_sri_format_roundtrip() -> anyhow::Result<()> {
         let hash = NixHash::compute(HashAlgo::SHA256, b"hello");
         let sri = hash.to_sri();
         assert!(sri.starts_with("sha256-"));
-        let parsed = NixHash::parse_sri(&sri).unwrap();
+        let parsed = NixHash::parse_sri(&sri)?;
         assert_eq!(parsed, hash);
+        Ok(())
     }
 
     #[test]
-    fn test_truncate_for_store_path() {
+    fn test_truncate_for_store_path() -> anyhow::Result<()> {
         let hash = NixHash::compute(HashAlgo::SHA256, b"test");
-        let truncated = hash.truncate_for_store_path().unwrap();
+        let truncated = hash.truncate_for_store_path()?;
         assert_eq!(truncated.len(), 20);
         // Verify XOR fold: bytes[0] ^ bytes[20], bytes[1] ^ bytes[21], etc.
         let digest = hash.digest();
@@ -289,6 +292,7 @@ mod tests {
             }
             assert_eq!(actual, expected);
         }
+        Ok(())
     }
 
     #[test]
@@ -301,13 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_detect_format() {
+    fn test_auto_detect_format() -> anyhow::Result<()> {
         let hash = NixHash::compute(HashAlgo::SHA256, b"hello");
         let colon = hash.to_colon();
         let sri = hash.to_sri();
 
-        assert_eq!(NixHash::parse(&colon).unwrap(), hash);
-        assert_eq!(NixHash::parse(&sri).unwrap(), hash);
+        assert_eq!(NixHash::parse(&colon)?, hash);
+        assert_eq!(NixHash::parse(&sri)?, hash);
+        Ok(())
     }
 
     #[test]

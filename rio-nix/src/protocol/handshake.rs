@@ -173,7 +173,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
-    async fn test_successful_handshake() {
+    async fn test_successful_handshake() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
@@ -187,45 +187,42 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(reader);
 
         // Step 1: Client sends MAGIC_1 + version
-        wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
-        wire::write_u64(&mut writer, PROTOCOL_VERSION)
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await?;
+        wire::write_u64(&mut writer, PROTOCOL_VERSION).await?;
+        writer.flush().await?;
 
         // Step 2: Client reads MAGIC_2 + server_version
-        let magic2 = wire::read_u64(&mut reader).await.unwrap();
+        let magic2 = wire::read_u64(&mut reader).await?;
         assert_eq!(magic2, WORKER_MAGIC_2);
-        let server_version = wire::read_u64(&mut reader).await.unwrap();
+        let server_version = wire::read_u64(&mut reader).await?;
         assert_eq!(server_version, PROTOCOL_VERSION);
 
         // Step 3 (>= 1.38): Client sends features
         let client_features: Vec<String> = vec![];
-        wire::write_strings(&mut writer, &client_features)
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
+        wire::write_strings(&mut writer, &client_features).await?;
+        writer.flush().await?;
 
         // Step 4: Client reads server features
-        let server_features = wire::read_strings(&mut reader).await.unwrap();
+        let server_features = wire::read_strings(&mut reader).await?;
         assert!(server_features.is_empty());
 
         // Post-handshake: client sends affinity + reserveSpace
-        wire::write_u64(&mut writer, 0).await.unwrap(); // CPU affinity = 0
-        wire::write_u64(&mut writer, 0).await.unwrap(); // reserveSpace = false
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, 0).await?; // CPU affinity = 0
+        wire::write_u64(&mut writer, 0).await?; // reserveSpace = false
+        writer.flush().await?;
 
         // Client reads version string + trusted + STDERR_LAST
-        let version_str = wire::read_string(&mut reader).await.unwrap();
+        let version_str = wire::read_string(&mut reader).await?;
         assert!(version_str.contains("rio-build"));
-        let trusted = wire::read_u64(&mut reader).await.unwrap();
+        let trusted = wire::read_u64(&mut reader).await?;
         assert_eq!(trusted, 1);
-        let stderr_last = wire::read_u64(&mut reader).await.unwrap();
+        let stderr_last = wire::read_u64(&mut reader).await?;
         assert_eq!(stderr_last, crate::protocol::stderr::STDERR_LAST);
 
         drop(writer);
-        let result = server_handle.await.unwrap().unwrap();
+        let result = server_handle.await??;
         assert_eq!(result.negotiated_version(), PROTOCOL_VERSION);
+        Ok(())
     }
 
     #[test]
@@ -236,7 +233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_magic_rejected() {
+    async fn test_invalid_magic_rejected() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
@@ -247,18 +244,19 @@ mod tests {
 
         let (_, mut writer) = tokio::io::split(client_stream);
         // Send wrong magic
-        wire::write_u64(&mut writer, 0xDEADBEEF).await.unwrap();
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, 0xDEADBEEF).await?;
+        writer.flush().await?;
 
-        let result = server_handle.await.unwrap();
+        let result = server_handle.await?;
         assert!(matches!(
             result,
             Err(HandshakeError::InvalidMagic(0xDEADBEEF))
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_version_too_old_rejected() {
+    async fn test_version_too_old_rejected() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
@@ -271,19 +269,17 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(reader);
 
         // Send correct magic
-        wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await?;
         // Send old version (1.32)
-        wire::write_u64(&mut writer, encode_version(1, 32))
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, encode_version(1, 32)).await?;
+        writer.flush().await?;
 
         // Read server's response (MAGIC_2 + version)
-        let _magic2 = wire::read_u64(&mut reader).await.unwrap();
-        let _server_version = wire::read_u64(&mut reader).await.unwrap();
+        let _magic2 = wire::read_u64(&mut reader).await?;
+        let _server_version = wire::read_u64(&mut reader).await?;
 
         drop(writer);
-        let result = server_handle.await.unwrap();
+        let result = server_handle.await?;
         assert!(matches!(
             result,
             Err(HandshakeError::VersionTooOld {
@@ -291,10 +287,11 @@ mod tests {
                 client_minor: 32,
             })
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_handshake_with_nonzero_cpu_affinity() {
+    async fn test_handshake_with_nonzero_cpu_affinity() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
@@ -307,42 +304,39 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(reader);
 
         // Magic + version
-        wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
-        wire::write_u64(&mut writer, PROTOCOL_VERSION)
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await?;
+        wire::write_u64(&mut writer, PROTOCOL_VERSION).await?;
+        writer.flush().await?;
 
         // Read server magic + version
-        let _magic2 = wire::read_u64(&mut reader).await.unwrap();
-        let _server_version = wire::read_u64(&mut reader).await.unwrap();
+        let _magic2 = wire::read_u64(&mut reader).await?;
+        let _server_version = wire::read_u64(&mut reader).await?;
 
         // Feature exchange
         let client_features: Vec<String> = vec![];
-        wire::write_strings(&mut writer, &client_features)
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
-        let _server_features = wire::read_strings(&mut reader).await.unwrap();
+        wire::write_strings(&mut writer, &client_features).await?;
+        writer.flush().await?;
+        let _server_features = wire::read_strings(&mut reader).await?;
 
         // Post-handshake: send NON-ZERO CPU affinity + mask
-        wire::write_u64(&mut writer, 1).await.unwrap(); // cpu_affinity = 1 (non-zero)
-        wire::write_u64(&mut writer, 0xFF).await.unwrap(); // affinity mask
-        wire::write_u64(&mut writer, 0).await.unwrap(); // reserveSpace
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, 1).await?; // cpu_affinity = 1 (non-zero)
+        wire::write_u64(&mut writer, 0xFF).await?; // affinity mask
+        wire::write_u64(&mut writer, 0).await?; // reserveSpace
+        writer.flush().await?;
 
         // Read version string + trusted + STDERR_LAST
-        let _version_str = wire::read_string(&mut reader).await.unwrap();
-        let _trusted = wire::read_u64(&mut reader).await.unwrap();
-        let _stderr_last = wire::read_u64(&mut reader).await.unwrap();
+        let _version_str = wire::read_string(&mut reader).await?;
+        let _trusted = wire::read_u64(&mut reader).await?;
+        let _stderr_last = wire::read_u64(&mut reader).await?;
 
         drop(writer);
-        let result = server_handle.await.unwrap().unwrap();
+        let result = server_handle.await??;
         assert_eq!(result.negotiated_version(), PROTOCOL_VERSION);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_handshake_v1_37_skips_feature_exchange() {
+    async fn test_handshake_v1_37_skips_feature_exchange() -> anyhow::Result<()> {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
@@ -355,30 +349,29 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(reader);
 
         // Send correct magic + version 1.37
-        wire::write_u64(&mut writer, WORKER_MAGIC_1).await.unwrap();
-        wire::write_u64(&mut writer, encode_version(1, 37))
-            .await
-            .unwrap();
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, WORKER_MAGIC_1).await?;
+        wire::write_u64(&mut writer, encode_version(1, 37)).await?;
+        writer.flush().await?;
 
         // Read server magic + version
-        let _magic2 = wire::read_u64(&mut reader).await.unwrap();
-        let _server_version = wire::read_u64(&mut reader).await.unwrap();
+        let _magic2 = wire::read_u64(&mut reader).await?;
+        let _server_version = wire::read_u64(&mut reader).await?;
 
         // NO feature exchange for v1.37 — jump straight to post-handshake
         // Send affinity + reserveSpace
-        wire::write_u64(&mut writer, 0).await.unwrap(); // CPU affinity = 0
-        wire::write_u64(&mut writer, 0).await.unwrap(); // reserveSpace = 0
-        writer.flush().await.unwrap();
+        wire::write_u64(&mut writer, 0).await?; // CPU affinity = 0
+        wire::write_u64(&mut writer, 0).await?; // reserveSpace = 0
+        writer.flush().await?;
 
         // Read version string + trusted + STDERR_LAST
-        let _version_str = wire::read_string(&mut reader).await.unwrap();
-        let _trusted = wire::read_u64(&mut reader).await.unwrap();
-        let last = wire::read_u64(&mut reader).await.unwrap();
+        let _version_str = wire::read_string(&mut reader).await?;
+        let _trusted = wire::read_u64(&mut reader).await?;
+        let last = wire::read_u64(&mut reader).await?;
         assert_eq!(last, crate::protocol::stderr::STDERR_LAST);
 
         drop(writer);
-        let result = server_handle.await.unwrap().unwrap();
+        let result = server_handle.await??;
         assert_eq!(result.negotiated_version(), encode_version(1, 37));
+        Ok(())
     }
 }

@@ -468,10 +468,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_simple_derivation() {
+    fn parse_simple_derivation() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-simple-test","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple-test"),("out","/nix/store/abc-simple-test"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].name(), "out");
         assert_eq!(drv.outputs()[0].path(), "/nix/store/abc-simple-test");
@@ -485,36 +485,39 @@ mod tests {
         assert_eq!(drv.args(), &["-c", "echo hello > $out"]);
         assert_eq!(drv.env().get("name").unwrap(), "simple-test");
         assert_eq!(drv.env().get("system").unwrap(), "x86_64-linux");
+        Ok(())
     }
 
     #[test]
-    fn parse_multi_output_derivation() {
+    fn parse_multi_output_derivation() -> anyhow::Result<()> {
         let aterm = r#"Derive([("dev","/nix/store/abc-dev","",""),("lib","/nix/store/abc-lib","",""),("out","/nix/store/abc-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","mkdir $out $dev $lib"],[("dev","/nix/store/abc-dev"),("lib","/nix/store/abc-lib"),("name","multi"),("out","/nix/store/abc-out"),("outputs","out dev lib"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.outputs().len(), 3);
         assert_eq!(drv.outputs()[0].name(), "dev");
         assert_eq!(drv.outputs()[1].name(), "lib");
         assert_eq!(drv.outputs()[2].name(), "out");
         assert_eq!(drv.env().get("outputs").unwrap(), "out dev lib");
+        Ok(())
     }
 
     #[test]
-    fn parse_fixed_output_derivation() {
+    fn parse_fixed_output_derivation() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("outputHash","abcdef0123456789"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].hash_algo(), "sha256");
         assert_eq!(drv.outputs()[0].hash(), "abcdef0123456789");
         assert!(drv.outputs()[0].is_fixed_output());
+        Ok(())
     }
 
     #[test]
-    fn parse_with_input_drvs() {
+    fn parse_with_input_drvs() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.input_drvs().len(), 2);
         assert!(drv.input_drvs().contains_key("/nix/store/abc-bash.drv"));
         assert!(drv.input_drvs().contains_key("/nix/store/abc-stdenv.drv"));
@@ -522,62 +525,69 @@ mod tests {
         assert!(bash_outputs.contains("out"));
         assert_eq!(drv.input_srcs().len(), 1);
         assert!(drv.input_srcs().contains("/nix/store/abc-source.sh"));
+        Ok(())
     }
 
     #[test]
-    fn parse_with_escaped_strings() {
+    fn parse_with_escaped_strings() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\" > $out"],[("env_val","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.args(), &["-c", "echo \"hello\\nworld\" > $out"]);
         assert_eq!(
             drv.env().get("env_val").unwrap(),
             "line1\nline2\ttab\nquote\"end"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_empty_env_value() {
+    fn parse_empty_env_value() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("empty",""),("name","test"),("out","/nix/store/abc-test"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         assert_eq!(drv.env().get("empty").unwrap(), "");
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_simple() {
+    fn roundtrip_simple() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-simple","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hello > $out"],[("builder","/bin/sh"),("name","simple"),("out","/nix/store/abc-simple"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         let serialized = drv.to_aterm();
         assert_eq!(serialized, aterm);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_with_input_drvs() {
+    fn roundtrip_with_input_drvs() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"]),("/nix/store/abc-stdenv.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/nix/store/abc-bash/bin/bash",["-e","/nix/store/abc-source.sh"],[("name","hello"),("out","/nix/store/abc-hello"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         let serialized = drv.to_aterm();
         assert_eq!(serialized, aterm);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_with_escapes() {
+    fn roundtrip_with_escapes() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-escape","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo \"hello\\nworld\""],[("env","line1\nline2\ttab\nquote\"end"),("name","escape"),("out","/nix/store/abc-escape"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         let serialized = drv.to_aterm();
         assert_eq!(serialized, aterm);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_fixed_output() {
+    fn roundtrip_fixed_output() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-fixed","sha256","abcdef0123456789")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/abc-fixed"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         let serialized = drv.to_aterm();
         assert_eq!(serialized, aterm);
+        Ok(())
     }
 
     #[test]
@@ -611,20 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_drvs_with_multiple_outputs() {
+    fn parse_input_drvs_with_multiple_outputs() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-test","","")],[("/nix/store/abc-multi.drv",["dev","lib","out"])],[],"x86_64-linux","/bin/sh",[],[("name","test"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         let multi_outputs = drv.input_drvs().get("/nix/store/abc-multi.drv").unwrap();
         assert_eq!(multi_outputs.len(), 3);
         assert!(multi_outputs.contains("dev"));
         assert!(multi_outputs.contains("lib"));
         assert!(multi_outputs.contains("out"));
+        Ok(())
     }
 
     /// Parse a real `.drv` file from the local Nix store.
     #[test]
-    fn parse_real_drv_file() {
+    fn parse_real_drv_file() -> anyhow::Result<()> {
         // Generate a simple derivation and parse it
         let output = std::process::Command::new("nix-instantiate")
             .args(["--expr", r#"derivation { name = "golden-test"; builder = "/bin/sh"; args = ["-c" "echo hello > $out"]; system = builtins.currentSystem; }"#])
@@ -634,15 +645,15 @@ mod tests {
             Ok(o) if o.status.success() => o,
             _ => {
                 eprintln!("skipping parse_real_drv_file: nix-instantiate not available");
-                return;
+                return Ok(());
             }
         };
 
-        let drv_path = String::from_utf8(output.stdout).unwrap();
+        let drv_path = String::from_utf8(output.stdout)?;
         let drv_path = drv_path.trim();
 
-        let drv_content = std::fs::read_to_string(drv_path).unwrap();
-        let drv = Derivation::parse(&drv_content).unwrap();
+        let drv_content = std::fs::read_to_string(drv_path)?;
+        let drv = Derivation::parse(&drv_content)?;
 
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].name(), "out");
@@ -652,13 +663,14 @@ mod tests {
 
         // Verify roundtrip: parse → serialize → parse
         let serialized = drv.to_aterm();
-        let reparsed = Derivation::parse(&serialized).unwrap();
+        let reparsed = Derivation::parse(&serialized)?;
         assert_eq!(drv, reparsed);
+        Ok(())
     }
 
     /// Parse the real hello .drv (complex, many deps).
     #[test]
-    fn parse_hello_drv() {
+    fn parse_hello_drv() -> anyhow::Result<()> {
         let output = std::process::Command::new("nix-instantiate")
             .args(["<nixpkgs>", "-A", "hello"])
             .output();
@@ -669,15 +681,15 @@ mod tests {
                 eprintln!(
                     "skipping parse_hello_drv: nix-instantiate not available or nixpkgs not found"
                 );
-                return;
+                return Ok(());
             }
         };
 
-        let drv_path = String::from_utf8(output.stdout).unwrap();
+        let drv_path = String::from_utf8(output.stdout)?;
         let drv_path = drv_path.trim();
 
-        let drv_content = std::fs::read_to_string(drv_path).unwrap();
-        let drv = Derivation::parse(&drv_content).unwrap();
+        let drv_content = std::fs::read_to_string(drv_path)?;
+        let drv = Derivation::parse(&drv_content)?;
 
         // hello has 1 output, multiple input drvs, and a rich env
         assert_eq!(drv.outputs().len(), 1);
@@ -688,8 +700,9 @@ mod tests {
 
         // Roundtrip
         let serialized = drv.to_aterm();
-        let reparsed = Derivation::parse(&serialized).unwrap();
+        let reparsed = Derivation::parse(&serialized)?;
         assert_eq!(drv, reparsed);
+        Ok(())
     }
 
     mod proptests {
@@ -708,7 +721,8 @@ mod tests {
                     } else {
                         "0".repeat(64) // 64-char hex digest
                     };
-                    DerivationOutput::new(name, path, hash_algo, hash).unwrap()
+                    DerivationOutput::new(name, path, hash_algo, hash)
+                        .expect("generated to be valid")
                 })
         }
 
@@ -750,7 +764,7 @@ mod tests {
             #[test]
             fn aterm_roundtrip(drv in arb_derivation()) {
                 let serialized = drv.to_aterm();
-                let reparsed = Derivation::parse(&serialized).unwrap();
+                let reparsed = Derivation::parse(&serialized)?;
                 prop_assert_eq!(drv, reparsed);
             }
         }

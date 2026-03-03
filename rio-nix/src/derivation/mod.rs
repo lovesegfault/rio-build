@@ -311,10 +311,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_basic_strips_input_drvs() {
+    fn to_basic_strips_input_drvs() -> anyhow::Result<()> {
         let aterm = r#"Derive([("out","/nix/store/abc-hello","","")],[("/nix/store/abc-bash.drv",["out"])],["/nix/store/abc-source.sh"],"x86_64-linux","/bin/bash",["-e","script.sh"],[("name","hello"),("system","x86_64-linux")])"#;
 
-        let drv = Derivation::parse(aterm).unwrap();
+        let drv = Derivation::parse(aterm)?;
         let basic = drv.to_basic();
 
         assert_eq!(basic.outputs().len(), 1);
@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(basic.builder(), "/bin/bash");
         assert_eq!(basic.args(), &["-e", "script.sh"]);
         assert_eq!(basic.env().get("name").unwrap(), "hello");
+        Ok(())
     }
 
     #[test]
