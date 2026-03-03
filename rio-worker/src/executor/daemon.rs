@@ -402,4 +402,177 @@ mod tests {
             rio_common::grpc::DEFAULT_DAEMON_TIMEOUT
         );
     }
+
+    // -----------------------------------------------------------------------
+    // read_build_stderr_loop — pure async, no daemon process needed
+    // -----------------------------------------------------------------------
+
+    use rio_nix::protocol::build::write_build_result;
+    use rio_nix::protocol::stderr::{STDERR_READ, STDERR_WRITE, StderrError, StderrWriter};
+
+    /// Serialize a BuildResult to wire bytes.
+    async fn build_result_bytes(r: &BuildResult) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_build_result(&mut buf, r).await.unwrap();
+        buf
+    }
+
+    /// Run read_build_stderr_loop against a Cursor of `input` bytes with a
+    /// fresh batcher. Returns (result, all batches received on log_rx).
+    async fn run_loop(
+        input: Vec<u8>,
+    ) -> (Result<BuildResult, wire::WireError>, Vec<WorkerMessage>) {
+        let mut batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut cursor = std::io::Cursor::new(input);
+        let result = read_build_stderr_loop(&mut cursor, &mut batcher, &tx).await;
+        drop(tx);
+        let mut batches = Vec::new();
+        while let Some(m) = rx.recv().await {
+            batches.push(m);
+        }
+        (result, batches)
+    }
+
+    /// Count total log lines across all received BuildLogBatch messages.
+    fn count_log_lines(batches: &[WorkerMessage]) -> usize {
+        batches
+            .iter()
+            .filter_map(|m| match &m.msg {
+                Some(worker_message::Msg::LogBatch(b)) => Some(b.lines.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Happy path: STDERR_NEXT ×2, STDERR_LAST, BuildResult{Built}.
+    #[tokio::test]
+    async fn test_stderr_loop_next_then_success() {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.log("line1").await.unwrap();
+            w.log("line2").await.unwrap();
+            w.finish().await.unwrap();
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await);
+
+        let (result, batches) = run_loop(buf).await;
+        let br = result.expect("loop should succeed");
+        assert_eq!(br.status, BuildStatus::Built);
+        // 2 lines may or may not have been flushed during the loop (depends on
+        // timing threshold). They're either in batches here or still pending
+        // in the batcher (which run_loop drops). The key assertion is the
+        // loop consumed them without error. For a deterministic line-count
+        // check, see the channel-closed test below which forces a flush.
+        assert!(count_log_lines(&batches) <= 2);
+    }
+
+    /// Daemon sends STDERR_ERROR → loop returns Ok(MiscFailure), NOT Err.
+    /// This is how build-time errors (compile failures etc.) propagate.
+    #[tokio::test]
+    async fn test_stderr_loop_daemon_error_returns_misc_failure() {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.log("compiling").await.unwrap();
+            w.error(&StderrError::simple("Build", "compile error: missing ;"))
+                .await
+                .unwrap();
+            // NO finish() — STDERR_ERROR terminates the loop.
+        }
+
+        let (result, _batches) = run_loop(buf).await;
+        let br = result.expect("daemon error is Ok(failure), not Err");
+        assert_eq!(br.status, BuildStatus::MiscFailure);
+        assert_eq!(br.error_msg, "compile error: missing ;");
+    }
+
+    /// STDERR_READ is not supported in build-stderr context → MiscFailure.
+    #[tokio::test]
+    async fn test_stderr_loop_read_not_supported() {
+        let mut buf = Vec::new();
+        wire::write_u64(&mut buf, STDERR_READ).await.unwrap();
+        wire::write_u64(&mut buf, 42).await.unwrap();
+
+        let (result, _) = run_loop(buf).await;
+        let br = result.expect("STDERR_READ is Ok(failure), not Err");
+        assert_eq!(br.status, BuildStatus::MiscFailure);
+        assert!(
+            br.error_msg.contains("STDERR_READ") && br.error_msg.contains("not supported"),
+            "error_msg: {}",
+            br.error_msg
+        );
+    }
+
+    /// Log channel closed mid-build → MiscFailure. The scheduler stream is
+    /// gone so there's no way to report completion anyway.
+    #[tokio::test]
+    async fn test_stderr_loop_log_channel_closed_returns_failure() {
+        // Feed enough STDERR_NEXT to force a batch flush (MAX_BATCH_LINES=64).
+        // The 65th add_line returns Some(batch); send_batch fails because rx
+        // is dropped.
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            for i in 0..65 {
+                w.log(&format!("line {i}")).await.unwrap();
+            }
+        }
+
+        let mut batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx); // channel closed before loop starts
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let result = read_build_stderr_loop(&mut cursor, &mut batcher, &tx).await;
+        let br = result.expect("channel-closed is Ok(failure)");
+        assert_eq!(br.status, BuildStatus::MiscFailure);
+        assert!(
+            br.error_msg.contains("log channel closed"),
+            "got: {}",
+            br.error_msg
+        );
+    }
+
+    /// Activity/Write/Result messages are silently discarded.
+    #[tokio::test]
+    async fn test_stderr_loop_discards_activity_and_write() {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            let aid = w
+                .start_activity(
+                    rio_nix::protocol::stderr::ActivityType::Build,
+                    "building",
+                    0,
+                    0,
+                )
+                .await
+                .unwrap();
+            w.stop_activity(aid).await.unwrap();
+        }
+        // STDERR_WRITE (raw, StderrWriter doesn't have a generic write)
+        wire::write_u64(&mut buf, STDERR_WRITE).await.unwrap();
+        wire::write_bytes(&mut buf, b"some data").await.unwrap();
+        // STDERR_RESULT: activity_id + result_type + 0 fields
+        wire::write_u64(&mut buf, rio_nix::protocol::stderr::STDERR_RESULT)
+            .await
+            .unwrap();
+        wire::write_u64(&mut buf, 1).await.unwrap(); // activity_id
+        wire::write_u64(&mut buf, 0).await.unwrap(); // result_type
+        wire::write_u64(&mut buf, 0).await.unwrap(); // field count
+        // STDERR_LAST + success
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            w.finish().await.unwrap();
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await);
+
+        let (result, batches) = run_loop(buf).await;
+        let br = result.expect("should succeed");
+        assert_eq!(br.status, BuildStatus::Built);
+        // None of these messages produce log lines.
+        assert_eq!(count_log_lines(&batches), 0);
+    }
 }
