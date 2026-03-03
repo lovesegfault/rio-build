@@ -34,3 +34,5 @@ tonic = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# figment::Jail (test-only env/cwd manipulation under a global mutex)
+figment = { workspace = true, features = ["test"] }

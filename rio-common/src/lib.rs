@@ -1,3 +1,4 @@
+pub mod config;
 pub mod grpc;
 pub mod limits;
 pub mod newtype;
