@@ -29,7 +29,7 @@ use rio_proto::types::{
     BuildResult as ProtoBuildResult, BuildResultStatus, BuiltOutput, WorkAssignment, WorkerMessage,
 };
 
-use crate::log_stream::LogBatcher;
+use crate::log_stream::{LogBatcher, LogLimits};
 use crate::overlay;
 use crate::synth_db::{self, SynthDrvOutput};
 use crate::upload;
@@ -47,6 +47,23 @@ use inputs::{
 /// GetPath .drv stream is typically <10 KB). 16 saturates a LAN without
 /// thundering the store.
 const MAX_PARALLEL_FETCHES: usize = 16;
+
+/// Per-worker immutable configuration for `execute_build`.
+///
+/// These don't change per-assignment — they're set once at startup from
+/// CLI/config. Bundled to avoid `too_many_arguments` on `execute_build`
+/// (the alternative was `#[allow]`, which we don't use in prod code).
+///
+/// Distinct from `BuildSpawnContext` (lib.rs): that holds Arc-shared
+/// state (stream_tx, running_builds) that needs per-call cloning; this
+/// holds `Copy`/cheap-to-copy config that can just be passed by value.
+#[derive(Clone)]
+pub struct ExecutorEnv {
+    pub fuse_mount_point: std::path::PathBuf,
+    pub overlay_base_dir: std::path::PathBuf,
+    pub worker_id: String,
+    pub log_limits: LogLimits,
+}
 
 /// Worker nix.conf content for sandbox builds.
 const WORKER_NIX_CONF: &str = "\
@@ -103,13 +120,19 @@ pub struct ExecutionResult {
 /// log streaming, output upload, and cleanup.
 pub async fn execute_build(
     assignment: &WorkAssignment,
-    fuse_mount_point: &Path,
-    overlay_base_dir: &Path,
+    env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
-    worker_id: &str,
     log_tx: &mpsc::Sender<WorkerMessage>,
     leak_counter: &Arc<AtomicUsize>,
 ) -> Result<ExecutionResult, ExecutorError> {
+    // Destructure for ergonomics — the body was written with these as
+    // params, and rewriting every `fuse_mount_point` to `env.fuse_mount_point`
+    // would be noise. The compiler inlines this away.
+    let fuse_mount_point: &Path = &env.fuse_mount_point;
+    let overlay_base_dir: &Path = &env.overlay_base_dir;
+    let worker_id: &str = &env.worker_id;
+    let log_limits = env.log_limits;
+
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
 
@@ -306,7 +329,7 @@ pub async fn execute_build(
 
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // Previously, any `?` between spawn and kill leaked the daemon process.
-    let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string());
+    let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string(), log_limits);
     let build_result =
         run_daemon_build(&mut daemon, drv_path, &basic_drv, timeout, batcher, log_tx).await;
 
@@ -529,16 +552,14 @@ mod tests {
         let (log_tx, _log_rx) = mpsc::channel(1);
         let dir = tempfile::tempdir()?;
 
-        let result = execute_build(
-            &assignment,
-            dir.path(),
-            dir.path(),
-            &mut store_client,
-            "test-worker",
-            &log_tx,
-            &leak_counter,
-        )
-        .await;
+        let env = ExecutorEnv {
+            fuse_mount_point: dir.path().to_path_buf(),
+            overlay_base_dir: dir.path().to_path_buf(),
+            worker_id: "test-worker".into(),
+            log_limits: LogLimits::UNLIMITED,
+        };
+        let result =
+            execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;
 
         // Must be Ok(ExecutionResult{InfrastructureFailure}), NOT Err —
         // Ok ensures CompletionReport is sent so the scheduler reassigns.

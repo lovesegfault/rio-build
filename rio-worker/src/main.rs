@@ -320,6 +320,10 @@ async fn main() -> anyhow::Result<()> {
         stream_tx,
         running_builds,
         leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        log_limits: rio_worker::log_stream::LogLimits {
+            rate_lines_per_sec: cfg.log_rate_limit,
+            total_bytes: cfg.log_size_limit,
+        },
     };
 
     // Process incoming scheduler messages

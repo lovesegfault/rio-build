@@ -16,7 +16,7 @@ use rio_nix::protocol::client::{
 use rio_nix::protocol::wire;
 use rio_proto::types::{WorkerMessage, worker_message};
 
-use crate::log_stream::{BATCH_TIMEOUT, LogBatcher};
+use crate::log_stream::{AddLineResult, BATCH_TIMEOUT, LogBatcher};
 use crate::overlay;
 
 use super::ExecutorError;
@@ -342,12 +342,38 @@ where
                                 "exceeded maximum STDERR messages during build",
                             )));
                         }
-                        if let Some(batch) = batcher.add_line(line.into_bytes())
-                            && !send_batch(log_tx, batch).await
-                        {
-                            break Ok(Some(misc_fail(
-                                "log channel closed during build (scheduler stream gone)",
-                            )));
+                        match batcher.add_line(line.into_bytes()) {
+                            AddLineResult::Buffered => {}
+                            AddLineResult::BatchReady(batch) => {
+                                if !send_batch(log_tx, batch).await {
+                                    break Ok(Some(misc_fail(
+                                        "log channel closed during build (scheduler stream gone)",
+                                    )));
+                                }
+                            }
+                            AddLineResult::LimitExceeded { reason } => {
+                                // Flush whatever's already buffered so the client
+                                // sees output right up to the limit (don't drop
+                                // 63 lines on the floor just because line 64 spewed).
+                                // Best-effort: if the channel is closed, the
+                                // LogLimitExceeded failure below still reports.
+                                if batcher.has_pending() {
+                                    let _ = send_batch(log_tx, batcher.flush()).await;
+                                }
+                                tracing::warn!(
+                                    reason = %reason,
+                                    "build log limit exceeded, aborting"
+                                );
+                                // LogLimitExceeded is a Nix-native BuildStatus
+                                // (=11). Terminal, non-retryable — a retry on a
+                                // different worker would just spew the same
+                                // logs. The scheduler treats this like
+                                // PermanentFailure (no re-queue).
+                                break Ok(Some(BuildResult::failure(
+                                    BuildStatus::LogLimitExceeded,
+                                    reason,
+                                )));
+                            }
                         }
                     }
                     Some(Ok(StderrMessage::Read(_))) => {
@@ -453,7 +479,11 @@ mod tests {
             vec![],
             Default::default(),
         )?;
-        let batcher = LogBatcher::new("test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new(
+            "test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
         let (log_tx, _log_rx) = mpsc::channel(4);
 
         // run_daemon_build should fail quickly (handshake reads EOF from closed stdout).
@@ -520,7 +550,11 @@ mod tests {
     async fn run_loop(
         input: Vec<u8>,
     ) -> (Result<BuildResult, wire::WireError>, Vec<WorkerMessage>) {
-        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
         let (tx, mut rx) = mpsc::channel(128);
         let cursor = std::io::Cursor::new(input);
         let result = read_build_stderr_loop(cursor, batcher, &tx).await;
@@ -617,7 +651,11 @@ mod tests {
             }
         }
 
-        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
         let (tx, rx) = mpsc::channel(1);
         drop(rx); // channel closed before loop starts
         let cursor = std::io::Cursor::new(buf);
@@ -688,7 +726,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_silent_period_triggers_flush() -> anyhow::Result<()> {
         let (mut write_half, read_half) = tokio::io::duplex(4096);
-        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
         // Spawn the loop. It will read from read_half (which we write to).
@@ -760,7 +802,11 @@ mod tests {
         use rio_nix::protocol::stderr::STDERR_NEXT;
 
         let (mut write_half, read_half) = tokio::io::duplex(4096);
-        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into());
+        let batcher = LogBatcher::new(
+            "/nix/store/test.drv".into(),
+            "test-worker".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+        );
         let (log_tx, mut log_rx) = mpsc::channel(8);
 
         let loop_handle =
@@ -858,6 +904,132 @@ mod tests {
             3,
             "final flush should drain the 3-line partial batch"
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Log limiting (LogLimitExceeded path through the stderr loop)
+    // -----------------------------------------------------------------------
+
+    /// Run the stderr loop with a batcher that has the given limits.
+    /// Same as `run_loop` but with configurable limits.
+    async fn run_loop_with_limits(
+        input: Vec<u8>,
+        limits: crate::log_stream::LogLimits,
+    ) -> (Result<BuildResult, wire::WireError>, Vec<WorkerMessage>) {
+        let batcher = LogBatcher::new("/nix/store/test.drv".into(), "test-worker".into(), limits);
+        let (tx, mut rx) = mpsc::channel(128);
+        let cursor = std::io::Cursor::new(input);
+        let result = read_build_stderr_loop(cursor, batcher, &tx).await;
+        drop(tx);
+        let mut batches = Vec::new();
+        while let Some(m) = rx.recv().await {
+            batches.push(m);
+        }
+        (result, batches)
+    }
+
+    /// Rate limit trip → BuildStatus::LogLimitExceeded (terminal, non-retry).
+    /// The pre-trip lines must be flushed to the scheduler — the user wants
+    /// to see output right up to the limit, not have 5 lines disappear.
+    #[tokio::test]
+    async fn test_stderr_loop_rate_limit_exceeded() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            // 10 lines: 5 accepted, 6th trips a rate_limit=5.
+            for i in 0..10 {
+                w.log(&format!("spew {i}")).await?;
+            }
+            // No finish() — loop breaks on LimitExceeded before reaching here.
+        }
+
+        let (result, batches) = run_loop_with_limits(
+            buf,
+            crate::log_stream::LogLimits {
+                rate_lines_per_sec: 5,
+                total_bytes: 0,
+            },
+        )
+        .await;
+
+        let br = result.expect("limit-exceeded is Ok(failure), not Err");
+        assert_eq!(
+            br.status,
+            BuildStatus::LogLimitExceeded,
+            "should map to Nix-native BuildStatus=11"
+        );
+        assert!(
+            br.error_msg.contains("log_rate_limit"),
+            "error_msg should name the limit: {}",
+            br.error_msg
+        );
+        // The 5 pre-trip lines MUST have been flushed. The LimitExceeded arm
+        // in the loop explicitly flushes before breaking — if it didn't, a
+        // build that trips at line 63 would lose lines 0-62.
+        assert_eq!(
+            count_log_lines(&batches),
+            5,
+            "pre-trip lines must be flushed; the tripping line is NOT buffered"
+        );
+        Ok(())
+    }
+
+    /// Size limit trip → same BuildStatus::LogLimitExceeded, different reason.
+    #[tokio::test]
+    async fn test_stderr_loop_size_limit_exceeded() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            // Each "line-N" is 6 bytes. 3 lines = 18 bytes accepted.
+            // 4th line (18+6=24 > 20) trips.
+            w.log("line-0").await?;
+            w.log("line-1").await?;
+            w.log("line-2").await?;
+            w.log("line-3").await?;
+        }
+
+        let (result, batches) = run_loop_with_limits(
+            buf,
+            crate::log_stream::LogLimits {
+                rate_lines_per_sec: 0,
+                total_bytes: 20,
+            },
+        )
+        .await;
+
+        let br = result.expect("limit-exceeded is Ok(failure)");
+        assert_eq!(br.status, BuildStatus::LogLimitExceeded);
+        assert!(
+            br.error_msg.contains("log_size_limit"),
+            "got: {}",
+            br.error_msg
+        );
+        assert_eq!(count_log_lines(&batches), 3, "3 pre-trip lines flushed");
+        Ok(())
+    }
+
+    /// With unlimited limits (the `run_loop` helper's default), the loop
+    /// proceeds normally even under heavy log volume. Regression guard:
+    /// making sure UNLIMITED really is a no-op.
+    #[tokio::test]
+    async fn test_stderr_loop_unlimited_does_not_trip() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            // 200 lines in rapid succession — would trip any finite rate.
+            for i in 0..200 {
+                w.log(&format!("heavy {i}")).await?;
+            }
+            w.finish().await?;
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
+
+        // run_loop uses UNLIMITED internally.
+        let (result, batches) = run_loop(buf).await;
+        let br = result.expect("should succeed");
+        assert_eq!(br.status, BuildStatus::Built);
+        assert_eq!(count_log_lines(&batches), 200);
         Ok(())
     }
 }
