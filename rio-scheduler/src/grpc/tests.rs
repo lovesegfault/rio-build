@@ -156,6 +156,147 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// End-to-end log pipeline over the gRPC wire: worker sends LogBatch on
+/// the BuildExecution stream → SchedulerGrpc recv task writes ring buffer
+/// + try_sends ForwardLogBatch → actor emits BuildEvent::Log on the
+/// broadcast channel → bridge_build_events delivers it on the gateway-
+/// facing SubmitBuild stream.
+///
+/// This is the FULL pipeline, touching every hop:
+///   1. gRPC wire decode (tonic)
+///   2. Ring buffer push (grpc/mod.rs LogBatch arm)
+///   3. Actor drv_path→hash→interested_builds resolution (ForwardLogBatch)
+///   4. Broadcast channel (emit_build_event)
+///   5. bridge_build_events (SubmitBuild stream bridge)
+///
+/// The ring-buffer write (hop 2) is also asserted — proves the
+/// SAME-Arc<LogBuffers> sharing between the recv task and the rest of
+/// the system works (the "don't use SchedulerGrpc::new() in prod" gotcha).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor(db.pool.clone());
+
+    // In-process gRPC server. Same setup as test_build_execution_stream_end_to_end.
+    let grpc = SchedulerGrpc::new(handle.clone());
+    // Grab the ring buffers BEFORE the server moves grpc — we assert on
+    // them after sending the LogBatch.
+    let log_buffers = grpc.log_buffers();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let _server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SchedulerServiceServer::new(grpc.clone()))
+            .add_service(WorkerServiceServer::new(grpc))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("test gRPC server should run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let endpoint = format!("http://{addr}");
+    let channel = tonic::transport::Channel::from_shared(endpoint)?
+        .connect()
+        .await?;
+    let mut worker_client = WorkerServiceClient::new(channel.clone());
+    let mut sched_client =
+        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::new(channel);
+
+    // Open BuildExecution stream with WorkerRegister.
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(32);
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Register(
+                rio_proto::types::WorkerRegister {
+                    worker_id: "log-e2e-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Heartbeat to fully register.
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            worker_id: "log-e2e-worker".into(),
+            system: "x86_64-linux".into(),
+            max_builds: 1,
+            ..Default::default()
+        })
+        .await?;
+
+    // Submit a build → worker gets WorkAssignment.
+    let mut event_stream = sched_client
+        .submit_build(rio_proto::types::SubmitBuildRequest {
+            priority_class: "scheduled".into(),
+            nodes: vec![make_test_node("log-pipeline-drv", "x86_64-linux")],
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    let assignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+        .await?
+        .expect("assignment")
+        .expect("not an error");
+    let work = match assignment.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("expected WorkAssignment, got {other:?}"),
+    };
+
+    // ═══════════ THE TEST ═══════════
+    // Worker sends a LogBatch on the stream. This is the real gRPC wire
+    // path, not a direct actor send.
+    let log_batch = rio_proto::types::BuildLogBatch {
+        derivation_path: work.drv_path.clone(),
+        lines: vec![b"wire-line-0".to_vec(), b"wire-line-1".to_vec()],
+        first_line_number: 0,
+        worker_id: "log-e2e-worker".into(),
+    };
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::LogBatch(log_batch)),
+        })
+        .await?;
+
+    // Assert 1: The gateway-facing event stream receives BuildEvent::Log.
+    // Drain through Started/DerivationStarted first. If Log never arrives,
+    // the 5s timeout unwinds via `?` and the test fails with a clear
+    // "Elapsed" error — no separate `saw_log` bool needed.
+    let received_lines = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), event_stream.next())
+            .await?
+            .expect("event")
+            .expect("not an error");
+        if let Some(rio_proto::types::build_event::Event::Log(log)) = ev.event {
+            assert_eq!(log.derivation_path, work.drv_path);
+            break log.lines;
+        }
+        // Other events (Started, DerivationStarted) are expected — drain.
+    };
+    assert_eq!(received_lines.len(), 2);
+    assert_eq!(received_lines[0], b"wire-line-0");
+    assert_eq!(received_lines[1], b"wire-line-1");
+
+    // Assert 2: Ring buffer was written. This proves the recv-task's
+    // log_buffers.push() call sees the same DashMap we do (the shared-Arc
+    // invariant). If SchedulerGrpc::new() had allocated a separate buffer,
+    // THIS one would be empty.
+    let buffered = log_buffers.read_since(&work.drv_path, 0);
+    assert_eq!(
+        buffered.len(),
+        2,
+        "ring buffer should have been written by the recv task; \
+         if empty, the Arc<LogBuffers> sharing is broken"
+    );
+    assert_eq!(buffered[0].1, b"wire-line-0");
+
+    Ok(())
+}
+
 /// SubmitBuild with an empty drv_hash in a node should be rejected at
 /// the gRPC boundary (proto types have no validation; an empty hash
 /// would become a DAG primary key).
