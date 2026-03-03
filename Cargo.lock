@@ -3640,6 +3640,7 @@ dependencies = [
  "rio-common",
  "rio-nix",
  "rio-proto",
+ "rio-test-support",
  "scopeguard",
  "sha2 0.10.9",
  "sqlx",

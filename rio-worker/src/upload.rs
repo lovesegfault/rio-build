@@ -248,4 +248,140 @@ mod tests {
         // Verify chunk size is reasonable
         assert_eq!(rio_proto::client::NAR_CHUNK_SIZE, 256 * 1024);
     }
+
+    // -----------------------------------------------------------------------
+    // gRPC upload tests via MockStore
+    // -----------------------------------------------------------------------
+
+    use rio_test_support::grpc::{MockStore, spawn_mock_store};
+    use std::sync::atomic::Ordering;
+
+    async fn spawn_and_connect() -> (
+        MockStore,
+        StoreServiceClient<Channel>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (store, addr, handle) = spawn_mock_store().await;
+        let client = rio_proto::client::connect_store(&addr.to_string())
+            .await
+            .expect("connect to mock store");
+        (store, client, handle)
+    }
+
+    /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir.
+    fn make_output_file(basename: &str, contents: &[u8]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join(basename), contents).unwrap();
+        tmp
+    }
+
+    #[tokio::test]
+    async fn test_upload_output_success() {
+        let (store, mut client, _h) = spawn_and_connect().await;
+        let tmp = make_output_file("abc-hello", b"hello world");
+
+        let result = upload_output(&mut client, tmp.path(), "abc-hello")
+            .await
+            .expect("upload should succeed");
+
+        assert_eq!(result.store_path, "/nix/store/abc-hello");
+        // Hash must match SHA-256 of the NAR serialization.
+        let expected_nar = nar::dump_path(&tmp.path().join("nix/store/abc-hello")).unwrap();
+        let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
+        assert_eq!(result.nar_hash, expected_hash.to_vec());
+        assert_eq!(result.nar_size, expected_nar.len() as u64);
+
+        // MockStore should have recorded exactly one PutPath call.
+        let puts = store.put_calls.read().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].store_path, "/nix/store/abc-hello");
+    }
+
+    /// Retry with exponential backoff — first 2 attempts fail, 3rd succeeds.
+    /// start_paused auto-advances the clock during sleep() so the 1s+2s
+    /// backoff delays don't wall-clock-block the test.
+    #[tokio::test(start_paused = true)]
+    async fn test_upload_output_retries_then_succeeds() {
+        let (store, mut client, _h) = spawn_and_connect().await;
+        store.fail_next_puts.store(2, Ordering::SeqCst);
+        let tmp = make_output_file("abc-retry", b"retry me");
+
+        let result = upload_output(&mut client, tmp.path(), "abc-retry")
+            .await
+            .expect("upload should succeed on 3rd attempt");
+
+        assert_eq!(result.store_path, "/nix/store/abc-retry");
+        // Only the successful attempt records the put.
+        assert_eq!(store.put_calls.read().unwrap().len(), 1);
+        // All injected failures should have been consumed.
+        assert_eq!(store.fail_next_puts.load(Ordering::SeqCst), 0);
+    }
+
+    /// More failures than MAX_UPLOAD_RETRIES → UploadExhausted.
+    #[tokio::test(start_paused = true)]
+    async fn test_upload_output_exhausts_retries() {
+        let (store, mut client, _h) = spawn_and_connect().await;
+        store
+            .fail_next_puts
+            .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
+        let tmp = make_output_file("abc-exhaust", b"never uploads");
+
+        let err = upload_output(&mut client, tmp.path(), "abc-exhaust")
+            .await
+            .expect_err("upload should exhaust retries");
+
+        assert!(
+            matches!(err, UploadError::UploadExhausted { .. }),
+            "expected UploadExhausted, got {err:?}"
+        );
+        // No successful PutPath recorded.
+        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+    }
+
+    /// upload_all_outputs runs concurrently; all outputs land in MockStore.
+    #[tokio::test]
+    async fn test_upload_all_outputs_multiple() {
+        let (store, client, _h) = spawn_and_connect().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("aaa-one"), b"one").unwrap();
+        fs::write(store_dir.join("bbb-two"), b"two").unwrap();
+        fs::write(store_dir.join("ccc-three"), b"three").unwrap();
+
+        let results = upload_all_outputs(&client, tmp.path())
+            .await
+            .expect("all uploads succeed");
+
+        assert_eq!(results.len(), 3);
+        // Result order is NOT guaranteed (buffer_unordered). Collect to set.
+        let paths: std::collections::HashSet<_> =
+            results.iter().map(|r| r.store_path.clone()).collect();
+        assert!(paths.contains("/nix/store/aaa-one"));
+        assert!(paths.contains("/nix/store/bbb-two"));
+        assert!(paths.contains("/nix/store/ccc-three"));
+        assert_eq!(store.put_calls.read().unwrap().len(), 3);
+    }
+
+    /// NAR serialization fails on ENOENT → UploadError::NarSerialize, no gRPC.
+    #[tokio::test]
+    async fn test_upload_output_nar_serialize_error() {
+        let (store, mut client, _h) = spawn_and_connect().await;
+        let tmp = tempfile::tempdir().unwrap();
+        // Create nix/store/ dir but NOT the output file.
+        fs::create_dir_all(tmp.path().join("nix/store")).unwrap();
+
+        let err = upload_output(&mut client, tmp.path(), "does-not-exist")
+            .await
+            .expect_err("should fail NAR serialization");
+
+        assert!(
+            matches!(err, UploadError::NarSerialize { .. }),
+            "expected NarSerialize, got {err:?}"
+        );
+        // No gRPC call attempted.
+        assert_eq!(store.put_calls.read().unwrap().len(), 0);
+    }
 }
