@@ -35,6 +35,7 @@ pub mod upload;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::{RwLock, mpsc};
 use tonic::transport::Channel;
@@ -44,6 +45,39 @@ use rio_proto::types::{
     CompletionReport, HeartbeatRequest, ResourceUsage, WorkAssignment, WorkAssignmentAck,
     WorkerMessage, worker_message,
 };
+
+/// Default threshold for leaked overlay mounts before the worker refuses
+/// new builds. Overridable via `RIO_WORKER_MAX_LEAKED_MOUNTS`.
+///
+/// A leaked mount means `umount2` failed in `OverlayMount::Drop` — typically
+/// the mount is stuck busy (open file handles, zombie nix-daemon). After N
+/// leaks the worker is likely in a degraded state; refusing new builds and
+/// reporting `InfrastructureFailure` lets the scheduler reassign to a
+/// healthy worker, and the worker can be restarted by its supervisor.
+const DEFAULT_MAX_LEAKED_MOUNTS: usize = 3;
+
+/// Read the leaked-mount threshold from `RIO_WORKER_MAX_LEAKED_MOUNTS`,
+/// falling back to [`DEFAULT_MAX_LEAKED_MOUNTS`].
+pub fn max_leaked_mounts() -> usize {
+    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| match std::env::var("RIO_WORKER_MAX_LEAKED_MOUNTS") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(n) => {
+                tracing::debug!(threshold = n, "using configured max leaked mounts");
+                n
+            }
+            Err(e) => {
+                tracing::warn!(
+                    value = %val,
+                    error = %e,
+                    "invalid RIO_WORKER_MAX_LEAKED_MOUNTS, using default {DEFAULT_MAX_LEAKED_MOUNTS}"
+                );
+                DEFAULT_MAX_LEAKED_MOUNTS
+            }
+        },
+        Err(_) => DEFAULT_MAX_LEAKED_MOUNTS,
+    })
+}
 
 /// Build a heartbeat request, populating `running_builds` from the shared tracker.
 ///
@@ -78,6 +112,9 @@ pub struct BuildSpawnContext {
     pub overlay_base_dir: PathBuf,
     pub stream_tx: mpsc::Sender<WorkerMessage>,
     pub running_builds: Arc<RwLock<HashSet<String>>>,
+    /// Worker-lifetime count of overlay mounts whose teardown failed.
+    /// `execute_build` checks this at entry; `OverlayMount::Drop` increments.
+    pub leaked_mounts: Arc<AtomicUsize>,
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -116,6 +153,7 @@ pub async fn spawn_build_task(
     let build_overlay_dir = ctx.overlay_base_dir.clone();
     let build_tx = ctx.stream_tx.clone();
     let build_running = ctx.running_builds.clone();
+    let build_leaked_mounts = ctx.leaked_mounts.clone();
     let build_drv_path = drv_path.clone();
 
     // Clone for the panic handler before moving into the task.
@@ -144,6 +182,7 @@ pub async fn spawn_build_task(
             &mut build_store_client,
             &build_worker_id,
             &build_tx,
+            &build_leaked_mounts,
         )
         .await;
 

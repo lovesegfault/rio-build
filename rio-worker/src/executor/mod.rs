@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -107,6 +109,7 @@ pub async fn execute_build(
     store_client: &mut StoreServiceClient<Channel>,
     worker_id: &str,
     log_tx: &mpsc::Sender<WorkerMessage>,
+    leak_counter: &Arc<AtomicUsize>,
 ) -> Result<ExecutionResult, ExecutorError> {
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
@@ -118,6 +121,37 @@ pub async fn execute_build(
         is_fod = assignment.is_fixed_output,
         "starting build"
     );
+
+    // Refuse new builds once the worker has leaked too many overlay mounts.
+    // A leaked mount (umount2 failed in OverlayMount::Drop) usually means
+    // the mount is stuck busy — open file handles, zombie nix-daemon, FUSE
+    // hang. After N leaks the worker is degraded; returning
+    // InfrastructureFailure here lets the scheduler reassign to a healthy
+    // worker, and the supervisor can restart this one. We check at ENTRY,
+    // not exit: a build that completes successfully shouldn't have its
+    // result overridden just because its own teardown later fails — the
+    // NEXT build is what gets refused.
+    let leaked = leak_counter.load(Ordering::Relaxed);
+    let threshold = crate::max_leaked_mounts();
+    if leaked >= threshold {
+        tracing::error!(
+            leaked,
+            threshold,
+            drv_path = %drv_path,
+            "refusing build: leaked overlay mount threshold exceeded; worker needs restart"
+        );
+        return Ok(ExecutionResult {
+            drv_path: drv_path.clone(),
+            result: ProtoBuildResult {
+                status: BuildResultStatus::InfrastructureFailure.into(),
+                error_msg: format!(
+                    "worker has {leaked} leaked overlay mounts (threshold {threshold}); refusing new builds"
+                ),
+                ..Default::default()
+            },
+            assignment_token: assignment.assignment_token.clone(),
+        });
+    }
 
     metrics::gauge!("rio_worker_builds_active").increment(1.0);
     // rio_worker_builds_total is incremented at completion (main.rs) with
@@ -136,8 +170,9 @@ pub async fn execute_build(
     let fuse_mp = fuse_mount_point.to_path_buf();
     let overlay_base = overlay_base_dir.to_path_buf();
     let build_id_owned = build_id.clone();
+    let leak_counter_owned = leak_counter.clone();
     let overlay_mount = tokio::task::spawn_blocking(move || {
-        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned)
+        overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned, leak_counter_owned)
     })
     .await
     .map_err(|e| ExecutorError::Overlay(anyhow::anyhow!("overlay setup task panicked: {e}")))??;
@@ -409,11 +444,11 @@ pub async fn execute_build(
     };
 
     // 11. Tear down overlay (explicit, before Drop).
-    // TODO(phase2b): leaked mounts should cause infrastructure failure once
-    // mount tracking is added. For now, Drop is the safety net; the build
-    // result is already determined (success or failure), so we log teardown
-    // failure but don't override the result. The metric is incremented in
-    // OverlayMount::Drop (centralized so ?-early-returns and panics also count).
+    // The leak-threshold check happens at ENTRY (above), not here: we don't
+    // override a successful build result just because its own teardown fails.
+    // Teardown failure increments the counter (in OverlayMount::Drop); the
+    // NEXT build is what gets refused. The metric is also incremented in
+    // Drop (centralized so ?-early-returns and panics also count).
     let merged_path = overlay_mount.merged_dir().to_path_buf();
     if let Err(e) = overlay::teardown_overlay(overlay_mount) {
         tracing::error!(
@@ -482,5 +517,66 @@ mod tests {
         assert!(conf_path.exists());
         let content = std::fs::read_to_string(&conf_path).unwrap();
         assert!(content.contains("sandbox = true"));
+    }
+
+    /// When the leak counter is at or over threshold, execute_build must
+    /// short-circuit with InfrastructureFailure BEFORE touching the overlay.
+    /// This test does NOT require CAP_SYS_ADMIN: it sets the counter over
+    /// the threshold and asserts the short-circuit path, which runs before
+    /// setup_overlay is ever called.
+    #[tokio::test]
+    async fn test_execute_build_refuses_when_leaked_exceeds_threshold() {
+        // Set well over any plausible threshold (default is 3).
+        let leak_counter = Arc::new(AtomicUsize::new(999));
+
+        let assignment = WorkAssignment {
+            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test.drv".into(),
+            assignment_token: "token-123".into(),
+            ..Default::default()
+        };
+
+        // store_client: execute_build short-circuits before any gRPC call, so
+        // we pass a client pointed at a garbage endpoint. connect_lazy() does
+        // not dial until first use.
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut store_client = StoreServiceClient::new(channel);
+
+        let (log_tx, _log_rx) = mpsc::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = execute_build(
+            &assignment,
+            dir.path(),
+            dir.path(),
+            &mut store_client,
+            "test-worker",
+            &log_tx,
+            &leak_counter,
+        )
+        .await;
+
+        // Must be Ok(ExecutionResult{InfrastructureFailure}), NOT Err —
+        // Ok ensures CompletionReport is sent so the scheduler reassigns.
+        let exec = result.expect("short-circuit path returns Ok, not Err");
+        assert_eq!(exec.drv_path, assignment.drv_path);
+        assert_eq!(exec.assignment_token, "token-123");
+        assert_eq!(
+            exec.result.status,
+            BuildResultStatus::InfrastructureFailure as i32,
+            "should report InfrastructureFailure"
+        );
+        assert!(
+            exec.result.error_msg.contains("leaked overlay mount"),
+            "error message should mention leaked mounts, got: {}",
+            exec.result.error_msg
+        );
+        assert!(
+            exec.result.error_msg.contains("999"),
+            "error message should include the leak count, got: {}",
+            exec.result.error_msg
+        );
+
+        // Counter unchanged — short-circuit doesn't touch the overlay.
+        assert_eq!(leak_counter.load(Ordering::Relaxed), 999);
     }
 }

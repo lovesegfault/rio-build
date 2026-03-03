@@ -226,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         overlay_base_dir: args.overlay_base_dir,
         stream_tx,
         running_builds,
+        leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     // Process incoming scheduler messages
