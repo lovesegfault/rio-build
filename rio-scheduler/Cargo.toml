@@ -29,9 +29,20 @@ rand = { workspace = true }
 prost-types = { workspace = true }
 rio-nix = { workspace = true }
 
+# phase2b: build-log S3 flush (gzip + PUT logs/{build_id}/{drv_hash}.log.gz)
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+flate2 = { workspace = true }
+# phase2b: log ring buffer written from BuildExecution recv tasks
+dashmap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rio-store = { path = "../rio-store" }
 rio-test-support = { path = "../rio-test-support" }
 sha2 = { workspace = true }
 tracing-test = "0.2"
+aws-smithy-mocks = "0.2"
+aws-sdk-s3 = { workspace = true, features = ["test-util"] }

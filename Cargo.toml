@@ -52,7 +52,7 @@ sqlx = { version = "0.8", default-features = false, features = [
   "migrate",
   "uuid",
 ] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 
 # S3
 aws-sdk-s3 = "1"
@@ -80,6 +80,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+
+# OpenTelemetry (phase2b: full OTLP, not just stdout — milestone requires
+# "traces visible in Jaeger")
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+
+# Configuration (phase2b: TOML + RIO_ env overlay)
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Compression (phase2b: build-log gzip before S3 flush)
+flate2 = "1"
+
+# Concurrent map (phase2b: scheduler log ring buffers, written from
+# BuildExecution recv tasks outside the actor loop)
+dashmap = "6"
 
 # Crypto
 sha1 = "0.10"

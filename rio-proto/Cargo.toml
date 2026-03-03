@@ -19,5 +19,9 @@ tokio = { workspace = true }
 rio-nix = { workspace = true }
 tracing = { workspace = true }
 
+# phase2b: W3C traceparent inject/extract via tonic interceptor
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 [build-dependencies]
 tonic-prost-build = { workspace = true }
