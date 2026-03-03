@@ -172,7 +172,7 @@ fn detect_system() -> String {
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("worker", cli)?;
-    rio_common::observability::init_from_env()?;
+    let _otel_guard = rio_common::observability::init_tracing("worker")?;
 
     anyhow::ensure!(
         !cfg.scheduler_addr.is_empty(),
