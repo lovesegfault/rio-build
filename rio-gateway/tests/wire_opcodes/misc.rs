@@ -5,12 +5,12 @@ use super::*;
 // ===========================================================================
 
 #[tokio::test]
-async fn test_unknown_opcode_returns_stderr_error() {
-    let mut h = TestHarness::setup().await;
+async fn test_unknown_opcode_returns_stderr_error() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream; u64: 99); // unknown opcode
 
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("99")
             || err.message.to_lowercase().contains("unknown")
@@ -20,14 +20,15 @@ async fn test_unknown_opcode_returns_stderr_error() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// SetOptions (19) standalone: verifies the opcode round-trip independently
 /// of the harness setup (which also sends it). Confirms STDERR_LAST with no
 /// result data.
 #[tokio::test]
-async fn test_set_options_standalone() {
-    let mut h = TestHarness::setup().await;
+async fn test_set_options_standalone() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     // Send a second SetOptions with different values.
     wire_send!(&mut h.stream;
@@ -47,10 +48,11 @@ async fn test_set_options_standalone() {
         u64: 0,                                  // overrides count
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
     // SetOptions has no result data.
 
     h.finish().await;
+    Ok(())
 }
 
 // ===========================================================================
@@ -67,23 +69,21 @@ async fn test_set_options_standalone() {
 /// Handshake-level: client sends a version older than 1.37 → STDERR_ERROR.
 /// This is gateway's responsibility (protocol negotiation), not the store's.
 #[tokio::test]
-async fn test_version_too_old_sends_stderr_error() {
+async fn test_version_too_old_sends_stderr_error() -> anyhow::Result<()> {
     use rio_nix::protocol::handshake::{WORKER_MAGIC_1, WORKER_MAGIC_2};
 
-    let (_store, store_addr, store_handle) = spawn_mock_store().await.unwrap();
-    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
+    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
+    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
     let store_channel = Channel::from_shared(format!("http://{store_addr}"))
         .unwrap()
         .connect()
-        .await
-        .unwrap();
+        .await?;
     let mut store_client = StoreServiceClient::new(store_channel);
     let sched_channel = Channel::from_shared(format!("http://{sched_addr}"))
         .unwrap()
         .connect()
-        .await
-        .unwrap();
+        .await?;
     let mut scheduler_client = SchedulerServiceClient::new(sched_channel);
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
@@ -105,12 +105,12 @@ async fn test_version_too_old_sends_stderr_error() {
     );
 
     // Read server magic + server version
-    let magic2 = wire::read_u64(&mut client).await.unwrap();
+    let magic2 = wire::read_u64(&mut client).await?;
     assert_eq!(magic2, WORKER_MAGIC_2);
-    let _server_version = wire::read_u64(&mut client).await.unwrap();
+    let _server_version = wire::read_u64(&mut client).await?;
 
     // Server should now send STDERR_ERROR (version rejected before feature exchange)
-    let err = drain_stderr_expecting_error(&mut client).await;
+    let err = drain_stderr_expecting_error(&mut client).await?;
     assert!(
         err.message.contains("1.37+"),
         "error should mention '1.37+', got: {}",
@@ -118,41 +118,43 @@ async fn test_version_too_old_sends_stderr_error() {
     );
 
     drop(client);
-    server_task.await.unwrap();
+    server_task.await?;
     store_handle.abort();
     sched_handle.abort();
+    Ok(())
 }
 
 /// Session stays open across multiple opcodes. Gateway processes each
 /// sequentially and returns to the opcode loop after STDERR_LAST.
 #[tokio::test]
-async fn test_multi_opcode_sequence() {
+async fn test_multi_opcode_sequence() -> anyhow::Result<()> {
     use rio_nix::protocol::stderr::STDERR_LAST;
 
-    let mut h = TestHarness::setup().await;
+    let mut h = TestHarness::setup().await?;
     let (nar, hash) = make_nar(b"multi-op");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
     // Op 1: IsValidPath (found)
     wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_A);
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), 1, "found");
+    assert_eq!(wire::read_u64(&mut h.stream).await?, STDERR_LAST);
+    assert_eq!(wire::read_u64(&mut h.stream).await?, 1, "found");
 
     // Op 2: IsValidPath (not found)
     wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_MISSING);
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), 0, "missing");
+    assert_eq!(wire::read_u64(&mut h.stream).await?, STDERR_LAST);
+    assert_eq!(wire::read_u64(&mut h.stream).await?, 0, "missing");
 
     // Op 3: AddTempRoot
     wire_send!(&mut h.stream; u64: 11, string: TEST_PATH_A);
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), 1);
+    assert_eq!(wire::read_u64(&mut h.stream).await?, STDERR_LAST);
+    assert_eq!(wire::read_u64(&mut h.stream).await?, 1);
 
     // Op 4: QueryPathFromHashPart (found — prefix match)
     wire_send!(&mut h.stream; u64: 29, string: "00000000000000000000000000000000");
-    assert_eq!(wire::read_u64(&mut h.stream).await.unwrap(), STDERR_LAST);
-    let path = wire::read_string(&mut h.stream).await.unwrap();
+    assert_eq!(wire::read_u64(&mut h.stream).await?, STDERR_LAST);
+    let path = wire::read_string(&mut h.stream).await?;
     assert_eq!(path, TEST_PATH_A);
 
     h.finish().await;
+    Ok(())
 }

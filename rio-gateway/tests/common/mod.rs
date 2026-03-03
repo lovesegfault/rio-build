@@ -28,20 +28,18 @@ pub struct GatewaySession {
 
 impl GatewaySession {
     /// Spawn mocks + run_protocol. Ready to send opcodes on `.stream`.
-    pub async fn new() -> Self {
-        let (store, store_addr, store_handle) = spawn_mock_store().await.unwrap();
-        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await.unwrap();
+    pub async fn new() -> anyhow::Result<Self> {
+        let (store, store_addr, store_handle) = spawn_mock_store().await?;
+        let (scheduler, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
-        let store_client = rio_proto::client::connect_store(&store_addr.to_string())
-            .await
-            .expect("connect to mock store");
-        let scheduler_client = rio_proto::client::connect_scheduler(&sched_addr.to_string())
-            .await
-            .expect("connect to mock scheduler");
+        let store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
+        let scheduler_client =
+            rio_proto::client::connect_scheduler(&sched_addr.to_string()).await?;
 
         let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
         let mut sc = store_client.clone();
         let mut scc = scheduler_client.clone();
+        // Fire-and-forget: aborted in Drop.
         let server_task = tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(server_stream);
             // UnexpectedEof is normal when the test drops its client stream.
@@ -52,7 +50,7 @@ impl GatewaySession {
             }
         });
 
-        Self {
+        Ok(Self {
             stream: client_stream,
             store,
             scheduler,
@@ -61,7 +59,7 @@ impl GatewaySession {
             store_handle,
             sched_handle,
             server_task,
-        }
+        })
     }
 
     /// Await the server task (after client stream is dropped/EOF).

@@ -1,7 +1,7 @@
 //! Nix wire protocol client-side test helpers.
 //!
 //! These send the client half of the handshake/setOptions exchange against
-//! a `DuplexStream`, `.unwrap()`-ing all wire I/O since they're for tests only.
+//! a `DuplexStream`. All wire I/O propagates via `?`.
 
 use rio_nix::protocol::client::{StderrMessage, read_stderr_message};
 use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGIC_2};
@@ -14,48 +14,50 @@ use tokio::io::DuplexStream;
 /// Sends magic1 + version, reads magic2 + server version, exchanges features,
 /// sends obsolete-affinity/reserve-space placeholders, reads version-string +
 /// trusted flag + STDERR_LAST.
-pub async fn do_handshake(s: &mut DuplexStream) {
+pub async fn do_handshake(s: &mut DuplexStream) -> anyhow::Result<()> {
     crate::wire_send!(s; u64: WORKER_MAGIC_1, u64: PROTOCOL_VERSION);
 
-    let magic2 = wire::read_u64(s).await.unwrap();
+    let magic2 = wire::read_u64(s).await?;
     assert_eq!(
         magic2, WORKER_MAGIC_2,
         "server must reply with WORKER_MAGIC_2"
     );
-    let _server_version = wire::read_u64(s).await.unwrap();
+    let _server_version = wire::read_u64(s).await?;
 
     crate::wire_send!(s; strings: wire::NO_STRINGS);
-    let _server_features = wire::read_strings(s).await.unwrap();
+    let _server_features = wire::read_strings(s).await?;
 
     crate::wire_send!(s; u64: 0, u64: 0); // obsolete CPU affinity, reserveSpace
 
-    let _version = wire::read_string(s).await.unwrap();
-    let _trusted = wire::read_u64(s).await.unwrap();
+    let _version = wire::read_string(s).await?;
+    let _trusted = wire::read_u64(s).await?;
 
-    let last = wire::read_u64(s).await.unwrap();
+    let last = wire::read_u64(s).await?;
     assert_eq!(last, STDERR_LAST, "handshake should end with STDERR_LAST");
+    Ok(())
 }
 
 /// Send wopSetOptions (19) with all-zero values and empty overrides.
-pub async fn send_set_options(s: &mut DuplexStream) {
+pub async fn send_set_options(s: &mut DuplexStream) -> anyhow::Result<()> {
     // 14 u64 zeros: opcode(19) + 12 option fields + overrides count(0)
     crate::wire_send!(s;
         u64: 19, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
         u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
     );
 
-    let msg = wire::read_u64(s).await.unwrap();
+    let msg = wire::read_u64(s).await?;
     assert_eq!(msg, STDERR_LAST, "setOptions should end with STDERR_LAST");
+    Ok(())
 }
 
 /// Drain STDERR messages until STDERR_LAST. Returns all non-Last messages.
 /// Panics if STDERR_ERROR is received (use `drain_stderr_expecting_error` for
 /// error-path tests).
-pub async fn drain_stderr_until_last(s: &mut DuplexStream) -> Vec<StderrMessage> {
+pub async fn drain_stderr_until_last(s: &mut DuplexStream) -> anyhow::Result<Vec<StderrMessage>> {
     let mut msgs = Vec::new();
     loop {
-        match read_stderr_message(s).await.unwrap() {
-            StderrMessage::Last => return msgs,
+        match read_stderr_message(s).await? {
+            StderrMessage::Last => return Ok(msgs),
             StderrMessage::Error(e) => {
                 panic!("unexpected STDERR_ERROR: {}", e.message);
             }
@@ -66,10 +68,10 @@ pub async fn drain_stderr_until_last(s: &mut DuplexStream) -> Vec<StderrMessage>
 
 /// Drain STDERR messages expecting STDERR_ERROR. Returns the error.
 /// Panics if STDERR_LAST is received first.
-pub async fn drain_stderr_expecting_error(s: &mut DuplexStream) -> StderrError {
+pub async fn drain_stderr_expecting_error(s: &mut DuplexStream) -> anyhow::Result<StderrError> {
     loop {
-        match read_stderr_message(s).await.unwrap() {
-            StderrMessage::Error(e) => return e,
+        match read_stderr_message(s).await? {
+            StderrMessage::Error(e) => return Ok(e),
             StderrMessage::Last => panic!("expected STDERR_ERROR but got STDERR_LAST"),
             _ => {} // skip other messages
         }
@@ -77,7 +79,9 @@ pub async fn drain_stderr_expecting_error(s: &mut DuplexStream) -> StderrError {
 }
 
 /// Build a `Vec<u8>` by sequentially writing Nix wire primitives.
-/// Each `kind: value` pair expands to `wire::write_<kind>(&mut buf, value).await.unwrap();`.
+/// Each `kind: value` pair expands to `wire::write_<kind>(&mut buf, value).await?;`.
+/// Callers must be in a function returning `Result` — the `?` inside the
+/// block-expression early-returns from the enclosing function.
 /// Must be called from async context.
 ///
 /// # Kinds
@@ -102,22 +106,22 @@ macro_rules! wire_bytes {
         __buf
     }};
     (@write $buf:expr, u64, $v:expr) => {
-        ::rio_nix::protocol::wire::write_u64($buf, $v).await.unwrap()
+        ::rio_nix::protocol::wire::write_u64($buf, $v).await?
     };
     (@write $buf:expr, string, $v:expr) => {
-        ::rio_nix::protocol::wire::write_string($buf, $v).await.unwrap()
+        ::rio_nix::protocol::wire::write_string($buf, $v).await?
     };
     (@write $buf:expr, strings, $v:expr) => {
-        ::rio_nix::protocol::wire::write_strings($buf, $v).await.unwrap()
+        ::rio_nix::protocol::wire::write_strings($buf, $v).await?
     };
     (@write $buf:expr, bool, $v:expr) => {
-        ::rio_nix::protocol::wire::write_bool($buf, $v).await.unwrap()
+        ::rio_nix::protocol::wire::write_bool($buf, $v).await?
     };
     (@write $buf:expr, bytes, $v:expr) => {
-        ::rio_nix::protocol::wire::write_bytes($buf, $v).await.unwrap()
+        ::rio_nix::protocol::wire::write_bytes($buf, $v).await?
     };
     (@write $buf:expr, framed, $v:expr) => {
-        ::rio_nix::protocol::wire::write_framed_stream($buf, $v, 8192).await.unwrap()
+        ::rio_nix::protocol::wire::write_framed_stream($buf, $v, 8192).await?
     };
     (@write $buf:expr, raw, $v:expr) => {
         { let __b: &mut Vec<u8> = $buf; __b.extend_from_slice($v); }
@@ -139,14 +143,14 @@ macro_rules! wire_send {
         // consuming them. For `&mut h.stream`-style call sites this is a no-op.
         let __s: &mut _ = &mut *$stream;
         $( $crate::wire_bytes!(@write __s, $kind, $val); )*
-        ::tokio::io::AsyncWriteExt::flush(__s).await.unwrap();
+        ::tokio::io::AsyncWriteExt::flush(__s).await?;
     }};
 }
 
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn wire_bytes_macro_roundtrip() {
+    async fn wire_bytes_macro_roundtrip() -> anyhow::Result<()> {
         use rio_nix::protocol::wire;
         let buf = crate::wire_bytes![
             u64: 42,
@@ -157,16 +161,15 @@ mod tests {
             raw: b"extra",
         ];
         let mut cur = std::io::Cursor::new(buf);
-        assert_eq!(wire::read_u64(&mut cur).await.unwrap(), 42);
-        assert_eq!(wire::read_string(&mut cur).await.unwrap(), "hello");
-        assert!(wire::read_bool(&mut cur).await.unwrap());
-        assert_eq!(wire::read_strings(&mut cur).await.unwrap(), vec!["a", "b"]);
-        assert_eq!(wire::read_bytes(&mut cur).await.unwrap(), b"raw");
+        assert_eq!(wire::read_u64(&mut cur).await?, 42);
+        assert_eq!(wire::read_string(&mut cur).await?, "hello");
+        assert!(wire::read_bool(&mut cur).await?);
+        assert_eq!(wire::read_strings(&mut cur).await?, vec!["a", "b"]);
+        assert_eq!(wire::read_bytes(&mut cur).await?, b"raw");
         // raw: bytes are appended verbatim (no length prefix)
         let mut rest = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut cur, &mut rest)
-            .await
-            .unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut cur, &mut rest).await?;
         assert_eq!(rest, b"extra");
+        Ok(())
     }
 }

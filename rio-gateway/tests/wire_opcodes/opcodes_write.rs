@@ -5,8 +5,8 @@ use super::*;
 // ===========================================================================
 
 #[tokio::test]
-async fn test_add_to_store_nar_accepts_valid() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_nar_accepts_valid() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     let (nar, hash) = make_nar(b"add-to-store-nar");
 
     wire_send!(&mut h.stream;
@@ -26,7 +26,7 @@ async fn test_add_to_store_nar_accepts_valid() {
         framed: &nar,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
     // AddToStoreNar has no result data after STDERR_LAST.
 
     // Verify the mock store received the PutPath call.
@@ -36,14 +36,15 @@ async fn test_add_to_store_nar_accepts_valid() {
     assert_eq!(calls[0].nar_hash, hash.to_vec());
 
     h.finish().await;
+    Ok(())
 }
 
 /// Gateway trusts client-declared narHash and passes it to the store.
 /// Hash verification is the store's responsibility (validate.rs). This test
 /// verifies the gateway passes the declared hash through unchanged.
 #[tokio::test]
-async fn test_add_to_store_nar_passes_declared_hash() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_nar_passes_declared_hash() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     let (nar, _actual_hash) = make_nar(b"trust-test");
     let declared_hash = [0xABu8; 32]; // deliberately different from actual
 
@@ -62,7 +63,7 @@ async fn test_add_to_store_nar_passes_declared_hash() {
         framed: &nar,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
 
     // Verify the DECLARED hash (not actual) was passed to the store.
     let calls = h.store.put_calls.read().unwrap().clone();
@@ -74,6 +75,7 @@ async fn test_add_to_store_nar_passes_declared_hash() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 // ===========================================================================
@@ -81,8 +83,8 @@ async fn test_add_to_store_nar_passes_declared_hash() {
 // ===========================================================================
 
 #[tokio::test]
-async fn test_add_multiple_to_store_batch() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     let (nar_a, hash_a) = make_nar(b"multi-a");
     let (nar_b, hash_b) = make_nar(b"multi-b");
 
@@ -132,7 +134,7 @@ async fn test_add_multiple_to_store_batch() {
         framed: &inner,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
 
     let calls = h.store.put_calls.read().unwrap().clone();
     assert_eq!(calls.len(), 2, "store should receive 2 PutPath calls");
@@ -141,13 +143,14 @@ async fn test_add_multiple_to_store_batch() {
     assert!(paths.contains(&test_path_b));
 
     h.finish().await;
+    Ok(())
 }
 
 /// Regression: handler must reject truncated NAR (nar_size claims more bytes
 /// than remain in the framed stream) instead of panicking on slice OOB.
 #[tokio::test]
-async fn test_add_multiple_to_store_truncated_nar() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
     let (nar, hash) = make_nar(b"truncated");
 
     let inner = wire_bytes![
@@ -173,7 +176,7 @@ async fn test_add_multiple_to_store_truncated_nar() {
     );
 
     // Handler should send STDERR_ERROR (not crash).
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("truncated"),
         "expected 'truncated' in error, got: {}",
@@ -182,6 +185,7 @@ async fn test_add_multiple_to_store_truncated_nar() {
 
     // No PutPath calls should have been made.
     assert_eq!(h.store.put_calls.read().unwrap().len(), 0);
+    Ok(())
 }
 
 // ===========================================================================
@@ -190,8 +194,8 @@ async fn test_add_multiple_to_store_truncated_nar() {
 // ===========================================================================
 
 #[tokio::test]
-async fn test_add_signatures_stub_returns_success() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_signatures_stub_returns_success() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
         u64: 37,                           // wopAddSignatures
@@ -199,16 +203,17 @@ async fn test_add_signatures_stub_returns_success() {
         strings: &["sig:fake"],
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
-    let result = wire::read_u64(&mut h.stream).await.unwrap();
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1, "AddSignatures stub should return 1 (success)");
 
     h.finish().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_register_drv_output_stub_reads_and_returns() {
-    let mut h = TestHarness::setup().await;
+async fn test_register_drv_output_stub_reads_and_returns() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     let realisation_json = r#"{"id":"sha256:abc!out","outPath":"/nix/store/xyz","signatures":[],"dependentRealisations":{}}"#;
     wire_send!(&mut h.stream;
@@ -216,15 +221,16 @@ async fn test_register_drv_output_stub_reads_and_returns() {
         string: realisation_json,
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
     // RegisterDrvOutput stub has no result data.
 
     h.finish().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_add_text_to_store() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_text_to_store() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
         u64: 8,                            // wopAddTextToStore
@@ -233,8 +239,8 @@ async fn test_add_text_to_store() {
         strings: wire::NO_STRINGS,         // references
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
-    let path = wire::read_string(&mut h.stream).await.unwrap();
+    drain_stderr_until_last(&mut h.stream).await?;
+    let path = wire::read_string(&mut h.stream).await?;
     assert!(
         path.starts_with("/nix/store/") && path.ends_with("-my-text"),
         "computed path should be a store path ending in -my-text: {path}"
@@ -246,6 +252,7 @@ async fn test_add_text_to_store() {
     assert_eq!(calls[0].store_path, path);
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopAddToStore (7) with cam_str="text:sha256": text-method CA path.
@@ -253,8 +260,8 @@ async fn test_add_text_to_store() {
 /// a 9-field ValidPathInfo. The computed path should match
 /// StorePath::make_text (content-addressed text import).
 #[tokio::test]
-async fn test_add_to_store_text_method() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_text_method() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     let content = b"hello from text method";
 
@@ -267,18 +274,18 @@ async fn test_add_to_store_text_method() {
         framed: content,                   // dump data
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
 
     // 9-field ValidPathInfo response
-    let path = wire::read_string(&mut h.stream).await.unwrap();
-    let _deriver = wire::read_string(&mut h.stream).await.unwrap();
-    let nar_hash_hex = wire::read_string(&mut h.stream).await.unwrap();
-    let _references = wire::read_strings(&mut h.stream).await.unwrap();
-    let _reg_time = wire::read_u64(&mut h.stream).await.unwrap();
-    let nar_size = wire::read_u64(&mut h.stream).await.unwrap();
-    let _ultimate = wire::read_bool(&mut h.stream).await.unwrap();
-    let _sigs = wire::read_strings(&mut h.stream).await.unwrap();
-    let ca = wire::read_string(&mut h.stream).await.unwrap();
+    let path = wire::read_string(&mut h.stream).await?;
+    let _deriver = wire::read_string(&mut h.stream).await?;
+    let nar_hash_hex = wire::read_string(&mut h.stream).await?;
+    let _references = wire::read_strings(&mut h.stream).await?;
+    let _reg_time = wire::read_u64(&mut h.stream).await?;
+    let nar_size = wire::read_u64(&mut h.stream).await?;
+    let _ultimate = wire::read_bool(&mut h.stream).await?;
+    let _sigs = wire::read_strings(&mut h.stream).await?;
+    let ca = wire::read_string(&mut h.stream).await?;
 
     assert!(
         path.starts_with("/nix/store/") && path.ends_with("-text-test"),
@@ -297,13 +304,14 @@ async fn test_add_to_store_text_method() {
     assert_eq!(calls[0].store_path, path);
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopAddToStore (7) with cam_str="fixed:sha256": flat-file fixed-output.
 /// The dump data is raw file content (not NAR); handler wraps it in NAR.
 #[tokio::test]
-async fn test_add_to_store_fixed_flat() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_fixed_flat() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     let content = b"raw file content for flat fixed-output";
 
@@ -316,17 +324,17 @@ async fn test_add_to_store_fixed_flat() {
         framed: content,                   // dump data (raw, not NAR)
     );
 
-    drain_stderr_until_last(&mut h.stream).await;
+    drain_stderr_until_last(&mut h.stream).await?;
 
-    let path = wire::read_string(&mut h.stream).await.unwrap();
-    let _deriver = wire::read_string(&mut h.stream).await.unwrap();
-    let _nar_hash = wire::read_string(&mut h.stream).await.unwrap();
-    let _refs = wire::read_strings(&mut h.stream).await.unwrap();
-    let _reg_time = wire::read_u64(&mut h.stream).await.unwrap();
-    let nar_size = wire::read_u64(&mut h.stream).await.unwrap();
-    let _ult = wire::read_bool(&mut h.stream).await.unwrap();
-    let _sigs = wire::read_strings(&mut h.stream).await.unwrap();
-    let ca = wire::read_string(&mut h.stream).await.unwrap();
+    let path = wire::read_string(&mut h.stream).await?;
+    let _deriver = wire::read_string(&mut h.stream).await?;
+    let _nar_hash = wire::read_string(&mut h.stream).await?;
+    let _refs = wire::read_strings(&mut h.stream).await?;
+    let _reg_time = wire::read_u64(&mut h.stream).await?;
+    let nar_size = wire::read_u64(&mut h.stream).await?;
+    let _ult = wire::read_bool(&mut h.stream).await?;
+    let _sigs = wire::read_strings(&mut h.stream).await?;
+    let ca = wire::read_string(&mut h.stream).await?;
 
     assert!(path.ends_with("-flat-test"));
     // Flat: NAR wraps the raw content, so nar_size > content.len()
@@ -341,13 +349,14 @@ async fn test_add_to_store_fixed_flat() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// wopAddToStore (7) with an invalid cam_str should send STDERR_ERROR
 /// (not crash or silently succeed).
 #[tokio::test]
-async fn test_add_to_store_invalid_cam_str_returns_error() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_invalid_cam_str_returns_error() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
         u64: 7,                            // wopAddToStore
@@ -359,7 +368,7 @@ async fn test_add_to_store_invalid_cam_str_returns_error() {
         framed: b"data",
     );
 
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("content-address method") || err.message.contains("bogus"),
         "error should mention invalid cam_str: {}",
@@ -367,12 +376,13 @@ async fn test_add_to_store_invalid_cam_str_returns_error() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// AddToStoreNar with invalid store path should send STDERR_ERROR.
 #[tokio::test]
-async fn test_add_to_store_nar_invalid_path_returns_error() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_nar_invalid_path_returns_error() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
         u64: 39,
@@ -389,7 +399,7 @@ async fn test_add_to_store_nar_invalid_path_returns_error() {
         // No framed data — handler should error before reading it.
     );
 
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("invalid store path"),
         "error should mention invalid path: {}",
@@ -397,13 +407,14 @@ async fn test_add_to_store_nar_invalid_path_returns_error() {
     );
 
     h.finish().await;
+    Ok(())
 }
 
 /// AddToStoreNar with nar_size > MAX_FRAMED_TOTAL should send STDERR_ERROR
 /// before reading any NAR data (prevents DoS).
 #[tokio::test]
-async fn test_add_to_store_nar_oversized_returns_error() {
-    let mut h = TestHarness::setup().await;
+async fn test_add_to_store_nar_oversized_returns_error() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
         u64: 39,
@@ -419,7 +430,7 @@ async fn test_add_to_store_nar_oversized_returns_error() {
         bool: false, bool: true,
     );
 
-    let err = drain_stderr_expecting_error(&mut h.stream).await;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("exceeds maximum"),
         "error should mention size limit: {}",
@@ -427,4 +438,5 @@ async fn test_add_to_store_nar_oversized_returns_error() {
     );
 
     h.finish().await;
+    Ok(())
 }

@@ -485,39 +485,43 @@ mod tests {
 
     /// parse_cam_str: text:sha256 → (is_text=true, is_recursive=false, SHA256)
     #[test]
-    fn test_parse_cam_str_text_sha256() {
+    fn test_parse_cam_str_text_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("text:sha256").unwrap();
         assert!(is_text);
         assert!(!is_recursive);
         assert_eq!(algo, HashAlgo::SHA256);
+        Ok(())
     }
 
     /// parse_cam_str: fixed:r:sha256 → (is_text=false, is_recursive=true, SHA256)
     #[test]
-    fn test_parse_cam_str_fixed_recursive_sha256() {
+    fn test_parse_cam_str_fixed_recursive_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:r:sha256").unwrap();
         assert!(!is_text);
         assert!(is_recursive);
         assert_eq!(algo, HashAlgo::SHA256);
+        Ok(())
     }
 
     /// parse_cam_str: fixed:git:sha1 → (is_text=false, is_recursive=true, SHA1)
     /// git: prefix is treated as recursive (same as r:)
     #[test]
-    fn test_parse_cam_str_fixed_git_sha1() {
+    fn test_parse_cam_str_fixed_git_sha1() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:git:sha1").unwrap();
         assert!(!is_text);
         assert!(is_recursive, "git: should be treated as recursive");
         assert_eq!(algo, HashAlgo::SHA1);
+        Ok(())
     }
 
     /// parse_cam_str: fixed:sha256 (flat) → (is_text=false, is_recursive=false, SHA256)
     #[test]
-    fn test_parse_cam_str_fixed_flat_sha256() {
+    fn test_parse_cam_str_fixed_flat_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:sha256").unwrap();
         assert!(!is_text);
         assert!(!is_recursive, "no r:/git: prefix should be flat");
         assert_eq!(algo, HashAlgo::SHA256);
+        Ok(())
     }
 
     /// parse_cam_str: unknown method → Err

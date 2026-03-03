@@ -600,34 +600,37 @@ pub fn assert_fully_consumed(data: &[u8], fields: &[ResponseField], context: &st
 // Client byte builders
 // ---------------------------------------------------------------------------
 
-pub async fn build_is_valid_path_bytes(path: &str) -> Vec<u8> {
-    wire_bytes![u64: 1, string: path]
+pub async fn build_is_valid_path_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 1, string: path])
 }
 
-pub async fn build_query_path_info_bytes(path: &str) -> Vec<u8> {
-    wire_bytes![u64: 26, string: path]
+pub async fn build_query_path_info_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 26, string: path])
 }
 
-pub async fn build_query_valid_paths_bytes(paths: &[&str], substitute: bool) -> Vec<u8> {
-    wire_bytes![u64: 31, strings: paths, bool: substitute]
+pub async fn build_query_valid_paths_bytes(
+    paths: &[&str],
+    substitute: bool,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 31, strings: paths, bool: substitute])
 }
 
-pub async fn build_add_temp_root_bytes(path: &str) -> Vec<u8> {
-    wire_bytes![u64: 11, string: path]
+pub async fn build_add_temp_root_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 11, string: path])
 }
 
-pub async fn build_query_missing_bytes(paths: &[&str]) -> Vec<u8> {
-    wire_bytes![u64: 40, strings: paths]
+pub async fn build_query_missing_bytes(paths: &[&str]) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 40, strings: paths])
 }
 
-pub async fn build_nar_from_path_bytes(path: &str) -> Vec<u8> {
-    wire_bytes![u64: 38, string: path]
+pub async fn build_nar_from_path_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 38, string: path])
 }
 
-pub async fn build_query_path_from_hash_part_bytes(hash_part: &str) -> Vec<u8> {
-    wire_bytes![u64: 29, string: hash_part]
+pub async fn build_query_path_from_hash_part_bytes(hash_part: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 29, string: hash_part])
 }
 
-pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> Vec<u8> {
-    wire_bytes![u64: 37, string: path, strings: sigs]
+pub async fn build_add_signatures_bytes(path: &str, sigs: &[&str]) -> anyhow::Result<Vec<u8>> {
+    Ok(wire_bytes![u64: 37, string: path, strings: sigs])
 }
