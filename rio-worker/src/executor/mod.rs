@@ -493,14 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_nix_conf() {
-        let dir = tempfile::tempdir().unwrap();
-        setup_nix_conf(dir.path()).unwrap();
+    fn test_setup_nix_conf() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        setup_nix_conf(dir.path())?;
 
         let conf_path = dir.path().join("etc/nix/nix.conf");
         assert!(conf_path.exists());
-        let content = std::fs::read_to_string(&conf_path).unwrap();
+        let content = std::fs::read_to_string(&conf_path)?;
         assert!(content.contains("sandbox = true"));
+        Ok(())
     }
 
     /// When the leak counter is at or over threshold, execute_build must
@@ -509,7 +510,7 @@ mod tests {
     /// the threshold and asserts the short-circuit path, which runs before
     /// setup_overlay is ever called.
     #[tokio::test]
-    async fn test_execute_build_refuses_when_leaked_exceeds_threshold() {
+    async fn test_execute_build_refuses_when_leaked_exceeds_threshold() -> anyhow::Result<()> {
         // Set well over any plausible threshold (default is 3).
         let leak_counter = Arc::new(AtomicUsize::new(999));
 
@@ -526,7 +527,7 @@ mod tests {
         let mut store_client = StoreServiceClient::new(channel);
 
         let (log_tx, _log_rx) = mpsc::channel(1);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir()?;
 
         let result = execute_build(
             &assignment,
@@ -562,5 +563,6 @@ mod tests {
 
         // Counter unchanged — short-circuit doesn't touch the overlay.
         assert_eq!(leak_counter.load(Ordering::Relaxed), 999);
+        Ok(())
     }
 }

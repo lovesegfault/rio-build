@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batcher_emits_at_64_lines() {
+    fn test_batcher_emits_at_64_lines() -> anyhow::Result<()> {
         let mut batcher = LogBatcher::new("drv-path".into(), "worker-1".into());
 
         for i in 0..63 {
@@ -113,11 +113,12 @@ mod tests {
         let batch = batcher.add_line(b"line 63".to_vec());
         assert!(batch.is_some());
 
-        let batch = batch.unwrap();
+        let batch = batch.expect("checked is_some");
         assert_eq!(batch.lines.len(), 64);
         assert_eq!(batch.first_line_number, 0);
         assert_eq!(batch.derivation_path, "drv-path");
         assert_eq!(batch.worker_id, "worker-1");
+        Ok(())
     }
 
     #[test]
@@ -172,7 +173,7 @@ mod tests {
     /// Verify the 100ms timeout causes a flush of a partial batch.
     /// Uses real time (LogBatcher uses Instant, not tokio::time).
     #[test]
-    fn test_batcher_100ms_timeout_flush() {
+    fn test_batcher_100ms_timeout_flush() -> anyhow::Result<()> {
         let mut batcher = LogBatcher::new("drv-path".into(), "worker-1".into());
 
         // Add a line — should not flush (< 64 lines)
@@ -186,12 +187,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(110));
         let batch = batcher.maybe_flush();
         assert!(batch.is_some(), "should flush after 100ms timeout");
-        let batch = batch.unwrap();
+        let batch = batch.expect("checked is_some");
         assert_eq!(batch.lines.len(), 1);
         assert_eq!(batch.lines[0], b"line 0");
         assert!(
             !batcher.has_pending(),
             "batcher should be empty after flush"
         );
+        Ok(())
     }
 }

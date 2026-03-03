@@ -320,40 +320,37 @@ mod tests {
     }
 
     /// Open a connection to an existing DB file for test assertions.
-    async fn open_db(db_path: &Path) -> SqliteConnection {
+    async fn open_db(db_path: &Path) -> anyhow::Result<SqliteConnection> {
         let url = format!("sqlite://{}", db_path.display());
-        SqliteConnection::connect(&url).await.unwrap()
+        Ok(SqliteConnection::connect(&url).await?)
     }
 
     #[tokio::test]
-    async fn test_generate_db_creates_valid_schema() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_creates_valid_schema() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
 
         // Check schema version
         let version: String =
             sqlx::query_scalar("SELECT value FROM Config WHERE name = 'SchemaVersion'")
                 .fetch_one(&mut conn)
-                .await
-                .unwrap();
+                .await?;
         assert_eq!(version, "10");
 
         // Check valid paths count
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(count, 2);
 
         // Check refs count (glibc self-ref + hello->glibc + hello self-ref)
         let ref_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Refs")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(ref_count, 3);
 
         // Verify specific FK pairs (referrer.path, reference.path) — not just count
@@ -365,8 +362,7 @@ mod tests {
                ORDER BY vp_referrer.path, vp_reference.path"#,
         )
         .fetch_all(&mut conn)
-        .await
-        .unwrap();
+        .await?;
 
         // Expected: glibc->glibc (self), hello->glibc, hello->hello (self)
         assert!(pairs.contains(&(
@@ -389,8 +385,7 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'Index%'",
         )
         .fetch_all(&mut conn)
-        .await
-        .unwrap();
+        .await?;
         for expected in [
             "IndexValidPathsPath",
             "IndexValidPathsHash",
@@ -402,11 +397,12 @@ mod tests {
                 "missing index {expected}; got indexes: {indexes:?}"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_derivation_outputs() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_derivation_outputs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
         // .drv file MUST be in ValidPaths for the FK to resolve.
@@ -432,9 +428,9 @@ mod tests {
             },
         ];
 
-        generate_db(&db_path, &paths, &drv_outputs).await.unwrap();
+        generate_db(&db_path, &paths, &drv_outputs).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
             r#"SELECT d.id, d.path FROM DerivationOutputs d
                JOIN ValidPaths vp ON d.drv = vp.id
@@ -442,8 +438,7 @@ mod tests {
                ORDER BY d.id"#,
         )
         .fetch_all(&mut conn)
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -454,11 +449,12 @@ mod tests {
             rows[1],
             ("out".to_string(), "/nix/store/yyyy-hello".to_string())
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_derivation_outputs_skips_missing_drv() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_derivation_outputs_skips_missing_drv() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
         // .drv NOT in ValidPaths → FK resolve fails → warn + skip (not error).
@@ -468,148 +464,146 @@ mod tests {
             output_path: "/nix/store/some-output".to_string(),
         }];
 
-        generate_db(&db_path, &[], &drv_outputs).await.unwrap();
+        generate_db(&db_path, &[], &drv_outputs).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM DerivationOutputs")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(count, 0, "should skip insert when .drv not in ValidPaths");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_has_realisations_table() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_has_realisations_table() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[], &[]).await.unwrap();
+        generate_db(&db_path, &[], &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
 
         // Realisations table should exist (empty, for future CA support)
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Realisations")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(count, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_registration_time_and_ultimate() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_registration_time_and_ultimate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
 
         // All input paths should have registrationTime=0 and ultimate=0
         let rows: Vec<(i64, i64)> =
             sqlx::query_as("SELECT registrationTime, ultimate FROM ValidPaths")
                 .fetch_all(&mut conn)
-                .await
-                .unwrap();
+                .await?;
 
         for (reg_time, ultimate) in rows {
             assert_eq!(reg_time, 0, "registrationTime must be 0 for input paths");
             assert_eq!(ultimate, 0, "ultimate must be 0 for input paths");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_path_lookup() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_path_lookup() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
 
         let hash: String = sqlx::query_scalar("SELECT hash FROM ValidPaths WHERE path = ?1")
             .bind("/nix/store/bbbb-hello-2.12.2")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(hash, "sha256:cafebabe");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_pragmas() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_pragmas() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &sample_paths(), &[]).await.unwrap();
+        generate_db(&db_path, &sample_paths(), &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
 
         let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(journal, "wal");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_empty() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
-        generate_db(&db_path, &[], &[]).await.unwrap();
+        generate_db(&db_path, &[], &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(count, 0);
 
         let version: String =
             sqlx::query_scalar("SELECT value FROM Config WHERE name = 'SchemaVersion'")
                 .fetch_one(&mut conn)
-                .await
-                .unwrap();
+                .await?;
         assert_eq!(version, "10");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_generate_db_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn test_generate_db_idempotent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("db.sqlite");
 
         let paths = sample_paths();
-        generate_db(&db_path, &paths, &[]).await.unwrap();
-        generate_db(&db_path, &paths, &[]).await.unwrap();
+        generate_db(&db_path, &paths, &[]).await?;
+        generate_db(&db_path, &paths, &[]).await?;
 
-        let mut conn = open_db(&db_path).await;
+        let mut conn = open_db(&db_path).await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ValidPaths")
             .fetch_one(&mut conn)
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(count, 2);
+        Ok(())
     }
 
     #[test]
-    fn test_synth_from_validated() {
+    fn test_synth_from_validated() -> anyhow::Result<()> {
         use rio_nix::store_path::StorePath;
         use rio_proto::validated::ValidatedPathInfo;
 
         let v = ValidatedPathInfo {
-            store_path: StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")
-                .unwrap(),
+            store_path: StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")?,
             store_path_hash: vec![],
-            deriver: Some(
-                StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv").unwrap(),
-            ),
+            deriver: Some(StorePath::parse(
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv",
+            )?),
             nar_hash: {
                 let mut h = [0u8; 32];
                 h[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
                 h
             },
             nar_size: 1024,
-            references: vec![
-                StorePath::parse("/nix/store/cccccccccccccccccccccccccccccccc-glibc").unwrap(),
-            ],
+            references: vec![StorePath::parse(
+                "/nix/store/cccccccccccccccccccccccccccccccc-glibc",
+            )?],
             registration_time: 0,
             ultimate: false,
             signatures: vec!["sig1".to_string()],
@@ -635,5 +629,6 @@ mod tests {
             vec!["/nix/store/cccccccccccccccccccccccccccccccc-glibc"]
         );
         assert!(synth.ca.is_none());
+        Ok(())
     }
 }

@@ -251,7 +251,7 @@ mod tests {
     /// This is the core of fetch_drv_from_store (minus the gRPC transport,
     /// which is straightforward streaming).
     #[test]
-    fn test_nar_wrapped_drv_parseable() {
+    fn test_nar_wrapped_drv_parseable() -> anyhow::Result<()> {
         // Minimal valid ATerm derivation (no inputs, one output).
         let drv_text = r#"Derive([("out","/nix/store/00000000000000000000000000000000-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/00000000000000000000000000000000-test")])"#;
 
@@ -261,7 +261,7 @@ mod tests {
             contents: drv_text.as_bytes().to_vec(),
         };
         let mut nar_bytes = Vec::new();
-        rio_nix::nar::serialize(&mut nar_bytes, &nar_node).unwrap();
+        rio_nix::nar::serialize(&mut nar_bytes, &nar_node)?;
 
         // Extract + parse (the tail of fetch_drv_from_store).
         let extracted =
@@ -272,6 +272,7 @@ mod tests {
         assert_eq!(drv.outputs().len(), 1);
         assert_eq!(drv.outputs()[0].name(), "out");
         assert_eq!(drv.platform(), "x86_64-linux");
+        Ok(())
     }
 
     /// Empty NAR data should produce a clear error (not silent success or panic).
@@ -299,23 +300,24 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_fod_output_hash_recursive_ok() {
+    fn test_verify_fod_output_hash_recursive_ok() -> anyhow::Result<()> {
         // r:sha256 — NAR hash comparison
         let expected_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let drv = make_fod_drv("/nix/store/test-fod", "r:sha256", expected_hash);
 
         let upload = upload::UploadResult {
             store_path: "/nix/store/test-fod".into(),
-            nar_hash: hex::decode(expected_hash).unwrap(),
+            nar_hash: hex::decode(expected_hash)?,
             nar_size: 100,
         };
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         assert!(verify_fod_hashes(&drv, &[upload], tmp.path()).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_verify_fod_output_hash_recursive_mismatch() {
+    fn test_verify_fod_output_hash_recursive_mismatch() -> anyhow::Result<()> {
         let expected_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let drv = make_fod_drv("/nix/store/test-fod", "r:sha256", expected_hash);
 
@@ -326,17 +328,18 @@ mod tests {
             nar_size: 100,
         };
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let result = verify_fod_hashes(&drv, &[upload], tmp.path());
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("mismatch"),
             "error should mention hash mismatch"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_verify_fod_output_hash_flat_ok() {
+    fn test_verify_fod_output_hash_flat_ok() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};
 
         // Flat sha256 — file content hash
@@ -347,17 +350,18 @@ mod tests {
         let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &expected_hash);
 
         // Write the file to overlay/nix/store/test-flat-fod
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        std::fs::write(store_dir.join("test-flat-fod"), content).unwrap();
+        std::fs::create_dir_all(&store_dir)?;
+        std::fs::write(store_dir.join("test-flat-fod"), content)?;
 
         // Uploads not used for flat hash verification
         assert!(verify_fod_hashes(&drv, &[], tmp.path()).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_verify_fod_output_hash_flat_mismatch() {
+    fn test_verify_fod_output_hash_flat_mismatch() -> anyhow::Result<()> {
         use sha2::{Digest, Sha256};
 
         let content = b"actual content";
@@ -366,21 +370,23 @@ mod tests {
 
         let drv = make_fod_drv("/nix/store/test-flat-fod", "sha256", &wrong_hash_hex);
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        std::fs::write(store_dir.join("test-flat-fod"), content).unwrap();
+        std::fs::create_dir_all(&store_dir)?;
+        std::fs::write(store_dir.join("test-flat-fod"), content)?;
 
         let result = verify_fod_hashes(&drv, &[], tmp.path());
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_verify_fod_non_fod_skipped() {
+    fn test_verify_fod_non_fod_skipped() -> anyhow::Result<()> {
         // Non-FOD (no hash) should be skipped without error
         let drv = make_fod_drv("/nix/store/test-non-fod", "", "");
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         assert!(verify_fod_hashes(&drv, &[], tmp.path()).is_ok());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -395,12 +401,10 @@ mod tests {
         test_store_path(name)
     }
 
-    async fn spawn_and_connect() -> (MockStore, StoreServiceClient<Channel>) {
-        let (store, addr, _h) = spawn_mock_store().await.unwrap();
-        let client = rio_proto::client::connect_store(&addr.to_string())
-            .await
-            .expect("connect to mock store");
-        (store, client)
+    async fn spawn_and_connect() -> anyhow::Result<(MockStore, StoreServiceClient<Channel>)> {
+        let (store, addr, _h) = spawn_mock_store().await?;
+        let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+        Ok((store, client))
     }
 
     /// Seed a path with the given reference tags. Content is arbitrary;
@@ -432,8 +436,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_input_metadata_success() {
-        let (store, client) = spawn_and_connect().await;
+    async fn test_fetch_input_metadata_success() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
         let (p_foo, p_bar) = (tp("foo"), tp("bar"));
         seed_with_refs(&store, &p_foo, &[]);
         seed_with_refs(&store, &p_bar, &[]);
@@ -446,11 +450,12 @@ mod tests {
         // fetch_input_metadata uses buffered (not unordered) → order preserved.
         assert_eq!(result[0].path, p_foo);
         assert_eq!(result[1].path, p_bar);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fetch_input_metadata_missing_path_errors() {
-        let (store, client) = spawn_and_connect().await;
+    async fn test_fetch_input_metadata_missing_path_errors() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
         let (p_present, p_missing) = (tp("present"), tp("missing"));
         seed_with_refs(&store, &p_present, &[]);
         // p_missing is NOT seeded.
@@ -465,11 +470,12 @@ mod tests {
             }
             other => panic!("expected MetadataFetch, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_compute_input_closure_bfs() {
-        let (store, client) = spawn_and_connect().await;
+    async fn test_compute_input_closure_bfs() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
         let (p_drv, p_a, p_b, p_c) = (tp("test.drv"), tp("lib"), tp("dep"), tp("leaf"));
         // Chain: drv → A → B → C
         seed_with_refs(&store, &p_drv, std::slice::from_ref(&p_a));
@@ -488,13 +494,14 @@ mod tests {
         assert!(set.contains(&p_a));
         assert!(set.contains(&p_b));
         assert!(set.contains(&p_c));
+        Ok(())
     }
 
     /// A referenced path not in the store is skipped (not an error).
     /// FUSE will lazy-fetch it at build time.
     #[tokio::test]
-    async fn test_compute_input_closure_skips_notfound() {
-        let (store, client) = spawn_and_connect().await;
+    async fn test_compute_input_closure_skips_notfound() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
         let (p_drv, p_a, p_missing) = (tp("test.drv"), tp("lib"), tp("missing"));
         seed_with_refs(&store, &p_drv, &[]);
         seed_with_refs(&store, &p_a, std::slice::from_ref(&p_missing));
@@ -510,12 +517,13 @@ mod tests {
         assert!(set.contains(&p_drv));
         assert!(set.contains(&p_a));
         assert!(!set.contains(&p_missing));
+        Ok(())
     }
 
     /// Diamond: A→C, B→C. C must appear once (set semantics + BFS dedup).
     #[tokio::test]
-    async fn test_compute_input_closure_dedupes_diamond() {
-        let (store, client) = spawn_and_connect().await;
+    async fn test_compute_input_closure_dedupes_diamond() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
         let (p_drv, p_a, p_b, p_c) = (tp("test.drv"), tp("left"), tp("right"), tp("shared"));
         seed_with_refs(&store, &p_drv, &[]);
         seed_with_refs(&store, &p_a, std::slice::from_ref(&p_c));
@@ -523,14 +531,15 @@ mod tests {
         seed_with_refs(&store, &p_c, &[]);
 
         let drv = drv_with_srcs(&[p_a, p_b]);
-        let closure = compute_input_closure(&client, &drv, &p_drv).await.unwrap();
+        let closure = compute_input_closure(&client, &drv, &p_drv).await?;
 
         assert_eq!(closure.len(), 4); // drv, A, B, C (once)
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fetch_drv_from_store_success() {
-        let (store, mut client) = spawn_and_connect().await;
+    async fn test_fetch_drv_from_store_success() -> anyhow::Result<()> {
+        let (store, mut client) = spawn_and_connect().await?;
         // NAR-wrap a minimal ATerm as a single regular file.
         let out = tp("test-out");
         let drv_text = format!(
@@ -546,11 +555,12 @@ mod tests {
 
         assert_eq!(drv.platform(), "x86_64-linux");
         assert_eq!(drv.outputs().len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fetch_drv_from_store_not_found() {
-        let (_store, mut client) = spawn_and_connect().await;
+    async fn test_fetch_drv_from_store_not_found() -> anyhow::Result<()> {
+        let (_store, mut client) = spawn_and_connect().await?;
 
         let missing = tp("nonexistent.drv");
         let err = fetch_drv_from_store(&mut client, &missing)
@@ -559,11 +569,12 @@ mod tests {
 
         assert!(matches!(err, ExecutorError::BuildFailed(_)));
         assert!(err.to_string().contains("nonexistent.drv"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fetch_drv_from_store_bad_nar() {
-        let (store, mut client) = spawn_and_connect().await;
+    async fn test_fetch_drv_from_store_bad_nar() -> anyhow::Result<()> {
+        let (store, mut client) = spawn_and_connect().await?;
         // Seed garbage — not a valid NAR.
         let garbage = b"this is definitely not a NAR archive".to_vec();
         let drv_path = tp("bad.drv");
@@ -578,5 +589,6 @@ mod tests {
             err.to_string().contains("failed to parse .drv from NAR"),
             "got: {err}"
         );
+        Ok(())
     }
 }

@@ -65,25 +65,27 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_stat_to_attr_regular_file() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_stat_to_attr_regular_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let file_path = dir.path().join("test.txt");
-        fs::write(&file_path, "hello").unwrap();
+        fs::write(&file_path, "hello")?;
 
-        let meta = file_path.symlink_metadata().unwrap();
+        let meta = file_path.symlink_metadata()?;
         let attr = stat_to_attr(42, &meta);
 
         assert_eq!(attr.ino, INodeNo(42));
         assert_eq!(attr.size, 5);
         assert_eq!(attr.kind, FileType::RegularFile);
+        Ok(())
     }
 
     #[test]
-    fn test_stat_to_attr_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().symlink_metadata().unwrap();
+    fn test_stat_to_attr_directory() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let meta = dir.path().symlink_metadata()?;
         let attr = stat_to_attr(1, &meta);
 
         assert_eq!(attr.kind, FileType::Directory);
+        Ok(())
     }
 }

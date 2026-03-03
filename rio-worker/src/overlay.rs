@@ -246,13 +246,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_prepare_nix_state_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_dir = prepare_nix_state_dirs(dir.path()).unwrap();
+    fn test_prepare_nix_state_dirs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_dir = prepare_nix_state_dirs(dir.path())?;
 
         assert!(db_dir.exists());
         assert!(db_dir.is_dir());
         assert_eq!(db_dir, dir.path().join("nix/var/nix/db"));
+        Ok(())
     }
 
     /// Verify the leak counter increments exactly when teardown fails in Drop.
@@ -326,29 +327,31 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_overlay_rejects_bad_build_id() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_setup_overlay_rejects_bad_build_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let lower = dir.path();
 
         assert!(setup_overlay(lower, dir.path(), "", dummy_counter()).is_err());
         assert!(setup_overlay(lower, dir.path(), "foo/bar", dummy_counter()).is_err());
         assert!(setup_overlay(lower, dir.path(), "foo\0bar", dummy_counter()).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_setup_overlay_rejects_same_filesystem() {
+    fn test_setup_overlay_rejects_same_filesystem() -> anyhow::Result<()> {
         // Both lower and base_dir under the same tempdir → same st_dev.
         // The check fires before the mount syscall, so this runs without CAP_SYS_ADMIN.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir()?;
         let lower = dir.path().join("lower");
         let base = dir.path().join("base");
-        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&lower)?;
 
         let Err(e) = setup_overlay(&lower, &base, "test-build", dummy_counter()) else {
             panic!("expected setup_overlay to fail when upper and lower share a filesystem");
         };
         let msg = e.to_string();
         assert!(msg.contains("same filesystem"), "got: {msg}");
+        Ok(())
     }
 
     /// Verify that setup_overlay creates `{upper}/nix/store/` as the overlayfs
@@ -356,11 +359,11 @@ mod tests {
     /// Uses the same-filesystem rejection path to test dir creation without
     /// needing CAP_SYS_ADMIN for the actual mount.
     #[test]
-    fn test_setup_overlay_creates_store_upper() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_setup_overlay_creates_store_upper() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let lower = dir.path().join("lower");
         let base = dir.path().join("base");
-        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&lower)?;
 
         // Fails at st_dev check (post-mkdir, pre-mount).
         let _ = setup_overlay(&lower, &base, "test-build", dummy_counter());
@@ -374,5 +377,6 @@ mod tests {
             "overlayfs upperdir {store_upper:?} should be created"
         );
         assert!(store_upper.is_dir());
+        Ok(())
     }
 }

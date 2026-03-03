@@ -235,27 +235,29 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_scan_new_outputs_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let outputs = scan_new_outputs(dir.path()).unwrap();
+    fn test_scan_new_outputs_empty() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let outputs = scan_new_outputs(dir.path())?;
         assert!(outputs.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_scan_new_outputs_with_paths() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_scan_new_outputs_with_paths() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let store_dir = dir.path().join("nix/store");
-        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&store_dir)?;
 
         // Create in reverse alphabetical order to verify internal sort.
-        fs::create_dir(store_dir.join("def-world")).unwrap();
-        fs::create_dir(store_dir.join("abc-hello")).unwrap();
+        fs::create_dir(store_dir.join("def-world"))?;
+        fs::create_dir(store_dir.join("abc-hello"))?;
         // Hidden files should be skipped
-        fs::write(store_dir.join(".links"), "").unwrap();
+        fs::write(store_dir.join(".links"), "")?;
 
         // scan_new_outputs sorts internally for deterministic output.
-        let outputs = scan_new_outputs(dir.path()).unwrap();
+        let outputs = scan_new_outputs(dir.path())?;
         assert_eq!(outputs, vec!["abc-hello", "def-world"]);
+        Ok(())
     }
 
     #[test]
@@ -272,32 +274,30 @@ mod tests {
     use rio_test_support::grpc::{MockStore, spawn_mock_store};
     use std::sync::atomic::Ordering;
 
-    async fn spawn_and_connect() -> (
+    async fn spawn_and_connect() -> anyhow::Result<(
         MockStore,
         StoreServiceClient<Channel>,
         tokio::task::JoinHandle<()>,
-    ) {
-        let (store, addr, handle) = spawn_mock_store().await.unwrap();
-        let client = rio_proto::client::connect_store(&addr.to_string())
-            .await
-            .expect("connect to mock store");
-        (store, client, handle)
+    )> {
+        let (store, addr, handle) = spawn_mock_store().await?;
+        let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+        Ok((store, client, handle))
     }
 
     /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir.
-    fn make_output_file(basename: &str, contents: &[u8]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn make_output_file(basename: &str, contents: &[u8]) -> anyhow::Result<tempfile::TempDir> {
+        let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
-        fs::create_dir_all(&store_dir).unwrap();
-        fs::write(store_dir.join(basename), contents).unwrap();
-        tmp
+        fs::create_dir_all(&store_dir)?;
+        fs::write(store_dir.join(basename), contents)?;
+        Ok(tmp)
     }
 
     #[tokio::test]
-    async fn test_upload_output_success() {
-        let (store, mut client, _h) = spawn_and_connect().await;
+    async fn test_upload_output_success() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_and_connect().await?;
         let basename = test_store_basename("hello");
-        let tmp = make_output_file(&basename, b"hello world");
+        let tmp = make_output_file(&basename, b"hello world")?;
 
         let result = upload_output(&mut client, tmp.path(), &basename)
             .await
@@ -305,7 +305,7 @@ mod tests {
 
         assert_eq!(result.store_path, format!("/nix/store/{basename}"));
         // Hash must match SHA-256 of the NAR serialization.
-        let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename)).unwrap();
+        let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename))?;
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
         assert_eq!(result.nar_hash, expected_hash.to_vec());
         assert_eq!(result.nar_size, expected_nar.len() as u64);
@@ -314,17 +314,18 @@ mod tests {
         let puts = store.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1);
         assert_eq!(puts[0].store_path, format!("/nix/store/{basename}"));
+        Ok(())
     }
 
     /// Retry with exponential backoff — first 2 attempts fail, 3rd succeeds.
     /// start_paused auto-advances the clock during sleep() so the 1s+2s
     /// backoff delays don't wall-clock-block the test.
     #[tokio::test(start_paused = true)]
-    async fn test_upload_output_retries_then_succeeds() {
-        let (store, mut client, _h) = spawn_and_connect().await;
+    async fn test_upload_output_retries_then_succeeds() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_and_connect().await?;
         store.fail_next_puts.store(2, Ordering::SeqCst);
         let basename = test_store_basename("retry");
-        let tmp = make_output_file(&basename, b"retry me");
+        let tmp = make_output_file(&basename, b"retry me")?;
 
         let result = upload_output(&mut client, tmp.path(), &basename)
             .await
@@ -335,17 +336,18 @@ mod tests {
         assert_eq!(store.put_calls.read().unwrap().len(), 1);
         // All injected failures should have been consumed.
         assert_eq!(store.fail_next_puts.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 
     /// More failures than MAX_UPLOAD_RETRIES → UploadExhausted.
     #[tokio::test(start_paused = true)]
-    async fn test_upload_output_exhausts_retries() {
-        let (store, mut client, _h) = spawn_and_connect().await;
+    async fn test_upload_output_exhausts_retries() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_and_connect().await?;
         store
             .fail_next_puts
             .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
         let basename = test_store_basename("exhaust");
-        let tmp = make_output_file(&basename, b"never uploads");
+        let tmp = make_output_file(&basename, b"never uploads")?;
 
         let err = upload_output(&mut client, tmp.path(), &basename)
             .await
@@ -357,23 +359,24 @@ mod tests {
         );
         // No successful PutPath recorded.
         assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        Ok(())
     }
 
     /// upload_all_outputs runs concurrently; all outputs land in MockStore.
     #[tokio::test]
-    async fn test_upload_all_outputs_multiple() {
-        let (store, client, _h) = spawn_and_connect().await;
-        let tmp = tempfile::tempdir().unwrap();
+    async fn test_upload_all_outputs_multiple() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_and_connect().await?;
+        let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
-        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&store_dir)?;
         let (b1, b2, b3) = (
             test_store_basename("one"),
             test_store_basename("two"),
             test_store_basename("three"),
         );
-        fs::write(store_dir.join(&b1), b"one").unwrap();
-        fs::write(store_dir.join(&b2), b"two").unwrap();
-        fs::write(store_dir.join(&b3), b"three").unwrap();
+        fs::write(store_dir.join(&b1), b"one")?;
+        fs::write(store_dir.join(&b2), b"two")?;
+        fs::write(store_dir.join(&b3), b"three")?;
 
         let results = upload_all_outputs(&client, tmp.path())
             .await
@@ -387,15 +390,16 @@ mod tests {
         assert!(paths.contains(&format!("/nix/store/{b2}")));
         assert!(paths.contains(&format!("/nix/store/{b3}")));
         assert_eq!(store.put_calls.read().unwrap().len(), 3);
+        Ok(())
     }
 
     /// NAR serialization fails on ENOENT → UploadError::NarSerialize, no gRPC.
     #[tokio::test]
-    async fn test_upload_output_nar_serialize_error() {
-        let (store, mut client, _h) = spawn_and_connect().await;
-        let tmp = tempfile::tempdir().unwrap();
+    async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_and_connect().await?;
+        let tmp = tempfile::tempdir()?;
         // Create nix/store/ dir but NOT the output file.
-        fs::create_dir_all(tmp.path().join("nix/store")).unwrap();
+        fs::create_dir_all(tmp.path().join("nix/store"))?;
 
         let err = upload_output(&mut client, tmp.path(), "does-not-exist")
             .await
@@ -407,5 +411,6 @@ mod tests {
         );
         // No gRPC call attempted.
         assert_eq!(store.put_calls.read().unwrap().len(), 0);
+        Ok(())
     }
 }
