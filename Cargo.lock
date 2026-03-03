@@ -3715,12 +3715,14 @@ dependencies = [
  "anyhow",
  "prost",
  "prost-types",
+ "rio-nix",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
