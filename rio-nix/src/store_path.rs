@@ -503,6 +503,54 @@ mod tests {
         assert!(!is_valid_name_char('\0'));
     }
 
+    /// Single test exercising all the string-like trait impls. These were
+    /// 10× 3-line blocks at 0% each in lcov (Deref, AsRef, Borrow,
+    /// PartialEq×3, FromStr, Hash, StorePathHash::as_bytes + Debug).
+    #[test]
+    fn test_string_like_trait_impls() {
+        let full = "/nix/store/7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y-hello-2.12.1";
+        let p = StorePath::parse(full).unwrap();
+
+        // Deref<Target=str>
+        let s: &str = &p;
+        assert_eq!(s, full);
+        // AsRef<str>
+        assert_eq!(<StorePath as AsRef<str>>::as_ref(&p), full);
+        // Borrow<str>
+        assert_eq!(<StorePath as std::borrow::Borrow<str>>::borrow(&p), full);
+        // PartialEq<str>
+        assert_eq!(p, *full);
+        // PartialEq<&str>
+        assert_eq!(p, full);
+        // PartialEq<String>
+        assert_eq!(p, full.to_string());
+        // FromStr
+        let p2: StorePath = full.parse().unwrap();
+        assert_eq!(p, p2);
+        // Hash + Borrow<str> → HashSet lookup by &str works
+        let mut set = std::collections::HashSet::new();
+        set.insert(p.clone());
+        assert!(set.contains(full));
+        // StorePathHash::as_bytes
+        assert_eq!(p.hash().as_bytes().len(), 20);
+        // StorePathHash Debug shows the nixbase32-encoded hash
+        let dbg = format!("{:?}", p.hash());
+        assert!(dbg.starts_with("StorePathHash("));
+        assert!(dbg.contains("7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y"));
+    }
+
+    /// make_text with non-empty references exercises the ref-append loop.
+    #[test]
+    fn test_make_text_with_references() {
+        let r1 = StorePath::parse("/nix/store/00000000000000000000000000000000-ref1").unwrap();
+        let r2 = StorePath::parse("/nix/store/11111111111111111111111111111111-ref2").unwrap();
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32]).unwrap();
+        let p = StorePath::make_text("mytext", &hash, &[r1, r2]).unwrap();
+        // Exact hash is tested elsewhere (golden conformance); here we just
+        // verify the function succeeds with multiple refs.
+        assert_eq!(p.name(), "mytext");
+    }
+
     #[test]
     fn test_name_length_limit() {
         let name = "a".repeat(MAX_NAME_LEN);
