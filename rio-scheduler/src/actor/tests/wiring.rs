@@ -8,18 +8,19 @@ use super::*;
 /// the SAME worker_id, the actor should see it as fully registered.
 /// Validates that stream + heartbeat with the same worker_id registers correctly.
 #[tokio::test]
-async fn test_worker_registers_via_stream_and_heartbeat() {
+async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker-1", "x86_64-linux", 2).await;
+        setup_with_worker("test-worker-1", "x86_64-linux", 2).await?;
     settle().await;
 
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     assert_eq!(workers.len(), 1);
     assert_eq!(workers[0].worker_id, "test-worker-1");
     assert!(
         workers[0].is_registered,
         "worker should be fully registered after stream + heartbeat"
     );
+    Ok(())
 }
 
 /// Bug reproduction: handle_completion uses drv_hash as the lookup key,
@@ -30,15 +31,16 @@ async fn test_worker_registers_via_stream_and_heartbeat() {
 /// Expected to FAIL before fix: completion is dropped ("unknown derivation")
 /// and the build stays Active forever.
 #[tokio::test]
-async fn test_completion_resolves_drv_path_to_hash() {
+async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 2).await;
+        setup_with_worker("test-worker", "x86_64-linux", 2).await?;
 
     // Merge a single-node DAG
     let build_id = Uuid::new_v4();
     let drv_hash = "abc123hash";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     settle().await;
 
@@ -51,12 +53,12 @@ async fn test_completion_resolves_drv_path_to_hash() {
         &drv_path,
         &test_store_path("xyz-foo"),
     )
-    .await;
+    .await?;
 
     settle().await;
 
     // Query build status — should be Succeeded (single derivation, completed)
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
 
     assert_eq!(
         status.state,
@@ -64,6 +66,7 @@ async fn test_completion_resolves_drv_path_to_hash() {
         "build should succeed after completion sent with drv_path (got state={:?})",
         rio_proto::types::BuildState::try_from(status.state)
     );
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -78,14 +81,15 @@ async fn test_completion_resolves_drv_path_to_hash() {
 /// state machine (Running -> Ready is not a valid transition) and did NOT
 /// increment retry_count.
 #[tokio::test]
-async fn test_worker_disconnect_running_derivation() {
+async fn test_worker_disconnect_running_derivation() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await;
+        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
 
     // Merge a single-node DAG (worker will get it assigned)
     let build_id = Uuid::new_v4();
     let drv_hash = "disconnect-test-hash";
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Worker should have received an assignment
@@ -110,8 +114,7 @@ async fn test_worker_disconnect_running_derivation() {
     // Check current status: should be Assigned
     let info = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist");
     assert_eq!(info.status, DerivationStatus::Assigned);
     assert_eq!(info.retry_count, 0);
@@ -121,8 +124,7 @@ async fn test_worker_disconnect_running_derivation() {
         .send_unchecked(ActorCommand::WorkerDisconnected {
             worker_id: "test-worker".into(),
         })
-        .await
-        .unwrap();
+        .await?;
     settle().await;
 
     // Derivation should be back in Ready state, and retry_count
@@ -130,8 +132,7 @@ async fn test_worker_disconnect_running_derivation() {
     // failed attempt that counts toward retries).
     let info = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should still exist");
     assert_eq!(
         info.status,
@@ -143,6 +144,7 @@ async fn test_worker_disconnect_running_derivation() {
         "disconnect during Assigned should count as a retry attempt"
     );
     assert!(info.assigned_worker.is_none());
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -154,14 +156,15 @@ async fn test_worker_disconnect_running_derivation() {
 /// The gRPC layer synthesizes InfrastructureFailure for None results,
 /// so this verifies the full path.
 #[tokio::test]
-async fn test_completion_infrastructure_failure_handled() {
+async fn test_completion_infrastructure_failure_handled() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await;
+        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-fail-hash";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Send completion with InfrastructureFailure (what gRPC layer sends
@@ -173,7 +176,7 @@ async fn test_completion_infrastructure_failure_handled() {
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "worker sent CompletionReport with no result",
     )
-    .await;
+    .await?;
     settle().await;
 
     // The derivation should have gone through Failed -> Ready (retry) and
@@ -182,8 +185,7 @@ async fn test_completion_infrastructure_failure_handled() {
     // was processed rather than silently dropped.
     let info = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist");
     assert_eq!(
         info.retry_count, 1,
@@ -199,19 +201,21 @@ async fn test_completion_infrastructure_failure_handled() {
         "expected Ready or Assigned after retry, got {:?}",
         info.status
     );
+    Ok(())
 }
 
 /// Malicious/buggy worker timestamps (i64::MIN start, i64::MAX stop) must
 /// not panic the actor with integer overflow in the EMA duration computation.
 #[tokio::test]
-async fn test_completion_with_extreme_timestamps() {
+async fn test_completion_with_extreme_timestamps() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await;
+        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "extreme-ts-hash";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Send completion with extreme timestamps that would overflow i64 subtraction.
@@ -238,19 +242,19 @@ async fn test_completion_with_extreme_timestamps() {
                 ..Default::default()
             },
         })
-        .await
-        .unwrap();
+        .await?;
     settle().await;
 
     // If we got here, the actor didn't panic. Verify completion was processed
     // (build succeeded) and actor is still alive.
     assert!(handle.is_alive(), "actor must survive extreme timestamps");
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
         "build should succeed despite bogus timestamps"
     );
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -259,10 +263,10 @@ async fn test_completion_with_extreme_timestamps() {
 
 /// Interactive (IFD) builds should jump to the front of the ready queue.
 #[tokio::test]
-async fn test_interactive_builds_pushed_to_front() {
+async fn test_interactive_builds_pushed_to_front() -> TestResult {
     // Worker with capacity for 1 build at a time
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 1).await;
+        setup_with_worker("test-worker", "x86_64-linux", 1).await?;
 
     // Merge a "scheduled" build first (should go to back of queue)
     let build_normal = Uuid::new_v4();
@@ -273,14 +277,13 @@ async fn test_interactive_builds_pushed_to_front() {
         "hash-normal",
         PriorityClass::Scheduled,
     )
-    .await;
+    .await?;
     settle().await;
 
     // The normal build gets assigned first (only one in queue)
     let first = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     let first_path = match first.msg {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
         _ => panic!("expected assignment"),
@@ -295,23 +298,23 @@ async fn test_interactive_builds_pushed_to_front() {
         "hash-scheduled2",
         PriorityClass::Scheduled,
     )
-    .await;
+    .await?;
 
     // Merge an "interactive" build — should go to FRONT
     let build_ifd = Uuid::new_v4();
     let p_ifd = test_drv_path("hash-ifd");
-    let _rx3 = merge_single_node(&handle, build_ifd, "hash-ifd", PriorityClass::Interactive).await;
+    let _rx3 =
+        merge_single_node(&handle, build_ifd, "hash-ifd", PriorityClass::Interactive).await?;
     settle().await;
 
     // Complete the first build to free worker capacity
-    complete_success_empty(&handle, "test-worker", &p_normal).await;
+    complete_success_empty(&handle, "test-worker", &p_normal).await?;
     settle().await;
 
     // The next assignment should be the IFD derivation (was pushed to front)
     let second = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     let second_path = match second.msg {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
         _ => panic!("expected assignment"),
@@ -320,4 +323,5 @@ async fn test_interactive_builds_pushed_to_front() {
         second_path, p_ifd,
         "interactive build should be dispatched before scheduled"
     );
+    Ok(())
 }

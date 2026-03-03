@@ -2,9 +2,9 @@ use super::*;
 
 /// keepGoing=false: on PermanentFailure, the entire build fails immediately.
 #[tokio::test]
-async fn test_keepgoing_false_fails_fast() {
+async fn test_keepgoing_false_fails_fast() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 2).await;
+        setup_with_worker("test-worker", "x86_64-linux", 2).await?;
 
     // Merge a two-node DAG with keepGoing=false
     let build_id = Uuid::new_v4();
@@ -18,7 +18,7 @@ async fn test_keepgoing_false_fails_fast() {
         vec![],
         false, // keep_going=false (critical)
     )
-    .await;
+    .await?;
     settle().await;
 
     // Send PermanentFailure for hashA
@@ -29,23 +29,24 @@ async fn test_keepgoing_false_fails_fast() {
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
-    .await;
+    .await?;
     settle().await;
 
     // Build should be Failed (not waiting for hashB)
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
         "build should fail fast on PermanentFailure with keepGoing=false"
     );
+    Ok(())
 }
 
 /// keepGoing=true: build waits for all derivations, fails only at the end.
 #[tokio::test]
-async fn test_keepgoing_true_waits_all() {
+async fn test_keepgoing_true_waits_all() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux", 2).await;
+        setup_with_worker("test-worker", "x86_64-linux", 2).await?;
 
     // Merge a two-node DAG with keepGoing=true
     let build_id = Uuid::new_v4();
@@ -59,7 +60,7 @@ async fn test_keepgoing_true_waits_all() {
         vec![],
         true, // keep_going=true (critical)
     )
-    .await;
+    .await?;
     settle().await;
 
     // Send PermanentFailure for hashX
@@ -70,11 +71,11 @@ async fn test_keepgoing_true_waits_all() {
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "failed",
     )
-    .await;
+    .await?;
     settle().await;
 
     // Build should still be Active (waiting for hashY)
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Active as i32,
@@ -82,16 +83,17 @@ async fn test_keepgoing_true_waits_all() {
     );
 
     // Complete hashY successfully
-    complete_success_empty(&handle, "test-worker", &test_drv_path("hashY")).await;
+    complete_success_empty(&handle, "test-worker", &test_drv_path("hashY")).await?;
     settle().await;
 
     // Now build should be Failed (all resolved, one failed)
-    let status2 = query_status(&handle, build_id).await;
+    let status2 = query_status(&handle, build_id).await?;
     assert_eq!(
         status2.state,
         rio_proto::types::BuildState::Failed as i32,
         "build should fail after all derivations resolve with keepGoing=true"
     );
+    Ok(())
 }
 
 /// keepGoing=true with a dependency chain: poisoning a leaf must cascade
@@ -99,10 +101,10 @@ async fn test_keepgoing_true_waits_all() {
 /// cascade, parents stay Queued forever and completed+failed never reaches
 /// total -> build hangs.
 #[tokio::test]
-async fn test_keepgoing_poisoned_dependency_cascades_failure() {
+async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
     // Worker with capacity 1: only the leaf gets dispatched initially.
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("cascade-worker", "x86_64-linux", 1).await;
+        setup_with_worker("cascade-worker", "x86_64-linux", 1).await?;
 
     // Chain: A depends on B depends on C. C is the leaf.
     let build_id = Uuid::new_v4();
@@ -120,20 +122,18 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
         ],
         true, // keep_going
     )
-    .await;
+    .await?;
     settle().await;
 
     // Sanity: C is the only Ready/Assigned derivation; A and B are Queued.
     let info_a = handle
         .debug_query_derivation("cascadeA")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     let info_b = handle
         .debug_query_derivation("cascadeB")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(info_a.status, DerivationStatus::Queued);
     assert_eq!(info_b.status, DerivationStatus::Queued);
 
@@ -145,15 +145,14 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
-    .await;
+    .await?;
     settle().await;
 
     // B and A should now be DependencyFailed (cascaded transitively).
     let info_b = handle
         .debug_query_derivation("cascadeB")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         info_b.status,
         DerivationStatus::DependencyFailed,
@@ -161,9 +160,8 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
     );
     let info_a = handle
         .debug_query_derivation("cascadeA")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         info_a.status,
         DerivationStatus::DependencyFailed,
@@ -172,7 +170,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
 
     // Build should terminate as Failed (all 3 derivations resolved:
     // 1 Poisoned + 2 DependencyFailed counted in failed).
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
@@ -182,6 +180,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
         status.failed_derivations, 3,
         "1 Poisoned + 2 DependencyFailed should all count as failed"
     );
+    Ok(())
 }
 
 /// When a new build depends on an already-poisoned derivation (from a
@@ -190,13 +189,13 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
 /// forever (never Ready, never cascaded since cascade only runs on
 /// *transition to* Poisoned).
 #[tokio::test]
-async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
+async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("poison-worker", "x86_64-linux", 1).await;
+        setup_with_worker("poison-worker", "x86_64-linux", 1).await?;
 
     // Build 1: single leaf, poisoned via PermanentFailure.
     let build1 = Uuid::new_v4();
-    let _rx1 = merge_single_node(&handle, build1, "preleaf", PriorityClass::Scheduled).await;
+    let _rx1 = merge_single_node(&handle, build1, "preleaf", PriorityClass::Scheduled).await?;
     settle().await;
     complete_failure(
         &handle,
@@ -205,15 +204,14 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "preleaf failed",
     )
-    .await;
+    .await?;
     settle().await;
 
     // Verify preleaf is Poisoned.
     let leaf = handle
         .debug_query_derivation("preleaf")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(leaf.status, DerivationStatus::Poisoned);
 
     // Build 2: new node depending on the poisoned preleaf.
@@ -229,15 +227,14 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
         vec![make_test_edge("preparent", "preleaf")],
         false,
     )
-    .await;
+    .await?;
     settle().await;
 
     // preparent must be DependencyFailed (not stuck Queued).
     let parent = handle
         .debug_query_derivation("preparent")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         parent.status,
         DerivationStatus::DependencyFailed,
@@ -245,12 +242,13 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
     );
 
     // Build 2 must be Failed (!keepGoing + dep failure).
-    let status = query_status(&handle, build2).await;
+    let status = query_status(&handle, build2).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
         "build depending on pre-poisoned dep must fail immediately (!keepGoing)"
     );
+    Ok(())
 }
 
 /// WatchBuild on an already-terminal build must immediately send the
@@ -258,17 +256,17 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
 /// BuildCompleted was sent to zero receivers (e.g., submit subscriber
 /// disconnected before completion), a late WatchBuild would hang forever.
 #[tokio::test]
-async fn test_watch_build_after_completion_receives_terminal_event() {
+async fn test_watch_build_after_completion_receives_terminal_event() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("watch-worker", "x86_64-linux", 1).await;
+        setup_with_worker("watch-worker", "x86_64-linux", 1).await?;
 
     // Submit a build, complete it, then drop the original subscriber.
     let build_id = Uuid::new_v4();
     let original_rx =
-        merge_single_node(&handle, build_id, "watch-hash", PriorityClass::Scheduled).await;
+        merge_single_node(&handle, build_id, "watch-hash", PriorityClass::Scheduled).await?;
     settle().await;
 
-    complete_success_empty(&handle, "watch-worker", &test_drv_path("watch-hash")).await;
+    complete_success_empty(&handle, "watch-worker", &test_drv_path("watch-hash")).await?;
     settle().await;
 
     // Drop the original subscriber. The BuildCompleted event was already
@@ -283,9 +281,8 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
             since_sequence: 0,
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    let mut watch_rx = reply_rx.await.unwrap().unwrap();
+        .await?;
+    let mut watch_rx = reply_rx.await??;
 
     // Should get a terminal event within a short timeout, not hang.
     let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.recv())
@@ -300,6 +297,7 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
         "late WatchBuild should receive BuildCompleted replay, got: {:?}",
         event.event
     );
+    Ok(())
 }
 
 /// Terminal build state should be cleaned up after TERMINAL_CLEANUP_DELAY
@@ -309,33 +307,33 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
 /// since paused time interferes with PG pool timeouts. The delay
 /// scheduling itself is trivially correct (tokio::time::sleep + try_send).
 #[tokio::test]
-async fn test_terminal_build_cleanup_after_delay() {
+async fn test_terminal_build_cleanup_after_delay() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("cleanup-worker", "x86_64-linux", 1).await;
+        setup_with_worker("cleanup-worker", "x86_64-linux", 1).await?;
 
     // Complete a build.
     let build_id = Uuid::new_v4();
     let drv_hash = "cleanup-hash";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
-    complete_success_empty(&handle, "cleanup-worker", &drv_path).await;
+    complete_success_empty(&handle, "cleanup-worker", &drv_path).await?;
     settle().await;
 
     // Build should be Succeeded and still queryable.
-    let status = try_query_status(&handle, build_id).await;
+    let status = try_query_status(&handle, build_id).await?;
     assert!(status.is_ok(), "build should be queryable before cleanup");
 
     // Directly inject the cleanup command (bypassing the 60s delay).
     handle
         .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id })
-        .await
-        .unwrap();
+        .await?;
     settle().await;
 
     // Build should now be gone (BuildNotFound).
-    let status = try_query_status(&handle, build_id).await;
+    let status = try_query_status(&handle, build_id).await?;
     assert!(
         matches!(status, Err(ActorError::BuildNotFound(_))),
         "build should be cleaned up after delay, got {:?}",
@@ -343,35 +341,35 @@ async fn test_terminal_build_cleanup_after_delay() {
     );
 
     // DAG node should also be reaped (Completed + orphaned).
-    let info = handle.debug_query_derivation(drv_hash).await.unwrap();
+    let info = handle.debug_query_derivation(drv_hash).await?;
     assert!(
         info.is_none(),
         "orphaned+terminal DAG node should be reaped"
     );
+    Ok(())
 }
 
 /// TransientFailure: retry on a different worker up to max_retries (default 2).
 #[tokio::test]
-async fn test_transient_retry_different_worker() {
+async fn test_transient_retry_different_worker() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Register two workers
-    let _rx1 = connect_worker(&handle, "worker-a", "x86_64-linux", 1).await;
-    let _rx2 = connect_worker(&handle, "worker-b", "x86_64-linux", 1).await;
+    let _rx1 = connect_worker(&handle, "worker-a", "x86_64-linux", 1).await?;
+    let _rx2 = connect_worker(&handle, "worker-b", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let p_retry = test_drv_path("retry-hash");
     let _event_rx =
-        merge_single_node(&handle, build_id, "retry-hash", PriorityClass::Scheduled).await;
+        merge_single_node(&handle, build_id, "retry-hash", PriorityClass::Scheduled).await?;
     settle().await;
 
     // Get initial worker assignment
     let info1 = handle
         .debug_query_derivation("retry-hash")
-        .await
-        .unwrap()
-        .unwrap();
-    let first_worker = info1.assigned_worker.clone().unwrap();
+        .await?
+        .expect("exists");
+    let first_worker = info1.assigned_worker.clone().expect("assigned to a worker");
     assert_eq!(info1.retry_count, 0);
 
     // Send TransientFailure from the first worker
@@ -382,15 +380,14 @@ async fn test_transient_retry_different_worker() {
         rio_proto::types::BuildResultStatus::TransientFailure,
         "network hiccup",
     )
-    .await;
+    .await?;
     settle().await;
 
     // Should be retried: retry_count=1, possibly on a different worker
     let info2 = handle
         .debug_query_derivation("retry-hash")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         info2.retry_count, 1,
         "transient failure should increment retry_count"
@@ -401,6 +398,7 @@ async fn test_transient_retry_different_worker() {
         info2.status,
         DerivationStatus::Assigned | DerivationStatus::Ready
     ));
+    Ok(())
 }
 
 /// max_retries (default 2) exhausted with the SAME worker should poison.
@@ -408,13 +406,13 @@ async fn test_transient_retry_different_worker() {
 /// POISON_THRESHOLD (3 distinct workers) — same worker failing
 /// repeatedly hits max_retries first.
 #[tokio::test]
-async fn test_transient_failure_max_retries_same_worker_poisons() {
-    let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await;
+async fn test_transient_failure_max_retries_same_worker_poisons() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let p_maxretry = test_drv_path("maxretry-hash");
     let _event_rx =
-        merge_single_node(&handle, build_id, "maxretry-hash", PriorityClass::Scheduled).await;
+        merge_single_node(&handle, build_id, "maxretry-hash", PriorityClass::Scheduled).await?;
     settle().await;
 
     // Default RetryPolicy::max_retries = 2. Fail 3 times on same worker:
@@ -427,32 +425,32 @@ async fn test_transient_failure_max_retries_same_worker_poisons() {
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("attempt {attempt} failed"),
         )
-        .await;
+        .await?;
         settle().await;
     }
 
     let info = handle
         .debug_query_derivation("maxretry-hash")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
         "3 transient failures on same worker (retry_count >= max_retries=2) should poison"
     );
+    Ok(())
 }
 
 /// CancelBuild on an active build should clean up derivations and emit
 /// BuildCancelled event. Previously untested.
 #[tokio::test]
-async fn test_cancel_build_active_drains_derivations() {
+async fn test_cancel_build_active_drains_derivations() -> TestResult {
     let (_db, handle, _task) = setup().await;
     // No workers — derivation stays Ready (never assigned).
 
     let build_id = Uuid::new_v4();
     let mut event_rx =
-        merge_single_node(&handle, build_id, "cancel-hash", PriorityClass::Scheduled).await;
+        merge_single_node(&handle, build_id, "cancel-hash", PriorityClass::Scheduled).await?;
     settle().await;
 
     // Send CancelBuild.
@@ -463,14 +461,13 @@ async fn test_cancel_build_active_drains_derivations() {
             reason: "test cancel".into(),
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    let cancelled = reply_rx.await.unwrap().unwrap();
+        .await?;
+    let cancelled = reply_rx.await??;
     assert!(cancelled, "CancelBuild should return true for active build");
     settle().await;
 
     // Build should be Cancelled.
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Cancelled as i32,
@@ -497,21 +494,21 @@ async fn test_cancel_build_active_drains_derivations() {
             reason: "already cancelled".into(),
             reply: reply_tx2,
         })
-        .await
-        .unwrap();
-    let re_cancelled = reply_rx2.await.unwrap().unwrap();
+        .await?;
+    let re_cancelled = reply_rx2.await??;
     assert!(
         !re_cancelled,
         "CancelBuild on already-terminal build should return false"
     );
+    Ok(())
 }
 
 /// WatchBuild during an active build should receive events as they happen.
 /// (The after-completion case is tested separately.)
 #[tokio::test]
-async fn test_watch_build_receives_events() {
+async fn test_watch_build_receives_events() -> TestResult {
     let (_db, handle, _task, _rx) =
-        setup_with_worker("watch-events-worker", "x86_64-linux", 1).await;
+        setup_with_worker("watch-events-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let _original = merge_single_node(
@@ -520,7 +517,7 @@ async fn test_watch_build_receives_events() {
         "watch-events-hash",
         PriorityClass::Scheduled,
     )
-    .await;
+    .await?;
     settle().await;
 
     // WatchBuild on the active build.
@@ -531,9 +528,8 @@ async fn test_watch_build_receives_events() {
             since_sequence: 0,
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    let mut watch_rx = reply_rx.await.unwrap().unwrap();
+        .await?;
+    let mut watch_rx = reply_rx.await??;
 
     // Complete the build; watcher should see BuildCompleted.
     complete_success_empty(
@@ -541,7 +537,7 @@ async fn test_watch_build_receives_events() {
         "watch-events-worker",
         &test_drv_path("watch-events-hash"),
     )
-    .await;
+    .await?;
 
     let mut saw_completed = false;
     // Drain events with a timeout.
@@ -563,15 +559,16 @@ async fn test_watch_build_receives_events() {
         saw_completed,
         "WatchBuild subscriber should see BuildCompleted"
     );
+    Ok(())
 }
 
 /// Dispatch should skip over derivations with no eligible worker (wrong
 /// system or missing feature) instead of blocking the entire queue.
 #[tokio::test]
-async fn test_dispatch_skips_ineligible_derivation() {
+async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
     // Only x86_64 worker registered.
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("x86-only-worker", "x86_64-linux", 2).await;
+        setup_with_worker("x86-only-worker", "x86_64-linux", 2).await?;
 
     // Merge aarch64 derivation FIRST (goes to queue head), then x86_64.
     // With the old `None => break`, the aarch64 drv at head would block
@@ -584,11 +581,11 @@ async fn test_dispatch_skips_ineligible_derivation() {
         vec![],
         false,
     )
-    .await;
+    .await?;
 
     let build_x86 = Uuid::new_v4();
     let p_x86 = test_drv_path("x86-hash");
-    let _rx = merge_single_node(&handle, build_x86, "x86-hash", PriorityClass::Scheduled).await;
+    let _rx = merge_single_node(&handle, build_x86, "x86-hash", PriorityClass::Scheduled).await?;
     settle().await;
 
     // x86_64 derivation should be dispatched despite aarch64 ahead of it.
@@ -608,22 +605,22 @@ async fn test_dispatch_skips_ineligible_derivation() {
     // aarch64 derivation should still be Ready (not stuck, not dispatched).
     let arm_info = handle
         .debug_query_derivation("arm-hash")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         arm_info.status,
         DerivationStatus::Ready,
         "aarch64 derivation should remain Ready (no eligible worker)"
     );
+    Ok(())
 }
 
 /// Per-build BuildOptions (max_silent_time, build_timeout) must propagate
 /// to the worker via WorkAssignment. Previously sent all-zeros defaults.
 #[tokio::test]
-async fn test_build_options_propagated_to_worker() {
+async fn test_build_options_propagated_to_worker() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("options-worker", "x86_64-linux", 1).await;
+        setup_with_worker("options-worker", "x86_64-linux", 1).await?;
 
     // Submit with build_timeout=300, max_silent_time=60.
     let build_id = Uuid::new_v4();
@@ -645,16 +642,14 @@ async fn test_build_options_propagated_to_worker() {
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    let _rx = reply_rx.await.unwrap().unwrap();
+        .await?;
+    let _rx = reply_rx.await??;
     settle().await;
 
     // Worker should receive assignment with the build's options.
     let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     let Some(rio_proto::types::scheduler_message::Msg::Assignment(assignment)) = msg.msg else {
         panic!("expected assignment");
     };
@@ -668,38 +663,39 @@ async fn test_build_options_propagated_to_worker() {
         "max_silent_time should propagate from build to worker"
     );
     assert_eq!(opts.build_cores, 4);
+    Ok(())
 }
 
 /// TOCTOU fix: a stale heartbeat (sent before scheduler assigned a
 /// derivation) must not clobber the scheduler's fresh assignment in
 /// worker.running_builds. The scheduler is authoritative.
 #[tokio::test]
-async fn test_heartbeat_does_not_clobber_fresh_assignment() {
+async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // Register worker (initial heartbeat has empty running_builds).
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("toctou-worker", "x86_64-linux", 2).await;
+        setup_with_worker("toctou-worker", "x86_64-linux", 2).await?;
     settle().await;
 
     // Merge a derivation. Scheduler will assign it to the worker and
     // insert it into worker.running_builds.
     let build_id = Uuid::new_v4();
     let drv_hash = "toctou-drv-hash";
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Verify: derivation is Assigned, worker.running_builds contains it.
     let info = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist");
     assert_eq!(info.status, DerivationStatus::Assigned);
 
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
         .find(|w| w.worker_id == "toctou-worker")
-        .unwrap();
+        .expect("toctou-worker registered");
     assert!(
         w.running_builds.contains(&drv_hash.to_string()),
         "scheduler should have tracked the assignment in worker.running_builds"
@@ -715,39 +711,40 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() {
             max_builds: 2,
             running_builds: vec![], // stale — does NOT include fresh assignment
         })
-        .await
-        .unwrap();
+        .await?;
     settle().await;
 
     // Assignment must still be tracked. Before the fix, running_builds
     // would be wholesale replaced with the empty set, orphaning the
     // assignment (completion would later warn "unknown derivation").
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     let w = workers
         .iter()
         .find(|w| w.worker_id == "toctou-worker")
-        .unwrap();
+        .expect("toctou-worker registered");
     assert!(
         w.running_builds.contains(&drv_hash.to_string()),
         "stale heartbeat must not clobber scheduler's fresh assignment"
     );
+    Ok(())
 }
 
 /// T4: Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
 #[tokio::test]
-async fn test_poison_threshold_after_distinct_workers() {
+async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Register 4 workers so the derivation can be re-dispatched after each failure.
-    let _rx1 = connect_worker(&handle, "poison-w1", "x86_64-linux", 1).await;
-    let _rx2 = connect_worker(&handle, "poison-w2", "x86_64-linux", 1).await;
-    let _rx3 = connect_worker(&handle, "poison-w3", "x86_64-linux", 1).await;
-    let _rx4 = connect_worker(&handle, "poison-w4", "x86_64-linux", 1).await;
+    let _rx1 = connect_worker(&handle, "poison-w1", "x86_64-linux", 1).await?;
+    let _rx2 = connect_worker(&handle, "poison-w2", "x86_64-linux", 1).await?;
+    let _rx3 = connect_worker(&handle, "poison-w3", "x86_64-linux", 1).await?;
+    let _rx4 = connect_worker(&handle, "poison-w4", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "poison-drv";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
@@ -759,14 +756,13 @@ async fn test_poison_threshold_after_distinct_workers() {
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("failure {i}"),
         )
-        .await;
+        .await?;
         settle().await;
     }
 
     let info = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist");
     assert_eq!(
         info.status,
@@ -776,19 +772,20 @@ async fn test_poison_threshold_after_distinct_workers() {
     );
 
     // Build should be Failed.
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Failed as i32,
         "build should fail after derivation is poisoned"
     );
+    Ok(())
 }
 
 /// T5: Completing a child releases its parent to Ready in a dependency chain.
 #[tokio::test]
-async fn test_dependency_chain_releases_parent() {
+async fn test_dependency_chain_releases_parent() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("chain-worker", "x86_64-linux", 1).await;
+        setup_with_worker("chain-worker", "x86_64-linux", 1).await?;
 
     // A depends on B. B is Ready (leaf), A is Queued.
     let build_id = Uuid::new_v4();
@@ -804,22 +801,20 @@ async fn test_dependency_chain_releases_parent() {
         vec![make_test_edge("chainA", "chainB")],
         false,
     )
-    .await;
+    .await?;
     settle().await;
 
     // B is dispatched first (leaf). A is Queued waiting for B.
     let info_a = handle
         .debug_query_derivation("chainA")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(info_a.status, DerivationStatus::Queued);
 
     // Worker receives B's assignment.
     let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     let assigned_path = match msg.msg {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
         _ => panic!("expected assignment"),
@@ -827,15 +822,14 @@ async fn test_dependency_chain_releases_parent() {
     assert_eq!(assigned_path, p_chain_b);
 
     // Complete B.
-    complete_success_empty(&handle, "chain-worker", &p_chain_b).await;
+    complete_success_empty(&handle, "chain-worker", &p_chain_b).await?;
     settle().await;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
     let info_a = handle
         .debug_query_derivation("chainA")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert!(
         matches!(
             info_a.status,
@@ -847,9 +841,8 @@ async fn test_dependency_chain_releases_parent() {
 
     // Worker should receive A's assignment.
     let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     let assigned_path = match msg.msg {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
         _ => panic!("expected assignment"),
@@ -858,29 +851,30 @@ async fn test_dependency_chain_releases_parent() {
         assigned_path, p_chain_a,
         "A should be dispatched after B completes"
     );
+    Ok(())
 }
 
 /// T9: Duplicate ProcessCompletion is an idempotent no-op.
 #[tokio::test]
-async fn test_duplicate_completion_idempotent() {
+async fn test_duplicate_completion_idempotent() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("idem-worker", "x86_64-linux", 1).await;
+        setup_with_worker("idem-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "idem-hash";
     let drv_path = test_drv_path(drv_hash);
     let mut event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Send completion TWICE.
     for _ in 0..2 {
-        complete_success_empty(&handle, "idem-worker", &drv_path).await;
+        complete_success_empty(&handle, "idem-worker", &drv_path).await?;
         settle().await;
     }
 
     // completed_count should be 1, not 2.
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.completed_derivations, 1,
         "duplicate completion should not double-count"
@@ -906,6 +900,7 @@ async fn test_duplicate_completion_idempotent() {
         completed_events, 1,
         "BuildCompleted event should fire exactly once"
     );
+    Ok(())
 }
 
 /// T1: Heartbeat timeout deregisters worker and reassigns its builds.
@@ -916,7 +911,7 @@ async fn test_duplicate_completion_idempotent() {
 /// so that path is already covered by test_worker_disconnect_running_derivation.
 /// This test verifies the Tick-driven path specifically by injecting Ticks.
 #[tokio::test]
-async fn test_heartbeat_timeout_via_tick_deregisters_worker() {
+async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
     // NOTE: This test would ideally use tokio::time::pause + advance, but
     // that interferes with PG pool timeouts. Instead, we verify that Tick
     // correctly processes the timeout path by checking the missed_heartbeats
@@ -926,20 +921,21 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() {
     // timeout-removal path is exercised directly via WorkerDisconnected
     // in test_worker_disconnect_running_derivation.
     let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("tick-worker", "x86_64-linux", 1).await;
+        setup_with_worker("tick-worker", "x86_64-linux", 1).await?;
     settle().await;
 
     // Send several Ticks. Worker has fresh heartbeat, should NOT be removed.
     for _ in 0..MAX_MISSED_HEARTBEATS + 1 {
-        handle.send_unchecked(ActorCommand::Tick).await.unwrap();
+        handle.send_unchecked(ActorCommand::Tick).await?;
     }
     settle().await;
 
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     assert!(
         workers.iter().any(|w| w.worker_id == "tick-worker"),
         "worker with fresh heartbeat should survive Tick"
     );
+    Ok(())
 }
 
 // ===========================================================================
@@ -950,8 +946,9 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() {
 /// a Tick is processed. Covers actor/worker.rs:178-201 (poison-expiry loop)
 /// and state/mod.rs:reset_from_poison.
 #[tokio::test]
-async fn test_tick_expires_poisoned_derivation() {
-    let (_db, handle, _task, _rx) = setup_with_worker("poison-ttl-worker", "x86_64-linux", 1).await;
+async fn test_tick_expires_poisoned_derivation() -> TestResult {
+    let (_db, handle, _task, _rx) =
+        setup_with_worker("poison-ttl-worker", "x86_64-linux", 1).await?;
 
     // Merge, dispatch, poison via PermanentFailure.
     let build_id = Uuid::new_v4();
@@ -961,7 +958,7 @@ async fn test_tick_expires_poisoned_derivation() {
         "poison-ttl-hash",
         PriorityClass::Scheduled,
     )
-    .await;
+    .await?;
     settle().await;
 
     complete_failure(
@@ -971,14 +968,13 @@ async fn test_tick_expires_poisoned_derivation() {
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
-    .await;
+    .await?;
     settle().await;
 
     // Verify poisoned.
     let pre = handle
         .debug_query_derivation("poison-ttl-hash")
-        .await
-        .unwrap()
+        .await?
         .expect("derivation exists");
     assert_eq!(pre.status, DerivationStatus::Poisoned);
 
@@ -986,19 +982,19 @@ async fn test_tick_expires_poisoned_derivation() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Tick processes the expiry.
-    handle.send_unchecked(ActorCommand::Tick).await.unwrap();
+    handle.send_unchecked(ActorCommand::Tick).await?;
     settle().await;
 
     let post = handle
         .debug_query_derivation("poison-ttl-hash")
-        .await
-        .unwrap()
+        .await?
         .expect("derivation still exists");
     assert_eq!(
         post.status,
         DerivationStatus::Created,
         "poisoned derivation should be reset after TTL expiry"
     );
+    Ok(())
 }
 
 // ===========================================================================
@@ -1016,14 +1012,14 @@ async fn test_tick_expires_poisoned_derivation() {
 /// derivation-status and assignment-status DB-error branches.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_completion_db_fault_build_history_logged() {
-    let (db, handle, _task, _rx) = setup_with_worker("fault-worker", "x86_64-linux", 1).await;
+async fn test_completion_db_fault_build_history_logged() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("fault-worker", "x86_64-linux", 1).await?;
 
     // Use a node with pname so update_build_history is called.
     let build_id = Uuid::new_v4();
     let mut node = make_test_node("fault-hash", "x86_64-linux");
     node.pname = "fault-pkg".into();
-    let _evt_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
+    let _evt_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
     settle().await;
 
     // Close pool AFTER merge/dispatch so only completion DB writes fail.
@@ -1047,16 +1043,14 @@ async fn test_completion_db_fault_build_history_logged() {
                 ..Default::default()
             },
         })
-        .await
-        .unwrap();
+        .await?;
     settle().await;
 
     // In-memory state should have transitioned despite all DB write failures.
     let post = handle
         .debug_query_derivation("fault-hash")
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(post.status, DerivationStatus::Completed);
 
     // The three DB-error branches should all have logged.
@@ -1068,17 +1062,18 @@ async fn test_completion_db_fault_build_history_logged() {
         logs_contain("failed to update build history EMA"),
         "build_history EMA DB failure should be logged"
     );
+    Ok(())
 }
 
 /// Transient failure with pool closed: retry-persist logs error.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_transient_failure_db_fault_retry_persist_logged() {
-    let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux", 1).await;
+async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let _evt_rx =
-        merge_single_node(&handle, build_id, "tfault-hash", PriorityClass::Scheduled).await;
+        merge_single_node(&handle, build_id, "tfault-hash", PriorityClass::Scheduled).await?;
     settle().await;
 
     db.pool.close().await;
@@ -1090,7 +1085,7 @@ async fn test_transient_failure_db_fault_retry_persist_logged() {
         rio_proto::types::BuildResultStatus::TransientFailure,
         "flaky network",
     )
-    .await;
+    .await?;
     settle().await;
 
     // Transient with retry_count < max → should hit the retry-persist branches.
@@ -1098,14 +1093,15 @@ async fn test_transient_failure_db_fault_retry_persist_logged() {
         logs_contain("failed to persist Failed status") || logs_contain("failed to persist retry"),
         "transient-failure DB write failure should be logged"
     );
+    Ok(())
 }
 
 /// 2-node chain: B completes, A becomes newly-ready. Pool closed →
 /// the newly-ready DB update fails and logs.
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_newly_ready_db_fault_status_persist_logged() {
-    let (db, handle, _task, _rx) = setup_with_worker("nrfault-worker", "x86_64-linux", 1).await;
+async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("nrfault-worker", "x86_64-linux", 1).await?;
 
     // A depends on B (edge parent=A, child=B — B must complete first).
     let build_id = Uuid::new_v4();
@@ -1119,7 +1115,7 @@ async fn test_newly_ready_db_fault_status_persist_logged() {
         vec![make_test_edge("nrA", "nrB")],
         false,
     )
-    .await;
+    .await?;
     settle().await;
 
     db.pool.close().await;
@@ -1131,11 +1127,14 @@ async fn test_newly_ready_db_fault_status_persist_logged() {
         &test_drv_path("nrB"),
         &test_store_path("out-B"),
     )
-    .await;
+    .await?;
     settle().await;
 
     // A should be Ready in-memory (transition succeeds); DB write logged.
-    let a = handle.debug_query_derivation("nrA").await.unwrap().unwrap();
+    let a = handle
+        .debug_query_derivation("nrA")
+        .await?
+        .expect("nrA exists");
     // A may have been dispatched immediately (Ready → Assigned). Either is fine.
     assert!(
         matches!(
@@ -1149,16 +1148,17 @@ async fn test_newly_ready_db_fault_status_persist_logged() {
         logs_contain("failed to update status"),
         "newly-ready DB write failure should be logged"
     );
+    Ok(())
 }
 
 /// Interactive builds get push_front on the ready queue. After a dependency
 /// completes, an Interactive build's newly-ready derivation dispatches
 /// BEFORE already-queued Scheduled derivations.
 #[tokio::test]
-async fn test_interactive_priority_push_front() {
+async fn test_interactive_priority_push_front() -> TestResult {
     // Worker with 1 slot so dispatch order is observable.
     let (_db, handle, _task, mut worker_rx) =
-        setup_with_worker("prio-worker", "x86_64-linux", 1).await;
+        setup_with_worker("prio-worker", "x86_64-linux", 1).await?;
 
     // Build 1: Scheduled, 2 independent leaves (Q, R). Both queue immediately.
     // Only 1 dispatches (worker has 1 slot); the other stays queued.
@@ -1173,7 +1173,7 @@ async fn test_interactive_priority_push_front() {
         vec![],
         false,
     )
-    .await;
+    .await?;
     settle().await;
 
     // Build 2: Interactive, 2-node chain A → B. B is a leaf, A blocked.
@@ -1197,9 +1197,8 @@ async fn test_interactive_priority_push_front() {
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    let _rx2 = reply_rx.await.unwrap().unwrap();
+        .await?;
+    let _rx2 = reply_rx.await??;
     settle().await;
 
     // Drain the first assignment (one of Q/R/B — whichever dispatched first).
@@ -1221,7 +1220,7 @@ async fn test_interactive_priority_push_front() {
         let path = a.drv_path.clone();
         seen_paths.push(path.clone());
         // Complete it.
-        complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await;
+        complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await?;
         settle().await;
         // If we just completed B, the NEXT dispatch should be A (push_front).
         if path == p_prio_b {
@@ -1235,7 +1234,7 @@ async fn test_interactive_priority_push_front() {
                 "Interactive newly-ready A should dispatch before queued Scheduled work. \
                  Dispatch history: {seen_paths:?}"
             );
-            return;
+            return Ok(());
         }
     }
     panic!("never dispatched prioB within 4 completions. Dispatch history: {seen_paths:?}");
@@ -1248,7 +1247,7 @@ async fn test_interactive_priority_push_front() {
 /// When DB persistence fails mid-merge, cleanup_failed_merge rolls back
 /// all in-memory state. The build_id should be unknown afterward.
 #[tokio::test]
-async fn test_merge_db_failure_rolls_back_memory() {
+async fn test_merge_db_failure_rolls_back_memory() -> TestResult {
     let (db, handle, _task) = setup().await;
 
     // Close pool BEFORE merge so insert_build fails immediately.
@@ -1269,9 +1268,8 @@ async fn test_merge_db_failure_rolls_back_memory() {
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    let reply = reply_rx.await.unwrap();
+        .await?;
+    let reply = reply_rx.await?;
 
     // Merge should have failed.
     assert!(
@@ -1280,27 +1278,26 @@ async fn test_merge_db_failure_rolls_back_memory() {
     );
 
     // And the build should NOT exist in memory (rollback worked).
-    let status_result = try_query_status(&handle, build_id).await;
+    let status_result = try_query_status(&handle, build_id).await?;
     assert!(
         matches!(status_result, Err(ActorError::BuildNotFound(_))),
         "rolled-back build should be NotFound, got {status_result:?}"
     );
+    Ok(())
 }
 
 /// check_cached_outputs store error is non-fatal: merge proceeds with
 /// empty-set result (everything assumed uncached).
 #[tokio::test]
-async fn test_check_cached_outputs_store_error_non_fatal() {
+async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
     use rio_test_support::grpc::spawn_mock_store;
     use std::sync::atomic::Ordering;
 
     let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, addr, _store_h) = spawn_mock_store().await.unwrap();
+    let (store, addr, _store_h) = spawn_mock_store().await?;
     store.fail_find_missing.store(true, Ordering::SeqCst);
 
-    let store_client = rio_proto::client::connect_store(&addr.to_string())
-        .await
-        .unwrap();
+    let store_client = rio_proto::client::connect_store(&addr.to_string()).await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Merge with expected_output_paths set so check_cached_outputs runs.
@@ -1321,14 +1318,14 @@ async fn test_check_cached_outputs_store_error_non_fatal() {
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
+        .await?;
 
     // Merge should SUCCEED despite the store error.
-    let reply = reply_rx.await.unwrap();
+    let reply = reply_rx.await?;
     assert!(reply.is_ok(), "store error should be non-fatal: {reply:?}");
 
     // Build should exist and be Active.
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
+    Ok(())
 }

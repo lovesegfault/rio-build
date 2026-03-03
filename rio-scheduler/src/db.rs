@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derivation_status_roundtrip() {
+    fn test_derivation_status_roundtrip() -> anyhow::Result<()> {
         for status in [
             DerivationStatus::Created,
             DerivationStatus::Queued,
@@ -403,13 +403,14 @@ mod tests {
             DerivationStatus::DependencyFailed,
         ] {
             let s = status.as_str();
-            let parsed: DerivationStatus = s.parse().unwrap();
+            let parsed: DerivationStatus = s.parse()?;
             assert_eq!(parsed, status);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_build_state_roundtrip() {
+    fn test_build_state_roundtrip() -> anyhow::Result<()> {
         for state in [
             BuildState::Pending,
             BuildState::Active,
@@ -418,9 +419,10 @@ mod tests {
             BuildState::Cancelled,
         ] {
             let s = state.as_str();
-            let parsed: BuildState = s.parse().unwrap();
+            let parsed: BuildState = s.parse()?;
             assert_eq!(parsed, state);
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -450,8 +452,8 @@ mod tests {
 
     /// Upsert a single derivation and return its db_id. Helper for tests
     /// that need a valid derivation_id foreign key.
-    async fn insert_test_derivation(db: &SchedulerDb, drv_hash: &str) -> Uuid {
-        let mut tx = db.pool.begin().await.unwrap();
+    async fn insert_test_derivation(db: &SchedulerDb, drv_hash: &str) -> anyhow::Result<Uuid> {
+        let mut tx = db.pool.begin().await?;
         let row = DerivationRow {
             drv_hash: drv_hash.into(),
             drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
@@ -460,57 +462,51 @@ mod tests {
             status: DerivationStatus::Created,
             required_features: vec![],
         };
-        let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row])
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        *ids.get(drv_hash).unwrap()
+        let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        tx.commit().await?;
+        Ok(*ids.get(drv_hash).expect("just inserted"))
     }
 
     #[tokio::test]
-    async fn test_insert_build_derivation_idempotent() {
+    async fn test_insert_build_derivation_idempotent() -> anyhow::Result<()> {
         let test_db = TestDb::new(&MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let build_id = Uuid::new_v4();
         db.insert_build(build_id, None, crate::state::PriorityClass::Scheduled)
-            .await
-            .unwrap();
-        let drv_id = insert_test_derivation(&db, "aaa").await;
+            .await?;
+        let drv_id = insert_test_derivation(&db, "aaa").await?;
 
         // Call twice — ON CONFLICT DO NOTHING should make the second call a no-op.
-        db.insert_build_derivation(build_id, drv_id).await.unwrap();
-        db.insert_build_derivation(build_id, drv_id).await.unwrap();
+        db.insert_build_derivation(build_id, drv_id).await?;
+        db.insert_build_derivation(build_id, drv_id).await?;
 
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM build_derivations WHERE build_id = $1")
                 .bind(build_id)
                 .fetch_one(&test_db.pool)
-                .await
-                .unwrap();
+                .await?;
         assert_eq!(count.0, 1, "ON CONFLICT should prevent duplicate");
+        Ok(())
     }
 
     /// BuildState::Pending has now_col="" → no timestamp column touched.
     #[tokio::test]
-    async fn test_update_build_status_pending_no_timestamps() {
+    async fn test_update_build_status_pending_no_timestamps() -> anyhow::Result<()> {
         let test_db = TestDb::new(&MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let build_id = Uuid::new_v4();
         db.insert_build(build_id, None, crate::state::PriorityClass::Scheduled)
-            .await
-            .unwrap();
+            .await?;
 
         // Insert starts at 'pending'. Transition to Active then back to Pending
         // (unusual but valid at the DB layer — the state machine rejects it,
         // but this is testing the raw SQL branch).
         db.update_build_status(build_id, BuildState::Active, None)
-            .await
-            .unwrap();
+            .await?;
         db.update_build_status(build_id, BuildState::Pending, None)
-            .await
-            .unwrap();
+            .await?;
 
         // Query timestamp as Option<String> via text cast to avoid adding a
         // chrono dep just for test assertions.
@@ -518,96 +514,91 @@ mod tests {
             sqlx::query_as("SELECT status, finished_at::text FROM builds WHERE build_id = $1")
                 .bind(build_id)
                 .fetch_one(&test_db.pool)
-                .await
-                .unwrap();
+                .await?;
         assert_eq!(status, "pending");
         // Pending transition does NOT set finished_at (the now_col="" branch).
         assert!(finished_at.is_none());
+        Ok(())
     }
 
     /// Non-terminal status (Acknowledged) → completed_at stays NULL.
     #[tokio::test]
-    async fn test_update_assignment_status_acknowledged_no_completed_at() {
+    async fn test_update_assignment_status_acknowledged_no_completed_at() -> anyhow::Result<()> {
         let test_db = TestDb::new(&MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
-        let drv_id = insert_test_derivation(&db, "bbb").await;
-        db.insert_assignment(drv_id, "worker-1", 1).await.unwrap();
+        let drv_id = insert_test_derivation(&db, "bbb").await?;
+        db.insert_assignment(drv_id, "worker-1", 1).await?;
 
         db.update_assignment_status(drv_id, AssignmentStatus::Acknowledged)
-            .await
-            .unwrap();
+            .await?;
 
         let (status, completed_at): (String, Option<String>) = sqlx::query_as(
             "SELECT status, completed_at::text FROM assignments WHERE derivation_id = $1",
         )
         .bind(drv_id)
         .fetch_one(&test_db.pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(status, "acknowledged");
         assert!(completed_at.is_none(), "non-terminal → completed_at NULL");
+        Ok(())
     }
 
     /// Terminal status (Completed) → completed_at = now().
     #[tokio::test]
-    async fn test_update_assignment_status_completed_sets_completed_at() {
+    async fn test_update_assignment_status_completed_sets_completed_at() -> anyhow::Result<()> {
         let test_db = TestDb::new(&MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
-        let drv_id = insert_test_derivation(&db, "ccc").await;
-        db.insert_assignment(drv_id, "worker-1", 1).await.unwrap();
+        let drv_id = insert_test_derivation(&db, "ccc").await?;
+        db.insert_assignment(drv_id, "worker-1", 1).await?;
 
         db.update_assignment_status(drv_id, AssignmentStatus::Completed)
-            .await
-            .unwrap();
+            .await?;
 
         let (status, completed_at): (String, Option<String>) = sqlx::query_as(
             "SELECT status, completed_at::text FROM assignments WHERE derivation_id = $1",
         )
         .bind(drv_id)
         .fetch_one(&test_db.pool)
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(status, "completed");
         assert!(completed_at.is_some(), "terminal → completed_at set");
+        Ok(())
     }
 
     /// EMA: first insert uses the duration directly; second update blends.
     /// ema = old * (1-ALPHA) + new * ALPHA = 10 * 0.7 + 20 * 0.3 = 13.
     #[tokio::test]
-    async fn test_update_build_history_ema_accumulates() {
+    async fn test_update_build_history_ema_accumulates() -> anyhow::Result<()> {
         let test_db = TestDb::new(&MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         db.update_build_history("hello", "x86_64-linux", 10.0)
-            .await
-            .unwrap();
+            .await?;
         let (ema1, count1): (f64, i32) = sqlx::query_as(
             "SELECT ema_duration_secs, sample_count FROM build_history \
              WHERE pname = 'hello' AND system = 'x86_64-linux'",
         )
         .fetch_one(&test_db.pool)
-        .await
-        .unwrap();
+        .await?;
         assert!((ema1 - 10.0).abs() < 0.001, "first insert: ema={ema1}");
         assert_eq!(count1, 1);
 
         db.update_build_history("hello", "x86_64-linux", 20.0)
-            .await
-            .unwrap();
+            .await?;
         let (ema2, count2): (f64, i32) = sqlx::query_as(
             "SELECT ema_duration_secs, sample_count FROM build_history \
              WHERE pname = 'hello' AND system = 'x86_64-linux'",
         )
         .fetch_one(&test_db.pool)
-        .await
-        .unwrap();
+        .await?;
         let expected = 10.0 * (1.0 - EMA_ALPHA) + 20.0 * EMA_ALPHA;
         assert!(
             (ema2 - expected).abs() < 0.001,
             "second update: expected {expected}, got {ema2}"
         );
         assert_eq!(count2, 2);
+        Ok(())
     }
 }
