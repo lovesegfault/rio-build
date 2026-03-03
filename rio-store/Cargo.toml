@@ -50,6 +50,9 @@ metrics = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 
+# Config
+serde = { workspace = true }
+
 [dev-dependencies]
 rio-test-support = { path = "../rio-test-support" }
 tempfile = { workspace = true }

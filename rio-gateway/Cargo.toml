@@ -25,6 +25,7 @@ clap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 rio-test-support = { path = "../rio-test-support" }
@@ -33,5 +34,4 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }

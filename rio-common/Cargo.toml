@@ -13,6 +13,16 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
+# OpenTelemetry (optional OTLP export, RIO_OTEL_ENDPOINT-gated)
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+
+# Configuration (figment: TOML + env + CLI layered)
+figment = { workspace = true }
+serde = { workspace = true }
+
 # Async runtime (for spawn_monitored)
 tokio = { workspace = true }
 futures-util = "0.3"
@@ -20,3 +30,6 @@ futures-util = "0.3"
 # Error handling
 anyhow = { workspace = true }
 tonic = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
