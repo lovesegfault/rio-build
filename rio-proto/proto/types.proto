@@ -324,16 +324,41 @@ message PathInfo {
 }
 
 // Request to upload a store path. First message contains metadata, subsequent
-// messages contain NAR data chunks.
+// messages contain NAR data chunks, optionally followed by a trailer.
+//
+// Two upload modes:
+//
+//   1. HASH-UPFRONT (phase2a, unchanged): metadata.info.nar_hash is non-empty.
+//      Server validates its computed SHA-256 against metadata. Trailer ignored.
+//      Used by the gateway (wopAddToStoreNar receives the hash from the Nix
+//      client before the NAR bytes).
+//
+//   2. HASH-TRAILER (phase2b, new): metadata.info.nar_hash is empty.
+//      Client streams the NAR while computing SHA-256, sends a PutPathTrailer
+//      with the finalized hash as the LAST message. Server validates against
+//      trailer. Used by the worker's single-pass tee upload (C15): reads
+//      file once, hashes + streams simultaneously, peak memory ~256KiB.
+//
+// WIRE-COMPATIBILITY: new clients (worker after C15) talking to OLD stores
+// would fail — the old store ignores the unknown trailer oneof case and sees
+// empty metadata hash => "hash mismatch". Deploy store before worker.
 message PutPathRequest {
   oneof msg {
     PutPathMetadata metadata = 1;         // First message: path metadata
-    bytes nar_chunk = 2;                  // Subsequent messages: NAR data
+    bytes nar_chunk = 2;                  // Middle messages: NAR data
+    PutPathTrailer trailer = 3;           // Optional last message (hash-trailer mode)
   }
 }
 
 message PutPathMetadata {
   PathInfo info = 1;                      // Path metadata (nar_hash, references, etc.)
+}
+
+// Finalizes a hash-trailer PutPath. MUST be the last message if sent.
+// Server rejects any nar_chunk after trailer as a protocol violation.
+message PutPathTrailer {
+  bytes nar_hash = 1;                     // SHA-256 of the full NAR (32 bytes)
+  uint64 nar_size = 2;                    // Total byte count
 }
 
 message PutPathResponse {

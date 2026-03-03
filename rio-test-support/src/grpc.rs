@@ -91,11 +91,26 @@ impl StoreService for MockStore {
                 .ok_or_else(|| Status::invalid_argument("PutPathMetadata missing PathInfo"))?,
             _ => return Err(Status::invalid_argument("first message must be metadata")),
         };
-        // Drain NAR chunks
+        // Drain NAR chunks. Trailer (if any) is accepted and its hash/size
+        // overwrites the metadata fields, mirroring real-store behavior so
+        // C15's upload tests see the right recorded PathInfo.
         let mut nar = Vec::new();
+        let mut info = info;
         while let Some(msg) = stream.message().await? {
-            if let Some(types::put_path_request::Msg::NarChunk(chunk)) = msg.msg {
-                nar.extend_from_slice(&chunk);
+            match msg.msg {
+                Some(types::put_path_request::Msg::NarChunk(chunk)) => {
+                    nar.extend_from_slice(&chunk);
+                }
+                Some(types::put_path_request::Msg::Trailer(t)) => {
+                    // Only apply if metadata hash was empty (trailer mode).
+                    // If metadata had a real hash, trailer is ignored
+                    // (matches real store).
+                    if info.nar_hash.is_empty() {
+                        info.nar_hash = t.nar_hash;
+                        info.nar_size = t.nar_size;
+                    }
+                }
+                _ => {}
             }
         }
         self.put_calls.write().unwrap().push(info.clone());
