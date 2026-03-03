@@ -250,6 +250,17 @@ pub struct DagActor {
     /// doesn't prevent channel close when all external handles are dropped.
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
+    /// Channel to the LogFlusher task. Completion handlers `try_send` a
+    /// FlushRequest here so the S3 upload is ordered AFTER the state
+    /// transition (hybrid model: buffer outside actor, flush triggered by
+    /// actor). `None` in tests/environments without S3.
+    ///
+    /// `try_send` (not `send`): if the flusher is backed up, drop the
+    /// request. The 30s periodic tick will still catch the buffer (it
+    /// snapshots, doesn't drain) until CleanupTerminalBuild removes it.
+    /// A dropped final-flush is a downgrade to "periodic snapshot only"
+    /// for that one derivation, not a hang.
+    log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
 }
 
 impl DagActor {
@@ -272,7 +283,16 @@ impl DagActor {
             backpressure_active: Arc::new(AtomicBool::new(false)),
             generation: 1,
             self_tx: None,
+            log_flush_tx: None,
         }
+    }
+
+    /// Inject the log flusher channel. Call before `run_with_self_tx`.
+    /// Separate from `new()` because tests don't have S3 and the None default
+    /// there keeps `new()`'s signature stable.
+    pub fn with_log_flusher(mut self, tx: mpsc::Sender<crate::logs::FlushRequest>) -> Self {
+        self.log_flush_tx = Some(tx);
+        self
     }
     /// Run the actor with a weak clone of its own sender for scheduling
     /// delayed internal commands (terminal cleanup, etc.). The weak sender
@@ -528,6 +548,43 @@ impl DagActor {
             .and_then(|h| self.dag.node(h))
             .and_then(|s| s.db_id)
     }
+
+    /// Fire a log-flush request for the given derivation. No-op if the
+    /// flusher isn't configured (tests, or `RIO_LOG_S3_BUCKET` unset).
+    ///
+    /// `try_send`: if the flusher channel is full (shouldn't happen — 1000
+    /// cap and the flusher's S3 PUT latency is sub-second), drop silently.
+    /// The 30s periodic tick will still snapshot until CleanupTerminalBuild.
+    ///
+    /// Called from `handle_completion_success` AND `handle_permanent_failure`
+    /// — both paths flush because failed builds still have useful logs.
+    /// NOT called from `handle_transient_failure`: the derivation gets
+    /// re-queued, a new worker builds it from scratch, and that worker's
+    /// logs replace the partial ones. The ring buffer gets `discard()`ed
+    /// by the BuildExecution recv task on worker disconnect (future: C10).
+    fn trigger_log_flush(&self, drv_hash: &str, interested_builds: Vec<Uuid>) {
+        let Some(tx) = &self.log_flush_tx else {
+            return;
+        };
+        let Some(drv_path) = self.drv_hash_to_path(drv_hash) else {
+            // Should be impossible at this call site (completion handlers
+            // already validated the hash exists in the DAG), but defensive.
+            warn!(drv_hash, "trigger_log_flush: hash not in DAG, skipping");
+            return;
+        };
+        let req = crate::logs::FlushRequest {
+            drv_path,
+            drv_hash: drv_hash.to_string(),
+            interested_builds,
+        };
+        if tx.try_send(req).is_err() {
+            warn!(
+                drv_hash,
+                "log flush channel full, dropped; periodic tick will snapshot"
+            );
+            metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);
+        }
+    }
 }
 
 mod build;
@@ -555,9 +612,16 @@ impl ActorHandle {
     /// Create a new actor handle and spawn the actor task.
     ///
     /// Returns the handle for sending commands.
-    pub fn spawn(db: SchedulerDb, store_client: Option<StoreServiceClient<Channel>>) -> Self {
+    pub fn spawn(
+        db: SchedulerDb,
+        store_client: Option<StoreServiceClient<Channel>>,
+        log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-        let actor = DagActor::new(db, store_client);
+        let mut actor = DagActor::new(db, store_client);
+        if let Some(flush_tx) = log_flush_tx {
+            actor = actor.with_log_flusher(flush_tx);
+        }
         let backpressure = actor.backpressure_flag();
         let self_tx = tx.downgrade();
         rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));

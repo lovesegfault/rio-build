@@ -45,6 +45,22 @@ in
       default = 10;
       description = "Housekeeping tick interval in seconds (`RIO_TICK_INTERVAL_SECS`).";
     };
+
+    logS3Bucket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        S3 bucket for build-log gzip flush (`RIO_LOG_S3_BUCKET`).
+        `null` = flush disabled; logs are ring-buffer-only (lost on restart,
+        but still live-servable while running).
+      '';
+    };
+
+    logS3Prefix = lib.mkOption {
+      type = lib.types.str;
+      default = "logs";
+      description = "S3 key prefix for build logs (`RIO_LOG_S3_PREFIX`).";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -68,7 +84,11 @@ in
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_TICK_INTERVAL_SECS = toString cfg.tickIntervalSecs;
+        RIO_LOG_S3_PREFIX = cfg.logS3Prefix;
         RIO_LOG_FORMAT = config.services.rio.logFormat;
+      }
+      // lib.optionalAttrs (cfg.logS3Bucket != null) {
+        RIO_LOG_S3_BUCKET = cfg.logS3Bucket;
       };
 
       serviceConfig = {
