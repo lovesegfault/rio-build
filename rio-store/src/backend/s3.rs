@@ -2,11 +2,6 @@
 //!
 //! Stores NARs as `{prefix}/{sha256-hex}.nar` in an S3 bucket using the
 //! `aws-sdk-s3` client.
-//!
-// TODO(phase2b): unit test is_not_found() branching with mocked aws-sdk-s3
-// responses (NoSuchKey vs network errors vs 5xx). S3 is the primary
-// production backend; a bug conflating network errors with 404s would
-// produce phantom "path not found" errors.
 
 use aws_sdk_s3::Client;
 use bytes::Bytes;
@@ -154,5 +149,138 @@ impl NarBackend for S3Backend {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::operation::get_object::GetObjectError;
+    use aws_sdk_s3::operation::head_object::HeadObjectError;
+    use aws_sdk_s3::types::error::{NoSuchKey, NotFound};
+    use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+    /// Map Result<Option<Box<dyn AsyncRead>>, E> to something Debug-printable
+    /// for assertion messages (dyn AsyncRead itself has no Debug impl).
+    fn describe_get(r: &anyhow::Result<Option<Box<dyn AsyncRead + Send + Unpin>>>) -> String {
+        match r {
+            Ok(Some(_)) => "Ok(Some(<stream>))".into(),
+            Ok(None) => "Ok(None)".into(),
+            Err(e) => format!("Err({e})"),
+        }
+    }
+
+    fn make_backend(client: Client) -> S3Backend {
+        S3Backend::new(client, "test-bucket".into(), "prefix".into())
+    }
+
+    /// GetObject → NoSuchKey must yield Ok(None), not Err.
+    /// This is the "path not in store" happy-negative path.
+    #[tokio::test]
+    async fn test_get_nosuchkey_returns_none() {
+        let rule = mock!(Client::get_object)
+            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
+        let backend = make_backend(client);
+
+        let result = backend.get("some-key.nar").await;
+        assert!(
+            matches!(result, Ok(None)),
+            "NoSuchKey should map to Ok(None), got {}",
+            describe_get(&result)
+        );
+    }
+
+    /// GetObject → transient server error must yield Err, NOT Ok(None).
+    /// Conflating these makes every store outage look like a cache miss —
+    /// callers would silently re-fetch instead of surfacing EIO.
+    #[tokio::test]
+    async fn test_get_server_error_returns_err() {
+        let rule = mock!(Client::get_object).then_error(|| {
+            GetObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("InternalError")
+                    .message("We encountered an internal error")
+                    .build(),
+            )
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
+        let backend = make_backend(client);
+
+        let result = backend.get("some-key.nar").await;
+        assert!(
+            result.is_err(),
+            "transient error should propagate as Err, got {}",
+            describe_get(&result)
+        );
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => unreachable!("asserted is_err above"),
+        };
+        assert!(
+            err.contains("GetObject failed"),
+            "error should mention GetObject, got: {err}"
+        );
+    }
+
+    /// HeadObject → NotFound must yield Ok(false).
+    #[tokio::test]
+    async fn test_exists_notfound_returns_false() {
+        let rule = mock!(Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
+        let backend = make_backend(client);
+
+        let result = backend.exists("some-key.nar").await;
+        assert!(
+            matches!(result, Ok(false)),
+            "NotFound should map to Ok(false), got {result:?}"
+        );
+    }
+
+    /// HeadObject → transient server error must yield Err, NOT Ok(false).
+    /// A bug here would make the put_path idempotency check (grpc.rs) silently
+    /// re-upload every NAR during a store outage.
+    #[tokio::test]
+    async fn test_exists_server_error_returns_err() {
+        let rule = mock!(Client::head_object).then_error(|| {
+            HeadObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("ServiceUnavailable")
+                    .message("Please reduce your request rate")
+                    .build(),
+            )
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
+        let backend = make_backend(client);
+
+        let result = backend.exists("some-key.nar").await;
+        assert!(
+            result.is_err(),
+            "transient error should propagate as Err, got {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("HeadObject failed"),
+            "error should mention HeadObject, got: {err}"
+        );
+    }
+
+    /// s3_key prefix joining: empty prefix → no slash, non-empty → slash-joined.
+    #[test]
+    fn test_s3_key_prefix_handling() {
+        // Can't construct a real Client in a sync #[test], so build S3Backend
+        // with a dummy config — s3_key() doesn't touch the client.
+        let cfg = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+        let client = Client::from_conf(cfg);
+
+        let with_prefix = S3Backend::new(client.clone(), "b".into(), "nars".into());
+        assert_eq!(with_prefix.s3_key("abc.nar"), "nars/abc.nar");
+
+        let no_prefix = S3Backend::new(client, "b".into(), "".into());
+        assert_eq!(no_prefix.s3_key("abc.nar"), "abc.nar");
     }
 }

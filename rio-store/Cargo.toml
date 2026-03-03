@@ -55,3 +55,5 @@ rio-test-support = { path = "../rio-test-support" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
+aws-smithy-mocks = "0.2"
+aws-sdk-s3 = { workspace = true, features = ["test-util"] }
