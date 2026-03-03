@@ -3,6 +3,7 @@
 //! Starts the gRPC server, connects to PostgreSQL, and spawns the DAG actor.
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use rio_proto::scheduler::scheduler_service_server::SchedulerServiceServer;
@@ -11,41 +12,92 @@ use rio_scheduler::actor::ActorHandle;
 use rio_scheduler::db::SchedulerDb;
 use rio_scheduler::grpc::SchedulerGrpc;
 
-#[derive(Parser, Debug)]
+// Two-struct config split — see rio-common/src/config.rs for rationale.
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Config {
+    listen_addr: String,
+    store_addr: String,
+    database_url: String,
+    metrics_addr: std::net::SocketAddr,
+    tick_interval_secs: u64,
+    /// S3 bucket for build-log flush (phase2b). `None` = flush disabled.
+    /// Env: `RIO_LOG_S3_BUCKET`. Not yet wired to a consumer — C8 does that.
+    log_s3_bucket: Option<String>,
+    log_s3_prefix: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0:9001".into(),
+            store_addr: String::new(),
+            database_url: String::new(),
+            metrics_addr: "0.0.0.0:9091".parse().unwrap(),
+            tick_interval_secs: 10,
+            log_s3_bucket: None,
+            log_s3_prefix: "logs".into(),
+        }
+    }
+}
+
+#[derive(Parser, Serialize, Default)]
 #[command(
     name = "rio-scheduler",
     about = "DAG-aware build scheduler for rio-build"
 )]
-struct Args {
+struct CliArgs {
     /// gRPC listen address for SchedulerService + WorkerService
-    #[arg(
-        long,
-        env = "RIO_SCHEDULER_LISTEN_ADDR",
-        default_value = "0.0.0.0:9001"
-    )]
-    listen_addr: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listen_addr: Option<String>,
 
     /// rio-store gRPC address
-    #[arg(long, env = "RIO_STORE_ADDR")]
-    store_addr: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_addr: Option<String>,
 
     /// PostgreSQL connection URL
-    #[arg(long, env = "DATABASE_URL")]
-    database_url: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database_url: Option<String>,
 
     /// Prometheus metrics listen address
-    #[arg(long, env = "RIO_METRICS_ADDR", default_value = "0.0.0.0:9091")]
-    metrics_addr: std::net::SocketAddr,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_addr: Option<std::net::SocketAddr>,
 
     /// Tick interval for housekeeping (seconds)
-    #[arg(long, env = "RIO_TICK_INTERVAL_SECS", default_value = "10")]
-    tick_interval_secs: u64,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick_interval_secs: Option<u64>,
+
+    /// S3 bucket for build-log gzip flush (unset = flush disabled)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_s3_bucket: Option<String>,
+
+    /// S3 key prefix for build logs
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_s3_prefix: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = CliArgs::parse();
+    let cfg: Config = rio_common::config::load("scheduler", cli)?;
     rio_common::observability::init_from_env()?;
+
+    anyhow::ensure!(
+        !cfg.store_addr.is_empty(),
+        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or scheduler.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.database_url.is_empty(),
+        "database_url is required (set --database-url, RIO_DATABASE_URL, or scheduler.toml)"
+    );
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
     info!(
@@ -53,12 +105,12 @@ async fn main() -> anyhow::Result<()> {
         "starting rio-scheduler"
     );
 
-    rio_common::observability::init_metrics(args.metrics_addr)?;
+    rio_common::observability::init_metrics(cfg.metrics_addr)?;
 
     // Connect to PostgreSQL
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(10)
-        .connect(&args.database_url)
+        .connect(&cfg.database_url)
         .await?;
 
     info!("connected to PostgreSQL");
@@ -71,14 +123,14 @@ async fn main() -> anyhow::Result<()> {
     // Connect to store for scheduler-side cache checks (closes TOCTOU between
     // gateway FindMissingPaths and DAG merge). Non-fatal if connect fails;
     // the actor will skip cache checks and log a warning.
-    let store_client = match rio_proto::client::connect_store(&args.store_addr).await {
+    let store_client = match rio_proto::client::connect_store(&cfg.store_addr).await {
         Ok(client) => {
-            info!(store_addr = %args.store_addr, "connected to store for cache checks");
+            info!(store_addr = %cfg.store_addr, "connected to store for cache checks");
             Some(client)
         }
         Err(e) => {
             tracing::warn!(
-                store_addr = %args.store_addr,
+                store_addr = %cfg.store_addr,
                 error = %e,
                 "failed to connect to store; scheduler-side cache check disabled"
             );
@@ -95,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start periodic tick task
     let tick_actor = actor.clone();
-    let tick_interval = std::time::Duration::from_secs(args.tick_interval_secs);
+    let tick_interval = std::time::Duration::from_secs(cfg.tick_interval_secs);
     rio_common::task::spawn_monitored("tick-loop", async move {
         let mut interval = tokio::time::interval(tick_interval);
         loop {
@@ -113,13 +165,14 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start gRPC server
-    let listen_addr: std::net::SocketAddr = args.listen_addr.parse()?;
+    let listen_addr: std::net::SocketAddr = cfg.listen_addr.parse()?;
     let max_message_size = rio_proto::max_message_size();
 
     info!(
         listen_addr = %listen_addr,
-        store_addr = %args.store_addr,
+        store_addr = %cfg.store_addr,
         max_message_size,
+        log_s3_bucket = ?cfg.log_s3_bucket,
         "starting gRPC server"
     );
 
@@ -138,4 +191,29 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_match_phase2a() {
+        let d = Config::default();
+        assert_eq!(d.listen_addr, "0.0.0.0:9001");
+        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9091");
+        assert_eq!(d.tick_interval_secs, 10);
+        // Phase2a required these; no default.
+        assert!(d.store_addr.is_empty());
+        assert!(d.database_url.is_empty());
+        // Phase2b additions — off by default.
+        assert_eq!(d.log_s3_bucket, None);
+        assert_eq!(d.log_s3_prefix, "logs");
+    }
+
+    #[test]
+    fn cli_args_parse_help() {
+        use clap::CommandFactory;
+        CliArgs::command().debug_assert();
+    }
 }

@@ -42,7 +42,7 @@ in
     maxBuilds = lib.mkOption {
       type = lib.types.ints.positive;
       default = 1;
-      description = "Maximum concurrent builds (`RIO_WORKER_MAX_BUILDS`).";
+      description = "Maximum concurrent builds (`RIO_MAX_BUILDS`).";
     };
 
     fuseMountPoint = lib.mkOption {
@@ -109,10 +109,12 @@ in
         pkgs.fuse3
       ];
 
+      # Env var naming: figment strips `RIO_` then lowercases to match
+      # the Config field. `RIO_MAX_BUILDS` -> `max_builds`, etc.
       environment = {
         RIO_SCHEDULER_ADDR = cfg.schedulerAddr;
         RIO_STORE_ADDR = cfg.storeAddr;
-        RIO_WORKER_MAX_BUILDS = toString cfg.maxBuilds;
+        RIO_MAX_BUILDS = toString cfg.maxBuilds;
         RIO_FUSE_MOUNT_POINT = cfg.fuseMountPoint;
         RIO_FUSE_CACHE_DIR = cfg.fuseCacheDir;
         RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -13,64 +14,113 @@ use rio_store::backend::filesystem::FilesystemBackend;
 use rio_store::backend::s3::S3Backend;
 use rio_store::grpc::{ChunkServiceStub, StoreServiceImpl};
 
-#[derive(Parser, Debug)]
+// Two-struct config split — see rio-common/src/config.rs for rationale.
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Config {
+    listen_addr: String,
+    backend: String,
+    base_dir: String,
+    /// S3 bucket (required if `backend = "s3"`, ignored for filesystem).
+    /// `Option` so "missing + filesystem backend" isn't an error.
+    s3_bucket: Option<String>,
+    s3_prefix: String,
+    s3_max_retries: u32,
+    s3_attempt_timeout_secs: u64,
+    database_url: String,
+    metrics_addr: std::net::SocketAddr,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0:9002".into(),
+            backend: "filesystem".into(),
+            base_dir: "/var/rio/store".into(),
+            s3_bucket: None,
+            s3_prefix: "nars".into(),
+            s3_max_retries: 5,
+            s3_attempt_timeout_secs: 30,
+            database_url: String::new(),
+            metrics_addr: "0.0.0.0:9092".parse().unwrap(),
+        }
+    }
+}
+
+#[derive(Parser, Serialize, Default)]
 #[command(
     name = "rio-store",
     about = "NAR content-addressable store for rio-build"
 )]
-struct Args {
+struct CliArgs {
     /// gRPC listen address
-    #[arg(long, env = "RIO_STORE_LISTEN_ADDR", default_value = "0.0.0.0:9002")]
-    listen_addr: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listen_addr: Option<String>,
 
     /// Storage backend (filesystem or s3)
-    #[arg(long, env = "RIO_STORE_BACKEND", default_value = "filesystem")]
-    backend: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
 
     /// Base directory for filesystem backend
-    #[arg(long, env = "RIO_STORE_BASE_DIR", default_value = "/var/rio/store")]
-    base_dir: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_dir: Option<String>,
 
     /// S3 bucket name (for S3 backend)
-    #[arg(long, env = "RIO_S3_BUCKET")]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     s3_bucket: Option<String>,
 
     /// S3 key prefix (for S3 backend)
-    #[arg(long, env = "RIO_S3_PREFIX", default_value = "nars")]
-    s3_prefix: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s3_prefix: Option<String>,
 
     /// Maximum S3 operation retry attempts (AWS SDK default: 3)
-    #[arg(long, env = "RIO_S3_MAX_RETRIES", default_value = "5")]
-    s3_max_retries: u32,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s3_max_retries: Option<u32>,
 
     /// Per-attempt timeout for S3 operations in seconds
-    #[arg(long, env = "RIO_S3_ATTEMPT_TIMEOUT_SECS", default_value = "30")]
-    s3_attempt_timeout_secs: u64,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s3_attempt_timeout_secs: Option<u64>,
 
     /// PostgreSQL connection URL
-    #[arg(long, env = "DATABASE_URL")]
-    database_url: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database_url: Option<String>,
 
     /// Prometheus metrics listen address
-    #[arg(long, env = "RIO_METRICS_ADDR", default_value = "0.0.0.0:9092")]
-    metrics_addr: std::net::SocketAddr,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_addr: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = CliArgs::parse();
+    let cfg: Config = rio_common::config::load("store", cli)?;
     rio_common::observability::init_from_env()?;
+
+    anyhow::ensure!(
+        !cfg.database_url.is_empty(),
+        "database_url is required (set --database-url, RIO_DATABASE_URL, or store.toml)"
+    );
 
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
 
-    rio_common::observability::init_metrics(args.metrics_addr)?;
+    rio_common::observability::init_metrics(cfg.metrics_addr)?;
 
     // Connect to PostgreSQL
-    info!(url = %args.database_url, "connecting to PostgreSQL");
+    info!(url = %cfg.database_url, "connecting to PostgreSQL");
     let pool = PgPoolOptions::new()
         .max_connections(20)
-        .connect(&args.database_url)
+        .connect(&cfg.database_url)
         .await?;
     info!("PostgreSQL connection established");
 
@@ -81,26 +131,26 @@ async fn main() -> anyhow::Result<()> {
     info!("database migrations applied");
 
     // Initialize backend
-    let backend: Arc<dyn NarBackend> = match args.backend.as_str() {
+    let backend: Arc<dyn NarBackend> = match cfg.backend.as_str() {
         "filesystem" => {
-            info!(base_dir = %args.base_dir, "using filesystem backend");
-            Arc::new(FilesystemBackend::new(&args.base_dir)?)
+            info!(base_dir = %cfg.base_dir, "using filesystem backend");
+            Arc::new(FilesystemBackend::new(&cfg.base_dir)?)
         }
         "s3" => {
-            let bucket = args
+            let bucket = cfg
                 .s3_bucket
-                .ok_or_else(|| anyhow::anyhow!("--s3-bucket is required for S3 backend"))?;
+                .ok_or_else(|| anyhow::anyhow!("s3_bucket is required for S3 backend"))?;
             info!(
                 bucket = %bucket,
-                prefix = %args.s3_prefix,
-                max_retries = args.s3_max_retries,
-                attempt_timeout_secs = args.s3_attempt_timeout_secs,
+                prefix = %cfg.s3_prefix,
+                max_retries = cfg.s3_max_retries,
+                attempt_timeout_secs = cfg.s3_attempt_timeout_secs,
                 "using S3 backend"
             );
             let retry_config =
-                aws_config::retry::RetryConfig::standard().with_max_attempts(args.s3_max_retries);
+                aws_config::retry::RetryConfig::standard().with_max_attempts(cfg.s3_max_retries);
             let timeout_config = aws_config::timeout::TimeoutConfig::builder()
-                .operation_attempt_timeout(Duration::from_secs(args.s3_attempt_timeout_secs))
+                .operation_attempt_timeout(Duration::from_secs(cfg.s3_attempt_timeout_secs))
                 .build();
             let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .retry_config(retry_config)
@@ -108,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
                 .load()
                 .await;
             let s3_client = aws_sdk_s3::Client::new(&aws_config);
-            Arc::new(S3Backend::new(s3_client, bucket, args.s3_prefix))
+            Arc::new(S3Backend::new(s3_client, bucket, cfg.s3_prefix))
         }
         other => {
             anyhow::bail!("unknown backend: {other} (expected 'filesystem' or 's3')");
@@ -119,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
     let store_service = StoreServiceImpl::new(backend, pool);
     let max_msg_size = rio_proto::max_message_size();
 
-    let addr = args.listen_addr.parse()?;
+    let addr = cfg.listen_addr.parse()?;
     info!(addr = %addr, max_msg_size, "starting gRPC server");
 
     Server::builder()
@@ -129,4 +179,29 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_match_phase2a() {
+        let d = Config::default();
+        assert_eq!(d.listen_addr, "0.0.0.0:9002");
+        assert_eq!(d.backend, "filesystem");
+        assert_eq!(d.base_dir, "/var/rio/store");
+        assert_eq!(d.s3_bucket, None);
+        assert_eq!(d.s3_prefix, "nars");
+        assert_eq!(d.s3_max_retries, 5);
+        assert_eq!(d.s3_attempt_timeout_secs, 30);
+        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9092");
+        assert!(d.database_url.is_empty());
+    }
+
+    #[test]
+    fn cli_args_parse_help() {
+        use clap::CommandFactory;
+        CliArgs::command().debug_assert();
+    }
 }

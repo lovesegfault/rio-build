@@ -15,7 +15,7 @@ in
     listenAddr = lib.mkOption {
       type = lib.types.str;
       default = "0.0.0.0:9001";
-      description = "gRPC listen address for SchedulerService + WorkerService (`RIO_SCHEDULER_LISTEN_ADDR`).";
+      description = "gRPC listen address for SchedulerService + WorkerService (`RIO_LISTEN_ADDR`).";
     };
 
     storeAddr = lib.mkOption {
@@ -29,7 +29,7 @@ in
     databaseUrl = lib.mkOption {
       type = lib.types.str;
       description = ''
-        PostgreSQL connection URL (`DATABASE_URL`).
+        PostgreSQL connection URL (`RIO_DATABASE_URL`).
         rio-scheduler applies migrations (sqlx migrate) on startup.
       '';
     };
@@ -60,10 +60,12 @@ in
       ];
       wants = [ "network-online.target" ];
 
+      # Env var naming: figment strips `RIO_` then lowercases to match
+      # the Config field. `RIO_LISTEN_ADDR` -> `listen_addr`, etc.
       environment = {
-        RIO_SCHEDULER_LISTEN_ADDR = cfg.listenAddr;
+        RIO_LISTEN_ADDR = cfg.listenAddr;
         RIO_STORE_ADDR = cfg.storeAddr;
-        DATABASE_URL = cfg.databaseUrl;
+        RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_TICK_INTERVAL_SECS = toString cfg.tickIntervalSecs;
         RIO_LOG_FORMAT = config.services.rio.logFormat;
