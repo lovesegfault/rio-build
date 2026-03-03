@@ -309,7 +309,7 @@ pub async fn execute_build(
     let build_result = build_result?;
 
     // 10. Check build result
-    let proto_result = if build_result.status().is_success() {
+    let proto_result = if build_result.status.is_success() {
         tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
 
         // Upload outputs
@@ -368,7 +368,7 @@ pub async fn execute_build(
                 ProtoBuildResult {
                     status: BuildResultStatus::Built.into(),
                     error_msg: String::new(),
-                    times_built: build_result.times_built(),
+                    times_built: build_result.times_built,
                     start_time: None,
                     stop_time: None,
                     built_outputs,
@@ -386,12 +386,12 @@ pub async fn execute_build(
     } else {
         tracing::warn!(
             drv_path = %drv_path,
-            status = ?build_result.status(),
-            error = %build_result.error_msg(),
+            status = ?build_result.status,
+            error = %build_result.error_msg,
             "build failed"
         );
 
-        let status = match build_result.status() {
+        let status = match build_result.status {
             rio_nix::protocol::build::BuildStatus::PermanentFailure => {
                 BuildResultStatus::PermanentFailure
             }
@@ -403,7 +403,7 @@ pub async fn execute_build(
 
         ProtoBuildResult {
             status: status.into(),
-            error_msg: build_result.error_msg().to_string(),
+            error_msg: build_result.error_msg.clone(),
             ..Default::default()
         }
     };

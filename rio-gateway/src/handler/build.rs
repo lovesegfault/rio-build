@@ -290,8 +290,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         };
 
     debug!(
-        status = ?build_result.status(),
-        error_msg = %build_result.error_msg(),
+        status = ?build_result.status,
+        error_msg = %build_result.error_msg,
         "wopBuildDerivation result"
     );
 
@@ -382,8 +382,8 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
             Err(e) => stderr_err!(stderr, "build failed: {e}"),
         };
 
-    if !build_result.status().is_success() {
-        stderr_err!(stderr, "build failed: {}", build_result.error_msg());
+    if !build_result.status.is_success() {
+        stderr_err!(stderr, "build failed: {}", build_result.error_msg);
     }
 
     stderr.finish().await?;
@@ -449,17 +449,10 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         match &dp {
             DerivedPath::Opaque(path) => {
                 let result = match grpc_is_valid_path(store_client, path).await {
-                    Ok(true) => BuildResult::new(
-                        BuildStatus::AlreadyValid,
-                        String::new(),
-                        0,
-                        false,
-                        0,
-                        0,
-                        None,
-                        None,
-                        Vec::new(),
-                    ),
+                    Ok(true) => BuildResult {
+                        status: BuildStatus::AlreadyValid,
+                        ..Default::default()
+                    },
                     Ok(false) => BuildResult::failure(
                         BuildStatus::MiscFailure,
                         format!("path '{}' not valid", path),
@@ -527,7 +520,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         for (idx, _raw) in raw_paths.iter().enumerate() {
             if let Some(opaque) = opaque_results.remove(&idx) {
                 results.push(opaque);
-            } else if build_result.status().is_success() {
+            } else if build_result.status.is_success() {
                 if let Some((drv_path, drv_obj)) = drv_for_idx.get(&idx) {
                     let resolve =
                         |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));

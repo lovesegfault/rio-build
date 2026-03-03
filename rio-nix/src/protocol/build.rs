@@ -107,102 +107,57 @@ pub struct BuiltOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildResult {
     /// Build status.
-    status: BuildStatus,
+    pub status: BuildStatus,
     /// Error message (empty on success).
-    error_msg: String,
+    pub error_msg: String,
     /// Number of times this derivation was built.
-    times_built: u64,
+    pub times_built: u64,
     /// Whether non-deterministic output was detected.
-    is_non_deterministic: bool,
+    pub is_non_deterministic: bool,
     /// Build start time (Unix epoch).
-    start_time: u64,
+    pub start_time: u64,
     /// Build stop time (Unix epoch).
-    stop_time: u64,
+    pub stop_time: u64,
     /// CPU user time in microseconds (protocol >= 1.37).
-    cpu_user: Option<i64>,
+    pub cpu_user: Option<i64>,
     /// CPU system time in microseconds (protocol >= 1.37).
-    cpu_system: Option<i64>,
+    pub cpu_system: Option<i64>,
     /// Built output entries (DrvOutput → Realisation).
-    built_outputs: Vec<BuiltOutput>,
+    pub built_outputs: Vec<BuiltOutput>,
+}
+
+impl Default for BuildResult {
+    fn default() -> Self {
+        Self {
+            status: BuildStatus::Built,
+            error_msg: String::new(),
+            times_built: 0,
+            is_non_deterministic: false,
+            start_time: 0,
+            stop_time: 0,
+            cpu_user: None,
+            cpu_system: None,
+            built_outputs: Vec::new(),
+        }
+    }
 }
 
 impl BuildResult {
-    /// Create a new build result.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        status: BuildStatus,
-        error_msg: String,
-        times_built: u64,
-        is_non_deterministic: bool,
-        start_time: u64,
-        stop_time: u64,
-        cpu_user: Option<i64>,
-        cpu_system: Option<i64>,
-        built_outputs: Vec<BuiltOutput>,
-    ) -> Self {
-        BuildResult {
-            status,
-            error_msg,
-            times_built,
-            is_non_deterministic,
-            start_time,
-            stop_time,
-            cpu_user,
-            cpu_system,
-            built_outputs,
-        }
-    }
-
     /// Create a simple success result with no outputs.
     pub fn success() -> Self {
-        Self::new(
-            BuildStatus::Built,
-            String::new(),
-            1,
-            false,
-            0,
-            0,
-            None,
-            None,
-            Vec::new(),
-        )
+        Self {
+            times_built: 1,
+            ..Default::default()
+        }
     }
 
     /// Create a failure result.
     pub fn failure(status: BuildStatus, error_msg: impl Into<String>) -> Self {
-        Self::new(
+        Self {
             status,
-            error_msg.into(),
-            0,
-            false,
-            0,
-            0,
-            None,
-            None,
-            Vec::new(),
-        )
-    }
-
-    pub fn status(&self) -> BuildStatus {
-        self.status
-    }
-    pub fn error_msg(&self) -> &str {
-        &self.error_msg
-    }
-    pub fn times_built(&self) -> u64 {
-        self.times_built
-    }
-    pub fn is_non_deterministic(&self) -> bool {
-        self.is_non_deterministic
-    }
-    pub fn start_time(&self) -> u64 {
-        self.start_time
-    }
-    pub fn stop_time(&self) -> u64 {
-        self.stop_time
-    }
-    pub fn built_outputs(&self) -> &[BuiltOutput] {
-        &self.built_outputs
+            error_msg: error_msg.into(),
+            ..Default::default()
+        }
     }
 
     /// Populate built_outputs from derivation output definitions and a
@@ -410,7 +365,7 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         });
     }
 
-    Ok(BuildResult::new(
+    Ok(BuildResult {
         status,
         error_msg,
         times_built,
@@ -420,7 +375,7 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         cpu_user,
         cpu_system,
         built_outputs,
-    ))
+    })
 }
 
 /// Write a `BuildResult` to the wire (server → client, protocol >= 1.37).
@@ -493,20 +448,19 @@ mod tests {
 
     #[tokio::test]
     async fn build_result_roundtrip() {
-        let result = BuildResult::new(
-            BuildStatus::Built,
-            String::new(),
-            1,
-            false,
-            1700000000,
-            1700000060,
-            Some(12345),
-            Some(6789),
-            vec![BuiltOutput {
+        let result = BuildResult {
+            status: BuildStatus::Built,
+            times_built: 1,
+            start_time: 1700000000,
+            stop_time: 1700000060,
+            cpu_user: Some(12345),
+            cpu_system: Some(6789),
+            built_outputs: vec![BuiltOutput {
                 drv_output_id: "sha256:abcdef0123456789!out".to_string(),
                 out_path: "/nix/store/abc-hello".to_string(),
             }],
-        );
+            ..Default::default()
+        };
 
         let mut buf = Vec::new();
         write_build_result(&mut buf, &result).await.unwrap();
@@ -525,9 +479,9 @@ mod tests {
 
         let mut reader = Cursor::new(buf);
         let parsed = read_build_result(&mut reader).await.unwrap();
-        assert_eq!(parsed.status(), BuildStatus::PermanentFailure);
-        assert_eq!(parsed.error_msg(), "build failed: exit 1");
-        assert!(parsed.built_outputs().is_empty());
+        assert_eq!(parsed.status, BuildStatus::PermanentFailure);
+        assert_eq!(parsed.error_msg, "build failed: exit 1");
+        assert!(parsed.built_outputs.is_empty());
     }
 
     #[tokio::test]
@@ -613,23 +567,21 @@ mod tests {
                         error_msg,
                         times_built,
                         is_non_deterministic,
-                        start,
-                        stop,
+                        start_time,
+                        stop_time,
                         cpu_user,
                         cpu_system,
-                        outputs,
-                    )| {
-                        BuildResult::new(
-                            status,
-                            error_msg,
-                            times_built,
-                            is_non_deterministic,
-                            start,
-                            stop,
-                            cpu_user,
-                            cpu_system,
-                            outputs,
-                        )
+                        built_outputs,
+                    )| BuildResult {
+                        status,
+                        error_msg,
+                        times_built,
+                        is_non_deterministic,
+                        start_time,
+                        stop_time,
+                        cpu_user,
+                        cpu_system,
+                        built_outputs,
                     },
                 )
         }
