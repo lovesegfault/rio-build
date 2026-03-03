@@ -99,6 +99,12 @@ where
 }
 
 #[cfg(test)]
+// figment::Jail::expect_with's closure returns Result<(), figment::Error>
+// where figment::Error is 208 bytes. That's figment's API — the closure
+// signature is fixed by the library, we can't box the error type. The lint
+// is about return-value copy cost on the Err path; in a test module that
+// only runs in CI, the ~200-byte copy is irrelevant.
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};

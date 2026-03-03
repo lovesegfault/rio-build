@@ -15,7 +15,7 @@ in
     listenAddr = lib.mkOption {
       type = lib.types.str;
       default = "0.0.0.0:9002";
-      description = "gRPC listen address (`RIO_STORE_LISTEN_ADDR`).";
+      description = "gRPC listen address (`RIO_LISTEN_ADDR`).";
     };
 
     backend = lib.mkOption {
@@ -24,19 +24,19 @@ in
         "s3"
       ];
       default = "filesystem";
-      description = "Storage backend (`RIO_STORE_BACKEND`).";
+      description = "Storage backend (`RIO_BACKEND`).";
     };
 
     baseDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/rio/store";
-      description = "Base directory for filesystem backend (`RIO_STORE_BASE_DIR`).";
+      description = "Base directory for filesystem backend (`RIO_BASE_DIR`).";
     };
 
     databaseUrl = lib.mkOption {
       type = lib.types.str;
       description = ''
-        PostgreSQL connection URL (`DATABASE_URL`).
+        PostgreSQL connection URL (`RIO_DATABASE_URL`).
         rio-store applies migrations (sqlx migrate) on startup.
       '';
     };
@@ -58,11 +58,16 @@ in
       ];
       wants = [ "network-online.target" ];
 
+      # Env var naming: figment strips `RIO_` prefix then lowercases to
+      # match the Config struct field name (e.g. RIO_LISTEN_ADDR ->
+      # `listen_addr`). Each rio binary runs as its own process with its
+      # own Config struct, so RIO_LISTEN_ADDR means "this binary's
+      # listen_addr" — no cross-component collision.
       environment = {
-        RIO_STORE_LISTEN_ADDR = cfg.listenAddr;
-        RIO_STORE_BACKEND = cfg.backend;
-        RIO_STORE_BASE_DIR = cfg.baseDir;
-        DATABASE_URL = cfg.databaseUrl;
+        RIO_LISTEN_ADDR = cfg.listenAddr;
+        RIO_BACKEND = cfg.backend;
+        RIO_BASE_DIR = cfg.baseDir;
+        RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_LOG_FORMAT = config.services.rio.logFormat;
       };

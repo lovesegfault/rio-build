@@ -9,69 +9,146 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tracing::info;
 
 use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
 use rio_worker::{BuildSpawnContext, build_heartbeat_request, fuse, spawn_build_task};
 
-#[derive(Parser, Debug)]
+// ---------------------------------------------------------------------------
+// Configuration (two-struct split per rio-common/src/config.rs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Config {
+    /// If empty after merge → auto-detect via hostname.
+    worker_id: String,
+    scheduler_addr: String,
+    store_addr: String,
+    max_builds: u32,
+    /// If empty after merge → auto-detect via std::env::consts.
+    system: String,
+    fuse_mount_point: PathBuf,
+    fuse_cache_dir: PathBuf,
+    fuse_cache_size_gb: u64,
+    fuse_threads: u32,
+    /// Defaults to `true`. NOT the serde bool default — see `default_true`.
+    /// A drift here (`false`) would silently disable kernel passthrough,
+    /// adding a userspace copy per FUSE read and ~2× per-build latency.
+    fuse_passthrough: bool,
+    overlay_base_dir: PathBuf,
+    metrics_addr: std::net::SocketAddr,
+    /// Phase2b log limits (configuration.md:68-69). 0 = unlimited.
+    /// Not yet wired to a consumer — C7 does that.
+    log_rate_limit: u64,
+    log_size_limit: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            worker_id: String::new(),
+            scheduler_addr: String::new(),
+            store_addr: String::new(),
+            max_builds: 1,
+            system: String::new(),
+            fuse_mount_point: "/nix/store".into(),
+            fuse_cache_dir: "/var/rio/cache".into(),
+            fuse_cache_size_gb: 50,
+            fuse_threads: 4,
+            fuse_passthrough: true,
+            overlay_base_dir: "/var/rio/overlays".into(),
+            metrics_addr: "0.0.0.0:9093".parse().unwrap(),
+            // configuration.md:68-69 specs these; current behavior (unlimited)
+            // is preserved until C7 wires them into LogBatcher.
+            log_rate_limit: 10_000,
+            log_size_limit: 100 * 1024 * 1024, // 100 MiB
+        }
+    }
+}
+
+#[derive(Parser, Serialize, Default)]
 #[command(
     name = "rio-worker",
     about = "Build executor with FUSE store for rio-build"
 )]
-struct Args {
+struct CliArgs {
     /// Worker ID (defaults to hostname)
-    #[arg(long, env = "RIO_WORKER_ID")]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     worker_id: Option<String>,
 
     /// rio-scheduler gRPC address
-    #[arg(long, env = "RIO_SCHEDULER_ADDR")]
-    scheduler_addr: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduler_addr: Option<String>,
 
     /// rio-store gRPC address
-    #[arg(long, env = "RIO_STORE_ADDR")]
-    store_addr: String,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_addr: Option<String>,
 
     /// Maximum concurrent builds
-    #[arg(long, env = "RIO_WORKER_MAX_BUILDS", default_value = "1")]
-    max_builds: u32,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_builds: Option<u32>,
 
     /// System architecture (auto-detected if not set)
-    #[arg(long, env = "RIO_WORKER_SYSTEM")]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
 
     /// FUSE mount point
-    #[arg(long, env = "RIO_FUSE_MOUNT_POINT", default_value = "/nix/store")]
-    fuse_mount_point: PathBuf,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuse_mount_point: Option<PathBuf>,
 
     /// FUSE cache directory
-    #[arg(long, env = "RIO_FUSE_CACHE_DIR", default_value = "/var/rio/cache")]
-    fuse_cache_dir: PathBuf,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuse_cache_dir: Option<PathBuf>,
 
     /// FUSE cache size limit in GB
-    #[arg(long, env = "RIO_FUSE_CACHE_SIZE_GB", default_value = "50")]
-    fuse_cache_size_gb: u64,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuse_cache_size_gb: Option<u64>,
 
     /// Number of FUSE threads
-    #[arg(long, env = "RIO_FUSE_THREADS", default_value = "4")]
-    fuse_threads: u32,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuse_threads: Option<u32>,
 
-    /// Enable FUSE passthrough mode
-    #[arg(long, env = "RIO_FUSE_PASSTHROUGH", default_value = "true")]
-    fuse_passthrough: bool,
+    /// Enable FUSE passthrough mode. Use --fuse-passthrough=false to disable.
+    //
+    // clap's `bool` is a flag (presence=true, absence=false), which would
+    // make it impossible to NOT set from CLI (defeating layering).
+    // `Option<bool>` with an explicit value parser makes clap accept
+    // `--fuse-passthrough=true|false` and leaves it None when absent.
+    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuse_passthrough: Option<bool>,
 
     /// Overlay base directory
-    #[arg(
-        long,
-        env = "RIO_OVERLAY_BASE_DIR",
-        default_value = "/var/rio/overlays"
-    )]
-    overlay_base_dir: PathBuf,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlay_base_dir: Option<PathBuf>,
 
     /// Prometheus metrics listen address
-    #[arg(long, env = "RIO_METRICS_ADDR", default_value = "0.0.0.0:9093")]
-    metrics_addr: std::net::SocketAddr,
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_addr: Option<std::net::SocketAddr>,
+
+    /// Max log lines/sec per build (0 = unlimited)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_rate_limit: Option<u64>,
+
+    /// Max total log bytes per build (0 = unlimited)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_size_limit: Option<u64>,
 }
 
 /// Heartbeat interval.
@@ -93,63 +170,79 @@ fn detect_system() -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = CliArgs::parse();
+    let cfg: Config = rio_common::config::load("worker", cli)?;
     rio_common::observability::init_from_env()?;
+
+    anyhow::ensure!(
+        !cfg.scheduler_addr.is_empty(),
+        "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or worker.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.store_addr.is_empty(),
+        "store_addr is required (set --store-addr, RIO_STORE_ADDR, or worker.toml)"
+    );
 
     // worker_id uniquely identifies this worker to the scheduler. Two workers
     // with the same ID would steal each other's builds via heartbeat merging.
     // Fail hard rather than silently colliding on "unknown".
-    let worker_id = args.worker_id.unwrap_or_else(|| {
+    let worker_id = if cfg.worker_id.is_empty() {
         nix::unistd::gethostname()
             .ok()
             .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    "cannot determine worker_id: gethostname() failed and --worker-id not provided"
-                );
-                std::process::exit(1);
-            })
-    });
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot determine worker_id: gethostname() failed and \
+                     worker_id not set (--worker-id, RIO_WORKER_ID, or worker.toml)"
+                )
+            })?
+    } else {
+        cfg.worker_id
+    };
 
-    let system = args.system.unwrap_or_else(detect_system);
+    let system = if cfg.system.is_empty() {
+        detect_system()
+    } else {
+        cfg.system
+    };
 
     let _root_guard =
         tracing::info_span!("worker", component = "worker", worker_id = %worker_id).entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-worker");
 
-    rio_common::observability::init_metrics(args.metrics_addr)?;
+    rio_common::observability::init_metrics(cfg.metrics_addr)?;
 
     // Connect to gRPC services
-    let store_client = rio_proto::client::connect_store(&args.store_addr).await?;
-    let mut scheduler_client = rio_proto::client::connect_worker(&args.scheduler_addr).await?;
+    let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
+    let mut scheduler_client = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
 
     info!(
         %worker_id,
-        scheduler_addr = %args.scheduler_addr,
-        store_addr = %args.store_addr,
-        max_builds = args.max_builds,
+        scheduler_addr = %cfg.scheduler_addr,
+        store_addr = %cfg.store_addr,
+        max_builds = cfg.max_builds,
         %system,
         "connected to gRPC services"
     );
 
     // Set up FUSE cache and mount
-    let cache = fuse::cache::Cache::new(args.fuse_cache_dir, args.fuse_cache_size_gb).await?;
+    let cache = fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?;
     let runtime = tokio::runtime::Handle::current();
 
-    std::fs::create_dir_all(&args.fuse_mount_point)?;
-    std::fs::create_dir_all(&args.overlay_base_dir)?;
+    std::fs::create_dir_all(&cfg.fuse_mount_point)?;
+    std::fs::create_dir_all(&cfg.overlay_base_dir)?;
 
     let _fuse_session = fuse::mount_fuse_background(
-        &args.fuse_mount_point,
+        &cfg.fuse_mount_point,
         cache,
         store_client.clone(),
         runtime,
-        args.fuse_passthrough,
-        args.fuse_threads,
+        cfg.fuse_passthrough,
+        cfg.fuse_threads,
     )?;
 
     info!(
-        mount_point = %args.fuse_mount_point.display(),
+        mount_point = %cfg.fuse_mount_point.display(),
         "FUSE store mounted"
     );
 
@@ -175,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         .into_inner();
 
     // Concurrent build semaphore
-    let build_semaphore = Arc::new(Semaphore::new(args.max_builds as usize));
+    let build_semaphore = Arc::new(Semaphore::new(cfg.max_builds as usize));
 
     // Track running builds (drv_path set) for heartbeat reporting
     let running_builds: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -187,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
     // and check liveness in the main event loop.
     let heartbeat_worker_id = worker_id.clone();
     let heartbeat_system = system.clone();
-    let heartbeat_max_builds = args.max_builds;
+    let heartbeat_max_builds = cfg.max_builds;
     let heartbeat_running = running_builds.clone();
     let mut heartbeat_client = scheduler_client.clone();
     let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
@@ -222,8 +315,8 @@ async fn main() -> anyhow::Result<()> {
     let build_ctx = BuildSpawnContext {
         store_client,
         worker_id,
-        fuse_mount_point: args.fuse_mount_point,
-        overlay_base_dir: args.overlay_base_dir,
+        fuse_mount_point: cfg.fuse_mount_point,
+        overlay_base_dir: cfg.overlay_base_dir,
         stream_tx,
         running_builds,
         leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -286,4 +379,60 @@ async fn main() -> anyhow::Result<()> {
 
     info!("build execution stream closed, shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: `Config::default()` must exactly match the old
+    /// clap `#[arg(default_value = ...)]` values from phase 2a. CRITICAL
+    /// case: `fuse_passthrough` defaults to `true` — NOT the serde bool
+    /// default. A drift to `false` here adds a userspace copy per FUSE
+    /// read (~2× per-build latency) and would only show up as a vm-phase2a
+    /// timing regression, not a hard failure.
+    #[test]
+    fn config_defaults_match_phase2a() {
+        let d = Config::default();
+        assert!(
+            d.worker_id.is_empty(),
+            "worker_id auto-detects via hostname"
+        );
+        assert!(d.scheduler_addr.is_empty(), "required, no default");
+        assert!(d.store_addr.is_empty(), "required, no default");
+        assert_eq!(d.max_builds, 1);
+        assert!(d.system.is_empty(), "system auto-detects");
+        assert_eq!(d.fuse_mount_point, PathBuf::from("/nix/store"));
+        assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
+        assert_eq!(d.fuse_cache_size_gb, 50);
+        assert_eq!(d.fuse_threads, 4);
+        assert!(
+            d.fuse_passthrough,
+            "fuse_passthrough MUST default to true (phase2a behavior); \
+             serde's bool default is false so this needs explicit handling"
+        );
+        assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
+        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9093");
+        // Phase2b additions — spec values from configuration.md:68-69.
+        assert_eq!(d.log_rate_limit, 10_000);
+        assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cli_args_parse_help() {
+        use clap::CommandFactory;
+        CliArgs::command().debug_assert();
+    }
+
+    /// `--fuse-passthrough` must accept explicit true/false (not a flag).
+    #[test]
+    fn cli_fuse_passthrough_explicit_bool() {
+        let args = CliArgs::try_parse_from(["rio-worker", "--fuse-passthrough", "false"]).unwrap();
+        assert_eq!(args.fuse_passthrough, Some(false));
+        let args = CliArgs::try_parse_from(["rio-worker", "--fuse-passthrough", "true"]).unwrap();
+        assert_eq!(args.fuse_passthrough, Some(true));
+        // Absent → None (layering: don't overlay).
+        let args = CliArgs::try_parse_from(["rio-worker"]).unwrap();
+        assert_eq!(args.fuse_passthrough, None);
+    }
 }
