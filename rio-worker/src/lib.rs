@@ -115,6 +115,10 @@ pub struct BuildSpawnContext {
     /// Worker-lifetime count of overlay mounts whose teardown failed.
     /// `execute_build` checks this at entry; `OverlayMount::Drop` increments.
     pub leaked_mounts: Arc<AtomicUsize>,
+    /// Per-build log rate/size limits. `Copy`, so cloning into each spawned
+    /// task is cheap. Worker-wide (set once at startup from config), not
+    /// per-assignment — the limits are a worker policy, not a build option.
+    pub log_limits: log_stream::LogLimits,
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -148,13 +152,16 @@ pub async fn spawn_build_task(
 
     // Clone state needed by spawned tasks ('static lifetime).
     let mut build_store_client = ctx.store_client.clone();
-    let build_worker_id = ctx.worker_id.clone();
-    let build_fuse_mount = ctx.fuse_mount_point.clone();
-    let build_overlay_dir = ctx.overlay_base_dir.clone();
     let build_tx = ctx.stream_tx.clone();
     let build_running = ctx.running_builds.clone();
     let build_leaked_mounts = ctx.leaked_mounts.clone();
     let build_drv_path = drv_path.clone();
+    let build_env = executor::ExecutorEnv {
+        fuse_mount_point: ctx.fuse_mount_point.clone(),
+        overlay_base_dir: ctx.overlay_base_dir.clone(),
+        worker_id: ctx.worker_id.clone(),
+        log_limits: ctx.log_limits,
+    };
 
     // Clone for the panic handler before moving into the task.
     let panic_tx = ctx.stream_tx.clone();
@@ -177,10 +184,8 @@ pub async fn spawn_build_task(
 
         let result = executor::execute_build(
             &assignment,
-            &build_fuse_mount,
-            &build_overlay_dir,
+            &build_env,
             &mut build_store_client,
-            &build_worker_id,
             &build_tx,
             &build_leaked_mounts,
         )
