@@ -127,12 +127,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_with_timeout_passes_through_fast_ok() {
+    async fn test_with_timeout_passes_through_fast_ok() -> anyhow::Result<()> {
         let result: anyhow::Result<u32> = with_timeout("fast-op", Duration::from_secs(1), async {
             Ok::<_, anyhow::Error>(42)
         })
         .await;
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result?, 42);
+        Ok(())
     }
 
     #[tokio::test]

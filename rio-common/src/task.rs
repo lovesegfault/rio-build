@@ -51,11 +51,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_spawn_monitored_normal_completion() {
+    async fn test_spawn_monitored_normal_completion() -> anyhow::Result<()> {
         let handle = spawn_monitored("test-normal", async {
             // Normal completion
         });
-        handle.await.expect("should complete without panic");
+        handle.await?;
+        Ok(())
     }
 
     #[tokio::test]
