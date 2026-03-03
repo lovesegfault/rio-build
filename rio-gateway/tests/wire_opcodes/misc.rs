@@ -75,13 +75,11 @@ async fn test_version_too_old_sends_stderr_error() -> anyhow::Result<()> {
     let (_store, store_addr, store_handle) = spawn_mock_store().await?;
     let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
-    let store_channel = Channel::from_shared(format!("http://{store_addr}"))
-        .unwrap()
+    let store_channel = Channel::from_shared(format!("http://{store_addr}"))?
         .connect()
         .await?;
     let mut store_client = StoreServiceClient::new(store_channel);
-    let sched_channel = Channel::from_shared(format!("http://{sched_addr}"))
-        .unwrap()
+    let sched_channel = Channel::from_shared(format!("http://{sched_addr}"))?
         .connect()
         .await?;
     let mut scheduler_client = SchedulerServiceClient::new(sched_channel);
