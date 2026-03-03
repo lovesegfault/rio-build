@@ -431,13 +431,20 @@ impl WorkerService for SchedulerGrpc {
                             }
                         }
                         rio_proto::types::worker_message::Msg::LogBatch(_log) => {
-                            // TODO(phase2b): buffer and forward build logs to gateway.
-                            // Phase 2b spec: 64-line/100ms batching, per-derivation ring
-                            // buffer, async S3 flush on completion.
+                            // PHASE 2B FEATURE ANCHOR (phase2b.md task 1): this is
+                            // where the log streaming pipeline plugs in. Scheduler-
+                            // side: per-derivation ring buffer for live serving,
+                            // async S3 flush on completion, rate limiting. Worker-
+                            // side batching (64 lines / 100ms, cancel-safe select!)
+                            // is already wired — batches arrive here but are
+                            // currently dropped.
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
-                            // TODO(phase2b): forward progress updates (resource usage,
-                            // build phase) via OpenTelemetry trace propagation.
+                            // PHASE 2B FEATURE ANCHOR (phase2b.md task 3):
+                            // tracing-opentelemetry propagation. Progress updates
+                            // land here from the worker; the feature work is to
+                            // inject them into the active trace span and propagate
+                            // across the gRPC boundary to the gateway.
                         }
                     }
                 }
