@@ -14,6 +14,7 @@ pub fn max_message_size() -> usize {
 }
 
 pub mod client;
+pub mod interceptor;
 pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.
