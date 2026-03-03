@@ -1,0 +1,113 @@
+# cargo-deny configuration for rio-build.
+#
+# Policy (dependencies.md:33): deny GPL-3.0+ (project is MIT/Apache-2.0),
+# check RustSec advisories in CI. Runs as part of `nix flake check` via
+# craneLib.cargoDeny.
+
+[graph]
+# Only the platforms we actually build for. This prunes advisory/license
+# noise from e.g. windows-only transitive deps.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+
+[licenses]
+# Explicit allowlist. Anything not here (including GPL-3.0) is denied.
+# This is the full set found in our current dep tree; expand as needed
+# but NEVER add GPL-3.0-or-later without explicit project-level signoff.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "Unlicense",
+  "0BSD",
+  "BSL-1.0",
+  # OpenSSL license (ring's aws-lc derivative uses it)
+  "OpenSSL",
+  # CDLA-Permissive-2.0 is used by webpki-roots' bundled root certs.
+  # It's permissive (no copyleft); allowing it is uncontroversial.
+  "CDLA-Permissive-2.0",
+]
+# Fail if cargo-deny's confidence in a license detection is below this.
+# 0.8 catches most ambiguous cases without excessive false positives.
+confidence-threshold = 0.8
+
+# ring uses a custom OpenSSL-style + ISC + MIT combination that cargo-deny
+# can't auto-classify with high confidence. Manually blessed.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ---------------------------------------------------------------------------
+# Advisories
+# ---------------------------------------------------------------------------
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail the build on unmaintained crates, not just warn. Exception list below.
+unmaintained = "workspace"
+# Using a yanked version = deny. It was yanked for a reason.
+yanked = "deny"
+
+# Known-accepted advisories with justification. Re-audit on each phase bump.
+ignore = [
+  # RUSTSEC-2023-0071: Marvin Attack — RSA timing sidechannel, no fix
+  # available upstream. Path: russh → rsa. Our exposure is minimal:
+  #
+  # 1. rio-gateway is an SSH SERVER, not a client — we hold the host key
+  #    (ed25519 via `load_or_generate_host_key`, NOT RSA).
+  # 2. Client authentication is ssh-ed25519 pubkey only (see
+  #    `load_authorized_keys` — no RSA key support on the auth path).
+  # 3. The vulnerable operation is RSA private-key signing/decryption.
+  #    We never hold an RSA private key.
+  #
+  # The only way russh's RSA code runs in our process is if a client
+  # offers an ssh-rsa host-key algorithm during KEX — and then it's the
+  # CLIENT doing RSA public-key ops (verification), not us. The advisory
+  # is about private-key timing leaks; public-key ops are not affected.
+  #
+  # Re-audit when russh bumps its rsa dep or a fixed release lands.
+  { id = "RUSTSEC-2023-0071", reason = "russh->rsa: we use ed25519 host keys + ed25519 client auth; no RSA private key is ever held by rio-gateway. Advisory concerns private-key timing leaks — does not apply." },
+]
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+
+[bans]
+# Multiple versions of the same crate bloat compile time and binary size.
+# "warn" (not deny) because the AWS SDK + tonic + rustls ecosystem
+# legitimately pulls 2-3 duplicates (e.g. hyper 0.14 + 1.x coexist until
+# the ecosystem finishes migrating). Deny would block every dep bump.
+multiple-versions = "warn"
+# Wildcard deps ("*") defeat reproducibility. We pin at the workspace level.
+wildcards = "deny"
+# Skip wildcard check for workspace-internal path deps (those are always
+# "*" in Cargo.toml and that's correct — resolution is by path, not version).
+allow-wildcard-paths = true
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+[sources]
+# We only pull from crates.io. Anything else (git deps, alt registries)
+# must be explicitly blessed here.
+unknown-registry = "deny"
+unknown-git = "deny"

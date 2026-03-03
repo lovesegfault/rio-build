@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "DAG-aware build scheduler for rio-build"
 
 [[bin]]

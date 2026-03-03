@@ -2,6 +2,7 @@
 name = "rio-test-support"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 description = "Test harness: ephemeral PostgreSQL, wire protocol helpers, mock gRPC services"
 
