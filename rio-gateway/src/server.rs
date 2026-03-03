@@ -393,3 +393,125 @@ impl Handler for ConnectionHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Generate a fresh ed25519 public key line for authorized_keys fixtures.
+    fn make_valid_pubkey_line() -> String {
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // load_authorized_keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_authorized_keys_valid_with_comments_and_blanks() {
+        let key1 = make_valid_pubkey_line();
+        let key2 = make_valid_pubkey_line();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), format!("# comment line\n\n{key1}\n{key2}\n")).unwrap();
+
+        let keys = load_authorized_keys(tmp.path()).expect("should load");
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_load_authorized_keys_skips_invalid_entry() {
+        let key1 = make_valid_pubkey_line();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), format!("{key1}\nthis is not a valid ssh key\n")).unwrap();
+
+        let keys = load_authorized_keys(tmp.path()).expect("should load");
+        assert_eq!(keys.len(), 1, "invalid line should be skipped");
+    }
+
+    #[test]
+    fn test_load_authorized_keys_all_invalid_bails() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "garbage line 1\ngarbage line 2\n").unwrap();
+
+        let err = load_authorized_keys(tmp.path()).expect_err("should bail");
+        assert!(
+            err.to_string().contains("no valid authorized keys"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_authorized_keys_missing_file() {
+        let err = load_authorized_keys(Path::new("/nonexistent/rio-test-authkeys"))
+            .expect_err("should fail on missing file");
+        assert!(err.to_string().contains("failed to read"));
+    }
+
+    // -----------------------------------------------------------------------
+    // load_or_generate_host_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_or_generate_host_key_generates_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("subdir/host_key");
+
+        // First call: generates and writes
+        let k1 = load_or_generate_host_key(&key_path).expect("should generate");
+        assert!(key_path.exists(), "key should be persisted");
+        let fp1 = k1.public_key().fingerprint(Default::default());
+
+        // Second call: loads the same key
+        let k2 = load_or_generate_host_key(&key_path).expect("should load");
+        let fp2 = k2.public_key().fingerprint(Default::default());
+        assert_eq!(fp1.to_string(), fp2.to_string(), "same key on reload");
+    }
+
+    #[test]
+    fn test_load_or_generate_host_key_loads_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("host_key");
+
+        // Write a key manually
+        let orig = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        std::fs::write(&key_path, orig.to_openssh(ssh_key::LineEnding::LF).unwrap()).unwrap();
+        let orig_fp = orig.public_key().fingerprint(Default::default());
+
+        let loaded = load_or_generate_host_key(&key_path).expect("should load");
+        assert_eq!(
+            loaded
+                .public_key()
+                .fingerprint(Default::default())
+                .to_string(),
+            orig_fp.to_string()
+        );
+    }
+
+    /// When the directory is unwritable, the key is still generated (ephemeral)
+    /// but NOT persisted. The function returns Ok and logs a warning.
+    #[test]
+    fn test_load_or_generate_host_key_unwritable_dir_ephemeral() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Make the tempdir read-only so write fails. The key_path itself
+        // doesn't exist so create_dir_all won't hit the read-only perms
+        // (parent already exists) but fs::write will.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let key_path = tmp.path().join("host_key");
+
+        let result = load_or_generate_host_key(&key_path);
+
+        // Restore perms so tempdir cleanup works regardless of outcome.
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755));
+
+        let _key = result.expect("should return ephemeral key despite write failure");
+        assert!(
+            !key_path.exists(),
+            "key should NOT be persisted (write failed)"
+        );
+    }
+}
