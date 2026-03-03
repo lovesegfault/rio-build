@@ -13,6 +13,7 @@ use rio_nix::protocol::build::{BuildMode, BuildResult, BuildStatus};
 use rio_nix::protocol::client::{
     StderrMessage, client_handshake, client_set_options, read_stderr_message,
 };
+use rio_nix::protocol::stderr::ResultField;
 use rio_nix::protocol::wire;
 use rio_proto::types::{WorkerMessage, worker_message};
 
@@ -379,7 +380,56 @@ where
                     Some(Ok(StderrMessage::Read(_))) => {
                         break Ok(Some(misc_fail("daemon sent STDERR_READ, not supported")));
                     }
-                    // Activity/progress messages we explicitly don't care about.
+                    // STDERR_RESULT with result_type 101 (BuildLogLine) or
+                    // 107 (PostBuildLogLine): this is how modern nix-daemon
+                    // sends builder stderr output. It DOES NOT come as raw
+                    // STDERR_NEXT — that's only for daemon chatter.
+                    //
+                    // This was a latent phase2a bug: we were silently dropping
+                    // all build output. It never mattered because phase2a
+                    // didn't assert on log content. vm-phase2b's log-pipeline
+                    // assertion caught it — exactly what milestone VM tests
+                    // are for.
+                    //
+                    // fields[0] is the log line (String). Same batching +
+                    // limit logic as STDERR_NEXT.
+                    Some(Ok(StderrMessage::Result { result_type, fields, .. }))
+                        if (result_type == 101 || result_type == 107)
+                            && matches!(fields.first(), Some(ResultField::String(_))) =>
+                    {
+                        // Safe: matches! above verified it's Some(String(_)).
+                        let ResultField::String(line) = &fields[0] else {
+                            unreachable!("match guard above proved String")
+                        };
+                        msg_count += 1;
+                        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
+                            break Err(wire::WireError::Io(std::io::Error::other(
+                                "exceeded maximum STDERR messages during build",
+                            )));
+                        }
+                        match batcher.add_line(line.clone().into_bytes()) {
+                            AddLineResult::Buffered => {}
+                            AddLineResult::BatchReady(batch) => {
+                                if !send_batch(log_tx, batch).await {
+                                    break Ok(Some(misc_fail(
+                                        "log channel closed during build (scheduler stream gone)",
+                                    )));
+                                }
+                            }
+                            AddLineResult::LimitExceeded { reason } => {
+                                if batcher.has_pending() {
+                                    let _ = send_batch(log_tx, batcher.flush()).await;
+                                }
+                                tracing::warn!(reason = %reason, "build log limit exceeded");
+                                break Ok(Some(BuildResult::failure(
+                                    BuildStatus::LogLimitExceeded,
+                                    reason,
+                                )));
+                            }
+                        }
+                    }
+                    // Other Result types (Progress, SetExpected, etc.) and
+                    // activity lifecycle messages — discard.
                     Some(Ok(
                         StderrMessage::Write(_)
                         | StderrMessage::StartActivity { .. }
@@ -1030,6 +1080,85 @@ mod tests {
         let br = result.expect("should succeed");
         assert_eq!(br.status, BuildStatus::Built);
         assert_eq!(count_log_lines(&batches), 200);
+        Ok(())
+    }
+
+    /// STDERR_RESULT with result_type=101 (BuildLogLine) is captured as a
+    /// log line. This is how modern nix-daemon actually sends builder
+    /// output — NOT as raw STDERR_NEXT. Latent phase2a bug caught by
+    /// vm-phase2b's log-pipeline assertion.
+    #[tokio::test]
+    async fn test_stderr_loop_result_build_log_line_captured() -> anyhow::Result<()> {
+        use rio_nix::protocol::stderr::ResultField;
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            // result_type 101 = BuildLogLine. First field is the line string.
+            // activity_id 42 is arbitrary (we don't use it).
+            w.result(
+                42,
+                101,
+                &[ResultField::String("compiling foo.c".to_string())],
+            )
+            .await?;
+            w.result(42, 101, &[ResultField::String("linking foo".to_string())])
+                .await?;
+            // result_type 107 = PostBuildLogLine — also captured.
+            w.result(
+                42,
+                107,
+                &[ResultField::String("post-build hook output".to_string())],
+            )
+            .await?;
+            // result_type 105 = Progress — discarded (not a log line).
+            w.result(42, 105, &[ResultField::Int(50), ResultField::Int(100)])
+                .await?;
+            w.finish().await?;
+        }
+        buf.extend(build_result_bytes(&BuildResult::success()).await?);
+
+        let (result, batches) = run_loop(buf).await;
+        let br = result.expect("should succeed");
+        assert_eq!(br.status, BuildStatus::Built);
+        // 3 log lines captured (101×2 + 107×1). Progress (105) NOT captured.
+        assert_eq!(
+            count_log_lines(&batches),
+            3,
+            "101 + 107 captured, 105 discarded"
+        );
+        Ok(())
+    }
+
+    /// BuildLogLine via STDERR_RESULT is subject to the same rate/size
+    /// limits as STDERR_NEXT.
+    #[tokio::test]
+    async fn test_stderr_loop_result_build_log_line_subject_to_limits() -> anyhow::Result<()> {
+        use rio_nix::protocol::stderr::ResultField;
+        let mut buf = Vec::new();
+        {
+            let mut w = StderrWriter::new(&mut buf);
+            for i in 0..10 {
+                w.result(
+                    1,
+                    101,
+                    &[ResultField::String(format!("spew-via-result {i}"))],
+                )
+                .await?;
+            }
+        }
+
+        let (result, batches) = run_loop_with_limits(
+            buf,
+            crate::log_stream::LogLimits {
+                rate_lines_per_sec: 5,
+                total_bytes: 0,
+            },
+        )
+        .await;
+
+        let br = result.expect("limit-exceeded is Ok(failure)");
+        assert_eq!(br.status, BuildStatus::LogLimitExceeded);
+        assert_eq!(count_log_lines(&batches), 5, "pre-trip lines flushed");
         Ok(())
     }
 }

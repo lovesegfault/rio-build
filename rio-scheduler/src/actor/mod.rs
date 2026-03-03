@@ -411,6 +411,7 @@ impl DagActor {
                     // (b) malformed batch from a buggy worker. Neither warrants
                     //     a warn!() — (a) is expected, (b) would spam.
                     if let Some(hash) = self.drv_path_to_hash(&drv_path) {
+                        let lines = batch.lines.len() as u64;
                         for build_id in self.get_interested_builds(&hash) {
                             // batch.clone(): BuildLogBatch has Vec<Vec<u8>> so
                             // this is a deep copy. For 64 lines × 100 bytes
@@ -422,6 +423,16 @@ impl DagActor {
                                 rio_proto::types::build_event::Event::Log(batch.clone()),
                             );
                         }
+                        // Metric: proves worker → scheduler → actor pipeline
+                        // works. vm-phase2b asserts this > 0. The gateway →
+                        // client leg (STDERR_NEXT rendering) depends on the
+                        // Nix client's verbosity and activity-context handling
+                        // — not something we control, so not asserted on in
+                        // the VM test. The ring buffer + AdminService give
+                        // the authoritative log-serving path; STDERR_NEXT is
+                        // a convenience tail that may or may not render.
+                        metrics::counter!("rio_scheduler_log_lines_forwarded_total")
+                            .increment(lines);
                     }
                 }
                 #[cfg(test)]

@@ -26,13 +26,13 @@
 | `ed25519-dalek` | NAR signing/verification | 2 | Binary cache signature support |
 | `fuser` | FUSE filesystem | 2 | Per-worker `/nix/store` mount (rio-fuse) |
 | `sqlx` (sqlite feature) | Synthetic store DB | 2 | Worker generates per-build SQLite DB |
-| `tracing-opentelemetry` | Distributed tracing | 2 | Trace propagation across gRPC boundaries |
+| `tracing-opentelemetry` | Distributed tracing | 2 (done) | Trace propagation across gRPC boundaries. `init_tracing` in `rio-common/observability.rs` + `inject_current`/`link_parent` in `rio-proto/interceptor.rs`. |
 | `kube` + `kube-runtime` | K8s client, CRDs, operator framework | 3 | `features = ["runtime", "derive", "rustls-tls"]` |
 | `k8s-openapi` | K8s API types | 3 | `features = ["latest"]` |
 | `schemars` | JSON Schema for CRDs | 3 | Required by kube-derive |
 | `cargo-deny` | License auditing, security advisories | 2 | Deny GPL-3.0+ per project policy; check advisories in CI |
 | `clap` | CLI argument parsing | 4 | rio-cli |
-| `opentelemetry` + `opentelemetry-otlp` | OTLP pipeline | 4 | Production Jaeger/Tempo backend |
+| `opentelemetry` + `opentelemetry-otlp` | OTLP pipeline | 2 (done) | Pulled forward from phase4: the phase2b milestone literally says "traces visible in Jaeger", which needs a real exporter. Full OTLP/gRPC via `opentelemetry-otlp` 0.31, batch processor, `ParentBased(TraceIdRatioBased)` sampler. `RIO_OTEL_ENDPOINT` gate; unset = zero overhead. |
 | TypeScript/React/Vite | Web dashboard | 5 | Separate `rio-dashboard/` project (not a Rust dep) |
 
 ## System Dependencies

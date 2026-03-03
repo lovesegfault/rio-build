@@ -511,11 +511,13 @@ impl WorkerService for SchedulerGrpc {
                             });
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
-                            // PHASE 2B FEATURE ANCHOR (phase2b.md task 3):
-                            // tracing-opentelemetry propagation. Progress updates
-                            // land here from the worker; the feature work is to
-                            // inject them into the active trace span and propagate
-                            // across the gRPC boundary to the gateway.
+                            // TODO(phase2c): ProgressUpdate carries ResourceUsage
+                            // (cpu/mem/disk) + build_phase. Phase 2c's build
+                            // duration estimation uses historical ResourceUsage
+                            // data for size-class routing (ADR-015). Current
+                            // behavior: drop silently (workers don't send these
+                            // yet anyway — worker-side ProgressUpdate emission
+                            // is also phase2c).
                         }
                     }
                 }
