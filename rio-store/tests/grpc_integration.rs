@@ -17,6 +17,7 @@ use rio_proto::types::{
     FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, QueryPathInfoRequest,
     put_path_request,
 };
+use rio_proto::validated::ValidatedPathInfo;
 use rio_store::backend::memory::MemoryBackend;
 use rio_store::grpc::StoreServiceImpl;
 use rio_test_support::TestDb;
@@ -68,7 +69,22 @@ pub async fn setup_store(
 }
 
 /// Helper: upload a path via PutPath, sending metadata + one nar_chunk.
+///
+/// Takes `ValidatedPathInfo` (the common case from `make_path_info_for_nar`)
+/// and converts to raw `PathInfo` internally. For tests that need to send
+/// DELIBERATELY INVALID data (bad references, etc.) to exercise server-side
+/// validation, use [`put_path_raw`] instead.
 pub async fn put_path(
+    client: &mut StoreServiceClient<Channel>,
+    info: ValidatedPathInfo,
+    nar: Vec<u8>,
+) -> Result<bool, tonic::Status> {
+    put_path_raw(client, info.into(), nar).await
+}
+
+/// Raw variant: takes unvalidated `PathInfo` directly. Use this to test
+/// server-side rejection of malformed input (e.g., bad reference strings).
+pub async fn put_path_raw(
     client: &mut StoreServiceClient<Channel>,
     info: PathInfo,
     nar: Vec<u8>,
@@ -246,7 +262,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() {
     let store_path = "/nix/store/88888888888888888888888888888888-corruption-test";
     let good_nar = make_nar(b"valid content for corruption test").0;
     let info = make_path_info_for_nar(store_path, &good_nar);
-    let sha256_hex = hex::encode(&info.nar_hash);
+    let sha256_hex = hex::encode(info.nar_hash);
 
     let created = put_path(&mut client, info, good_nar)
         .await
@@ -472,7 +488,7 @@ async fn test_put_path_rejects_duplicate_metadata() {
     // Metadata #1
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info.clone()),
+            info: Some(info.clone().into()),
         })),
     })
     .await
@@ -480,7 +496,7 @@ async fn test_put_path_rejects_duplicate_metadata() {
     // Metadata #2 (protocol violation)
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info),
+            info: Some(info.into()),
         })),
     })
     .await
@@ -540,17 +556,26 @@ async fn test_put_path_rejects_excessive_references() {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
 
+    // We're testing SERVER-SIDE rejection of too-many-references. Build raw
+    // PathInfo directly since ValidatedPathInfo can't hold 10,001 unparsed
+    // string references (client-side TryFrom would reject first).
     let nar = make_nar(b"refs-test").0;
-    let mut info = make_path_info_for_nar(
+    let base: PathInfo = make_path_info_for_nar(
         "/nix/store/66666666666666666666666666666666-too-many-refs",
         &nar,
-    );
-    // MAX_REFERENCES = 10_000; send 10_001 to trigger the check.
-    info.references = (0..10_001)
-        .map(|i| format!("/nix/store/{:032}-{}", i, i))
-        .collect();
+    )
+    .into();
+    let info = PathInfo {
+        // MAX_REFERENCES = 10_000; send 10_001 to trigger the check.
+        // Each ref is a VALID store path (TryFrom would accept them); the
+        // server's check_bound fires on COUNT, not on per-ref syntax.
+        references: (0..10_001)
+            .map(|i| format!("/nix/store/{:032}-ref-{i}", i % 10))
+            .collect(),
+        ..base
+    };
 
-    let result = put_path(&mut client, info, nar).await;
+    let result = put_path_raw(&mut client, info, nar).await;
     assert!(result.is_err(), "10,001 references should be rejected");
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -569,12 +594,16 @@ async fn test_put_path_rejects_malformed_reference() {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
 
+    // Testing SERVER-SIDE rejection: build raw PathInfo with a garbage ref.
     let nar = make_nar(b"refs-test").0;
-    let mut info =
-        make_path_info_for_nar("/nix/store/77777777777777777777777777777777-bad-ref", &nar);
-    info.references = vec!["not-a-valid-store-path".into()];
+    let base: PathInfo =
+        make_path_info_for_nar("/nix/store/77777777777777777777777777777777-bad-ref", &nar).into();
+    let info = PathInfo {
+        references: vec!["not-a-valid-store-path".into()],
+        ..base
+    };
 
-    let result = put_path(&mut client, info, nar).await;
+    let result = put_path_raw(&mut client, info, nar).await;
     assert!(result.is_err(), "malformed reference should be rejected");
     assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
 

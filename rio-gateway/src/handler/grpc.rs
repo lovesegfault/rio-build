@@ -1,12 +1,13 @@
 //! Store-query helpers using gRPC.
 
 use super::*;
+use rio_proto::validated::ValidatedPathInfo;
 
 /// Query PathInfo from store via gRPC. Returns None if NOT_FOUND.
 pub(super) async fn grpc_query_path_info(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
-) -> anyhow::Result<Option<types::PathInfo>> {
+) -> anyhow::Result<Option<ValidatedPathInfo>> {
     rio_proto::client::query_path_info_opt(store_client, store_path, DEFAULT_GRPC_TIMEOUT)
         .await
         .map_err(|e| anyhow::anyhow!("gRPC QueryPathInfo failed: {e}"))
@@ -25,7 +26,7 @@ pub(super) async fn grpc_is_valid_path(
 /// Upload a path to the store via gRPC PutPath (metadata + NAR chunks).
 pub(super) async fn grpc_put_path(
     store_client: &mut StoreServiceClient<Channel>,
-    info: types::PathInfo,
+    info: ValidatedPathInfo,
     nar_data: Vec<u8>,
 ) -> anyhow::Result<bool> {
     let nar: std::sync::Arc<[u8]> = nar_data.into();
@@ -45,7 +46,7 @@ pub(super) async fn grpc_put_path(
 pub(super) async fn grpc_get_path(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
-) -> anyhow::Result<Option<(types::PathInfo, Vec<u8>)>> {
+) -> anyhow::Result<Option<(ValidatedPathInfo, Vec<u8>)>> {
     rio_proto::client::get_path_nar(store_client, store_path, GRPC_STREAM_TIMEOUT, MAX_NAR_SIZE)
         .await
         .map_err(|e| anyhow::anyhow!("gRPC GetPath for {store_path}: {e}"))

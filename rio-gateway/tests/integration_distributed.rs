@@ -94,20 +94,10 @@ async fn test_distributed_query_with_populated_store() {
 
     // Pre-populate the mock store with one path
     let test_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
+    let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"hello content");
     sess.store.seed(
-        types::PathInfo {
-            store_path: test_path.to_string(),
-            store_path_hash: vec![0u8; 32],
-            deriver: String::new(),
-            nar_hash: vec![0u8; 32],
-            nar_size: 100,
-            references: vec![],
-            registration_time: 0,
-            ultimate: false,
-            signatures: vec![],
-            content_address: String::new(),
-        },
-        vec![],
+        rio_test_support::fixtures::make_path_info(test_path, &nar, nar_hash),
+        nar,
     );
 
     let s = &mut sess.stream;

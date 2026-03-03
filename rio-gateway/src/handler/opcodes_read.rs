@@ -96,15 +96,19 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         }
         Some(info) => {
             wire::write_bool(w, true).await?;
-            wire::write_string(w, &info.deriver).await?;
-            // narHash: convert raw bytes to hex string
-            wire::write_string(w, &hex::encode(&info.nar_hash)).await?;
-            wire::write_strings(w, &info.references).await?;
+            // deriver: Option<StorePath> → empty string if None (wire convention)
+            wire::write_string(w, info.deriver.as_ref().map(|d| d.as_str()).unwrap_or("")).await?;
+            // narHash: [u8;32] → hex string
+            wire::write_string(w, &hex::encode(info.nar_hash)).await?;
+            // references: Vec<StorePath> → Vec<&str> via Deref
+            let ref_strs: Vec<&str> = info.references.iter().map(|r| r.as_str()).collect();
+            wire::write_strings(w, &ref_strs).await?;
             wire::write_u64(w, info.registration_time).await?;
             wire::write_u64(w, info.nar_size).await?;
             wire::write_bool(w, info.ultimate).await?;
             wire::write_strings(w, &info.signatures).await?;
-            wire::write_string(w, &info.content_address).await?;
+            // content_address: Option<String> → empty string if None
+            wire::write_string(w, info.content_address.as_deref().unwrap_or("")).await?;
         }
     }
 
@@ -305,8 +309,9 @@ pub(super) async fn handle_query_path_from_hash_part<
     let result = grpc_query_path_info(store_client, &format!("/nix/store/{hash_part}")).await;
 
     let path_str = match result {
-        Ok(Some(info)) if !info.store_path.is_empty() => info.store_path,
-        Ok(_) => String::new(),
+        // ValidatedPathInfo.store_path is always non-empty (StorePath can't be empty).
+        Ok(Some(info)) => info.store_path.to_string(),
+        Ok(None) => String::new(),
         Err(e) => return send_store_error(stderr, e).await,
     };
 

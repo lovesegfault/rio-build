@@ -58,25 +58,18 @@ pub struct SynthDrvOutput {
     pub output_path: String,
 }
 
-/// Convert a `PathInfo` protobuf message to `SynthPathInfo`.
-pub fn path_info_to_synth(info: &rio_proto::types::PathInfo) -> SynthPathInfo {
-    let nar_hash = format!("sha256:{}", hex::encode(&info.nar_hash));
-    SynthPathInfo {
-        path: info.store_path.clone(),
-        nar_hash,
-        nar_size: info.nar_size,
-        deriver: if info.deriver.is_empty() {
-            None
-        } else {
-            Some(info.deriver.clone())
-        },
-        references: info.references.clone(),
-        signatures: info.signatures.clone(),
-        ca: if info.content_address.is_empty() {
-            None
-        } else {
-            Some(info.content_address.clone())
-        },
+impl From<rio_proto::validated::ValidatedPathInfo> for SynthPathInfo {
+    fn from(info: rio_proto::validated::ValidatedPathInfo) -> Self {
+        let nar_hash = format!("sha256:{}", hex::encode(info.nar_hash));
+        SynthPathInfo {
+            path: info.store_path.to_string(),
+            nar_hash,
+            nar_size: info.nar_size,
+            deriver: info.deriver.map(|d| d.to_string()),
+            references: info.references.into_iter().map(|r| r.to_string()).collect(),
+            signatures: info.signatures,
+            ca: info.content_address,
+        }
     }
 }
 
@@ -597,26 +590,50 @@ mod tests {
     }
 
     #[test]
-    fn test_path_info_to_synth() {
-        let proto_info = rio_proto::types::PathInfo {
-            store_path: "/nix/store/abc-hello".to_string(),
-            nar_hash: vec![0xde, 0xad, 0xbe, 0xef],
-            nar_size: 1024,
-            deriver: "/nix/store/def-hello.drv".to_string(),
-            references: vec!["/nix/store/ghi-glibc".to_string()],
-            signatures: vec!["sig1".to_string()],
-            content_address: String::new(),
+    fn test_synth_from_validated() {
+        use rio_nix::store_path::StorePath;
+        use rio_proto::validated::ValidatedPathInfo;
+
+        let v = ValidatedPathInfo {
+            store_path: StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")
+                .unwrap(),
             store_path_hash: vec![],
+            deriver: Some(
+                StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv").unwrap(),
+            ),
+            nar_hash: {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+                h
+            },
+            nar_size: 1024,
+            references: vec![
+                StorePath::parse("/nix/store/cccccccccccccccccccccccccccccccc-glibc").unwrap(),
+            ],
             registration_time: 0,
             ultimate: false,
+            signatures: vec!["sig1".to_string()],
+            content_address: None,
         };
 
-        let synth = path_info_to_synth(&proto_info);
-        assert_eq!(synth.path, "/nix/store/abc-hello");
-        assert_eq!(synth.nar_hash, "sha256:deadbeef");
+        let synth = SynthPathInfo::from(v);
+        assert_eq!(
+            synth.path,
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"
+        );
+        assert_eq!(
+            synth.nar_hash,
+            "sha256:deadbeef00000000000000000000000000000000000000000000000000000000"
+        );
         assert_eq!(synth.nar_size, 1024);
-        assert_eq!(synth.deriver, Some("/nix/store/def-hello.drv".to_string()));
-        assert_eq!(synth.references, vec!["/nix/store/ghi-glibc"]);
+        assert_eq!(
+            synth.deriver,
+            Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv".to_string())
+        );
+        assert_eq!(
+            synth.references,
+            vec!["/nix/store/cccccccccccccccccccccccccccccccc-glibc"]
+        );
         assert!(synth.ca.is_none());
     }
 }

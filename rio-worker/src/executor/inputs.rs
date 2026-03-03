@@ -8,7 +8,7 @@ use tonic::transport::Channel;
 use rio_nix::derivation::Derivation;
 use rio_proto::store::store_service_client::StoreServiceClient;
 
-use crate::synth_db::{SynthPathInfo, path_info_to_synth};
+use crate::synth_db::SynthPathInfo;
 use crate::upload;
 
 use super::{ExecutorError, MAX_PARALLEL_FETCHES};
@@ -91,7 +91,7 @@ pub(super) async fn fetch_input_metadata(
                 )
                 .await
                 {
-                    Ok(Some(info)) => Ok(path_info_to_synth(&info)),
+                    Ok(Some(info)) => Ok(SynthPathInfo::from(info)),
                     Ok(None) | Err(_) => {
                         tracing::warn!(
                             path = %path,
@@ -187,6 +187,9 @@ pub(super) async fn compute_input_closure(
 
         // Fetch this layer concurrently. Each result is
         // (path, Option<references>); None means NotFound.
+        // References are Vec<StorePath> now (ValidatedPathInfo); convert
+        // to String here since `closure` is a HashSet<String> (closure
+        // membership is checked against string keys from the .drv parse).
         let results: Vec<(String, Option<Vec<String>>)> = stream::iter(batch)
             .map(|path| {
                 let mut client = store_client.clone();
@@ -198,7 +201,10 @@ pub(super) async fn compute_input_closure(
                     )
                     .await
                     {
-                        Ok(Some(info)) => Ok((path, Some(info.references))),
+                        Ok(Some(info)) => {
+                            let refs = info.references.iter().map(|r| r.to_string()).collect();
+                            Ok((path, Some(refs)))
+                        }
                         Ok(None) => {
                             // Path not in store yet (output of a not-yet-built
                             // input drv). FUSE will lazy-fetch at build time.
@@ -381,8 +387,13 @@ mod tests {
     // gRPC fetch tests via MockStore
     // -----------------------------------------------------------------------
 
-    use rio_test_support::fixtures::{make_nar, make_path_info};
+    use rio_test_support::fixtures::{make_nar, make_path_info, test_store_path};
     use rio_test_support::grpc::{MockStore, spawn_mock_store};
+
+    /// Shorthand for test_store_path — these tests use many paths.
+    fn tp(name: &str) -> String {
+        test_store_path(name)
+    }
 
     async fn spawn_and_connect() -> (MockStore, StoreServiceClient<Channel>) {
         let (store, addr, _h) = spawn_mock_store().await;
@@ -392,21 +403,29 @@ mod tests {
         (store, client)
     }
 
-    /// Seed a path with the given refs. Content is arbitrary; PathInfo.references
-    /// is what compute_input_closure walks.
-    fn seed_with_refs(store: &MockStore, path: &str, refs: &[&str]) {
+    /// Seed a path with the given reference tags. Content is arbitrary;
+    /// PathInfo.references is what compute_input_closure walks.
+    /// `path` and each `ref` must be a VALID store path (use `tp()`).
+    fn seed_with_refs(store: &MockStore, path: &str, refs: &[String]) {
         let (nar, hash) = make_nar(b"content");
         let mut info = make_path_info(path, &nar, hash);
-        info.references = refs.iter().map(|s| s.to_string()).collect();
+        info.references = refs
+            .iter()
+            .map(|s| {
+                rio_nix::store_path::StorePath::parse(s)
+                    .unwrap_or_else(|e| panic!("test ref {s:?} invalid: {e}"))
+            })
+            .collect();
         store.seed(info, nar);
     }
 
     /// Build a Derivation with the given input_srcs via ATerm parsing
     /// (Derivation has no public constructor).
-    fn drv_with_srcs(srcs: &[&str]) -> Derivation {
+    fn drv_with_srcs(srcs: &[String]) -> Derivation {
         let srcs_quoted: Vec<String> = srcs.iter().map(|s| format!(r#""{s}""#)).collect();
+        let out = tp("test-out");
         let aterm = format!(
-            r#"Derive([("out","/nix/store/00000000000000000000000000000000-test","","")],[],[{}],"x86_64-linux","/bin/sh",[],[("out","/nix/store/00000000000000000000000000000000-test")])"#,
+            r#"Derive([("out","{out}","","")],[],[{}],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#,
             srcs_quoted.join(",")
         );
         Derivation::parse(&aterm).unwrap_or_else(|e| panic!("bad ATerm: {e}\n{aterm}"))
@@ -415,41 +434,34 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_input_metadata_success() {
         let (store, client) = spawn_and_connect().await;
-        seed_with_refs(&store, "/nix/store/aaa-foo", &[]);
-        seed_with_refs(&store, "/nix/store/bbb-bar", &[]);
+        let (p_foo, p_bar) = (tp("foo"), tp("bar"));
+        seed_with_refs(&store, &p_foo, &[]);
+        seed_with_refs(&store, &p_bar, &[]);
 
-        let result = fetch_input_metadata(
-            &client,
-            &["/nix/store/aaa-foo".into(), "/nix/store/bbb-bar".into()],
-        )
-        .await
-        .expect("fetch should succeed");
+        let result = fetch_input_metadata(&client, &[p_foo.clone(), p_bar.clone()])
+            .await
+            .expect("fetch should succeed");
 
         assert_eq!(result.len(), 2);
         // fetch_input_metadata uses buffered (not unordered) → order preserved.
-        assert_eq!(result[0].path, "/nix/store/aaa-foo");
-        assert_eq!(result[1].path, "/nix/store/bbb-bar");
+        assert_eq!(result[0].path, p_foo);
+        assert_eq!(result[1].path, p_bar);
     }
 
     #[tokio::test]
     async fn test_fetch_input_metadata_missing_path_errors() {
         let (store, client) = spawn_and_connect().await;
-        seed_with_refs(&store, "/nix/store/aaa-present", &[]);
-        // /nix/store/bbb-missing is NOT seeded.
+        let (p_present, p_missing) = (tp("present"), tp("missing"));
+        seed_with_refs(&store, &p_present, &[]);
+        // p_missing is NOT seeded.
 
-        let err = fetch_input_metadata(
-            &client,
-            &[
-                "/nix/store/aaa-present".into(),
-                "/nix/store/bbb-missing".into(),
-            ],
-        )
-        .await
-        .expect_err("should error on missing path");
+        let err = fetch_input_metadata(&client, &[p_present, p_missing.clone()])
+            .await
+            .expect_err("should error on missing path");
 
         match err {
             ExecutorError::MetadataFetch { path, .. } => {
-                assert_eq!(path, "/nix/store/bbb-missing");
+                assert_eq!(path, p_missing);
             }
             other => panic!("expected MetadataFetch, got {other:?}"),
         }
@@ -458,23 +470,24 @@ mod tests {
     #[tokio::test]
     async fn test_compute_input_closure_bfs() {
         let (store, client) = spawn_and_connect().await;
+        let (p_drv, p_a, p_b, p_c) = (tp("test.drv"), tp("lib"), tp("dep"), tp("leaf"));
         // Chain: drv → A → B → C
-        seed_with_refs(&store, "/nix/store/ddd-test.drv", &["/nix/store/aaa-lib"]);
-        seed_with_refs(&store, "/nix/store/aaa-lib", &["/nix/store/bbb-dep"]);
-        seed_with_refs(&store, "/nix/store/bbb-dep", &["/nix/store/ccc-leaf"]);
-        seed_with_refs(&store, "/nix/store/ccc-leaf", &[]);
+        seed_with_refs(&store, &p_drv, std::slice::from_ref(&p_a));
+        seed_with_refs(&store, &p_a, std::slice::from_ref(&p_b));
+        seed_with_refs(&store, &p_b, std::slice::from_ref(&p_c));
+        seed_with_refs(&store, &p_c, &[]);
 
-        let drv = drv_with_srcs(&["/nix/store/aaa-lib"]);
-        let closure = compute_input_closure(&client, &drv, "/nix/store/ddd-test.drv")
+        let drv = drv_with_srcs(std::slice::from_ref(&p_a));
+        let closure = compute_input_closure(&client, &drv, &p_drv)
             .await
             .expect("closure computation should succeed");
 
         let set: std::collections::HashSet<String> = closure.into_iter().collect();
         assert_eq!(set.len(), 4);
-        assert!(set.contains("/nix/store/ddd-test.drv"));
-        assert!(set.contains("/nix/store/aaa-lib"));
-        assert!(set.contains("/nix/store/bbb-dep"));
-        assert!(set.contains("/nix/store/ccc-leaf"));
+        assert!(set.contains(&p_drv));
+        assert!(set.contains(&p_a));
+        assert!(set.contains(&p_b));
+        assert!(set.contains(&p_c));
     }
 
     /// A referenced path not in the store is skipped (not an error).
@@ -482,35 +495,35 @@ mod tests {
     #[tokio::test]
     async fn test_compute_input_closure_skips_notfound() {
         let (store, client) = spawn_and_connect().await;
-        seed_with_refs(&store, "/nix/store/ddd-test.drv", &[]);
-        seed_with_refs(&store, "/nix/store/aaa-lib", &["/nix/store/bbb-missing"]);
-        // bbb-missing is NOT seeded.
+        let (p_drv, p_a, p_missing) = (tp("test.drv"), tp("lib"), tp("missing"));
+        seed_with_refs(&store, &p_drv, &[]);
+        seed_with_refs(&store, &p_a, std::slice::from_ref(&p_missing));
+        // p_missing is NOT seeded.
 
-        let drv = drv_with_srcs(&["/nix/store/aaa-lib"]);
-        let closure = compute_input_closure(&client, &drv, "/nix/store/ddd-test.drv")
+        let drv = drv_with_srcs(std::slice::from_ref(&p_a));
+        let closure = compute_input_closure(&client, &drv, &p_drv)
             .await
             .expect("missing ref is non-fatal");
 
         let set: std::collections::HashSet<String> = closure.into_iter().collect();
         assert_eq!(set.len(), 2, "closure should be {{drv, A}} without B");
-        assert!(set.contains("/nix/store/ddd-test.drv"));
-        assert!(set.contains("/nix/store/aaa-lib"));
-        assert!(!set.contains("/nix/store/bbb-missing"));
+        assert!(set.contains(&p_drv));
+        assert!(set.contains(&p_a));
+        assert!(!set.contains(&p_missing));
     }
 
     /// Diamond: A→C, B→C. C must appear once (set semantics + BFS dedup).
     #[tokio::test]
     async fn test_compute_input_closure_dedupes_diamond() {
         let (store, client) = spawn_and_connect().await;
-        seed_with_refs(&store, "/nix/store/ddd-test.drv", &[]);
-        seed_with_refs(&store, "/nix/store/aaa-left", &["/nix/store/ccc-shared"]);
-        seed_with_refs(&store, "/nix/store/bbb-right", &["/nix/store/ccc-shared"]);
-        seed_with_refs(&store, "/nix/store/ccc-shared", &[]);
+        let (p_drv, p_a, p_b, p_c) = (tp("test.drv"), tp("left"), tp("right"), tp("shared"));
+        seed_with_refs(&store, &p_drv, &[]);
+        seed_with_refs(&store, &p_a, std::slice::from_ref(&p_c));
+        seed_with_refs(&store, &p_b, std::slice::from_ref(&p_c));
+        seed_with_refs(&store, &p_c, &[]);
 
-        let drv = drv_with_srcs(&["/nix/store/aaa-left", "/nix/store/bbb-right"]);
-        let closure = compute_input_closure(&client, &drv, "/nix/store/ddd-test.drv")
-            .await
-            .unwrap();
+        let drv = drv_with_srcs(&[p_a, p_b]);
+        let closure = compute_input_closure(&client, &drv, &p_drv).await.unwrap();
 
         assert_eq!(closure.len(), 4); // drv, A, B, C (once)
     }
@@ -519,12 +532,15 @@ mod tests {
     async fn test_fetch_drv_from_store_success() {
         let (store, mut client) = spawn_and_connect().await;
         // NAR-wrap a minimal ATerm as a single regular file.
-        let drv_text = r#"Derive([("out","/nix/store/00000000000000000000000000000000-test","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/00000000000000000000000000000000-test")])"#;
+        let out = tp("test-out");
+        let drv_text = format!(
+            r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","{out}")])"#
+        );
         let (nar, hash) = make_nar(drv_text.as_bytes());
-        let drv_path = "/nix/store/ddd-test.drv";
-        store.seed(make_path_info(drv_path, &nar, hash), nar);
+        let drv_path = tp("test.drv");
+        store.seed(make_path_info(&drv_path, &nar, hash), nar);
 
-        let drv = fetch_drv_from_store(&mut client, drv_path)
+        let drv = fetch_drv_from_store(&mut client, &drv_path)
             .await
             .expect("fetch + parse should succeed");
 
@@ -536,15 +552,13 @@ mod tests {
     async fn test_fetch_drv_from_store_not_found() {
         let (_store, mut client) = spawn_and_connect().await;
 
-        let err = fetch_drv_from_store(&mut client, "/nix/store/zzz-nonexistent.drv")
+        let missing = tp("nonexistent.drv");
+        let err = fetch_drv_from_store(&mut client, &missing)
             .await
             .expect_err("should fail on missing .drv");
 
-        // get_path_nar returns NotFound as an error (not Ok(None)) when the
-        // gRPC call itself returns NOT_FOUND, so we hit the map_err at 134
-        // rather than the Ok(None) arm at 136. Either branch is BuildFailed.
         assert!(matches!(err, ExecutorError::BuildFailed(_)));
-        assert!(err.to_string().contains("zzz-nonexistent.drv"));
+        assert!(err.to_string().contains("nonexistent.drv"));
     }
 
     #[tokio::test]
@@ -552,10 +566,10 @@ mod tests {
         let (store, mut client) = spawn_and_connect().await;
         // Seed garbage — not a valid NAR.
         let garbage = b"this is definitely not a NAR archive".to_vec();
-        let drv_path = "/nix/store/eee-bad.drv";
-        store.seed(make_path_info(drv_path, &garbage, [0u8; 32]), garbage);
+        let drv_path = tp("bad.drv");
+        store.seed(make_path_info(&drv_path, &garbage, [0u8; 32]), garbage);
 
-        let err = fetch_drv_from_store(&mut client, drv_path)
+        let err = fetch_drv_from_store(&mut client, &drv_path)
             .await
             .expect_err("should fail on bad NAR");
 
