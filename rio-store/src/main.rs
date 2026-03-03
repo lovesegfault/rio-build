@@ -104,7 +104,7 @@ struct CliArgs {
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("store", cli)?;
-    rio_common::observability::init_from_env()?;
+    let _otel_guard = rio_common::observability::init_tracing("store")?;
 
     anyhow::ensure!(
         !cfg.database_url.is_empty(),

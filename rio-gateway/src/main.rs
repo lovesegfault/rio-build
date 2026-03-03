@@ -87,7 +87,7 @@ struct CliArgs {
 async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("gateway", cli)?;
-    rio_common::observability::init_from_env()?;
+    let _otel_guard = rio_common::observability::init_tracing("gateway")?;
 
     // Required-field checks that `#[serde(default)]` can't express
     // (figment's "missing field" error for `String` defaulting to `""`
