@@ -244,46 +244,49 @@ mod tests {
     // --- HashingReader ---
 
     #[tokio::test]
-    async fn hashing_reader_computes_correct_digest() {
+    async fn hashing_reader_computes_correct_digest() -> anyhow::Result<()> {
         let data = b"hello world, this is test data for hashing";
         let mut hashing = HashingReader::new(std::io::Cursor::new(data.as_slice()));
         let mut buf = Vec::new();
-        hashing.read_to_end(&mut buf).await.unwrap();
+        hashing.read_to_end(&mut buf).await?;
         assert_eq!(buf, data);
 
         let digest = hashing.into_digest();
         let expected: [u8; 32] = Sha256::digest(data).into();
         assert_eq!(digest.sha256(), &expected);
         assert_eq!(digest.size(), data.len() as u64);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hashing_reader_empty() {
+    async fn hashing_reader_empty() -> anyhow::Result<()> {
         let mut hashing = HashingReader::new(std::io::Cursor::new(&[] as &[u8]));
         let mut buf = Vec::new();
-        hashing.read_to_end(&mut buf).await.unwrap();
+        hashing.read_to_end(&mut buf).await?;
         assert!(buf.is_empty());
 
         let digest = hashing.into_digest();
         let expected: [u8; 32] = Sha256::digest(b"").into();
         assert_eq!(digest.sha256(), &expected);
         assert_eq!(digest.size(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hashing_reader_bytes_read_tracks_progress() {
+    async fn hashing_reader_bytes_read_tracks_progress() -> anyhow::Result<()> {
         let data = b"abcdefghij"; // 10 bytes
         let mut hashing = HashingReader::new(std::io::Cursor::new(data.as_slice()));
         assert_eq!(hashing.bytes_read(), 0);
 
         let mut buf = [0u8; 5];
-        let n = hashing.read(&mut buf).await.unwrap();
+        let n = hashing.read(&mut buf).await?;
         assert_eq!(n, 5);
         assert_eq!(hashing.bytes_read(), 5);
 
-        let n = hashing.read(&mut buf).await.unwrap();
+        let n = hashing.read(&mut buf).await?;
         assert_eq!(n, 5);
         assert_eq!(hashing.bytes_read(), 10);
+        Ok(())
     }
 
     #[tokio::test]
@@ -321,7 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hashing_reader_matches_from_bytes() {
+    async fn hashing_reader_matches_from_bytes() -> anyhow::Result<()> {
         // Verify streaming digest matches bulk digest for various data sizes.
         for size in [0, 1, 7, 64, 255, 1024, 65536] {
             let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
@@ -330,7 +333,7 @@ mod tests {
 
             let mut hashing = HashingReader::new(std::io::Cursor::new(data.as_slice()));
             let mut buf = Vec::new();
-            hashing.read_to_end(&mut buf).await.unwrap();
+            hashing.read_to_end(&mut buf).await?;
             let streaming = hashing.into_digest();
 
             assert_eq!(
@@ -338,5 +341,6 @@ mod tests {
                 "digest mismatch for size {size}: {bulk:?} vs {streaming:?}"
             );
         }
+        Ok(())
     }
 }
