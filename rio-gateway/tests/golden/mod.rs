@@ -127,6 +127,37 @@ async fn read_strings_field(cursor: &mut Cursor<Vec<u8>>) -> Vec<u8> {
     result
 }
 
+/// Wire field type for schema-driven parsing (simple flat responses only).
+#[derive(Clone, Copy)]
+enum FieldType {
+    U64,
+    Str,
+    Strs,
+}
+
+impl FieldType {
+    async fn read(self, cur: &mut Cursor<Vec<u8>>) -> Vec<u8> {
+        match self {
+            Self::U64 => read_u64_field(cur).await,
+            Self::Str => read_string_field(cur).await,
+            Self::Strs => read_strings_field(cur).await,
+        }
+    }
+}
+
+/// Parse a flat response using a schema table (name, type) -> `Vec<ResponseField>`.
+async fn parse_schema(data: &[u8], schema: &[(&'static str, FieldType)]) -> Vec<ResponseField> {
+    let mut cur = Cursor::new(data.to_vec());
+    let mut out = Vec::with_capacity(schema.len());
+    for &(name, ty) in schema {
+        out.push(ResponseField {
+            name,
+            bytes: ty.read(&mut cur).await,
+        });
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // STDERR activity message helpers
 // ---------------------------------------------------------------------------
@@ -220,25 +251,12 @@ pub async fn parse_handshake_fields(data: &[u8]) -> Vec<ResponseField> {
 }
 
 pub async fn parse_set_options_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![ResponseField {
-        name: "stderr_last",
-        bytes: read_u64_field(&mut cursor).await,
-    }]
+    parse_schema(data, &[("stderr_last", FieldType::U64)]).await
 }
 
 pub async fn parse_is_valid_path_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![
-        ResponseField {
-            name: "stderr_last",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "valid",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-    ]
+    use FieldType::*;
+    parse_schema(data, &[("stderr_last", U64), ("valid", U64)]).await
 }
 
 /// Parse a QueryPathInfo response. Handles both found and not-found cases.
@@ -297,61 +315,29 @@ pub async fn parse_query_path_info_fields(data: &[u8]) -> Vec<ResponseField> {
 }
 
 pub async fn parse_query_valid_paths_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![
-        ResponseField {
-            name: "stderr_last",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "valid_paths",
-            bytes: read_strings_field(&mut cursor).await,
-        },
-    ]
+    use FieldType::*;
+    parse_schema(data, &[("stderr_last", U64), ("valid_paths", Strs)]).await
 }
 
 pub async fn parse_add_temp_root_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![
-        ResponseField {
-            name: "stderr_last",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "result",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-    ]
+    use FieldType::*;
+    parse_schema(data, &[("stderr_last", U64), ("result", U64)]).await
 }
 
 pub async fn parse_query_missing_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![
-        ResponseField {
-            name: "stderr_last",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "will_build",
-            bytes: read_strings_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "will_substitute",
-            bytes: read_strings_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "unknown",
-            bytes: read_strings_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "download_size",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "nar_size",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-    ]
+    use FieldType::*;
+    parse_schema(
+        data,
+        &[
+            ("stderr_last", U64),
+            ("will_build", Strs),
+            ("will_substitute", Strs),
+            ("unknown", Strs),
+            ("download_size", U64),
+            ("nar_size", U64),
+        ],
+    )
+    .await
 }
 
 /// Parse NarFromPath response. Both rio-gateway and nix-daemon now use the
@@ -409,31 +395,13 @@ pub fn parse_nar_from_path_fields(
 }
 
 pub async fn parse_query_path_from_hash_part_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![
-        ResponseField {
-            name: "stderr_last",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "path",
-            bytes: read_string_field(&mut cursor).await,
-        },
-    ]
+    use FieldType::*;
+    parse_schema(data, &[("stderr_last", U64), ("path", Str)]).await
 }
 
 pub async fn parse_add_signatures_fields(data: &[u8]) -> Vec<ResponseField> {
-    let mut cursor = Cursor::new(data.to_vec());
-    vec![
-        ResponseField {
-            name: "stderr_last",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-        ResponseField {
-            name: "result",
-            bytes: read_u64_field(&mut cursor).await,
-        },
-    ]
+    use FieldType::*;
+    parse_schema(data, &[("stderr_last", U64), ("result", U64)]).await
 }
 
 // ---------------------------------------------------------------------------
