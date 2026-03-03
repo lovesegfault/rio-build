@@ -48,39 +48,41 @@ fn make_edge_with_paths(parent: &str, child: &str) -> DerivationEdge {
 }
 
 #[test]
-fn test_merge_empty_dag() {
+fn test_merge_empty_dag() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![make_node("hash1", "x86_64-linux")];
     let edges = vec![];
 
-    let newly = dag.merge(build_id, &nodes, &edges).unwrap().newly_inserted;
+    let newly = dag.merge(build_id, &nodes, &edges)?.newly_inserted;
     assert_eq!(newly.len(), 1);
     assert!(dag.nodes.contains_key("hash1"));
     assert!(dag.nodes["hash1"].interested_builds.contains(&build_id));
+    Ok(())
 }
 
 #[test]
-fn test_merge_dedup() {
+fn test_merge_dedup() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build1 = Uuid::new_v4();
     let build2 = Uuid::new_v4();
     let nodes = vec![make_node("hash1", "x86_64-linux")];
 
-    let newly1 = dag.merge(build1, &nodes, &[]).unwrap().newly_inserted;
+    let newly1 = dag.merge(build1, &nodes, &[])?.newly_inserted;
     assert_eq!(newly1.len(), 1);
 
-    let result2 = dag.merge(build2, &nodes, &[]).unwrap();
+    let result2 = dag.merge(build2, &nodes, &[])?;
     assert_eq!(result2.newly_inserted.len(), 0); // Already exists
     assert_eq!(result2.interest_added, vec!["hash1"]);
 
     let node = &dag.nodes["hash1"];
     assert!(node.interested_builds.contains(&build1));
     assert!(node.interested_builds.contains(&build2));
+    Ok(())
 }
 
 #[test]
-fn test_edges_and_deps() {
+fn test_edges_and_deps() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![
@@ -91,7 +93,7 @@ fn test_edges_and_deps() {
     // A depends on B and C
     let edges = vec![make_edge("hashA", "hashB"), make_edge("hashA", "hashC")];
 
-    dag.merge(build_id, &nodes, &edges).unwrap();
+    dag.merge(build_id, &nodes, &edges)?;
 
     // A has deps, B and C don't
     assert!(!dag.all_deps_completed("hashA"));
@@ -102,10 +104,11 @@ fn test_edges_and_deps() {
     assert_eq!(dag.children["hashA"].len(), 2);
     assert!(dag.get_parents("hashB").iter().any(|h| h == "hashA"));
     assert!(dag.get_parents("hashC").iter().any(|h| h == "hashA"));
+    Ok(())
 }
 
 #[test]
-fn test_initial_states() {
+fn test_initial_states() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![
@@ -114,7 +117,7 @@ fn test_initial_states() {
     ];
     let edges = vec![make_edge("hashA", "hashB")];
 
-    let newly = dag.merge(build_id, &nodes, &edges).unwrap().newly_inserted;
+    let newly = dag.merge(build_id, &nodes, &edges)?.newly_inserted;
     let states = dag.compute_initial_states(&newly);
 
     // B has no deps -> Ready; A has dep on B -> Queued
@@ -125,21 +128,22 @@ fn test_initial_states() {
             assert_eq!(*status, DerivationStatus::Queued);
         }
     }
+    Ok(())
 }
 
 #[test]
-fn test_initial_states_with_prepoisoned_dep() {
+fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build1 = Uuid::new_v4();
 
     // Build 1: just the leaf.
     let leaf_nodes = vec![make_node("leafP", "x86_64-linux")];
-    dag.merge(build1, &leaf_nodes, &[]).unwrap();
+    dag.merge(build1, &leaf_nodes, &[])?;
 
     // Poison it.
     dag.nodes
         .get_mut("leafP")
-        .unwrap()
+        .expect("leafP")
         .set_status_for_test(DerivationStatus::Poisoned);
 
     assert!(!dag.any_dep_terminally_failed("leafP")); // no deps
@@ -151,10 +155,7 @@ fn test_initial_states_with_prepoisoned_dep() {
         make_node("leafP", "x86_64-linux"),
     ];
     let edges = vec![make_edge("parentP", "leafP")];
-    let newly = dag
-        .merge(build2, &parent_nodes, &edges)
-        .unwrap()
-        .newly_inserted;
+    let newly = dag.merge(build2, &parent_nodes, &edges)?.newly_inserted;
 
     // Only parentP is newly inserted (leafP already existed).
     assert_eq!(newly, HashSet::from(["parentP".into()]));
@@ -169,10 +170,11 @@ fn test_initial_states_with_prepoisoned_dep() {
         DerivationStatus::DependencyFailed,
         "node with pre-poisoned dep should be DependencyFailed, not Queued"
     );
+    Ok(())
 }
 
 #[test]
-fn test_find_newly_ready() {
+fn test_find_newly_ready() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![
@@ -181,20 +183,21 @@ fn test_find_newly_ready() {
     ];
     let edges = vec![make_edge("hashA", "hashB")];
 
-    dag.merge(build_id, &nodes, &edges).unwrap();
+    dag.merge(build_id, &nodes, &edges)?;
 
     // Set B to completed, A to queued
     dag.nodes
         .get_mut("hashB")
-        .unwrap()
+        .expect("hashB")
         .set_status_for_test(DerivationStatus::Completed);
     dag.nodes
         .get_mut("hashA")
-        .unwrap()
+        .expect("hashA")
         .set_status_for_test(DerivationStatus::Queued);
 
     let ready = dag.find_newly_ready("hashB");
     assert_eq!(ready, vec!["hashA".to_string()]);
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -279,7 +282,7 @@ fn test_merge_after_cycle_rollback() {
 /// can create a cycle. The DFS must start from edge endpoints, not just
 /// newly-inserted nodes.
 #[test]
-fn test_cycle_via_new_edge_between_existing_nodes() {
+fn test_cycle_via_new_edge_between_existing_nodes() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let build1 = Uuid::new_v4();
 
@@ -289,7 +292,7 @@ fn test_cycle_via_new_edge_between_existing_nodes() {
         make_node("hashB", "x86_64-linux"),
     ];
     let initial_edges = vec![make_edge("hashA", "hashB")];
-    dag.merge(build1, &nodes, &initial_edges).unwrap();
+    dag.merge(build1, &nodes, &initial_edges)?;
     assert_eq!(dag.nodes.len(), 2);
 
     // Now merge the SAME nodes (no new inserts) with a B->A edge.
@@ -315,23 +318,24 @@ fn test_cycle_via_new_edge_between_existing_nodes() {
             .is_some_and(|c| c.contains("hashA")),
         "cycle-creating B->A edge should be rolled back"
     );
+    Ok(())
 }
 
 /// When a build merges successfully, then later merges again with a cycle,
 /// rollback must NOT clear the build's interest from nodes that already
 /// had it from the prior successful merge.
 #[test]
-fn test_cycle_rollback_preserves_prior_interest() {
+fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let b1 = Uuid::new_v4();
 
     // Step 1: merge B1 with node A only — succeeds. A.interested = {B1}.
     let nodes_a = vec![make_node("hashA", "x86_64-linux")];
-    dag.merge(b1, &nodes_a, &[]).unwrap();
+    dag.merge(b1, &nodes_a, &[])?;
     assert!(
         dag.nodes
             .get("hashA")
-            .unwrap()
+            .expect("hashA")
             .interested_builds
             .contains(&b1),
         "B1 interest in A should be set after successful merge"
@@ -353,7 +357,7 @@ fn test_cycle_rollback_preserves_prior_interest() {
     assert!(
         dag.nodes
             .get("hashA")
-            .unwrap()
+            .expect("hashA")
             .interested_builds
             .contains(&b1),
         "B1 interest in A from prior successful merge must survive rollback"
@@ -362,12 +366,13 @@ fn test_cycle_rollback_preserves_prior_interest() {
         !dag.nodes.contains_key("hashC"),
         "newly-inserted C should be rolled back"
     );
+    Ok(())
 }
 
 /// The path_to_hash reverse index must stay in sync with nodes across
 /// merge, rollback, and reap operations.
 #[test]
-fn test_path_to_hash_consistency() {
+fn test_path_to_hash_consistency() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let b1 = Uuid::new_v4();
     let p_a = test_drv_path("hashA");
@@ -379,7 +384,7 @@ fn test_path_to_hash_consistency() {
         make_node("hashA", "x86_64-linux"),
         make_node("hashB", "x86_64-linux"),
     ];
-    dag.merge(b1, &nodes, &[]).unwrap();
+    dag.merge(b1, &nodes, &[])?;
     assert_eq!(dag.hash_for_path(&p_a).map(|h| h.as_str()), Some("hashA"));
     assert_eq!(dag.hash_for_path(&p_b).map(|h| h.as_str()), Some("hashB"));
     assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
@@ -405,25 +410,20 @@ fn test_path_to_hash_consistency() {
     // Reap: terminal orphaned node's path entry must be removed.
     // First, mark A as terminal so it's eligible for reaping.
     dag.node_mut("hashA")
-        .unwrap()
-        .transition(DerivationStatus::Queued)
-        .unwrap();
+        .expect("hashA")
+        .transition(DerivationStatus::Queued)?;
     dag.node_mut("hashA")
-        .unwrap()
-        .transition(DerivationStatus::Ready)
-        .unwrap();
+        .expect("hashA")
+        .transition(DerivationStatus::Ready)?;
     dag.node_mut("hashA")
-        .unwrap()
-        .transition(DerivationStatus::Assigned)
-        .unwrap();
+        .expect("hashA")
+        .transition(DerivationStatus::Assigned)?;
     dag.node_mut("hashA")
-        .unwrap()
-        .transition(DerivationStatus::Running)
-        .unwrap();
+        .expect("hashA")
+        .transition(DerivationStatus::Running)?;
     dag.node_mut("hashA")
-        .unwrap()
-        .transition(DerivationStatus::Completed)
-        .unwrap();
+        .expect("hashA")
+        .transition(DerivationStatus::Completed)?;
     let reaped = dag.remove_build_interest_and_reap(b1);
     assert_eq!(reaped, 1, "hashA should be reaped (terminal, no interest)");
     assert_eq!(
@@ -433,6 +433,7 @@ fn test_path_to_hash_consistency() {
     );
     // B is not terminal, so it survives reaping.
     assert_eq!(dag.hash_for_path(&p_b).map(|h| h.as_str()), Some("hashB"));
+    Ok(())
 }
 
 /// Regression test for stack overflow in the recursive DFS cycle check.

@@ -3,8 +3,8 @@
 use super::*;
 use tokio::sync::mpsc;
 
-pub(super) use rio_test_support::TestDb;
 pub(super) use rio_test_support::fixtures::{test_drv_path, test_store_path};
+pub(super) use rio_test_support::{TestDb, TestResult};
 pub(super) use std::time::Duration;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
@@ -44,15 +44,15 @@ pub(crate) async fn setup_with_worker(
     worker_id: &str,
     system: &str,
     max_builds: u32,
-) -> (
+) -> anyhow::Result<(
     TestDb,
     ActorHandle,
     tokio::task::JoinHandle<()>,
     mpsc::Receiver<rio_proto::types::SchedulerMessage>,
-) {
+)> {
     let (db, handle, task) = setup().await;
-    let rx = connect_worker(&handle, worker_id, system, max_builds).await;
-    (db, handle, task, rx)
+    let rx = connect_worker(&handle, worker_id, system, max_builds).await?;
+    Ok((db, handle, task, rx))
 }
 
 /// Create a minimal test DerivationNode.
@@ -94,15 +94,14 @@ pub(crate) async fn connect_worker(
     worker_id: &str,
     system: &str,
     max_builds: u32,
-) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
+) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
     let (stream_tx, stream_rx) = mpsc::channel(256);
     handle
         .send_unchecked(ActorCommand::WorkerConnected {
             worker_id: worker_id.into(),
             stream_tx,
         })
-        .await
-        .unwrap();
+        .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             worker_id: worker_id.into(),
@@ -111,9 +110,8 @@ pub(crate) async fn connect_worker(
             max_builds,
             running_builds: vec![],
         })
-        .await
-        .unwrap();
-    stream_rx
+        .await?;
+    Ok(stream_rx)
 }
 
 /// Merge a single-node DAG and return the event receiver.
@@ -124,7 +122,7 @@ pub(crate) async fn merge_single_node(
     build_id: Uuid,
     tag: &str,
     priority_class: PriorityClass,
-) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
+) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
@@ -139,9 +137,8 @@ pub(crate) async fn merge_single_node(
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    reply_rx.await.unwrap().unwrap()
+        .await?;
+    Ok(reply_rx.await??)
 }
 
 /// Merge a multi-node DAG with default options (tenant=None,
@@ -153,7 +150,7 @@ pub(crate) async fn merge_dag(
     nodes: Vec<rio_proto::types::DerivationNode>,
     edges: Vec<rio_proto::types::DerivationEdge>,
     keep_going: bool,
-) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
+) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {
@@ -168,42 +165,39 @@ pub(crate) async fn merge_dag(
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
-    reply_rx.await.unwrap().unwrap()
+        .await?;
+    Ok(reply_rx.await??)
 }
 
-/// Query build status (unwraps the Result; panics on BuildNotFound).
+/// Query build status. Propagates BuildNotFound as an error.
 pub(crate) async fn query_status(
     handle: &ActorHandle,
     build_id: Uuid,
-) -> rio_proto::types::BuildStatus {
+) -> anyhow::Result<rio_proto::types::BuildStatus> {
     let (tx, rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::QueryBuildStatus {
             build_id,
             reply: tx,
         })
-        .await
-        .unwrap();
-    rx.await.unwrap().unwrap()
+        .await?;
+    Ok(rx.await??)
 }
 
-/// Query build status, returning the raw Result (for tests that expect
-/// BuildNotFound).
+/// Query build status, returning the inner Result (for tests that expect
+/// BuildNotFound). Propagates send/recv failures; caller inspects ActorError.
 pub(crate) async fn try_query_status(
     handle: &ActorHandle,
     build_id: Uuid,
-) -> Result<rio_proto::types::BuildStatus, ActorError> {
+) -> anyhow::Result<Result<rio_proto::types::BuildStatus, ActorError>> {
     let (tx, rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::QueryBuildStatus {
             build_id,
             reply: tx,
         })
-        .await
-        .unwrap();
-    rx.await.unwrap()
+        .await?;
+    Ok(rx.await?)
 }
 
 /// Send a successful completion (Built) with a single `out` output.
@@ -214,7 +208,7 @@ pub(crate) async fn complete_success(
     worker_id: &str,
     drv_key: &str,
     output_path: &str,
-) {
+) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: worker_id.into(),
@@ -229,13 +223,17 @@ pub(crate) async fn complete_success(
                 ..Default::default()
             },
         })
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 /// Send a successful completion (Built) with NO built_outputs.
 /// Many tests don't care about output paths and just need the state transition.
-pub(crate) async fn complete_success_empty(handle: &ActorHandle, worker_id: &str, drv_key: &str) {
+pub(crate) async fn complete_success_empty(
+    handle: &ActorHandle,
+    worker_id: &str,
+    drv_key: &str,
+) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: worker_id.into(),
@@ -245,8 +243,8 @@ pub(crate) async fn complete_success_empty(handle: &ActorHandle, worker_id: &str
                 ..Default::default()
             },
         })
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 /// Send a failed completion with the given status and error message.
@@ -256,7 +254,7 @@ pub(crate) async fn complete_failure(
     drv_key: &str,
     status: rio_proto::types::BuildResultStatus,
     error_msg: &str,
-) {
+) -> anyhow::Result<()> {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: worker_id.into(),
@@ -267,8 +265,8 @@ pub(crate) async fn complete_failure(
                 ..Default::default()
             },
         })
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 /// Give the actor time to process commands.
@@ -277,20 +275,18 @@ pub(crate) async fn settle() {
 }
 
 #[tokio::test]
-async fn test_actor_starts_and_stops() {
+async fn test_actor_starts_and_stops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, task) = setup_actor(db.pool.clone());
     settle().await;
     // Query should succeed (actor is running)
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     assert!(workers.is_empty());
     // Drop handle to close channel
     drop(handle);
     // Actor task should exit
-    tokio::time::timeout(Duration::from_secs(5), task)
-        .await
-        .expect("actor should shut down")
-        .expect("actor should not panic");
+    tokio::time::timeout(Duration::from_secs(5), task).await??;
+    Ok(())
 }
 
 /// is_alive() should detect actor death (channel closed = receiver dropped).

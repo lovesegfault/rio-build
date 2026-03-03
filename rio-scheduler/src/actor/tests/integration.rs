@@ -7,7 +7,7 @@ use super::*;
 /// Spin up an in-process rio-store on an ephemeral port.
 async fn setup_inproc_store(
     pool: sqlx::PgPool,
-) -> (StoreServiceClient<Channel>, tokio::task::JoinHandle<()>) {
+) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
     use rio_proto::store::store_service_server::StoreServiceServer;
     use rio_store::backend::memory::MemoryBackend;
     use rio_store::grpc::StoreServiceImpl;
@@ -16,10 +16,11 @@ async fn setup_inproc_store(
     let backend = Arc::new(MemoryBackend::new());
     let service = StoreServiceImpl::new(backend, pool);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
+    // Fire-and-forget: aborted at test end, never joined.
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(StoreServiceServer::new(service))
@@ -30,16 +31,17 @@ async fn setup_inproc_store(
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
+    let channel = Channel::from_shared(format!("http://{addr}"))?
         .connect()
-        .await
-        .unwrap();
-    (StoreServiceClient::new(channel), server)
+        .await?;
+    Ok((StoreServiceClient::new(channel), server))
 }
 
 /// Build a minimal single-file NAR and upload it to the store.
-async fn put_test_path(client: &mut StoreServiceClient<Channel>, store_path: &str) {
+async fn put_test_path(
+    client: &mut StoreServiceClient<Channel>,
+    store_path: &str,
+) -> anyhow::Result<()> {
     use rio_proto::types::{PathInfo, PutPathMetadata, PutPathRequest, put_path_request};
     use sha2::{Digest, Sha256};
 
@@ -48,7 +50,7 @@ async fn put_test_path(client: &mut StoreServiceClient<Channel>, store_path: &st
         contents: b"hello".to_vec(),
     };
     let mut nar = Vec::new();
-    rio_nix::nar::serialize(&mut nar, &node).unwrap();
+    rio_nix::nar::serialize(&mut nar, &node)?;
 
     let nar_hash = Sha256::digest(&nar).to_vec();
     let info = PathInfo {
@@ -64,28 +66,27 @@ async fn put_test_path(client: &mut StoreServiceClient<Channel>, store_path: &st
             info: Some(info),
         })),
     })
-    .await
-    .unwrap();
+    .await?;
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::NarChunk(nar)),
     })
-    .await
-    .unwrap();
+    .await?;
     drop(tx);
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    client.put_path(stream).await.unwrap();
+    client.put_path(stream).await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_scheduler_cache_check_skips_build() {
+async fn test_scheduler_cache_check_skips_build() -> TestResult {
     let sched_db = TestDb::new(&MIGRATOR).await;
     let store_db = TestDb::new(&MIGRATOR).await;
 
     // Start in-process store and pre-populate the expected output path.
-    let (mut store_client, _store_server) = setup_inproc_store(store_db.pool.clone()).await;
+    let (mut store_client, _store_server) = setup_inproc_store(store_db.pool.clone()).await?;
     let cached_output = test_store_path("cached-output");
-    put_test_path(&mut store_client, &cached_output).await;
+    put_test_path(&mut store_client, &cached_output).await?;
 
     // Spawn actor WITH the store client — cache check will run.
     let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone()));
@@ -97,14 +98,13 @@ async fn test_scheduler_cache_check_skips_build() {
     let mut node = make_test_node("cached-hash", "x86_64-linux");
     node.expected_output_paths = vec![cached_output.to_string()];
 
-    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
+    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
     settle().await;
 
     // Derivation should have gone Created → Completed (scheduler cache hit).
     let info = handle
         .debug_query_derivation("cached-hash")
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist in DAG");
     assert_eq!(
         info.status,
@@ -114,7 +114,7 @@ async fn test_scheduler_cache_check_skips_build() {
     assert_eq!(info.output_paths, vec![cached_output]);
 
     // Build should be Succeeded (all 1 derivation cached).
-    let status = query_status(&handle, build_id).await;
+    let status = query_status(&handle, build_id).await?;
     assert_eq!(status.cached_derivations, 1);
     assert_eq!(
         status.completed_derivations, 1,
@@ -125,26 +125,26 @@ async fn test_scheduler_cache_check_skips_build() {
         rio_proto::types::BuildState::Succeeded as i32,
         "build with all-cached derivations should be Succeeded"
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_scheduler_cache_check_skipped_without_store() {
+async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
     // No store client — setup() uses setup_actor(pool, None).
-    let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
     let mut node = make_test_node("uncached-hash", "x86_64-linux");
     // expected_output_paths set but store client is None — should NOT short-circuit
     node.expected_output_paths = vec![test_store_path("uncached-out")];
 
-    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
+    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
     settle().await;
 
     // Without store client, derivation should proceed normally to dispatch.
     let info = handle
         .debug_query_derivation("uncached-hash")
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist");
     assert!(
         matches!(
@@ -154,6 +154,7 @@ async fn test_scheduler_cache_check_skipped_without_store() {
         "derivation should be dispatched normally without store client, got {:?}",
         info.status
     );
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -165,19 +166,19 @@ async fn test_scheduler_cache_check_skipped_without_store() {
 /// DB writes are best-effort; the actor must not stall on DB unavailability.
 #[tracing_test::traced_test]
 #[tokio::test]
-async fn test_db_failure_during_completion_logged() {
-    let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await;
+async fn test_db_failure_during_completion_logged() -> TestResult {
+    let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await?;
     let build_id = Uuid::new_v4();
     let drv_hash = "db-fault-hash";
     let drv_path = test_drv_path(drv_hash);
-    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
+    let _event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     settle().await;
 
     // Sanity check: derivation was dispatched.
     let pre = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should exist");
     assert_eq!(pre.status, DerivationStatus::Assigned);
 
@@ -192,14 +193,13 @@ async fn test_db_failure_during_completion_logged() {
         &drv_path,
         &test_store_path("fake-output"),
     )
-    .await;
+    .await?;
     settle().await;
 
     // In-memory state should have transitioned despite DB failure.
     let post = handle
         .debug_query_derivation(drv_hash)
-        .await
-        .unwrap()
+        .await?
         .expect("derivation should still exist");
     assert_eq!(
         post.status,
@@ -221,6 +221,7 @@ async fn test_db_failure_during_completion_logged() {
 
     // TestDb::drop uses a separate admin connection, so closing the test
     // pool here doesn't prevent database cleanup.
+    Ok(())
 }
 
 /// A cyclic DAG submission must not leak into the actor's in-memory maps.
@@ -228,7 +229,7 @@ async fn test_db_failure_during_completion_logged() {
 /// inserts, so a CycleDetected error leaves no trace in
 /// build_events/build_sequences/builds.
 #[tokio::test]
-async fn test_cyclic_merge_does_not_leak_in_memory_state() {
+async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
@@ -256,10 +257,9 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() {
             },
             reply: reply_tx,
         })
-        .await
-        .unwrap();
+        .await?;
 
-    let result = reply_rx.await.unwrap();
+    let result = reply_rx.await?;
     assert!(
         result.is_err(),
         "cyclic DAG should be rejected with an error"
@@ -267,23 +267,24 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() {
 
     // The build must NOT be in the actor's maps (it was never inserted,
     // or it was rolled back). QueryBuildStatus should return NotFound.
-    let status_result = try_query_status(&handle, build_id).await;
+    let status_result = try_query_status(&handle, build_id).await?;
     assert!(
         matches!(status_result, Err(ActorError::BuildNotFound(_))),
         "build should not be in actor maps after cyclic merge failure; got {status_result:?}"
     );
 
     // The DAG should have no trace of the cyclic nodes.
-    let drv_a = handle.debug_query_derivation("cycA").await.unwrap();
+    let drv_a = handle.debug_query_derivation("cycA").await?;
     assert!(
         drv_a.is_none(),
         "cycA should not exist in DAG after cycle rollback"
     );
-    let drv_b = handle.debug_query_derivation("cycB").await.unwrap();
+    let drv_b = handle.debug_query_derivation("cycB").await?;
     assert!(
         drv_b.is_none(),
         "cycB should not exist in DAG after cycle rollback"
     );
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -369,7 +370,7 @@ async fn test_handle_uses_shared_backpressure_flag() {
 /// Without cleanup: phantom capacity leak (worker appears full forever)
 /// or infinite dispatch loop when max_builds > 1.
 #[tokio::test]
-async fn test_assign_send_failure_cleans_running_builds() {
+async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     // Connect worker with capacity-1 stream channel so we can fill it.
@@ -379,8 +380,7 @@ async fn test_assign_send_failure_cleans_running_builds() {
             worker_id: "tight-worker".into(),
             stream_tx,
         })
-        .await
-        .unwrap();
+        .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             worker_id: "tight-worker".into(),
@@ -389,8 +389,7 @@ async fn test_assign_send_failure_cleans_running_builds() {
             max_builds: 2, // room for 2, but stream has room for 1
             running_builds: vec![],
         })
-        .await
-        .unwrap();
+        .await?;
 
     // Merge 2 leaf derivations. Both go Ready; dispatch assigns both.
     // First assignment succeeds (fills stream channel). Second try_send
@@ -406,16 +405,16 @@ async fn test_assign_send_failure_cleans_running_builds() {
         vec![],
         false,
     )
-    .await;
+    .await?;
     settle().await;
 
     // Worker should have EXACTLY 1 running build (the successful assign),
     // not 2 (which would indicate the failed assign leaked into running_builds).
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     let worker = workers
         .iter()
         .find(|w| w.worker_id == "tight-worker")
-        .unwrap();
+        .expect("tight-worker registered");
     assert_eq!(
         worker.running_count, 1,
         "failed try_send must clean up running_builds; got {:?}",
@@ -427,9 +426,8 @@ async fn test_assign_send_failure_cleans_running_builds() {
     let unsent_hash = if sent_hash == "drvA" { "drvB" } else { "drvA" };
     let unsent = handle
         .debug_query_derivation(unsent_hash)
-        .await
-        .unwrap()
-        .unwrap();
+        .await?
+        .expect("exists");
     assert_eq!(
         unsent.status,
         DerivationStatus::Ready,
@@ -437,7 +435,7 @@ async fn test_assign_send_failure_cleans_running_builds() {
     );
 
     // Drain the stream channel; next dispatch should pick up the unsent drv.
-    let _first_assignment = stream_rx.recv().await.unwrap();
+    let _first_assignment = stream_rx.recv().await.expect("stream message");
     // Trigger dispatch via heartbeat.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
@@ -447,19 +445,19 @@ async fn test_assign_send_failure_cleans_running_builds() {
             max_builds: 2,
             running_builds: vec![sent_hash.clone()],
         })
-        .await
-        .unwrap();
+        .await?;
     settle().await;
 
     // Now both should be assigned.
-    let workers = handle.debug_query_workers().await.unwrap();
+    let workers = handle.debug_query_workers().await?;
     let worker = workers
         .iter()
         .find(|w| w.worker_id == "tight-worker")
-        .unwrap();
+        .expect("tight-worker registered");
     assert_eq!(
         worker.running_count, 2,
         "after draining stream, both derivations should be assigned"
     );
-    let _second_assignment = stream_rx.recv().await.unwrap();
+    let _second_assignment = stream_rx.recv().await.expect("stream message");
+    Ok(())
 }

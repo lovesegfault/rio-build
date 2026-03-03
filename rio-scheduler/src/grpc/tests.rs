@@ -17,16 +17,17 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// submits a build via SchedulerService, receives WorkAssignment on the
 /// stream, sends CompletionReport, verifies build completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_build_execution_stream_end_to_end() {
+async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _actor_task) = setup_actor(db.pool.clone());
 
     // Spin up in-process gRPC server (SchedulerService + WorkerService).
     let grpc = SchedulerGrpc::new(handle.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
+    // Fire-and-forget: never joined.
     let _server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(SchedulerServiceServer::new(grpc.clone()))
@@ -38,11 +39,9 @@ async fn test_build_execution_stream_end_to_end() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let endpoint = format!("http://{addr}");
-    let channel = tonic::transport::Channel::from_shared(endpoint)
-        .unwrap()
+    let channel = tonic::transport::Channel::from_shared(endpoint)?
         .connect()
-        .await
-        .unwrap();
+        .await?;
     let mut worker_client = WorkerServiceClient::new(channel.clone());
     let mut sched_client =
         rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::new(channel);
@@ -57,8 +56,7 @@ async fn test_build_execution_stream_end_to_end() {
                 },
             )),
         })
-        .await
-        .unwrap();
+        .await?;
 
     let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
     let mut inbound = worker_client
@@ -155,6 +153,7 @@ async fn test_build_execution_stream_end_to_end() {
         saw_completed,
         "BuildCompleted event should be emitted after worker sends CompletionReport"
     );
+    Ok(())
 }
 
 /// SubmitBuild with an empty drv_hash in a node should be rejected at

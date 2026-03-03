@@ -767,11 +767,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_to_ready() {
+    fn test_reset_to_ready() -> anyhow::Result<()> {
         let node = dummy_node();
 
         // Assigned -> Ready: direct valid transition
-        let mut state = DerivationState::try_from_node(&node).unwrap();
+        let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Assigned);
         state.assigned_worker = Some("w1".into());
         assert!(state.reset_to_ready().is_ok());
@@ -779,7 +779,7 @@ mod tests {
         assert!(state.assigned_worker.is_none());
 
         // Running -> Failed -> Ready: goes through Failed
-        let mut state = DerivationState::try_from_node(&node).unwrap();
+        let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Running);
         state.assigned_worker = Some("w1".into());
         assert!(state.reset_to_ready().is_ok());
@@ -787,20 +787,21 @@ mod tests {
         assert!(state.assigned_worker.is_none());
 
         // Invalid source states rejected
-        let mut state = DerivationState::try_from_node(&node).unwrap();
+        let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Queued);
         assert!(state.reset_to_ready().is_err());
 
-        let mut state = DerivationState::try_from_node(&node).unwrap();
+        let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Completed);
         assert!(state.reset_to_ready().is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_reset_from_poison() {
+    fn test_reset_from_poison() -> anyhow::Result<()> {
         let node = dummy_node();
 
-        let mut state = DerivationState::try_from_node(&node).unwrap();
+        let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Poisoned);
         state.poisoned_at = Some(Instant::now());
         state.retry_count = 5;
@@ -814,9 +815,10 @@ mod tests {
         assert!(state.failed_workers.is_empty());
 
         // Non-poisoned state rejected
-        let mut state = DerivationState::try_from_node(&node).unwrap();
+        let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Running);
         assert!(state.reset_from_poison().is_err());
+        Ok(())
     }
 
     #[test]
@@ -875,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_info_transition_validated() {
+    fn test_build_info_transition_validated() -> anyhow::Result<()> {
         let mut b = BuildInfo::new_pending(
             Uuid::new_v4(),
             None,
@@ -887,12 +889,12 @@ mod tests {
         assert_eq!(b.state(), BuildState::Pending);
 
         // Valid: Pending -> Active
-        let old = b.transition(BuildState::Active).unwrap();
+        let old = b.transition(BuildState::Active)?;
         assert_eq!(old, BuildState::Pending);
         assert_eq!(b.state(), BuildState::Active);
 
         // Valid: Active -> Succeeded
-        b.transition(BuildState::Succeeded).unwrap();
+        b.transition(BuildState::Succeeded)?;
         assert_eq!(b.state(), BuildState::Succeeded);
 
         // Invalid: terminal -> anything
@@ -902,6 +904,7 @@ mod tests {
             BuildState::Succeeded,
             "state must be unchanged after rejected transition"
         );
+        Ok(())
     }
 
     #[test]
