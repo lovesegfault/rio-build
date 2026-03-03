@@ -6,9 +6,11 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use rio_proto::admin::admin_service_server::AdminServiceServer;
 use rio_proto::scheduler::scheduler_service_server::SchedulerServiceServer;
 use rio_proto::worker::worker_service_server::WorkerServiceServer;
 use rio_scheduler::actor::ActorHandle;
+use rio_scheduler::admin::AdminServiceImpl;
 use rio_scheduler::db::SchedulerDb;
 use rio_scheduler::grpc::SchedulerGrpc;
 
@@ -142,10 +144,12 @@ async fn main() -> anyhow::Result<()> {
     // (inside SchedulerGrpc), drained by the flusher, read by AdminService.
     let log_buffers = std::sync::Arc::new(rio_scheduler::logs::LogBuffers::new());
 
-    // Log flusher: gzip → S3 PUT → PG insert. Optional — only if
-    // RIO_LOG_S3_BUCKET is set. Without it, logs are ring-buffer-only
-    // (lost on scheduler restart, but still live-servable while running).
-    let log_flush_tx = match &cfg.log_s3_bucket {
+    // Log flusher + AdminService S3: both need the same S3 client (if
+    // configured). Build it once, clone where needed.
+    // Without RIO_LOG_S3_BUCKET, logs are ring-buffer-only (lost on
+    // restart, still live-servable while running) and AdminService can
+    // only serve active-derivation logs.
+    let (log_flush_tx, admin_s3) = match &cfg.log_s3_bucket {
         Some(bucket) => {
             let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .load()
@@ -153,22 +157,22 @@ async fn main() -> anyhow::Result<()> {
             let s3 = aws_sdk_s3::Client::new(&aws_cfg);
             let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(1000);
             let flusher = rio_scheduler::logs::LogFlusher::new(
-                s3,
+                s3.clone(),
                 bucket.clone(),
                 cfg.log_s3_prefix.clone(),
-                pool,
+                pool.clone(),
                 log_buffers.clone(),
             );
             let _flusher_handle = flusher.spawn(flush_rx);
             info!(bucket = %bucket, prefix = %cfg.log_s3_prefix, "log flusher spawned");
-            Some(flush_tx)
+            (Some(flush_tx), Some((s3, bucket.clone())))
         }
         None => {
             tracing::warn!(
                 "RIO_LOG_S3_BUCKET not set; build logs will be ring-buffer-only \
-                 (lost on scheduler restart)"
+                 (lost on scheduler restart, AdminService can't serve completed logs)"
             );
-            None
+            (None, None)
         }
     };
 
@@ -176,11 +180,12 @@ async fn main() -> anyhow::Result<()> {
     let actor = ActorHandle::spawn(db, store_client, log_flush_tx);
     info!("DAG actor spawned");
 
-    // Create gRPC service. It gets its own LogBuffers Arc — same underlying
-    // DashMap as the flusher's. SchedulerGrpc::new creates a SEPARATE one
-    // internally, which would break everything (flusher draining the wrong
-    // buffer). So inject the shared one.
-    let grpc_service = SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers);
+    // Create gRPC services. All three get the SAME Arc<LogBuffers>:
+    // SchedulerGrpc writes, AdminService reads (live), LogFlusher drains
+    // (on completion). SchedulerGrpc::new() would make a SEPARATE buffer,
+    // silently breaking the whole pipeline — hence with_log_buffers().
+    let grpc_service = SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers.clone());
+    let admin_service = AdminServiceImpl::new(log_buffers, admin_s3, pool);
 
     // Start periodic tick task
     let tick_actor = actor.clone();
@@ -221,6 +226,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .add_service(
             WorkerServiceServer::new(grpc_service)
+                .max_decoding_message_size(max_message_size)
+                .max_encoding_message_size(max_message_size),
+        )
+        .add_service(
+            AdminServiceServer::new(admin_service)
                 .max_decoding_message_size(max_message_size)
                 .max_encoding_message_size(max_message_size),
         )

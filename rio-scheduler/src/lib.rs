@@ -19,6 +19,7 @@
 //! - [`grpc`]: SchedulerService + WorkerService gRPC implementations
 
 pub mod actor;
+pub mod admin;
 pub mod dag;
 pub mod db;
 pub mod grpc;
