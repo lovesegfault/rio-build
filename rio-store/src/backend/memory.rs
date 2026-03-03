@@ -88,59 +88,55 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
-    async fn put_and_get() {
+    async fn put_and_get() -> anyhow::Result<()> {
         let backend = MemoryBackend::new();
         let data = Bytes::from_static(b"test nar data");
-        let key = backend.put("abc123", data.clone()).await.unwrap();
+        let key = backend.put("abc123", data.clone()).await?;
         assert_eq!(key, "abc123.nar");
 
-        let mut reader = backend.get(&key).await.unwrap().unwrap();
+        let mut reader = backend.get(&key).await?.expect("key just written");
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
+        reader.read_to_end(&mut buf).await?;
         assert_eq!(buf, b"test nar data");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn get_missing_returns_none() {
+    async fn get_missing_returns_none() -> anyhow::Result<()> {
         let backend = MemoryBackend::new();
-        assert!(backend.get("nonexistent.nar").await.unwrap().is_none());
+        assert!(backend.get("nonexistent.nar").await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn exists_and_delete() {
+    async fn exists_and_delete() -> anyhow::Result<()> {
         let backend = MemoryBackend::new();
-        let key = backend
-            .put("def456", Bytes::from_static(b"data"))
-            .await
-            .unwrap();
-        assert!(backend.exists(&key).await.unwrap());
+        let key = backend.put("def456", Bytes::from_static(b"data")).await?;
+        assert!(backend.exists(&key).await?);
 
-        backend.delete(&key).await.unwrap();
-        assert!(!backend.exists(&key).await.unwrap());
+        backend.delete(&key).await?;
+        assert!(!backend.exists(&key).await?);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn put_overwrites() {
+    async fn put_overwrites() -> anyhow::Result<()> {
         let backend = MemoryBackend::new();
-        backend
-            .put("same", Bytes::from_static(b"first"))
-            .await
-            .unwrap();
-        let key = backend
-            .put("same", Bytes::from_static(b"second"))
-            .await
-            .unwrap();
+        backend.put("same", Bytes::from_static(b"first")).await?;
+        let key = backend.put("same", Bytes::from_static(b"second")).await?;
 
-        let mut reader = backend.get(&key).await.unwrap().unwrap();
+        let mut reader = backend.get(&key).await?.expect("key just written");
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
+        reader.read_to_end(&mut buf).await?;
         assert_eq!(buf, b"second");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn delete_nonexistent_is_noop() {
+    async fn delete_nonexistent_is_noop() -> anyhow::Result<()> {
         let backend = MemoryBackend::new();
         // Should not error
-        backend.delete("nonexistent.nar").await.unwrap();
+        backend.delete("nonexistent.nar").await?;
+        Ok(())
     }
 }

@@ -117,60 +117,62 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
-    async fn put_and_get() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path()).unwrap();
+    async fn put_and_get() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemBackend::new(dir.path())?;
         let data = Bytes::from_static(b"filesystem test nar data");
-        let key = backend.put("abc123", data.clone()).await.unwrap();
+        let key = backend.put("abc123", data.clone()).await?;
         assert_eq!(key, "abc123.nar");
 
-        let mut reader = backend.get(&key).await.unwrap().unwrap();
+        let mut reader = backend.get(&key).await?.expect("key just written");
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
+        reader.read_to_end(&mut buf).await?;
         assert_eq!(buf, b"filesystem test nar data");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn get_missing_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path()).unwrap();
-        assert!(backend.get("nonexistent.nar").await.unwrap().is_none());
+    async fn get_missing_returns_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemBackend::new(dir.path())?;
+        assert!(backend.get("nonexistent.nar").await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn exists_and_delete() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path()).unwrap();
-        let key = backend
-            .put("def456", Bytes::from_static(b"data"))
-            .await
-            .unwrap();
-        assert!(backend.exists(&key).await.unwrap());
+    async fn exists_and_delete() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemBackend::new(dir.path())?;
+        let key = backend.put("def456", Bytes::from_static(b"data")).await?;
+        assert!(backend.exists(&key).await?);
 
-        backend.delete(&key).await.unwrap();
-        assert!(!backend.exists(&key).await.unwrap());
+        backend.delete(&key).await?;
+        assert!(!backend.exists(&key).await?);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn delete_nonexistent_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path()).unwrap();
-        backend.delete("nonexistent.nar").await.unwrap();
+    async fn delete_nonexistent_is_noop() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemBackend::new(dir.path())?;
+        backend.delete("nonexistent.nar").await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn creates_base_dir_on_construction() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn creates_base_dir_on_construction() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let nested = dir.path().join("deep").join("nested");
         assert!(!nested.exists());
-        let _backend = FilesystemBackend::new(&nested).unwrap();
+        let _backend = FilesystemBackend::new(&nested)?;
         assert!(nested.exists());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_path_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = FilesystemBackend::new(dir.path()).unwrap();
+    async fn rejects_path_traversal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let backend = FilesystemBackend::new(dir.path())?;
 
         // All operations should reject traversal attempts.
         assert!(backend.get("../etc/passwd").await.is_err());
@@ -181,5 +183,6 @@ mod tests {
 
         // Valid keys (no slashes, no ..) should work.
         assert!(backend.get("valid-key.nar").await.is_ok());
+        Ok(())
     }
 }

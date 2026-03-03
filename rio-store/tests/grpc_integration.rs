@@ -20,8 +20,8 @@ use rio_proto::types::{
 use rio_proto::validated::ValidatedPathInfo;
 use rio_store::backend::memory::MemoryBackend;
 use rio_store::grpc::StoreServiceImpl;
-use rio_test_support::TestDb;
 use rio_test_support::fixtures::{make_nar, make_path_info_for_nar};
+use rio_test_support::{Context, TestDb, TestResult};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
@@ -33,39 +33,36 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// should be aborted at test end (or dropped) to shut down the server.
 pub async fn setup_store(
     pool: PgPool,
-) -> (
+) -> anyhow::Result<(
     StoreServiceClient<Channel>,
     Arc<MemoryBackend>,
     tokio::task::JoinHandle<()>,
-) {
+)> {
     let backend = Arc::new(MemoryBackend::new());
     let service = StoreServiceImpl::new(backend.clone(), pool);
 
     // Bind to a random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
+    // Fire-and-forget: aborted at test end, never joined.
     let server = tokio::spawn(async move {
         Server::builder()
             .add_service(StoreServiceServer::new(service))
             .serve_with_incoming(incoming)
             .await
-            .unwrap();
+            .expect("in-process store server");
     });
 
     // Give the server a moment to start accepting
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let endpoint = format!("http://{addr}");
-    let channel = Channel::from_shared(endpoint)
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = Channel::from_shared(endpoint)?.connect().await?;
     let client = StoreServiceClient::new(channel);
 
-    (client, backend, server)
+    Ok((client, backend, server))
 }
 
 /// Helper: upload a path via PutPath, sending metadata + one nar_chunk.
@@ -92,20 +89,21 @@ pub async fn put_path_raw(
     let (tx, rx) = mpsc::channel(8);
 
     // Send metadata first
+    // Fresh channel with buffer=8, receiver alive: these sends cannot fail.
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),
         })),
     })
     .await
-    .unwrap();
+    .expect("fresh channel");
 
     // Send NAR data as one chunk
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::NarChunk(nar)),
     })
     .await
-    .unwrap();
+    .expect("fresh channel");
 
     // Close the stream
     drop(tx);
@@ -116,9 +114,9 @@ pub async fn put_path_raw(
 }
 
 #[tokio::test]
-async fn test_harness_smoke() {
+async fn test_harness_smoke() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // QueryPathInfo on missing path should return NOT_FOUND
     let result = client
@@ -130,6 +128,7 @@ async fn test_harness_smoke() {
     assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
 
     server.abort();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -139,9 +138,9 @@ async fn test_harness_smoke() {
 /// After a PutPath fails validation (hash mismatch), the placeholder rows
 /// should be cleaned up so a retry with the correct data succeeds.
 #[tokio::test]
-async fn test_put_path_cleanup_on_hash_mismatch() {
+async fn test_put_path_cleanup_on_hash_mismatch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let store_path = "/nix/store/11111111111111111111111111111111-test-cleanup-path";
     let good_nar = make_nar(b"correct content").0;
@@ -156,8 +155,7 @@ async fn test_put_path_cleanup_on_hash_mismatch() {
     let stale: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM nar_blobs WHERE status = 'uploading'")
             .fetch_one(&db.pool)
-            .await
-            .unwrap();
+            .await?;
     assert_eq!(stale, 0, "uploading placeholder should be cleaned up");
 
     // Retry with correct content should succeed (no unique constraint violation)
@@ -166,9 +164,10 @@ async fn test_put_path_cleanup_on_hash_mismatch() {
         result.is_ok(),
         "retry after cleanup should succeed: {result:?}"
     );
-    assert!(result.unwrap(), "should be newly created");
+    assert!(result?, "should be newly created");
 
     server.abort();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -177,11 +176,11 @@ async fn test_put_path_cleanup_on_hash_mismatch() {
 
 /// PutPath followed by GetPath should return the same NAR content.
 #[tokio::test]
-async fn test_put_get_roundtrip() {
+async fn test_put_get_roundtrip() -> TestResult {
     use rio_proto::types::{GetPathRequest, get_path_response};
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let store_path = "/nix/store/22222222222222222222222222222222-test-roundtrip-path";
     let nar = make_nar(b"roundtrip test content!").0;
@@ -190,7 +189,7 @@ async fn test_put_get_roundtrip() {
     // Put
     let created = put_path(&mut client, info.clone(), nar.clone())
         .await
-        .expect("put should succeed");
+        .context("put should succeed")?;
     assert!(created, "should be newly created");
 
     // Get
@@ -199,12 +198,12 @@ async fn test_put_get_roundtrip() {
             store_path: store_path.into(),
         })
         .await
-        .expect("get should succeed")
+        .context("get should succeed")?
         .into_inner();
 
     let mut got_info = None;
     let mut got_nar = Vec::new();
-    while let Some(msg) = stream.message().await.unwrap() {
+    while let Some(msg) = stream.message().await? {
         match msg.msg {
             Some(get_path_response::Msg::Info(i)) => got_info = Some(i),
             Some(get_path_response::Msg::NarChunk(chunk)) => got_nar.extend_from_slice(&chunk),
@@ -212,23 +211,23 @@ async fn test_put_get_roundtrip() {
         }
     }
 
-    assert!(got_info.is_some(), "should receive PathInfo");
-    let got_info = got_info.unwrap();
+    let got_info = got_info.expect("should receive PathInfo");
     assert_eq!(got_info.store_path, store_path);
     assert_eq!(got_info.nar_hash, info.nar_hash);
     assert_eq!(got_info.nar_size, info.nar_size);
     assert_eq!(got_nar, nar, "NAR content should roundtrip exactly");
 
     server.abort();
+    Ok(())
 }
 
 /// GetPath on a path that was never uploaded should return NOT_FOUND.
 #[tokio::test]
-async fn test_get_path_nonexistent_returns_not_found() {
+async fn test_get_path_nonexistent_returns_not_found() -> TestResult {
     use rio_proto::types::GetPathRequest;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let result = client
         .get_path(GetPathRequest {
@@ -244,6 +243,7 @@ async fn test_get_path_nonexistent_returns_not_found() {
     );
 
     server.abort();
+    Ok(())
 }
 
 /// GetPath on a corrupted blob (bitrot, disk failure) should stream chunks
@@ -252,11 +252,11 @@ async fn test_get_path_nonexistent_returns_not_found() {
 /// If this check is broken, corrupted NARs would be served silently, causing
 /// silent build output corruption.
 #[tokio::test]
-async fn test_get_path_corrupted_blob_returns_data_loss() {
+async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     use rio_proto::types::{GetPathRequest, get_path_response};
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, backend, server) = setup_store(db.pool.clone()).await?;
 
     // 1. Upload a valid NAR.
     let store_path = "/nix/store/88888888888888888888888888888888-corruption-test";
@@ -266,7 +266,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() {
 
     let created = put_path(&mut client, info, good_nar)
         .await
-        .expect("put should succeed");
+        .context("put should succeed")?;
     assert!(created);
 
     // 2. Corrupt the blob directly in the backend (same length so size check
@@ -283,7 +283,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() {
             store_path: store_path.into(),
         })
         .await
-        .expect("get_path call should succeed (error comes in stream)")
+        .context("get_path call should succeed (error comes in stream)")?
         .into_inner();
 
     let mut got_data_loss = false;
@@ -323,13 +323,14 @@ async fn test_get_path_corrupted_blob_returns_data_loss() {
     );
 
     server.abort();
+    Ok(())
 }
 
 /// Second PutPath with same content should return created=false (idempotent).
 #[tokio::test]
-async fn test_idempotent_put_path() {
+async fn test_idempotent_put_path() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let store_path = "/nix/store/33333333333333333333333333333333-test-idempotent-path";
     let nar = make_nar(b"idempotent test").0;
@@ -338,16 +339,17 @@ async fn test_idempotent_put_path() {
     // First put
     let created1 = put_path(&mut client, info.clone(), nar.clone())
         .await
-        .expect("first put should succeed");
+        .context("first put should succeed")?;
     assert!(created1, "first put should create");
 
     // Second put with same content
     let created2 = put_path(&mut client, info, nar)
         .await
-        .expect("second put should succeed (idempotent)");
+        .context("second put should succeed (idempotent)")?;
     assert!(!created2, "second put should return created=false");
 
     server.abort();
+    Ok(())
 }
 
 /// Two concurrent PutPath requests for the same path: exactly one should
@@ -356,9 +358,9 @@ async fn test_idempotent_put_path() {
 /// in-progress window). Never: both created=true, or the loser's cleanup
 /// deleting the winner's placeholder.
 #[tokio::test]
-async fn test_concurrent_putpath_same_path_one_wins() {
+async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client1, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client1, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // Second client to the same server so we can send two concurrent streams.
     let mut client2 = client1.clone();
@@ -397,17 +399,18 @@ async fn test_concurrent_putpath_same_path_one_wins() {
             store_path: store_path.into(),
         })
         .await
-        .expect("path should be queryable after concurrent uploads");
+        .context("path should be queryable after concurrent uploads")?;
     assert_eq!(qpi.into_inner().nar_size, nar.len() as u64);
 
     server.abort();
+    Ok(())
 }
 
 /// PutPath with chunks exceeding declared nar_size should be rejected.
 #[tokio::test]
-async fn test_put_path_rejects_oversized_nar() {
+async fn test_put_path_rejects_oversized_nar() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // Declare nar_size=100 but send 100_000 bytes (well over + 4KB tolerance)
     let mut info = make_path_info_for_nar(
@@ -433,15 +436,16 @@ async fn test_put_path_rejects_oversized_nar() {
     );
 
     server.abort();
+    Ok(())
 }
 
 /// Oversized rejection must clean up the uploading placeholder so a retry
 /// with correct data succeeds. Regression test for the placeholder leak at
 /// the chunk-size-exceeded early return.
 #[tokio::test]
-async fn test_put_path_oversized_then_retry_succeeds() {
+async fn test_put_path_oversized_then_retry_succeeds() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let store_path = "/nix/store/66666666666666666666666666666666-oversized-retry";
     let real_nar = make_nar(b"retry test data").0;
@@ -458,7 +462,7 @@ async fn test_put_path_oversized_then_retry_succeeds() {
     // Second attempt: correct data. Must succeed (placeholder was cleaned up).
     let r2 = put_path(&mut client, real_info, real_nar.clone())
         .await
-        .expect("retry with correct data must succeed after oversized rejection");
+        .context("retry with correct data must succeed after oversized rejection")?;
     assert!(r2, "retry should create");
 
     // Verify the path is queryable.
@@ -467,18 +471,19 @@ async fn test_put_path_oversized_then_retry_succeeds() {
             store_path: store_path.into(),
         })
         .await
-        .expect("path should be queryable");
+        .context("path should be queryable")?;
     assert_eq!(qpi.into_inner().nar_size, real_nar.len() as u64);
 
     server.abort();
+    Ok(())
 }
 
 /// Duplicate metadata mid-stream is a protocol violation and must be rejected
 /// (not silently ignored).
 #[tokio::test]
-async fn test_put_path_rejects_duplicate_metadata() {
+async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let store_path = "/nix/store/77777777777777777777777777777777-dup-metadata";
     let nar = make_nar(b"dup metadata test").0;
@@ -491,22 +496,19 @@ async fn test_put_path_rejects_duplicate_metadata() {
             info: Some(info.clone().into()),
         })),
     })
-    .await
-    .unwrap();
+    .await?;
     // Metadata #2 (protocol violation)
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info.into()),
         })),
     })
-    .await
-    .unwrap();
+    .await?;
     // Chunk (never read — server should reject before this)
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::NarChunk(nar)),
     })
-    .await
-    .unwrap();
+    .await?;
     drop(tx);
 
     let result = client.put_path(ReceiverStream::new(rx)).await;
@@ -520,14 +522,15 @@ async fn test_put_path_rejects_duplicate_metadata() {
     );
 
     server.abort();
+    Ok(())
 }
 
 /// PutPath with absurdly large declared nar_size should be rejected BEFORE
 /// allocation (prevents OOM from malicious clients).
 #[tokio::test]
-async fn test_put_path_rejects_absurd_nar_size() {
+async fn test_put_path_rejects_absurd_nar_size() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let mut info = make_path_info_for_nar(
         "/nix/store/55555555555555555555555555555555-absurd-size-test",
@@ -548,13 +551,14 @@ async fn test_put_path_rejects_absurd_nar_size() {
     );
 
     server.abort();
+    Ok(())
 }
 
 /// PutPath with more than MAX_REFERENCES entries should be rejected.
 #[tokio::test]
-async fn test_put_path_rejects_excessive_references() {
+async fn test_put_path_rejects_excessive_references() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // We're testing SERVER-SIDE rejection of too-many-references. Build raw
     // PathInfo directly since ValidatedPathInfo can't hold 10,001 unparsed
@@ -586,13 +590,14 @@ async fn test_put_path_rejects_excessive_references() {
     );
 
     server.abort();
+    Ok(())
 }
 
 /// PutPath with a malformed reference path should be rejected.
 #[tokio::test]
-async fn test_put_path_rejects_malformed_reference() {
+async fn test_put_path_rejects_malformed_reference() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // Testing SERVER-SIDE rejection: build raw PathInfo with a garbage ref.
     let nar = make_nar(b"refs-test").0;
@@ -608,14 +613,15 @@ async fn test_put_path_rejects_malformed_reference() {
     assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
 
     server.abort();
+    Ok(())
 }
 
 /// Malformed store paths (no 32-char hash prefix, traversal attempts) should
 /// be rejected with INVALID_ARGUMENT at the RPC boundary.
 #[tokio::test]
-async fn test_rejects_malformed_store_paths() {
+async fn test_rejects_malformed_store_paths() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     let bad_paths = [
         "/nix/store/too-short",     // no 32-char hash
@@ -639,13 +645,14 @@ async fn test_rejects_malformed_store_paths() {
     }
 
     server.abort();
+    Ok(())
 }
 
 /// FindMissingPaths with > MAX_BATCH_PATHS entries should be rejected.
 #[tokio::test]
-async fn test_find_missing_paths_rejects_oversized_batch() {
+async fn test_find_missing_paths_rejects_oversized_batch() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // 10_001 paths (one over the limit).
     let paths: Vec<String> = (0..10_001)
@@ -672,6 +679,7 @@ async fn test_find_missing_paths_rejects_oversized_batch() {
     );
 
     server.abort();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -681,9 +689,9 @@ async fn test_find_missing_paths_rejects_oversized_batch() {
 /// internal_error() must NOT leak sqlx/Postgres details to the client.
 /// Server logs the full error; client sees only "storage operation failed".
 #[tokio::test]
-async fn test_internal_error_hides_sqlx_details() {
+async fn test_internal_error_hides_sqlx_details() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, _backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, _backend, server) = setup_store(db.pool.clone()).await?;
 
     // Close the pool so the next DB query fails with a sqlx::Error::PoolClosed.
     db.pool.close().await;
@@ -707,6 +715,7 @@ async fn test_internal_error_hides_sqlx_details() {
     assert!(!status.message().to_lowercase().contains("pool"));
 
     server.abort();
+    Ok(())
 }
 
 // Note: the "NAR blob not found for" branch (grpc.rs:369-372) is defense-
@@ -717,16 +726,16 @@ async fn test_internal_error_hides_sqlx_details() {
 /// GetPath with nar_blobs row present but blob missing from backend.
 /// This is the data-loss scenario: metadata says it's there, backend lost it.
 #[tokio::test]
-async fn test_get_path_backend_blob_missing() {
+async fn test_get_path_backend_blob_missing() -> TestResult {
     use rio_proto::types::GetPathRequest;
 
     let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store(db.pool.clone()).await;
+    let (mut client, backend, server) = setup_store(db.pool.clone()).await?;
 
     let store_path = "/nix/store/33333333333333333333333333333333-backend-missing";
     let nar = make_nar(b"content").0;
     let info = make_path_info_for_nar(store_path, &nar);
-    put_path(&mut client, info, nar).await.unwrap();
+    put_path(&mut client, info, nar).await?;
 
     // Delete the blob from the backend so metadata says it's there but
     // backend.get() returns None. This is the data-loss scenario.
@@ -737,12 +746,11 @@ async fn test_get_path_backend_blob_missing() {
     )
     .bind(store_path)
     .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    .await?;
     backend
         .delete(&blob_key)
         .await
-        .expect("delete from backend");
+        .context("delete from backend")?;
 
     let result = client
         .get_path(GetPathRequest {
@@ -758,4 +766,5 @@ async fn test_get_path_backend_blob_missing() {
     );
 
     server.abort();
+    Ok(())
 }
