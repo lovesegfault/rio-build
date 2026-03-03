@@ -36,3 +36,4 @@ rand = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+rio-test-support = { path = "../rio-test-support" }
