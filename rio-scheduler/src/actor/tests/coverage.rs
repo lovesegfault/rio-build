@@ -12,8 +12,8 @@ async fn test_keepgoing_false_fails_fast() {
         &handle,
         build_id,
         vec![
-            make_test_node("hashA", "/nix/store/hashA.drv", "x86_64-linux"),
-            make_test_node("hashB", "/nix/store/hashB.drv", "x86_64-linux"),
+            make_test_node("hashA", "x86_64-linux"),
+            make_test_node("hashB", "x86_64-linux"),
         ],
         vec![],
         false, // keep_going=false (critical)
@@ -25,7 +25,7 @@ async fn test_keepgoing_false_fails_fast() {
     complete_failure(
         &handle,
         "test-worker",
-        "/nix/store/hashA.drv",
+        &test_drv_path("hashA"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
@@ -53,8 +53,8 @@ async fn test_keepgoing_true_waits_all() {
         &handle,
         build_id,
         vec![
-            make_test_node("hashX", "/nix/store/hashX.drv", "x86_64-linux"),
-            make_test_node("hashY", "/nix/store/hashY.drv", "x86_64-linux"),
+            make_test_node("hashX", "x86_64-linux"),
+            make_test_node("hashY", "x86_64-linux"),
         ],
         vec![],
         true, // keep_going=true (critical)
@@ -66,7 +66,7 @@ async fn test_keepgoing_true_waits_all() {
     complete_failure(
         &handle,
         "test-worker",
-        "/nix/store/hashX.drv",
+        &test_drv_path("hashX"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "failed",
     )
@@ -82,7 +82,7 @@ async fn test_keepgoing_true_waits_all() {
     );
 
     // Complete hashY successfully
-    complete_success_empty(&handle, "test-worker", "/nix/store/hashY.drv").await;
+    complete_success_empty(&handle, "test-worker", &test_drv_path("hashY")).await;
     settle().await;
 
     // Now build should be Failed (all resolved, one failed)
@@ -110,13 +110,13 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
         &handle,
         build_id,
         vec![
-            make_test_node("cascadeA", "/nix/store/cascadeA.drv", "x86_64-linux"),
-            make_test_node("cascadeB", "/nix/store/cascadeB.drv", "x86_64-linux"),
-            make_test_node("cascadeC", "/nix/store/cascadeC.drv", "x86_64-linux"),
+            make_test_node("cascadeA", "x86_64-linux"),
+            make_test_node("cascadeB", "x86_64-linux"),
+            make_test_node("cascadeC", "x86_64-linux"),
         ],
         vec![
-            make_test_edge("/nix/store/cascadeA.drv", "/nix/store/cascadeB.drv"),
-            make_test_edge("/nix/store/cascadeB.drv", "/nix/store/cascadeC.drv"),
+            make_test_edge("cascadeA", "cascadeB"),
+            make_test_edge("cascadeB", "cascadeC"),
         ],
         true, // keep_going
     )
@@ -141,7 +141,7 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
     complete_failure(
         &handle,
         "cascade-worker",
-        "/nix/store/cascadeC.drv",
+        &test_drv_path("cascadeC"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
@@ -196,19 +196,12 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
 
     // Build 1: single leaf, poisoned via PermanentFailure.
     let build1 = Uuid::new_v4();
-    let _rx1 = merge_single_node(
-        &handle,
-        build1,
-        "preleaf",
-        "/nix/store/preleaf.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let _rx1 = merge_single_node(&handle, build1, "preleaf", PriorityClass::Scheduled).await;
     settle().await;
     complete_failure(
         &handle,
         "poison-worker",
-        "/nix/store/preleaf.drv",
+        &test_drv_path("preleaf"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "preleaf failed",
     )
@@ -230,13 +223,10 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
         &handle,
         build2,
         vec![
-            make_test_node("preparent", "/nix/store/preparent.drv", "x86_64-linux"),
-            make_test_node("preleaf", "/nix/store/preleaf.drv", "x86_64-linux"),
+            make_test_node("preparent", "x86_64-linux"),
+            make_test_node("preleaf", "x86_64-linux"),
         ],
-        vec![make_test_edge(
-            "/nix/store/preparent.drv",
-            "/nix/store/preleaf.drv",
-        )],
+        vec![make_test_edge("preparent", "preleaf")],
         false,
     )
     .await;
@@ -274,17 +264,11 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
 
     // Submit a build, complete it, then drop the original subscriber.
     let build_id = Uuid::new_v4();
-    let original_rx = merge_single_node(
-        &handle,
-        build_id,
-        "watch-hash",
-        "/nix/store/watch-hash.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let original_rx =
+        merge_single_node(&handle, build_id, "watch-hash", PriorityClass::Scheduled).await;
     settle().await;
 
-    complete_success_empty(&handle, "watch-worker", "/nix/store/watch-hash.drv").await;
+    complete_success_empty(&handle, "watch-worker", &test_drv_path("watch-hash")).await;
     settle().await;
 
     // Drop the original subscriber. The BuildCompleted event was already
@@ -332,18 +316,11 @@ async fn test_terminal_build_cleanup_after_delay() {
     // Complete a build.
     let build_id = Uuid::new_v4();
     let drv_hash = "cleanup-hash";
-    let drv_path = "/nix/store/cleanup-hash.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
-    complete_success_empty(&handle, "cleanup-worker", drv_path).await;
+    complete_success_empty(&handle, "cleanup-worker", &drv_path).await;
     settle().await;
 
     // Build should be Succeeded and still queryable.
@@ -383,14 +360,9 @@ async fn test_transient_retry_different_worker() {
     let _rx2 = connect_worker(&handle, "worker-b", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        "retry-hash",
-        "/nix/store/retry-hash.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let p_retry = test_drv_path("retry-hash");
+    let _event_rx =
+        merge_single_node(&handle, build_id, "retry-hash", PriorityClass::Scheduled).await;
     settle().await;
 
     // Get initial worker assignment
@@ -406,7 +378,7 @@ async fn test_transient_retry_different_worker() {
     complete_failure(
         &handle,
         &first_worker,
-        "/nix/store/retry-hash.drv",
+        &p_retry,
         rio_proto::types::BuildResultStatus::TransientFailure,
         "network hiccup",
     )
@@ -440,14 +412,9 @@ async fn test_transient_failure_max_retries_same_worker_poisons() {
     let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        "maxretry-hash",
-        "/nix/store/maxretry-hash.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let p_maxretry = test_drv_path("maxretry-hash");
+    let _event_rx =
+        merge_single_node(&handle, build_id, "maxretry-hash", PriorityClass::Scheduled).await;
     settle().await;
 
     // Default RetryPolicy::max_retries = 2. Fail 3 times on same worker:
@@ -456,7 +423,7 @@ async fn test_transient_failure_max_retries_same_worker_poisons() {
         complete_failure(
             &handle,
             "flaky-worker",
-            "/nix/store/maxretry-hash.drv",
+            &p_maxretry,
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("attempt {attempt} failed"),
         )
@@ -484,14 +451,8 @@ async fn test_cancel_build_active_drains_derivations() {
     // No workers — derivation stays Ready (never assigned).
 
     let build_id = Uuid::new_v4();
-    let mut event_rx = merge_single_node(
-        &handle,
-        build_id,
-        "cancel-hash",
-        "/nix/store/cancel-hash.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let mut event_rx =
+        merge_single_node(&handle, build_id, "cancel-hash", PriorityClass::Scheduled).await;
     settle().await;
 
     // Send CancelBuild.
@@ -557,7 +518,6 @@ async fn test_watch_build_receives_events() {
         &handle,
         build_id,
         "watch-events-hash",
-        "/nix/store/watch-events-hash.drv",
         PriorityClass::Scheduled,
     )
     .await;
@@ -579,7 +539,7 @@ async fn test_watch_build_receives_events() {
     complete_success_empty(
         &handle,
         "watch-events-worker",
-        "/nix/store/watch-events-hash.drv",
+        &test_drv_path("watch-events-hash"),
     )
     .await;
 
@@ -620,25 +580,15 @@ async fn test_dispatch_skips_ineligible_derivation() {
     let _rx = merge_dag(
         &handle,
         build_arm,
-        vec![make_test_node(
-            "arm-hash",
-            "/nix/store/arm-hash.drv",
-            "aarch64-linux",
-        )],
+        vec![make_test_node("arm-hash", "aarch64-linux")],
         vec![],
         false,
     )
     .await;
 
     let build_x86 = Uuid::new_v4();
-    let _rx = merge_single_node(
-        &handle,
-        build_x86,
-        "x86-hash",
-        "/nix/store/x86-hash.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let p_x86 = test_drv_path("x86-hash");
+    let _rx = merge_single_node(&handle, build_x86, "x86-hash", PriorityClass::Scheduled).await;
     settle().await;
 
     // x86_64 derivation should be dispatched despite aarch64 ahead of it.
@@ -651,7 +601,7 @@ async fn test_dispatch_skips_ineligible_derivation() {
         _ => panic!("expected assignment"),
     };
     assert_eq!(
-        dispatched_path, "/nix/store/x86-hash.drv",
+        dispatched_path, p_x86,
         "x86_64 derivation should be dispatched even with ineligible aarch64 ahead in queue"
     );
 
@@ -684,11 +634,7 @@ async fn test_build_options_propagated_to_worker() {
                 build_id,
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node(
-                    "opts-hash",
-                    "/nix/store/opts-hash.drv",
-                    "x86_64-linux",
-                )],
+                nodes: vec![make_test_node("opts-hash", "x86_64-linux")],
                 edges: vec![],
                 options: BuildOptions {
                     max_silent_time: 60,
@@ -738,15 +684,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() {
     // insert it into worker.running_builds.
     let build_id = Uuid::new_v4();
     let drv_hash = "toctou-drv-hash";
-    let drv_path = "/nix/store/toctou-drv-hash.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Verify: derivation is Assigned, worker.running_builds contains it.
@@ -808,15 +746,8 @@ async fn test_poison_threshold_after_distinct_workers() {
 
     let build_id = Uuid::new_v4();
     let drv_hash = "poison-drv";
-    let drv_path = "/nix/store/poison-drv.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
@@ -824,7 +755,7 @@ async fn test_poison_threshold_after_distinct_workers() {
         complete_failure(
             &handle,
             worker,
-            drv_path,
+            &drv_path,
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("failure {i}"),
         )
@@ -861,17 +792,16 @@ async fn test_dependency_chain_releases_parent() {
 
     // A depends on B. B is Ready (leaf), A is Queued.
     let build_id = Uuid::new_v4();
+    let p_chain_a = test_drv_path("chainA");
+    let p_chain_b = test_drv_path("chainB");
     let _rx = merge_dag(
         &handle,
         build_id,
         vec![
-            make_test_node("chainA", "/nix/store/chainA.drv", "x86_64-linux"),
-            make_test_node("chainB", "/nix/store/chainB.drv", "x86_64-linux"),
+            make_test_node("chainA", "x86_64-linux"),
+            make_test_node("chainB", "x86_64-linux"),
         ],
-        vec![make_test_edge(
-            "/nix/store/chainA.drv",
-            "/nix/store/chainB.drv",
-        )],
+        vec![make_test_edge("chainA", "chainB")],
         false,
     )
     .await;
@@ -894,10 +824,10 @@ async fn test_dependency_chain_releases_parent() {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
         _ => panic!("expected assignment"),
     };
-    assert_eq!(assigned_path, "/nix/store/chainB.drv");
+    assert_eq!(assigned_path, p_chain_b);
 
     // Complete B.
-    complete_success_empty(&handle, "chain-worker", "/nix/store/chainB.drv").await;
+    complete_success_empty(&handle, "chain-worker", &p_chain_b).await;
     settle().await;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
@@ -925,7 +855,7 @@ async fn test_dependency_chain_releases_parent() {
         _ => panic!("expected assignment"),
     };
     assert_eq!(
-        assigned_path, "/nix/store/chainA.drv",
+        assigned_path, p_chain_a,
         "A should be dispatched after B completes"
     );
 }
@@ -938,20 +868,14 @@ async fn test_duplicate_completion_idempotent() {
 
     let build_id = Uuid::new_v4();
     let drv_hash = "idem-hash";
-    let drv_path = "/nix/store/idem-hash.drv";
-    let mut event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let mut event_rx =
+        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Send completion TWICE.
     for _ in 0..2 {
-        complete_success_empty(&handle, "idem-worker", drv_path).await;
+        complete_success_empty(&handle, "idem-worker", &drv_path).await;
         settle().await;
     }
 
@@ -1035,7 +959,6 @@ async fn test_tick_expires_poisoned_derivation() {
         &handle,
         build_id,
         "poison-ttl-hash",
-        "/nix/store/poison-ttl.drv",
         PriorityClass::Scheduled,
     )
     .await;
@@ -1044,7 +967,7 @@ async fn test_tick_expires_poisoned_derivation() {
     complete_failure(
         &handle,
         "poison-ttl-worker",
-        "/nix/store/poison-ttl.drv",
+        &test_drv_path("poison-ttl-hash"),
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
@@ -1098,7 +1021,7 @@ async fn test_completion_db_fault_build_history_logged() {
 
     // Use a node with pname so update_build_history is called.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("fault-hash", "/nix/store/fault.drv", "x86_64-linux");
+    let mut node = make_test_node("fault-hash", "x86_64-linux");
     node.pname = "fault-pkg".into();
     let _evt_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
     settle().await;
@@ -1110,7 +1033,7 @@ async fn test_completion_db_fault_build_history_logged() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "fault-worker".into(),
-            drv_key: "/nix/store/fault.drv".into(),
+            drv_key: test_drv_path("fault-hash"),
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 start_time: Some(prost_types::Timestamp {
@@ -1154,14 +1077,8 @@ async fn test_transient_failure_db_fault_retry_persist_logged() {
     let (db, handle, _task, _rx) = setup_with_worker("tfault-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
-    let _evt_rx = merge_single_node(
-        &handle,
-        build_id,
-        "tfault-hash",
-        "/nix/store/tfault.drv",
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let _evt_rx =
+        merge_single_node(&handle, build_id, "tfault-hash", PriorityClass::Scheduled).await;
     settle().await;
 
     db.pool.close().await;
@@ -1169,7 +1086,7 @@ async fn test_transient_failure_db_fault_retry_persist_logged() {
     complete_failure(
         &handle,
         "tfault-worker",
-        "/nix/store/tfault.drv",
+        &test_drv_path("tfault-hash"),
         rio_proto::types::BuildResultStatus::TransientFailure,
         "flaky network",
     )
@@ -1196,10 +1113,10 @@ async fn test_newly_ready_db_fault_status_persist_logged() {
         &handle,
         build_id,
         vec![
-            make_test_node("nrA", "/nix/store/nrA.drv", "x86_64-linux"),
-            make_test_node("nrB", "/nix/store/nrB.drv", "x86_64-linux"),
+            make_test_node("nrA", "x86_64-linux"),
+            make_test_node("nrB", "x86_64-linux"),
         ],
-        vec![make_test_edge("/nix/store/nrA.drv", "/nix/store/nrB.drv")],
+        vec![make_test_edge("nrA", "nrB")],
         false,
     )
     .await;
@@ -1211,8 +1128,8 @@ async fn test_newly_ready_db_fault_status_persist_logged() {
     complete_success(
         &handle,
         "nrfault-worker",
-        "/nix/store/nrB.drv",
-        "/nix/store/out-B",
+        &test_drv_path("nrB"),
+        &test_store_path("out-B"),
     )
     .await;
     settle().await;
@@ -1250,8 +1167,8 @@ async fn test_interactive_priority_push_front() {
         &handle,
         build1,
         vec![
-            make_test_node("prioQ", "/nix/store/prioQ.drv", "x86_64-linux"),
-            make_test_node("prioR", "/nix/store/prioR.drv", "x86_64-linux"),
+            make_test_node("prioQ", "x86_64-linux"),
+            make_test_node("prioR", "x86_64-linux"),
         ],
         vec![],
         false,
@@ -1260,6 +1177,8 @@ async fn test_interactive_priority_push_front() {
     settle().await;
 
     // Build 2: Interactive, 2-node chain A → B. B is a leaf, A blocked.
+    let p_prio_a = test_drv_path("prioA");
+    let p_prio_b = test_drv_path("prioB");
     let build2 = Uuid::new_v4();
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
@@ -1269,13 +1188,10 @@ async fn test_interactive_priority_push_front() {
                 tenant_id: None,
                 priority_class: PriorityClass::Interactive,
                 nodes: vec![
-                    make_test_node("prioA", "/nix/store/prioA.drv", "x86_64-linux"),
-                    make_test_node("prioB", "/nix/store/prioB.drv", "x86_64-linux"),
+                    make_test_node("prioA", "x86_64-linux"),
+                    make_test_node("prioB", "x86_64-linux"),
                 ],
-                edges: vec![make_test_edge(
-                    "/nix/store/prioA.drv",
-                    "/nix/store/prioB.drv",
-                )],
+                edges: vec![make_test_edge("prioA", "prioB")],
                 options: BuildOptions::default(),
                 keep_going: false,
             },
@@ -1305,17 +1221,17 @@ async fn test_interactive_priority_push_front() {
         let path = a.drv_path.clone();
         seen_paths.push(path.clone());
         // Complete it.
-        complete_success(&handle, "prio-worker", &path, "/nix/store/out").await;
+        complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await;
         settle().await;
         // If we just completed B, the NEXT dispatch should be A (push_front).
-        if path == "/nix/store/prioB.drv" {
+        if path == p_prio_b {
             let next = worker_rx.recv().await.expect("should get next assignment");
             let Some(rio_proto::types::scheduler_message::Msg::Assignment(next_a)) = next.msg
             else {
                 panic!("expected Assignment");
             };
             assert_eq!(
-                next_a.drv_path, "/nix/store/prioA.drv",
+                next_a.drv_path, p_prio_a,
                 "Interactive newly-ready A should dispatch before queued Scheduled work. \
                  Dispatch history: {seen_paths:?}"
             );
@@ -1346,11 +1262,7 @@ async fn test_merge_db_failure_rolls_back_memory() {
                 build_id,
                 tenant_id: None,
                 priority_class: PriorityClass::Scheduled,
-                nodes: vec![make_test_node(
-                    "rollback",
-                    "/nix/store/rb.drv",
-                    "x86_64-linux",
-                )],
+                nodes: vec![make_test_node("rollback", "x86_64-linux")],
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
@@ -1393,8 +1305,8 @@ async fn test_check_cached_outputs_store_error_non_fatal() {
 
     // Merge with expected_output_paths set so check_cached_outputs runs.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("cache-err", "/nix/store/ce.drv", "x86_64-linux");
-    node.expected_output_paths = vec!["/nix/store/expected-out".into()];
+    let mut node = make_test_node("cache-err", "x86_64-linux");
+    node.expected_output_paths = vec![test_store_path("expected-out")];
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::MergeDag {

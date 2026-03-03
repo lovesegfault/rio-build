@@ -4,6 +4,7 @@ use super::*;
 use tokio::sync::mpsc;
 
 pub(super) use rio_test_support::TestDb;
+pub(super) use rio_test_support::fixtures::{test_drv_path, test_store_path};
 pub(super) use std::time::Duration;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
@@ -55,14 +56,15 @@ pub(crate) async fn setup_with_worker(
 }
 
 /// Create a minimal test DerivationNode.
-pub(crate) fn make_test_node(
-    hash: &str,
-    path: &str,
-    system: &str,
-) -> rio_proto::types::DerivationNode {
+///
+/// `drv_path` is auto-generated from `tag` via [`test_drv_path`], so
+/// callers get a valid /nix/store/{32-char-hash}-{tag}.drv path for free.
+/// Use [`test_drv_path`] directly when you need the path string for
+/// assertions or edge construction.
+pub(crate) fn make_test_node(tag: &str, system: &str) -> rio_proto::types::DerivationNode {
     rio_proto::types::DerivationNode {
-        drv_hash: hash.into(),
-        drv_path: path.into(),
+        drv_hash: tag.into(),
+        drv_path: test_drv_path(tag),
         pname: "test-pkg".into(),
         system: system.into(),
         required_features: vec![],
@@ -72,11 +74,16 @@ pub(crate) fn make_test_node(
     }
 }
 
-/// Create a minimal test DerivationEdge.
-pub(crate) fn make_test_edge(parent: &str, child: &str) -> rio_proto::types::DerivationEdge {
+/// Create a minimal test DerivationEdge from tags.
+///
+/// Generates valid drv_paths internally — same as `make_test_node`.
+pub(crate) fn make_test_edge(
+    parent_tag: &str,
+    child_tag: &str,
+) -> rio_proto::types::DerivationEdge {
     rio_proto::types::DerivationEdge {
-        parent_drv_path: parent.into(),
-        child_drv_path: child.into(),
+        parent_drv_path: test_drv_path(parent_tag),
+        child_drv_path: test_drv_path(child_tag),
     }
 }
 
@@ -110,11 +117,12 @@ pub(crate) async fn connect_worker(
 }
 
 /// Merge a single-node DAG and return the event receiver.
+///
+/// `drv_path` is auto-generated from `tag` via [`test_drv_path`].
 pub(crate) async fn merge_single_node(
     handle: &ActorHandle,
     build_id: Uuid,
-    hash: &str,
-    path: &str,
+    tag: &str,
     priority_class: PriorityClass,
 ) -> broadcast::Receiver<rio_proto::types::BuildEvent> {
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -124,7 +132,7 @@ pub(crate) async fn merge_single_node(
                 build_id,
                 tenant_id: None,
                 priority_class,
-                nodes: vec![make_test_node(hash, path, "x86_64-linux")],
+                nodes: vec![make_test_node(tag, "x86_64-linux")],
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,

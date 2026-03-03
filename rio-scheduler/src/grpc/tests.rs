@@ -4,6 +4,7 @@ use rio_proto::scheduler::scheduler_service_server::SchedulerServiceServer;
 use rio_proto::worker::worker_service_client::WorkerServiceClient;
 use rio_proto::worker::worker_service_server::WorkerServiceServer;
 use rio_test_support::TestDb;
+use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
@@ -84,11 +85,7 @@ async fn test_build_execution_stream_end_to_end() {
     let submit_req = rio_proto::types::SubmitBuildRequest {
         tenant_id: String::new(),
         priority_class: "scheduled".into(),
-        nodes: vec![make_test_node(
-            "e2e-hash",
-            "/nix/store/e2e-hash.drv",
-            "x86_64-linux",
-        )],
+        nodes: vec![make_test_node("e2e-hash", "x86_64-linux")],
         edges: vec![],
         max_silent_time: 0,
         build_timeout: 0,
@@ -111,7 +108,7 @@ async fn test_build_execution_stream_end_to_end() {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
         other => panic!("expected WorkAssignment, got {other:?}"),
     };
-    assert_eq!(work.drv_path, "/nix/store/e2e-hash.drv");
+    assert_eq!(work.drv_path, test_drv_path("e2e-hash"));
 
     // Send CompletionReport back on the stream.
     stream_tx
@@ -127,7 +124,7 @@ async fn test_build_execution_stream_end_to_end() {
                         stop_time: None,
                         built_outputs: vec![rio_proto::types::BuiltOutput {
                             output_name: "out".into(),
-                            output_path: "/nix/store/e2e-output".into(),
+                            output_path: rio_test_support::fixtures::test_store_path("e2e-output"),
                             output_hash: vec![0u8; 32],
                         }],
                     }),
@@ -169,7 +166,7 @@ async fn test_submit_build_rejects_empty_drv_hash() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
-    let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
+    let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_hash = String::new(); // empty!
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
@@ -196,7 +193,7 @@ async fn test_submit_build_rejects_empty_drv_path() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
-    let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
+    let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_path = String::new(); // empty!
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
@@ -219,7 +216,7 @@ async fn test_submit_build_rejects_empty_system() {
     let (handle, _task) = setup_actor(db.pool.clone());
     let grpc = SchedulerGrpc::new(handle);
 
-    let mut bad_node = make_test_node("h", "/nix/store/h.drv", "x86_64-linux");
+    let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.system = String::new(); // empty!
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
@@ -249,7 +246,7 @@ async fn test_submit_build_rejects_invalid_priority_class() {
     let grpc = SchedulerGrpc::new(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![make_test_node("h", "/nix/store/h.drv", "x86_64-linux")],
+        nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
         priority_class: "urgent".into(), // not in {ci, interactive, scheduled}
         ..Default::default()
@@ -275,7 +272,7 @@ async fn test_submit_build_rejects_invalid_tenant_id() {
     let grpc = SchedulerGrpc::new(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![make_test_node("h", "/nix/store/h.drv", "x86_64-linux")],
+        nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
         tenant_id: "customer-foo".into(), // not a UUID
         ..Default::default()
@@ -310,7 +307,7 @@ async fn test_submit_build_rejects_too_many_edges() {
         .collect();
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
-        nodes: vec![make_test_node("h", "/nix/store/h.drv", "x86_64-linux")],
+        nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: too_many,
         ..Default::default()
     });

@@ -298,7 +298,7 @@ pub struct DerivationState {
     /// Store path of the .drv file. Private because the DAG maintains a
     /// `path_to_hash` reverse index keyed on this field — mutating it
     /// directly would silently corrupt that index. Read via `drv_path()`.
-    drv_path: String,
+    drv_path: rio_nix::store_path::StorePath,
     /// Package name (for duration estimation).
     pub pname: Option<String>,
     /// Target system (e.g. "x86_64-linux").
@@ -332,10 +332,18 @@ pub struct DerivationState {
 
 impl DerivationState {
     /// Create a new derivation state from a proto DerivationNode.
-    pub fn from_node(node: &rio_proto::types::DerivationNode) -> Self {
-        Self {
+    ///
+    /// Validates `node.drv_path` parses as a well-formed `StorePath`. The
+    /// gRPC layer also validates upfront (returns INVALID_ARGUMENT), so this
+    /// is belt-and-suspenders for when the actor is driven by something
+    /// other than gRPC (tests, future admin APIs).
+    pub fn try_from_node(
+        node: &rio_proto::types::DerivationNode,
+    ) -> Result<Self, rio_nix::store_path::StorePathError> {
+        let drv_path = rio_nix::store_path::StorePath::parse(&node.drv_path)?;
+        Ok(Self {
             drv_hash: node.drv_hash.as_str().into(),
-            drv_path: node.drv_path.clone(),
+            drv_path,
             pname: (!node.pname.is_empty()).then(|| node.pname.clone()),
             system: node.system.clone(),
             required_features: node.required_features.clone(),
@@ -350,7 +358,7 @@ impl DerivationState {
             output_paths: Vec::new(),
             db_id: None,
             ready_at: None,
-        }
+        })
     }
 
     /// Current status (read-only). Use `transition()` etc. to mutate.
@@ -359,10 +367,9 @@ impl DerivationState {
     }
 
     /// Store path of the .drv file (read-only; DAG owns the reverse index).
-    pub fn drv_path(&self) -> &str {
-        // TODO(phase2b): migrate drv_path to StorePath newtype. Currently
-        // String; validation only at gRPC boundary. StorePath exists in
-        // rio-nix and validates the /nix/store/{hash}-{name} format.
+    ///
+    /// Callers using `&str` auto-deref via `StorePath::Deref<Target=str>`.
+    pub fn drv_path(&self) -> &rio_nix::store_path::StorePath {
         &self.drv_path
     }
 
@@ -653,7 +660,7 @@ mod tests {
     fn dummy_node() -> rio_proto::types::DerivationNode {
         rio_proto::types::DerivationNode {
             drv_hash: "h".into(),
-            drv_path: "/nix/store/h.drv".into(),
+            drv_path: rio_test_support::fixtures::test_drv_path("h"),
             pname: String::new(),
             system: "x86_64-linux".into(),
             required_features: vec![],
@@ -764,7 +771,7 @@ mod tests {
         let node = dummy_node();
 
         // Assigned -> Ready: direct valid transition
-        let mut state = DerivationState::from_node(&node);
+        let mut state = DerivationState::try_from_node(&node).unwrap();
         state.set_status_for_test(DerivationStatus::Assigned);
         state.assigned_worker = Some("w1".into());
         assert!(state.reset_to_ready().is_ok());
@@ -772,7 +779,7 @@ mod tests {
         assert!(state.assigned_worker.is_none());
 
         // Running -> Failed -> Ready: goes through Failed
-        let mut state = DerivationState::from_node(&node);
+        let mut state = DerivationState::try_from_node(&node).unwrap();
         state.set_status_for_test(DerivationStatus::Running);
         state.assigned_worker = Some("w1".into());
         assert!(state.reset_to_ready().is_ok());
@@ -780,11 +787,11 @@ mod tests {
         assert!(state.assigned_worker.is_none());
 
         // Invalid source states rejected
-        let mut state = DerivationState::from_node(&node);
+        let mut state = DerivationState::try_from_node(&node).unwrap();
         state.set_status_for_test(DerivationStatus::Queued);
         assert!(state.reset_to_ready().is_err());
 
-        let mut state = DerivationState::from_node(&node);
+        let mut state = DerivationState::try_from_node(&node).unwrap();
         state.set_status_for_test(DerivationStatus::Completed);
         assert!(state.reset_to_ready().is_err());
     }
@@ -793,7 +800,7 @@ mod tests {
     fn test_reset_from_poison() {
         let node = dummy_node();
 
-        let mut state = DerivationState::from_node(&node);
+        let mut state = DerivationState::try_from_node(&node).unwrap();
         state.set_status_for_test(DerivationStatus::Poisoned);
         state.poisoned_at = Some(Instant::now());
         state.retry_count = 5;
@@ -807,7 +814,7 @@ mod tests {
         assert!(state.failed_workers.is_empty());
 
         // Non-poisoned state rejected
-        let mut state = DerivationState::from_node(&node);
+        let mut state = DerivationState::try_from_node(&node).unwrap();
         state.set_status_for_test(DerivationStatus::Running);
         assert!(state.reset_from_poison().is_err());
     }

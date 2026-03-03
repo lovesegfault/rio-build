@@ -148,11 +148,26 @@ impl SchedulerService for SchedulerGrpc {
             if node.drv_hash.is_empty() {
                 return Err(Status::invalid_argument("node drv_hash must be non-empty"));
             }
-            if node.drv_path.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "node {} drv_path must be non-empty",
-                    node.drv_hash
-                )));
+            // Structural validation: drv_path must parse as a valid
+            // /nix/store/{32-char-nixbase32}-{name}.drv path. Previously
+            // only checked !is_empty() — a garbage path like "/tmp/evil"
+            // would become a DAG key. StorePath::parse catches: missing
+            // /nix/store/ prefix, bad hash length, bad nixbase32 chars,
+            // path traversal, oversized names.
+            match rio_nix::store_path::StorePath::parse(&node.drv_path) {
+                Ok(sp) if sp.is_derivation() => {}
+                Ok(_) => {
+                    return Err(Status::invalid_argument(format!(
+                        "node {} drv_path {:?} is not a .drv path",
+                        node.drv_hash, node.drv_path
+                    )));
+                }
+                Err(e) => {
+                    return Err(Status::invalid_argument(format!(
+                        "node {} drv_path {:?} is malformed: {e}",
+                        node.drv_hash, node.drv_path
+                    )));
+                }
             }
             if node.system.is_empty() {
                 return Err(Status::invalid_argument(format!(

@@ -84,8 +84,8 @@ async fn test_scheduler_cache_check_skips_build() {
 
     // Start in-process store and pre-populate the expected output path.
     let (mut store_client, _store_server) = setup_inproc_store(store_db.pool.clone()).await;
-    let cached_output = "/nix/store/00000000000000000000000000000000-cached-output";
-    put_test_path(&mut store_client, cached_output).await;
+    let cached_output = test_store_path("cached-output");
+    put_test_path(&mut store_client, &cached_output).await;
 
     // Spawn actor WITH the store client — cache check will run.
     let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone()));
@@ -94,7 +94,7 @@ async fn test_scheduler_cache_check_skips_build() {
     // pre-populated path. No worker needed — scheduler should find it
     // cached and complete immediately.
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node("cached-hash", "/nix/store/cached-hash.drv", "x86_64-linux");
+    let mut node = make_test_node("cached-hash", "x86_64-linux");
     node.expected_output_paths = vec![cached_output.to_string()];
 
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
@@ -111,7 +111,7 @@ async fn test_scheduler_cache_check_skips_build() {
         DerivationStatus::Completed,
         "scheduler cache check should mark derivation as Completed"
     );
-    assert_eq!(info.output_paths, vec![cached_output.to_string()]);
+    assert_eq!(info.output_paths, vec![cached_output]);
 
     // Build should be Succeeded (all 1 derivation cached).
     let status = query_status(&handle, build_id).await;
@@ -133,13 +133,9 @@ async fn test_scheduler_cache_check_skipped_without_store() {
     let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
-    let mut node = make_test_node(
-        "uncached-hash",
-        "/nix/store/uncached-hash.drv",
-        "x86_64-linux",
-    );
+    let mut node = make_test_node("uncached-hash", "x86_64-linux");
     // expected_output_paths set but store client is None — should NOT short-circuit
-    node.expected_output_paths = vec!["/nix/store/uncached-out".to_string()];
+    node.expected_output_paths = vec![test_store_path("uncached-out")];
 
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await;
     settle().await;
@@ -173,15 +169,8 @@ async fn test_db_failure_during_completion_logged() {
     let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await;
     let build_id = Uuid::new_v4();
     let drv_hash = "db-fault-hash";
-    let drv_path = "/nix/store/db-fault-hash.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Sanity check: derivation was dispatched.
@@ -197,7 +186,13 @@ async fn test_db_failure_during_completion_logged() {
 
     // Send successful completion. DB write will fail but in-memory
     // transition should succeed.
-    complete_success(&handle, "test-worker", drv_path, "/nix/store/fake-output").await;
+    complete_success(
+        &handle,
+        "test-worker",
+        &drv_path,
+        &test_store_path("fake-output"),
+    )
+    .await;
     settle().await;
 
     // In-memory state should have transitioned despite DB failure.
@@ -239,18 +234,12 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() {
     let build_id = Uuid::new_v4();
     // A depends on B, B depends on A — cycle.
     let nodes = vec![
-        make_test_node("cycA", "/nix/store/cycA.drv", "x86_64-linux"),
-        make_test_node("cycB", "/nix/store/cycB.drv", "x86_64-linux"),
+        make_test_node("cycA", "x86_64-linux"),
+        make_test_node("cycB", "x86_64-linux"),
     ];
     let edges = vec![
-        rio_proto::types::DerivationEdge {
-            parent_drv_path: "/nix/store/cycA.drv".into(),
-            child_drv_path: "/nix/store/cycB.drv".into(),
-        },
-        rio_proto::types::DerivationEdge {
-            parent_drv_path: "/nix/store/cycB.drv".into(),
-            child_drv_path: "/nix/store/cycA.drv".into(),
-        },
+        make_test_edge("cycA", "cycB"),
+        make_test_edge("cycB", "cycA"),
     ];
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -411,8 +400,8 @@ async fn test_assign_send_failure_cleans_running_builds() {
         &handle,
         build_id,
         vec![
-            make_test_node("drvA", "/nix/store/drvA.drv", "x86_64-linux"),
-            make_test_node("drvB", "/nix/store/drvB.drv", "x86_64-linux"),
+            make_test_node("drvA", "x86_64-linux"),
+            make_test_node("drvB", "x86_64-linux"),
         ],
         vec![],
         false,

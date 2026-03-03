@@ -27,11 +27,11 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 prost-types = { workspace = true }
+rio-nix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rio-store = { path = "../rio-store" }
 rio-test-support = { path = "../rio-test-support" }
-rio-nix = { workspace = true }
 sha2 = { workspace = true }
 tracing-test = "0.2"

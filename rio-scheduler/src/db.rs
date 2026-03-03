@@ -454,7 +454,7 @@ mod tests {
         let mut tx = db.pool.begin().await.unwrap();
         let row = DerivationRow {
             drv_hash: drv_hash.into(),
-            drv_path: format!("/nix/store/{drv_hash}-test.drv"),
+            drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
             pname: Some("test-pkg".into()),
             system: "x86_64-linux".into(),
             status: DerivationStatus::Created,
