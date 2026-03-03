@@ -16,6 +16,11 @@ use crate::state::{DerivationState, DerivationStatus, DrvHash};
 pub enum DagError {
     #[error("dependency cycle detected")]
     CycleDetected,
+    #[error("invalid drv_path {path:?}: {source}")]
+    InvalidDrvPath {
+        path: String,
+        source: rio_nix::store_path::StorePathError,
+    },
 }
 
 /// Result of a successful `merge()` operation. Surfaces all the rollback
@@ -124,8 +129,17 @@ impl DerivationDag {
                     interest_added.push(drv_hash.clone());
                 }
             } else {
-                // New node
-                let mut state = DerivationState::from_node(node);
+                // New node. try_from_node validates drv_path: StorePath::parse.
+                // Invalid paths fail the whole merge (the actor rolls back
+                // as it does for CycleDetected). The gRPC layer also validates
+                // upfront and returns INVALID_ARGUMENT, so this is belt-and-
+                // suspenders — but it's the only thing protecting us if the
+                // actor is ever driven by something other than the gRPC layer.
+                let mut state =
+                    DerivationState::try_from_node(node).map_err(|e| DagError::InvalidDrvPath {
+                        path: node.drv_path.clone(),
+                        source: e,
+                    })?;
                 state.interested_builds.insert(build_id);
                 self.path_to_hash
                     .insert(state.drv_path().to_string(), drv_hash.clone());
@@ -298,7 +312,7 @@ impl DerivationDag {
         // Remove newly-inserted nodes (and their path index entries)
         for hash in newly_inserted {
             if let Some(state) = self.nodes.remove(hash) {
-                self.path_to_hash.remove(state.drv_path());
+                self.path_to_hash.remove(state.drv_path().as_str());
             }
             // Also clean up any edge entries keyed on this hash
             self.children.remove(hash);
@@ -418,7 +432,7 @@ impl DerivationDag {
         let reaped = to_reap.len();
         for hash in to_reap {
             if let Some(state) = self.nodes.remove(&hash) {
-                self.path_to_hash.remove(state.drv_path());
+                self.path_to_hash.remove(state.drv_path().as_str());
             }
             self.children.remove(&hash);
             self.parents.remove(&hash);

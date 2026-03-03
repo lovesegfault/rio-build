@@ -37,22 +37,21 @@ async fn test_completion_resolves_drv_path_to_hash() {
     // Merge a single-node DAG
     let build_id = Uuid::new_v4();
     let drv_hash = "abc123hash";
-    let drv_path = "/nix/store/abc123hash-foo.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
 
     settle().await;
 
     // Worker should have received an assignment (derivation is ready, worker has capacity)
     // Now send completion using drv_PATH (mimics what grpc.rs does with report.drv_path)
     // Note: PATH, not hash — tests that grpc.rs drv_path resolves correctly.
-    complete_success(&handle, "test-worker", drv_path, "/nix/store/xyz-foo").await;
+    complete_success(
+        &handle,
+        "test-worker",
+        &drv_path,
+        &test_store_path("xyz-foo"),
+    )
+    .await;
 
     settle().await;
 
@@ -86,15 +85,7 @@ async fn test_worker_disconnect_running_derivation() {
     // Merge a single-node DAG (worker will get it assigned)
     let build_id = Uuid::new_v4();
     let drv_hash = "disconnect-test-hash";
-    let drv_path = "/nix/store/disconnect-test-hash.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Worker should have received an assignment
@@ -169,15 +160,8 @@ async fn test_completion_infrastructure_failure_handled() {
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-fail-hash";
-    let drv_path = "/nix/store/infra-fail-hash.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Send completion with InfrastructureFailure (what gRPC layer sends
@@ -185,7 +169,7 @@ async fn test_completion_infrastructure_failure_handled() {
     complete_failure(
         &handle,
         "test-worker",
-        drv_path,
+        &drv_path,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "worker sent CompletionReport with no result",
     )
@@ -226,15 +210,8 @@ async fn test_completion_with_extreme_timestamps() {
 
     let build_id = Uuid::new_v4();
     let drv_hash = "extreme-ts-hash";
-    let drv_path = "/nix/store/extreme-ts-hash.drv";
-    let _event_rx = merge_single_node(
-        &handle,
-        build_id,
-        drv_hash,
-        drv_path,
-        PriorityClass::Scheduled,
-    )
-    .await;
+    let drv_path = test_drv_path(drv_hash);
+    let _event_rx = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await;
     settle().await;
 
     // Send completion with extreme timestamps that would overflow i64 subtraction.
@@ -242,7 +219,7 @@ async fn test_completion_with_extreme_timestamps() {
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
-            drv_key: drv_path.into(),
+            drv_key: drv_path,
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 start_time: Some(prost_types::Timestamp {
@@ -255,7 +232,7 @@ async fn test_completion_with_extreme_timestamps() {
                 }),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
                     output_name: "out".into(),
-                    output_path: "/nix/store/xyz-extreme".into(),
+                    output_path: test_store_path("xyz-extreme"),
                     output_hash: vec![0u8; 32],
                 }],
                 ..Default::default()
@@ -289,11 +266,11 @@ async fn test_interactive_builds_pushed_to_front() {
 
     // Merge a "scheduled" build first (should go to back of queue)
     let build_normal = Uuid::new_v4();
+    let p_normal = test_drv_path("hash-normal");
     let _rx1 = merge_single_node(
         &handle,
         build_normal,
         "hash-normal",
-        "/nix/store/hash-normal.drv",
         PriorityClass::Scheduled,
     )
     .await;
@@ -308,7 +285,7 @@ async fn test_interactive_builds_pushed_to_front() {
         Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
         _ => panic!("expected assignment"),
     };
-    assert_eq!(first_path, "/nix/store/hash-normal.drv");
+    assert_eq!(first_path, p_normal);
 
     // Now merge a second "scheduled" build — goes to back
     let build_scheduled2 = Uuid::new_v4();
@@ -316,25 +293,18 @@ async fn test_interactive_builds_pushed_to_front() {
         &handle,
         build_scheduled2,
         "hash-scheduled2",
-        "/nix/store/hash-scheduled2.drv",
         PriorityClass::Scheduled,
     )
     .await;
 
     // Merge an "interactive" build — should go to FRONT
     let build_ifd = Uuid::new_v4();
-    let _rx3 = merge_single_node(
-        &handle,
-        build_ifd,
-        "hash-ifd",
-        "/nix/store/hash-ifd.drv",
-        PriorityClass::Interactive,
-    )
-    .await;
+    let p_ifd = test_drv_path("hash-ifd");
+    let _rx3 = merge_single_node(&handle, build_ifd, "hash-ifd", PriorityClass::Interactive).await;
     settle().await;
 
     // Complete the first build to free worker capacity
-    complete_success_empty(&handle, "test-worker", "/nix/store/hash-normal.drv").await;
+    complete_success_empty(&handle, "test-worker", &p_normal).await;
     settle().await;
 
     // The next assignment should be the IFD derivation (was pushed to front)
@@ -347,7 +317,7 @@ async fn test_interactive_builds_pushed_to_front() {
         _ => panic!("expected assignment"),
     };
     assert_eq!(
-        second_path, "/nix/store/hash-ifd.drv",
+        second_path, p_ifd,
         "interactive build should be dispatched before scheduled"
     );
 }

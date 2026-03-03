@@ -1,7 +1,24 @@
 use super::*;
 use rio_proto::types::{DerivationEdge, DerivationNode};
+use rio_test_support::fixtures::test_drv_path;
 
-fn make_node(drv_hash: &str, drv_path: &str, system: &str) -> DerivationNode {
+/// Build a test node. `drv_path` is auto-generated from `tag` via [`test_drv_path`].
+fn make_node(tag: &str, system: &str) -> DerivationNode {
+    DerivationNode {
+        drv_path: test_drv_path(tag),
+        drv_hash: tag.to_string(),
+        pname: String::new(),
+        system: system.to_string(),
+        required_features: vec![],
+        output_names: vec!["out".to_string()],
+        is_fixed_output: false,
+        expected_output_paths: vec![],
+    }
+}
+
+/// Build a test node with an EXPLICIT `drv_path` (for deep-chain tests
+/// that generate their own valid 32-char-hash paths).
+fn make_node_with_path(drv_hash: &str, drv_path: &str, system: &str) -> DerivationNode {
     DerivationNode {
         drv_path: drv_path.to_string(),
         drv_hash: drv_hash.to_string(),
@@ -14,7 +31,16 @@ fn make_node(drv_hash: &str, drv_path: &str, system: &str) -> DerivationNode {
     }
 }
 
-fn make_edge(parent: &str, child: &str) -> DerivationEdge {
+/// Build a test edge from tags. Paths are auto-generated via [`test_drv_path`].
+fn make_edge(parent_tag: &str, child_tag: &str) -> DerivationEdge {
+    DerivationEdge {
+        parent_drv_path: test_drv_path(parent_tag),
+        child_drv_path: test_drv_path(child_tag),
+    }
+}
+
+/// Build a test edge from explicit full paths.
+fn make_edge_with_paths(parent: &str, child: &str) -> DerivationEdge {
     DerivationEdge {
         parent_drv_path: parent.to_string(),
         child_drv_path: child.to_string(),
@@ -25,7 +51,7 @@ fn make_edge(parent: &str, child: &str) -> DerivationEdge {
 fn test_merge_empty_dag() {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
-    let nodes = vec![make_node("hash1", "/nix/store/hash1.drv", "x86_64-linux")];
+    let nodes = vec![make_node("hash1", "x86_64-linux")];
     let edges = vec![];
 
     let newly = dag.merge(build_id, &nodes, &edges).unwrap().newly_inserted;
@@ -39,7 +65,7 @@ fn test_merge_dedup() {
     let mut dag = DerivationDag::new();
     let build1 = Uuid::new_v4();
     let build2 = Uuid::new_v4();
-    let nodes = vec![make_node("hash1", "/nix/store/hash1.drv", "x86_64-linux")];
+    let nodes = vec![make_node("hash1", "x86_64-linux")];
 
     let newly1 = dag.merge(build1, &nodes, &[]).unwrap().newly_inserted;
     assert_eq!(newly1.len(), 1);
@@ -58,15 +84,12 @@ fn test_edges_and_deps() {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
-        make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
+        make_node("hashC", "x86_64-linux"),
     ];
     // A depends on B and C
-    let edges = vec![
-        make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
-        make_edge("/nix/store/a.drv", "/nix/store/c.drv"),
-    ];
+    let edges = vec![make_edge("hashA", "hashB"), make_edge("hashA", "hashC")];
 
     dag.merge(build_id, &nodes, &edges).unwrap();
 
@@ -86,10 +109,10 @@ fn test_initial_states() {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
     ];
-    let edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
+    let edges = vec![make_edge("hashA", "hashB")];
 
     let newly = dag.merge(build_id, &nodes, &edges).unwrap().newly_inserted;
     let states = dag.compute_initial_states(&newly);
@@ -110,7 +133,7 @@ fn test_initial_states_with_prepoisoned_dep() {
     let build1 = Uuid::new_v4();
 
     // Build 1: just the leaf.
-    let leaf_nodes = vec![make_node("leafP", "/nix/store/leafP.drv", "x86_64-linux")];
+    let leaf_nodes = vec![make_node("leafP", "x86_64-linux")];
     dag.merge(build1, &leaf_nodes, &[]).unwrap();
 
     // Poison it.
@@ -124,10 +147,10 @@ fn test_initial_states_with_prepoisoned_dep() {
     // Build 2: parent depending on the poisoned leaf.
     let build2 = Uuid::new_v4();
     let parent_nodes = vec![
-        make_node("parentP", "/nix/store/parentP.drv", "x86_64-linux"),
-        make_node("leafP", "/nix/store/leafP.drv", "x86_64-linux"),
+        make_node("parentP", "x86_64-linux"),
+        make_node("leafP", "x86_64-linux"),
     ];
-    let edges = vec![make_edge("/nix/store/parentP.drv", "/nix/store/leafP.drv")];
+    let edges = vec![make_edge("parentP", "leafP")];
     let newly = dag
         .merge(build2, &parent_nodes, &edges)
         .unwrap()
@@ -153,10 +176,10 @@ fn test_find_newly_ready() {
     let mut dag = DerivationDag::new();
     let build_id = Uuid::new_v4();
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
     ];
-    let edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
+    let edges = vec![make_edge("hashA", "hashB")];
 
     dag.merge(build_id, &nodes, &edges).unwrap();
 
@@ -186,12 +209,12 @@ fn test_merge_rejects_cycle() {
 
     // A depends on B, B depends on A — cycle
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
     ];
     let edges = vec![
-        make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
-        make_edge("/nix/store/b.drv", "/nix/store/a.drv"), // cycle!
+        make_edge("hashA", "hashB"),
+        make_edge("hashB", "hashA"), // cycle!
     ];
 
     let result = dag.merge(build_id, &nodes, &edges);
@@ -212,15 +235,15 @@ fn test_merge_rejects_indirect_cycle() {
     let build_id = Uuid::new_v4();
 
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
-        make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
+        make_node("hashC", "x86_64-linux"),
     ];
     // A depends on B, B depends on C, C depends on A — indirect cycle
     let edges = vec![
-        make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
-        make_edge("/nix/store/b.drv", "/nix/store/c.drv"),
-        make_edge("/nix/store/c.drv", "/nix/store/a.drv"),
+        make_edge("hashA", "hashB"),
+        make_edge("hashB", "hashC"),
+        make_edge("hashC", "hashA"),
     ];
 
     let result = dag.merge(build_id, &nodes, &edges);
@@ -236,17 +259,14 @@ fn test_merge_after_cycle_rollback() {
 
     // First: try to insert a cycle (should fail and rollback)
     let cyclic_nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
     ];
-    let cyclic_edges = vec![
-        make_edge("/nix/store/a.drv", "/nix/store/b.drv"),
-        make_edge("/nix/store/b.drv", "/nix/store/a.drv"),
-    ];
+    let cyclic_edges = vec![make_edge("hashA", "hashB"), make_edge("hashB", "hashA")];
     assert!(dag.merge(build_id, &cyclic_nodes, &cyclic_edges).is_err());
 
     // Second: insert a valid DAG with the same nodes (should succeed)
-    let valid_edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
+    let valid_edges = vec![make_edge("hashA", "hashB")];
     let result = dag.merge(build_id, &cyclic_nodes, &valid_edges);
     assert!(
         result.is_ok(),
@@ -265,17 +285,17 @@ fn test_cycle_via_new_edge_between_existing_nodes() {
 
     // Insert A and B separately with A->B edge.
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
     ];
-    let initial_edges = vec![make_edge("/nix/store/a.drv", "/nix/store/b.drv")];
+    let initial_edges = vec![make_edge("hashA", "hashB")];
     dag.merge(build1, &nodes, &initial_edges).unwrap();
     assert_eq!(dag.nodes.len(), 2);
 
     // Now merge the SAME nodes (no new inserts) with a B->A edge.
     // This creates a cycle via a new edge between two existing nodes.
     let build2 = Uuid::new_v4();
-    let cycle_edge = vec![make_edge("/nix/store/b.drv", "/nix/store/a.drv")];
+    let cycle_edge = vec![make_edge("hashB", "hashA")];
     let result = dag.merge(build2, &nodes, &cycle_edge);
 
     assert!(
@@ -306,7 +326,7 @@ fn test_cycle_rollback_preserves_prior_interest() {
     let b1 = Uuid::new_v4();
 
     // Step 1: merge B1 with node A only — succeeds. A.interested = {B1}.
-    let nodes_a = vec![make_node("hashA", "/nix/store/a.drv", "x86_64-linux")];
+    let nodes_a = vec![make_node("hashA", "x86_64-linux")];
     dag.merge(b1, &nodes_a, &[]).unwrap();
     assert!(
         dag.nodes
@@ -321,13 +341,10 @@ fn test_cycle_rollback_preserves_prior_interest() {
     // Pre-fix: rollback would clear B1 from A even though B1 was already
     // interested in A from step 1.
     let nodes_ac = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashC", "x86_64-linux"),
     ];
-    let cycle_edges = vec![
-        make_edge("/nix/store/a.drv", "/nix/store/c.drv"),
-        make_edge("/nix/store/c.drv", "/nix/store/a.drv"),
-    ];
+    let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
     let result = dag.merge(b1, &nodes_ac, &cycle_edges);
     assert!(result.is_err(), "cycle should be rejected");
 
@@ -353,40 +370,34 @@ fn test_cycle_rollback_preserves_prior_interest() {
 fn test_path_to_hash_consistency() {
     let mut dag = DerivationDag::new();
     let b1 = Uuid::new_v4();
+    let p_a = test_drv_path("hashA");
+    let p_b = test_drv_path("hashB");
+    let p_c = test_drv_path("hashC");
 
     // Merge: index should be populated.
     let nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashB", "/nix/store/b.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashB", "x86_64-linux"),
     ];
     dag.merge(b1, &nodes, &[]).unwrap();
-    assert_eq!(
-        dag.hash_for_path("/nix/store/a.drv").map(|h| h.as_str()),
-        Some("hashA")
-    );
-    assert_eq!(
-        dag.hash_for_path("/nix/store/b.drv").map(|h| h.as_str()),
-        Some("hashB")
-    );
+    assert_eq!(dag.hash_for_path(&p_a).map(|h| h.as_str()), Some("hashA"));
+    assert_eq!(dag.hash_for_path(&p_b).map(|h| h.as_str()), Some("hashB"));
     assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
 
     // Cycle rollback: newly-inserted node's path entry must be removed.
     let cycle_nodes = vec![
-        make_node("hashA", "/nix/store/a.drv", "x86_64-linux"),
-        make_node("hashC", "/nix/store/c.drv", "x86_64-linux"),
+        make_node("hashA", "x86_64-linux"),
+        make_node("hashC", "x86_64-linux"),
     ];
-    let cycle_edges = vec![
-        make_edge("/nix/store/a.drv", "/nix/store/c.drv"),
-        make_edge("/nix/store/c.drv", "/nix/store/a.drv"),
-    ];
+    let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
     dag.merge(b1, &cycle_nodes, &cycle_edges).unwrap_err();
     assert_eq!(
-        dag.hash_for_path("/nix/store/c.drv"),
+        dag.hash_for_path(&p_c),
         None,
         "rollback must remove path index for newly-inserted node"
     );
     assert_eq!(
-        dag.hash_for_path("/nix/store/a.drv").map(|h| h.as_str()),
+        dag.hash_for_path(&p_a).map(|h| h.as_str()),
         Some("hashA"),
         "rollback must preserve path index for pre-existing node"
     );
@@ -416,15 +427,12 @@ fn test_path_to_hash_consistency() {
     let reaped = dag.remove_build_interest_and_reap(b1);
     assert_eq!(reaped, 1, "hashA should be reaped (terminal, no interest)");
     assert_eq!(
-        dag.hash_for_path("/nix/store/a.drv"),
+        dag.hash_for_path(&p_a),
         None,
         "reap must remove path index for reaped node"
     );
     // B is not terminal, so it survives reaping.
-    assert_eq!(
-        dag.hash_for_path("/nix/store/b.drv").map(|h| h.as_str()),
-        Some("hashB")
-    );
+    assert_eq!(dag.hash_for_path(&p_b).map(|h| h.as_str()), Some("hashB"));
 }
 
 /// Regression test for stack overflow in the recursive DFS cycle check.
@@ -441,7 +449,7 @@ fn test_cycle_detection_deep_linear_chain_no_overflow() {
     const DEPTH: usize = 10_000;
     let nodes: Vec<_> = (0..DEPTH)
         .map(|i| {
-            make_node(
+            make_node_with_path(
                 &format!("hash{i:05}"),
                 &format!("/nix/store/{i:032}-n{i}.drv"),
                 "x86_64-linux",
@@ -450,7 +458,7 @@ fn test_cycle_detection_deep_linear_chain_no_overflow() {
         .collect();
     let edges: Vec<_> = (0..DEPTH - 1)
         .map(|i| {
-            make_edge(
+            make_edge_with_paths(
                 &format!("/nix/store/{i:032}-n{i}.drv"),
                 &format!("/nix/store/{:032}-n{}.drv", i + 1, i + 1),
             )
@@ -473,7 +481,7 @@ fn test_cycle_detection_deep_chain_with_back_edge() {
     const DEPTH: usize = 5_000;
     let nodes: Vec<_> = (0..DEPTH)
         .map(|i| {
-            make_node(
+            make_node_with_path(
                 &format!("hash{i:05}"),
                 &format!("/nix/store/{i:032}-n{i}.drv"),
                 "x86_64-linux",
@@ -482,14 +490,14 @@ fn test_cycle_detection_deep_chain_with_back_edge() {
         .collect();
     let mut edges: Vec<_> = (0..DEPTH - 1)
         .map(|i| {
-            make_edge(
+            make_edge_with_paths(
                 &format!("/nix/store/{i:032}-n{i}.drv"),
                 &format!("/nix/store/{:032}-n{}.drv", i + 1, i + 1),
             )
         })
         .collect();
     // Back-edge from the deepest node to the root: cycle.
-    edges.push(make_edge(
+    edges.push(make_edge_with_paths(
         &format!("/nix/store/{:032}-n{}.drv", DEPTH - 1, DEPTH - 1),
         &format!("/nix/store/{:032}-n{}.drv", 0, 0),
     ));
