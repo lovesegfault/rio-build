@@ -273,7 +273,10 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     /// - 105 (Progress): [u64 done, u64 expected, u64 running, u64 failed]
     /// - 106 (SetExpected): [u64 type, u64 expected]
     /// - 107 (PostBuildLogLine): [string line]
-    #[cfg(test)]
+    ///
+    /// Not #[cfg(test)] — rio-worker's daemon.rs tests synthesize
+    /// nix-daemon STDERR_RESULT output, and cfg(test) on a lib crate's
+    /// method doesn't enable it for dependent crates' tests.
     pub async fn result(
         &mut self,
         activity_id: u64,
