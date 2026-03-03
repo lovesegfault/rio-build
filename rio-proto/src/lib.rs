@@ -14,13 +14,7 @@ pub fn max_message_size() -> usize {
 }
 
 pub mod client;
-
-// TODO(phase2b): add validated.rs with newtype wrappers around generated proto
-// types. Currently PathInfo.nar_hash: Vec<u8> and store_path: String propagate
-// unvalidated through the whole system, with checks only at the gRPC ingress.
-// NarinfoRow::into_path_info (DB egress) has no validation at all. A
-// ValidatedPathInfo { store_path: StorePath, nar_hash: [u8; 32], ... } with
-// TryFrom<PathInfo> would centralize validation.
+pub mod validated;
 
 /// Shared protobuf types (messages, enums) used across all services.
 pub mod types {

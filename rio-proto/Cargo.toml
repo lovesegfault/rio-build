@@ -16,6 +16,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true }
 tokio = { workspace = true }
+rio-nix = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
