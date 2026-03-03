@@ -3,10 +3,8 @@ use super::*;
 /// keepGoing=false: on PermanentFailure, the entire build fails immediately.
 #[tokio::test]
 async fn test_keepgoing_false_fails_fast() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 2).await;
 
     // Merge a two-node DAG with keepGoing=false
     let build_id = Uuid::new_v4();
@@ -46,10 +44,8 @@ async fn test_keepgoing_false_fails_fast() {
 /// keepGoing=true: build waits for all derivations, fails only at the end.
 #[tokio::test]
 async fn test_keepgoing_true_waits_all() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "test-worker", "x86_64-linux", 2).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("test-worker", "x86_64-linux", 2).await;
 
     // Merge a two-node DAG with keepGoing=true
     let build_id = Uuid::new_v4();
@@ -104,11 +100,9 @@ async fn test_keepgoing_true_waits_all() {
 /// total -> build hangs.
 #[tokio::test]
 async fn test_keepgoing_poisoned_dependency_cascades_failure() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
     // Worker with capacity 1: only the leaf gets dispatched initially.
-    let _stream_rx = connect_worker(&handle, "cascade-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("cascade-worker", "x86_64-linux", 1).await;
 
     // Chain: A depends on B depends on C. C is the leaf.
     let build_id = Uuid::new_v4();
@@ -197,9 +191,8 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() {
 /// *transition to* Poisoned).
 #[tokio::test]
 async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let _stream_rx = connect_worker(&handle, "poison-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("poison-worker", "x86_64-linux", 1).await;
 
     // Build 1: single leaf, poisoned via PermanentFailure.
     let build1 = Uuid::new_v4();
@@ -276,9 +269,8 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() {
 /// disconnected before completion), a late WatchBuild would hang forever.
 #[tokio::test]
 async fn test_watch_build_after_completion_receives_terminal_event() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let _stream_rx = connect_worker(&handle, "watch-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("watch-worker", "x86_64-linux", 1).await;
 
     // Submit a build, complete it, then drop the original subscriber.
     let build_id = Uuid::new_v4();
@@ -334,10 +326,8 @@ async fn test_watch_build_after_completion_receives_terminal_event() {
 /// scheduling itself is trivially correct (tokio::time::sleep + try_send).
 #[tokio::test]
 async fn test_terminal_build_cleanup_after_delay() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "cleanup-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("cleanup-worker", "x86_64-linux", 1).await;
 
     // Complete a build.
     let build_id = Uuid::new_v4();
@@ -386,8 +376,7 @@ async fn test_terminal_build_cleanup_after_delay() {
 /// TransientFailure: retry on a different worker up to max_retries (default 2).
 #[tokio::test]
 async fn test_transient_retry_different_worker() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let (_db, handle, _task) = setup().await;
 
     // Register two workers
     let _rx1 = connect_worker(&handle, "worker-a", "x86_64-linux", 1).await;
@@ -448,9 +437,7 @@ async fn test_transient_retry_different_worker() {
 /// repeatedly hits max_retries first.
 #[tokio::test]
 async fn test_transient_failure_max_retries_same_worker_poisons() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let _rx = connect_worker(&handle, "flaky-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
     let _event_rx = merge_single_node(
@@ -493,8 +480,7 @@ async fn test_transient_failure_max_retries_same_worker_poisons() {
 /// BuildCancelled event. Previously untested.
 #[tokio::test]
 async fn test_cancel_build_active_drains_derivations() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let (_db, handle, _task) = setup().await;
     // No workers — derivation stays Ready (never assigned).
 
     let build_id = Uuid::new_v4();
@@ -563,9 +549,8 @@ async fn test_cancel_build_active_drains_derivations() {
 /// (The after-completion case is tested separately.)
 #[tokio::test]
 async fn test_watch_build_receives_events() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let _rx = connect_worker(&handle, "watch-events-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _rx) =
+        setup_with_worker("watch-events-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
     let _original = merge_single_node(
@@ -624,11 +609,9 @@ async fn test_watch_build_receives_events() {
 /// system or missing feature) instead of blocking the entire queue.
 #[tokio::test]
 async fn test_dispatch_skips_ineligible_derivation() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
     // Only x86_64 worker registered.
-    let mut stream_rx = connect_worker(&handle, "x86-only-worker", "x86_64-linux", 2).await;
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("x86-only-worker", "x86_64-linux", 2).await;
 
     // Merge aarch64 derivation FIRST (goes to queue head), then x86_64.
     // With the old `None => break`, the aarch64 drv at head would block
@@ -689,10 +672,8 @@ async fn test_dispatch_skips_ineligible_derivation() {
 /// to the worker via WorkAssignment. Previously sent all-zeros defaults.
 #[tokio::test]
 async fn test_build_options_propagated_to_worker() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let mut stream_rx = connect_worker(&handle, "options-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("options-worker", "x86_64-linux", 1).await;
 
     // Submit with build_timeout=300, max_silent_time=60.
     let build_id = Uuid::new_v4();
@@ -748,11 +729,9 @@ async fn test_build_options_propagated_to_worker() {
 /// worker.running_builds. The scheduler is authoritative.
 #[tokio::test]
 async fn test_heartbeat_does_not_clobber_fresh_assignment() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
     // Register worker (initial heartbeat has empty running_builds).
-    let _stream_rx = connect_worker(&handle, "toctou-worker", "x86_64-linux", 2).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("toctou-worker", "x86_64-linux", 2).await;
     settle().await;
 
     // Merge a derivation. Scheduler will assign it to the worker and
@@ -819,8 +798,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() {
 /// T4: Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
 #[tokio::test]
 async fn test_poison_threshold_after_distinct_workers() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let (_db, handle, _task) = setup().await;
 
     // Register 4 workers so the derivation can be re-dispatched after each failure.
     let _rx1 = connect_worker(&handle, "poison-w1", "x86_64-linux", 1).await;
@@ -878,10 +856,8 @@ async fn test_poison_threshold_after_distinct_workers() {
 /// T5: Completing a child releases its parent to Ready in a dependency chain.
 #[tokio::test]
 async fn test_dependency_chain_releases_parent() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let mut stream_rx = connect_worker(&handle, "chain-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("chain-worker", "x86_64-linux", 1).await;
 
     // A depends on B. B is Ready (leaf), A is Queued.
     let build_id = Uuid::new_v4();
@@ -957,10 +933,8 @@ async fn test_dependency_chain_releases_parent() {
 /// T9: Duplicate ProcessCompletion is an idempotent no-op.
 #[tokio::test]
 async fn test_duplicate_completion_idempotent() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "idem-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("idem-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "idem-hash";
@@ -1027,10 +1001,8 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() {
     // heartbeat does NOT remove the worker (negative test), and the
     // timeout-removal path is exercised directly via WorkerDisconnected
     // in test_worker_disconnect_running_derivation.
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let _stream_rx = connect_worker(&handle, "tick-worker", "x86_64-linux", 1).await;
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("tick-worker", "x86_64-linux", 1).await;
     settle().await;
 
     // Send several Ticks. Worker has fresh heartbeat, should NOT be removed.

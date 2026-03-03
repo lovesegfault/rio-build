@@ -129,11 +129,8 @@ async fn test_scheduler_cache_check_skips_build() {
 
 #[tokio::test]
 async fn test_scheduler_cache_check_skipped_without_store() {
-    let db = TestDb::new(&MIGRATOR).await;
-
-    // No store client — cache check should silently skip.
-    let (handle, _task) = setup_actor(db.pool.clone());
-    let _rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+    // No store client — setup() uses setup_actor(pool, None).
+    let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await;
 
     let build_id = Uuid::new_v4();
     let mut node = make_test_node(
@@ -173,11 +170,7 @@ async fn test_scheduler_cache_check_skipped_without_store() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn test_db_failure_during_completion_logged() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    // Get a single derivation to Assigned state.
-    let _rx = connect_worker(&handle, "test-worker", "x86_64-linux", 1).await;
+    let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux", 1).await;
     let build_id = Uuid::new_v4();
     let drv_hash = "db-fault-hash";
     let drv_path = "/nix/store/db-fault-hash.drv";
@@ -241,8 +234,7 @@ async fn test_db_failure_during_completion_logged() {
 /// build_events/build_sequences/builds.
 #[tokio::test]
 async fn test_cyclic_merge_does_not_leak_in_memory_state() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     // A depends on B, B depends on A — cycle.
@@ -353,8 +345,7 @@ async fn test_backpressure_hysteresis() {
 /// hysteresis flag, not compute their own threshold.
 #[tokio::test]
 async fn test_handle_uses_shared_backpressure_flag() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let (_db, handle, _task) = setup().await;
 
     // Initially not backpressured (empty queue).
     assert!(!handle.is_backpressured());
@@ -390,8 +381,7 @@ async fn test_handle_uses_shared_backpressure_flag() {
 /// or infinite dispatch loop when max_builds > 1.
 #[tokio::test]
 async fn test_assign_send_failure_cleans_running_builds() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
+    let (_db, handle, _task) = setup().await;
 
     // Connect worker with capacity-1 stream channel so we can fill it.
     let (stream_tx, mut stream_rx) = mpsc::channel(1);
