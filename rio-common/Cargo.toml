@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Shared configuration, observability, and error types for rio-build"
 
 [dependencies]
