@@ -43,27 +43,27 @@ pub enum NarInfoError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarInfo {
     /// Full store path (e.g., `/nix/store/abc...-hello`).
-    store_path: String,
+    pub store_path: String,
     /// URL to the NAR file (e.g., `nar/abc123.nar.zst`).
-    url: String,
+    pub url: String,
     /// Compression method (e.g., `zstd`, `xz`, `none`).
-    compression: String,
+    pub compression: String,
     /// NAR hash (e.g., `sha256:abc123...`).
-    nar_hash: String,
+    pub nar_hash: String,
     /// NAR size in bytes.
-    nar_size: u64,
+    pub nar_size: u64,
     /// Referenced store path basenames, space-separated in text form.
-    references: Vec<String>,
+    pub references: Vec<String>,
     /// Deriver basename (e.g., `xyz...-hello.drv`).
-    deriver: Option<String>,
+    pub deriver: Option<String>,
     /// Cryptographic signatures.
-    sigs: Vec<String>,
+    pub sigs: Vec<String>,
     /// Content address (e.g., `fixed:sha256:abc...`).
-    ca: Option<String>,
+    pub ca: Option<String>,
     /// Compressed file hash (e.g., `sha256:def...`).
-    file_hash: Option<String>,
+    pub file_hash: Option<String>,
     /// Compressed file size in bytes.
-    file_size: Option<u64>,
+    pub file_size: Option<u64>,
 }
 
 impl NarInfo {
@@ -222,61 +222,6 @@ impl NarInfo {
         }
 
         out
-    }
-
-    /// The full store path.
-    pub fn store_path(&self) -> &str {
-        &self.store_path
-    }
-
-    /// URL to the NAR file.
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Compression method.
-    pub fn compression(&self) -> &str {
-        &self.compression
-    }
-
-    /// NAR hash string (e.g., `sha256:abc...`).
-    pub fn nar_hash(&self) -> &str {
-        &self.nar_hash
-    }
-
-    /// NAR size in bytes.
-    pub fn nar_size(&self) -> u64 {
-        self.nar_size
-    }
-
-    /// Referenced store path basenames.
-    pub fn references(&self) -> &[String] {
-        &self.references
-    }
-
-    /// Deriver basename.
-    pub fn deriver(&self) -> Option<&str> {
-        self.deriver.as_deref()
-    }
-
-    /// Cryptographic signatures.
-    pub fn sigs(&self) -> &[String] {
-        &self.sigs
-    }
-
-    /// Content address.
-    pub fn ca(&self) -> Option<&str> {
-        self.ca.as_deref()
-    }
-
-    /// Compressed file hash.
-    pub fn file_hash(&self) -> Option<&str> {
-        self.file_hash.as_deref()
-    }
-
-    /// Compressed file size in bytes.
-    pub fn file_size(&self) -> Option<u64> {
-        self.file_size
     }
 }
 
@@ -598,7 +543,7 @@ References:
 CA: fixed:sha256:abcdef
 ";
         let info = NarInfo::parse(text)?;
-        assert_eq!(info.ca(), Some("fixed:sha256:abcdef"));
+        assert_eq!(info.ca.as_deref(), Some("fixed:sha256:abcdef"));
         Ok(())
     }
 
@@ -615,9 +560,9 @@ Sig: key1:sig1
 Sig: key2:sig2
 ";
         let info = NarInfo::parse(text)?;
-        assert_eq!(info.sigs().len(), 2);
-        assert_eq!(info.sigs()[0], "key1:sig1");
-        assert_eq!(info.sigs()[1], "key2:sig2");
+        assert_eq!(info.sigs.len(), 2);
+        assert_eq!(info.sigs[0], "key1:sig1");
+        assert_eq!(info.sigs[1], "key2:sig2");
         Ok(())
     }
 
@@ -634,8 +579,8 @@ NarSize: 10000
 References:
 ";
         let info = NarInfo::parse(text)?;
-        assert_eq!(info.file_hash(), Some("sha256:deadbeef"));
-        assert_eq!(info.file_size(), Some(5000));
+        assert_eq!(info.file_hash.as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(info.file_size, Some(5000));
         Ok(())
     }
 
@@ -735,11 +680,11 @@ Deriver: second.drv
         .ca("fixed:sha256:beef")
         .build()?;
 
-        assert_eq!(info.store_path(), "/nix/store/abc-test");
-        assert_eq!(info.references(), &["abc-dep"]);
-        assert_eq!(info.deriver(), Some("xyz-test.drv"));
-        assert_eq!(info.sigs(), &["key:sig"]);
-        assert_eq!(info.ca(), Some("fixed:sha256:beef"));
+        assert_eq!(info.store_path, "/nix/store/abc-test");
+        assert_eq!(info.references, ["abc-dep"]);
+        assert_eq!(info.deriver.as_deref(), Some("xyz-test.drv"));
+        assert_eq!(info.sigs, ["key:sig"]);
+        assert_eq!(info.ca.as_deref(), Some("fixed:sha256:beef"));
 
         // Verify it roundtrips
         let serialized = info.serialize();
@@ -780,19 +725,19 @@ NarSize: 12345
         let info = NarInfo::parse(text)?;
 
         assert_eq!(
-            info.store_path(),
+            info.store_path,
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test"
         );
-        assert_eq!(info.url(), "nar/test.nar.zst");
-        assert_eq!(info.compression(), "zstd");
-        assert_eq!(info.nar_hash(), "sha256:abc123");
-        assert_eq!(info.nar_size(), 12345);
-        assert!(info.references().is_empty());
-        assert!(info.deriver().is_none());
-        assert!(info.sigs().is_empty());
-        assert!(info.ca().is_none());
-        assert!(info.file_hash().is_none());
-        assert!(info.file_size().is_none());
+        assert_eq!(info.url, "nar/test.nar.zst");
+        assert_eq!(info.compression, "zstd");
+        assert_eq!(info.nar_hash, "sha256:abc123");
+        assert_eq!(info.nar_size, 12345);
+        assert!(info.references.is_empty());
+        assert!(info.deriver.is_none());
+        assert!(info.sigs.is_empty());
+        assert!(info.ca.is_none());
+        assert!(info.file_hash.is_none());
+        assert!(info.file_size.is_none());
         Ok(())
     }
 
@@ -814,28 +759,28 @@ FileSize: 54321
         let info = NarInfo::parse(text)?;
 
         assert_eq!(
-            info.store_path(),
+            info.store_path,
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2"
         );
-        assert_eq!(info.url(), "nar/full-test.nar.zst");
-        assert_eq!(info.compression(), "xz");
-        assert_eq!(info.nar_hash(), "sha256:deadbeef0123456789abcdef");
-        assert_eq!(info.nar_size(), 999999);
+        assert_eq!(info.url, "nar/full-test.nar.zst");
+        assert_eq!(info.compression, "xz");
+        assert_eq!(info.nar_hash, "sha256:deadbeef0123456789abcdef");
+        assert_eq!(info.nar_size, 999999);
         assert_eq!(
-            info.references(),
-            &[
+            info.references,
+            [
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.2",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.42",
             ]
         );
         assert_eq!(
-            info.deriver(),
+            info.deriver.as_deref(),
             Some("cccccccccccccccccccccccccccccccc-hello-2.12.2.drv")
         );
-        assert_eq!(info.sigs(), &["cache.example.com-1:base64signaturedata=="]);
-        assert_eq!(info.ca(), Some("fixed:sha256:cafebabe"));
-        assert_eq!(info.file_hash(), Some("sha256:f00dcafe"));
-        assert_eq!(info.file_size(), Some(54321));
+        assert_eq!(info.sigs, ["cache.example.com-1:base64signaturedata=="]);
+        assert_eq!(info.ca.as_deref(), Some("fixed:sha256:cafebabe"));
+        assert_eq!(info.file_hash.as_deref(), Some("sha256:f00dcafe"));
+        assert_eq!(info.file_size, Some(54321));
         Ok(())
     }
 
@@ -863,17 +808,8 @@ FileSize: 54321
         let serialized = original.serialize();
         let reparsed = NarInfo::parse(&serialized)?;
 
-        assert_eq!(original.store_path(), reparsed.store_path());
-        assert_eq!(original.url(), reparsed.url());
-        assert_eq!(original.compression(), reparsed.compression());
-        assert_eq!(original.nar_hash(), reparsed.nar_hash());
-        assert_eq!(original.nar_size(), reparsed.nar_size());
-        assert_eq!(original.references(), reparsed.references());
-        assert_eq!(original.deriver(), reparsed.deriver());
-        assert_eq!(original.sigs(), reparsed.sigs());
-        assert_eq!(original.ca(), reparsed.ca());
-        assert_eq!(original.file_hash(), reparsed.file_hash());
-        assert_eq!(original.file_size(), reparsed.file_size());
+        // PartialEq covers all 11 fields; the field-by-field assertions
+        // above were redundant boilerplate from when fields were private.
         assert_eq!(original, reparsed);
         Ok(())
     }

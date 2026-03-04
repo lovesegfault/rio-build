@@ -8,7 +8,6 @@ pub mod daemon;
 use std::io::Cursor;
 
 use rio_nix::hash::NixHash;
-use rio_nix::protocol::stderr::STDERR_WRITE;
 use rio_test_support::grpc::MockStore;
 use rio_test_support::wire_bytes;
 
@@ -354,10 +353,10 @@ pub fn parse_nar_from_path_fields(
 
         let mut cursor = Cursor::new(data.to_vec());
 
-        // Skip activity messages until STDERR_LAST (or handle STDERR_WRITE
-        // for backward compat with older rio-build behavior)
+        // Skip activity messages until STDERR_LAST. Both nix-daemon and
+        // rio-gateway send STDERR_LAST then raw NAR bytes (the old
+        // STDERR_WRITE framing was bug #11: `error: no sink`).
         let last_bytes;
-        let mut nar_data = Vec::new();
         loop {
             let msg_bytes = read_u64_field(&mut cursor).await;
             let msg = u64::from_le_bytes(msg_bytes.clone().try_into().unwrap());
@@ -365,12 +364,6 @@ pub fn parse_nar_from_path_fields(
             if msg == STDERR_LAST {
                 last_bytes = msg_bytes;
                 break;
-            } else if msg == STDERR_WRITE {
-                // Legacy path: rio-build used STDERR_WRITE chunks.
-                // rio-gateway now matches daemon (raw NAR after LAST).
-                let chunk_field = read_string_field(&mut cursor).await;
-                let chunk_len = u64::from_le_bytes(chunk_field[..8].try_into().unwrap()) as usize;
-                nar_data.extend_from_slice(&chunk_field[8..8 + chunk_len]);
             } else if is_stderr_activity(msg) {
                 skip_stderr_activity_message(&mut cursor, msg).await;
             } else {
@@ -378,12 +371,10 @@ pub fn parse_nar_from_path_fields(
             }
         }
 
-        // If nar_data is still empty, read raw NAR bytes after STDERR_LAST
-        // (the daemon format, and what rio-gateway now does too).
-        if nar_data.is_empty() {
-            use tokio::io::AsyncReadExt;
-            cursor.read_to_end(&mut nar_data).await.unwrap();
-        }
+        // Read raw NAR bytes after STDERR_LAST.
+        let mut nar_data = Vec::new();
+        use tokio::io::AsyncReadExt;
+        cursor.read_to_end(&mut nar_data).await.unwrap();
 
         vec![
             ResponseField {
