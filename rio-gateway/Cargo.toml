@@ -33,8 +33,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-rio-test-support = { path = "../rio-test-support" }
-sqlx = { workspace = true }
+rio-test-support = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true }

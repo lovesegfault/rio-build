@@ -26,7 +26,7 @@ serde = { workspace = true }
 
 # Async runtime (for spawn_monitored)
 tokio = { workspace = true }
-futures-util = "0.3"
+futures-util = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
