@@ -81,6 +81,24 @@ impl DerivationDag {
         self.path_to_hash.get(drv_path)
     }
 
+    /// Returns a clone of the canonical `DrvHash` stored as a key in `nodes`.
+    ///
+    /// "Canonical" means: the Arc allocated when the node was FIRST inserted
+    /// by `merge()`. All subsequent clones via `path_to_hash`, `children`,
+    /// `parents`, `get_parents`/`get_children`, `compute_initial_states`, etc.
+    /// share this same Arc (ptr-equal). Cloning the canonical DrvHash is an
+    /// atomic refcount bump — no allocation.
+    ///
+    /// Returns `None` if the hash isn't in the DAG. The `&str` signature
+    /// accepts both raw strings and `&DrvHash` (via deref coercion).
+    ///
+    /// Use this when you have a FRESH `DrvHash` (e.g., constructed from a
+    /// proto string) and want to exchange it for the existing canonical one,
+    /// so downstream clones don't proliferate distinct Arc allocations.
+    pub fn canonical(&self, hash: &str) -> Option<DrvHash> {
+        self.nodes.get_key_value(hash).map(|(k, _)| k.clone())
+    }
+
     /// Iterate all (drv_hash, state) pairs.
     pub fn iter_nodes(&self) -> impl Iterator<Item = (&str, &DerivationState)> {
         self.nodes.iter().map(|(k, v)| (k.as_str(), v))
@@ -120,13 +138,21 @@ impl DerivationDag {
 
         // Insert or update nodes
         for node in nodes {
-            let drv_hash: DrvHash = node.drv_hash.as_str().into();
+            // Exchange the fresh proto-derived hash for the canonical one
+            // from a prior merge if this node already exists. canonical()
+            // returns an Arc-clone of the existing map key, so downstream
+            // pushes into interest_added don't proliferate distinct allocs.
+            // If the node is new, our fresh Arc BECOMES the canonical one
+            // when inserted below.
+            let drv_hash = self
+                .canonical(node.drv_hash.as_str())
+                .unwrap_or_else(|| node.drv_hash.as_str().into());
 
             if let Some(existing) = self.nodes.get_mut(&drv_hash) {
                 // Node already exists: add this build's interest.
                 // `insert` returns true iff build_id was not already present.
                 if existing.interested_builds.insert(build_id) {
-                    interest_added.push(drv_hash.clone());
+                    interest_added.push(drv_hash);
                 }
             } else {
                 // New node. try_from_node validates drv_path: StorePath::parse.
@@ -141,10 +167,13 @@ impl DerivationDag {
                         source: e,
                     })?;
                 state.interested_builds.insert(build_id);
+                // All three inserts clone the SAME Arc — they're mutually
+                // ptr-equal. This is what makes path_to_hash.get().cloned()
+                // canonical, which makes the edge-insert loop canonical, etc.
                 self.path_to_hash
                     .insert(state.drv_path().to_string(), drv_hash.clone());
                 self.nodes.insert(drv_hash.clone(), state);
-                newly_inserted.insert(drv_hash.clone());
+                newly_inserted.insert(drv_hash);
             }
         }
 

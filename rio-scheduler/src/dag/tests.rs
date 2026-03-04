@@ -509,3 +509,96 @@ fn test_cycle_detection_deep_chain_with_back_edge() {
     assert!(result.is_err(), "cycle at depth must be detected");
     assert_eq!(dag.nodes.len(), 0, "rollback must clear all nodes");
 }
+
+// ---------------------------------------------------------------------------
+// D5: canonical() interning
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_canonical_returns_pointer_equal_arc() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let nodes = vec![make_node("canon-hash", "x86_64-linux")];
+    dag.merge(Uuid::new_v4(), &nodes, &[])?;
+
+    // Two calls to canonical() return ptr-equal clones — both are refcount
+    // bumps of the same Arc stored as the key in `nodes`.
+    let a = dag.canonical("canon-hash").expect("inserted above");
+    let b = dag.canonical("canon-hash").expect("inserted above");
+    assert!(DrvHash::ptr_eq(&a, &b), "canonical must be ptr-stable");
+
+    // And a FRESH construction from the same string is NOT ptr-equal —
+    // it's a distinct alloc. canonical() exchanges it for the interned one.
+    let fresh = DrvHash::from("canon-hash");
+    assert_eq!(fresh, a, "structurally equal");
+    assert!(!DrvHash::ptr_eq(&fresh, &a), "but distinct alloc");
+    Ok(())
+}
+
+#[test]
+fn test_canonical_returns_none_for_unknown() {
+    let dag = DerivationDag::new();
+    assert!(dag.canonical("never-inserted").is_none());
+}
+
+/// The interning INVARIANT: all DrvHash clones flowing out of DAG accessors
+/// are ptr-equal to the canonical key in `nodes`. This holds because
+/// `merge()` inserts clones of the SAME local Arc into `nodes`,
+/// `path_to_hash`, and `newly_inserted` — everything downstream reads
+/// from those maps.
+///
+/// This test verifies the invariant end-to-end across a multi-merge
+/// scenario with edges (the case where `path_to_hash.get().cloned()`
+/// feeds into `children`/`parents`).
+#[test]
+fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let nodes = vec![
+        make_node("parent", "x86_64-linux"),
+        make_node("child", "x86_64-linux"),
+    ];
+    let edges = vec![make_edge("parent", "child")];
+    let result = dag.merge(b1, &nodes, &edges)?;
+
+    let parent_canon = dag.canonical("parent").unwrap();
+    let child_canon = dag.canonical("child").unwrap();
+
+    // newly_inserted entries are canonical (cloned from same Arc as nodes key).
+    let ni_parent = result.newly_inserted.get("parent").unwrap();
+    let ni_child = result.newly_inserted.get("child").unwrap();
+    assert!(DrvHash::ptr_eq(ni_parent, &parent_canon));
+    assert!(DrvHash::ptr_eq(ni_child, &child_canon));
+
+    // path_to_hash values are canonical.
+    let pth = dag.hash_for_path(&test_drv_path("parent")).unwrap();
+    assert!(DrvHash::ptr_eq(pth, &parent_canon));
+
+    // get_parents / get_children return canonical.
+    let parents_of_child = dag.get_parents("child");
+    assert!(DrvHash::ptr_eq(&parents_of_child[0], &parent_canon));
+    let children_of_parent = dag.get_children("parent");
+    assert!(DrvHash::ptr_eq(&children_of_parent[0], &child_canon));
+
+    // compute_initial_states returns canonical.
+    let states = dag.compute_initial_states(&result.newly_inserted);
+    for (h, _) in &states {
+        let canon = dag.canonical(h).unwrap();
+        assert!(DrvHash::ptr_eq(h, &canon));
+    }
+
+    // --- The ONE case D5 fixed: second merge of the same node. ---
+    // Before: interest_added held a fresh Arc (from proto string).
+    // After: exchanged via canonical() upfront, so it's ptr-equal.
+    let b2 = Uuid::new_v4();
+    let result2 = dag.merge(b2, &nodes, &edges)?;
+    assert_eq!(result2.interest_added.len(), 2);
+    for h in &result2.interest_added {
+        let canon = dag.canonical(h).unwrap();
+        assert!(
+            DrvHash::ptr_eq(h, &canon),
+            "interest_added entry must be canonical (was the D5 fix)"
+        );
+    }
+
+    Ok(())
+}

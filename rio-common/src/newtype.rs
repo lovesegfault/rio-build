@@ -97,8 +97,9 @@ macro_rules! arc_string_newtype {
             pub fn into_inner(self) -> ::std::sync::Arc<str> { self.0 }
             /// Pointer-equality check on the underlying Arc. Two clones of
             /// the same `$name` are ptr_eq; two independent `$name::from("x")`
-            /// are NOT. Test helper for verifying interning.
-            #[cfg(test)]
+            /// are NOT. Useful for verifying interning invariants in tests.
+            /// Not `#[cfg(test)]` because downstream crates' tests need it
+            /// (deps are built with `cfg(not(test))`).
             pub fn ptr_eq(a: &Self, b: &Self) -> bool {
                 ::std::sync::Arc::ptr_eq(&a.0, &b.0)
             }
