@@ -26,10 +26,7 @@ use crate::validated::ValidatedPathInfo;
 pub const NAR_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Connect to a gRPC endpoint at `host:port` and return a raw [`Channel`].
-///
-/// The caller wraps in `XServiceClient::new(channel)`. Use the per-service
-/// helpers below unless you need to share one channel across multiple clients.
-pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
+async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     let endpoint = format!("http://{addr}");
     Channel::from_shared(endpoint)?
         .connect()

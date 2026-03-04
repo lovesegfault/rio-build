@@ -32,12 +32,15 @@ pub struct SchedulerGrpc {
 }
 
 impl SchedulerGrpc {
-    /// Create a new gRPC service with the given actor handle.
+    /// Test-only constructor: makes a FRESH `LogBuffers`, not shared with
+    /// any flusher. Production MUST use [`with_log_buffers`](Self::with_log_buffers)
+    /// — a fresh DashMap means the flusher drains an unrelated empty buffer
+    /// forever while real logs pile up here (silent total log loss).
     ///
-    /// This makes a FRESH `LogBuffers`. For production (where the flusher
-    /// needs the same buffers), use [`with_log_buffers`](Self::with_log_buffers)
-    /// instead. This constructor is kept for tests where no flusher runs.
-    pub fn new(actor: ActorHandle) -> Self {
+    /// `#[cfg(test)]` makes prod misuse a compile error, not a runtime
+    /// footgun.
+    #[cfg(test)]
+    pub fn new_for_tests(actor: ActorHandle) -> Self {
         Self {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
@@ -46,9 +49,7 @@ impl SchedulerGrpc {
 
     /// Create with an externally-owned `LogBuffers`. Production `main.rs`
     /// uses this so the LogFlusher (separate task) drains the SAME buffers
-    /// that the BuildExecution recv task writes to. If you use `new()` in
-    /// production, the flusher would drain an unrelated empty DashMap
-    /// forever while the real logs pile up here — a silent total log loss.
+    /// that the BuildExecution recv task writes to.
     pub fn with_log_buffers(actor: ActorHandle, log_buffers: Arc<LogBuffers>) -> Self {
         Self { actor, log_buffers }
     }
