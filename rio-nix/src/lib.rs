@@ -1,3 +1,11 @@
+//! Nix protocol types and wire format.
+//!
+//! Provides the core Nix types ([`StorePath`](store_path::StorePath),
+//! [`NixHash`](hash::NixHash), [`Derivation`](derivation::Derivation),
+//! [`NarInfo`](narinfo::NarInfo)), the worker-protocol wire primitives
+//! ([`protocol::wire`]), and handshake/STDERR framing. Fuzzed parsers
+//! live in `rio-nix/fuzz/`.
+
 pub mod derivation;
 pub mod hash;
 pub mod nar;

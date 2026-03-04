@@ -1,3 +1,10 @@
+//! NAR content-addressable store.
+//!
+//! PostgreSQL-backed metadata (`narinfo`, `manifests`) with FastCDC
+//! chunk deduplication, moka chunk cache, ed25519 narinfo [`signing`],
+//! and an axum binary-cache HTTP server. Serves `StoreService` +
+//! `ChunkService` gRPC (see [`grpc`]).
+
 pub mod backend;
 pub mod cache_server;
 pub mod cas;
