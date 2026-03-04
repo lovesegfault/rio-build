@@ -9,7 +9,7 @@ members = [
   "rio-test-support",
   "rio-worker",
 ]
-exclude = ["rio-nix/fuzz"]
+exclude = ["rio-nix/fuzz", "rio-store/fuzz"]
 resolver = "2"
 
 [workspace.package]
