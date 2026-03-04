@@ -1,4 +1,4 @@
-//! Shared test helpers: actor setup, fixture builders, settle/timing.
+//! Shared test helpers: actor setup, fixture builders, synchronization barrier.
 
 use super::*;
 use tokio::sync::mpsc;
@@ -252,17 +252,36 @@ pub(crate) async fn complete_failure(
     Ok(())
 }
 
-/// Give the actor time to process commands.
-pub(crate) async fn settle() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
+/// Awaits actor quiescence by round-tripping a no-op query.
+///
+/// Unlike the old `settle()` (sleep-based), this is a **true barrier**:
+/// when it returns, the actor has processed all messages sent before
+/// this call. Works because the actor processes messages serially from
+/// one mpsc — a request-reply guarantees everything ahead of it in the
+/// channel has been handled.
+///
+/// ## When you DON'T need this
+///
+/// Most call sites don't need an explicit barrier at all, because the
+/// next line is already a request-reply:
+///   - `debug_query_*` / `query_status` / `try_query_status`
+///   - `merge_single_node` / `merge_dag` (awaits MergeDag reply, which
+///     is sent AFTER `dispatch_ready()` runs inline)
+///   - any `reply_rx.await`
+///
+/// You only need `barrier()` when the next assertion is on state that
+/// isn't mediated by the actor channel — e.g. `logs_contain()` (checks
+/// captured tracing output) or assertions on shared Arc state that the
+/// actor mutates as a side effect.
+pub(crate) async fn barrier(handle: &ActorHandle) {
+    let _ = handle.debug_query_workers().await;
 }
 
 #[tokio::test]
 async fn test_actor_starts_and_stops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, task) = setup_actor(db.pool.clone());
-    settle().await;
-    // Query should succeed (actor is running)
+    // Query should succeed (actor is running). Also acts as a barrier.
     let workers = handle.debug_query_workers().await?;
     assert!(workers.is_empty());
     // Drop handle to close channel
@@ -277,9 +296,9 @@ async fn test_actor_starts_and_stops() -> TestResult {
 async fn test_actor_is_alive_detection() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, task) = setup_actor(db.pool.clone());
-    settle().await;
 
-    // Actor should be alive after spawn.
+    // Actor should be alive after spawn. is_alive() is just !tx.is_closed()
+    // — no message processing needed for this check.
     assert!(handle.is_alive(), "actor should be alive after spawn");
 
     // Abort the actor task to simulate a panic/crash.

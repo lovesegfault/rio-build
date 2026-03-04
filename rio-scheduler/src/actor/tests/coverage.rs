@@ -19,7 +19,6 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
         false, // keep_going=false (critical)
     )
     .await?;
-    settle().await;
 
     // Send PermanentFailure for hashA
     complete_failure(
@@ -30,7 +29,6 @@ async fn test_keepgoing_false_fails_fast() -> TestResult {
         "compile error",
     )
     .await?;
-    settle().await;
 
     // Build should be Failed (not waiting for hashB)
     let status = query_status(&handle, build_id).await?;
@@ -61,7 +59,6 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
         true, // keep_going=true (critical)
     )
     .await?;
-    settle().await;
 
     // Send PermanentFailure for hashX
     complete_failure(
@@ -72,7 +69,6 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
         "failed",
     )
     .await?;
-    settle().await;
 
     // Build should still be Active (waiting for hashY)
     let status = query_status(&handle, build_id).await?;
@@ -84,7 +80,6 @@ async fn test_keepgoing_true_waits_all() -> TestResult {
 
     // Complete hashY successfully
     complete_success_empty(&handle, "test-worker", &test_drv_path("hashY")).await?;
-    settle().await;
 
     // Now build should be Failed (all resolved, one failed)
     let status2 = query_status(&handle, build_id).await?;
@@ -123,7 +118,6 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
         true, // keep_going
     )
     .await?;
-    settle().await;
 
     // Sanity: C is the only Ready/Assigned derivation; A and B are Queued.
     let info_a = handle
@@ -146,7 +140,6 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
         "compile error",
     )
     .await?;
-    settle().await;
 
     // B and A should now be DependencyFailed (cascaded transitively).
     let info_b = handle
@@ -196,7 +189,6 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
     // Build 1: single leaf, poisoned via PermanentFailure.
     let build1 = Uuid::new_v4();
     let _rx1 = merge_single_node(&handle, build1, "preleaf", PriorityClass::Scheduled).await?;
-    settle().await;
     complete_failure(
         &handle,
         "poison-worker",
@@ -205,7 +197,6 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
         "preleaf failed",
     )
     .await?;
-    settle().await;
 
     // Verify preleaf is Poisoned.
     let leaf = handle
@@ -228,7 +219,6 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
         false,
     )
     .await?;
-    settle().await;
 
     // preparent must be DependencyFailed (not stuck Queued).
     let parent = handle
@@ -264,10 +254,8 @@ async fn test_watch_build_after_completion_receives_terminal_event() -> TestResu
     let build_id = Uuid::new_v4();
     let original_rx =
         merge_single_node(&handle, build_id, "watch-hash", PriorityClass::Scheduled).await?;
-    settle().await;
 
     complete_success_empty(&handle, "watch-worker", &test_drv_path("watch-hash")).await?;
-    settle().await;
 
     // Drop the original subscriber. The BuildCompleted event was already
     // sent; a NEW subscriber should not hang waiting for it.
@@ -317,10 +305,8 @@ async fn test_terminal_build_cleanup_after_delay() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     complete_success_empty(&handle, "cleanup-worker", &drv_path).await?;
-    settle().await;
 
     // Build should be Succeeded and still queryable.
     let status = try_query_status(&handle, build_id).await?;
@@ -330,7 +316,6 @@ async fn test_terminal_build_cleanup_after_delay() -> TestResult {
     handle
         .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id })
         .await?;
-    settle().await;
 
     // Build should now be gone (BuildNotFound).
     let status = try_query_status(&handle, build_id).await?;
@@ -362,7 +347,6 @@ async fn test_transient_retry_different_worker() -> TestResult {
     let p_retry = test_drv_path("retry-hash");
     let _event_rx =
         merge_single_node(&handle, build_id, "retry-hash", PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Get initial worker assignment
     let info1 = handle
@@ -381,7 +365,6 @@ async fn test_transient_retry_different_worker() -> TestResult {
         "network hiccup",
     )
     .await?;
-    settle().await;
 
     // Should be retried: retry_count=1, possibly on a different worker
     let info2 = handle
@@ -413,7 +396,6 @@ async fn test_transient_failure_max_retries_same_worker_poisons() -> TestResult 
     let p_maxretry = test_drv_path("maxretry-hash");
     let _event_rx =
         merge_single_node(&handle, build_id, "maxretry-hash", PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Default RetryPolicy::max_retries = 2. Fail 3 times on same worker:
     // retry_count 0 -> 1 (retry), 1 -> 2 (retry), 2 >= 2 -> Poisoned.
@@ -426,7 +408,6 @@ async fn test_transient_failure_max_retries_same_worker_poisons() -> TestResult 
             &format!("attempt {attempt} failed"),
         )
         .await?;
-        settle().await;
     }
 
     let info = handle
@@ -451,7 +432,6 @@ async fn test_cancel_build_active_drains_derivations() -> TestResult {
     let build_id = Uuid::new_v4();
     let mut event_rx =
         merge_single_node(&handle, build_id, "cancel-hash", PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Send CancelBuild.
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -464,7 +444,6 @@ async fn test_cancel_build_active_drains_derivations() -> TestResult {
         .await?;
     let cancelled = reply_rx.await??;
     assert!(cancelled, "CancelBuild should return true for active build");
-    settle().await;
 
     // Build should be Cancelled.
     let status = query_status(&handle, build_id).await?;
@@ -518,7 +497,6 @@ async fn test_watch_build_receives_events() -> TestResult {
         PriorityClass::Scheduled,
     )
     .await?;
-    settle().await;
 
     // WatchBuild on the active build.
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -642,7 +620,6 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             running_builds: vec![],
         })
         .await?;
-    settle().await;
 
     // Prime the estimator. Normally it refreshes on Tick every 60s;
     // for the test we trigger it via 6 Ticks (the refresh cadence).
@@ -651,14 +628,12 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     for _ in 0..6 {
         handle.send_unchecked(ActorCommand::Tick).await?;
     }
-    settle().await;
 
     // Merge a build with pname="bigthing" so estimator matches.
     let build_id = Uuid::new_v4();
     let mut node = make_test_node("bigthing-hash", "x86_64-linux");
     node.pname = "bigthing".into();
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    settle().await;
 
     // Large worker should get the assignment. Small worker should NOT.
     let large_msg = tokio::time::timeout(Duration::from_secs(2), large_rx.recv())
@@ -719,7 +694,6 @@ async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
     let build_x86 = Uuid::new_v4();
     let p_x86 = test_drv_path("x86-hash");
     let _rx = merge_single_node(&handle, build_x86, "x86-hash", PriorityClass::Scheduled).await?;
-    settle().await;
 
     // x86_64 derivation should be dispatched despite aarch64 ahead of it.
     let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
@@ -777,7 +751,6 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
         })
         .await?;
     let _rx = reply_rx.await??;
-    settle().await;
 
     // Worker should receive assignment with the build's options.
     let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
@@ -807,7 +780,6 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // Register worker (initial heartbeat has empty running_builds).
     let (_db, handle, _task, _stream_rx) =
         setup_with_worker("toctou-worker", "x86_64-linux", 2).await?;
-    settle().await;
 
     // Merge a derivation. Scheduler will assign it to the worker and
     // insert it into worker.running_builds.
@@ -815,7 +787,6 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     let drv_hash = "toctou-drv-hash";
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Verify: derivation is Assigned, worker.running_builds contains it.
     let info = handle
@@ -847,7 +818,6 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
             running_builds: vec![], // stale — does NOT include fresh assignment
         })
         .await?;
-    settle().await;
 
     // Assignment must still be tracked. Before the fix, running_builds
     // would be wholesale replaced with the empty set, orphaning the
@@ -880,7 +850,6 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
     for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
@@ -892,7 +861,6 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
             &format!("failure {i}"),
         )
         .await?;
-        settle().await;
     }
 
     let info = handle
@@ -937,7 +905,6 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
         false,
     )
     .await?;
-    settle().await;
 
     // B is dispatched first (leaf). A is Queued waiting for B.
     let info_a = handle
@@ -958,7 +925,6 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
 
     // Complete B.
     complete_success_empty(&handle, "chain-worker", &p_chain_b).await?;
-    settle().await;
 
     // A should now transition Queued -> Ready -> Assigned (dispatched).
     let info_a = handle
@@ -1000,12 +966,10 @@ async fn test_duplicate_completion_idempotent() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let mut event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Send completion TWICE.
     for _ in 0..2 {
         complete_success_empty(&handle, "idem-worker", &drv_path).await?;
-        settle().await;
     }
 
     // completed_count should be 1, not 2.
@@ -1057,13 +1021,11 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
     // in test_worker_disconnect_running_derivation.
     let (_db, handle, _task, _stream_rx) =
         setup_with_worker("tick-worker", "x86_64-linux", 1).await?;
-    settle().await;
 
     // Send several Ticks. Worker has fresh heartbeat, should NOT be removed.
     for _ in 0..MAX_MISSED_HEARTBEATS + 1 {
         handle.send_unchecked(ActorCommand::Tick).await?;
     }
-    settle().await;
 
     let workers = handle.debug_query_workers().await?;
     assert!(
@@ -1094,7 +1056,6 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
         PriorityClass::Scheduled,
     )
     .await?;
-    settle().await;
 
     complete_failure(
         &handle,
@@ -1104,7 +1065,6 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
         "permanent",
     )
     .await?;
-    settle().await;
 
     // Verify poisoned.
     let pre = handle
@@ -1118,7 +1078,6 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
 
     // Tick processes the expiry.
     handle.send_unchecked(ActorCommand::Tick).await?;
-    settle().await;
 
     let post = handle
         .debug_query_derivation("poison-ttl-hash")
@@ -1155,7 +1114,6 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
     let mut node = make_test_node("fault-hash", "x86_64-linux");
     node.pname = "fault-pkg".into();
     let _evt_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    settle().await;
 
     // Close pool AFTER merge/dispatch so only completion DB writes fail.
     db.pool.close().await;
@@ -1181,7 +1139,6 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
             output_size_bytes: 0,
         })
         .await?;
-    settle().await;
 
     // In-memory state should have transitioned despite all DB write failures.
     let post = handle
@@ -1211,7 +1168,6 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
     let build_id = Uuid::new_v4();
     let _evt_rx =
         merge_single_node(&handle, build_id, "tfault-hash", PriorityClass::Scheduled).await?;
-    settle().await;
 
     db.pool.close().await;
 
@@ -1223,7 +1179,9 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
         "flaky network",
     )
     .await?;
-    settle().await;
+    // logs_contain() checks captured tracing output, not actor state —
+    // needs an explicit barrier since no request-reply follows.
+    barrier(&handle).await;
 
     // Transient with retry_count < max → should hit the retry-persist branches.
     assert!(
@@ -1253,7 +1211,6 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
         false,
     )
     .await?;
-    settle().await;
 
     db.pool.close().await;
 
@@ -1265,7 +1222,6 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
         &test_store_path("out-B"),
     )
     .await?;
-    settle().await;
 
     // A should be Ready in-memory (transition succeeds); DB write logged.
     let a = handle
@@ -1314,7 +1270,6 @@ async fn test_interactive_priority_boost() -> TestResult {
         false,
     )
     .await?;
-    settle().await;
 
     // Build 2: Interactive, 2-node chain A → B. B is a leaf, A blocked.
     let p_prio_a = test_drv_path("prioA");
@@ -1339,7 +1294,6 @@ async fn test_interactive_priority_boost() -> TestResult {
         })
         .await?;
     let _rx2 = reply_rx.await??;
-    settle().await;
 
     // Drain the first assignment (one of Q/R/B — whichever dispatched first).
     // We don't care which; we only care what happens AFTER we complete it
@@ -1361,7 +1315,6 @@ async fn test_interactive_priority_boost() -> TestResult {
         seen_paths.push(path.clone());
         // Complete it.
         complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await?;
-        settle().await;
         // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
             let next = worker_rx.recv().await.expect("should get next assignment");
