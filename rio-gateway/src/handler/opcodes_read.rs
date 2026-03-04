@@ -301,7 +301,7 @@ pub(super) async fn handle_query_path_from_hash_part<
     let hash_part = wire::read_string(reader).await?;
     debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
 
-    // Dedicated RPC (resolves the old TODO(phase2c) workaround).
+    // Dedicated RPC (resolves the old phase2c-tagged workaround).
     // The store validates hash_part (32 chars, nixbase32 charset) and
     // does the LIKE prefix query. NOT_FOUND → empty string to Nix; other
     // gRPC errors → STDERR_ERROR.
@@ -345,7 +345,7 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     let sigs = wire::read_strings(reader).await?;
     debug!(path = %path_str, count = sigs.len(), "wopAddSignatures");
 
-    // Dedicated RPC (resolves the old TODO(phase2c) stub). The store
+    // Dedicated RPC (resolves the old phase2c-tagged stub). The store
     // appends to narinfo.signatures TEXT[]. NOT_FOUND → STDERR_ERROR
     // (matches the real daemon: signing a path you don't have is an error,
     // not a silent no-op — `nix store sign` expects to hear about it).
