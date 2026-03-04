@@ -38,6 +38,10 @@ use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
+// narinfo_cols! is #[macro_export] (for content_index.rs) so it lands at
+// crate root — re-import it here where it's defined.
+use crate::narinfo_cols;
+
 /// Typed error for the metadata/DB layer. Replaces `anyhow::Result` so
 /// callers can discriminate retriable failures (connection, serialization)
 /// from permanent ones (corruption) and map to precise gRPC status codes.
@@ -227,37 +231,7 @@ pub async fn complete_manifest_inline(
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
 
-    let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
-    let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-    let ca_str = info.content_address.as_deref();
-
-    let narinfo_result = sqlx::query(
-        r#"
-        UPDATE narinfo SET
-            deriver           = $2,
-            nar_hash          = $3,
-            nar_size          = $4,
-            "references"      = $5,
-            signatures        = $6,
-            ca                = $7,
-            registration_time = $8,
-            ultimate          = $9
-        WHERE store_path_hash = $1
-        "#,
-    )
-    .bind(&info.store_path_hash)
-    .bind(deriver_str)
-    .bind(info.nar_hash.as_slice())
-    .bind(info.nar_size as i64)
-    .bind(&refs_str)
-    .bind(&info.signatures)
-    .bind(ca_str)
-    .bind(info.registration_time as i64)
-    .bind(info.ultimate)
-    .execute(&mut *tx)
-    .await?;
-
-    if narinfo_result.rows_affected() == 0 {
+    if update_narinfo_complete(&mut tx, info).await? == 0 {
         // insert_manifest_uploading MUST have run first. If rows_affected
         // is 0, delete_manifest_uploading raced us and won. The caller's
         // placeholder is gone; bailing here prevents a half-complete write.
@@ -442,25 +416,18 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
 /// are invisible.
 #[instrument(skip(pool))]
 pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<ValidatedPathInfo>> {
-    let row: Option<NarinfoRow> = sqlx::query_as(
-        r#"
-        SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n."references", n.signatures, n.ca, n.registration_time, n.ultimate
-        FROM narinfo n
-        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
-        WHERE n.store_path = $1 AND m.status = 'complete'
-        "#,
-    )
+    let row: Option<NarinfoRow> = sqlx::query_as(concat!(
+        "SELECT ",
+        narinfo_cols!(),
+        " FROM narinfo n \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         WHERE n.store_path = $1 AND m.status = 'complete'"
+    ))
     .bind(store_path)
     .fetch_optional(pool)
     .await?;
 
-    // DB-egress validation: a malformed row (garbage store_path, wrong-length
-    // nar_hash) would otherwise propagate silently. Caught here at the trust
-    // boundary — PG doesn't enforce these as CHECK constraints.
-    row.map(|r| r.try_into_validated())
-        .transpose()
-        .map_err(MetadataError::MalformedRow)
+    validate_row(row)
 }
 
 /// Batch check which store paths are missing.
@@ -617,37 +584,7 @@ pub async fn upgrade_manifest_to_chunked(
 pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) -> Result<()> {
     let mut tx = pool.begin().await?;
 
-    let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
-    let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
-    let ca_str = info.content_address.as_deref();
-
-    let narinfo_result = sqlx::query(
-        r#"
-        UPDATE narinfo SET
-            deriver           = $2,
-            nar_hash          = $3,
-            nar_size          = $4,
-            "references"      = $5,
-            signatures        = $6,
-            ca                = $7,
-            registration_time = $8,
-            ultimate          = $9
-        WHERE store_path_hash = $1
-        "#,
-    )
-    .bind(&info.store_path_hash)
-    .bind(deriver_str)
-    .bind(info.nar_hash.as_slice())
-    .bind(info.nar_size as i64)
-    .bind(&refs_str)
-    .bind(&info.signatures)
-    .bind(ca_str)
-    .bind(info.registration_time as i64)
-    .bind(info.ultimate)
-    .execute(&mut *tx)
-    .await?;
-
-    if narinfo_result.rows_affected() == 0 {
+    if update_narinfo_complete(&mut tx, info).await? == 0 {
         return Err(MetadataError::PlaceholderMissing {
             store_path: info.store_path.to_string(),
         });
@@ -867,22 +804,18 @@ pub async fn query_by_hash_part(
     // including it makes the match exact.
     let pattern = format!("/nix/store/{hash_part}-%");
 
-    let row: Option<NarinfoRow> = sqlx::query_as(
-        r#"
-        SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n."references", n.signatures, n.ca, n.registration_time, n.ultimate
-        FROM narinfo n
-        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
-        WHERE n.store_path LIKE $1 AND m.status = 'complete'
-        "#,
-    )
+    let row: Option<NarinfoRow> = sqlx::query_as(concat!(
+        "SELECT ",
+        narinfo_cols!(),
+        " FROM narinfo n \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         WHERE n.store_path LIKE $1 AND m.status = 'complete'"
+    ))
     .bind(&pattern)
     .fetch_optional(pool)
     .await?;
 
-    row.map(|r| r.try_into_validated())
-        .transpose()
-        .map_err(MetadataError::MalformedRow)
+    validate_row(row)
 }
 
 /// Append signatures to an existing narinfo.
@@ -919,8 +852,79 @@ pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String])
 }
 
 // ---------------------------------------------------------------------------
-// Internal types
+// Shared helpers — NarinfoRow column list + validation epilogue + UPDATE SQL
+//
+// These three are used by query_path_info, query_by_hash_part, and
+// content_index::lookup. Extracting them means adding a column to
+// NarinfoRow requires editing ONE macro, not 3 SELECT strings.
 // ---------------------------------------------------------------------------
+
+/// Expands to the 10-column SELECT list for `NarinfoRow`, aliased `n.*`.
+/// A macro (not a const) so `concat!` can embed it in query literals —
+/// `concat!` only accepts literal tokens, not const expressions, and we
+/// want compile-time strings (no per-query `format!` alloc).
+#[macro_export]
+#[doc(hidden)]
+macro_rules! narinfo_cols {
+    () => {
+        r#"n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
+           n."references", n.signatures, n.ca, n.registration_time, n.ultimate"#
+    };
+}
+
+/// Convert `Option<NarinfoRow>` → `Result<Option<ValidatedPathInfo>>`.
+///
+/// Shared epilogue for the three fetch_optional → validate queries.
+/// DB-egress validation: a malformed row (garbage store_path, wrong-length
+/// nar_hash) would otherwise propagate silently. Caught here at the trust
+/// boundary — PG doesn't enforce these as CHECK constraints.
+pub(crate) fn validate_row(row: Option<NarinfoRow>) -> Result<Option<ValidatedPathInfo>> {
+    row.map(NarinfoRow::try_into_validated)
+        .transpose()
+        .map_err(MetadataError::MalformedRow)
+}
+
+/// Fill the real narinfo fields (replacing placeholder zeros).
+///
+/// Shared by `complete_manifest_inline` and `complete_manifest_chunked` —
+/// both do the exact same 9-column UPDATE before their manifest-table
+/// operation diverges. Returns rows_affected so callers can check for
+/// the placeholder-raced-away case.
+async fn update_narinfo_complete(
+    tx: &mut sqlx::PgConnection,
+    info: &ValidatedPathInfo,
+) -> std::result::Result<u64, sqlx::Error> {
+    let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
+    let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+    let ca_str = info.content_address.as_deref();
+
+    sqlx::query(
+        r#"
+        UPDATE narinfo SET
+            deriver           = $2,
+            nar_hash          = $3,
+            nar_size          = $4,
+            "references"      = $5,
+            signatures        = $6,
+            ca                = $7,
+            registration_time = $8,
+            ultimate          = $9
+        WHERE store_path_hash = $1
+        "#,
+    )
+    .bind(&info.store_path_hash)
+    .bind(deriver_str)
+    .bind(info.nar_hash.as_slice())
+    .bind(info.nar_size as i64)
+    .bind(&refs_str)
+    .bind(&info.signatures)
+    .bind(ca_str)
+    .bind(info.registration_time as i64)
+    .bind(info.ultimate)
+    .execute(&mut *tx)
+    .await
+    .map(|r| r.rows_affected())
+}
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct NarinfoRow {

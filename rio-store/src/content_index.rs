@@ -78,24 +78,20 @@ pub async fn lookup(
     pool: &PgPool,
     content_hash: &[u8],
 ) -> crate::metadata::Result<Option<ValidatedPathInfo>> {
-    let row: Option<crate::metadata::NarinfoRow> = sqlx::query_as(
-        r#"
-        SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n."references", n.signatures, n.ca, n.registration_time, n.ultimate
-        FROM content_index ci
-        INNER JOIN narinfo n ON ci.store_path_hash = n.store_path_hash
-        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
-        WHERE ci.content_hash = $1 AND m.status = 'complete'
-        LIMIT 1
-        "#,
-    )
+    let row: Option<crate::metadata::NarinfoRow> = sqlx::query_as(concat!(
+        "SELECT ",
+        crate::narinfo_cols!(),
+        " FROM content_index ci \
+         INNER JOIN narinfo n ON ci.store_path_hash = n.store_path_hash \
+         INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash \
+         WHERE ci.content_hash = $1 AND m.status = 'complete' \
+         LIMIT 1"
+    ))
     .bind(content_hash)
     .fetch_optional(pool)
     .await?;
 
-    row.map(|r| r.try_into_validated())
-        .transpose()
-        .map_err(crate::metadata::MetadataError::MalformedRow)
+    crate::metadata::validate_row(row)
 }
 
 #[cfg(test)]
