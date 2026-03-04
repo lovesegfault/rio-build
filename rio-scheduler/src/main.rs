@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
+    rio_scheduler::describe_metrics();
 
     // Connect to PostgreSQL
     let pool = sqlx::postgres::PgPoolOptions::new()

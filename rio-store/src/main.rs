@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
 
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
+    rio_store::describe_metrics();
 
     // Connect to PostgreSQL
     info!(url = %cfg.database_url, "connecting to PostgreSQL");

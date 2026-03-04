@@ -241,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-worker");
 
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
+    rio_worker::describe_metrics();
 
     // Connect to gRPC services
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
