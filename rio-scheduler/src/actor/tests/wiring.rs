@@ -241,6 +241,8 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
                 }],
                 ..Default::default()
             },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
         })
         .await?;
     settle().await;

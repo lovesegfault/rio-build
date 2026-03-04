@@ -223,6 +223,8 @@ pub(crate) async fn complete_success(
                 }],
                 ..Default::default()
             },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
         })
         .await?;
     Ok(())
@@ -243,6 +245,8 @@ pub(crate) async fn complete_success_empty(
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 ..Default::default()
             },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
         })
         .await?;
     Ok(())
@@ -265,6 +269,8 @@ pub(crate) async fn complete_failure(
                 error_msg: error_msg.into(),
                 ..Default::default()
             },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
         })
         .await?;
     Ok(())

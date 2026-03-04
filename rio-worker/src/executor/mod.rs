@@ -111,6 +111,39 @@ pub struct ExecutionResult {
     pub result: ProtoBuildResult,
     /// Assignment token from the WorkAssignment.
     pub assignment_token: String,
+    /// Peak memory (RSS) in bytes, sampled from VmHWM before daemon
+    /// kill. 0 = couldn't read (proc gone, build failed early).
+    pub peak_memory_bytes: u64,
+    /// Total bytes uploaded (sum of NAR sizes). 0 on failure.
+    pub output_size_bytes: u64,
+}
+
+/// Read VmHWM from /proc/{pid}/status. The kernel tracks process-
+/// lifetime peak RSS here — no polling needed, one read gives the max.
+///
+/// Returns `None` on any failure (file missing = process dead, parse
+/// fail = kernel format changed). Caller treats None as "no signal"
+/// and reports 0 to the scheduler.
+///
+/// Format: `VmHWM:    123456 kB` (whitespace-separated, always kB).
+/// We parse the number and convert kB → bytes. The "always kB" is a
+/// Linux kernel guarantee (fs/proc/task_mmu.c) — no unit parsing needed.
+fn read_vmhwm_bytes(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{pid}/status");
+    let content = std::fs::read_to_string(&path).ok()?;
+
+    // Find the VmHWM line. Lines look like "VmHWM:\t   12345 kB".
+    // split_whitespace handles any mix of tabs/spaces.
+    content
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .and_then(|line| {
+            // ["VmHWM:", "12345", "kB"] — we want index 1.
+            line.split_whitespace().nth(1)
+        })
+        .and_then(|kb_str| kb_str.parse::<u64>().ok())
+        // kB → bytes. The kernel ALWAYS reports in kB for VmHWM.
+        .map(|kb| kb * 1024)
 }
 
 /// Execute a single build assignment.
@@ -172,6 +205,9 @@ pub async fn execute_build(
                 ..Default::default()
             },
             assignment_token: assignment.assignment_token.clone(),
+            // Infra failure before daemon spawn = no memory, no outputs.
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
         });
     }
 
@@ -333,6 +369,15 @@ pub async fn execute_build(
     let build_result =
         run_daemon_build(&mut daemon, drv_path, &basic_drv, timeout, batcher, log_tx).await;
 
+    // Sample VmHWM (peak RSS) BEFORE killing — /proc/{pid} goes away
+    // on exit. The kernel tracks VmHWM for us (no polling needed);
+    // one read at build-end gives the lifetime peak. This feeds
+    // build_history.ema_peak_memory_bytes for D7's size-class routing.
+    //
+    // 0 on any failure (pid None = already dead, file gone, parse fail).
+    // Scheduler treats 0 as "no signal" — doesn't drag the EMA.
+    let peak_memory_bytes = daemon.id().and_then(read_vmhwm_bytes).unwrap_or(0);
+
     // ALWAYS kill the daemon, regardless of success/failure.
     if let Err(e) = daemon.kill().await {
         tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
@@ -350,7 +395,9 @@ pub async fn execute_build(
     // NOW propagate any daemon error (after kill).
     let build_result = build_result?;
 
-    // 10. Check build result
+    // 10. Check build result. output_size_bytes tracked alongside:
+    // sum of uploaded NAR sizes (only set on successful upload path).
+    let mut output_size_bytes = 0u64;
     let proto_result = if build_result.status.is_success() {
         tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
 
@@ -376,8 +423,17 @@ pub async fn execute_build(
                             ..Default::default()
                         },
                         assignment_token: assignment.assignment_token.clone(),
+                        // Build DID run (FOD verification is post-build),
+                        // so VmHWM is meaningful even though we reject.
+                        peak_memory_bytes,
+                        output_size_bytes: 0,
                     });
                 }
+
+                // Sum NAR sizes for the CompletionReport. Feeds
+                // build_history.ema_output_size_bytes — not used for
+                // routing yet but useful for dashboards / capacity.
+                output_size_bytes = upload_results.iter().map(|r| r.nar_size).sum();
 
                 // Map store_path → output_name from the derivation. Upload
                 // results are unordered (buffer_unordered), and even the
@@ -470,6 +526,8 @@ pub async fn execute_build(
         drv_path: drv_path.clone(),
         result: proto_result,
         assignment_token: assignment.assignment_token.clone(),
+        peak_memory_bytes,
+        output_size_bytes,
     })
 }
 
@@ -585,5 +643,36 @@ mod tests {
         // Counter unchanged — short-circuit doesn't touch the overlay.
         assert_eq!(leak_counter.load(Ordering::Relaxed), 999);
         Ok(())
+    }
+
+    /// VmHWM parse against a real /proc entry: this process. The test
+    /// process itself has a nonzero RSS, so VmHWM must be > 0. This
+    /// exercises the whole path (file read, line scan, whitespace
+    /// split, kB→bytes) without needing to spawn a daemon.
+    #[test]
+    fn test_read_vmhwm_bytes_self() {
+        let pid = std::process::id();
+        let hwm = read_vmhwm_bytes(pid).expect("/proc/self/status should exist and parse");
+
+        // The test binary's peak RSS is at LEAST a few hundred KB
+        // (stack + heap + mapped libs). 64 KiB is a safe floor; a
+        // real value is typically tens of MB. This guards against
+        // silently parsing the wrong field or dropping the ×1024.
+        assert!(
+            hwm > 64 * 1024,
+            "VmHWM for self should be well over 64 KiB, got {hwm} bytes"
+        );
+
+        // Kernel reports in whole kB, so bytes MUST be a multiple of
+        // 1024. Catches "forgot to ×1024" and "parsed wrong number"
+        // classes of bug.
+        assert_eq!(hwm % 1024, 0, "VmHWM should be kB-aligned, got {hwm}");
+    }
+
+    /// Nonexistent PID → None (not panic, not Err). PID 1 billion is
+    /// way past pid_max (default ~4M on Linux), so guaranteed absent.
+    #[test]
+    fn test_read_vmhwm_bytes_nonexistent_pid() {
+        assert_eq!(read_vmhwm_bytes(1_000_000_000), None);
     }
 }
