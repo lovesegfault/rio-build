@@ -204,8 +204,16 @@ pub enum ActorError {
     #[error("backpressure: actor queue is overloaded")]
     Backpressure,
 
-    #[error("internal error: {0}")]
-    Internal(String),
+    #[error("DAG merge failed: {0}")]
+    Dag(#[from] crate::dag::DagError),
+
+    /// Invariant violation: an edge references a derivation that was never
+    /// persisted to PG. Merge assigns db_ids to every node before processing
+    /// edges; if `find_db_id_by_path` returns None for an edge endpoint, the
+    /// node was never in the submission (malformed request) or the id_map
+    /// build loop has a bug.
+    #[error("edge references unpersisted derivation (db_id missing): {drv_path}")]
+    MissingDbId { drv_path: String },
 
     /// Store service is unreachable (cache-check circuit breaker is open).
     /// Maps to gRPC UNAVAILABLE. Rejecting SubmitBuild here is the user
