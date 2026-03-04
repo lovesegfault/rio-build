@@ -41,6 +41,26 @@ service StoreService {
   // opcodes_read.rs:337). Now we actually persist: UPDATE narinfo
   // SET signatures = signatures || $2.
   rpc AddSignatures(rio.types.AddSignaturesRequest) returns (rio.types.AddSignaturesResponse);
+
+  // Register a CA derivation realisation (wopRegisterDrvOutput, 42).
+  //
+  // When Nix finishes building a CA derivation, it sends us the mapping
+  // (modular_drv_hash, output_name) -> (output_path, output_hash). We store
+  // it so future builds of the same derivation can cache-hit via
+  // QueryRealisation — even before Phase 5's full early-cutoff activation.
+  //
+  // Idempotent (ON CONFLICT DO NOTHING): the same (drv_hash, output_name)
+  // always maps to the same output_path (CA derivations are deterministic
+  // by construction), so a duplicate registration is a no-op, not an error.
+  rpc RegisterRealisation(rio.types.RegisterRealisationRequest) returns (rio.types.RegisterRealisationResponse);
+
+  // Query a CA derivation realisation (wopQueryRealisation, 43).
+  //
+  // Nix asks "has (drv_hash, output_name) been built before?" and expects
+  // back the output_path if yes. NOT_FOUND means "build it yourself" —
+  // a normal cache miss, not an error. The gateway translates NOT_FOUND
+  // into an empty-set wire response (u64 count = 0).
+  rpc QueryRealisation(rio.types.QueryRealisationRequest) returns (rio.types.Realisation);
 }
 
 // Chunk-level storage service for content-defined chunking.

@@ -27,6 +27,10 @@ use rio_proto::validated::ValidatedPathInfo;
 /// `(PathInfo, NAR bytes)` — stored value type for [`MockStore::paths`].
 type StoredPath = (types::PathInfo, Vec<u8>);
 
+/// `(drv_hash, output_name)` — key type for [`MockStore::realisations`].
+/// Alias silences clippy::type_complexity on the nested generic field.
+type RealisationKey = (Vec<u8>, String);
+
 /// In-memory store: `store_path -> (PathInfo, nar_bytes)`.
 ///
 /// Records PutPath calls and supports prefix-match QueryPathInfo (for
@@ -42,6 +46,9 @@ pub struct MockStore {
     /// If true, find_missing_paths returns Unavailable. For scheduler
     /// cache-check error-path tests.
     pub fail_find_missing: Arc<AtomicBool>,
+    /// CA realisations: (drv_hash, output_name) -> Realisation.
+    /// For E4's gateway wopRegisterDrvOutput/wopQueryRealisation tests.
+    pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
 }
 
 impl MockStore {
@@ -235,6 +242,35 @@ impl StoreService for MockStore {
                 Ok(Response::new(types::AddSignaturesResponse {}))
             }
             None => Err(Status::not_found(format!("not found: {}", req.store_path))),
+        }
+    }
+
+    async fn register_realisation(
+        &self,
+        request: Request<types::RegisterRealisationRequest>,
+    ) -> Result<Response<types::RegisterRealisationResponse>, Status> {
+        let r = request
+            .into_inner()
+            .realisation
+            .ok_or_else(|| Status::invalid_argument("realisation required"))?;
+        // Key by (drv_hash, output_name) — mirrors the real store's PK.
+        let key = (r.drv_hash.clone(), r.output_name.clone());
+        self.realisations.write().unwrap().insert(key, r);
+        Ok(Response::new(types::RegisterRealisationResponse {}))
+    }
+
+    async fn query_realisation(
+        &self,
+        request: Request<types::QueryRealisationRequest>,
+    ) -> Result<Response<types::Realisation>, Status> {
+        let req = request.into_inner();
+        let key = (req.drv_hash, req.output_name.clone());
+        match self.realisations.read().unwrap().get(&key) {
+            Some(r) => Ok(Response::new(r.clone())),
+            None => Err(Status::not_found(format!(
+                "no realisation for {}",
+                req.output_name
+            ))),
         }
     }
 }
