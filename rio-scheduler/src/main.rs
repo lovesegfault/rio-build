@@ -282,7 +282,7 @@ mod tests {
         // Phase2b additions — off by default.
         assert_eq!(d.log_s3_bucket, None);
         assert_eq!(d.log_s3_prefix, "logs");
-        // Phase2c: size-classes off by default (backward compat).
+        // Size-classes: optional feature, off by default.
         assert!(d.size_classes.is_empty());
     }
 

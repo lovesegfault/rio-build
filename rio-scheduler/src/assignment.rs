@@ -62,7 +62,7 @@ pub struct SizeClassConfig {
 
 /// Classify a derivation into a size-class.
 ///
-/// `None` = no classification (empty config, backward-compat).
+/// `None` = no classification (size-classes not configured, optional feature).
 /// `Some(name)` = route to workers whose `size_class` matches.
 ///
 /// Algorithm:
@@ -82,9 +82,8 @@ pub fn classify(
     classes: &[SizeClassConfig],
 ) -> Option<String> {
     if classes.is_empty() {
-        // Gotcha #14: empty config = unconfigured = no filtering.
-        // Backward-compat with pre-D7 deployments (phase1/2a/2b VM
-        // tests have no size_classes in their scheduler.toml).
+        // Empty config = size-classes unconfigured = optional feature off.
+        // phase1/2a/2b VM tests have no size_classes in scheduler.toml.
         return None;
     }
 
@@ -157,8 +156,8 @@ const W_LOAD: f64 = 0.3;
 /// score the survivors, return the lowest. `None` if nobody passes the
 /// filter — caller defers the derivation.
 ///
-/// `target_class` is D7's size-class filter. `None` = no class filtering
-/// (backward compat, or size-classes not configured).
+/// `target_class` is the size-class filter. `None` = size-classes not
+/// configured on this scheduler (optional feature).
 pub fn best_worker(
     workers: &HashMap<WorkerId, WorkerState>,
     drv: &DerivationState,
@@ -171,13 +170,16 @@ pub fn best_worker(
         .filter(|w| {
             w.has_capacity()
                 && w.can_build(&drv.system, &drv.required_features)
-                // Size-class filter: if a target is specified, worker
-                // must match. If no target (None), all workers pass.
-                // Worker with size_class=None also passes — backward
-                // compat with pre-D7 workers.
+                // Size-class filter. If the scheduler is classifying
+                // (target is Some), workers MUST declare a class.
+                // An unclassified worker when the scheduler has
+                // size_classes configured is a misconfiguration —
+                // rejecting it makes the problem visible instead
+                // of silently routing 10-hour builds to a spot
+                // instance that declares nothing.
                 && match (target_class, w.size_class.as_deref()) {
-                    (None, _) => true,         // no filter
-                    (Some(_), None) => true,   // worker unclassified = wildcard
+                    (None, _) => true,          // scheduler not classifying
+                    (Some(_), None) => false,   // misconfigured worker: reject
                     (Some(t), Some(wc)) => t == wc,
                 }
         })
@@ -467,15 +469,26 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_worker_is_wildcard() {
-        // Worker with no size_class should pass ANY target filter.
-        // Backward compat: pre-D7 workers don't declare a class.
-        let unclassified = make_worker("old-worker", 4, 0); // size_class=None
+    fn unclassified_worker_rejected_when_scheduler_classified() {
+        // If the scheduler has size_classes configured (target is Some),
+        // a worker that doesn't declare a class is a misconfiguration.
+        // Rejecting it surfaces the problem instead of silently
+        // wildcarding — the old (Some(_), None) => true behavior could
+        // route a 10-hour "large" build to a spot instance that just
+        // never set RIO_SIZE_CLASS.
+        let unclassified = make_worker("misconfigured", 4, 0); // size_class=None
         let workers = workers_map(vec![unclassified]);
         let dag = DerivationDag::new();
 
         let result = best_worker(&workers, &make_drv(), &dag, Some("large"));
-        assert_eq!(result.as_deref(), Some("old-worker"));
+        assert_eq!(
+            result, None,
+            "unclassified worker must be rejected when scheduler is classifying"
+        );
+
+        // Sanity: same worker IS accepted when scheduler not classifying.
+        let result = best_worker(&workers, &make_drv(), &dag, None);
+        assert_eq!(result.as_deref(), Some("misconfigured"));
     }
 
     #[test]
@@ -518,7 +531,7 @@ mod tests {
 
     #[test]
     fn classify_empty_config_returns_none() {
-        // Gotcha #14: empty = backward-compat, no filtering.
+        // Empty config = optional feature off, no filtering.
         assert_eq!(classify(100.0, None, &[]), None);
         assert_eq!(classify(0.1, Some(1e12), &[]), None);
     }

@@ -44,12 +44,13 @@ struct Config {
     /// Not yet wired to a consumer — C7 does that.
     log_rate_limit: u64,
     log_size_limit: u64,
-    /// Size-class this worker is deployed as. Empty = unclassified
-    /// (wildcard: accepts any class). Operator sets this to match the
-    /// scheduler's size_classes config — e.g. "small" workers on cheap
-    /// spot instances, "large" on memory-optimized. The scheduler
-    /// routes by estimated duration; this just declares which bucket
-    /// this worker serves.
+    /// Size-class this worker is deployed as. Empty = unclassified.
+    /// If the scheduler has size_classes configured, unclassified
+    /// workers are REJECTED (misconfiguration — set this). Operator
+    /// sets it to match the scheduler's size_classes config — e.g.
+    /// "small" workers on cheap spot instances, "large" on
+    /// memory-optimized. The scheduler routes by estimated duration;
+    /// this just declares which bucket this worker serves.
     size_class: String,
     /// Threshold for leaked overlay mounts before refusing new builds.
     /// After N umount2 failures (stuck-busy mounts), the worker is

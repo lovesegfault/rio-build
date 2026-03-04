@@ -36,8 +36,8 @@ impl DagActor {
                 }
 
                 // Classify by estimated duration + memory. None if
-                // size_classes unconfigured (backward compat — no
-                // filter, all workers candidates).
+                // size_classes unconfigured (optional feature off —
+                // no filter, all workers candidates).
                 let target_class = crate::assignment::classify(
                     state.est_duration,
                     self.estimator

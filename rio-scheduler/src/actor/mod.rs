@@ -378,9 +378,9 @@ pub struct DagActor {
     /// doesn't prevent channel close when all external handles are dropped.
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
-    /// Size-class cutoff config. Empty = no classification (backward
-    /// compat). dispatch.rs calls classify() with this; completion.rs
-    /// looks up cutoff_for() for misclassification detection.
+    /// Size-class cutoff config. Empty = feature off (no classification).
+    /// dispatch.rs calls classify() with this; completion.rs looks up
+    /// cutoff_for() for misclassification detection.
     size_classes: Vec<crate::assignment::SizeClassConfig>,
     /// Channel to the LogFlusher task. Completion handlers `try_send` a
     /// FlushRequest here so the S3 upload is ordered AFTER the state
@@ -434,8 +434,8 @@ impl DagActor {
     /// Inject size-class config. Empty vec (the default) = no
     /// classification → all workers are candidates for all builds.
     /// Separate from `new()` for the same reason as `with_log_flusher`:
-    /// tests don't need it, and backward-compat deployments (VM tests
-    /// phase1a/1b/2a/2b) don't configure size_classes.
+    /// tests don't need it, and deployments without size-class routing
+    /// (VM tests phase1a/1b/2a/2b) leave size_classes unconfigured.
     pub fn with_size_classes(mut self, classes: Vec<crate::assignment::SizeClassConfig>) -> Self {
         self.size_classes = classes;
         self
