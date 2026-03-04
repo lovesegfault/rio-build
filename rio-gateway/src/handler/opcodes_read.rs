@@ -368,28 +368,207 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     Ok(())
 }
 
-/// wopRegisterDrvOutput (42): Stub for CA derivation output registration.
+/// Parse a Nix DrvOutput id string into (drv_hash, output_name).
+///
+/// Wire format: `"sha256:<hex>!<name>"` — hex (not nixbase32), exclamation
+/// separator. This is the same format Nix uses in BuildResult builtOutputs
+/// (see `rio-nix/src/protocol/build.rs:341`). The `sha256:` prefix is
+/// literal; Nix doesn't support other hash algos here.
+///
+/// Returns `None` for malformed input. Caller logs + soft-fails (accept
+/// and discard for Register, empty-set for Query) — a bad id from a buggy
+/// client shouldn't crash the session.
+fn parse_drv_output_id(id: &str) -> Option<([u8; 32], String)> {
+    let (hash_part, output_name) = id.split_once('!')?;
+    let hex_part = hash_part.strip_prefix("sha256:")?;
+    let bytes = hex::decode(hex_part).ok()?;
+    let drv_hash: [u8; 32] = bytes.as_slice().try_into().ok()?;
+    // Empty output name is never valid (would be "sha256:...!").
+    if output_name.is_empty() {
+        return None;
+    }
+    Some((drv_hash, output_name.to_string()))
+}
+
+/// wopRegisterDrvOutput (42): Register a CA derivation output mapping.
+///
+/// Wire: ONE string = Realisation JSON. The JSON has four fields we care
+/// about: `id` (DrvOutput string), `outPath`, `signatures`,
+/// `dependentRealisations` (ignored — phase 5's early cutoff uses it, not
+/// us). Response: nothing after STDERR_LAST (no result data).
+///
+/// Soft-fail on malformed JSON/id: log + return success. The old stub
+/// accepted everything; suddenly hard-failing would break clients that were
+/// already "working" (silently). A bad registration just means the cache-hit
+/// doesn't happen — degraded, not broken.
 #[instrument(skip_all)]
 pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
-    let _realisation_json = wire::read_string(reader).await?;
-    debug!("wopRegisterDrvOutput (stubbed, accepting)");
+    let json = wire::read_string(reader).await?;
+    debug!(json_len = json.len(), "wopRegisterDrvOutput");
+
+    // Parse the Realisation JSON. serde_json::Value (not a struct derive)
+    // because the Nix JSON schema has fields we don't care about
+    // (dependentRealisations) and fields we can't validate at parse time
+    // (id needs the !-split). Value lets us pull out exactly what we need
+    // and ignore the rest — forward-compatible with whatever Nix adds.
+    let parsed: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(json = %json, error = %e, "wopRegisterDrvOutput: malformed JSON, discarding");
+            stderr.finish().await?;
+            return Ok(());
+        }
+    };
+
+    let id = parsed
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let out_path = parsed
+        .get("outPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let Some((drv_hash, output_name)) = parse_drv_output_id(id) else {
+        warn!(id = %id, "wopRegisterDrvOutput: malformed DrvOutput id, discarding");
+        stderr.finish().await?;
+        return Ok(());
+    };
+
+    // signatures: optional array of strings. Default to empty if missing/wrong-type.
+    let signatures: Vec<String> = parsed
+        .get("signatures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // output_hash: the Nix Realisation JSON doesn't include it directly.
+    // We could QueryPathInfo for the outPath and pull nar_hash... but that's
+    // a roundtrip we can defer. Store zeros for now — the store's
+    // RegisterRealisation validates output_hash is 32 bytes but doesn't
+    // check it's the RIGHT hash (it can't, without the NAR). Phase 5's
+    // realisation signing will need the real hash; until then, this is
+    // metadata the store has elsewhere (narinfo.nar_hash for outPath).
+    //
+    // TODO(phase5): populate output_hash from QueryPathInfo(outPath).nar_hash
+    // before signing realisations. Zeros are fine for cache-hit purposes —
+    // QueryRealisation only uses (drv_hash, output_name) as the key.
+    let output_hash = [0u8; 32];
+
+    let req = types::RegisterRealisationRequest {
+        realisation: Some(types::Realisation {
+            drv_hash: drv_hash.to_vec(),
+            output_name,
+            output_path: out_path.to_string(),
+            output_hash: output_hash.to_vec(),
+            signatures,
+        }),
+    };
+
+    // gRPC error here IS a hard fail (store unreachable, not client input).
+    if let Err(e) = rio_common::grpc::with_timeout(
+        "RegisterRealisation",
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.register_realisation(req),
+    )
+    .await
+    {
+        return send_store_error(stderr, e).await;
+    }
+
     stderr.finish().await?;
     Ok(())
 }
 
-/// wopQueryRealisation (43): Stub returning empty set.
+/// wopQueryRealisation (43): Look up a CA derivation output mapping.
+///
+/// Wire: ONE string = DrvOutput id (`"sha256:<hex>!<name>"`).
+/// Response: u64 count + per-entry Realisation JSON string. Count is 0
+/// (cache miss, normal) or 1 (found). Nix's wire format allows >1 but in
+/// practice the store returns at most one — the (drv_hash, output_name) PK
+/// is unique.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
+    store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
-    let _output_id = wire::read_string(reader).await?;
-    debug!("wopQueryRealisation (stubbed, returning empty)");
+    let id = wire::read_string(reader).await?;
+    debug!(id = %id, "wopQueryRealisation");
+
+    // Malformed id → empty set. Same soft-fail rationale as Register:
+    // the old stub returned empty for everything, so hard-failing here
+    // would be a regression for buggy clients.
+    let Some((drv_hash, output_name)) = parse_drv_output_id(&id) else {
+        warn!(id = %id, "wopQueryRealisation: malformed DrvOutput id, returning empty");
+        stderr.finish().await?;
+        wire::write_u64(stderr.inner_mut(), 0).await?;
+        return Ok(());
+    };
+
+    let req = types::QueryRealisationRequest {
+        drv_hash: drv_hash.to_vec(),
+        output_name,
+    };
+    let result = rio_common::grpc::with_timeout(
+        "QueryRealisation",
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.query_realisation(req),
+    )
+    .await;
+
     stderr.finish().await?;
-    wire::write_u64(stderr.inner_mut(), 0).await?;
+    let w = stderr.inner_mut();
+
+    match result {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            // Reconstruct the Nix Realisation JSON. id is the same string
+            // we got; outPath from the store; signatures from the store;
+            // dependentRealisations is always empty (phase 5 populates it).
+            //
+            // serde_json::json! macro gives us correct escaping for free —
+            // outPath could theoretically contain JSON-special chars (it
+            // won't, store paths are nixbase32+name, but defensive).
+            let json = serde_json::json!({
+                "id": id,
+                "outPath": r.output_path,
+                "signatures": r.signatures,
+                "dependentRealisations": {}
+            });
+            wire::write_u64(w, 1).await?;
+            wire::write_string(w, &json.to_string()).await?;
+        }
+        // NOT_FOUND is a cache miss → empty set. Normal, not an error.
+        Err(e)
+            if e.downcast_ref::<tonic::Status>()
+                .is_some_and(|s| s.code() == tonic::Code::NotFound) =>
+        {
+            wire::write_u64(w, 0).await?;
+        }
+        // Other gRPC errors (store unreachable) ARE errors. But we've
+        // already sent STDERR_LAST above — too late for STDERR_ERROR.
+        // Return empty set + log. The next opcode on this session will
+        // hit the same store and fail properly via its own error path.
+        //
+        // Why not check the error BEFORE stderr.finish()? Because we'd
+        // need to buffer the response. This is a rare degraded path
+        // (store blip during a CA cache check); the consequence is one
+        // missed cache hit, not corruption.
+        Err(e) => {
+            warn!(error = %e, "wopQueryRealisation: store error after STDERR_LAST, returning empty");
+            wire::write_u64(w, 0).await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -509,4 +688,64 @@ pub(super) async fn handle_query_derivation_output_map<
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_drv_output_id;
+
+    #[test]
+    fn parse_valid_id() {
+        let hex = "aa".repeat(32);
+        let id = format!("sha256:{hex}!out");
+        let (hash, name) = parse_drv_output_id(&id).unwrap();
+        assert_eq!(hash, [0xAA; 32]);
+        assert_eq!(name, "out");
+    }
+
+    #[test]
+    fn parse_multi_word_output_name() {
+        // Multi-output derivations: "out", "dev", "doc", "man", etc.
+        // Names are identifiers, no special chars, but test that split_once
+        // doesn't eat characters.
+        let hex = "00".repeat(32);
+        let (_, name) = parse_drv_output_id(&format!("sha256:{hex}!dev")).unwrap();
+        assert_eq!(name, "dev");
+    }
+
+    #[test]
+    fn parse_rejects_missing_bang() {
+        assert!(parse_drv_output_id("sha256:aabb").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_wrong_prefix() {
+        // blake3: isn't a thing Nix sends. Only sha256: on this wire.
+        let hex = "aa".repeat(32);
+        assert!(parse_drv_output_id(&format!("blake3:{hex}!out")).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_bad_hex() {
+        // "zz" is not hex.
+        assert!(parse_drv_output_id(&format!("sha256:{}!out", "zz".repeat(32))).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_wrong_hash_length() {
+        // 63 hex chars = 31.5 bytes — can't try_into [u8;32].
+        let short = "a".repeat(63);
+        assert!(parse_drv_output_id(&format!("sha256:{short}!out")).is_none());
+        // 66 hex chars = 33 bytes — same problem.
+        let long = "a".repeat(66);
+        assert!(parse_drv_output_id(&format!("sha256:{long}!out")).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_empty_output_name() {
+        // "sha256:...!" — valid prefix but nothing after !. Nix never
+        // sends this (output names are required) but a buggy client might.
+        let hex = "aa".repeat(32);
+        assert!(parse_drv_output_id(&format!("sha256:{hex}!")).is_none());
+    }
 }

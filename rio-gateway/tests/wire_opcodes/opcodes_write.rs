@@ -256,18 +256,78 @@ async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// RegisterDrvOutput with valid Realisation JSON: parses, calls store,
+/// MockStore records it. No longer a stub (phase2c E4).
 #[tokio::test]
-async fn test_register_drv_output_stub_reads_and_returns() -> anyhow::Result<()> {
+async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
     let mut h = TestHarness::setup().await?;
 
-    let realisation_json = r#"{"id":"sha256:abc!out","outPath":"/nix/store/xyz","signatures":[],"dependentRealisations":{}}"#;
+    // 64-char hex = 32-byte SHA-256. All-AA for test determinism.
+    let drv_hash_hex = "aa".repeat(32);
+    let out_path = "/nix/store/00000000000000000000000000000000-ca-test-out";
+    let realisation_json = format!(
+        r#"{{"id":"sha256:{drv_hash_hex}!out","outPath":"{out_path}","signatures":["sig:test"],"dependentRealisations":{{}}}}"#
+    );
+
     wire_send!(&mut h.stream;
         u64: 42,                           // wopRegisterDrvOutput
-        string: realisation_json,
+        string: &realisation_json,
     );
 
     drain_stderr_until_last(&mut h.stream).await?;
-    // RegisterDrvOutput stub has no result data.
+    // No result data after STDERR_LAST.
+
+    // Verify MockStore recorded it. The old stub discarded silently — this
+    // assertion would have caught that.
+    let drv_hash = hex::decode(&drv_hash_hex)?;
+    let key = (drv_hash, "out".to_string());
+    let stored = h.store.realisations.read().unwrap().get(&key).cloned();
+    let stored = stored.expect("MockStore should have the realisation");
+    assert_eq!(stored.output_path, out_path);
+    assert_eq!(stored.signatures, vec!["sig:test"]);
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Malformed JSON: soft-fail (accept + discard, log). The old stub did this
+/// implicitly; now it's explicit. Hard-failing would regress buggy clients.
+#[tokio::test]
+async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
+
+    wire_send!(&mut h.stream;
+        u64: 42,
+        string: "not valid json {",
+    );
+
+    // STDERR_LAST, no error. Session continues.
+    drain_stderr_until_last(&mut h.stream).await?;
+    assert!(
+        h.store.realisations.read().unwrap().is_empty(),
+        "malformed JSON should not reach MockStore"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Malformed DrvOutput id (wrong prefix, bad hex, no !, etc): soft-fail.
+#[tokio::test]
+async fn test_register_drv_output_malformed_id_soft_fails() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
+
+    // "abc" is 3 hex chars — not 64, so hex::decode → wrong length.
+    // Previously the stub test used exactly this and it "passed" because
+    // the stub didn't parse the id at all.
+    let bad_json = r#"{"id":"sha256:abc!out","outPath":"/nix/store/xyz","signatures":[],"dependentRealisations":{}}"#;
+    wire_send!(&mut h.stream;
+        u64: 42,
+        string: bad_json,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    assert!(h.store.realisations.read().unwrap().is_empty());
 
     h.finish().await;
     Ok(())

@@ -227,8 +227,12 @@ where
             ctx.has_seen_build_paths_with_results = true;
             handle_build_paths_with_results(reader, &mut stderr, ctx).await
         }
-        Some(WorkerOp::RegisterDrvOutput) => handle_register_drv_output(reader, &mut stderr).await,
-        Some(WorkerOp::QueryRealisation) => handle_query_realisation(reader, &mut stderr).await,
+        Some(WorkerOp::RegisterDrvOutput) => {
+            handle_register_drv_output(reader, &mut stderr, &mut ctx.store_client).await
+        }
+        Some(WorkerOp::QueryRealisation) => {
+            handle_query_realisation(reader, &mut stderr, &mut ctx.store_client).await
+        }
         None => {
             warn!(opcode = opcode, "unknown opcode, closing connection");
             stderr
