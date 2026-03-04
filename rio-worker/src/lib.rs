@@ -191,12 +191,18 @@ pub async fn spawn_build_task(
         )
         .await;
 
-        // Send CompletionReport
+        // Send CompletionReport.
+        // peak_memory_bytes / output_size_bytes: 0 here is the explicit
+        // "no signal" value. F2 wires VmHWM sampling in executor/daemon.rs;
+        // until then, the scheduler sees 0 and doesn't update the EMA
+        // (treats it as missing data, not as "build used zero memory").
         let completion = match result {
             Ok(exec_result) => CompletionReport {
                 drv_path: exec_result.drv_path,
                 result: Some(exec_result.result),
                 assignment_token: exec_result.assignment_token,
+                peak_memory_bytes: 0,
+                output_size_bytes: 0,
             },
             Err(e) => {
                 tracing::error!(
@@ -212,6 +218,8 @@ pub async fn spawn_build_task(
                         ..Default::default()
                     }),
                     assignment_token,
+                    peak_memory_bytes: 0,
+                    output_size_bytes: 0,
                 }
             }
         };
@@ -250,6 +258,9 @@ pub async fn spawn_build_task(
                     ..Default::default()
                 }),
                 assignment_token: panic_token,
+                // Panic = no VmHWM to read. 0 = "no signal".
+                peak_memory_bytes: 0,
+                output_size_bytes: 0,
             };
             let msg = WorkerMessage {
                 msg: Some(worker_message::Msg::Completion(completion)),

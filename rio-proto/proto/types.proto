@@ -157,6 +157,27 @@ message CompletionReport {
   string drv_path = 1;                     // Derivation that completed
   BuildResult result = 2;                  // Build result details
   string assignment_token = 3;             // From the WorkAssignment
+
+  // Peak memory (RSS) in bytes, sampled from /proc/{pid}/status VmHWM at
+  // build end. VmHWM is kernel-tracked process-lifetime peak — no polling
+  // needed, one read. Feeds into build_history.ema_peak_memory_bytes for
+  // size-class memory-bump decisions: a derivation that fits the "small"
+  // duration class but historically OOM-kills on small workers gets bumped.
+  //
+  // 0 means "couldn't read" (proc gone before we sampled, or build failed
+  // before the daemon spawned). Scheduler treats 0 as "no signal" — the EMA
+  // keeps its prior value, doesn't drag toward zero.
+  uint64 peak_memory_bytes = 4;
+
+  // Total bytes uploaded to the store (sum of NAR sizes across all outputs).
+  // Feeds build_history.ema_output_size_bytes. Not used for routing decisions
+  // yet — informational for dashboards / capacity planning.
+  uint64 output_size_bytes = 5;
+
+  // TODO(phase3a): peak_cpu_cores. CPU% needs polling during the build
+  // (VmHWM is a one-shot read at the end; there's no CpuHWM equivalent).
+  // The build_history.ema_peak_cpu_cores column exists (migration 006)
+  // but stays NULL until the worker-side poller lands.
 }
 
 // Result of building a single derivation.

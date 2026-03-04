@@ -127,6 +127,8 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
                         }],
                     }),
                     assignment_token: work.assignment_token.clone(),
+                    peak_memory_bytes: 0,
+                    output_size_bytes: 0,
                 },
             )),
         })
