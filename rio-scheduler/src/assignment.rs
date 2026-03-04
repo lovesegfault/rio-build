@@ -82,8 +82,8 @@ pub fn classify(
     classes: &[SizeClassConfig],
 ) -> Option<String> {
     if classes.is_empty() {
-        // Empty config = size-classes unconfigured = optional feature off.
-        // phase1/2a/2b VM tests have no size_classes in scheduler.toml.
+        // If no size_classes configured, skip classification entirely —
+        // optional feature, not required for single-pool deployments.
         return None;
     }
 
