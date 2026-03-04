@@ -284,6 +284,13 @@ enum BloomHashAlgorithm {
   BLOOM_HASH_ALGORITHM_UNSPECIFIED = 0;
   BLOOM_HASH_ALGORITHM_MURMUR3_128 = 1;
   BLOOM_HASH_ALGORITHM_XXHASH64 = 2;
+  // blake3 split into double-hash indices (Kirsch-Mitzenmacher). Chosen
+  // because it's PORTABLE — the bloom filter is a wire protocol (worker
+  // builds it, scheduler queries it); AES-NI-based hashes like gxhash
+  // produce different output on different architectures, which would
+  // turn every query into a false negative on a heterogeneous cluster.
+  // blake3 is deterministic everywhere. Also: already a dep (chunking).
+  BLOOM_HASH_ALGORITHM_BLAKE3_256 = 3;
 }
 
 // Worker resource usage reported in heartbeats and progress updates.

@@ -30,7 +30,17 @@ futures-util = "0.3"
 
 # Error handling
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tonic = { workspace = true }
+
+# Bloom filter hash (phase2c D1). blake3: portable (deterministic across
+# architectures — matters for a WIRE PROTOCOL where worker builds and
+# scheduler queries must agree on bit indices). Single 256-bit output
+# split into double-hash values; no seeded re-hash.
+blake3 = { workspace = true }
+
+[dev-dependencies.proptest]
+workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

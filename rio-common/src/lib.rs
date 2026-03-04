@@ -1,3 +1,4 @@
+pub mod bloom;
 pub mod config;
 pub mod grpc;
 pub mod limits;
