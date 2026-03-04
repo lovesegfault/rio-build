@@ -5,4 +5,5 @@ pub mod grpc;
 pub mod manifest;
 pub mod metadata;
 pub mod realisations;
+pub mod signing;
 pub mod validate;
