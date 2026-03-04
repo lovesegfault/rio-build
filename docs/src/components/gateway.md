@@ -458,9 +458,10 @@ Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection*
 
 | Category | Opcodes |
 |----------|---------|
-| Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStore`, `wopAddTextToStore`, `wopAddToStoreNar`, `wopEnsurePath`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap`, `wopQueryPathFromHashPart`, `wopAddSignatures` |
-| Stubbed (no-op, accept and ignore — full CA support in Phase 2c/5) | `wopRegisterDrvOutput`, `wopQueryRealisation` |
+| Fully implemented | `wopIsValidPath`, `wopQueryPathInfo`, `wopQueryValidPaths`, `wopAddToStore`, `wopAddTextToStore`, `wopAddToStoreNar`, `wopEnsurePath`, `wopNarFromPath`, `wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`, `wopQueryMissing`, `wopAddTempRoot`, `wopSetOptions`, `wopAddMultipleToStore`, `wopQueryDerivationOutputMap`, `wopQueryPathFromHashPart`, `wopAddSignatures`, `wopRegisterDrvOutput`, `wopQueryRealisation` |
 | Rejected (STDERR_ERROR) | Everything else |
+
+**Note on CA opcodes:** `wopRegisterDrvOutput` / `wopQueryRealisation` parse the Nix Realisation JSON (`{"id":"sha256:<hex>!<name>","outPath":...,"signatures":[...],"dependentRealisations":{}}`) and call the store's RegisterRealisation/QueryRealisation RPCs. Soft-fail on malformed input (discard/empty-set rather than STDERR_ERROR) to avoid regressing buggy clients that worked against the old stubs. Full CA early cutoff (dependentRealisations tracking in the DAG) is Phase 5.
 
 **Note on `wopQueryDerivationOutputMap`:** Moved from "CA-aware" to "Fully implemented" because modern Nix clients call this for ALL derivation types. For input-addressed derivations, it returns the statically-known output paths. For CA derivations, it returns the realized output paths if known.
 

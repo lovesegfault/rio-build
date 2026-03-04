@@ -124,20 +124,21 @@ async fn main() -> anyhow::Result<()> {
         .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
     info!("database migrations applied");
 
-    // Phase 2c: NarBackend is gone. Inline NARs live in manifests.inline_blob;
-    // chunked NARs (C3) will use a ChunkBackend (S3 or filesystem), constructed
-    // from cfg.backend + cfg.s3_bucket etc. — same config fields, different
-    // trait. The config fields stay so C3's diff is purely additive; they're
-    // read but ignored for now.
+    // NarBackend is gone (E1). Inline NARs live in manifests.inline_blob.
+    // ChunkBackend (C2: S3/fs/memory impls) + ChunkCache (C4: moka) +
+    // put_chunked (C3) + cache_server (B3) are library-complete and
+    // tested but not yet wired here — constructing them from cfg.backend
+    // + cfg.s3_bucket etc. is TODO(phase3a). The config fields stay so
+    // that diff is purely additive.
     //
-    // Logging the backend config anyway so operators see what'll be used once
-    // chunking lands — a silent config drift between now and C3 would be
-    // confusing to debug.
+    // Until then: inline-only storage, ChunkService RPCs return
+    // FAILED_PRECONDITION, cache_server not spawned. All correct for
+    // a store without chunk dedup enabled.
     info!(
         backend = %cfg.backend,
         base_dir = %cfg.base_dir,
         s3_bucket = ?cfg.s3_bucket,
-        "backend config (unused until C3 chunking; inline storage only)"
+        "backend config (inline-only until phase3a wires ChunkBackend here)"
     );
     let _ = (
         cfg.backend,
@@ -150,15 +151,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Build gRPC services.
     //
-    // ChunkService shares the same pool + cache as StoreService. main.rs
-    // doesn't construct a chunk backend yet (that's the TODO-phase2c line
-    // above — inline-only until C3's wiring lands here); with cache=None,
-    // ChunkService RPCs return FAILED_PRECONDITION, which is the right
-    // answer for an inline-only store.
-    //
-    // TODO(phase3a): when the ChunkBackend construction (from cfg.backend
-    // etc.) lands here, pass the same Arc<ChunkCache> to both services.
-    // One cache, shared — a chunk warmed by GetPath is hot for GetChunk.
+    // TODO(phase3a): construct ChunkBackend from cfg.backend +
+    // cfg.s3_bucket etc., wrap in ChunkCache, pass the SAME
+    // Arc<ChunkCache> to both StoreServiceImpl (via with_chunk_backend)
+    // and ChunkServiceImpl. One cache, shared — a chunk warmed by
+    // GetPath is hot for GetChunk. Also spawn cache_server if
+    // cache_http_addr is configured (needs ChunkCache for reassembly).
+    // With cache=None below, ChunkService returns FAILED_PRECONDITION,
+    // which is the right answer for an inline-only store.
     let store_service = StoreServiceImpl::new(pool.clone());
     let chunk_service = ChunkServiceImpl::new(pool, None);
     let max_msg_size = rio_proto::max_message_size();

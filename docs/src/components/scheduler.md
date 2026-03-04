@@ -24,14 +24,14 @@ The scheduler uses a **single-owner actor model** for the in-memory global DAG. 
 - `SubmitBuild` → DAG merge command
 - `ReportCompletion` → node completion + downstream release command
 - `CancelBuild` → orphan derivations command
-- Heartbeat → worker liveness + running_builds merge (bloom filter processing deferred to Phase 2c)
+- Heartbeat → worker liveness + running_builds merge + bloom filter + size_class
 - CA early cutoff → edge cutoff + potential cancellation command
 
 gRPC handler tasks send commands to the DAG actor and `await` responses. This eliminates lock contention, makes operation ordering deterministic, and simplifies reasoning about correctness. PostgreSQL writes are batched and performed asynchronously by the actor.
 
 ## Scheduling Algorithm
 
-> **Phase 2a simplification:** The full scheduling algorithm below is the Phase 2c+ target. Phase 2a implements a minimal FIFO queue with system/feature matching: ready derivations are dispatched to any worker with a matching `system` and available capacity. No critical path priority, no size-class routing, no locality scoring, no bloom filters. Interactive builds (`priority_class="interactive"`) push_front the ready queue for a simple two-tier priority.
+The scheduling algorithm below is implemented as of Phase 2c: critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value) rather than the Phase 2a `push_front`. **CutoffRebalancer (adaptive cutoffs) and WorkerPoolSet CRD are deferred to Phase 3a** — size-class cutoffs are operator-configured static values.
 
 ```
 1. Receive derivation DAG from gateway
@@ -429,22 +429,24 @@ Critical-path priorities are maintained **incrementally**, not via full O(V+E) r
 
 This approach keeps per-event processing well under the 1ms budget needed for 1000+ ops/sec throughput.
 
-## Key Files (Phase 2a)
+## Key Files
 
-- `rio-scheduler/src/actor.rs` — DAG actor (single-owner event loop, dispatch, retry, cleanup)
-- `rio-scheduler/src/dag.rs` — DAG representation, merge, cycle detection, topological ops
-- `rio-scheduler/src/state.rs` — State machines (DerivationStatus, BuildState), transition validation, RetryPolicy
-- `rio-scheduler/src/queue.rs` — FIFO ready queue (VecDeque; priority queue deferred to Phase 2c)
-- `rio-scheduler/src/grpc.rs` — SchedulerService + WorkerService gRPC implementations
-- `rio-scheduler/src/db.rs` — PostgreSQL persistence layer
+- `rio-scheduler/src/actor/` — DAG actor (single-owner event loop, dispatch, retry, cleanup; split into mod/merge/completion/dispatch/worker/build submodules)
+- `rio-scheduler/src/dag/` — DAG representation, merge, cycle detection, topological ops
+- `rio-scheduler/src/state/` — State machines (DerivationStatus, BuildState), transition validation, RetryPolicy, newtypes (DrvHash, WorkerId)
+- `rio-scheduler/src/queue.rs` — Priority BinaryHeap ReadyQueue (OrderedFloat + lazy invalidation)
+- `rio-scheduler/src/critical_path.rs` — Bottom-up priority: `est_duration + max(children's priority)`; incremental ancestor-walk on completion
+- `rio-scheduler/src/assignment.rs` — Worker scoring (bloom locality + load fraction) + size-class classify()
+- `rio-scheduler/src/estimator.rs` — Duration + peak-memory from build_history; fallback chain (exact → pname-cross-system → 30s default)
+- `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
+- `rio-scheduler/src/db.rs` — PostgreSQL persistence (derivations, assignments, build_history EMA)
+- `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
 
-## Planned Files (Phase 2c+)
+## Planned Files (Phase 3a/5+)
 
-- `rio-scheduler/src/critical_path.rs` — Critical path priority computation
-- `rio-scheduler/src/assignment.rs` — Worker scoring (locality, load)
-- `rio-scheduler/src/early_cutoff.rs` — CA early cutoff detection
-- `rio-scheduler/src/estimator.rs` — Duration estimation from history
+- `rio-scheduler/src/early_cutoff.rs` — CA early cutoff detection (per-edge DAG tracking)
 - `rio-scheduler/src/poison.rs` — Cross-build poison derivation tracking
+- CutoffRebalancer — adaptive size-class cutoff adjustment from misclassification_count
 
 ```mermaid
 flowchart LR

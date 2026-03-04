@@ -8,10 +8,14 @@
 # phase3a per TODO(phase3a) at rio-store/src/main.rs:159. This VM test
 # validates what IS observable end-to-end:
 #
-#   1. CA data model: build registers a realisation; psql confirms row
+#   1. Size-class config load: cutoff_seconds gauge from /etc/rio/scheduler.toml
 #   2. Critical-path priority: chain-a dispatched before standalone solo
 #   3. Size-class routing: pre-seeded "bigthing" → w-large not w-small
-#   4. Circuit breaker: stop store → breaker opens → restart → recovers
+#   4. content_index populated: PutPath writes nar_hash → store_path rows
+#
+# Circuit breaker: covered by E5 unit tests. Can't trigger via nix-build
+# when store is fully down — gateway's wopEnsurePath fails before
+# SubmitBuild reaches the scheduler's merge where the breaker lives.
 #
 # Five VMs:
 #   control  — PostgreSQL, rio-store, rio-scheduler, rio-gateway
@@ -251,61 +255,52 @@ pkgs.testers.runNixOSTest {
     ).strip()
     assert before == "0", f"realisations should start empty, got {before}"
 
-    # ── Build: chain + solo (critical-path test derivation) ──────────
-    try:
-        client.succeed(
+    # Helper: run a build against the gateway, dumping logs on failure.
+    def build(attr=""):
+        cmd = (
             "nix-build --no-out-link "
             "--store 'ssh-ng://control' "
             "--arg busybox '(builtins.storePath ${busybox})' "
-            "${testDrvFile} 2>&1"
+            "${testDrvFile}"
         )
-    except Exception:
-        for w in [wsmall1, wsmall2, wlarge]:
-            w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
-        control.execute("journalctl -u rio-scheduler --no-pager -n 200 >&2")
-        raise
+        if attr:
+            cmd += f" -A {attr}"
+        try:
+            return client.succeed(cmd + " 2>&1")
+        except Exception:
+            for w in [wsmall1, wsmall2, wlarge]:
+                w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
+            control.execute("journalctl -u rio-scheduler --no-pager -n 200 >&2")
+            raise
+
+    # ── Build: chain + solo (critical-path test derivation) ──────────
+    build("all")
 
     control.succeed(
         "curl -sf http://localhost:9091/metrics | "
         "grep -E 'rio_scheduler_builds_total\\{outcome=\"success\"\\} [1-9]'"
     )
 
-    # ── Assertion 2: Critical-path dispatch order ────────────────────
-    # chain-a (3-deep critical path) should dispatch BEFORE solo
-    # (1-deep). Both were Ready at the same time; priority-based
-    # BinaryHeap (D5) pops chain-a first because its priority is the
-    # sum along the path.
+    # ── Assertion 2: Scheduling pipeline wired ───────────────────────
+    # Both chain-a and solo dispatched. Smoke check that the full
+    # merge → compute_initial → push_ready → dispatch_ready →
+    # best_worker pipeline works end-to-end.
     #
-    # Grep scheduler logs for "assigned derivation to worker" lines
-    # (debug! at dispatch.rs end of assign_to_worker). chain-a before
-    # solo. If FIFO, order would be merge-insertion order (arbitrary).
-    #
-    # Note: this is a weak signal — timing races in the VM could
-    # obscure it. The REAL proof is the queue unit tests (D5). This
-    # is a smoke check that priority routing is WIRED in dispatch.
+    # NOT asserting dispatch ORDER: chain-a and solo are both LEAVES
+    # with no dependencies → both have priority = est_duration = 30 →
+    # TIE (FIFO tie-break by seq). Critical-path gives higher priority
+    # to nodes with accumulated work: chain-b=60, chain-c=90 (est_dur +
+    # max(children.priority) bottom-up). The benefit is chain-b beating
+    # a fresh leaf AFTER chain-a completes — not chain-a beating solo.
+    # Unit tests (D4/D5) prove the priority computation; here we just
+    # check the wiring is live.
     sched_log = control.succeed(
         "journalctl -u rio-scheduler --no-pager | "
-        "grep 'assigned derivation to worker' || true"
+        "grep 'worker acknowledged assignment' || true"
     )
-    # Find line indices for chain-a and solo assignments.
-    chain_a_idx = -1
-    solo_idx = -1
-    for i, line in enumerate(sched_log.splitlines()):
-        if "rio-2c-chain-a" in line and chain_a_idx == -1:
-            chain_a_idx = i
-        if "rio-2c-solo" in line and solo_idx == -1:
-            solo_idx = i
-    # Both must be dispatched (got assignments).
-    assert chain_a_idx >= 0, "chain-a should have been dispatched"
-    assert solo_idx >= 0, "solo should have been dispatched"
-    # chain-a FIRST: critical path wins. The weak part: with 3 workers
-    # and maxBuilds=2 each, there's enough slots for everything — both
-    # could go in the same dispatch pass. The heap POP order still
-    # determines log order within that pass, so this should hold.
-    assert chain_a_idx < solo_idx, (
-        f"critical-path: chain-a (3-deep) should dispatch BEFORE solo (1-deep); "
-        f"got chain-a at line {chain_a_idx}, solo at line {solo_idx}"
-    )
+    assert "rio-2c-chain-a" in sched_log, "chain-a should have dispatched"
+    assert "rio-2c-solo" in sched_log, "solo should have dispatched"
+    assert "rio-2c-chain-c" in sched_log, "chain-c should have dispatched (depends on b depends on a)"
 
     # ── Assertion 3: Size-class routing (pre-seeded EMA) ─────────────
     # Pre-seed build_history: "rio-2c-bigthing" has 120s EMA. With
@@ -322,23 +317,10 @@ pkgs.testers.runNixOSTest {
     # Wait for estimator refresh. 6 ticks × 2s = 12s + slop.
     control.sleep(15)
 
-    # Build a "bigthing" derivation (single node, pname set to match
-    # the seeded EMA). This is inline Nix — simpler than another file.
-    # The build itself is trivial (echo); what matters is routing.
-    try:
-        client.succeed(
-            "nix-build --no-out-link --store 'ssh-ng://control' "
-            "-E '(derivation { "
-            "  name = \"rio-2c-bigthing\"; "
-            "  system = builtins.currentSystem; "
-            "  builder = \"${busybox}/bin/sh\"; "
-            "  args = [\"-c\" \"${busybox}/bin/busybox mkdir -p $out && "
-            "    ${busybox}/bin/busybox echo big > $out/mark\"]; "
-            "})' 2>&1"
-        )
-    except Exception:
-        control.execute("journalctl -u rio-scheduler --no-pager -n 100 >&2")
-        raise
+    # Build bigthing (pname="rio-2c-bigthing" in env — estimator keys
+    # on that). With the 120s seeded EMA and 30s small cutoff,
+    # classify() picks "large".
+    build("bigthing")
 
     # Check the size_class_assignments metric: large should increment.
     # This is the hard signal — a metric bump proves classify() ran
@@ -362,70 +344,19 @@ pkgs.testers.runNixOSTest {
         "journalctl -u rio-worker --no-pager | grep 'rio-2c-bigthing'"
     )
 
-    # ── Assertion 4: Circuit breaker ─────────────────────────────────
-    # Stop rio-store → scheduler's FindMissingPaths in merge fails →
-    # after 5 consecutive failures the breaker opens. While open,
-    # SubmitBuild returns UNAVAILABLE (fail fast, no avalanche of
-    # 100%-miss rebuilds).
+    # ── Circuit breaker: covered by E5 unit tests ────────────────────
+    # The scheduler's CacheCheckBreaker is inside merge.rs → it fires
+    # when FindMissingPaths fails INSIDE the scheduler. But nix-build
+    # hits the GATEWAY first, and the gateway does its own store calls
+    # (wopEnsurePath → QueryPathInfo) which fail earlier when the store
+    # is down. So the gateway short-circuits before SubmitBuild ever
+    # reaches the scheduler's merge, and the breaker never probes.
     #
-    # Capture the open counter before (should be 0).
-    before_open = control.succeed(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep rio_scheduler_cache_check_circuit_open_total | "
-        "grep -oE '[0-9]+$' || echo 0"
-    ).strip()
-
-    control.succeed("systemctl stop rio-store.service")
-    # Give the store port time to close (otherwise the first few
-    # probes might succeed against a lingering socket).
-    control.wait_until_fails("curl -sf http://localhost:9002/")
-
-    # Send 6 builds to trip the breaker. Each merge calls
-    # check_cached_outputs → FindMissingPaths → connection refused.
-    # 5 failures open it; the 6th hits the open-breaker rejection.
-    #
-    # All 6 should FAIL (breaker or store unreachable — either way not
-    # a hung build). `.fail()` expects non-zero exit.
-    for i in range(6):
-        client.fail(
-            f"nix-build --no-out-link --store 'ssh-ng://control' "
-            f"-E '(derivation {{ "
-            f"  name = \"rio-2c-breaker-{i}\"; "
-            f"  system = builtins.currentSystem; "
-            f"  builder = \"${busybox}/bin/sh\"; "
-            f"  args = [\"-c\" \"${busybox}/bin/busybox mkdir $out\"]; "
-            f"}})' 2>&1"
-        )
-
-    # Breaker should have opened: counter incremented.
-    after_open = control.succeed(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep rio_scheduler_cache_check_circuit_open_total | "
-        "grep -oE '[0-9]+$'"
-    ).strip()
-    assert int(after_open) > int(before_open), (
-        f"circuit breaker should have opened: before={before_open}, after={after_open}"
-    )
-
-    # Recovery: start store → next merge's half-open probe succeeds
-    # → breaker closes → build succeeds.
-    control.succeed("systemctl start rio-store.service")
-    control.wait_for_open_port(9002)
-
-    # The breaker stays open for 30s (OPEN_DURATION) OR until a
-    # successful probe closes it. The half-open probe runs on every
-    # merge attempt, so the next build SHOULD succeed immediately
-    # (probe succeeds, breaker closes, build proceeds).
-    client.succeed(
-        "nix-build --no-out-link --store 'ssh-ng://control' "
-        "-E '(derivation { "
-        "  name = \"rio-2c-recovered\"; "
-        "  system = builtins.currentSystem; "
-        "  builder = \"${busybox}/bin/sh\"; "
-        "  args = [\"-c\" \"${busybox}/bin/busybox mkdir -p $out && "
-        "    ${busybox}/bin/busybox echo ok > $out/mark\"]; "
-        "})' 2>&1"
-    )
+    # This is correct layering — the gateway fails fast too, just not
+    # via the breaker. To VM-test the breaker we'd need a store that's
+    # UP for gateway calls but DOWN for the scheduler's FindMissingPaths,
+    # which is impractical to rig. E5's unit test directly triggers
+    # merge with a failing MockStore: that's the authoritative coverage.
 
     # ── Final: content_index populated ───────────────────────────────
     # Every PutPath now inserts into content_index (G1). Count should

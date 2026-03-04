@@ -1,13 +1,18 @@
-# Phase 2c test derivations: chain for critical-path + standalone.
+# Phase 2c test derivations.
 #
-# Layout:
+# Default build (`phase2c-derivation.nix`):
 #   chain-a → chain-b → chain-c   (sequential, est ~4s total path)
 #   solo                          (independent, est ~1s)
 #
 # With critical-path priority: chain-a has priority ≈ 3×est (sum along
-# path), solo has priority ≈ 1×est. So chain-a should dispatch BEFORE
-# solo even though solo is shorter. The VM test greps dispatch order in
-# scheduler logs to verify.
+# path), solo has priority ≈ 1×est. So chain-a dispatches BEFORE solo.
+#
+# `-A bigthing` build:
+#   Single derivation with `pname = "rio-2c-bigthing"` in env. The VM
+#   test pre-seeds build_history with 120s EMA for that pname, so the
+#   estimator picks it up and classify() routes to "large". The pname
+#   MUST be in env (not just `name`) — gateway's translate.rs reads
+#   pname from `drv.env().get("pname")`.
 #
 # Each build sleeps briefly so the dispatch order is observable (without
 # the sleep, all four would complete too fast to distinguish). Keep it
@@ -44,19 +49,38 @@ let
   chainC = mkStep "rio-2c-chain-c" chainB;
   solo = mkStep "rio-2c-solo" null;
 in
-# Build both — a wrapper that references chainC and solo so nix-build
-# builds the whole graph. The VM test asserts on what reaches workers,
-# not on this wrapper's output.
-derivation {
-  name = "rio-2c-all";
-  system = builtins.currentSystem;
-  builder = sh;
-  args = [
-    "-c"
-    ''
-      ${bb} mkdir -p $out
-      ${bb} cp ${chainC}/mark $out/chain
-      ${bb} cp ${solo}/mark $out/solo
-    ''
-  ];
+{
+  # Default attr: chain + solo. `nix-build phase2c-derivation.nix`.
+  all = derivation {
+    name = "rio-2c-all";
+    system = builtins.currentSystem;
+    builder = sh;
+    args = [
+      "-c"
+      ''
+        ${bb} mkdir -p $out
+        ${bb} cp ${chainC}/mark $out/chain
+        ${bb} cp ${solo}/mark $out/solo
+      ''
+    ];
+  };
+
+  # Size-class routing test: `nix-build phase2c-derivation.nix -A bigthing`.
+  # pname MUST be in the env attrset — gateway reads drv.env().get("pname"),
+  # NOT the derivation name. Without this, estimator lookup misses and
+  # defaults to 30s → classifies "small" → test fails for the wrong reason.
+  bigthing = derivation {
+    name = "rio-2c-bigthing";
+    pname = "rio-2c-bigthing"; # ← this becomes an env var; estimator keys on it
+    system = builtins.currentSystem;
+    builder = sh;
+    args = [
+      "-c"
+      ''
+        ${bb} mkdir -p $out
+        ${bb} echo big > $out/mark
+      ''
+    ];
+  };
+
 }

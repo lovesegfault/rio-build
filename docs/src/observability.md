@@ -87,12 +87,13 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_scheduler_log_flush_total` | Counter | Successful S3 log flushes (labeled by `kind`: `final`/`periodic`). |
 | `rio_scheduler_log_flush_failures_total` | Counter | Failed S3 log flushes (labeled by `phase`: `s3`/`pg`). Alert if rate > 0 sustained: build logs are being lost. |
 | `rio_scheduler_log_flush_dropped_total` | Counter | Final-flush requests dropped due to flusher channel backpressure. Periodic tick will snapshot instead. |
-| `rio_scheduler_critical_path_accuracy` *(Phase 2c+)* | Histogram | Predicted vs. actual completion ratio |
-| `rio_scheduler_size_class_assignments_total` *(Phase 2c+)* | Counter | Assignments per size class (labeled by class name) |
-| `rio_scheduler_misclassifications_total` *(Phase 2c+)* | Counter | Builds that exceeded 2x their class cutoff duration |
-| `rio_scheduler_cutoff_seconds` *(Phase 2c+)* | Gauge | Current duration cutoff per class boundary (labeled by class) |
-| `rio_scheduler_class_load_fraction` *(Phase 2c+)* | Gauge | Load fraction per size class (should be ~equal when SITA-E is active) |
-| `rio_scheduler_class_queue_depth` *(Phase 2c+)* | Gauge | Queue depth per size class |
+| `rio_scheduler_critical_path_accuracy` | Histogram | Predicted vs. actual completion ratio (actual/estimated; 1.0 = perfect, >1.0 = underestimate) |
+| `rio_scheduler_size_class_assignments_total` | Counter | Assignments per size class (labeled by class name) |
+| `rio_scheduler_misclassifications_total` | Counter | Builds that exceeded 2× their class cutoff duration (triggers penalty EMA overwrite) |
+| `rio_scheduler_cutoff_seconds` | Gauge | Duration cutoff per class (labeled by class; set once at config load, static) |
+| `rio_scheduler_class_queue_depth` | Gauge | Deferred derivations per target class (snapshot per dispatch pass) |
+| `rio_scheduler_cache_check_circuit_open_total` | Counter | Circuit-breaker open transitions (store unreachable for 5 consecutive cache checks). Alert if rate > 0: scheduler falling back to rejecting SubmitBuild. |
+| `rio_scheduler_class_load_fraction` *(Phase 3a+)* | Gauge | Load fraction per size class (adaptive rebalancer input) |
 
 ### Store Metrics
 
@@ -101,10 +102,12 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_store_put_path_total` | Counter | Total PutPath operations |
 | `rio_store_put_path_duration_seconds` | Histogram | PutPath latency |
 | `rio_store_integrity_failures_total` | Counter | GetPath content integrity check failures (bitrot/corruption) |
-| `rio_store_chunks_total` *(Phase 2c+)* | Gauge | Total chunks in storage |
-| `rio_store_chunk_dedup_ratio` *(Phase 2c+)* | Gauge | Chunk deduplication ratio |
+| `rio_store_chunks_total` | Gauge | Total chunks in storage (piggybacked on FindMissingChunks) |
+| `rio_store_chunk_dedup_ratio` | Gauge | Per-upload dedup ratio (1.0 - missing/total after chunking) |
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |
-| `rio_store_cache_hit_ratio` *(Phase 2c+)* | Gauge | In-process LRU cache hit ratio |
+| `rio_store_cache_hit_ratio` | Gauge | moka chunk cache hit ratio (per-instance; use `_hits_total`/`_misses_total` counters for aggregation) |
+| `rio_store_chunk_cache_hits_total` | Counter | moka chunk cache hits (for cross-instance aggregation) |
+| `rio_store_chunk_cache_misses_total` | Counter | moka chunk cache misses |
 
 ### Worker Metrics
 
