@@ -90,7 +90,7 @@ pub async fn generate_db(
     db_path: &Path,
     paths: &[SynthPathInfo],
     drv_outputs: &[SynthDrvOutput],
-) -> anyhow::Result<()> {
+) -> Result<(), sqlx::Error> {
     // sqlx sqlite URI format: sqlite:///absolute/path or sqlite://relative
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
     let mut conn = SqliteConnection::connect(&url).await?;
@@ -117,7 +117,7 @@ pub async fn generate_db(
     Ok(())
 }
 
-async fn create_schema(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+async fn create_schema(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     // sqlx executes one statement at a time, so issue each CREATE separately.
     let stmts = [
         r#"CREATE TABLE IF NOT EXISTS Config (
@@ -176,7 +176,10 @@ async fn create_schema(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn insert_paths(conn: &mut SqliteConnection, paths: &[SynthPathInfo]) -> anyhow::Result<()> {
+async fn insert_paths(
+    conn: &mut SqliteConnection,
+    paths: &[SynthPathInfo],
+) -> Result<(), sqlx::Error> {
     let mut tx = conn.begin().await?;
 
     // Set schema version
@@ -257,7 +260,7 @@ async fn insert_paths(conn: &mut SqliteConnection, paths: &[SynthPathInfo]) -> a
 async fn insert_drv_outputs(
     conn: &mut SqliteConnection,
     drv_outputs: &[SynthDrvOutput],
-) -> anyhow::Result<()> {
+) -> Result<(), sqlx::Error> {
     if drv_outputs.is_empty() {
         return Ok(());
     }
