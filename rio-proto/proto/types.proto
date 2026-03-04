@@ -264,6 +264,13 @@ message HeartbeatRequest {
   string system = 5;                      // e.g. "x86_64-linux"
   repeated string supported_features = 6; // requiredSystemFeatures this worker supports
   uint32 max_builds = 7;                  // Concurrency limit
+  // Size-class this worker is deployed as (e.g. "small", "large"). Static
+  // config — the operator sets this in worker.toml, NOT auto-detected.
+  // Empty = unclassified (wildcard: accepts any-class work). Scheduler
+  // routes derivations by estimated duration; a "small" worker gets quick
+  // builds, "large" gets slow ones. Empty-string semantics avoid needing
+  // Option in the proto; scheduler side maps "" → None.
+  string size_class = 8;
 }
 
 message HeartbeatResponse {

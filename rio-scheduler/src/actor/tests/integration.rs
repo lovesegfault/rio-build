@@ -382,6 +382,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             bloom: None,
+            size_class: None,
             worker_id: "tight-worker".into(),
             system: "x86_64-linux".into(),
             supported_features: vec![],
@@ -439,6 +440,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             bloom: None,
+            size_class: None,
             worker_id: "tight-worker".into(),
             system: "x86_64-linux".into(),
             supported_features: vec![],

@@ -433,6 +433,40 @@ impl SchedulerDb {
 
         Ok(())
     }
+
+    /// Penalty-write for misclassified builds: a build that took >2×
+    /// its class cutoff was routed wrong. Overwrite the EMA with the
+    /// actual duration (NOT blend — a blend would take multiple
+    /// overruns to correct) so the NEXT classify() picks a larger
+    /// class. Also bump the counter for dashboard/alerting.
+    ///
+    /// This is intentionally harsh: one bad classification is enough
+    /// to fix the estimate. If the build was a fluke (transient slow
+    /// disk), the next normal completion blends it back down. Better
+    /// to over-correct once than to keep OOMing small workers.
+    pub async fn update_build_history_misclassified(
+        &self,
+        pname: &str,
+        system: &str,
+        actual_duration_secs: f64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE build_history
+            SET ema_duration_secs = $3,
+                misclassification_count = misclassification_count + 1,
+                last_updated = now()
+            WHERE pname = $1 AND system = $2
+            "#,
+        )
+        .bind(pname)
+        .bind(system)
+        .bind(actual_duration_secs)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +759,52 @@ mod tests {
             out.is_some_and(|o| (o - expect_out).abs() < 0.001),
             "Some×Some: out should blend to {expect_out}, got {out:?}"
         );
+
+        Ok(())
+    }
+
+    /// Misclassification penalty: overwrites EMA (not blends), bumps count.
+    /// Harsh correction so the next classify() picks the right class after
+    /// ONE bad route, not several.
+    #[tokio::test]
+    async fn test_update_build_history_misclassified_overwrites() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        // Seed: EMA at 10s (would classify as "small").
+        db.update_build_history("slowpoke", "x86_64-linux", 10.0, None, None)
+            .await?;
+
+        // Actual took 200s. Penalty write.
+        db.update_build_history_misclassified("slowpoke", "x86_64-linux", 200.0)
+            .await?;
+
+        let (ema, miscount): (f64, i32) = sqlx::query_as(
+            "SELECT ema_duration_secs, misclassification_count FROM build_history \
+             WHERE pname = 'slowpoke' AND system = 'x86_64-linux'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+
+        // EMA is OVERWRITTEN (not 10*0.7+200*0.3=67). The next
+        // classify() sees 200s, routes to large. That's the point.
+        assert!(
+            (ema - 200.0).abs() < 0.001,
+            "penalty overwrites (not blends): expected 200, got {ema}"
+        );
+        assert_eq!(miscount, 1, "misclassification counter bumped");
+
+        // Second penalty: counter increments, EMA overwritten again.
+        db.update_build_history_misclassified("slowpoke", "x86_64-linux", 180.0)
+            .await?;
+        let (ema2, miscount2): (f64, i32) = sqlx::query_as(
+            "SELECT ema_duration_secs, misclassification_count FROM build_history \
+             WHERE pname = 'slowpoke'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert!((ema2 - 180.0).abs() < 0.001);
+        assert_eq!(miscount2, 2);
 
         Ok(())
     }

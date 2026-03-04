@@ -75,6 +75,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             running_builds: vec![],
             resources: None,
             local_paths: None,
+            size_class: String::new(),
         })
         .await
         .expect("heartbeat should succeed");
@@ -484,6 +485,7 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
         running_builds: too_many,
         resources: None,
         local_paths: None,
+        size_class: String::new(),
     });
 
     let result = grpc.heartbeat(req).await;

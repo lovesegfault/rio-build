@@ -79,7 +79,11 @@ impl DagActor {
         supported_features: Vec<String>,
         max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
-        bloom: Option<rio_common::bloom::BloomFilter>,
+        // Grouped to stay under clippy's 7-arg limit. Both are
+        // optional heartbeat-carried hints with identical overwrite-
+        // unconditionally semantics (None clears stale). They're
+        // unpacked immediately below; the tuple is just transport.
+        (bloom, size_class): (Option<rio_common::bloom::BloomFilter>, Option<String>),
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -149,6 +153,11 @@ impl DagActor {
         // "unknown locality" than use a stale filter that claims
         // paths are cached when they might have been evicted.
         worker.bloom = bloom;
+        // size_class: also overwrite unconditionally. None means the
+        // worker didn't declare one (empty string in proto) — it
+        // becomes a wildcard worker that accepts any class. Same
+        // don't-trust-stale reasoning as bloom.
+        worker.size_class = size_class;
 
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");

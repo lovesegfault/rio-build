@@ -562,6 +562,139 @@ async fn test_watch_build_receives_events() -> TestResult {
     Ok(())
 }
 
+/// Size-class routing: a derivation classified as "large" goes only to
+/// the large worker, even when a small worker has free capacity. The
+/// overflow chain walks small→large but a large build never tries small.
+#[tokio::test]
+async fn test_size_class_routing_respects_classification() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Pre-seed build_history: "bigthing" has a 120s EMA. With a 30s
+    // small cutoff, classify() will pick "large". Without this seed,
+    // est_duration defaults to 30s (DEFAULT_DURATION_SECS) and hits
+    // the small class exactly — not what we want to test.
+    sqlx::query(
+        "INSERT INTO build_history (pname, system, ema_duration_secs, sample_count, last_updated) \
+         VALUES ('bigthing', 'x86_64-linux', 120.0, 1, now())",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // Actor with size_classes configured. setup_actor_with_store
+    // builds DagActor::new() directly, so we can't inject the config
+    // that way — build the actor inline with .with_size_classes().
+    let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
+    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
+        SizeClassConfig {
+            name: "small".into(),
+            cutoff_secs: 30.0,
+            mem_limit_bytes: u64::MAX,
+        },
+        SizeClassConfig {
+            name: "large".into(),
+            cutoff_secs: 3600.0,
+            mem_limit_bytes: u64::MAX,
+        },
+    ]);
+    let backpressure = actor.backpressure_flag();
+    let self_tx = tx.downgrade();
+    let _task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
+    let handle = ActorHandle { tx, backpressure };
+
+    // Connect TWO workers: one small (will NOT get the big build),
+    // one large (will). Both idle with capacity.
+    let (small_tx, mut small_rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "w-small".into(),
+            stream_tx: small_tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            bloom: None,
+            size_class: Some("small".into()),
+            worker_id: "w-small".into(),
+            system: "x86_64-linux".into(),
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+        })
+        .await?;
+
+    let (large_tx, mut large_rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "w-large".into(),
+            stream_tx: large_tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            bloom: None,
+            size_class: Some("large".into()),
+            worker_id: "w-large".into(),
+            system: "x86_64-linux".into(),
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+        })
+        .await?;
+    settle().await;
+
+    // Prime the estimator. Normally it refreshes on Tick every 60s;
+    // for the test we trigger it via 6 Ticks (the refresh cadence).
+    // Without this, estimator is empty → est_duration=30s default →
+    // goes to "small" → test passes for the wrong reason.
+    for _ in 0..6 {
+        handle.send_unchecked(ActorCommand::Tick).await?;
+    }
+    settle().await;
+
+    // Merge a build with pname="bigthing" so estimator matches.
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("bigthing-hash", "x86_64-linux");
+    node.pname = "bigthing".into();
+    let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    settle().await;
+
+    // Large worker should get the assignment. Small worker should NOT.
+    let large_msg = tokio::time::timeout(Duration::from_secs(2), large_rx.recv())
+        .await
+        .expect("large worker should get assignment within 2s")
+        .expect("stream open");
+    assert!(
+        matches!(
+            large_msg.msg,
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+        ),
+        "large worker should get the bigthing build"
+    );
+
+    // Small worker got nothing (try_recv = empty). If classify() was
+    // broken and sent to small, this would fail.
+    assert!(
+        small_rx.try_recv().is_err(),
+        "small worker should NOT get the big build (classify routed to large)"
+    );
+
+    // The derivation should record that it was assigned to "large"
+    // (for misclassification detection at completion).
+    let state = handle
+        .debug_query_derivation("bigthing-hash")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        state.assigned_size_class.as_deref(),
+        Some("large"),
+        "assigned_size_class recorded for misclassification detection"
+    );
+
+    Ok(())
+}
+
 /// Dispatch should skip over derivations with no eligible worker (wrong
 /// system or missing feature) instead of blocking the entire queue.
 #[tokio::test]
@@ -706,6 +839,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             bloom: None,
+            size_class: None,
             worker_id: "toctou-worker".into(),
             system: "x86_64-linux".into(),
             supported_features: vec![],

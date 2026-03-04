@@ -28,6 +28,16 @@ struct Config {
     /// Env: `RIO_LOG_S3_BUCKET`. Not yet wired to a consumer — C8 does that.
     log_s3_bucket: Option<String>,
     log_s3_prefix: String,
+    /// Size-class cutoff config. Empty = disabled (all workers get all
+    /// builds). Workers declare their class in heartbeat; scheduler
+    /// routes by estimated duration. TOML array-of-tables:
+    ///   [[size_classes]]
+    ///   name = "small"
+    ///   cutoff_secs = 30.0
+    ///   mem_limit_bytes = 1073741824
+    /// No CLI override — this is structural deploy config, not a knob
+    /// you tweak per-invocation. Change it in scheduler.toml.
+    size_classes: Vec<rio_scheduler::assignment::SizeClassConfig>,
 }
 
 impl Default for Config {
@@ -40,6 +50,7 @@ impl Default for Config {
             tick_interval_secs: 10,
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
+            size_classes: Vec::new(),
         }
     }
 }
@@ -176,8 +187,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Emit cutoff gauges BEFORE spawn. Static config — set once,
+    // never changes. Operators correlate with class_queue_depth:
+    // "small=30s cutoff and 100 queued there → scale small pool."
+    // Empty config → no gauges emitted (size-classes disabled).
+    for class in &cfg.size_classes {
+        metrics::gauge!("rio_scheduler_cutoff_seconds", "class" => class.name.clone())
+            .set(class.cutoff_secs);
+    }
+    if !cfg.size_classes.is_empty() {
+        info!(
+            classes = ?cfg.size_classes.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            "size-class routing enabled"
+        );
+    }
+
     // Spawn the DAG actor
-    let actor = ActorHandle::spawn(db, store_client, log_flush_tx);
+    let actor = ActorHandle::spawn(db, store_client, log_flush_tx, cfg.size_classes);
     info!("DAG actor spawned");
 
     // Create gRPC services. All three get the SAME Arc<LogBuffers>:
@@ -256,6 +282,8 @@ mod tests {
         // Phase2b additions — off by default.
         assert_eq!(d.log_s3_bucket, None);
         assert_eq!(d.log_s3_prefix, "logs");
+        // Phase2c: size-classes off by default (backward compat).
+        assert!(d.size_classes.is_empty());
     }
 
     #[test]

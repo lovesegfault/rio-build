@@ -108,6 +108,10 @@ pub enum ActorCommand {
         /// send one (old worker, or FUSE not mounted). Stored on
         /// WorkerState for assignment scoring.
         bloom: Option<rio_common::bloom::BloomFilter>,
+        /// Size-class from worker config (e.g. "small", "large"). gRPC
+        /// maps empty-string → None. Stored on WorkerState for D7's
+        /// classify() → best_worker() filter.
+        size_class: Option<String>,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
@@ -181,6 +185,7 @@ pub struct DebugDerivationInfo {
     pub status: DerivationStatus,
     pub retry_count: u32,
     pub assigned_worker: Option<String>,
+    pub assigned_size_class: Option<String>,
     pub output_paths: Vec<String>,
 }
 
@@ -373,6 +378,10 @@ pub struct DagActor {
     /// doesn't prevent channel close when all external handles are dropped.
     /// `None` if spawned via bare `run()` (no delayed scheduling).
     self_tx: Option<mpsc::WeakSender<ActorCommand>>,
+    /// Size-class cutoff config. Empty = no classification (backward
+    /// compat). dispatch.rs calls classify() with this; completion.rs
+    /// looks up cutoff_for() for misclassification detection.
+    size_classes: Vec<crate::assignment::SizeClassConfig>,
     /// Channel to the LogFlusher task. Completion handlers `try_send` a
     /// FlushRequest here so the S3 upload is ordered AFTER the state
     /// transition (hybrid model: buffer outside actor, flush triggered by
@@ -409,6 +418,7 @@ impl DagActor {
             backpressure_active: Arc::new(AtomicBool::new(false)),
             generation: 1,
             self_tx: None,
+            size_classes: Vec::new(),
             log_flush_tx: None,
         }
     }
@@ -418,6 +428,16 @@ impl DagActor {
     /// there keeps `new()`'s signature stable.
     pub fn with_log_flusher(mut self, tx: mpsc::Sender<crate::logs::FlushRequest>) -> Self {
         self.log_flush_tx = Some(tx);
+        self
+    }
+
+    /// Inject size-class config. Empty vec (the default) = no
+    /// classification → all workers are candidates for all builds.
+    /// Separate from `new()` for the same reason as `with_log_flusher`:
+    /// tests don't need it, and backward-compat deployments (VM tests
+    /// phase1a/1b/2a/2b) don't configure size_classes.
+    pub fn with_size_classes(mut self, classes: Vec<crate::assignment::SizeClassConfig>) -> Self {
+        self.size_classes = classes;
         self
     }
     /// Run the actor with a weak clone of its own sender for scheduling
@@ -500,6 +520,7 @@ impl DagActor {
                     max_builds,
                     running_builds,
                     bloom,
+                    size_class,
                 } => {
                     self.handle_heartbeat(
                         &worker_id,
@@ -507,7 +528,7 @@ impl DagActor {
                         supported_features,
                         max_builds,
                         running_builds,
-                        bloom,
+                        (bloom, size_class),
                     );
                     // Dispatch on heartbeat: new capacity may be available
                     self.dispatch_ready().await;
@@ -599,6 +620,7 @@ impl DagActor {
                         status: s.status(),
                         retry_count: s.retry_count,
                         assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),
+                        assigned_size_class: s.assigned_size_class.clone(),
                         output_paths: s.output_paths.clone(),
                     });
                     let _ = reply.send(info);
@@ -790,9 +812,10 @@ impl ActorHandle {
         db: SchedulerDb,
         store_client: Option<StoreServiceClient<Channel>>,
         log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+        size_classes: Vec<crate::assignment::SizeClassConfig>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-        let mut actor = DagActor::new(db, store_client);
+        let mut actor = DagActor::new(db, store_client).with_size_classes(size_classes);
         if let Some(flush_tx) = log_flush_tx {
             actor = actor.with_log_flusher(flush_tx);
         }

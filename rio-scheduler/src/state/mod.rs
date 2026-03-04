@@ -316,6 +316,11 @@ pub struct DerivationState {
     pub interested_builds: HashSet<Uuid>,
     /// Worker currently assigned/running this derivation.
     pub assigned_worker: Option<WorkerId>,
+    /// Size-class this derivation was dispatched to. Recorded at
+    /// assign time so completion can check misclassification (actual
+    /// duration > 2× the class cutoff). `None` = size-classes not
+    /// configured, or never assigned.
+    pub assigned_size_class: Option<String>,
     /// Number of retry attempts so far.
     pub retry_count: u32,
     /// Workers that have failed building this derivation (for poison tracking).
@@ -369,6 +374,7 @@ impl DerivationState {
             status: DerivationStatus::Created,
             interested_builds: HashSet::new(),
             assigned_worker: None,
+            assigned_size_class: None,
             retry_count: 0,
             failed_workers: HashSet::new(),
             poisoned_at: None,
