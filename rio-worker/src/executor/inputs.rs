@@ -92,15 +92,16 @@ pub(super) async fn fetch_input_metadata(
                 .await
                 {
                     Ok(Some(info)) => Ok(SynthPathInfo::from(info)),
-                    Ok(None) | Err(_) => {
-                        tracing::warn!(
-                            path = %path,
-                            "failed to fetch input path metadata (not found or error)"
-                        );
+                    Ok(None) => {
+                        tracing::warn!(path = %path, "input path not found in store");
                         Err(ExecutorError::MetadataFetch {
                             path,
                             source: tonic::Status::not_found("path missing from store"),
                         })
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path, error = %e, "failed to fetch input path metadata");
+                        Err(ExecutorError::MetadataFetch { path, source: e })
                     }
                 }
             }
@@ -465,8 +466,42 @@ mod tests {
             .expect_err("should error on missing path");
 
         match err {
-            ExecutorError::MetadataFetch { path, .. } => {
+            ExecutorError::MetadataFetch { path, source } => {
                 assert_eq!(path, p_missing);
+                assert_eq!(source.code(), tonic::Code::NotFound);
+            }
+            other => panic!("expected MetadataFetch, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Regression: a real gRPC error (e.g., store unavailable) must propagate
+    /// with its original status code, NOT be collapsed into a fabricated
+    /// NotFound. The old `Ok(None) | Err(_)` arm discarded the real error.
+    #[tokio::test]
+    async fn test_fetch_input_metadata_grpc_error_preserves_code() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
+        let p = tp("foo");
+        seed_with_refs(&store, &p, &[]);
+        // Inject Unavailable on query_path_info.
+        store
+            .fail_query_path_info
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = fetch_input_metadata(&client, std::slice::from_ref(&p))
+            .await
+            .expect_err("should error on store unavailable");
+
+        match err {
+            ExecutorError::MetadataFetch { path, source } => {
+                assert_eq!(path, p);
+                // The critical assertion: NOT NotFound. The old code would
+                // have fabricated NotFound here, masking the real failure.
+                assert_eq!(
+                    source.code(),
+                    tonic::Code::Unavailable,
+                    "real gRPC error code must propagate (was collapsed to NotFound before fix)"
+                );
             }
             other => panic!("expected MetadataFetch, got {other:?}"),
         }
