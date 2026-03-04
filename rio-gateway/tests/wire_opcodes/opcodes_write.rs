@@ -6,7 +6,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_add_to_store_nar_accepts_valid() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"add-to-store-nar");
 
     wire_send!(&mut h.stream;
@@ -44,7 +44,7 @@ async fn test_add_to_store_nar_accepts_valid() -> anyhow::Result<()> {
 /// verifies the gateway passes the declared hash through unchanged.
 #[tokio::test]
 async fn test_add_to_store_nar_passes_declared_hash() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, _actual_hash) = make_nar(b"trust-test");
     let declared_hash = [0xABu8; 32]; // deliberately different from actual
 
@@ -84,7 +84,7 @@ async fn test_add_to_store_nar_passes_declared_hash() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar_a, hash_a) = make_nar(b"multi-a");
     let (nar_b, hash_b) = make_nar(b"multi-b");
 
@@ -150,7 +150,7 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
 /// than remain in the framed stream) instead of panicking on slice OOB.
 #[tokio::test]
 async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"truncated");
 
     let inner = wire_bytes![
@@ -197,7 +197,7 @@ async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
 /// No longer a stub (phase2c E2) — actually calls the store RPC now.
 #[tokio::test]
 async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"addsig test");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
@@ -236,7 +236,7 @@ async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()>
 /// the real daemon's behavior.
 #[tokio::test]
 async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     // TEST_PATH_A NOT seeded — MockStore returns NOT_FOUND.
 
     wire_send!(&mut h.stream;
@@ -260,7 +260,7 @@ async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
 /// MockStore records it. No longer a stub (phase2c E4).
 #[tokio::test]
 async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     // 64-char hex = 32-byte SHA-256. All-AA for test determinism.
     let drv_hash_hex = "aa".repeat(32);
@@ -294,7 +294,7 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
 /// implicitly; now it's explicit. Hard-failing would regress buggy clients.
 #[tokio::test]
 async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 42,
@@ -315,7 +315,7 @@ async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<
 /// Malformed DrvOutput id (wrong prefix, bad hex, no !, etc): soft-fail.
 #[tokio::test]
 async fn test_register_drv_output_malformed_id_soft_fails() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     // "abc" is 3 hex chars — not 64, so hex::decode → wrong length.
     // Previously the stub test used exactly this and it "passed" because
@@ -335,7 +335,7 @@ async fn test_register_drv_output_malformed_id_soft_fails() -> anyhow::Result<()
 
 #[tokio::test]
 async fn test_add_text_to_store() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 8,                            // wopAddTextToStore
@@ -366,7 +366,7 @@ async fn test_add_text_to_store() -> anyhow::Result<()> {
 /// StorePath::make_text (content-addressed text import).
 #[tokio::test]
 async fn test_add_to_store_text_method() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     let content = b"hello from text method";
 
@@ -416,7 +416,7 @@ async fn test_add_to_store_text_method() -> anyhow::Result<()> {
 /// The dump data is raw file content (not NAR); handler wraps it in NAR.
 #[tokio::test]
 async fn test_add_to_store_fixed_flat() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     let content = b"raw file content for flat fixed-output";
 
@@ -461,7 +461,7 @@ async fn test_add_to_store_fixed_flat() -> anyhow::Result<()> {
 /// (not crash or silently succeed).
 #[tokio::test]
 async fn test_add_to_store_invalid_cam_str_returns_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 7,                            // wopAddToStore
@@ -487,7 +487,7 @@ async fn test_add_to_store_invalid_cam_str_returns_error() -> anyhow::Result<()>
 /// AddToStoreNar with invalid store path should send STDERR_ERROR.
 #[tokio::test]
 async fn test_add_to_store_nar_invalid_path_returns_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 39,
@@ -519,7 +519,7 @@ async fn test_add_to_store_nar_invalid_path_returns_error() -> anyhow::Result<()
 /// before reading any NAR data (prevents DoS).
 #[tokio::test]
 async fn test_add_to_store_nar_oversized_returns_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 39,

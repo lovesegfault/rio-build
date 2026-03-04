@@ -6,7 +6,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_unknown_opcode_returns_stderr_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream; u64: 99); // unknown opcode
 
@@ -28,7 +28,7 @@ async fn test_unknown_opcode_returns_stderr_error() -> anyhow::Result<()> {
 /// result data.
 #[tokio::test]
 async fn test_set_options_standalone() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     // Send a second SetOptions with different values.
     wire_send!(&mut h.stream;
@@ -68,57 +68,35 @@ async fn test_set_options_standalone() -> anyhow::Result<()> {
 
 /// Handshake-level: client sends a version older than 1.37 → STDERR_ERROR.
 /// This is gateway's responsibility (protocol negotiation), not the store's.
+///
+/// Uses bare `GatewaySession::new()` (NOT `new_with_handshake`) so we can
+/// drive the handshake manually with a bad version.
 #[tokio::test]
 async fn test_version_too_old_sends_stderr_error() -> anyhow::Result<()> {
     use rio_nix::protocol::handshake::{WORKER_MAGIC_1, WORKER_MAGIC_2};
 
-    let (_store, store_addr, store_handle) = spawn_mock_store().await?;
-    let (_sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
-
-    let store_channel = Channel::from_shared(format!("http://{store_addr}"))?
-        .connect()
-        .await?;
-    let mut store_client = StoreServiceClient::new(store_channel);
-    let sched_channel = Channel::from_shared(format!("http://{sched_addr}"))?
-        .connect()
-        .await?;
-    let mut scheduler_client = SchedulerServiceClient::new(sched_channel);
-
-    let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let server_task = tokio::spawn(async move {
-        let (mut r, mut w) = tokio::io::split(server);
-        let _ = rio_gateway::session::run_protocol(
-            &mut r,
-            &mut w,
-            &mut store_client,
-            &mut scheduler_client,
-        )
-        .await;
-    });
+    let mut h = GatewaySession::new().await?;
 
     // Phase 1: send magic + old version (1.32 = 0x120)
-    wire_send!(&mut client;
+    wire_send!(&mut h.stream;
         u64: WORKER_MAGIC_1,
         u64: 0x120,
     );
 
     // Read server magic + server version
-    let magic2 = wire::read_u64(&mut client).await?;
+    let magic2 = wire::read_u64(&mut h.stream).await?;
     assert_eq!(magic2, WORKER_MAGIC_2);
-    let _server_version = wire::read_u64(&mut client).await?;
+    let _server_version = wire::read_u64(&mut h.stream).await?;
 
     // Server should now send STDERR_ERROR (version rejected before feature exchange)
-    let err = drain_stderr_expecting_error(&mut client).await?;
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
         err.message.contains("1.37+"),
         "error should mention '1.37+', got: {}",
         err.message
     );
 
-    drop(client);
-    server_task.await?;
-    store_handle.abort();
-    sched_handle.abort();
+    h.finish().await;
     Ok(())
 }
 
@@ -128,7 +106,7 @@ async fn test_version_too_old_sends_stderr_error() -> anyhow::Result<()> {
 async fn test_multi_opcode_sequence() -> anyhow::Result<()> {
     use rio_nix::protocol::stderr::STDERR_LAST;
 
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"multi-op");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 

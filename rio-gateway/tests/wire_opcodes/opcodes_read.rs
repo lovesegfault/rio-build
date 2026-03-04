@@ -6,7 +6,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_is_valid_path_exists() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"hello");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
@@ -25,7 +25,7 @@ async fn test_is_valid_path_exists() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_is_valid_path_missing() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 1,                             // wopIsValidPath
@@ -46,7 +46,7 @@ async fn test_is_valid_path_missing() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_ensure_path_exists() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"ensure");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
@@ -67,7 +67,7 @@ async fn test_ensure_path_exists() -> anyhow::Result<()> {
 /// whether the path exists. It reads the path argument and returns 1.
 #[tokio::test]
 async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 10,                            // wopEnsurePath
@@ -89,7 +89,7 @@ async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_query_path_info_exists() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"pathinfo");
     let info = make_path_info(TEST_PATH_A, &nar, hash);
     h.store.seed(info, nar.clone());
@@ -123,7 +123,7 @@ async fn test_query_path_info_exists() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_query_path_info_missing_returns_invalid() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 26,                            // wopQueryPathInfo
@@ -146,7 +146,7 @@ async fn test_query_path_info_missing_returns_invalid() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_query_path_from_hash_part_found() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"hashpart");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
 
@@ -165,7 +165,7 @@ async fn test_query_path_from_hash_part_found() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_query_path_from_hash_part_not_found() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 29,                            // wopQueryPathFromHashPart
@@ -186,7 +186,7 @@ async fn test_query_path_from_hash_part_not_found() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_add_temp_root() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream; u64: 11, string: TEST_PATH_A); // wopAddTempRoot
 
@@ -204,7 +204,7 @@ async fn test_add_temp_root() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_nar_from_path_streams_chunks() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"nar-from-path content");
     h.store
         .seed(make_path_info(TEST_PATH_A, &nar, hash), nar.clone());
@@ -232,7 +232,7 @@ async fn test_nar_from_path_streams_chunks() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_nar_from_path_missing_returns_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 38,                            // wopNarFromPath
@@ -248,7 +248,7 @@ async fn test_nar_from_path_missing_returns_error() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     // Send a string that fails StorePath::parse (no /nix/store/ prefix).
     wire_send!(&mut h.stream;
@@ -272,7 +272,7 @@ async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
 /// stub). "abc" is 3 hex chars, not 64.
 #[tokio::test]
 async fn test_query_realisation_malformed_id_returns_empty() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 43,                            // wopQueryRealisation
@@ -290,7 +290,7 @@ async fn test_query_realisation_malformed_id_returns_empty() -> anyhow::Result<(
 /// QueryRealisation: valid id but not in MockStore → empty set (cache miss).
 #[tokio::test]
 async fn test_query_realisation_miss_returns_empty() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     let drv_hash_hex = "bb".repeat(32);
     wire_send!(&mut h.stream;
@@ -311,7 +311,7 @@ async fn test_query_realisation_miss_returns_empty() -> anyhow::Result<()> {
 /// CA derivations skip rebuilds.
 #[tokio::test]
 async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     let drv_hash_hex = "cc".repeat(32);
     let drv_hash = hex::decode(&drv_hash_hex)?;
@@ -365,7 +365,7 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
 /// + unknown + downloadSize + narSize.
 #[tokio::test]
 async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     // Don't seed the .drv: handler filters paths whose store_path is NOT in
     // the missing set. A Built path's store_path() is the .drv; if the .drv
@@ -404,7 +404,7 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
 /// (name, path) pairs. Error path: missing .drv in store.
 #[tokio::test]
 async fn test_query_derivation_output_map_missing_drv() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 41,
@@ -423,7 +423,7 @@ async fn test_query_derivation_output_map_missing_drv() -> anyhow::Result<()> {
 /// output name -> path map.
 #[tokio::test]
 async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     let drv_text = r#"Derive([("out","/nix/store/zzz-output","",""),("dev","/nix/store/yyy-dev","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
@@ -480,7 +480,7 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
 /// QueryValidPaths (31) happy path: returns paths present in the mock store.
 #[tokio::test]
 async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let (nar, hash) = make_nar(b"qvp");
     h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
     // TEST_PATH_MISSING is not seeded.
@@ -506,7 +506,7 @@ async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
 /// QueryValidPaths with empty input returns empty output.
 #[tokio::test]
 async fn test_query_valid_paths_empty() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 31,
@@ -526,7 +526,7 @@ async fn test_query_valid_paths_empty() -> anyhow::Result<()> {
 /// This documents the graceful-degradation behavior for Nix compatibility.
 #[tokio::test]
 async fn test_is_valid_path_garbage_returns_false() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 1,
