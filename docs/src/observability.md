@@ -87,6 +87,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_scheduler_log_flush_total` | Counter | Successful S3 log flushes (labeled by `kind`: `final`/`periodic`). |
 | `rio_scheduler_log_flush_failures_total` | Counter | Failed S3 log flushes (labeled by `phase`: `s3`/`pg`). Alert if rate > 0 sustained: build logs are being lost. |
 | `rio_scheduler_log_flush_dropped_total` | Counter | Final-flush requests dropped due to flusher channel backpressure. Periodic tick will snapshot instead. |
+| `rio_scheduler_log_forward_dropped_total` | Counter | Live log forwards dropped due to actor channel backpressure. Lines remain in the ring buffer (serveable via AdminService) but the gateway misses the live stream. Sustained non-zero → actor is saturated. |
 | `rio_scheduler_critical_path_accuracy` | Histogram | Predicted vs. actual completion ratio (actual/estimated; 1.0 = perfect, >1.0 = underestimate) |
 | `rio_scheduler_size_class_assignments_total` | Counter | Assignments per size class (labeled by class name) |
 | `rio_scheduler_misclassifications_total` | Counter | Builds that exceeded 2× their class cutoff duration (triggers penalty EMA overwrite) |

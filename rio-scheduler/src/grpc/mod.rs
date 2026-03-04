@@ -524,10 +524,16 @@ impl WorkerService for SchedulerGrpc {
                             //    leaves a derivation stuck Running forever). A dropped
                             //    log batch is a degraded-mode nuisance, not a hang.
                             let drv_path = log.derivation_path.clone();
-                            let _ = actor_for_recv.try_send(ActorCommand::ForwardLogBatch {
-                                drv_path,
-                                batch: log,
-                            });
+                            if actor_for_recv
+                                .try_send(ActorCommand::ForwardLogBatch {
+                                    drv_path,
+                                    batch: log,
+                                })
+                                .is_err()
+                            {
+                                metrics::counter!("rio_scheduler_log_forward_dropped_total")
+                                    .increment(1);
+                            }
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
                             // ProgressUpdate still dropped. For size-class
