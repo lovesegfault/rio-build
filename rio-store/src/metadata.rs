@@ -117,7 +117,7 @@ pub async fn insert_manifest_uploading(
 /// `query_path_info` or it stays a placeholder. No partial-complete state.
 ///
 /// `registration_time` and `ultimate` are now persisted (resolves the
-/// TODO(phase2c) at the old metadata.rs:329 — previously they were dropped
+/// phase2c-tagged deferral at the old metadata.rs:329 — previously dropped
 /// on write and returned as 0/false on read, which was observable via
 /// `nix path-info --json` but didn't break clients).
 #[instrument(skip(pool, info, nar_data), fields(store_path = %info.store_path.as_str(), nar_size = nar_data.len()))]

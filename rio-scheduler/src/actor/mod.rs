@@ -190,6 +190,105 @@ pub enum ActorError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Store service is unreachable (cache-check circuit breaker is open).
+    /// Maps to gRPC UNAVAILABLE. Rejecting SubmitBuild here is the user
+    /// decision from phase2c planning: if the store is down, builds can't
+    /// dispatch anyway (workers PutPath/GetPath also fail), so fail fast
+    /// with a clear error instead of queueing builds that will all stall.
+    #[error("store service unavailable (cache-check circuit breaker open)")]
+    StoreUnavailable,
+}
+
+/// Circuit breaker for the scheduler's cache-check FindMissingPaths call.
+///
+/// Without this, a sustained store outage means every SubmitBuild treats
+/// every derivation as a cache miss — an avalanche of unnecessary rebuilds
+/// once the store comes back (or workers thrash trying to fetch inputs).
+///
+/// # States
+///
+/// - **Closed** (normal): cache check runs, result used. Tracks consecutive
+///   failures; trips open after [`OPEN_THRESHOLD`].
+/// - **Open**: cache check STILL runs (half-open probe), but if it fails,
+///   SubmitBuild is rejected with `StoreUnavailable` instead of queueing.
+///   If the probe succeeds, the breaker closes and the result is used.
+///   Auto-closes after [`OPEN_DURATION`] even without a successful probe
+///   (so a transient store blip doesn't lock us out forever if no builds
+///   arrive to probe with).
+///
+/// # Why half-open probe, not skip-the-call
+///
+/// If we skipped the cache check entirely while open, the breaker could
+/// only close via timeout. A successful probe is a faster, more responsive
+/// signal that the store is back. The probe costs one RPC per SubmitBuild
+/// — same as the closed state — so there's no extra load.
+#[derive(Debug, Default)]
+pub(super) struct CacheCheckBreaker {
+    /// Consecutive cache-check failures. Reset to 0 on any success.
+    consecutive_failures: u32,
+    /// If `Some`, the breaker is open until this instant. `None` = closed.
+    open_until: Option<Instant>,
+}
+
+/// Trip open after this many consecutive failures.
+const OPEN_THRESHOLD: u32 = 5;
+
+/// Stay open for this long before auto-closing (even without a probe success).
+const OPEN_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl CacheCheckBreaker {
+    /// Record a failure. Returns `true` if this failure trips the breaker open
+    /// (or it was already open) — caller should reject SubmitBuild.
+    ///
+    /// The "already open" case matters: while open, we STILL attempt the cache
+    /// check (half-open probe). A failed probe keeps us open but doesn't
+    /// re-increment the open-transition metric (it's the same outage).
+    pub(super) fn record_failure(&mut self) -> bool {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+
+        // Already open: stay open. No metric (same outage, not a new trip).
+        if self.is_open() {
+            return true;
+        }
+
+        // Trip open on threshold crossing.
+        if self.consecutive_failures >= OPEN_THRESHOLD {
+            self.open_until = Some(Instant::now() + OPEN_DURATION);
+            warn!(
+                consecutive_failures = self.consecutive_failures,
+                open_for = ?OPEN_DURATION,
+                "cache-check circuit breaker OPENING — rejecting SubmitBuild until store recovers"
+            );
+            metrics::counter!("rio_scheduler_cache_check_circuit_open_total").increment(1);
+            return true;
+        }
+
+        // Still under threshold: proceed as if the cache check just missed.
+        false
+    }
+
+    /// Record a success. Closes the breaker and resets the failure counter.
+    pub(super) fn record_success(&mut self) {
+        if self.is_open() {
+            info!(
+                after_failures = self.consecutive_failures,
+                "cache-check circuit breaker CLOSING — store recovered"
+            );
+        }
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+
+    /// Whether the breaker is open RIGHT NOW. Handles timeout-based
+    /// auto-close: if `open_until` is in the past, we're closed.
+    ///
+    /// Doesn't mutate state — the stale `open_until` is cleaned up lazily
+    /// on the next `record_success()`. This keeps the check cheap (one
+    /// `Instant::now()` compare) and avoids needing `&mut self` here.
+    fn is_open(&self) -> bool {
+        self.open_until.is_some_and(|until| Instant::now() < until)
+    }
 }
 
 /// Read-only view of the actor's backpressure state.
@@ -239,6 +338,10 @@ pub struct DagActor {
     /// Store service client for scheduler-side cache checks. `None` in tests
     /// that don't need the store (cache check is then skipped).
     store_client: Option<StoreServiceClient<Channel>>,
+    /// Circuit breaker for the cache-check FindMissingPaths call. Owned by
+    /// the actor (single-threaded, no lock needed). Checked/updated in
+    /// `merge.rs::check_cached_outputs`.
+    cache_breaker: CacheCheckBreaker,
     /// Whether backpressure is currently active. Shared with ActorHandle
     /// so hysteresis (80%/60%) is honored by send() instead of a simple
     /// threshold check. `Arc<AtomicBool>` for lock-free reads on the hot path.
@@ -280,6 +383,7 @@ impl DagActor {
             retry_policy: RetryPolicy::default(),
             db,
             store_client,
+            cache_breaker: CacheCheckBreaker::default(),
             backpressure_active: Arc::new(AtomicBool::new(false)),
             generation: 1,
             self_tx: None,

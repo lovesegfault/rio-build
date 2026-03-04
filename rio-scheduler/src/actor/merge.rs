@@ -101,7 +101,23 @@ impl DagActor {
         // Completed. This closes the TOCTOU window between the gateway's
         // FindMissingPaths and our merge (another build may have completed the
         // derivation in between).
-        let cached_hashes = self.check_cached_outputs(newly_inserted, &node_index).await;
+        //
+        // Err(StoreUnavailable) → circuit breaker is open (sustained store
+        // outage). Roll back the merge and reject the whole SubmitBuild. The
+        // alternative — queueing with 100% cache miss — causes a rebuild
+        // avalanche once the store recovers.
+        let cached_hashes = match self.check_cached_outputs(newly_inserted, &node_index).await {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                // Same rollback as persist_merge_to_db failure: undo the DAG
+                // merge, the map inserts, and the DB build row. Without this,
+                // the build would be half-committed (Active in the DB but
+                // rejected to the client).
+                error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
+                self.cleanup_failed_merge(build_id, &merge_result).await;
+                return Err(e);
+            }
+        };
 
         for drv_hash in &cached_hashes {
             let Some(node) = node_index.get(drv_hash.as_str()) else {
@@ -383,15 +399,26 @@ impl DagActor {
     /// Query the store for newly-inserted derivations' expected outputs and
     /// return the set of drv_hashes whose outputs are all already present.
     ///
-    /// Returns an empty set if there's no store client (tests) or if the
-    /// RPC fails (non-fatal — we fall back to building).
+    /// # Circuit breaker interaction
+    ///
+    /// - Store unreachable + breaker closed + under threshold → `Ok(empty set)`.
+    ///   Build proceeds as 100% cache miss. Slightly wasteful but recoverable.
+    /// - Store unreachable + breaker trips open (or was already open) →
+    ///   `Err(StoreUnavailable)`. SubmitBuild is rejected entirely.
+    /// - Store reachable → `Ok(cached set)`. Breaker closes (if it was open,
+    ///   this was a successful half-open probe).
+    /// - No store client (tests) → `Ok(empty set)`. Breaker not touched.
+    /// - No expected_output_paths → `Ok(empty set)`. Breaker not touched
+    ///   (we didn't actually probe the store, so no signal either way).
+    ///
+    /// `&mut self` because the breaker is actor-owned state.
     async fn check_cached_outputs(
-        &self,
+        &mut self,
         newly_inserted: &HashSet<DrvHash>,
         node_index: &HashMap<&str, &rio_proto::types::DerivationNode>,
-    ) -> HashSet<DrvHash> {
+    ) -> Result<HashSet<DrvHash>, ActorError> {
         let Some(store_client) = &self.store_client else {
-            return HashSet::new();
+            return Ok(HashSet::new());
         };
 
         // Collect all expected output paths for newly-inserted derivations.
@@ -403,12 +430,21 @@ impl DagActor {
             .collect();
 
         if check_paths.is_empty() {
-            return HashSet::new();
+            // Didn't probe the store — no signal for the breaker. If it's
+            // open, it stays open; if closed, stays closed. Returning
+            // Ok here (not checking breaker.is_open()) is deliberate: a
+            // submission with no expected_output_paths is unaffected by
+            // store availability (there's nothing to cache-check), so
+            // rejecting it with StoreUnavailable would be a false positive.
+            return Ok(HashSet::new());
         }
 
         // Wrap in a timeout: this is a synchronous call inside the
         // single-threaded actor event loop. If the store hangs, NO heartbeats,
         // completions, or dispatches are processed until this returns.
+        //
+        // This call is ALSO the half-open probe: if the breaker is open, we
+        // still make the call. Success → close; failure → stay open + reject.
         let resp = match tokio::time::timeout(
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
             store_client
@@ -419,22 +455,35 @@ impl DagActor {
         )
         .await
         {
-            Ok(Ok(r)) => r.into_inner(),
+            Ok(Ok(r)) => {
+                // Success — close the breaker (resets counter). Cheap no-op
+                // if it was already closed.
+                self.cache_breaker.record_success();
+                r.into_inner()
+            }
             Ok(Err(e)) => {
-                warn!(error = %e, "store FindMissingPaths failed; skipping scheduler cache check");
+                warn!(error = %e, "store FindMissingPaths failed");
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
-                // TODO(phase2c): circuit-breaker on sustained failures. Treating
-                // every submission as 100% cache miss when the store is unreachable
-                // causes an avalanche of unnecessary rebuilds.
-                return HashSet::new();
+                // record_failure() returns true if this trips the breaker
+                // open (or it was already open from a prior trip).
+                if self.cache_breaker.record_failure() {
+                    return Err(ActorError::StoreUnavailable);
+                }
+                // Under threshold: proceed with empty cache-hit set.
+                // The build runs with 100% miss — wasteful, but N<5 of
+                // these is tolerable. The breaker catches sustained outages.
+                return Ok(HashSet::new());
             }
             Err(_) => {
                 warn!(
                     timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-                    "store FindMissingPaths timed out; skipping scheduler cache check"
+                    "store FindMissingPaths timed out"
                 );
                 metrics::counter!("rio_scheduler_cache_check_failures_total").increment(1);
-                return HashSet::new();
+                if self.cache_breaker.record_failure() {
+                    return Err(ActorError::StoreUnavailable);
+                }
+                return Ok(HashSet::new());
             }
         };
 
@@ -446,7 +495,7 @@ impl DagActor {
 
         // A derivation is cached if it has at least one expected output path
         // AND all of them are present.
-        newly_inserted
+        Ok(newly_inserted
             .iter()
             .filter(|h| {
                 node_index.get(h.as_str()).is_some_and(|n| {
@@ -455,6 +504,6 @@ impl DagActor {
                 })
             })
             .cloned()
-            .collect()
+            .collect())
     }
 }
