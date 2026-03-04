@@ -223,7 +223,7 @@ enum BuildResultStatus {
 // Work assignment from scheduler to worker.
 message WorkAssignment {
   string drv_path = 1;                    // Store path of the .drv file
-  bytes drv_content = 2;                  // Inline ATerm content (empty in Phase 2a; worker fetches from store via GetPath)
+  bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); worker fetches via GetPath.
   repeated string input_paths = 3;        // Store paths needed as build inputs (empty in Phase 2a; worker computes closure via QueryPathInfo)
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
@@ -297,8 +297,11 @@ message BloomFilter {
 
 enum BloomHashAlgorithm {
   BLOOM_HASH_ALGORITHM_UNSPECIFIED = 0;
-  BLOOM_HASH_ALGORITHM_MURMUR3_128 = 1;
-  BLOOM_HASH_ALGORITHM_XXHASH64 = 2;
+  // 1 (MURMUR3_128) and 2 (XXHASH64) were never implemented; only
+  // blake3 is supported. We control both ends of this protocol, so
+  // there's no cross-version ambiguity to preserve.
+  reserved 1, 2;
+  reserved "BLOOM_HASH_ALGORITHM_MURMUR3_128", "BLOOM_HASH_ALGORITHM_XXHASH64";
   // blake3 split into double-hash indices (Kirsch-Mitzenmacher). Chosen
   // because it's PORTABLE — the bloom filter is a wire protocol (worker
   // builds it, scheduler queries it); AES-NI-based hashes like gxhash
@@ -432,7 +435,10 @@ message FindMissingPathsResponse {
 // Content-addressed lookup: find a store path by its content hash.
 message ContentLookupRequest {
   bytes content_hash = 1;                 // SHA-256 of the output content
-  string output_name = 2;                // Output name hint
+  // Field 2 (output_name) was never read by the handler — content_index
+  // is keyed purely on content_hash. Removed in pre-phase3a cleanup.
+  reserved 2;
+  reserved "output_name";
 }
 
 message ContentLookupResponse {
@@ -487,7 +493,7 @@ message QueryRealisationRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Chunk service types (Phase 2a: stub, no chunking)
+// Chunk service types
 // ---------------------------------------------------------------------------
 
 message PutChunkRequest {
