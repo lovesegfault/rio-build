@@ -1,8 +1,8 @@
 //! Macros for defining string-like newtypes with ergonomic trait impls.
 //!
 //! Two variants:
-//! - [`string_newtype!`] — `String` backing. Clone = allocation.
-//! - [`arc_string_newtype!`] — `Arc<str>` backing. Clone = atomic refcount
+//! - [`string_newtype!`](crate::string_newtype) — `String` backing. Clone = allocation.
+//! - [`arc_string_newtype!`](crate::arc_string_newtype) — `Arc<str>` backing. Clone = atomic refcount
 //!   bump. Use for identifiers that are cloned frequently in hot paths
 //!   (DAG edge storage, queue entries, cascade walks).
 //!
@@ -67,7 +67,7 @@ macro_rules! string_newtype {
 }
 
 /// Define an `Arc<str>`-backed newtype with the same trait surface as
-/// [`string_newtype!`].
+/// [`string_newtype!`](crate::string_newtype).
 ///
 /// The key difference is `Clone`: `Arc<str>` clones via atomic refcount
 /// increment — no allocation, no memcpy. For identifiers cloned ~40×/merge

@@ -64,7 +64,7 @@ impl LogBuffers {
         }
     }
 
-    /// Push a batch. Evicts oldest lines if the buffer exceeds [`RING_CAPACITY`].
+    /// Push a batch. Evicts oldest lines if the buffer exceeds `RING_CAPACITY`.
     ///
     /// Returns `true` if this is the first batch for this `drv_path` (i.e., a
     /// new buffer was created). Callers can use this to know when a derivation

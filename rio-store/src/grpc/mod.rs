@@ -207,7 +207,7 @@ impl StoreServiceImpl {
 
 #[tonic::async_trait]
 impl StoreService for StoreServiceImpl {
-    /// Upload a store path. See [`put_path`] for the write-ahead flow.
+    /// Upload a store path. See the `put_path` module for the write-ahead flow.
     #[instrument(skip(self, request), fields(rpc = "PutPath"))]
     async fn put_path(
         &self,
@@ -218,7 +218,7 @@ impl StoreService for StoreServiceImpl {
 
     type GetPathStream = get_path::GetPathStream;
 
-    /// Download a store path's NAR. See [`get_path`] for the streaming flow.
+    /// Download a store path's NAR. See the `get_path` module for the streaming flow.
     #[instrument(skip(self, request), fields(rpc = "GetPath"))]
     async fn get_path(
         &self,

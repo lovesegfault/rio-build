@@ -458,7 +458,15 @@
                 RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
               }
             );
-            doc = craneLib.cargoDoc (commonArgs // { inherit cargoArtifacts; });
+            doc = craneLib.cargoDoc (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                # Deny rustdoc warnings (private_intra_doc_links, broken_intra_doc_links,
+                # unclosed HTML tags) — catches doc regressions in CI.
+                RUSTDOCFLAGS = "-Dwarnings";
+              }
+            );
             # Coverage via `cargo llvm-cov nextest` (NOT `cargo llvm-cov test`).
             #
             # Root cause of the previous flakiness: `cargo test` runs all

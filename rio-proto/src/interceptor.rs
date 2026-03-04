@@ -5,7 +5,7 @@
 //!
 //! - [`inject_current`]: copy the current span's trace context into a
 //!   `tonic::Request` (client side, before sending).
-//! - [`extract_parent`]: recover a parent Context from an incoming
+//! - [`link_parent`]: recover a parent Context from an incoming
 //!   `tonic::Request`'s metadata (server side, at handler entry).
 //!
 //! # Design: manual inject/extract, not a tonic Interceptor
@@ -21,7 +21,7 @@
 //! - Works for RPCs that don't go through our `connect_*` helpers
 //!   (e.g., test clients).
 //!
-//! Server-side is the same: [`extract_parent`] + `Span::current().set_parent()`
+//! Server-side is the same: [`link_parent`] + `Span::current().set_parent()`
 //! at the top of each `#[instrument]`ed handler body. Tonic has no server-
 //! interceptor trait that composes with `#[instrument]` anyway.
 //!
