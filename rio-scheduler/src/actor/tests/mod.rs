@@ -11,6 +11,12 @@ pub(crate) use super::*;
 pub(crate) mod helpers;
 pub(crate) use helpers::*; // Re-export for grpc.rs tests
 
-mod coverage;
+mod build;
+mod completion;
+mod dispatch;
+mod fault;
 mod integration;
+mod keep_going;
+mod merge;
 mod wiring;
+mod worker;
