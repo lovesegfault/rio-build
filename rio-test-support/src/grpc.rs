@@ -70,6 +70,20 @@ impl MockStore {
             .unwrap()
             .insert(store_path, (info.into(), nar));
     }
+
+    /// Seed a path with a single-file NAR built from `content`.
+    ///
+    /// Wraps the `make_nar + make_path_info + seed` combo that
+    /// every wire_opcodes test does. Returns (nar_bytes, nar_hash) for
+    /// tests that need to assert on wire-level bytes.
+    pub fn seed_with_content(&self, path: &str, content: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        let (nar, hash) = crate::fixtures::make_nar(content);
+        self.seed(
+            crate::fixtures::make_path_info(path, &nar, hash),
+            nar.clone(),
+        );
+        (nar, hash)
+    }
 }
 
 #[tonic::async_trait]
@@ -499,6 +513,21 @@ pub async fn spawn_mock_store()
     let router = Server::builder().add_service(StoreServiceServer::new(store.clone()));
     let (addr, handle) = spawn_grpc_server(router).await;
     Ok((store, addr, handle))
+}
+
+/// Spawn a MockStore + connect a StoreServiceClient in one call.
+///
+/// Extracts the spawn-then-connect combo that appears in worker upload
+/// tests, executor input tests, gateway translate tests, and scheduler
+/// coverage tests. Returns the JoinHandle so callers can abort/join.
+pub async fn spawn_mock_store_with_client() -> anyhow::Result<(
+    MockStore,
+    rio_proto::StoreServiceClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (store, addr, handle) = spawn_mock_store().await?;
+    let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+    Ok((store, client, handle))
 }
 
 /// Spawn a MockScheduler on an ephemeral port. Returns `(scheduler, addr, handle)`.

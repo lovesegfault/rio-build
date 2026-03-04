@@ -19,6 +19,19 @@ pub(crate) mod realisations;
 pub mod signing;
 pub(crate) mod validate;
 
+/// Shared sqlx migrator for the `migrations/` directory. Embeds
+/// migration SQL at compile time via `sqlx::migrate!`.
+///
+/// `#[cfg(test)]` (not `pub`) — the rio-store/fuzz/ workspace compiles
+/// this lib as a dep, and its source filter doesn't include migrations/.
+/// sqlx::migrate! reads files at COMPILE time, so even an unused static
+/// breaks the fuzz build. cfg(test) means the macro only expands when
+/// building the lib's own unit tests (not as a dep). Integration tests
+/// in tests/grpc/ keep their own copy — they compile the lib WITHOUT
+/// cfg(test), so they can't see this one.
+#[cfg(test)]
+pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
 /// Register `# HELP` descriptions for all store metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions

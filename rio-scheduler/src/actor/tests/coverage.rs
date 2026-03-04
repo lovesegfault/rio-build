@@ -636,17 +636,8 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
     // Large worker should get the assignment. Small worker should NOT.
-    let large_msg = tokio::time::timeout(Duration::from_secs(2), large_rx.recv())
-        .await
-        .expect("large worker should get assignment within 2s")
-        .expect("stream open");
-    assert!(
-        matches!(
-            large_msg.msg,
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-        ),
-        "large worker should get the bigthing build"
-    );
+    // recv_assignment panics if not an Assignment within 2s.
+    let _ = recv_assignment(&mut large_rx).await;
 
     // Small worker got nothing (try_recv = empty). If classify() was
     // broken and sent to small, this would fail.
@@ -696,14 +687,7 @@ async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
     let _rx = merge_single_node(&handle, build_x86, "x86-hash", PriorityClass::Scheduled).await?;
 
     // x86_64 derivation should be dispatched despite aarch64 ahead of it.
-    let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .expect("x86_64 derivation should be dispatched within 2s")
-        .expect("stream should not close");
-    let dispatched_path = match msg.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
-        _ => panic!("expected assignment"),
-    };
+    let dispatched_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(
         dispatched_path, p_x86,
         "x86_64 derivation should be dispatched even with ineligible aarch64 ahead in queue"
@@ -753,12 +737,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
     let _rx = reply_rx.await??;
 
     // Worker should receive assignment with the build's options.
-    let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await?
-        .expect("exists");
-    let Some(rio_proto::types::scheduler_message::Msg::Assignment(assignment)) = msg.msg else {
-        panic!("expected assignment");
-    };
+    let assignment = recv_assignment(&mut stream_rx).await;
     let opts = assignment.build_options.expect("options should be set");
     assert_eq!(
         opts.build_timeout, 300,
@@ -914,13 +893,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     assert_eq!(info_a.status, DerivationStatus::Queued);
 
     // Worker receives B's assignment.
-    let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await?
-        .expect("exists");
-    let assigned_path = match msg.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
-        _ => panic!("expected assignment"),
-    };
+    let assigned_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(assigned_path, p_chain_b);
 
     // Complete B.
@@ -941,13 +914,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     );
 
     // Worker should receive A's assignment.
-    let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await?
-        .expect("exists");
-    let assigned_path = match msg.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
-        _ => panic!("expected assignment"),
-    };
+    let assigned_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(
         assigned_path, p_chain_a,
         "A should be dispatched after B completes"
@@ -1317,11 +1284,7 @@ async fn test_interactive_priority_boost() -> TestResult {
         complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await?;
         // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
-            let next = worker_rx.recv().await.expect("should get next assignment");
-            let Some(rio_proto::types::scheduler_message::Msg::Assignment(next_a)) = next.msg
-            else {
-                panic!("expected Assignment");
-            };
+            let next_a = recv_assignment(&mut worker_rx).await;
             assert_eq!(
                 next_a.drv_path, p_prio_a,
                 "Interactive newly-ready A should dispatch before queued Scheduled work. \
@@ -1383,14 +1346,12 @@ async fn test_merge_db_failure_rolls_back_memory() -> TestResult {
 /// empty-set result (everything assumed uncached).
 #[tokio::test]
 async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store;
+    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
     let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, addr, _store_h) = spawn_mock_store().await?;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     store.fail_find_missing.store(true, Ordering::SeqCst);
-
-    let store_client = rio_proto::client::connect_store(&addr.to_string()).await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Merge with expected_output_paths set so check_cached_outputs runs.
@@ -1431,14 +1392,12 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
 /// This proves both the open transition AND the close-on-recovery path.
 #[tokio::test]
 async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
-    use rio_test_support::grpc::spawn_mock_store;
+    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
 
     let test_db = TestDb::new(&MIGRATOR).await;
-    let (store, addr, _store_h) = spawn_mock_store().await?;
+    let (store, store_client, _store_h) = spawn_mock_store_with_client().await?;
     store.fail_find_missing.store(true, Ordering::SeqCst);
-
-    let store_client = rio_proto::client::connect_store(&addr.to_string()).await?;
     let (handle, _task) = setup_actor_with_store(test_db.pool.clone(), Some(store_client));
 
     // Helper: merge a single-node DAG. Each call MUST use a unique tag —

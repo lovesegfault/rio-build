@@ -198,8 +198,7 @@ async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"addsig test");
-    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    h.store.seed_with_content(TEST_PATH_A, b"addsig test");
 
     wire_send!(&mut h.stream;
         u64: 37,                           // wopAddSignatures

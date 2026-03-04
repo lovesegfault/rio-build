@@ -972,8 +972,6 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
-
     // =======================================================================
     // MetadataError classification (From<sqlx::Error>)
     // =======================================================================
@@ -1011,7 +1009,7 @@ mod tests {
     /// Real 23505 unique_violation → Conflict. Insert the same PK twice.
     #[tokio::test]
     async fn integration_unique_violation_is_conflict() {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let hash = vec![0xAAu8; 32];
 
         // First insert: OK.
@@ -1047,7 +1045,7 @@ mod tests {
     /// row whose store_path_hash FK doesn't exist in narinfo.
     #[tokio::test]
     async fn integration_fk_violation_is_conflict() {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
 
         let err: MetadataError = sqlx::query("INSERT INTO manifests (store_path_hash) VALUES ($1)")
             .bind(vec![0xBBu8; 32]) // no matching narinfo row
@@ -1067,7 +1065,7 @@ mod tests {
     /// UPDATEs → PlaceholderMissing, NOT a sqlx error.
     #[tokio::test]
     async fn integration_complete_without_placeholder_is_placeholder_missing() {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let info = rio_test_support::fixtures::make_path_info(
             &rio_test_support::fixtures::test_store_path("noplaceholder"),
             b"nar",

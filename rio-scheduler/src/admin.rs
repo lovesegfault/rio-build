@@ -377,8 +377,6 @@ mod tests {
     use rio_test_support::TestDb;
     use tokio_stream::StreamExt;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
-
     fn mk_batch(drv_path: &str, first_line: u64, lines: &[&[u8]]) -> BuildLogBatch {
         BuildLogBatch {
             derivation_path: drv_path.to_string(),
@@ -396,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_from_ring_buffer() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let buffers = Arc::new(LogBuffers::new());
         buffers.push(&mk_batch(
             "/nix/store/abc-test.drv",
@@ -428,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_since_line_filters() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let buffers = Arc::new(LogBuffers::new());
         buffers.push(&mk_batch(
             "/nix/store/abc-test.drv",
@@ -455,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let build_id = uuid::Uuid::new_v4();
         sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded')")
             .bind(build_id)
@@ -522,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let buffers = Arc::new(LogBuffers::new());
         // No S3 configured, buffer empty.
         let svc = AdminServiceImpl::new(buffers, None, db.pool.clone());
@@ -542,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = AdminServiceImpl::new(Arc::new(LogBuffers::new()), None, db.pool.clone());
 
         let result = svc
@@ -561,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn stubs_return_unimplemented() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = AdminServiceImpl::new(Arc::new(LogBuffers::new()), None, db.pool.clone());
 
         assert_eq!(

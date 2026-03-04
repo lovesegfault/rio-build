@@ -86,15 +86,8 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Worker should have received an assignment
-    let assignment = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .expect("should receive assignment within 2s")
-        .expect("stream should not be closed");
-    assert!(matches!(
-        assignment.msg,
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-    ));
+    // Worker should have received an assignment (recv_assignment panics if not).
+    let _ = recv_assignment(&mut stream_rx).await;
 
     // Derivation should now be Assigned. Simulate worker sending an Ack
     // to transition to Running via a completion with a sentinel... actually
@@ -273,13 +266,7 @@ async fn test_interactive_builds_pushed_to_front() -> TestResult {
     .await?;
 
     // The normal build gets assigned first (only one in queue)
-    let first = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await?
-        .expect("exists");
-    let first_path = match first.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
-        _ => panic!("expected assignment"),
-    };
+    let first_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(first_path, p_normal);
 
     // Now merge a second "scheduled" build — goes to back
@@ -302,13 +289,7 @@ async fn test_interactive_builds_pushed_to_front() -> TestResult {
     complete_success_empty(&handle, "test-worker", &p_normal).await?;
 
     // The next assignment should be the IFD derivation (was pushed to front)
-    let second = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-        .await?
-        .expect("exists");
-    let second_path = match second.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a.drv_path,
-        _ => panic!("expected assignment"),
-    };
+    let second_path = recv_assignment(&mut stream_rx).await.drv_path;
     assert_eq!(
         second_path, p_ifd,
         "interactive build should be dispatched before scheduled"

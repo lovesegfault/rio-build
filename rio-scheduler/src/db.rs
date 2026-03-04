@@ -519,7 +519,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use rio_test_support::TestDb;
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
     #[test]
     fn test_assignment_status_as_str_exhaustive() {
@@ -558,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_build_derivation_idempotent() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let build_id = Uuid::new_v4();
@@ -582,7 +581,7 @@ mod tests {
     /// BuildState::Pending has now_col="" → no timestamp column touched.
     #[tokio::test]
     async fn test_update_build_status_pending_no_timestamps() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let build_id = Uuid::new_v4();
@@ -613,7 +612,7 @@ mod tests {
     /// Non-terminal status (Acknowledged) → completed_at stays NULL.
     #[tokio::test]
     async fn test_update_assignment_status_acknowledged_no_completed_at() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let drv_id = insert_test_derivation(&db, "bbb").await?;
@@ -637,7 +636,7 @@ mod tests {
     /// Terminal status (Completed) → completed_at = now().
     #[tokio::test]
     async fn test_update_assignment_status_completed_sets_completed_at() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let drv_id = insert_test_derivation(&db, "ccc").await?;
@@ -662,7 +661,7 @@ mod tests {
     /// ema = old * (1-ALPHA) + new * ALPHA = 10 * 0.7 + 20 * 0.3 = 13.
     #[tokio::test]
     async fn test_update_build_history_ema_accumulates() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         db.update_build_history("hello", "x86_64-linux", 10.0, None, None)
@@ -699,7 +698,7 @@ mod tests {
     /// a real EMA toward zero on every build with a failed proc read.
     #[tokio::test]
     async fn test_update_build_history_memory_ema_none_is_no_signal() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let fetch = || async {
@@ -770,7 +769,7 @@ mod tests {
     /// ONE bad route, not several.
     #[tokio::test]
     async fn test_update_build_history_misclassified_overwrites() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         // Seed: EMA at 10s (would classify as "small").
@@ -815,7 +814,7 @@ mod tests {
     /// classify(). Verify the write→read roundtrip works end to end.
     #[tokio::test]
     async fn test_build_history_memory_roundtrip_read() -> anyhow::Result<()> {
-        let test_db = TestDb::new(&MIGRATOR).await;
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
         db.update_build_history(

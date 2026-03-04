@@ -464,18 +464,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use rio_test_support::fixtures::test_store_basename;
-    use rio_test_support::grpc::{MockStore, spawn_mock_store};
+    use rio_test_support::grpc::spawn_mock_store_with_client;
     use std::sync::atomic::Ordering;
-
-    async fn spawn_and_connect() -> anyhow::Result<(
-        MockStore,
-        StoreServiceClient<Channel>,
-        tokio::task::JoinHandle<()>,
-    )> {
-        let (store, addr, handle) = spawn_mock_store().await?;
-        let client = rio_proto::client::connect_store(&addr.to_string()).await?;
-        Ok((store, client, handle))
-    }
 
     /// Write a file at `{tmp}/nix/store/{basename}` and return the tempdir.
     fn make_output_file(basename: &str, contents: &[u8]) -> anyhow::Result<tempfile::TempDir> {
@@ -488,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_output_success() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_and_connect().await?;
+        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("hello");
         let tmp = make_output_file(&basename, b"hello world")?;
 
@@ -515,7 +505,7 @@ mod tests {
     /// backoff delays don't wall-clock-block the test.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_retries_then_succeeds() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_and_connect().await?;
+        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         store.fail_next_puts.store(2, Ordering::SeqCst);
         let basename = test_store_basename("retry");
         let tmp = make_output_file(&basename, b"retry me")?;
@@ -535,7 +525,7 @@ mod tests {
     /// More failures than MAX_UPLOAD_RETRIES → UploadExhausted.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_exhausts_retries() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_and_connect().await?;
+        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         store
             .fail_next_puts
             .store(MAX_UPLOAD_RETRIES + 1, Ordering::SeqCst);
@@ -558,7 +548,7 @@ mod tests {
     /// upload_all_outputs runs concurrently; all outputs land in MockStore.
     #[tokio::test]
     async fn test_upload_all_outputs_multiple() -> anyhow::Result<()> {
-        let (store, client, _h) = spawn_and_connect().await?;
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
         let tmp = tempfile::tempdir()?;
         let store_dir = tmp.path().join("nix/store");
         fs::create_dir_all(&store_dir)?;
@@ -593,7 +583,7 @@ mod tests {
     /// worker surfaces a useful error.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
-        let (_store, mut client, _h) = spawn_and_connect().await?;
+        let (_store, mut client, _h) = spawn_mock_store_with_client().await?;
         let tmp = tempfile::tempdir()?;
         // Create nix/store/ dir but NOT the output file.
         fs::create_dir_all(tmp.path().join("nix/store"))?;
@@ -658,7 +648,7 @@ mod tests {
     /// tee produce the same result as phase2a's eager dump+digest.
     #[tokio::test]
     async fn test_upload_streaming_mockstore_has_trailer_hash() -> anyhow::Result<()> {
-        let (store, mut client, _h) = spawn_and_connect().await?;
+        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("tee-hash");
         let tmp = make_output_file(&basename, b"tee upload test data")?;
 

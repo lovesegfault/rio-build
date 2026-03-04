@@ -34,6 +34,10 @@ pub mod state;
 // is part of the binary's TOML schema.
 pub use assignment::SizeClassConfig;
 
+/// Shared sqlx migrator for the `migrations/` directory. See
+/// rio-store's MIGRATOR for rationale — same pattern.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
 /// Register `# HELP` descriptions for all scheduler metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Descriptions

@@ -387,8 +387,6 @@ mod tests {
     use rio_test_support::TestDb;
     use tower::ServiceExt;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
-
     /// Build a Router backed by real PG + memory chunk backend.
     ///
     /// Returns `TestDb` (not just the pool) because TestDb's Drop
@@ -396,7 +394,7 @@ mod tests {
     /// router's pool points at a dead DB by the time the test runs.
     /// The `_db` binding in each test keeps it alive.
     async fn setup() -> (Router, TestDb, Arc<MemoryChunkBackend>) {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let backend = Arc::new(MemoryChunkBackend::new());
         let cache = Arc::new(ChunkCache::new(backend.clone() as Arc<dyn ChunkBackend>));
         let state = Arc::new(CacheServerState {
