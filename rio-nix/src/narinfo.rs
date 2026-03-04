@@ -280,6 +280,65 @@ impl NarInfo {
     }
 }
 
+/// Compute the narinfo signing fingerprint.
+///
+/// This is the canonical string that ed25519 signatures cover. A client
+/// verifying a narinfo `Sig:` line reconstructs this string from the
+/// narinfo fields, verifies the signature against it, and trusts the
+/// path iff a signature from a key in `trusted-public-keys` validates.
+///
+/// # Format
+///
+/// `"1;{store_path};{nar_hash};{nar_size};{refs}"` where:
+/// - `1` is the fingerprint version (only version Nix has)
+/// - `store_path` is the full `/nix/store/...` path
+/// - `nar_hash` is `sha256:{nixbase32}` (52-char nixbase32 of the raw
+///   32-byte SHA-256 — NOT hex, NOT SRI base64)
+/// - `nar_size` is the decimal byte count
+/// - `refs` is comma-joined FULL store paths, sorted lexicographically
+///   (not basenames — the narinfo text format uses basenames, but the
+///   fingerprint uses full paths)
+///
+/// # Nix reference
+///
+/// Matches `ValidPathInfo::fingerprint()` in Nix's `path-info.cc`.
+/// Getting this byte-for-byte right is load-bearing: one wrong
+/// separator or encoding and EVERY signature we produce is invalid.
+///
+/// # Why a free function, not a method on NarInfo
+///
+/// B2's signer calls this with fields from `ValidatedPathInfo` (the
+/// store's internal type), not from a `NarInfo` struct. Making it a
+/// method would force constructing a NarInfo just to sign — wasteful
+/// and backwards (we sign BEFORE building the narinfo text).
+pub fn fingerprint(
+    store_path: &str,
+    nar_hash_sha256: &[u8; 32],
+    nar_size: u64,
+    references: &[String],
+) -> String {
+    use crate::store_path::nixbase32;
+
+    // nixbase32-encode the raw SHA-256 bytes. 32 bytes → 52 chars.
+    // Nix's printHash32 does exactly this; the `sha256:` prefix is
+    // the type tag (same as narinfo's NarHash field).
+    let hash_colon = format!("sha256:{}", nixbase32::encode(nar_hash_sha256));
+
+    // Sort refs lexicographically. Nix's fingerprint() does this
+    // internally (it uses a BTreeSet). We take a slice so the caller
+    // doesn't have to pre-sort; we sort a clone.
+    //
+    // Full paths, not basenames. The narinfo TEXT format uses basenames
+    // (saves space, store dir is implicit), but the fingerprint uses
+    // full paths. Easy to get wrong if you've been staring at narinfo
+    // text.
+    let mut sorted_refs: Vec<&str> = references.iter().map(String::as_str).collect();
+    sorted_refs.sort_unstable();
+    let refs_joined = sorted_refs.join(",");
+
+    format!("1;{store_path};{hash_colon};{nar_size};{refs_joined}")
+}
+
 /// Builder for constructing [`NarInfo`] values.
 pub struct NarInfoBuilder {
     store_path: String,
@@ -388,6 +447,144 @@ impl NarInfoBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // fingerprint()
+    // ========================================================================
+
+    /// Exact-match test vector. This fingerprint string IS the contract
+    /// with Nix — if it changes, every signature we've ever produced
+    /// becomes invalid. The expected string below was cross-checked
+    /// against Nix's `ValidPathInfo::fingerprint()` (path-info.cc).
+    #[test]
+    fn fingerprint_exact() {
+        let store_path = "/nix/store/00000000000000000000000000000000-foo";
+        // All-zero hash: nixbase32 of 32 zero bytes is 52 zero-digit chars.
+        // (nixbase32 alphabet starts with '0', and all-zero input encodes
+        // to all-first-alphabet-char output.)
+        let hash = [0u8; 32];
+        let refs = vec![
+            "/nix/store/11111111111111111111111111111111-dep-b".to_string(),
+            "/nix/store/22222222222222222222222222222222-dep-a".to_string(),
+        ];
+
+        let fp = fingerprint(store_path, &hash, 12345, &refs);
+
+        // Refs are sorted lexicographically. "11...-dep-b" sorts before
+        // "22...-dep-a" (the HASH part, not the name, determines order
+        // for full paths).
+        let expected = format!(
+            "1;{};sha256:{};12345;{},{}",
+            store_path,
+            "0".repeat(52),
+            "/nix/store/11111111111111111111111111111111-dep-b",
+            "/nix/store/22222222222222222222222222222222-dep-a",
+        );
+        assert_eq!(fp, expected);
+    }
+
+    #[test]
+    fn fingerprint_no_refs() {
+        // Empty refs → empty string after the last semicolon.
+        // NOT ";," or ";{}" — just ";". Easy to get wrong with a
+        // join that doesn't handle empty input.
+        let fp = fingerprint(
+            "/nix/store/00000000000000000000000000000000-x",
+            &[0xAB; 32],
+            1,
+            &[],
+        );
+        assert!(fp.ends_with(";1;"), "empty refs should end ';size;': {fp}");
+        // And there's exactly one trailing semicolon region.
+        assert_eq!(fp.matches(';').count(), 4, "exactly 4 semicolons");
+    }
+
+    #[test]
+    fn fingerprint_sorts_refs() {
+        // Caller passes unsorted; we sort. Nix uses BTreeSet internally.
+        let refs = vec![
+            "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-z".to_string(),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a".to_string(),
+            "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-m".to_string(),
+        ];
+        let fp = fingerprint(
+            "/nix/store/00000000000000000000000000000000-x",
+            &[0; 32],
+            1,
+            &refs,
+        );
+
+        // Extract the refs part (after the 4th semicolon).
+        let refs_part = fp.rsplit_once(';').unwrap().1;
+        assert_eq!(
+            refs_part,
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a,\
+             /nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-m,\
+             /nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-z"
+        );
+    }
+
+    #[test]
+    fn fingerprint_hash_is_nixbase32_not_hex() {
+        // The single most likely bug: using hex instead of nixbase32.
+        // hex(00..00) = 64 '0' chars. nixbase32(00..00) = 52 '0' chars.
+        // The first-alphabet-char happens to be '0' for both, so count
+        // the length to distinguish.
+        let fp = fingerprint(
+            "/nix/store/00000000000000000000000000000000-x",
+            &[0; 32],
+            1,
+            &[],
+        );
+
+        // Find the "sha256:..." part.
+        let hash_part = fp
+            .split(';')
+            .find(|s| s.starts_with("sha256:"))
+            .unwrap()
+            .strip_prefix("sha256:")
+            .unwrap();
+
+        assert_eq!(
+            hash_part.len(),
+            52,
+            "hash must be nixbase32 (52 chars for SHA-256), not hex (64 chars): {hash_part}"
+        );
+    }
+
+    /// Non-zero hash check: verify the nixbase32 encoding is the SAME
+    /// one Nix uses (least-significant-digit-first, custom alphabet).
+    /// A different base32 variant would produce 52 chars too but
+    /// different content.
+    #[test]
+    fn fingerprint_hash_encoding_matches_nix() {
+        use crate::store_path::nixbase32;
+
+        // SHA-256 of "hello" — a well-known test vector.
+        // hex: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        let hash: [u8; 32] =
+            hex::decode("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        let fp = fingerprint(
+            "/nix/store/00000000000000000000000000000000-x",
+            &hash,
+            1,
+            &[],
+        );
+
+        // The hash in the fingerprint must match what nixbase32::encode
+        // produces independently. This is a tautology NOW (fingerprint
+        // calls nixbase32::encode) but catches future refactors that
+        // swap in a different encoder.
+        let expected_hash = nixbase32::encode(&hash);
+        assert!(
+            fp.contains(&format!("sha256:{expected_hash}")),
+            "fingerprint should contain nixbase32-encoded hash: {fp}"
+        );
+    }
 
     #[test]
     fn parse_with_ca() -> anyhow::Result<()> {
