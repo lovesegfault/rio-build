@@ -1,44 +1,85 @@
 //! Store path metadata persistence in PostgreSQL.
 //!
-//! CRUD operations for the `narinfo` and `nar_blobs` tables defined in
-//! `migrations/002_store_tables.sql`.
+//! CRUD operations for the `narinfo` and `manifests` tables defined in
+//! `migrations/006_phase2c.sql`.
 //!
-//! Phase 2a uses full NARs (no chunking), so `nar_blobs` tracks the storage
-//! key and upload status for each NAR blob.
+//! # Storage model (phase 2c)
+//!
+//! NAR content lives in one of two places, determined by `manifests.inline_blob`:
+//!
+//! - **Inline** (`inline_blob IS NOT NULL`): whole NAR stored directly in the
+//!   manifests row. No `manifest_data` row. Used for small NARs (<256KB by
+//!   default; E1 interim: ALL NARs, chunking lands in C3).
+//! - **Chunked** (`inline_blob IS NULL`): NAR split by FastCDC; chunks in S3;
+//!   `manifest_data.chunk_list` holds the ordered (blake3, size) list.
+//!
+//! This invariant (`inline_blob IS NOT NULL <=> no manifest_data row`) is
+//! enforced by code, not by a CHECK constraint — PG can't express "row in
+//! another table must not exist".
+//!
+//! # Write-ahead pattern
+//!
+//! 1. `insert_manifest_uploading()` — writes placeholder narinfo + manifest
+//!    with `status='uploading'`. Protects the upload from concurrent GC.
+//! 2. Caller writes inline_blob or uploads chunks.
+//! 3. `complete_manifest_inline()` / `complete_manifest_chunked()` — fills
+//!    real narinfo metadata + flips `status='complete'` atomically.
+//!
+//! On failure between 1 and 3, `delete_manifest_uploading()` reclaims the
+//! placeholder. It only touches rows where `nar_size = 0` (the placeholder
+//! marker — real NARs are always >0), so it's safe even if a concurrent
+//! upload already succeeded.
+//!
+//! `query_path_info()` and `find_missing_paths()` filter on
+//! `manifests.status = 'complete'`, so placeholders are never exposed.
 
+use bytes::Bytes;
 use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
-/// Insert a `nar_blobs` row with `status='uploading'` for a new upload.
+/// How a NAR's content is stored. Returned by [`get_manifest`].
 ///
-/// Write-ahead pattern step 1: mark the blob as "uploading" before writing
-/// data to the backend.
+/// This is the one place callers branch on inline-vs-chunked. GetPath reads
+/// this; the binary cache HTTP server reads this; future GC reads this.
+/// Encapsulating the branch here means the "check inline_blob FIRST, only
+/// then query manifest_data" rule lives in exactly one SQL query.
+#[derive(Debug)]
+pub enum ManifestKind {
+    /// Whole NAR stored in `manifests.inline_blob`.
+    Inline(Bytes),
+    /// NAR chunked; reassemble from this ordered list.
+    /// Each entry is `(blake3_digest, chunk_size_bytes)`.
+    ///
+    /// E1 returns an empty Vec here (chunking lands in C3) — this is
+    /// future-proofing the return type so GetPath doesn't need a second
+    /// rewrite when chunking lands.
+    Chunked(Vec<([u8; 32], u32)>),
+}
+
+/// Begin a new upload: insert placeholder narinfo + manifest rows.
 ///
-/// Implementation detail: `nar_blobs` has a FK to `narinfo`, so we insert a
-/// placeholder `narinfo` row (with zero nar_hash and nar_size=0) in the same
-/// transaction. The placeholder is overwritten with real metadata at
-/// `complete_upload()` time. `QueryPathInfo` and `find_missing_paths` filter
-/// on `nar_blobs.status='complete'`, so the placeholder is never exposed to
-/// clients.
+/// The placeholder narinfo has `nar_hash = [0;32]` and `nar_size = 0`.
+/// `nar_size = 0` is the placeholder marker: the minimum valid NAR is ~100
+/// bytes, so 0 unambiguously means "not a real upload yet". This lets
+/// `delete_manifest_uploading` identify placeholders without touching a
+/// concurrent successful upload of the same path.
 ///
-/// The `nar_size=0` placeholder is a safe marker: the minimum valid NAR is
-/// ~100 bytes, so nar_size=0 can never represent a real uploaded path. This
-/// enables `delete_uploading` to safely identify and clean up orphaned
-/// placeholders.
-///
-/// Returns `true` if inserted, `false` if a row already exists (idempotent).
+/// Returns `true` if inserted, `false` if another upload already holds a
+/// placeholder (caller should re-check `check_manifest_complete` — the race
+/// winner may have finished).
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn insert_uploading(
+pub async fn insert_manifest_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
-    blob_key: &str,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
 
-    // Insert narinfo placeholder (ON CONFLICT DO NOTHING for idempotency)
-    let narinfo_result = sqlx::query(
+    // narinfo placeholder first (manifests has FK to narinfo). ON CONFLICT
+    // DO NOTHING: if another uploader already inserted, we don't clobber
+    // their (possibly real, possibly placeholder) row.
+    sqlx::query(
         r#"
         INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size)
         VALUES ($1, $2, $3, 0)
@@ -47,25 +88,20 @@ pub async fn insert_uploading(
     )
     .bind(store_path_hash)
     .bind(store_path)
-    .bind(&[0u8; 32] as &[u8]) // placeholder hash, overwritten at complete time
+    .bind(&[0u8; 32] as &[u8])
     .execute(&mut *tx)
     .await?;
 
-    debug!(
-        narinfo_inserted = narinfo_result.rows_affected() > 0,
-        "narinfo placeholder insert"
-    );
-
-    // Insert nar_blobs with status='uploading'
+    // manifests placeholder. ON CONFLICT DO NOTHING for the same reason.
+    // rows_affected = 0 means another uploader owns this slot.
     let result = sqlx::query(
         r#"
-        INSERT INTO nar_blobs (store_path_hash, status, blob_key)
-        VALUES ($1, 'uploading', $2)
+        INSERT INTO manifests (store_path_hash, status)
+        VALUES ($1, 'uploading')
         ON CONFLICT (store_path_hash) DO NOTHING
         "#,
     )
     .bind(store_path_hash)
-    .bind(blob_key)
     .execute(&mut *tx)
     .await?;
 
@@ -74,35 +110,39 @@ pub async fn insert_uploading(
     Ok(result.rows_affected() > 0)
 }
 
-/// Complete an upload: update `nar_blobs.status` to `'complete'` and fill in
-/// the full `narinfo` metadata.
+/// Finalize an inline upload: fill real narinfo + store the NAR in
+/// `manifests.inline_blob` + flip status to 'complete'.
 ///
-/// This is the final step of the write-ahead pattern. Only after the NAR has
-/// been fully written and SHA-256 verified do we flip the status and populate
-/// the narinfo row with real metadata. This ensures `QueryPathInfo` never
-/// returns metadata for incomplete uploads.
-#[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
-pub async fn complete_upload(
+/// Single transaction: either the path becomes fully visible to
+/// `query_path_info` or it stays a placeholder. No partial-complete state.
+///
+/// `registration_time` and `ultimate` are now persisted (resolves the
+/// TODO(phase2c) at the old metadata.rs:329 — previously they were dropped
+/// on write and returned as 0/false on read, which was observable via
+/// `nix path-info --json` but didn't break clients).
+#[instrument(skip(pool, info, nar_data), fields(store_path = %info.store_path.as_str(), nar_size = nar_data.len()))]
+pub async fn complete_manifest_inline(
     pool: &PgPool,
     info: &ValidatedPathInfo,
-    blob_key: &str,
+    nar_data: Bytes,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    // Update narinfo with full metadata. StorePath::to_string() clones the
-    // cached `full` field (cheap). nar_hash.as_slice() on [u8;32] is free.
     let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
     let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
     let ca_str = info.content_address.as_deref();
+
     let narinfo_result = sqlx::query(
         r#"
         UPDATE narinfo SET
-            deriver = $2,
-            nar_hash = $3,
-            nar_size = $4,
-            "references" = $5,
-            signatures = $6,
-            ca = $7
+            deriver           = $2,
+            nar_hash          = $3,
+            nar_size          = $4,
+            "references"      = $5,
+            signatures        = $6,
+            ca                = $7,
+            registration_time = $8,
+            ultimate          = $9
         WHERE store_path_hash = $1
         "#,
     )
@@ -113,60 +153,70 @@ pub async fn complete_upload(
     .bind(&refs_str)
     .bind(&info.signatures)
     .bind(ca_str)
+    .bind(info.registration_time as i64)
+    .bind(info.ultimate)
     .execute(&mut *tx)
     .await?;
 
-    // Placeholder must exist. If rows_affected==0, another process deleted it
-    // (via delete_uploading) between insert_uploading and now. Fail explicitly.
     if narinfo_result.rows_affected() == 0 {
+        // insert_manifest_uploading MUST have run first. If rows_affected
+        // is 0, delete_manifest_uploading raced us and won. The caller's
+        // placeholder is gone; bailing here prevents a half-complete write.
         anyhow::bail!(
-            "complete_upload: narinfo placeholder missing for {} (concurrently deleted?)",
+            "complete_manifest_inline: narinfo placeholder missing for {} (concurrently deleted?)",
             info.store_path.as_str()
         );
     }
 
-    // Flip nar_blobs status to 'complete' and update blob_key
-    let blobs_result = sqlx::query(
+    // Store NAR + flip status. nar_data is Bytes (Arc-refcounted); sqlx binds
+    // &[u8], so .as_ref() — no copy.
+    let manifest_result = sqlx::query(
         r#"
-        UPDATE nar_blobs SET
-            status = 'complete',
-            blob_key = $2,
-            updated_at = now()
+        UPDATE manifests SET
+            status      = 'complete',
+            inline_blob = $2,
+            updated_at  = now()
         WHERE store_path_hash = $1
         "#,
     )
     .bind(&info.store_path_hash)
-    .bind(blob_key)
+    .bind(nar_data.as_ref())
     .execute(&mut *tx)
     .await?;
 
-    if blobs_result.rows_affected() == 0 {
+    if manifest_result.rows_affected() == 0 {
         anyhow::bail!(
-            "complete_upload: nar_blobs placeholder missing for {} (concurrently deleted?)",
+            "complete_manifest_inline: manifest placeholder missing for {} (concurrently deleted?)",
             info.store_path.as_str()
         );
     }
 
     tx.commit().await?;
 
-    debug!(store_path = %info.store_path.as_str(), "upload completed");
+    debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())
 }
 
-/// Delete the placeholder rows created by `insert_uploading` for a failed upload.
+/// Reclaim placeholder rows from a failed upload.
 ///
-/// Safe to call even if no placeholder exists. Only deletes rows where
-/// `nar_size=0` (the placeholder marker — real uploads always have nar_size > 0)
-/// AND `nar_blobs.status='uploading'`. This makes it safe even if a concurrent
-/// upload succeeded for the same path (that upload would have nar_size > 0).
+/// Only deletes rows where `narinfo.nar_size = 0` AND
+/// `manifests.status = 'uploading'`. Both conditions together: if a
+/// concurrent upload succeeded, its nar_size is >0 and status is 'complete',
+/// so we don't touch it. Safe to call even if no placeholder exists (no-op).
+///
+/// manifests deleted first (FK dependency: manifests → narinfo). ON DELETE
+/// CASCADE on the FK would also work but explicit ordering makes intent
+/// clear and doesn't depend on schema details.
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn delete_uploading(pool: &PgPool, store_path_hash: &[u8]) -> anyhow::Result<()> {
+pub async fn delete_manifest_uploading(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    // Delete nar_blobs first (FK constraint: nar_blobs references narinfo)
     sqlx::query(
         r#"
-        DELETE FROM nar_blobs
+        DELETE FROM manifests
         WHERE store_path_hash = $1 AND status = 'uploading'
         "#,
     )
@@ -174,7 +224,8 @@ pub async fn delete_uploading(pool: &PgPool, store_path_hash: &[u8]) -> anyhow::
     .execute(&mut *tx)
     .await?;
 
-    // Delete narinfo placeholder (nar_size=0 is the placeholder marker)
+    // nar_size = 0 is the placeholder marker. A successful upload ALWAYS
+    // has nar_size > 0 (min valid NAR is ~100 bytes).
     sqlx::query(
         r#"
         DELETE FROM narinfo
@@ -191,29 +242,83 @@ pub async fn delete_uploading(pool: &PgPool, store_path_hash: &[u8]) -> anyhow::
 
 /// Check if a store path already has a completed upload.
 ///
-/// Returns `Some(blob_key)` if the path exists with `status='complete'`,
-/// `None` otherwise.
+/// Idempotency pre-check for PutPath: if `true`, the path exists and the
+/// caller should return `created: false` without touching anything.
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn check_complete(
+pub async fn check_manifest_complete(
     pool: &PgPool,
     store_path_hash: &[u8],
-) -> anyhow::Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
+) -> anyhow::Result<bool> {
+    // EXISTS returns a PG bool, which sqlx decodes cleanly. `SELECT 1` would
+    // return int4 and need i32 (not i64) — a type-width footgun that turns
+    // into an opaque "ColumnDecode" runtime error. EXISTS sidesteps it
+    // entirely and is also the idiomatic existence-check query.
+    let exists: bool = sqlx::query_scalar(
         r#"
-        SELECT blob_key FROM nar_blobs
-        WHERE store_path_hash = $1 AND status = 'complete'
+        SELECT EXISTS(
+            SELECT 1 FROM manifests
+            WHERE store_path_hash = $1 AND status = 'complete'
+        )
         "#,
     )
     .bind(store_path_hash)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
+
+/// Fetch the storage kind + content for a completed path.
+///
+/// This is THE one place the inline/chunked branch is implemented. Callers
+/// (GetPath, cache_server) match on the result; they never query manifests
+/// or manifest_data directly.
+///
+/// `None` means the path has no complete manifest (either never uploaded,
+/// or stuck in 'uploading' from a crashed PutPath).
+///
+/// E1 interim: chunked arm is a stub. When `inline_blob IS NULL` we return
+/// `Chunked(vec![])` — unreachable in practice since E1's PutPath always
+/// writes inline, but the type is in place for C3/C5.
+#[instrument(skip(pool))]
+pub async fn get_manifest(pool: &PgPool, store_path: &str) -> anyhow::Result<Option<ManifestKind>> {
+    // Single query: join narinfo→manifests, filter status='complete',
+    // pull inline_blob. manifest_data is a second query only if needed
+    // (avoids pulling a potentially-large chunk_list we won't use).
+    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+        r#"
+        SELECT m.inline_blob
+        FROM manifests m
+        INNER JOIN narinfo n ON n.store_path_hash = m.store_path_hash
+        WHERE n.store_path = $1 AND m.status = 'complete'
+        "#,
+    )
+    .bind(store_path)
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|(key,)| key))
+    match row {
+        None => Ok(None),
+        Some((Some(blob),)) => Ok(Some(ManifestKind::Inline(Bytes::from(blob)))),
+        // inline_blob NULL → chunked. C3/C5 will query manifest_data here.
+        // E1 interim: PutPath always writes inline, so this arm is dead
+        // code — but returning a typed Chunked(empty) means C5's GetPath
+        // rewrite is purely additive (fill in this arm).
+        Some((None,)) => {
+            debug!(
+                store_path,
+                "manifest has NULL inline_blob; chunked path not yet wired (C3/C5)"
+            );
+            Ok(Some(ManifestKind::Chunked(Vec::new())))
+        }
+    }
 }
 
-/// Query path info for a store path. Only returns paths with `status='complete'`
-/// in `nar_blobs` to exclude the placeholder narinfo rows created by
-/// `insert_uploading`.
+/// Query path info for a store path.
+///
+/// Only returns paths with `manifests.status = 'complete'`. Placeholders
+/// (status = 'uploading') and orphans (narinfo row but no manifests row)
+/// are invisible.
 #[instrument(skip(pool))]
 pub async fn query_path_info(
     pool: &PgPool,
@@ -222,28 +327,28 @@ pub async fn query_path_info(
     let row: Option<NarinfoRow> = sqlx::query_as(
         r#"
         SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
-               n."references", n.signatures, n.ca
+               n."references", n.signatures, n.ca, n.registration_time, n.ultimate
         FROM narinfo n
-        INNER JOIN nar_blobs b ON n.store_path_hash = b.store_path_hash
-        WHERE n.store_path = $1 AND b.status = 'complete'
+        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
+        WHERE n.store_path = $1 AND m.status = 'complete'
         "#,
     )
     .bind(store_path)
     .fetch_optional(pool)
     .await?;
 
-    // DB-egress validation: before this commit, a malformed row (garbage
-    // store_path, wrong-length nar_hash) propagated silently through the
-    // whole system. Now it's caught here at the trust boundary.
+    // DB-egress validation: a malformed row (garbage store_path, wrong-length
+    // nar_hash) would otherwise propagate silently. Caught here at the trust
+    // boundary — PG doesn't enforce these as CHECK constraints.
     row.map(|r| r.try_into_validated())
         .transpose()
         .map_err(|e| anyhow::anyhow!("malformed narinfo row for {store_path}: {e}"))
 }
-/// Batch check which store paths are missing (not in the store with `status='complete'`).
+
+/// Batch check which store paths are missing.
 ///
-/// Only paths with `nar_blobs.status = 'complete'` are considered present.
-/// Paths stuck in `status='uploading'` (from an interrupted upload) are
-/// treated as missing so the client can retry.
+/// "Missing" means no manifests row with `status = 'complete'`. Paths stuck
+/// in 'uploading' (crashed PutPath) are missing — the client should retry.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
 pub async fn find_missing_paths(
     pool: &PgPool,
@@ -253,13 +358,12 @@ pub async fn find_missing_paths(
         return Ok(Vec::new());
     }
 
-    // Query all completed paths from the input set
     let complete: Vec<(String,)> = sqlx::query_as(
         r#"
         SELECT n.store_path
         FROM narinfo n
-        INNER JOIN nar_blobs b ON n.store_path_hash = b.store_path_hash
-        WHERE n.store_path = ANY($1) AND b.status = 'complete'
+        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
+        WHERE n.store_path = ANY($1) AND m.status = 'complete'
         "#,
     )
     .bind(store_paths)
@@ -269,38 +373,17 @@ pub async fn find_missing_paths(
     let complete_set: std::collections::HashSet<&str> =
         complete.iter().map(|(p,)| p.as_str()).collect();
 
-    let missing = store_paths
+    Ok(store_paths
         .iter()
         .filter(|p| !complete_set.contains(p.as_str()))
         .cloned()
-        .collect();
-
-    Ok(missing)
-}
-
-/// Get the blob key for a completed store path.
-#[instrument(skip(pool))]
-pub async fn get_blob_key(pool: &PgPool, store_path: &str) -> anyhow::Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT b.blob_key
-        FROM nar_blobs b
-        INNER JOIN narinfo n ON n.store_path_hash = b.store_path_hash
-        WHERE n.store_path = $1 AND b.status = 'complete'
-        "#,
-    )
-    .bind(store_path)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|(key,)| key))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 
-/// Row type for narinfo queries.
 #[derive(sqlx::FromRow)]
 struct NarinfoRow {
     store_path: String,
@@ -311,14 +394,16 @@ struct NarinfoRow {
     references: Vec<String>,
     signatures: Vec<String>,
     ca: Option<String>,
+    registration_time: i64,
+    ultimate: bool,
 }
 
 impl NarinfoRow {
     fn try_into_validated(self) -> Result<ValidatedPathInfo, PathInfoValidationError> {
-        // Build the raw PathInfo first, then delegate to TryFrom. Keeps the
-        // validation logic centralized in rio-proto::validated instead of
-        // duplicating it here.
         use rio_proto::types::PathInfo;
+        // Build raw PathInfo then delegate to the centralized TryFrom —
+        // keeps validation logic in one place (rio-proto::validated), not
+        // duplicated here.
         ValidatedPathInfo::try_from(PathInfo {
             store_path: self.store_path,
             store_path_hash: self.store_path_hash,
@@ -326,12 +411,12 @@ impl NarinfoRow {
             nar_hash: self.nar_hash,
             nar_size: self.nar_size as u64,
             references: self.references,
-            // TODO(phase2c): persist registration_time/ultimate columns.
-            // Currently dropped (narinfo table doesn't have them); gateway
-            // returns 0/false which is observable via nix store --query but
-            // doesn't break clients.
-            registration_time: 0,
-            ultimate: false,
+            // Now actually roundtrip (was 0/false before phase2c).
+            // `as u64` cast: registration_time is Unix epoch seconds,
+            // non-negative in practice. A negative value in the DB would
+            // be corruption; the cast wraps, which is detectable downstream.
+            registration_time: self.registration_time as u64,
+            ultimate: self.ultimate,
             signatures: self.signatures,
             content_address: self.ca.unwrap_or_default(),
         })

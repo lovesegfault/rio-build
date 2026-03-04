@@ -3,12 +3,9 @@
 //! Implements PutPath, GetPath, QueryPathInfo, FindMissingPaths.
 //! ContentLookup returns UNIMPLEMENTED (Phase 2a stub).
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, instrument, warn};
@@ -23,9 +20,8 @@ use rio_proto::types::{
 };
 use rio_proto::validated::ValidatedPathInfo;
 
-use crate::backend::NarBackend;
-use crate::metadata;
-use crate::validate::{HashingReader, validate_nar_digest};
+use crate::metadata::{self, ManifestKind};
+use crate::validate::validate_nar_digest;
 
 use rio_proto::client::NAR_CHUNK_SIZE;
 
@@ -53,23 +49,24 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
 
 /// The StoreService gRPC server.
 ///
-/// Holds a reference to the NAR backend and the PostgreSQL pool for metadata.
+/// Phase 2c: NAR content lives in `manifests.inline_blob` (small NARs) or
+/// as FastCDC chunks (large NARs, lands in C3). The `NarBackend` field from
+/// phase 2a is gone — inline blobs are stored directly in PG.
 pub struct StoreServiceImpl {
-    backend: Arc<dyn NarBackend>,
     pool: PgPool,
 }
 
 impl StoreServiceImpl {
     /// Create a new StoreService.
-    pub fn new(backend: Arc<dyn NarBackend>, pool: PgPool) -> Self {
-        Self { backend, pool }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Clean up an uploading placeholder after a PutPath error and record
-    /// the error metric. Call this on any error path AFTER insert_uploading
-    /// returned true (i.e., we own the placeholder).
+    /// the error metric. Call this on any error path AFTER
+    /// `insert_manifest_uploading` returned true (i.e., we own the placeholder).
     async fn abort_upload(&self, store_path_hash: &[u8]) {
-        if let Err(e) = metadata::delete_uploading(&self.pool, store_path_hash).await {
+        if let Err(e) = metadata::delete_manifest_uploading(&self.pool, store_path_hash).await {
             error!(error = %e, "PutPath: failed to clean up placeholder during abort");
         }
         metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
@@ -80,13 +77,16 @@ impl StoreServiceImpl {
 impl StoreService for StoreServiceImpl {
     /// Upload a store path (streaming NAR data with metadata).
     ///
-    /// PutPath flow (write-ahead pattern):
+    /// PutPath flow (write-ahead pattern, phase 2c inline storage):
     /// 1. Receive first message: PutPathMetadata with PathInfo
     /// 2. Check idempotency: if path already complete, return success
-    /// 3. Insert nar_blobs row with status='uploading'
+    /// 3. Insert manifest placeholder with status='uploading'
     /// 4. Accumulate NAR chunks (bounded by declared size + tolerance)
     /// 5. Verify SHA-256 matches declared nar_hash
-    /// 6. Complete upload: update narinfo + flip status to 'complete'
+    /// 6. Store NAR in manifests.inline_blob + flip status to 'complete'
+    ///
+    /// E1 interim: ALL NARs go into inline_blob regardless of size. C3 adds
+    /// the chunked path for NARs ≥ 256KB (FastCDC + S3 chunks + manifest_data).
     #[instrument(skip(self, request), fields(rpc = "PutPath"))]
     async fn put_path(
         &self,
@@ -183,11 +183,6 @@ impl StoreService for StoreServiceImpl {
         } else {
             info.store_path_hash.clone()
         };
-        // In trailer mode this is hex(zeros) — a placeholder. Only used for
-        // the insert_uploading lock row below; the REAL hex is recomputed
-        // after trailer resolution for backend.put() and complete_upload().
-        let placeholder_sha256_hex = hex::encode(info.nar_hash);
-
         debug!(
             store_path = %info.store_path.as_str(),
             nar_size = info.nar_size,
@@ -196,50 +191,47 @@ impl StoreService for StoreServiceImpl {
         );
 
         // Step 2: Check idempotency — if path already complete, return success
-        match metadata::check_complete(&self.pool, &store_path_hash).await {
-            Ok(Some(_)) => {
+        match metadata::check_manifest_complete(&self.pool, &store_path_hash).await {
+            Ok(true) => {
                 debug!(store_path = %info.store_path.as_str(), "PutPath: path already complete, returning success");
                 // Drain remaining stream messages (protocol contract)
                 drain_stream(&mut stream).await;
                 metrics::counter!("rio_store_put_path_total", "result" => "exists").increment(1);
                 return Ok(Response::new(PutPathResponse { created: false }));
             }
-            Ok(None) => {} // Not yet complete, proceed
+            Ok(false) => {} // Not yet complete, proceed
             Err(e) => {
                 // Drain remaining stream messages before returning error
                 drain_stream(&mut stream).await;
-                return Err(internal_error("PutPath: check_complete", e));
+                return Err(internal_error("PutPath: check_manifest_complete", e));
             }
         }
 
-        // Step 3: Insert nar_blobs row with status='uploading'.
-        // insert_uploading returns false (ON CONFLICT DO NOTHING no-op) if
-        // another uploader already holds a placeholder for this path.
-        // In that case we must NOT proceed: if we do and later fail
-        // validation, delete_uploading would delete the OTHER uploader's
-        // placeholder, losing their valid upload.
-        let blob_key = format!("{placeholder_sha256_hex}.nar");
-        let inserted = match metadata::insert_uploading(
+        // Step 3: Insert manifest placeholder with status='uploading'.
+        // Returns false (ON CONFLICT DO NOTHING no-op) if another uploader
+        // already holds a placeholder. In that case we must NOT proceed: if
+        // we do and later fail validation, delete_manifest_uploading would
+        // delete the OTHER uploader's placeholder, losing their valid upload.
+        let inserted = match metadata::insert_manifest_uploading(
             &self.pool,
             &store_path_hash,
             &info.store_path,
-            &blob_key,
         )
         .await
         {
             Ok(b) => b,
             Err(e) => {
                 drain_stream(&mut stream).await;
-                return Err(internal_error("PutPath: insert_uploading", e));
+                return Err(internal_error("PutPath: insert_manifest_uploading", e));
             }
         };
         if !inserted {
             // Another upload is in progress (or just completed in the window
-            // between check_complete above and now). Re-check: if it flipped
-            // to complete, return success; otherwise tell the client to retry.
+            // between check_manifest_complete above and now). Re-check: if
+            // it flipped to complete, return success; else tell client retry.
             drain_stream(&mut stream).await;
-            match metadata::check_complete(&self.pool, &store_path_hash).await {
-                Ok(Some(_)) => {
+            match metadata::check_manifest_complete(&self.pool, &store_path_hash).await {
+                Ok(true) => {
                     debug!(store_path = %info.store_path, "PutPath: concurrent upload won the race");
                     metrics::counter!("rio_store_put_path_total", "result" => "exists")
                         .increment(1);
@@ -392,40 +384,25 @@ impl StoreService for StoreServiceImpl {
             )));
         }
 
-        // In trailer mode, the sha256_hex we computed BEFORE the chunk loop
-        // (line ~186) was from the placeholder [0;32]. The blob_key derived
-        // from it is wrong. Recompute now that info.nar_hash is real.
-        let sha256_hex = hex::encode(info.nar_hash);
-
-        // Write to backend. Capture the actual storage key returned by put()
-        // instead of using the pre-computed blob_key: if a backend adds
-        // sharding (e.g., "ab/abcd...nar"), the two would silently drift and
-        // break GetPath. Currently both produce "{sha}.nar" so this is
-        // future-proofing.
-        let actual_blob_key = match self.backend.put(&sha256_hex, Bytes::from(nar_data)).await {
-            Ok(key) => key,
-            Err(e) => {
-                error!(error = %e, "PutPath: failed to write to backend");
-                self.abort_upload(&store_path_hash).await;
-                return Err(internal_error("backend write", e));
-            }
-        };
-
-        // Step 6: Complete upload — update narinfo + flip status to 'complete'.
+        // Step 6: Complete upload — store NAR in inline_blob + flip status.
         // `info` is already ValidatedPathInfo; just fill in the computed hash.
+        //
+        // complete_manifest_inline takes the NAR directly — no separate
+        // backend write step. This is atomic: either narinfo + manifest both
+        // commit, or neither does. No orphaned-blob cleanup needed (unlike
+        // phase 2a's backend-then-DB two-step, where a crash between them
+        // leaked S3 objects). C3 will add the chunked path here for NARs
+        // ≥ 256KB — THAT path reintroduces the two-step (PG manifest +
+        // S3 chunks), and the orphan-cleanup concern returns with it.
         let full_info = ValidatedPathInfo {
             store_path_hash,
             ..info
         };
-        if let Err(e) = metadata::complete_upload(&self.pool, &full_info, &actual_blob_key).await {
-            // Clean up placeholder rows AND backend blob (unlike validation/backend
-            // failures which only clean metadata). The blob is now orphaned —
-            // metadata never flipped to 'complete', so GetPath can't serve it.
+        if let Err(e) =
+            metadata::complete_manifest_inline(&self.pool, &full_info, Bytes::from(nar_data)).await
+        {
             self.abort_upload(&full_info.store_path_hash).await;
-            if let Err(backend_err) = self.backend.delete(&actual_blob_key).await {
-                warn!(error = %backend_err, "PutPath: failed to delete orphaned blob after complete_upload failure");
-            }
-            return Err(internal_error("PutPath: complete_upload", e));
+            return Err(internal_error("PutPath: complete_manifest_inline", e));
         }
 
         debug!(store_path = %full_info.store_path.as_str(), "PutPath: upload completed successfully");
@@ -439,11 +416,15 @@ impl StoreService for StoreServiceImpl {
 
     /// Download a store path's NAR data (streaming).
     ///
-    /// GetPath flow:
-    /// 1. Look up narinfo + nar_blobs from PostgreSQL
+    /// GetPath flow (phase 2c inline storage):
+    /// 1. Look up narinfo + manifest from PostgreSQL
     /// 2. First response message: PathInfo metadata
-    /// 3. Subsequent messages: NAR data chunks (64 KB each)
-    /// 4. Verify content integrity via HashingReader (detects on-disk corruption)
+    /// 3. Subsequent messages: NAR data sliced into NAR_CHUNK_SIZE pieces
+    /// 4. Verify content integrity via SHA-256 (detects DB corruption/bitrot)
+    ///
+    /// E1 interim: handles `ManifestKind::Inline` only. The `Chunked` arm is
+    /// unreachable (PutPath always writes inline) but compiles so C5's
+    /// chunked reassembly is purely additive.
     #[instrument(skip(self, request), fields(rpc = "GetPath"))]
     async fn get_path(
         &self,
@@ -454,42 +435,34 @@ impl StoreService for StoreServiceImpl {
 
         validate_store_path(&req.store_path)?;
 
-        // Step 1: Look up narinfo
+        // Step 1: Look up narinfo (for the first response message).
         let info = metadata::query_path_info(&self.pool, &req.store_path)
             .await
             .map_err(|e| internal_error("GetPath: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
-        // Look up blob key
-        let blob_key = metadata::get_blob_key(&self.pool, &req.store_path)
+        // Look up the manifest (inline blob or chunk list).
+        //
+        // `None` here is defense-in-depth for a race where query_path_info
+        // found the narinfo but get_manifest doesn't find the manifest. Both
+        // queries filter on manifests.status='complete', so in practice they
+        // agree. If they don't, the narinfo is orphaned — treat as NOT_FOUND.
+        let manifest = metadata::get_manifest(&self.pool, &req.store_path)
             .await
-            .map_err(|e| internal_error("GetPath: get_blob_key", e))?
+            .map_err(|e| internal_error("GetPath: get_manifest", e))?
             .ok_or_else(|| {
-                Status::not_found(format!("NAR blob not found for: {}", req.store_path))
-            })?;
-
-        // Step 2: Open blob from backend
-        let reader = self
-            .backend
-            .get(&blob_key)
-            .await
-            .map_err(|e| internal_error("backend read", e))?
-            .ok_or_else(|| {
-                Status::not_found(format!("NAR blob missing from backend: {blob_key}"))
+                Status::not_found(format!("manifest not found for: {}", req.store_path))
             })?;
 
         let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
 
-        // Stream response via a channel
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
-        // Send metadata as first message (convert back to raw PathInfo for the wire)
         let info_raw: PathInfo = info.into();
         rio_common::task::spawn_monitored("get-path-stream", async move {
-            // Bound the entire streaming task. A stalled backend read or a
-            // slow-consuming client can otherwise keep this task alive forever,
-            // leaking resources.
+            // Bound the entire streaming task. A slow-consuming client can
+            // otherwise keep this task alive forever, leaking resources.
             let stream_fut = async {
                 // First message: PathInfo
                 if tx
@@ -502,37 +475,48 @@ impl StoreService for StoreServiceImpl {
                     return;
                 }
 
-                // Step 3: Stream NAR data through HashingReader for integrity verification
-                let mut hashing = HashingReader::new(reader);
-                let mut buf = vec![0u8; NAR_CHUNK_SIZE];
+                // Step 3: Stream the NAR content. Branch on storage kind.
+                let nar_bytes = match manifest {
+                    ManifestKind::Inline(bytes) => bytes,
+                    ManifestKind::Chunked(_chunks) => {
+                        // E1 interim: unreachable (PutPath always inline).
+                        // C5 replaces this with reassemble_nar(chunks).
+                        let _ = tx
+                            .send(Err(Status::internal(
+                                "chunked NAR reassembly not yet implemented (phase2c C5)",
+                            )))
+                            .await;
+                        return;
+                    }
+                };
 
-                loop {
-                    match hashing.read(&mut buf).await {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            let chunk = buf[..n].to_vec();
-                            if tx
-                                .send(Ok(GetPathResponse {
-                                    msg: Some(get_path_response::Msg::NarChunk(chunk)),
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                return; // Client disconnected
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(internal_error("NAR stream read", e))).await;
-                            return;
-                        }
+                // Slice into NAR_CHUNK_SIZE pieces. `Bytes::slice()` is
+                // zero-copy (refcounted Arc-bump + offset); `.to_vec()` is
+                // one copy into the outgoing proto bytes field (protobuf
+                // needs owned Vec<u8>, no way around this one).
+                for slice in nar_bytes.chunks(NAR_CHUNK_SIZE) {
+                    if tx
+                        .send(Ok(GetPathResponse {
+                            msg: Some(get_path_response::Msg::NarChunk(slice.to_vec())),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return; // Client disconnected
                     }
                 }
 
-                // Step 4: Verify content integrity — the NAR on disk may have been
-                // corrupted (bitrot, partial write) since it was originally stored.
-                // If the hash doesn't match, send DATA_LOSS so the client knows not
-                // to trust the data.
-                let digest = hashing.into_digest();
+                // Step 4: Verify content integrity — the inline_blob in PG
+                // may have been corrupted (TOAST storage bitrot, manual DB
+                // tampering). SHA-256 over the whole blob; if it doesn't
+                // match narinfo.nar_hash, send DATA_LOSS.
+                //
+                // This is cheap: the blob is already in memory (no disk
+                // re-read), and SHA-256 over a few MB is sub-millisecond.
+                // For the chunked path (C5), per-chunk BLAKE3 verification
+                // happens during reassembly, and this whole-NAR SHA-256
+                // stays as belt-and-suspenders.
+                let digest = crate::validate::NarDigest::from_bytes(&nar_bytes);
                 if let Err(e) = validate_nar_digest(&digest, &expected_hash, expected_size) {
                     error!(error = %e, "GetPath: content integrity check failed");
                     metrics::counter!("rio_store_integrity_failures_total").increment(1);
@@ -565,7 +549,7 @@ impl StoreService for StoreServiceImpl {
 
     /// Query metadata for a single store path.
     ///
-    /// Only returns paths with nar_blobs.status='complete'.
+    /// Only returns paths with manifests.status='complete'.
     #[instrument(skip(self, request), fields(rpc = "QueryPathInfo"))]
     async fn query_path_info(
         &self,
@@ -586,7 +570,7 @@ impl StoreService for StoreServiceImpl {
 
     /// Batch check which paths are missing from the store.
     ///
-    /// Only completed paths (nar_blobs.status='complete') count as "present".
+    /// Only completed paths (manifests.status='complete') count as "present".
     #[instrument(skip(self, request), fields(rpc = "FindMissingPaths"))]
     async fn find_missing_paths(
         &self,
