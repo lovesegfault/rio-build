@@ -4040,6 +4040,7 @@ dependencies = [
  "bytes",
  "clap",
  "fastcdc",
+ "futures-util",
  "hex",
  "metrics",
  "proptest",

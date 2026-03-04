@@ -1,8 +1,13 @@
-//! NAR blob storage backends.
+//! Storage backends.
 //!
-//! Phase 2a stores full NARs (no chunking). The `NarBackend` trait
-//! abstracts over filesystem and S3 storage.
+//! `NarBackend` (filesystem/memory/s3): whole-NAR storage. Unused since
+//! E1 (inline storage in manifests.inline_blob replaced it), kept for the
+//! C3 ChunkBackend construction path — same config fields, different trait.
+//!
+//! `ChunkBackend` (chunk.rs): BLAKE3-addressed chunk storage for the
+//! phase2c chunked CAS. C3 wires this into PutPath.
 
+pub mod chunk;
 pub mod filesystem;
 pub mod memory;
 pub mod s3;
