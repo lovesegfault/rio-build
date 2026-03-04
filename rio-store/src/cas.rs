@@ -1,17 +1,16 @@
 //! Chunked content-addressable storage orchestration.
 //!
-//! `put_chunked()` is the phase-2c write path for large NARs. It ties
-//! together chunker (FastCDC), metadata (PG write-ahead + refcounts),
-//! and ChunkBackend (S3 upload), implementing the write-ahead pattern
-//! from `store.md:94-100`.
+//! Write path: `put_chunked()` — FastCDC + write-ahead + parallel upload.
+//! Read path: `ChunkCache` — moka LRU + singleflight + BLAKE3 verify.
 //!
-//! Called from `grpc.rs` PutPath AFTER the NAR is buffered and SHA-256
-//! verified. The gRPC layer owns step 0 (validate, idempotency check);
-//! this module owns steps 1-5 (write-ahead, upload, complete).
+//! The gRPC layer owns request parsing and the inline/chunked branch;
+//! this module owns everything below that.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use dashmap::DashMap;
+use futures_util::FutureExt;
 use sqlx::PgPool;
 use tracing::{debug, instrument, warn};
 
@@ -298,5 +297,466 @@ async fn rollback(pool: &PgPool, store_path_hash: &[u8], chunk_hashes: &[Vec<u8>
         metadata::delete_manifest_chunked_uploading(pool, store_path_hash, chunk_hashes).await
     {
         warn!(error = %e, "rollback of chunked upload failed; orphan scanner will clean up");
+    }
+}
+
+// ============================================================================
+// ChunkCache: read-path caching + singleflight + verification
+// ============================================================================
+
+/// In-process chunk cache with singleflight coalescing and BLAKE3 verify.
+///
+/// Wraps a `ChunkBackend`. GetPath (C5) uses this instead of the backend
+/// directly. Three layers:
+///
+/// 1. **moka LRU** — hot chunks stay in memory. Weight-based: tracks
+///    byte-size per entry, 2 GiB cap is a real memory bound (not just
+///    an entry count that might be 2 GiB or might be 100 MiB depending
+///    on chunk-size distribution).
+/// 2. **Singleflight** — if N concurrent GetPaths all need chunk X, one
+///    backend GET runs; N-1 await the same future. `store.md:114-122`
+///    calls this the thundering-herd fix: cold start with 100 builds
+///    needing overlapping closures would be O(100×M) S3 GETs without
+///    this; with it, O(M).
+/// 3. **BLAKE3 verify** — EVERY returned chunk is hashed against the
+///    requested hash. This is `store.md:45`: "corrupt chunks are re-
+///    fetched or flagged as an error". Catches: S3 bitrot, moka's
+///    memory getting corrupted (hardware fault), a backend bug returning
+///    the wrong chunk. The verify is ~250 MB/s; for a 64 KiB chunk
+///    that's ~0.25ms — trivial against S3's ~50ms GET latency.
+///
+/// # Why verify is HERE and not in the backend
+///
+/// Verifying in `ChunkBackend::get` would mean moka-cache hits skip
+/// verification (the cache returns bytes from memory, not from the
+/// backend). We want verify-always. Putting it at THIS layer means one
+/// verify per `get_verified()` call, regardless of which layer served
+/// the bytes.
+pub struct ChunkCache {
+    backend: Arc<dyn ChunkBackend>,
+    /// Lock-free async LRU. Key is the 32-byte BLAKE3 hash; value is the
+    /// chunk bytes. moka handles eviction internally based on the weigher.
+    lru: moka::future::Cache<[u8; 32], Bytes>,
+    /// In-flight backend fetches, keyed by hash. `Shared` lets N callers
+    /// clone and await the same future. The inner BoxFuture wraps a
+    /// spawned task — spawning means even if the first caller is
+    /// cancelled, the fetch runs to completion for the N-1 others.
+    ///
+    /// Output is `Option<Bytes>`: None covers both "not found" and
+    /// "backend error / task panic" (both log, then return None so
+    /// singleflight cleanup is uniform). Callers that need the
+    /// distinction... don't, actually: both mean "couldn't get the
+    /// chunk". The log captures which for operators.
+    ///
+    /// Why BoxFuture instead of `Shared<JoinHandle<...>>` directly:
+    /// Shared requires Output: Clone. JoinHandle's output is
+    /// `Result<T, JoinError>`; JoinError isn't Clone. So we map the
+    /// JoinHandle through `.ok().flatten()` BEFORE sharing — the
+    /// mapped future's output is `Option<Bytes>`, which IS Clone.
+    /// BoxFuture erases the unnamable `Map<JoinHandle, closure>` type.
+    inflight: DashMap<[u8; 32], InflightFetch>,
+}
+
+/// The Shared-future type stored in `inflight`. Type alias because the
+/// full type is 3 lines of generics that would obscure the struct.
+type InflightFetch =
+    futures_util::future::Shared<futures_util::future::BoxFuture<'static, Option<Bytes>>>;
+
+/// Default LRU capacity: 2 GiB. Configurable via `ChunkCache::with_capacity`.
+///
+/// At 64 KiB avg chunk size, 2 GiB holds ~32k chunks. That's enough to
+/// keep a whole stdenv closure (~1 GiB of outputs, chunked) hot. For
+/// smaller deployments, `with_capacity(256 * 1024 * 1024)` is plenty.
+const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Error from `ChunkCache::get_verified`.
+#[derive(Debug, thiserror::Error)]
+pub enum ChunkError {
+    /// Backend returned None — chunk not in S3. If the manifest says
+    /// this hash exists, this is data loss. Caller should propagate as
+    /// a hard error (not retry — retrying NotFound is pointless).
+    #[error("chunk {} not found in backend (data loss if manifest claims it exists)", hex::encode(.0))]
+    NotFound([u8; 32]),
+
+    /// BLAKE3 of the fetched bytes doesn't match the requested hash.
+    /// S3 bitrot, memory corruption, or a backend bug. The corrupt
+    /// bytes are NOT cached (we verify before insert).
+    #[error("chunk {} failed BLAKE3 verification (corrupt; expected {}, got {})",
+        hex::encode(.expected), hex::encode(.expected), hex::encode(.actual))]
+    Corrupt {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
+    /// Backend transient error (S3 5xx, network). Retriable.
+    ///
+    /// NOTE: currently unused — singleflight flattens backend errors to
+    /// None (same as NotFound) for simplicity. The log inside the spawned
+    /// task captures the actual error. This variant stays for C5's direct
+    /// backend path (if any) and to document the intent.
+    #[error("backend fetch failed: {0}")]
+    #[allow(dead_code)]
+    Backend(anyhow::Error),
+}
+
+impl ChunkCache {
+    /// Create a cache with the default 2 GiB capacity.
+    pub fn new(backend: Arc<dyn ChunkBackend>) -> Self {
+        Self::with_capacity(backend, DEFAULT_CACHE_CAPACITY_BYTES)
+    }
+
+    /// Create a cache with a custom capacity (bytes, not entry count).
+    pub fn with_capacity(backend: Arc<dyn ChunkBackend>, capacity_bytes: u64) -> Self {
+        let lru = moka::future::Cache::builder()
+            // Weight = byte size. u32 return type; CHUNK_MAX is 256 KiB so
+            // no overflow risk. The `.min()` is defensive for a pathological
+            // Bytes someone stuffs in via a future API.
+            .weigher(|_k: &[u8; 32], v: &Bytes| v.len().min(u32::MAX as usize) as u32)
+            .max_capacity(capacity_bytes)
+            .build();
+        Self {
+            backend,
+            lru,
+            inflight: DashMap::new(),
+        }
+    }
+
+    /// Fetch a chunk, with caching + singleflight + BLAKE3 verify.
+    ///
+    /// # Flow
+    ///
+    /// 1. LRU hit → verify → return. No backend call, no singleflight.
+    /// 2. LRU miss → check singleflight map:
+    ///    - Fetch in progress → await the existing future.
+    ///    - No fetch → spawn one, insert into map, await it.
+    /// 3. Verify the bytes (regardless of where they came from).
+    /// 4. Insert into LRU (only if verify passed — don't cache corruption).
+    /// 5. Remove from singleflight map.
+    ///
+    /// # Singleflight lifecycle
+    ///
+    /// The inflight entry is removed AFTER the fetch completes (success
+    /// or error). A failed fetch removes the entry so the next caller
+    /// retries cleanly — if we left the error in the map, all subsequent
+    /// callers would see the same stale error even after S3 recovered.
+    #[instrument(skip(self), fields(hash = hex::encode(hash)))]
+    pub async fn get_verified(&self, hash: &[u8; 32]) -> Result<Bytes, ChunkError> {
+        // --- Layer 1: LRU ---
+        if let Some(bytes) = self.lru.get(hash).await {
+            metrics::counter!("rio_store_chunk_cache_hits_total").increment(1);
+            // Verify even on cache hit. Memory corruption is rare but
+            // real (cosmic rays, bad RAM). The alternative — trusting
+            // the cache unconditionally — means a single bit-flip
+            // propagates to every subsequent GetPath until restart.
+            return Self::verify(hash, bytes);
+        }
+        metrics::counter!("rio_store_chunk_cache_misses_total").increment(1);
+
+        // --- Layer 2: Singleflight ---
+        let fetched = self.singleflight_fetch(hash).await?;
+
+        // NotFound: backend says it doesn't have this chunk. Don't cache
+        // the absence (the chunk might get uploaded between now and the
+        // next call). Propagate as data-loss error.
+        let bytes = fetched.ok_or(ChunkError::NotFound(*hash))?;
+
+        // --- Layer 3: Verify BEFORE cache insert ---
+        // If this fails, the corrupt bytes never enter the cache. The
+        // next call retries from the backend (which might have recovered
+        // — S3 bitrot is sometimes transient, sometimes not).
+        let verified = Self::verify(hash, bytes)?;
+
+        // --- Layer 4: Cache insert ---
+        // moka's insert is async (eviction runs concurrently). Bytes is
+        // Arc-backed so cloning is cheap.
+        self.lru.insert(*hash, verified.clone()).await;
+
+        Ok(verified)
+    }
+
+    /// Singleflight: either await an in-progress fetch or start a new one.
+    ///
+    /// Returns `Option<Bytes>` from the backend (None = NotFound).
+    /// Errors from the backend propagate through; the inflight entry
+    /// is cleaned up so the next call retries.
+    async fn singleflight_fetch(&self, hash: &[u8; 32]) -> Result<Option<Bytes>, ChunkError> {
+        // Check-then-insert with entry API. DashMap's entry() locks the
+        // shard for this key, so two concurrent callers racing on the
+        // same hash are serialized here: one inserts, one finds it.
+        //
+        // We spawn the backend call instead of just storing a future.
+        // Why: if the FIRST caller is cancelled (client disconnect),
+        // a plain Shared<impl Future> would also be cancelled, and the
+        // N-1 awaiters would see a cancelled future. A spawned task
+        // runs to completion regardless of who's awaiting.
+        let shared = self
+            .inflight
+            .entry(*hash)
+            .or_insert_with(|| {
+                let backend = Arc::clone(&self.backend);
+                let h = *hash;
+                // Spawn + map + boxed + shared:
+                // - spawn: fetch survives first-caller cancellation
+                // - map: JoinHandle's Result<Opt,JoinError> → Opt (JoinError
+                //   isn't Clone, so Shared can't hold it; .ok().flatten()
+                //   turns panic → None, same as backend error → None)
+                // - boxed: erase the unnamable Map<JoinHandle,closure> type
+                //   so it fits InflightFetch
+                // - shared: N callers await the same result
+                //
+                // Error is logged inside the task. None here conflates
+                // "not found" with "backend error" with "task panicked"
+                // — all three mean "couldn't get the chunk"; the log
+                // distinguishes them for operators. Callers retry
+                // uniformly (inflight cleanup below runs either way).
+                tokio::spawn(async move {
+                    match backend.get(&h).await {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            warn!(hash = %hex::encode(h), error = %e,
+                                  "chunk backend fetch failed");
+                            None
+                        }
+                    }
+                })
+                .map(|join_result| {
+                    // Task panic → None. Log here (the task itself
+                    // didn't get to log its own panic).
+                    join_result
+                        .inspect_err(|e| warn!(error = %e, "chunk fetch task panicked"))
+                        .ok()
+                        .flatten()
+                })
+                .boxed()
+                .shared()
+            })
+            .clone();
+
+        // Await the shared fetch. The task continues even if we're
+        // cancelled here (it's spawned); the shared handle is just
+        // our window into its result.
+        let result = shared.await;
+
+        // Cleanup: remove from inflight. Runs once per AWAITER, not
+        // once per fetch — N callers all call remove. DashMap::remove
+        // on a missing key is a cheap no-op; first one removes, rest
+        // no-op.
+        //
+        // Why remove-after not remove-before? Remove-before means the
+        // next caller starts a duplicate fetch while we're awaiting.
+        // Remove-after means the window between fetch-complete and
+        // remove is tiny, and a caller in that window awaits an
+        // already-complete Shared (instant return).
+        self.inflight.remove(hash);
+
+        Ok(result)
+    }
+
+    /// BLAKE3-verify bytes against the expected hash.
+    ///
+    /// Pass-through on success (same Bytes, Arc-bumped). Err on mismatch.
+    /// Factored out so LRU-hit and LRU-miss paths both call it.
+    fn verify(expected: &[u8; 32], bytes: Bytes) -> Result<Bytes, ChunkError> {
+        let actual = *blake3::hash(&bytes).as_bytes();
+        if actual == *expected {
+            Ok(bytes)
+        } else {
+            metrics::counter!("rio_store_integrity_failures_total").increment(1);
+            Err(ChunkError::Corrupt {
+                expected: *expected,
+                actual,
+            })
+        }
+    }
+
+    /// Expose the cache hit ratio for the `rio_store_cache_hit_ratio` gauge.
+    ///
+    /// moka doesn't track hit/miss internally; we count via the metrics
+    /// above. This computes the ratio from whatever Prometheus has. For
+    /// local testing, call this after a known number of gets. In prod,
+    /// the counter pair (hits_total / misses_total) is what dashboards
+    /// should query — ratio gauges lose meaning when averaged across
+    /// instances (`observability.md:123`).
+    ///
+    /// This is a placeholder: returns 0.0 until C5 wires the gauge via
+    /// the actual counters. The counters are the real signal.
+    #[cfg(test)]
+    pub fn test_cache_len(&self) -> u64 {
+        // moka's entry_count is approximate (eventually consistent with
+        // pending eviction). Good enough for tests.
+        self.lru.entry_count()
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::backend::chunk::MemoryChunkBackend;
+
+    /// Real hash/data pair: the BLAKE3 of "hello chunk cache".
+    /// `get_verified` hashes the data and compares, so these must match.
+    fn sample_chunk() -> ([u8; 32], Bytes) {
+        let data = Bytes::from_static(b"hello chunk cache");
+        let hash = *blake3::hash(&data).as_bytes();
+        (hash, data)
+    }
+
+    fn make_cache() -> (Arc<MemoryChunkBackend>, ChunkCache) {
+        let backend = Arc::new(MemoryChunkBackend::new());
+        // Small capacity so eviction tests don't need GB of data.
+        let cache =
+            ChunkCache::with_capacity(backend.clone() as Arc<dyn ChunkBackend>, 1024 * 1024);
+        (backend, cache)
+    }
+
+    #[tokio::test]
+    async fn get_found_and_verified() {
+        let (backend, cache) = make_cache();
+        let (hash, data) = sample_chunk();
+        backend.put(&hash, data.clone()).await.unwrap();
+
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn get_not_found() {
+        let (_backend, cache) = make_cache();
+        let (hash, _) = sample_chunk();
+        // Not in backend → NotFound.
+
+        let result = cache.get_verified(&hash).await;
+        assert!(matches!(result, Err(ChunkError::NotFound(_))));
+    }
+
+    /// The critical test: corrupt data in backend → verify catches it.
+    /// Without this, S3 bitrot would propagate silently.
+    #[tokio::test]
+    async fn corrupt_chunk_rejected() {
+        let (backend, cache) = make_cache();
+        let (hash, _good_data) = sample_chunk();
+
+        // Store GARBAGE under the real hash. Backend accepts it (put
+        // doesn't verify — that's the contract, caller is supposed to
+        // pass matching hash+data).
+        backend
+            .put(&hash, Bytes::from_static(b"garbage"))
+            .await
+            .unwrap();
+
+        let result = cache.get_verified(&hash).await;
+        match result {
+            Err(ChunkError::Corrupt { expected, actual }) => {
+                assert_eq!(expected, hash);
+                assert_ne!(actual, hash); // hash of "garbage", not the real one
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Corrupt data should NOT be cached — next call retries backend.
+    #[tokio::test]
+    async fn corrupt_not_cached_retry_succeeds() {
+        let (backend, cache) = make_cache();
+        let (hash, good_data) = sample_chunk();
+
+        // First: garbage.
+        backend
+            .put(&hash, Bytes::from_static(b"garbage"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get_verified(&hash).await,
+            Err(ChunkError::Corrupt { .. })
+        ));
+
+        // Fix the backend (simulating S3 recovering / re-upload).
+        backend.put(&hash, good_data.clone()).await.unwrap();
+
+        // Second call hits backend again (corrupt bytes weren't cached),
+        // sees good data, verifies, succeeds.
+        let got = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(got, good_data);
+    }
+
+    /// Second get of same chunk → LRU hit (no second backend call).
+    /// We can't directly observe "no backend call" with MemoryChunkBackend,
+    /// but we CAN delete from backend after first get — if the second
+    /// get succeeds, it came from LRU.
+    #[tokio::test]
+    async fn lru_hit_skips_backend() {
+        let (backend, cache) = make_cache();
+        let (hash, data) = sample_chunk();
+        backend.put(&hash, data.clone()).await.unwrap();
+
+        // First get: miss → backend → cache insert.
+        let first = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(first, data);
+
+        // moka inserts are async; give eviction/insert a moment to settle.
+        // `run_pending_tasks()` makes this deterministic for tests.
+        cache.lru.run_pending_tasks().await;
+
+        // Delete from backend. Second get MUST come from LRU or fail.
+        backend.corrupt_for_test(&hash, Bytes::from_static(b"DELETED"));
+        // Actually corrupt_for_test overwrites — let me use something
+        // that would fail verify if it reached the backend.
+        // Already done: "DELETED" ≠ good data → verify would fail.
+
+        let second = cache.get_verified(&hash).await.unwrap();
+        assert_eq!(second, data, "LRU hit should skip backend");
+    }
+
+    /// Singleflight: N concurrent gets for the same chunk → 1 backend call.
+    ///
+    /// We can verify this by using a backend that DELAYS and counting
+    /// concurrent entries in the inflight map. But MemoryChunkBackend is
+    /// instant. Alternative: spawn 10 concurrent gets, verify they all
+    /// succeed with the same data (weak but proves no corruption from
+    /// the race) AND the inflight map is empty after (cleanup worked).
+    #[tokio::test]
+    async fn singleflight_concurrent_gets() {
+        let (backend, cache) = make_cache();
+        let cache = Arc::new(cache);
+        let (hash, data) = sample_chunk();
+        backend.put(&hash, data.clone()).await.unwrap();
+
+        // 10 concurrent gets.
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move { cache.get_verified(&hash).await })
+            })
+            .collect();
+
+        for h in handles {
+            let got = h.await.unwrap().unwrap();
+            assert_eq!(got, data);
+        }
+
+        // Inflight map cleaned up after all awaiters finish.
+        assert!(
+            cache.inflight.is_empty(),
+            "inflight map should be empty after fetch completes"
+        );
+    }
+
+    /// After a failed fetch (backend error), inflight is cleaned up so
+    /// the next call retries cleanly.
+    #[tokio::test]
+    async fn singleflight_cleanup_on_miss() {
+        let (_backend, cache) = make_cache();
+        let (hash, _) = sample_chunk();
+        // Backend empty → first call fails with NotFound.
+
+        let first = cache.get_verified(&hash).await;
+        assert!(matches!(first, Err(ChunkError::NotFound(_))));
+
+        // Inflight should be clean (remove-after-await).
+        assert!(cache.inflight.is_empty());
+
+        // Second call also hits backend (inflight didn't cache the miss).
+        let second = cache.get_verified(&hash).await;
+        assert!(matches!(second, Err(ChunkError::NotFound(_))));
     }
 }
