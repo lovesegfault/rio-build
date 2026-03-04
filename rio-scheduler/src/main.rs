@@ -193,6 +193,17 @@ async fn main() -> anyhow::Result<()> {
     // "small=30s cutoff and 100 queued there → scale small pool."
     // Empty config → no gauges emitted (size-classes disabled).
     for class in &cfg.size_classes {
+        // Reject NaN/inf/zero/negative cutoffs at startup. TOML supports
+        // `nan` and `inf` as float literals; without this check, a typo
+        // like `cutoff_secs = nan` would crash the scheduler on every
+        // dispatch (the pre-total_cmp sort panicked on NaN). Fail fast
+        // with a message pointing at the offending class.
+        anyhow::ensure!(
+            class.cutoff_secs.is_finite() && class.cutoff_secs > 0.0,
+            "size_classes[{}].cutoff_secs must be finite and positive, got {}",
+            class.name,
+            class.cutoff_secs
+        );
         metrics::gauge!("rio_scheduler_cutoff_seconds", "class" => class.name.clone())
             .set(class.cutoff_secs);
     }

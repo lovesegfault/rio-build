@@ -91,12 +91,14 @@ pub fn classify(
     // ~100 bytes and the sort is trivial. Not worth caching sorted
     // order on the actor — this runs once per dispatch decision, not
     // per-packet.
+    //
+    // total_cmp (not partial_cmp) — main.rs validates cutoff_secs is
+    // finite at startup, but total_cmp is defense-in-depth: it defines
+    // NaN as "largest" under IEEE 754 total order, so a hypothetical
+    // NaN cutoff would sort to the end rather than panicking the
+    // scheduler on every dispatch.
     let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.cutoff_secs
-            .partial_cmp(&b.cutoff_secs)
-            .expect("cutoffs are operator-configured finite values")
-    });
+    sorted.sort_by(|a, b| a.cutoff_secs.total_cmp(&b.cutoff_secs));
 
     // Find the smallest class whose cutoff covers est_dur, then check
     // memory. If memory forces a bump, we want the NEXT class — hence
@@ -525,6 +527,33 @@ mod tests {
         // 10 hours > every cutoff. Goes to largest, not None.
         // Returning None would strand slow builds forever.
         assert_eq!(classify(36000.0, None, &c).as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn classify_nan_cutoff_does_not_panic() {
+        // main.rs rejects NaN cutoffs at startup with an operator-facing
+        // error. But classify() is still defense-in-depth: total_cmp
+        // puts NaN at the end of the sort (IEEE 754 total order), so a
+        // NaN cutoff acts like "infinite cutoff" — it becomes the
+        // overflow bucket. The important property: no panic.
+        let c = vec![
+            SizeClassConfig {
+                name: "normal".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+            },
+            SizeClassConfig {
+                name: "broken".into(),
+                cutoff_secs: f64::NAN,
+                mem_limit_bytes: u64::MAX,
+            },
+        ];
+        // 10s fits in "normal" → that wins (NaN sorted last).
+        assert_eq!(classify(10.0, None, &c).as_deref(), Some("normal"));
+        // 100s overflows "normal". The NaN class is "largest" by
+        // total_cmp, so it's the overflow target. `100.0 > NaN` is
+        // false so the duration-fits check at line ~107 passes.
+        assert_eq!(classify(100.0, None, &c).as_deref(), Some("broken"));
     }
 
     #[test]

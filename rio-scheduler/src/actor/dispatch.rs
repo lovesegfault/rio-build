@@ -162,7 +162,7 @@ impl DagActor {
         chain.sort_by(|a, b| {
             let ca = crate::assignment::cutoff_for(a, &self.size_classes).unwrap_or(f64::MAX);
             let cb = crate::assignment::cutoff_for(b, &self.size_classes).unwrap_or(f64::MAX);
-            ca.partial_cmp(&cb).expect("cutoffs finite")
+            ca.total_cmp(&cb)
         });
 
         // Walk the chain: first class with an available worker wins.
