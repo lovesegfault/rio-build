@@ -38,6 +38,10 @@ bytes = { workspace = true }
 # Crypto
 sha2 = { workspace = true }
 
+# Phase 2c chunked CAS
+fastcdc = { workspace = true }
+blake3 = { workspace = true }
+
 # Encoding
 hex = { workspace = true }
 
@@ -50,6 +54,7 @@ metrics = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Config
 serde = { workspace = true }
@@ -61,3 +66,4 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 aws-smithy-mocks = "0.2"
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
