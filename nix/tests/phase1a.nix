@@ -15,7 +15,7 @@
 # wopQueryValidPaths, wopNarFromPath (via `nix store cat`).
 #
 # Run interactively:
-#   nix build .#checks.x86_64-linux.rio-phase1a.driverInteractive
+#   nix build .#checks.x86_64-linux.vm-phase1a.driverInteractive
 #   ./result/bin/nixos-test-driver
 #   >>> start_all(); gateway.shell_interact()
 {
