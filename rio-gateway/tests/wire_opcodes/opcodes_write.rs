@@ -193,9 +193,51 @@ async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
 // QueryRealisation (43)
 // ===========================================================================
 
+/// AddSignatures on a seeded path: appends to MockStore and returns success.
+/// No longer a stub (phase2c E2) — actually calls the store RPC now.
 #[tokio::test]
-async fn test_add_signatures_stub_returns_success() -> anyhow::Result<()> {
+async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()> {
     let mut h = TestHarness::setup().await?;
+    let (nar, hash) = make_nar(b"addsig test");
+    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+
+    wire_send!(&mut h.stream;
+        u64: 37,                           // wopAddSignatures
+        string: TEST_PATH_A,
+        strings: &["cache.test:SIG_A", "cache.test:SIG_B"],
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "AddSignatures should return 1 (success)");
+
+    // Verify MockStore actually recorded the sigs (the old stub discarded
+    // them silently — this assertion would have caught that).
+    let stored_sigs = h
+        .store
+        .paths
+        .read()
+        .unwrap()
+        .get(TEST_PATH_A)
+        .map(|(info, _)| info.signatures.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        stored_sigs,
+        vec!["cache.test:SIG_A", "cache.test:SIG_B"],
+        "sigs should reach MockStore"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// AddSignatures on unknown path: STDERR_ERROR (not silent success).
+/// The old stub accepted everything; now unknown paths fail, matching
+/// the real daemon's behavior.
+#[tokio::test]
+async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
+    // TEST_PATH_A NOT seeded — MockStore returns NOT_FOUND.
 
     wire_send!(&mut h.stream;
         u64: 37,                           // wopAddSignatures
@@ -203,9 +245,12 @@ async fn test_add_signatures_stub_returns_success() -> anyhow::Result<()> {
         strings: &["sig:fake"],
     );
 
-    drain_stderr_until_last(&mut h.stream).await?;
-    let result = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(result, 1, "AddSignatures stub should return 1 (success)");
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("not found") || err.message.contains("NotFound"),
+        "error should mention not found, got: {}",
+        err.message
+    );
 
     h.finish().await;
     Ok(())

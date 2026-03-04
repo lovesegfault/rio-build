@@ -380,6 +380,86 @@ pub async fn find_missing_paths(
         .collect())
 }
 
+/// Resolve a store path from its 32-char nixbase32 hash part.
+///
+/// Nix store paths look like `/nix/store/{hash-part}-{name}`. The daemon's
+/// wopQueryPathFromHashPart hands us just `{hash-part}`; we need to find the
+/// full path. The hash-part uniquely identifies a path (it's a truncated hash
+/// of the full fingerprint), so a LIKE prefix match is correct, not just
+/// convenient.
+///
+/// `hash_part` is expected to be exactly 32 nixbase32 chars. The caller
+/// (gRPC layer) validates length and charset — we don't re-check here.
+/// An unvalidated `hash_part` with `%` or `_` in it would be a LIKE-
+/// injection (matches anything / anything-one-char); the gRPC validation
+/// prevents that by rejecting non-nixbase32 chars upfront.
+#[instrument(skip(pool))]
+pub async fn query_by_hash_part(
+    pool: &PgPool,
+    hash_part: &str,
+) -> anyhow::Result<Option<ValidatedPathInfo>> {
+    // LIKE pattern: the store prefix + hash + dash + anything.
+    // The dash is important — without it, a hash-part "aaa...a" would also
+    // match a hypothetical "aaa...ab-name" (32-char hash that happens to
+    // prefix-extend). Nix store paths always have the dash separator, so
+    // including it makes the match exact.
+    let pattern = format!("/nix/store/{hash_part}-%");
+
+    let row: Option<NarinfoRow> = sqlx::query_as(
+        r#"
+        SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
+               n."references", n.signatures, n.ca, n.registration_time, n.ultimate
+        FROM narinfo n
+        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
+        WHERE n.store_path LIKE $1 AND m.status = 'complete'
+        "#,
+    )
+    .bind(&pattern)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| r.try_into_validated())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("malformed narinfo row for hash-part {hash_part}: {e}"))
+}
+
+/// Append signatures to an existing narinfo.
+///
+/// Does NOT deduplicate — if the client sends the same sig twice, we store
+/// it twice. Nix's own AddSignatures has the same behavior; dedup is the
+/// client's responsibility. The `signatures` column is TEXT[], and PG's
+/// `||` (array concat) preserves order.
+///
+/// Returns the number of rows updated (0 = path not found, 1 = appended).
+/// Caller maps 0 to NOT_FOUND.
+#[instrument(skip(pool, sigs), fields(count = sigs.len()))]
+pub async fn append_signatures(
+    pool: &PgPool,
+    store_path: &str,
+    sigs: &[String],
+) -> anyhow::Result<u64> {
+    // WHERE ... = $1 (not LIKE): this takes a full path. Only
+    // query_by_hash_part does prefix matching.
+    //
+    // No manifests-join here: signatures are metadata on narinfo, independent
+    // of whether the NAR content is complete. In practice clients sign AFTER
+    // uploading (they need the nar_hash), so the manifest is always complete
+    // when this is called — but coupling this function to that assumption
+    // would break `nix store sign` against a path whose upload got stuck.
+    let result = sqlx::query(
+        r#"
+        UPDATE narinfo SET signatures = signatures || $2
+        WHERE store_path = $1
+        "#,
+    )
+    .bind(store_path)
+    .bind(sigs)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------

@@ -200,6 +200,43 @@ impl StoreService for MockStore {
             info: None,
         }))
     }
+
+    async fn query_path_from_hash_part(
+        &self,
+        request: Request<types::QueryPathFromHashPartRequest>,
+    ) -> Result<Response<types::PathInfo>, Status> {
+        let hash_part = request.into_inner().hash_part;
+        // Prefix-match: /nix/store/{hash}-...
+        // This is the same prefix-lookup query_path_info already did for the
+        // gateway's old workaround; now it's the dedicated RPC. The fallthrough
+        // prefix-scan in query_path_info stays (some tests may still hit it)
+        // but new tests should use this RPC.
+        let prefix = format!("/nix/store/{hash_part}-");
+        let paths = self.paths.read().unwrap();
+        for (k, (info, _)) in paths.iter() {
+            if k.starts_with(&prefix) {
+                return Ok(Response::new(info.clone()));
+            }
+        }
+        Err(Status::not_found(format!(
+            "not found: hash_part {hash_part}"
+        )))
+    }
+
+    async fn add_signatures(
+        &self,
+        request: Request<types::AddSignaturesRequest>,
+    ) -> Result<Response<types::AddSignaturesResponse>, Status> {
+        let req = request.into_inner();
+        let mut paths = self.paths.write().unwrap();
+        match paths.get_mut(&req.store_path) {
+            Some((info, _)) => {
+                info.signatures.extend(req.signatures);
+                Ok(Response::new(types::AddSignaturesResponse {}))
+            }
+            None => Err(Status::not_found(format!("not found: {}", req.store_path))),
+        }
+    }
 }
 
 // ============================================================================

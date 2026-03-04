@@ -21,6 +21,26 @@ service StoreService {
   // Content-addressed lookup: find a store path by its content hash.
   // Phase 2a: returns UNIMPLEMENTED (no CA cutoff).
   rpc ContentLookup(rio.types.ContentLookupRequest) returns (rio.types.ContentLookupResponse);
+
+  // Resolve a store path from its 32-char nixbase32 hash part.
+  //
+  // wopQueryPathFromHashPart (29) gives us just "abc123..." (the hash-part
+  // from /nix/store/{hash-part}-{name}). The Nix daemon looks this up in its
+  // ValidPaths table by prefix. We need the same: WHERE store_path LIKE
+  // '/nix/store/' || hash_part || '-%'. Without this RPC, the gateway was
+  // calling QueryPathInfo with a constructed path that has no name — always
+  // a miss (see the TODO this resolves at opcodes_read.rs:292).
+  //
+  // Also reused by cache_server.rs for /{hash}.narinfo HTTP requests.
+  rpc QueryPathFromHashPart(rio.types.QueryPathFromHashPartRequest) returns (rio.types.PathInfo);
+
+  // Append signatures to an existing store path's narinfo.
+  //
+  // wopAddSignatures (37): Nix clients send this after `nix store sign`.
+  // Previously stubbed (read wire data, discard — see TODO at
+  // opcodes_read.rs:337). Now we actually persist: UPDATE narinfo
+  // SET signatures = signatures || $2.
+  rpc AddSignatures(rio.types.AddSignaturesRequest) returns (rio.types.AddSignaturesResponse);
 }
 
 // Chunk-level storage service for content-defined chunking.
