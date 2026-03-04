@@ -79,7 +79,23 @@ pub fn max_leaked_mounts() -> usize {
     })
 }
 
-/// Build a heartbeat request, populating `running_builds` from the shared tracker.
+/// Handle to the FUSE cache's bloom filter. Extracted via
+/// `Cache::bloom_handle()` before the Cache is moved into the FUSE
+/// mount — lets the heartbeat loop read the same filter that `insert()`
+/// writes to.
+pub type BloomHandle = Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>;
+
+/// Build a heartbeat request, populating `running_builds` from the shared
+/// tracker and `local_paths` from the FUSE cache bloom filter.
+///
+/// `bloom` is `Option<&BloomHandle>` because not every test has FUSE
+/// mounted. `None` = no filter sent; scheduler treats that worker's
+/// locality score as "unknown" (neutral, not penalized).
+///
+/// Takes a bloom HANDLE (not `&Cache`) because main.rs has to move the
+/// Cache into `mount_fuse_background`. The handle is Arc-cloned out
+/// before the move; same underlying RwLock, so Cache::insert writes
+/// show up in our snapshots.
 ///
 /// Extracted for testability — the heartbeat loop in main.rs calls this.
 pub async fn build_heartbeat_request(
@@ -87,13 +103,34 @@ pub async fn build_heartbeat_request(
     system: &str,
     max_builds: u32,
     running: &RwLock<HashSet<String>>,
+    bloom: Option<&BloomHandle>,
 ) -> HeartbeatRequest {
     let current: Vec<String> = running.read().await.iter().cloned().collect();
+
+    // Snapshot + serialize. The snapshot clone is ~60 KB (default
+    // sizing); cheap for a 10s interval. Cloning out of the lock
+    // (instead of holding the guard) means insert() isn't blocked
+    // for the duration of the gRPC send.
+    //
+    // to_wire() returns a tuple because rio-common can't depend on
+    // rio-proto (cycle). We unpack into the proto struct here.
+    let local_paths = bloom.map(|b| {
+        let snapshot = b.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let (data, hash_count, num_bits, version) = snapshot.to_wire();
+        rio_proto::types::BloomFilter {
+            data,
+            hash_count,
+            num_bits,
+            hash_algorithm: rio_proto::types::BloomHashAlgorithm::Blake3256 as i32,
+            version,
+        }
+    });
+
     HeartbeatRequest {
         worker_id: worker_id.to_string(),
         running_builds: current,
         resources: Some(ResourceUsage::default()),
-        local_paths: None,
+        local_paths,
         system: system.to_string(),
         supported_features: Vec::new(),
         max_builds,
@@ -292,7 +329,7 @@ mod tests {
             .await
             .insert("/nix/store/bar.drv".to_string());
 
-        let req = build_heartbeat_request("worker-1", "x86_64-linux", 2, &running).await;
+        let req = build_heartbeat_request("worker-1", "x86_64-linux", 2, &running, None).await;
         assert_eq!(req.running_builds.len(), 2);
         assert!(
             req.running_builds
@@ -305,12 +342,108 @@ mod tests {
         assert_eq!(req.worker_id, "worker-1");
         assert_eq!(req.system, "x86_64-linux");
         assert_eq!(req.max_builds, 2);
+        // No cache → no bloom filter.
+        assert!(req.local_paths.is_none());
     }
 
     #[tokio::test]
     async fn test_heartbeat_empty_running_builds() {
         let running = Arc::new(RwLock::new(HashSet::new()));
-        let req = build_heartbeat_request("worker-1", "x86_64-linux", 1, &running).await;
+        let req = build_heartbeat_request("worker-1", "x86_64-linux", 1, &running, None).await;
         assert!(req.running_builds.is_empty());
+    }
+
+    /// With a cache, the heartbeat includes a bloom filter that
+    /// positive-matches inserted paths.
+    #[tokio::test]
+    async fn test_heartbeat_includes_bloom_from_cache() {
+        // Real Cache needs SQLite on disk — tempdir.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1)
+            .await
+            .unwrap();
+
+        // Cache::insert uses Handle::block_on (designed for FUSE's sync
+        // callbacks which run on dedicated threads). Calling it directly
+        // from an async test = "cannot block_on within a runtime" panic.
+        // spawn_blocking moves it to a blocking-thread-pool thread where
+        // block_on is legal.
+        let cache = Arc::new(cache);
+        {
+            let c = Arc::clone(&cache);
+            tokio::task::spawn_blocking(move || {
+                c.insert("/nix/store/aaa-test-one", 100).unwrap();
+                c.insert("/nix/store/bbb-test-two", 200).unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        // Extract handle (same thing main.rs does before moving Cache
+        // into the FUSE mount).
+        let bloom = cache.bloom_handle();
+
+        let running = Arc::new(RwLock::new(HashSet::new()));
+        let req =
+            build_heartbeat_request("worker-1", "x86_64-linux", 1, &running, Some(&bloom)).await;
+
+        let bloom_proto = req.local_paths.expect("cache present → bloom present");
+        assert_eq!(
+            bloom_proto.hash_algorithm,
+            rio_proto::types::BloomHashAlgorithm::Blake3256 as i32
+        );
+        assert_eq!(bloom_proto.version, 1);
+
+        // Deserialize and query — proves the wire roundtrip works AND
+        // the scheduler would see the inserted paths.
+        let filter = rio_common::bloom::BloomFilter::from_wire(
+            bloom_proto.data,
+            bloom_proto.hash_count,
+            bloom_proto.num_bits,
+            bloom_proto.hash_algorithm,
+            bloom_proto.version,
+        )
+        .unwrap();
+
+        assert!(filter.maybe_contains("/nix/store/aaa-test-one"));
+        assert!(filter.maybe_contains("/nix/store/bbb-test-two"));
+        // Absent path — probably-false (could be a false positive, but
+        // at 1% FPR with 2 items inserted, that's vanishingly unlikely).
+        assert!(!filter.maybe_contains("/nix/store/zzz-never-inserted"));
+    }
+
+    /// Bloom filter is populated from SQLite at Cache::new — paths that
+    /// were cached in a PREVIOUS run are in the filter immediately.
+    #[tokio::test]
+    async fn test_bloom_rebuilt_from_sqlite_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First "run": insert a path, drop the Cache.
+        {
+            let cache = Arc::new(
+                fuse::cache::Cache::new(dir.path().to_path_buf(), 1)
+                    .await
+                    .unwrap(),
+            );
+            let c = Arc::clone(&cache);
+            // spawn_blocking for the same block_on-in-async reason as above.
+            tokio::task::spawn_blocking(move || {
+                c.insert("/nix/store/persistent-path", 100).unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        // Second "run": fresh Cache on the SAME dir. SQLite persisted;
+        // bloom should be rebuilt from it.
+        let cache = fuse::cache::Cache::new(dir.path().to_path_buf(), 1)
+            .await
+            .unwrap();
+        let snapshot = cache.bloom_snapshot();
+
+        assert!(
+            snapshot.maybe_contains("/nix/store/persistent-path"),
+            "bloom should include paths from previous run's SQLite"
+        );
     }
 }

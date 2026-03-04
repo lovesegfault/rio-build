@@ -227,6 +227,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up FUSE cache and mount
     let cache = fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?;
+    // Extract the bloom handle BEFORE cache moves into mount_fuse_background.
+    // The heartbeat loop reads from the same RwLock that cache.insert() writes
+    // to — inserts by FUSE ops show up in subsequent heartbeat snapshots.
+    let heartbeat_bloom = cache.bloom_handle();
     let runtime = tokio::runtime::Handle::current();
 
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
@@ -293,6 +297,7 @@ async fn main() -> anyhow::Result<()> {
                 &heartbeat_system,
                 heartbeat_max_builds,
                 &heartbeat_running,
+                Some(&heartbeat_bloom),
             )
             .await;
 
