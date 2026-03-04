@@ -200,8 +200,22 @@ impl StoreService for MockStore {
 
     async fn content_lookup(
         &self,
-        _request: Request<types::ContentLookupRequest>,
+        request: Request<types::ContentLookupRequest>,
     ) -> Result<Response<types::ContentLookupResponse>, Status> {
+        let content_hash = request.into_inner().content_hash;
+        // Scan stored paths for a nar_hash match. O(n) is fine for a
+        // mock; real store has a PG index. First match wins (same
+        // semantics as the real LIMIT 1 — multiple paths with same
+        // content are all correct answers).
+        let paths = self.paths.read().unwrap();
+        for (store_path, (info, _nar)) in paths.iter() {
+            if info.nar_hash == content_hash {
+                return Ok(Response::new(types::ContentLookupResponse {
+                    store_path: store_path.clone(),
+                    info: Some(info.clone()),
+                }));
+            }
+        }
         Ok(Response::new(types::ContentLookupResponse {
             store_path: String::new(),
             info: None,
