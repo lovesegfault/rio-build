@@ -117,7 +117,7 @@ mod tests {
         let store_path = rio_nix::store_path::StorePath::parse(
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ci-test",
         )?;
-        let sp_hash = crate::grpc::compute_store_path_hash(store_path.as_str());
+        let sp_hash = store_path.sha256_digest().to_vec();
         let nar_hash = [0x42u8; 32];
 
         let info = ValidatedPathInfo {
@@ -169,7 +169,7 @@ mod tests {
         let sp = rio_nix::store_path::StorePath::parse(
             "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-idem",
         )?;
-        let sp_hash = crate::grpc::compute_store_path_hash(sp.as_str());
+        let sp_hash = sp.sha256_digest().to_vec();
         let nar_hash = [0x11u8; 32];
         let info = ValidatedPathInfo {
             store_path: sp,

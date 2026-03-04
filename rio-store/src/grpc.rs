@@ -326,7 +326,7 @@ impl StoreService for StoreServiceImpl {
 
         // Compute store_path_hash if not provided
         let store_path_hash = if info.store_path_hash.is_empty() {
-            compute_store_path_hash(info.store_path.as_str())
+            info.store_path.sha256_digest().to_vec()
         } else {
             info.store_path_hash.clone()
         };
@@ -1279,11 +1279,6 @@ impl ChunkService for ChunkServiceImpl {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Compute SHA-256 hash of the store path string (used as primary key).
-pub(crate) fn compute_store_path_hash(store_path: &str) -> Vec<u8> {
-    Sha256::digest(store_path.as_bytes()).to_vec()
-}
 
 /// Drain remaining messages from a streaming request.
 ///
