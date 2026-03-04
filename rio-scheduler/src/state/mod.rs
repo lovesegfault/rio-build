@@ -591,9 +591,10 @@ pub struct WorkerState {
     /// (false positive) or was stale (evicted since last heartbeat).
     pub bloom: Option<rio_common::bloom::BloomFilter>,
     /// Size class (e.g., "small", "large") reported by the worker.
-    /// `None` = worker doesn't declare a class (backward compat with
-    /// pre-D7 workers, and deployments without size-class config).
-    /// D7 uses this to filter candidate workers.
+    /// `None` = worker didn't declare a class. If the scheduler has
+    /// size_classes configured, best_worker() REJECTS unclassified
+    /// workers (misconfiguration — visible failure, not silent wildcard).
+    /// If the scheduler has no size_classes, this field is ignored.
     pub size_class: Option<String>,
 }
 
