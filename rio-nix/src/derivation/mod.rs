@@ -48,10 +48,10 @@ pub enum DerivationError {
     RecursionLimitExceeded(String),
 
     #[error("NAR extraction failed: {0}")]
-    NarExtract(String),
+    NarExtract(#[from] crate::nar::NarError),
 
     #[error("derivation content is not valid UTF-8: {0}")]
-    InvalidUtf8(String),
+    InvalidUtf8(#[from] std::string::FromUtf8Error),
 }
 
 /// Maximum recursion depth for `hash_derivation_modulo` (DoS prevention).
@@ -164,10 +164,8 @@ impl Derivation {
     ///
     /// Equivalent to: `extract_single_file(nar)` → UTF-8 decode → [`Derivation::parse`].
     pub fn parse_from_nar(nar_data: &[u8]) -> Result<Self, DerivationError> {
-        let drv_bytes = crate::nar::extract_single_file(nar_data)
-            .map_err(|e| DerivationError::NarExtract(e.to_string()))?;
-        let drv_text = String::from_utf8(drv_bytes)
-            .map_err(|e| DerivationError::InvalidUtf8(e.to_string()))?;
+        let drv_bytes = crate::nar::extract_single_file(nar_data)?;
+        let drv_text = String::from_utf8(drv_bytes)?;
         Self::parse(&drv_text)
     }
 

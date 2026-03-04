@@ -43,12 +43,12 @@ pub(super) fn verify_fod_hashes(
                 .iter()
                 .find(|u| u.store_path == output.path())
                 .with_context(|| format!("FOD output '{}' not found in uploads", output.name()))?;
-            if upload.nar_hash != expected {
+            if upload.nar_hash.as_slice() != expected {
                 bail!(
                     "FOD NAR hash mismatch for '{}': expected {}, got {}",
                     output.name(),
                     output.hash(),
-                    hex::encode(&upload.nar_hash)
+                    hex::encode(upload.nar_hash)
                 );
             }
         } else {
@@ -308,7 +308,7 @@ mod tests {
 
         let upload = upload::UploadResult {
             store_path: "/nix/store/test-fod".into(),
-            nar_hash: hex::decode(expected_hash)?,
+            nar_hash: hex::decode(expected_hash)?.try_into().unwrap(),
             nar_size: 100,
         };
 
@@ -325,7 +325,7 @@ mod tests {
         // Upload has DIFFERENT hash
         let upload = upload::UploadResult {
             store_path: "/nix/store/test-fod".into(),
-            nar_hash: vec![0u8; 32], // all zeros, != expected
+            nar_hash: [0u8; 32], // all zeros, != expected
             nar_size: 100,
         };
 

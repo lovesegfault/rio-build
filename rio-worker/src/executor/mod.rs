@@ -472,7 +472,7 @@ pub async fn execute_build(
                                     .to_string()
                             }),
                         output_path: result.store_path.clone(),
-                        output_hash: result.nar_hash.clone(),
+                        output_hash: result.nar_hash.to_vec(),
                     })
                     .collect();
 

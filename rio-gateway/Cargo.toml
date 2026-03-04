@@ -26,6 +26,7 @@ clap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 # wopRegisterDrvOutput/wopQueryRealisation parse/emit Realisation JSON
 # on the wire. Was dev-only (golden tests); promoted now that the opcodes

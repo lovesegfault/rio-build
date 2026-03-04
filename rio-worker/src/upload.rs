@@ -44,8 +44,11 @@ const STREAM_CHANNEL_BUF: usize = 4;
 pub struct UploadResult {
     /// The store path that was uploaded.
     pub store_path: String,
-    /// SHA-256 digest of the NAR.
-    pub nar_hash: Vec<u8>,
+    /// SHA-256 digest of the NAR. Always 32 bytes — `[u8; 32]` instead of
+    /// `Vec<u8>` so the type system enforces it (no `hash.len() == 32` check
+    /// at every consumer). The source (`do_upload_streaming`) already returns
+    /// `[u8; 32]`; the old `.to_vec()` was a gratuitous heap allocation.
+    pub nar_hash: [u8; 32],
     /// Size of the NAR in bytes.
     pub nar_size: u64,
 }
@@ -161,7 +164,7 @@ async fn upload_output(
                 );
                 return Ok(UploadResult {
                     store_path,
-                    nar_hash: nar_hash.to_vec(),
+                    nar_hash,
                     nar_size,
                 });
             }
@@ -493,7 +496,7 @@ mod tests {
         // Hash must match SHA-256 of the NAR serialization.
         let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename))?;
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
-        assert_eq!(result.nar_hash, expected_hash.to_vec());
+        assert_eq!(result.nar_hash, expected_hash);
         assert_eq!(result.nar_size, expected_nar.len() as u64);
 
         // MockStore should have recorded exactly one PutPath call.
@@ -661,7 +664,7 @@ mod tests {
         // == SHA-256 of dump_path(). Three-way consistency.
         let expected_nar = nar::dump_path(&tmp.path().join("nix/store").join(&basename))?;
         let expected_hash: [u8; 32] = Sha256::digest(&expected_nar).into();
-        assert_eq!(result.nar_hash, expected_hash.to_vec(), "worker's hash");
+        assert_eq!(result.nar_hash, expected_hash, "worker's hash");
 
         let puts = store.put_calls.read().unwrap();
         assert_eq!(puts.len(), 1);
