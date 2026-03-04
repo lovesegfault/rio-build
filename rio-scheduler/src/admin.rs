@@ -29,7 +29,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument};
 
-use rio_proto::admin::admin_service_server::AdminService;
+use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
     DrainWorkerRequest, DrainWorkerResponse, GcProgress, GcRequest, GetBuildLogsRequest,

@@ -15,10 +15,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use rio_proto::scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
-use rio_proto::store::store_service_server::{StoreService, StoreServiceServer};
 use rio_proto::types;
 use rio_proto::validated::ValidatedPathInfo;
+use rio_proto::{SchedulerService, SchedulerServiceServer, StoreService, StoreServiceServer};
 
 // ============================================================================
 // MockStore

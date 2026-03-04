@@ -4,8 +4,8 @@ use sqlx::postgres::PgPoolOptions;
 use tonic::transport::Server;
 use tracing::{error, info};
 
-use rio_proto::store::chunk_service_server::ChunkServiceServer;
-use rio_proto::store::store_service_server::StoreServiceServer;
+use rio_proto::ChunkServiceServer;
+use rio_proto::StoreServiceServer;
 use rio_store::grpc::{ChunkServiceImpl, StoreServiceImpl};
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.

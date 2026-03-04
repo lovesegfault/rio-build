@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::SchedulerServiceClient;
+use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};

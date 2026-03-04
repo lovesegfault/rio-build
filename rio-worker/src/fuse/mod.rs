@@ -28,7 +28,7 @@ use fuser::{BackingId, Config, INodeNo, MountOption, SessionACL};
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::StoreServiceClient;
 
 use self::cache::Cache;
 use self::inode::{InodeMap, ephemeral_inode};

@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Server};
 
-use rio_proto::store::store_service_client::StoreServiceClient;
-use rio_proto::store::store_service_server::StoreServiceServer;
+use rio_proto::StoreServiceClient;
+use rio_proto::StoreServiceServer;
 use rio_proto::types::{
     FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, QueryPathInfoRequest,
     put_path_request,
@@ -1649,8 +1649,8 @@ async fn test_chunked_manifest_no_cache_preflight_fails() -> TestResult {
 // ChunkService (phase2c C6)
 // ===========================================================================
 
-use rio_proto::store::chunk_service_client::ChunkServiceClient;
-use rio_proto::store::chunk_service_server::ChunkServiceServer;
+use rio_proto::ChunkServiceClient;
+use rio_proto::ChunkServiceServer;
 use rio_proto::types::{FindMissingChunksRequest, GetChunkRequest};
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::ChunkServiceImpl;

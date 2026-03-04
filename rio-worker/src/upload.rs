@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
 use rio_nix::nar;
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
 };

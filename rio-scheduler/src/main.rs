@@ -6,9 +6,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use rio_proto::admin::admin_service_server::AdminServiceServer;
-use rio_proto::scheduler::scheduler_service_server::SchedulerServiceServer;
-use rio_proto::worker::worker_service_server::WorkerServiceServer;
+use rio_proto::AdminServiceServer;
+use rio_proto::SchedulerServiceServer;
+use rio_proto::WorkerServiceServer;
 use rio_scheduler::actor::ActorHandle;
 use rio_scheduler::admin::AdminServiceImpl;
 use rio_scheduler::db::SchedulerDb;

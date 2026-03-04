@@ -12,7 +12,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
 use tonic::transport::Channel;
 
-use crate::store::store_service_client::StoreServiceClient;
+use crate::StoreServiceClient;
 use crate::types::{
     GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest,
     QueryPathInfoRequest, get_path_response, put_path_request,
@@ -38,39 +38,29 @@ pub async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
 }
 
 /// Connect to the store service.
-pub async fn connect_store(
-    addr: &str,
-) -> anyhow::Result<crate::store::store_service_client::StoreServiceClient<Channel>> {
+pub async fn connect_store(addr: &str) -> anyhow::Result<StoreServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
-    Ok(
-        crate::store::store_service_client::StoreServiceClient::new(ch)
-            .max_decoding_message_size(crate::max_message_size())
-            .max_encoding_message_size(crate::max_message_size()),
-    )
+    Ok(StoreServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
 }
 
 /// Connect to the scheduler service (gateway-facing).
 pub async fn connect_scheduler(
     addr: &str,
-) -> anyhow::Result<crate::scheduler::scheduler_service_client::SchedulerServiceClient<Channel>> {
+) -> anyhow::Result<crate::SchedulerServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
-    Ok(
-        crate::scheduler::scheduler_service_client::SchedulerServiceClient::new(ch)
-            .max_decoding_message_size(crate::max_message_size())
-            .max_encoding_message_size(crate::max_message_size()),
-    )
+    Ok(crate::SchedulerServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
 }
 
 /// Connect to the worker service (worker-facing scheduler RPCs).
-pub async fn connect_worker(
-    addr: &str,
-) -> anyhow::Result<crate::worker::worker_service_client::WorkerServiceClient<Channel>> {
+pub async fn connect_worker(addr: &str) -> anyhow::Result<crate::WorkerServiceClient<Channel>> {
     let ch = connect_channel(addr).await?;
-    Ok(
-        crate::worker::worker_service_client::WorkerServiceClient::new(ch)
-            .max_decoding_message_size(crate::max_message_size())
-            .max_encoding_message_size(crate::max_message_size()),
-    )
+    Ok(crate::WorkerServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
 }
 
 // ===========================================================================

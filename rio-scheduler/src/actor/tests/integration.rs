@@ -8,7 +8,7 @@ use super::*;
 async fn setup_inproc_store(
     pool: sqlx::PgPool,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    use rio_proto::store::store_service_server::StoreServiceServer;
+    use rio_proto::StoreServiceServer;
     use rio_store::grpc::StoreServiceImpl;
 
     // Inline storage in manifests.inline_blob (no chunk backend needed).
