@@ -20,7 +20,7 @@
 # to avoid seeding the stdenv closure.
 #
 # Run interactively:
-#   nix build .#checks.x86_64-linux.rio-phase1b.driverInteractive
+#   nix build .#checks.x86_64-linux.vm-phase1b.driverInteractive
 #   ./result/bin/nixos-test-driver
 {
   pkgs,

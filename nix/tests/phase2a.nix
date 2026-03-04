@@ -16,7 +16,7 @@
 #   client    — Nix client speaking ssh-ng to control
 #
 # Run interactively for debugging:
-#   nix build .#checks.x86_64-linux.rio-phase2a.driverInteractive
+#   nix build .#checks.x86_64-linux.vm-phase2a.driverInteractive
 #   ./result/bin/nixos-test-driver
 #   >>> start_all(); control.shell_interact()
 {
