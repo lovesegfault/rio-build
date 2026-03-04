@@ -557,7 +557,18 @@ fn test_actor_error_to_status_all_arms() {
             Code::Internal,
             "database",
         ),
-        (ActorError::Internal("boom".into()), Code::Internal, "boom"),
+        (
+            ActorError::Dag(crate::dag::DagError::CycleDetected),
+            Code::Internal,
+            "cycle",
+        ),
+        (
+            ActorError::MissingDbId {
+                drv_path: "/nix/store/x".into(),
+            },
+            Code::Internal,
+            "unpersisted",
+        ),
     ];
     for (err, expected_code, expected_substr) in cases {
         let status = SchedulerGrpc::actor_error_to_status(err);

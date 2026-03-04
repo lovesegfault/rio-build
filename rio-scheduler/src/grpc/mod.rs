@@ -77,7 +77,8 @@ impl SchedulerGrpc {
             }
             ActorError::ChannelSend => Status::internal("scheduler actor is unavailable"),
             ActorError::Database(e) => Status::internal(format!("database error: {e}")),
-            ActorError::Internal(msg) => Status::internal(msg),
+            ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
+            ActorError::MissingDbId { .. } => Status::internal(err.to_string()),
             // UNAVAILABLE — gateway/client sees this as a retriable error.
             // They should back off and retry; the breaker auto-closes in 30s
             // or on the next successful probe.

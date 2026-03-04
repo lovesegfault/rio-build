@@ -44,7 +44,7 @@ impl DagActor {
                     warn!(build_id = %build_id, error = %db_e,
                           "failed to delete orphan build row after DAG merge failure");
                 }
-                return Err(ActorError::Internal(format!("DAG merge failed: {e}")));
+                return Err(ActorError::Dag(e));
             }
         };
         let newly_inserted = &merge_result.newly_inserted;
@@ -352,16 +352,14 @@ impl DagActor {
             .iter()
             .map(|e| {
                 let parent = self.find_db_id_by_path(&e.parent_drv_path).ok_or_else(|| {
-                    ActorError::Internal(format!(
-                        "edge {} -> {} references unpersisted derivation (db_id missing)",
-                        e.parent_drv_path, e.child_drv_path
-                    ))
+                    ActorError::MissingDbId {
+                        drv_path: e.parent_drv_path.clone(),
+                    }
                 })?;
                 let child = self.find_db_id_by_path(&e.child_drv_path).ok_or_else(|| {
-                    ActorError::Internal(format!(
-                        "edge {} -> {} references unpersisted derivation (db_id missing)",
-                        e.parent_drv_path, e.child_drv_path
-                    ))
+                    ActorError::MissingDbId {
+                        drv_path: e.child_drv_path.clone(),
+                    }
                 })?;
                 Ok((parent, child))
             })
