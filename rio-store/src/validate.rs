@@ -1,15 +1,20 @@
 //! NAR data validation utilities.
 //!
-//! Provides streaming validation via [`HashingReader`] + [`validate_nar_digest`].
-//! Store implementations should wrap their incoming `AsyncRead` in a
-//! `HashingReader`, drain it, then call `validate_nar_digest` on the result.
-//! For callers that already have buffered data, use
+//! For callers that already have buffered data (the common case: PutPath
+//! accumulates the full NAR before validation), use
 //! `validate_nar_digest(&NarDigest::from_bytes(data), ...)`.
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
+//!
+//! The streaming `HashingReader` path is test-only — grpc.rs now buffers
+//! the full NAR and uses `from_bytes` (see grpc.rs:~517 comment re: avoiding
+//! the double-Vec peak).
 
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+use std::pin::Pin;
+#[cfg(test)]
+use std::task::{Context, Poll};
+#[cfg(test)]
 use tokio::io::{AsyncRead, ReadBuf};
 
 // PathInfo validation is done at the gRPC boundary
@@ -18,10 +23,10 @@ use tokio::io::{AsyncRead, ReadBuf};
 // NarDigest
 // ---------------------------------------------------------------------------
 
-/// Accumulated SHA-256 hash and byte count from streaming NAR data.
+/// Accumulated SHA-256 hash and byte count from NAR data.
 ///
-/// Produced by [`HashingReader::into_digest`] or [`NarDigest::from_bytes`].
-/// Compare against expected values via [`validate_nar_digest`].
+/// Produced by [`NarDigest::from_bytes`]. Compare against expected
+/// values via [`validate_nar_digest`].
 #[derive(Clone, PartialEq, Eq)]
 #[must_use]
 pub struct NarDigest {
@@ -75,6 +80,7 @@ impl std::fmt::Debug for NarDigest {
 /// let digest = hashing.into_digest();
 /// validate_nar_digest(&digest, expected_hash, expected_size)?;
 /// ```
+#[cfg(test)]
 pub struct HashingReader<R> {
     inner: R,
     hasher: Sha256,
@@ -82,6 +88,7 @@ pub struct HashingReader<R> {
     seen_eof: bool,
 }
 
+#[cfg(test)]
 impl<R> HashingReader<R> {
     /// Wrap an `AsyncRead` source with incremental SHA-256 hashing.
     pub fn new(inner: R) -> Self {
@@ -110,6 +117,7 @@ impl<R> HashingReader<R> {
     }
 }
 
+#[cfg(test)]
 impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,

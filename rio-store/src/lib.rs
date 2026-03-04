@@ -1,11 +1,11 @@
 pub mod backend;
 pub mod cache_server;
 pub mod cas;
-pub mod chunker;
-pub mod content_index;
+pub(crate) mod chunker;
+pub(crate) mod content_index;
 pub mod grpc;
-pub mod manifest;
-pub mod metadata;
-pub mod realisations;
+pub(crate) mod manifest;
+pub(crate) mod metadata;
+pub(crate) mod realisations;
 pub mod signing;
-pub mod validate;
+pub(crate) mod validate;

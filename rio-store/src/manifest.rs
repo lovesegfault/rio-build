@@ -143,8 +143,9 @@ impl Manifest {
     /// Total size in bytes when all chunks are concatenated.
     ///
     /// u64 because even though each chunk is u32-sized, 200k × 256 KiB
-    /// = 50 GiB > u32::MAX. Used by GetPath for sanity-checking against
-    /// narinfo.nar_size before starting the expensive reassembly.
+    /// = 50 GiB > u32::MAX. Intended for GetPath sanity-checking against
+    /// narinfo.nar_size before reassembly — not yet wired (test-only).
+    #[cfg(test)]
     pub fn total_size(&self) -> u64 {
         self.entries.iter().map(|e| e.size as u64).sum()
     }
