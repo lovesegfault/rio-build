@@ -32,7 +32,6 @@
 }:
 let
   common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
-  inherit (common) busybox busyboxClosure databaseUrl;
 
   testDrvFile = ./phase2b-derivation.nix;
 
@@ -46,14 +45,26 @@ pkgs.testers.runNixOSTest {
   name = "rio-phase2b";
 
   nodes = {
+    # Control node = standard rio control plane + Tempo layered on top.
+    # mkControlNode handles postgres/store/scheduler/gateway/firewall/VM;
+    # NixOS module merging lets us add Tempo's systemd unit, config file,
+    # and OTel env vars here without conflicting.
     control = {
       imports = [
-        rioModules.store
-        rioModules.scheduler
-        rioModules.gateway
-        common.postgresqlConfig
+        (common.mkControlNode {
+          hostName = "control";
+          memorySize = 1536; # Tempo adds ~200MB
+          # 3200 = Tempo query, 4317 = OTLP gRPC, 9090-9092 = metrics.
+          extraFirewallPorts = [
+            3200
+            4317
+            9090
+            9091
+            9092
+          ];
+          extraPackages = [ pkgs.python3 ]; # for the Tempo JSON assertion
+        })
       ];
-      networking.hostName = "control";
 
       # Tempo: Grafana's trace backend. Accepts OTLP/gRPC on 4317, serves
       # query API on 3200. Jaeger all-in-one isn't packaged in nixpkgs;
@@ -82,69 +93,23 @@ pkgs.testers.runNixOSTest {
               path: /var/lib/tempo/wal
       '';
 
-      services.rio = {
-        package = rio-workspace;
-        logFormat = "pretty";
-        store = {
-          enable = true;
-          inherit databaseUrl;
-        };
-        scheduler = {
-          enable = true;
-          storeAddr = "localhost:9002";
-          inherit databaseUrl;
-        };
-        gateway = {
-          enable = true;
-          schedulerAddr = "localhost:9001";
-          storeAddr = "localhost:9002";
-          authorizedKeysPath = "/var/lib/rio/gateway/authorized_keys";
-        };
-      };
-
-      # Grouped per statix repeated-keys rule.
-      systemd = {
-        services = {
-          tempo = {
-            description = "Tempo trace backend for OTLP validation";
-            wantedBy = [ "multi-user.target" ];
-            after = [ "network-online.target" ];
-            serviceConfig = {
-              ExecStart = "${pkgs.tempo}/bin/tempo -config.file=/etc/tempo.yaml";
-              StateDirectory = "tempo";
-              Restart = "on-failure";
-            };
+      systemd.services = {
+        tempo = {
+          description = "Tempo trace backend for OTLP validation";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network-online.target" ];
+          serviceConfig = {
+            ExecStart = "${pkgs.tempo}/bin/tempo -config.file=/etc/tempo.yaml";
+            StateDirectory = "tempo";
+            Restart = "on-failure";
           };
-          # OTel for scheduler + gateway. Gateway is the trace ROOT;
-          # scheduler is the first hop. Both need to export to Tempo for
-          # the trace to be queryable. (Store would be nice too but not
-          # milestone-critical.)
-          rio-scheduler.environment.RIO_OTEL_ENDPOINT = "http://localhost:4317";
-          rio-gateway.environment.RIO_OTEL_ENDPOINT = "http://localhost:4317";
         };
-        tmpfiles.rules = common.gatewayTmpfiles;
-      };
-
-      environment.systemPackages = [
-        pkgs.curl
-        pkgs.python3 # for the Tempo JSON assertion
-      ];
-
-      networking.firewall.allowedTCPPorts = [
-        2222
-        4317
-        9001
-        9002
-        9090
-        9091
-        9092
-        3200
-      ];
-
-      virtualisation = {
-        memorySize = 1536; # Tempo adds ~200MB
-        diskSize = 4096;
-        cores = 4;
+        # OTel for scheduler + gateway. Gateway is the trace ROOT;
+        # scheduler is the first hop. Both need to export to Tempo for
+        # the trace to be queryable. (Store would be nice too but not
+        # milestone-critical.)
+        rio-scheduler.environment.RIO_OTEL_ENDPOINT = "http://localhost:4317";
+        rio-gateway.environment.RIO_OTEL_ENDPOINT = "http://localhost:4317";
       };
     };
 
@@ -176,20 +141,20 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Bootstrap ─────────────────────────────────────────────────────
-    control.wait_for_unit("postgresql.service")
+    ${common.waitForControlPlane "control"}
+    # Tempo boots independently of the rio services (no ordering deps);
+    # wait for it after the control-plane waits. Units boot in parallel —
+    # wait_for_* just blocks until each is ready.
     control.wait_for_unit("tempo.service")
     control.wait_for_open_port(4317)   # OTLP gRPC
     control.wait_for_open_port(3200)   # Tempo query
-    control.wait_for_unit("rio-store.service")
-    control.wait_for_open_port(9002)
-    control.wait_for_unit("rio-scheduler.service")
-    control.wait_for_open_port(9001)
 
     # SSH keys + gateway restart (same dance as phase2a).
     ${common.sshKeySetup "control"}
 
     # Workers register.
-    for w in [worker1, worker2, worker3]:
+    workers = [worker1, worker2, worker3]
+    for w in workers:
         w.wait_for_unit("rio-worker.service")
     control.wait_until_succeeds(
         "curl -sf http://localhost:9091/metrics | "
@@ -197,27 +162,16 @@ pkgs.testers.runNixOSTest {
     )
 
     # Seed busybox via gateway.
-    client.succeed("ls ${busybox}")
-    client.succeed(
-        "nix copy --no-check-sigs --to 'ssh-ng://control' "
-        "$(cat ${busyboxClosure}/store-paths)"
-    )
+    ${common.seedBusybox "control"}
 
     # ── Build 1: Chain A→B→C ──────────────────────────────────────────
     # Capture stdout+stderr — the PHASE2B-LOG-MARKER lines come through
     # the log pipeline to the client's stderr.
-    try:
-        output = client.succeed(
-            "nix-build --no-out-link "
-            "--store 'ssh-ng://control' "
-            "--arg busybox '(builtins.storePath ${busybox})' "
-            "${testDrvFile} 2>&1"
-        )
-    except Exception:
-        for w in [worker1, worker2, worker3]:
-            w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
-        control.execute("journalctl -u rio-scheduler --no-pager -n 100 >&2")
-        raise
+    ${common.mkBuildHelper {
+      gatewayHost = "control";
+      inherit testDrvFile;
+    }}
+    output = build(workers)
 
     # ── Assertion 1: Build succeeded ──────────────────────────────────
     control.succeed(
@@ -256,12 +210,7 @@ pkgs.testers.runNixOSTest {
     # Second build of the SAME derivations should be served from the
     # scheduler's cache check (FindMissingPaths finds them all present).
     t0 = time.time()
-    client.succeed(
-        "nix-build --no-out-link "
-        "--store 'ssh-ng://control' "
-        "--arg busybox '(builtins.storePath ${busybox})' "
-        "${testDrvFile} 2>&1"
-    )
+    build(workers)
     elapsed = time.time() - t0
     # 10s is generous — cache hit should be sub-second, but VM timing is
     # noisy. The REAL signal is the metric below.

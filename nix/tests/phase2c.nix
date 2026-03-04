@@ -34,7 +34,6 @@
 }:
 let
   common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
-  inherit (common) busybox busyboxClosure databaseUrl;
 
   testDrvFile = ./phase2c-derivation.nix;
 
@@ -57,62 +56,24 @@ pkgs.testers.runNixOSTest {
   name = "rio-phase2c";
 
   nodes = {
-    control = {
-      imports = [
-        rioModules.store
-        rioModules.scheduler
-        rioModules.gateway
-        common.postgresqlConfig
-      ];
-      networking.hostName = "control";
-
-      services.rio = {
-        package = rio-workspace;
-        logFormat = "pretty";
-        store = {
-          enable = true;
-          inherit databaseUrl;
-        };
-        scheduler = {
-          enable = true;
-          storeAddr = "localhost:9002";
-          inherit databaseUrl;
-          # size_classes via /etc/rio/scheduler.toml (figment reads it).
-          # Env vars can't express TOML arrays-of-tables.
-          extraConfig = schedulerSizeClasses;
-          # Short tick = faster estimator refresh. Default 10s × 6 = 60s
-          # wait for estimator; 2s × 6 = 12s is tolerable for a VM test.
-          tickIntervalSecs = 2;
-        };
-        gateway = {
-          enable = true;
-          schedulerAddr = "localhost:9001";
-          storeAddr = "localhost:9002";
-          authorizedKeysPath = "/var/lib/rio/gateway/authorized_keys";
-        };
+    control = common.mkControlNode {
+      hostName = "control";
+      memorySize = 1536;
+      extraSchedulerConfig = {
+        # size_classes via /etc/rio/scheduler.toml (figment reads it).
+        # Env vars can't express TOML arrays-of-tables.
+        extraConfig = schedulerSizeClasses;
+        # Short tick = faster estimator refresh. Default 10s × 6 = 60s
+        # wait for estimator; 2s × 6 = 12s is tolerable for a VM test.
+        tickIntervalSecs = 2;
       };
-
-      systemd.tmpfiles.rules = common.gatewayTmpfiles;
-
-      environment.systemPackages = [
-        pkgs.curl
-        pkgs.postgresql # psql for direct queries
-      ];
-
-      networking.firewall.allowedTCPPorts = [
-        2222
-        9001
-        9002
+      # 9090-9092: Prometheus metrics ports.
+      extraFirewallPorts = [
         9090
         9091
         9092
       ];
-
-      virtualisation = {
-        memorySize = 1536;
-        diskSize = 4096;
-        cores = 4;
-      };
+      extraPackages = [ pkgs.postgresql ]; # psql for direct queries
     };
 
     wsmall1 = common.mkWorkerNode {
@@ -141,11 +102,7 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Bootstrap ─────────────────────────────────────────────────────
-    control.wait_for_unit("postgresql.service")
-    control.wait_for_unit("rio-store.service")
-    control.wait_for_open_port(9002)
-    control.wait_for_unit("rio-scheduler.service")
-    control.wait_for_open_port(9001)
+    ${common.waitForControlPlane "control"}
 
     # Verify scheduler loaded the size_classes config. This gauge is
     # set once at startup from /etc/rio/scheduler.toml. If it's absent,
@@ -164,7 +121,8 @@ pkgs.testers.runNixOSTest {
     ${common.sshKeySetup "control"}
 
     # All 3 workers register. Check they declared size_class.
-    for w in [wsmall1, wsmall2, wlarge]:
+    workers = [wsmall1, wsmall2, wlarge]
+    for w in workers:
         w.wait_for_unit("rio-worker.service")
     control.wait_until_succeeds(
         "curl -sf http://localhost:9091/metrics | "
@@ -172,11 +130,7 @@ pkgs.testers.runNixOSTest {
     )
 
     # Seed busybox.
-    client.succeed("ls ${busybox}")
-    client.succeed(
-        "nix copy --no-check-sigs --to 'ssh-ng://control' "
-        "$(cat ${busyboxClosure}/store-paths)"
-    )
+    ${common.seedBusybox "control"}
 
     # ── Assertion 1: CA data model roundtrip ─────────────────────────
     # The phase2c derivations aren't CA (that needs __contentAddressed
@@ -196,25 +150,13 @@ pkgs.testers.runNixOSTest {
     assert before == "0", f"realisations should start empty, got {before}"
 
     # Helper: run a build against the gateway, dumping logs on failure.
-    def build(attr=""):
-        cmd = (
-            "nix-build --no-out-link "
-            "--store 'ssh-ng://control' "
-            "--arg busybox '(builtins.storePath ${busybox})' "
-            "${testDrvFile}"
-        )
-        if attr:
-            cmd += f" -A {attr}"
-        try:
-            return client.succeed(cmd + " 2>&1")
-        except Exception:
-            for w in [wsmall1, wsmall2, wlarge]:
-                w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
-            control.execute("journalctl -u rio-scheduler --no-pager -n 200 >&2")
-            raise
+    ${common.mkBuildHelper {
+      gatewayHost = "control";
+      inherit testDrvFile;
+    }}
 
     # ── Build: chain + solo (critical-path test derivation) ──────────
-    build("all")
+    build(workers, attr="all")
 
     control.succeed(
         "curl -sf http://localhost:9091/metrics | "
@@ -260,7 +202,7 @@ pkgs.testers.runNixOSTest {
     # Build bigthing (pname="rio-2c-bigthing" in env — estimator keys
     # on that). With the 120s seeded EMA and 30s small cutoff,
     # classify() picks "large".
-    build("bigthing")
+    build(workers, attr="bigthing")
 
     # Check the size_class_assignments metric: large should increment.
     # This is the hard signal — a metric bump proves classify() ran

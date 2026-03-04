@@ -1,21 +1,30 @@
 # Shared helpers for the per-phase VM tests.
 #
-# ~250 LOC was duplicated across phase{1a,1b,2a,2b,2c}.nix:
-#   - PostgreSQL config block (5× identical)
-#   - SSH key setup Python (5× near-identical, differs only in host var)
-#   - workerConfig function (3× near-identical in 2a/2b/2c)
-#   - client node config (5× near-identical)
+# Duplication extracted from phase{1a,1b,2a,2b,2c}.nix:
+#   - Control node config (5× near-identical → mkControlNode)
+#   - PostgreSQL config block (5× identical → postgresqlConfig)
+#   - SSH key setup Python (5× → sshKeySetup)
+#   - Worker node config (3× in 2a/2b/2c → mkWorkerNode)
+#   - Client node config (5× → mkClientNode)
+#   - Control-plane wait testScript (5× → waitForControlPlane)
+#   - Seed-busybox testScript (5× → seedBusybox)
+#   - Build + journal-dump-on-failure (4× → mkBuildHelper)
 #   - let-bindings (busybox, busyboxClosure, databaseUrl)
 #
 # Usage:
 #   let
 #     common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
 #   in pkgs.testers.runNixOSTest {
-#     nodes.control = { imports = [ common.controlNode ]; ... };
-#     nodes.worker1 = common.mkWorkerNode { hostName = "worker1"; };
+#     nodes.control = common.mkControlNode { hostName = "control"; };
+#     nodes.worker1 = common.mkWorkerNode { hostName = "worker1"; maxBuilds = 2; };
+#     nodes.client  = common.mkClientNode { gatewayHost = "control"; };
 #     testScript = ''
+#       start_all()
+#       ${common.waitForControlPlane "control"}
 #       ${common.sshKeySetup "control"}
-#       ...
+#       ${common.seedBusybox "control"}
+#       ${common.mkBuildHelper { gatewayHost = "control"; inherit testDrvFile; }}
+#       build([worker1])
 #     '';
 #   }
 {
@@ -72,6 +81,87 @@ rec {
     "d /var/lib/rio/gateway 0755 root root -"
     "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
   ];
+
+  # ── Control node config (5× near-identical) ─────────────────────────
+  #
+  # Runs PostgreSQL + rio-store + rio-scheduler + rio-gateway on one VM.
+  # All 5 phase tests share this topology for the control plane; only
+  # per-phase knobs (memory, firewall, scheduler extras) vary.
+  #
+  # Use as a full node definition for simple cases:
+  #   control = common.mkControlNode { hostName = "control"; };
+  #
+  # Or as an import when layering extras (phase2b adds Tempo on top —
+  # NixOS module merging handles systemd.services, systemPackages etc.):
+  #   control = {
+  #     imports = [ (common.mkControlNode { hostName = "control"; ... }) ];
+  #     systemd.services.tempo = { ... };
+  #   };
+  mkControlNode =
+    {
+      hostName,
+      memorySize ? 1024,
+      diskSize ? 4096,
+      # Merged into services.rio.scheduler via // — phase2c passes
+      # extraConfig + tickIntervalSecs for size-class TOML routing.
+      extraSchedulerConfig ? { },
+      # Appended to the base set [ 2222 9001 9002 ]. phase2a/2c open
+      # metrics ports; phase2b also opens Tempo's OTLP + query ports.
+      extraFirewallPorts ? [ ],
+      # Appended to the base [ pkgs.curl ] — every build-capable test
+      # scrapes metrics via curl on the control node. phase1a doesn't
+      # need curl but getting it is harmless.
+      extraPackages ? [ ],
+    }:
+    {
+      imports = [
+        rioModules.store
+        rioModules.scheduler
+        rioModules.gateway
+        postgresqlConfig
+      ];
+      networking.hostName = hostName;
+
+      services.rio = {
+        package = rio-workspace;
+        logFormat = "pretty"; # human-readable in VM test logs
+        store = {
+          enable = true;
+          inherit databaseUrl;
+        };
+        scheduler = {
+          enable = true;
+          storeAddr = "localhost:9002";
+          inherit databaseUrl;
+        }
+        // extraSchedulerConfig;
+        gateway = {
+          enable = true;
+          schedulerAddr = "localhost:9001";
+          storeAddr = "localhost:9002";
+          authorizedKeysPath = "/var/lib/rio/gateway/authorized_keys";
+        };
+      };
+
+      systemd.tmpfiles.rules = gatewayTmpfiles;
+
+      environment.systemPackages = [ pkgs.curl ] ++ extraPackages;
+
+      # 2222 = gateway SSH (client), 9001 = scheduler gRPC (workers),
+      # 9002 = store gRPC (workers). phase1a has no workers so 9001/9002
+      # are technically unused cross-VM there, but opening them is a no-op.
+      networking.firewall.allowedTCPPorts = [
+        2222
+        9001
+        9002
+      ]
+      ++ extraFirewallPorts;
+
+      virtualisation = {
+        cores = 4;
+        inherit memorySize diskSize;
+      };
+    };
 
   # ── Worker node config (3× near-identical in 2a/2b/2c) ──────────────
   #
@@ -214,4 +304,72 @@ rec {
     ${gatewayHost}.wait_for_unit("rio-gateway.service")
     ${gatewayHost}.wait_for_open_port(2222)
   '';
+
+  # ── Control-plane wait (5× identical) ───────────────────────────────
+  # Blocks until postgres + rio-store + rio-scheduler are all ready.
+  # Gateway startup is handled separately by sshKeySetup (restart after
+  # populating authorized_keys). `node` is the Python variable name for
+  # the control node (phase1a: `gateway`, all others: `control`).
+  waitForControlPlane = node: ''
+    ${node}.wait_for_unit("postgresql.service")
+    ${node}.wait_for_unit("rio-store.service")
+    ${node}.wait_for_open_port(9002)
+    ${node}.wait_for_unit("rio-scheduler.service")
+    ${node}.wait_for_open_port(9001)
+  '';
+
+  # ── Seed busybox closure (5× identical modulo ssh target) ───────────
+  # Uploads the static-busybox closure via `nix copy` over ssh-ng.
+  # Exercises wopAddToStoreNar / wopAddMultipleToStore. `--no-check-sigs`
+  # because the client's local store paths aren't signed. `gatewayHost`
+  # is the SSH target hostname (phase1a: "gateway", others: "control").
+  seedBusybox = gatewayHost: ''
+    client.succeed("ls ${busybox}")
+    client.succeed(
+        "nix copy --no-check-sigs --to 'ssh-ng://${gatewayHost}' "
+        "$(cat ${busyboxClosure}/store-paths)"
+    )
+  '';
+
+  # ── Build helper with journal dump on failure (4× near-identical) ───
+  #
+  # Generates a Python `def build(workers, attr="", capture_stderr=True)`
+  # that runs nix-build against the gateway and dumps worker +
+  # control-plane journals on failure before re-raising.
+  #
+  #   - `workers` is passed at the Python level so each test can supply
+  #     its own worker node list (phase1b: [worker], phase2a: [worker1,
+  #     worker2], phase2c: [wsmall1, wsmall2, wlarge], etc.).
+  #   - `attr` selects a derivation attr via `-A` (phase2c uses this).
+  #   - `capture_stderr=False` for tests asserting on the build's stdout
+  #     (phase1b checks the output path starts with /nix/store/; 2>&1
+  #     would mix nix-build progress lines into the captured output).
+  #
+  # `gatewayHost` doubles as the SSH target hostname AND the Python
+  # variable name for the control node — these match in all current
+  # tests (both are "control"; phase1a doesn't build so N/A there).
+  # `testDrvFile` is baked at Nix-eval time (per-phase; can be either
+  # a `./foo.nix` path literal or a `pkgs.writeText` derivation).
+  mkBuildHelper =
+    { gatewayHost, testDrvFile }:
+    ''
+      def build(workers, attr="", capture_stderr=True):
+          cmd = (
+              "nix-build --no-out-link "
+              "--store 'ssh-ng://${gatewayHost}' "
+              "--arg busybox '(builtins.storePath ${busybox})' "
+              "${testDrvFile}"
+          )
+          if attr:
+              cmd += f" -A {attr}"
+          if capture_stderr:
+              cmd += " 2>&1"
+          try:
+              return client.succeed(cmd)
+          except Exception:
+              for w in workers:
+                  w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
+              ${gatewayHost}.execute("journalctl -u rio-scheduler -u rio-gateway --no-pager -n 200 >&2")
+              raise
+    '';
 }

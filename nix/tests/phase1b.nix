@@ -29,7 +29,6 @@
 }:
 let
   common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
-  inherit (common) busybox busyboxClosure databaseUrl;
 
   # Single trivial derivation — one leaf from the phase2a DAG.
   # Reuses the same builder pattern (busybox sh + mkdir + echo).
@@ -54,51 +53,7 @@ pkgs.testers.runNixOSTest {
   name = "rio-phase1b";
 
   nodes = {
-    control = {
-      imports = [
-        rioModules.store
-        rioModules.scheduler
-        rioModules.gateway
-        common.postgresqlConfig
-      ];
-      networking.hostName = "control";
-
-      services.rio = {
-        package = rio-workspace;
-        logFormat = "pretty";
-        store = {
-          enable = true;
-          inherit databaseUrl;
-        };
-        scheduler = {
-          enable = true;
-          storeAddr = "localhost:9002";
-          inherit databaseUrl;
-        };
-        gateway = {
-          enable = true;
-          schedulerAddr = "localhost:9001";
-          storeAddr = "localhost:9002";
-          authorizedKeysPath = "/var/lib/rio/gateway/authorized_keys";
-        };
-      };
-
-      systemd.tmpfiles.rules = common.gatewayTmpfiles;
-
-      environment.systemPackages = [ pkgs.curl ];
-
-      networking.firewall.allowedTCPPorts = [
-        2222
-        9001
-        9002
-      ];
-
-      virtualisation = {
-        memorySize = 1024;
-        diskSize = 4096;
-        cores = 4;
-      };
-    };
+    control = common.mkControlNode { hostName = "control"; };
 
     worker = common.mkWorkerNode {
       hostName = "worker";
@@ -112,11 +67,7 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Bootstrap control plane ───────────────────────────────────────
-    control.wait_for_unit("postgresql.service")
-    control.wait_for_unit("rio-store.service")
-    control.wait_for_open_port(9002)
-    control.wait_for_unit("rio-scheduler.service")
-    control.wait_for_open_port(9001)
+    ${common.waitForControlPlane "control"}
 
     # ── SSH key exchange + gateway start ──────────────────────────────
     ${common.sshKeySetup "control"}
@@ -129,28 +80,19 @@ pkgs.testers.runNixOSTest {
     )
 
     # ── Seed store ────────────────────────────────────────────────────
-    client.succeed("ls ${busybox}")
-    client.succeed(
-        "nix copy --no-check-sigs --to 'ssh-ng://control' "
-        "$(cat ${busyboxClosure}/store-paths)"
-    )
+    ${common.seedBusybox "control"}
 
     # ── Milestone: single-node build ──────────────────────────────────
     # One trivial derivation, one worker. Exercises the full build path
     # (gateway → scheduler → worker → nix-daemon --stdio → upload) without
-    # distribution concerns.
-    try:
-        out = client.succeed(
-            "nix-build --no-out-link "
-            "--store 'ssh-ng://control' "
-            "--arg busybox '(builtins.storePath ${busybox})' "
-            "${testDrvFile}"
-        ).strip()
-    except Exception:
-        worker.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
-        control.execute("journalctl -u rio-scheduler --no-pager -n 100 >&2")
-        control.execute("journalctl -u rio-gateway --no-pager -n 100 >&2")
-        raise
+    # distribution concerns. capture_stderr=False: we assert the output
+    # path starts with /nix/store/, so stderr progress lines must not
+    # be mixed into the captured stdout.
+    ${common.mkBuildHelper {
+      gatewayHost = "control";
+      inherit testDrvFile;
+    }}
+    out = build([worker], capture_stderr=False).strip()
 
     print(f"build output: {out}")
     assert out.startswith("/nix/store/"), f"unexpected build output: {out!r}"
