@@ -675,6 +675,21 @@ pub async fn delete_manifest_chunked_uploading(
     Ok(())
 }
 
+/// Total chunks in the store. For the `rio_store_chunks_total` gauge.
+///
+/// Counts all rows regardless of refcount/deleted — the gauge answers
+/// "how many distinct chunks exist in S3" (approximately; PG is the
+/// source of truth for intent, S3 might have orphans). For "active"
+/// chunks, filter `WHERE refcount > 0 AND deleted = FALSE` — but
+/// that's a different metric (not this one).
+#[instrument(skip(pool))]
+pub async fn count_chunks(pool: &PgPool) -> anyhow::Result<i64> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
 /// Find which chunks are NOT yet in the `chunks` table.
 ///
 /// This is the dedup pre-check: PutPath calls this BEFORE uploading to
