@@ -30,7 +30,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -194,18 +194,17 @@ async fn narinfo(
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        "text/x-nix-narinfo".parse().expect("static header value"),
+        HeaderValue::from_static("text/x-nix-narinfo"),
     );
     headers.insert(
         header::CACHE_CONTROL,
-        "public, max-age=31536000, immutable"
-            .parse()
-            .expect("static header value"),
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
     headers.insert(
         header::ETAG,
-        format!("\"{}\"", hex::encode(info.nar_hash))
-            .parse()
+        // hex output is [0-9a-f]+, double-quote is 0x22, both valid header
+        // chars — HeaderValue::from_str can only fail on control bytes.
+        HeaderValue::from_str(&format!("\"{}\"", hex::encode(info.nar_hash)))
             .expect("hex is always valid header value"),
     );
 
@@ -316,19 +315,16 @@ async fn nar(State(state): State<Arc<CacheServerState>>, Path(filename): Path<St
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        "application/x-nix-nar".parse().expect("static"),
+        HeaderValue::from_static("application/x-nix-nar"),
     );
     // Same immutable cache policy as narinfo — content-addressed.
     headers.insert(
         header::CACHE_CONTROL,
-        "public, max-age=31536000, immutable"
-            .parse()
-            .expect("static"),
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
     headers.insert(
         header::ETAG,
-        format!("\"{}\"", hex::encode(nar_hash))
-            .parse()
+        HeaderValue::from_str(&format!("\"{}\"", hex::encode(nar_hash)))
             .expect("hex is valid header"),
     );
 
