@@ -1,8 +1,8 @@
 use super::*;
 use crate::actor::tests::{make_test_node, setup_actor};
-use rio_proto::scheduler::scheduler_service_server::SchedulerServiceServer;
-use rio_proto::worker::worker_service_client::WorkerServiceClient;
-use rio_proto::worker::worker_service_server::WorkerServiceServer;
+use rio_proto::SchedulerServiceServer;
+use rio_proto::WorkerServiceClient;
+use rio_proto::WorkerServiceServer;
 use rio_test_support::TestDb;
 use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
@@ -43,8 +43,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
         .connect()
         .await?;
     let mut worker_client = WorkerServiceClient::new(channel.clone());
-    let mut sched_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::new(channel);
+    let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
 
     // Open BuildExecution stream. First message MUST be WorkerRegister.
     let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(32);
@@ -204,8 +203,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
         .connect()
         .await?;
     let mut worker_client = WorkerServiceClient::new(channel.clone());
-    let mut sched_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::new(channel);
+    let mut sched_client = rio_proto::SchedulerServiceClient::new(channel);
 
     // Open BuildExecution stream with WorkerRegister.
     let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(32);

@@ -12,8 +12,8 @@ use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use rio_proto::scheduler::scheduler_service_server::SchedulerService;
-use rio_proto::worker::worker_service_server::WorkerService;
+use rio_proto::SchedulerService;
+use rio_proto::WorkerService;
 
 use crate::actor::{ActorCommand, ActorError, ActorHandle, MergeDagRequest};
 use crate::logs::LogBuffers;

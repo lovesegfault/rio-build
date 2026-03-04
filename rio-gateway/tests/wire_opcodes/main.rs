@@ -15,8 +15,8 @@ use tokio::io::DuplexStream;
 use tonic::transport::Channel;
 
 use rio_nix::protocol::wire;
-use rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::SchedulerServiceClient;
+use rio_proto::StoreServiceClient;
 use rio_test_support::fixtures::{make_nar, make_path_info};
 use rio_test_support::grpc::{
     MockScheduler, MockSchedulerOutcome, MockStore, spawn_mock_scheduler, spawn_mock_store,

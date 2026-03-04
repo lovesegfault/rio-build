@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rio_nix::derivation::{BasicDerivation, Derivation};
 use rio_nix::store_path::StorePath;
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::StoreServiceClient;
 use rio_proto::types;
 use tonic::transport::Channel;
 use tracing::{debug, warn};
@@ -382,7 +382,7 @@ mod tests {
     // before hitting the store. By pre-populating drv_cache with all needed
     // derivations, we can test reconstruct_dag without a live store.
 
-    use rio_proto::store::store_service_client::StoreServiceClient;
+    use rio_proto::StoreServiceClient;
 
     /// Spin up a mock store that fails all RPCs (lazy connect to dead port).
     /// Used to verify reconstruct_dag fails hard on unresolvable inputDrvs.

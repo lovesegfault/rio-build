@@ -1,8 +1,8 @@
 #![allow(dead_code)] // helpers used by integration tests; Cargo compiles each test binary separately
 
 use rio_gateway::session;
-use rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::SchedulerServiceClient;
+use rio_proto::StoreServiceClient;
 use rio_test_support::grpc::{MockScheduler, MockStore, spawn_mock_scheduler, spawn_mock_store};
 use tokio::io::DuplexStream;
 use tonic::transport::Channel;

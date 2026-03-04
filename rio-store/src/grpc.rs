@@ -9,8 +9,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, instrument, warn};
 
-use rio_proto::store::chunk_service_server::ChunkService;
-use rio_proto::store::store_service_server::StoreService;
+use rio_proto::ChunkService;
+use rio_proto::StoreService;
 use rio_proto::types::{
     AddSignaturesRequest, AddSignaturesResponse, ContentLookupRequest, ContentLookupResponse,
     FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,

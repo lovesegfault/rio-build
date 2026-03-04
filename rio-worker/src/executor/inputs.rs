@@ -6,7 +6,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tonic::transport::Channel;
 
 use rio_nix::derivation::Derivation;
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::StoreServiceClient;
 
 use crate::synth_db::SynthPathInfo;
 use crate::upload;

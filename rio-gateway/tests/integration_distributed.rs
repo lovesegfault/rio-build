@@ -240,11 +240,9 @@ async fn test_cancel_build_recorded_by_mock_scheduler() -> anyhow::Result<()> {
     let (sched, sched_addr, sched_handle) = spawn_mock_scheduler().await?;
 
     let mut scheduler_client =
-        rio_proto::scheduler::scheduler_service_client::SchedulerServiceClient::connect(format!(
-            "http://{sched_addr}"
-        ))
-        .await
-        .expect("connect");
+        rio_proto::SchedulerServiceClient::connect(format!("http://{sched_addr}"))
+            .await
+            .expect("connect");
 
     // Simulate the session.rs disconnect handler: call cancel_build directly.
     scheduler_client

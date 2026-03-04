@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicUsize;
 use tokio::sync::{RwLock, mpsc};
 use tonic::transport::Channel;
 
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     CompletionReport, HeartbeatRequest, ResourceUsage, WorkAssignment, WorkAssignmentAck,
     WorkerMessage, worker_message,

@@ -45,3 +45,23 @@ pub mod store {
 pub mod admin {
     tonic::include_proto!("rio.admin");
 }
+
+// ---------------------------------------------------------------------------
+// Flattened service re-exports
+//
+// tonic-build emits `store::store_service_client::StoreServiceClient` —
+// deep nesting that's an artifact of codegen, not design. Flatten to
+// crate root so callers write `rio_proto::StoreServiceClient` instead
+// of `rio_proto::store::store_service_client::StoreServiceClient`.
+// ---------------------------------------------------------------------------
+
+pub use admin::admin_service_client::AdminServiceClient;
+pub use admin::admin_service_server::{AdminService, AdminServiceServer};
+pub use scheduler::scheduler_service_client::SchedulerServiceClient;
+pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
+pub use store::chunk_service_client::ChunkServiceClient;
+pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
+pub use store::store_service_client::StoreServiceClient;
+pub use store::store_service_server::{StoreService, StoreServiceServer};
+pub use worker::worker_service_client::WorkerServiceClient;
+pub use worker::worker_service_server::{WorkerService, WorkerServiceServer};

@@ -14,7 +14,7 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use rio_proto::store::store_service_client::StoreServiceClient;
+use rio_proto::StoreServiceClient;
 use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::DerivationDag;

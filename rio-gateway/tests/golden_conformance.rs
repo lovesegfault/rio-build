@@ -56,7 +56,7 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
 
 /// Spawn a pre-populated MockStore and return its address.
 async fn spawn_store_for(store: MockStore) -> anyhow::Result<std::net::SocketAddr> {
-    use rio_proto::store::store_service_server::StoreServiceServer;
+    use rio_proto::StoreServiceServer;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
