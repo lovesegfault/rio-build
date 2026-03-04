@@ -17,6 +17,7 @@ use rio_nix::protocol::handshake::{PROTOCOL_VERSION, WORKER_MAGIC_1, WORKER_MAGI
 use rio_nix::protocol::stderr::STDERR_LAST;
 use rio_nix::protocol::wire;
 use rio_proto::types;
+use rio_test_support::fixtures::test_store_path;
 use rio_test_support::grpc::spawn_mock_scheduler;
 use rio_test_support::wire::{do_handshake, send_set_options};
 use rio_test_support::wire_send;
@@ -66,8 +67,8 @@ async fn test_distributed_handshake_query_empty_store() -> anyhow::Result<()> {
     let valid = query_valid_paths(
         s,
         &[
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
+            &test_store_path("hello-2.12.1"),
+            &test_store_path("world-1.0"),
         ],
     )
     .await?;
@@ -94,10 +95,10 @@ async fn test_distributed_query_with_populated_store() -> anyhow::Result<()> {
     let mut sess = common::GatewaySession::new().await?;
 
     // Pre-populate the mock store with one path
-    let test_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
+    let test_path = test_store_path("hello-2.12.1");
     let (nar, nar_hash) = rio_test_support::fixtures::make_nar(b"hello content");
     sess.store.seed(
-        rio_test_support::fixtures::make_path_info(test_path, &nar, nar_hash),
+        rio_test_support::fixtures::make_path_info(&test_path, &nar, nar_hash),
         nar,
     );
 
@@ -107,14 +108,7 @@ async fn test_distributed_query_with_populated_store() -> anyhow::Result<()> {
     send_set_options(s).await?;
 
     // Query two paths: one present, one missing
-    let valid = query_valid_paths(
-        s,
-        &[
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1",
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-world-1.0",
-        ],
-    )
-    .await?;
+    let valid = query_valid_paths(s, &[&test_path, &test_store_path("world-1.0")]).await?;
 
     // Only the pre-populated path should be valid
     assert_eq!(
@@ -122,10 +116,7 @@ async fn test_distributed_query_with_populated_store() -> anyhow::Result<()> {
         1,
         "expected exactly 1 valid path, got: {valid:?}"
     );
-    assert_eq!(
-        valid[0],
-        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
-    );
+    assert_eq!(valid[0], test_path);
     Ok(())
 }
 

@@ -115,7 +115,7 @@ mod tests {
         // Need a complete narinfo + manifest for the join. Use
         // complete_manifest_inline for a realistic path.
         let store_path = rio_nix::store_path::StorePath::parse(
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ci-test",
+            &rio_test_support::fixtures::test_store_path("ci-test"),
         )?;
         let sp_hash = store_path.sha256_digest().to_vec();
         let nar_hash = [0x42u8; 32];

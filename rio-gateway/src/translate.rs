@@ -383,6 +383,7 @@ mod tests {
     // derivations, we can test reconstruct_dag without a live store.
 
     use rio_proto::StoreServiceClient;
+    use rio_test_support::fixtures::test_drv_path;
 
     /// Spin up a mock store that fails all RPCs (lazy connect to dead port).
     /// Used to verify reconstruct_dag fails hard on unresolvable inputDrvs.
@@ -416,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruct_dag_single_node_no_inputs() {
-        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let root_path = sp(&test_drv_path("root"));
         let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[]);
 
         let mut store = unreachable_store();
@@ -434,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruct_dag_one_input_drv() {
-        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let root_path = sp(&test_drv_path("root"));
         let child_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-child.drv");
 
         let root_drv = make_test_derivation(
@@ -469,7 +470,7 @@ mod tests {
         // inputDrv not in cache AND store unreachable -> hard failure.
         // Previously this produced a stub leaf with system:"" that never
         // matched any worker, causing a silent hang. Now it fails immediately.
-        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let root_path = sp(&test_drv_path("root"));
         let missing_child = "/nix/store/cccccccccccccccccccccccccccccccc-missing.drv";
 
         let root_drv =
@@ -499,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconstruct_dag_invalid_inputdrv_path_fails() {
         // inputDrv is not a valid store path -> hard failure (corrupt .drv).
-        let root_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv");
+        let root_path = sp(&test_drv_path("root"));
         let bogus_child = "/not/a/store/path";
 
         let root_drv = make_test_derivation("/nix/store/aaa-root-out", &[(bogus_child, &["out"])]);
@@ -524,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconstruct_dag_transitive_chain() {
         // A -> B -> C chain. All in cache.
-        let a_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let a_path = sp(&test_drv_path("a"));
         let b_path = sp("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
         let c_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-c.drv");
 
@@ -629,7 +630,7 @@ mod tests {
     /// worker will fetch. This is an OPTIMIZATION, not correctness.
     #[tokio::test]
     async fn test_filter_and_inline_drv_store_error_skips_safely() {
-        let drv_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv");
+        let drv_path = sp(&test_drv_path("x"));
         let drv = make_test_derivation("/nix/store/aaa-out", &[]);
 
         let mut cache = HashMap::new();
@@ -659,7 +660,7 @@ mod tests {
 
         // Node with no expected_output_paths (like single_node_from_basic).
         let mut nodes = vec![types::DerivationNode {
-            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+            drv_path: test_drv_path("x"),
             drv_hash: "x".into(),
             expected_output_paths: vec![], // KEY: empty
             ..Default::default()
