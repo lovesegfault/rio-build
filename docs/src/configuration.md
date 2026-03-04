@@ -150,7 +150,7 @@ For production deployments with many worker pods, deploy PgBouncer between compo
 |-----------|------|---------|-------------|
 | `grpc.max_message_size` | u32 | 33554432 (32MB) | Maximum gRPC message size in bytes. Must be >= 32MB for large DAG submissions (nixpkgs stdenv is ~12MB). Applies to all gRPC services. |
 
-Environment variable: `RIO_GRPC__MAX_MESSAGE_SIZE`
+Environment variable: `RIO_GRPC_MAX_MESSAGE_SIZE`
 
 ### High Availability
 

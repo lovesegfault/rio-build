@@ -46,39 +46,6 @@ use rio_proto::types::{
     WorkerMessage, worker_message,
 };
 
-/// Default threshold for leaked overlay mounts before the worker refuses
-/// new builds. Overridable via `RIO_WORKER_MAX_LEAKED_MOUNTS`.
-///
-/// A leaked mount means `umount2` failed in `OverlayMount::Drop` — typically
-/// the mount is stuck busy (open file handles, zombie nix-daemon). After N
-/// leaks the worker is likely in a degraded state; refusing new builds and
-/// reporting `InfrastructureFailure` lets the scheduler reassign to a
-/// healthy worker, and the worker can be restarted by its supervisor.
-const DEFAULT_MAX_LEAKED_MOUNTS: usize = 3;
-
-/// Read the leaked-mount threshold from `RIO_WORKER_MAX_LEAKED_MOUNTS`,
-/// falling back to [`DEFAULT_MAX_LEAKED_MOUNTS`].
-pub fn max_leaked_mounts() -> usize {
-    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| match std::env::var("RIO_WORKER_MAX_LEAKED_MOUNTS") {
-        Ok(val) => match val.parse::<usize>() {
-            Ok(n) => {
-                tracing::debug!(threshold = n, "using configured max leaked mounts");
-                n
-            }
-            Err(e) => {
-                tracing::warn!(
-                    value = %val,
-                    error = %e,
-                    "invalid RIO_WORKER_MAX_LEAKED_MOUNTS, using default {DEFAULT_MAX_LEAKED_MOUNTS}"
-                );
-                DEFAULT_MAX_LEAKED_MOUNTS
-            }
-        },
-        Err(_) => DEFAULT_MAX_LEAKED_MOUNTS,
-    })
-}
-
 /// Handle to the FUSE cache's bloom filter. Extracted via
 /// `Cache::bloom_handle()` before the Cache is moved into the FUSE
 /// mount — lets the heartbeat loop read the same filter that `insert()`
@@ -161,6 +128,8 @@ pub struct BuildSpawnContext {
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
+    /// Leaked overlay mount threshold (from `Config.max_leaked_mounts`).
+    pub max_leaked_mounts: usize,
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -203,6 +172,7 @@ pub async fn spawn_build_task(
         overlay_base_dir: ctx.overlay_base_dir.clone(),
         worker_id: ctx.worker_id.clone(),
         log_limits: ctx.log_limits,
+        max_leaked_mounts: ctx.max_leaked_mounts,
     };
 
     // Clone for the panic handler before moving into the task.

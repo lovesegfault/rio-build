@@ -701,10 +701,15 @@ pub const POISON_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 
 #[cfg(test)]
 pub const POISON_TTL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Heartbeat interval and timeout constants.
-pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
-pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-pub const MAX_MISSED_HEARTBEATS: u32 = 3;
+/// Heartbeat constants. Re-exported from rio-common so the worker's send
+/// interval and the scheduler's timeout check derive from the same
+/// source of truth. Before this re-export, the worker's `10s` and the
+/// scheduler's `30s` were independently hardcoded; now `timeout =
+/// interval × max_missed` is a compile-time derivation, not a
+/// copy-paste invariant.
+pub use rio_common::limits::{
+    HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, MAX_MISSED_HEARTBEATS,
+};
 
 #[cfg(test)]
 mod tests {
