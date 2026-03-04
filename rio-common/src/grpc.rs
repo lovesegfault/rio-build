@@ -6,7 +6,6 @@
 //! provides consistent timeout bounds and a helper to wrap calls.
 
 use std::future::Future;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Default timeout for metadata gRPC calls (QueryPathInfo, FindMissingPaths, etc.).
@@ -20,38 +19,6 @@ pub const DEFAULT_GRPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// At `MAX_NAR_SIZE` = 4 GiB and ~15 MB/s, a full transfer is ~270s. 300s
 /// gives headroom without being unbounded.
 pub const GRPC_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Default timeout for local nix-daemon subprocess builds.
-///
-/// Overridable via `RIO_DAEMON_TIMEOUT_SECS`. This is intentionally long
-/// (2 hours) because some builds genuinely take that long; the purpose is
-/// to bound blast radius of a truly stuck daemon.
-pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
-
-/// Get the daemon timeout, reading `RIO_DAEMON_TIMEOUT_SECS` once.
-///
-/// Returns `DEFAULT_DAEMON_TIMEOUT` if the env var is unset or unparseable.
-pub fn daemon_timeout() -> Duration {
-    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
-    *TIMEOUT.get_or_init(|| match std::env::var("RIO_DAEMON_TIMEOUT_SECS") {
-        Ok(val) => match val.parse::<u64>() {
-            Ok(secs) => {
-                tracing::debug!(timeout_secs = secs, "using configured daemon timeout");
-                Duration::from_secs(secs)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    value = %val,
-                    error = %e,
-                    "invalid RIO_DAEMON_TIMEOUT_SECS, using default {}s",
-                    DEFAULT_DAEMON_TIMEOUT.as_secs()
-                );
-                DEFAULT_DAEMON_TIMEOUT
-            }
-        },
-        Err(_) => DEFAULT_DAEMON_TIMEOUT,
-    })
-}
 
 /// Wrap a gRPC call (or any fallible async op) with a timeout.
 ///
@@ -186,9 +153,9 @@ mod tests {
             DEFAULT_GRPC_TIMEOUT < GRPC_STREAM_TIMEOUT,
             "metadata timeout should be shorter than stream timeout"
         );
-        assert!(
-            GRPC_STREAM_TIMEOUT < DEFAULT_DAEMON_TIMEOUT,
-            "stream timeout should be shorter than daemon build timeout"
-        );
+        // Stream timeout (300s) is shorter than any sane daemon build
+        // timeout — now lives in rio-worker Config.daemon_timeout_secs
+        // (default 7200s). The ordering invariant is enforced at
+        // rio-worker/src/executor/daemon.rs test_timeout_ordering.
     }
 }

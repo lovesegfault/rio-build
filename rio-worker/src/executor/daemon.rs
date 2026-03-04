@@ -581,9 +581,16 @@ mod tests {
     #[test]
     fn test_timeout_ordering() {
         assert!(
-            DAEMON_SETUP_TIMEOUT < rio_common::grpc::DEFAULT_DAEMON_TIMEOUT,
+            DAEMON_SETUP_TIMEOUT < crate::executor::DEFAULT_DAEMON_TIMEOUT,
             "setup timeout ({DAEMON_SETUP_TIMEOUT:?}) must be shorter than default daemon timeout ({:?})",
-            rio_common::grpc::DEFAULT_DAEMON_TIMEOUT
+            crate::executor::DEFAULT_DAEMON_TIMEOUT
+        );
+        // Also: the gRPC stream timeout (300s, NAR transfers) is
+        // shorter than the daemon build timeout. That ordering used
+        // to be asserted in rio-common before daemon_timeout moved here.
+        assert!(
+            rio_common::grpc::GRPC_STREAM_TIMEOUT < crate::executor::DEFAULT_DAEMON_TIMEOUT,
+            "NAR stream timeout must be shorter than daemon build timeout"
         );
     }
 
