@@ -40,13 +40,12 @@ aws-config = { workspace = true }
 flate2 = { workspace = true }
 # phase2b: log ring buffer written from BuildExecution recv tasks
 dashmap = { workspace = true }
-hex = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-rio-store = { path = "../rio-store" }
-rio-test-support = { path = "../rio-test-support" }
+rio-store = { workspace = true }
+rio-test-support = { workspace = true }
 sha2 = { workspace = true }
 tracing-test = "0.2"
 aws-smithy-mocks = "0.2"

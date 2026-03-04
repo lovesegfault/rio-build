@@ -53,7 +53,7 @@ fastcdc = { workspace = true }
 blake3 = { workspace = true }
 # join_all for bounded-parallel S3 HeadObject batches (exists_batch).
 # Worker already uses this; not a new transitive dep.
-futures-util = "0.3"
+futures-util = { workspace = true }
 # In-process chunk cache. Lock-free, weight-based eviction — tracks
 # byte-size per entry so the 2GB cap is a real memory bound, not just
 # an entry count.
@@ -81,7 +81,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
-rio-test-support = { path = "../rio-test-support" }
+rio-test-support = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }

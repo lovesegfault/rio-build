@@ -30,7 +30,7 @@ metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true }
-futures-util = "0.3"
+futures-util = { workspace = true }
 scopeguard = "1"
 rand = { workspace = true }
 serde = { workspace = true }
@@ -38,4 +38,4 @@ serde = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-rio-test-support = { path = "../rio-test-support" }
+rio-test-support = { workspace = true }

@@ -24,6 +24,8 @@ repository = "https://github.com/lovesegfault/rio-build"
 rio-common = { path = "rio-common" }
 rio-nix = { path = "rio-nix" }
 rio-proto = { path = "rio-proto" }
+rio-store = { path = "rio-store" }
+rio-test-support = { path = "rio-test-support" }
 
 # Byte buffers
 bytes = "1"
@@ -118,15 +120,10 @@ zstd = "0.13"
 # --- phase2c: binary cache HTTP server ---
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
 # narinfo signing. pkcs8 for key encode/decode; rand_core for keygen in tests.
 # Nix binary caches sign the fingerprint `1;path;narHash;narSize;refs` —
 # sigs are stored at PutPath time so the HTTP server never touches the privkey.
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
-# stream! macro for pipelining reassemble_nar → zstd::Encoder → axum Body.
-# Without this the NAR would have to materialize fully in memory before
-# compression starts — defeats the whole chunk-streaming design for large NARs.
-async-stream = "0.3"
 
 # --- phase2c: priority scheduling ---
 # BinaryHeap over f64 critical-path priority. f64 doesn't impl Ord (NaN);
@@ -154,6 +151,7 @@ rand = "0.9"
 
 # Stream utilities (tonic re-exports, but we need it directly for ReceiverStream etc.)
 tokio-stream = "0.1"
+futures-util = "0.3"
 
 # Testing
 proptest = "1"
