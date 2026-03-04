@@ -406,9 +406,9 @@ mod tests {
 
     #[test]
     fn wire_rejects_wrong_algorithm() {
-        // 2 = XXHASH64 (we don't support it).
-        let result = BloomFilter::from_wire(vec![0; 10], 4, 64, 2, 1);
-        assert!(matches!(result, Err(BloomError::UnsupportedAlgorithm(2))));
+        // 99 = unknown variant. Only 3 (BLAKE3_256) is accepted.
+        let result = BloomFilter::from_wire(vec![0; 10], 4, 64, 99, 1);
+        assert!(matches!(result, Err(BloomError::UnsupportedAlgorithm(99))));
     }
 
     #[test]

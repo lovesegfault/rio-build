@@ -19,7 +19,6 @@ service StoreService {
   rpc FindMissingPaths(rio.types.FindMissingPathsRequest) returns (rio.types.FindMissingPathsResponse);
 
   // Content-addressed lookup: find a store path by its content hash.
-  // Phase 2a: returns UNIMPLEMENTED (no CA cutoff).
   rpc ContentLookup(rio.types.ContentLookupRequest) returns (rio.types.ContentLookupResponse);
 
   // Resolve a store path from its 32-char nixbase32 hash part.
@@ -64,7 +63,7 @@ service StoreService {
 }
 
 // Chunk-level storage service for content-defined chunking.
-// Phase 2a: all RPCs return UNIMPLEMENTED (full NARs only, no chunking).
+// PutChunk is UNIMPLEMENTED (server-side chunking only; see TODO(phase3a) in chunk.rs).
 service ChunkService {
   // Upload a chunk.
   rpc PutChunk(stream rio.types.PutChunkRequest) returns (rio.types.PutChunkResponse);
