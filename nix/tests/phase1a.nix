@@ -24,14 +24,8 @@
   rioModules,
 }:
 let
-  inherit (pkgs) lib;
-
-  # Static busybox: single-path closure, seeded via `nix copy` to give the
-  # read-only queries something to return. Same rationale as phase2a.nix.
-  inherit (pkgs.pkgsStatic) busybox;
-  busyboxClosure = pkgs.closureInfo { rootPaths = [ busybox ]; };
-
-  databaseUrl = "postgres://postgres@localhost/rio";
+  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  inherit (common) busybox busyboxClosure databaseUrl;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase1a";
@@ -42,21 +36,9 @@ pkgs.testers.runNixOSTest {
         rioModules.store
         rioModules.scheduler
         rioModules.gateway
+        common.postgresqlConfig
       ];
       networking.hostName = "gateway";
-
-      services.postgresql = {
-        enable = true;
-        enableTCPIP = true;
-        authentication = lib.mkForce ''
-          local all all trust
-          host  all all 127.0.0.1/32 trust
-          host  all all ::1/128 trust
-        '';
-        initialScript = pkgs.writeText "rio-init.sql" ''
-          CREATE DATABASE rio;
-        '';
-      };
 
       services.rio = {
         package = rio-workspace;
@@ -78,13 +60,7 @@ pkgs.testers.runNixOSTest {
         };
       };
 
-      # Empty authorized_keys so the gateway unit can start; testScript
-      # populates it before the client connects.
-      systemd.tmpfiles.rules = [
-        "d /var/lib/rio 0755 root root -"
-        "d /var/lib/rio/gateway 0755 root root -"
-        "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
-      ];
+      systemd.tmpfiles.rules = common.gatewayTmpfiles;
 
       networking.firewall.allowedTCPPorts = [ 2222 ];
 
@@ -95,32 +71,7 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    client = {
-      networking.hostName = "client";
-
-      nix.settings.experimental-features = [
-        "nix-command"
-        "flakes"
-      ];
-
-      environment.systemPackages = [ busybox ];
-      environment.etc."rio/busybox-closure".source = "${busyboxClosure}";
-
-      programs.ssh.extraConfig = ''
-        Host gateway
-          HostName gateway
-          User root
-          Port 2222
-          IdentityFile /root/.ssh/id_ed25519
-          StrictHostKeyChecking no
-          UserKnownHostsFile /dev/null
-      '';
-
-      virtualisation = {
-        memorySize = 1024;
-        cores = 4;
-      };
-    };
+    client = common.mkClientNode { gatewayHost = "gateway"; };
   };
 
   testScript = ''
@@ -134,12 +85,7 @@ pkgs.testers.runNixOSTest {
     gateway.wait_for_open_port(9001)
 
     # SSH key exchange + gateway restart
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    gateway.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
-    gateway.succeed("systemctl restart rio-gateway.service")
-    gateway.wait_for_unit("rio-gateway.service")
-    gateway.wait_for_open_port(2222)
+    ${common.sshKeySetup "gateway"}
 
     # ── Milestone: SSH handshake ──────────────────────────────────────
     # `nix store info` exercises the ssh-ng SSH layer + Nix protocol

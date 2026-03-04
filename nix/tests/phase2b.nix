@@ -1,14 +1,14 @@
 # Phase 2b milestone validation as a NixOS VM test.
 #
 # Milestone (docs/src/phases/phase2b.md:46):
-#   Traces visible in Jaeger for a multi-worker build;
+#   Traces visible in Tempo for a multi-worker build;
 #   container images build via `nix build .#dockerImages`.
 #
 # (Container images are validated separately by .#dockerImages; this test
-# covers the Jaeger/tracing + log-streaming + cache-hit parts.)
+# covers the Tempo/tracing + log-streaming + cache-hit parts.)
 #
 # Five VMs:
-#   control  — PostgreSQL, rio-store, rio-scheduler, rio-gateway, Jaeger
+#   control  — PostgreSQL, rio-store, rio-scheduler, rio-gateway, Tempo
 #   worker1  — rio-worker (CAP_SYS_ADMIN, /dev/fuse)
 #   worker2  — rio-worker
 #   worker3  — rio-worker
@@ -19,7 +19,7 @@
 #   2. PHASE2B-LOG-MARKER visible in client's nix-build output (log pipeline
 #      end-to-end: worker → scheduler ring buffer → gateway → SSH → client)
 #   3. Second build of same chain is fast AND increments cache_hits_total
-#   4. Jaeger has at least one trace with service="scheduler" (OTLP export +
+#   4. Tempo has at least one trace with service="scheduler" (OTLP export +
 #      traceparent propagation gateway→scheduler)
 #
 # Run interactively:
@@ -31,49 +31,16 @@
   rioModules,
 }:
 let
-  inherit (pkgs) lib;
+  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  inherit (common) busybox busyboxClosure databaseUrl;
 
-  inherit (pkgs.pkgsStatic) busybox;
-  busyboxClosure = pkgs.closureInfo { rootPaths = [ busybox ]; };
   testDrvFile = ./phase2b-derivation.nix;
-  databaseUrl = "postgres://postgres@localhost/rio";
 
-  # OTLP endpoint on control. Jaeger all-in-one listens on 4317 for OTLP/gRPC.
+  # OTLP endpoint on control. Tempo listens on 4317 for OTLP/gRPC.
+  # The milestone spec says "visible in Jaeger" but Jaeger all-in-one
+  # isn't packaged in nixpkgs; Tempo is, and it speaks the same OTLP.
+  # Same validation: OTLP export works + queryable.
   otelEndpoint = "http://control:4317";
-
-  workerConfig = hostName: {
-    imports = [ rioModules.worker ];
-    networking.hostName = hostName;
-
-    services.rio = {
-      package = rio-workspace;
-      logFormat = "pretty";
-      worker = {
-        enable = true;
-        schedulerAddr = "control:9001";
-        storeAddr = "control:9002";
-        maxBuilds = 1; # 3 workers × 1 slot each = exactly one derivation each
-      };
-    };
-
-    # OTel endpoint for the worker. Not strictly needed for the milestone
-    # (gateway→scheduler is the critical trace hop), but having worker
-    # spans in Jaeger makes the trace tree look like the spec diagram.
-    systemd.services.rio-worker.environment.RIO_OTEL_ENDPOINT = otelEndpoint;
-
-    environment.systemPackages = [ pkgs.curl ];
-
-    virtualisation = {
-      memorySize = 1024;
-      diskSize = 4096;
-      cores = 4;
-      writableStore = false;
-    };
-    fileSystems."/nix/var" = {
-      fsType = "tmpfs";
-      neededForBoot = true;
-    };
-  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase2b";
@@ -84,21 +51,9 @@ pkgs.testers.runNixOSTest {
         rioModules.store
         rioModules.scheduler
         rioModules.gateway
+        common.postgresqlConfig
       ];
       networking.hostName = "control";
-
-      services.postgresql = {
-        enable = true;
-        enableTCPIP = true;
-        authentication = lib.mkForce ''
-          local all all trust
-          host  all all 127.0.0.1/32 trust
-          host  all all ::1/128 trust
-        '';
-        initialScript = pkgs.writeText "rio-init.sql" ''
-          CREATE DATABASE rio;
-        '';
-      };
 
       # Tempo: Grafana's trace backend. Accepts OTLP/gRPC on 4317, serves
       # query API on 3200. Jaeger all-in-one isn't packaged in nixpkgs;
@@ -167,16 +122,12 @@ pkgs.testers.runNixOSTest {
           rio-scheduler.environment.RIO_OTEL_ENDPOINT = "http://localhost:4317";
           rio-gateway.environment.RIO_OTEL_ENDPOINT = "http://localhost:4317";
         };
-        tmpfiles.rules = [
-          "d /var/lib/rio 0755 root root -"
-          "d /var/lib/rio/gateway 0755 root root -"
-          "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
-        ];
+        tmpfiles.rules = common.gatewayTmpfiles;
       };
 
       environment.systemPackages = [
         pkgs.curl
-        pkgs.python3 # for the Jaeger JSON assertion
+        pkgs.python3 # for the Tempo JSON assertion
       ];
 
       networking.firewall.allowedTCPPorts = [
@@ -197,32 +148,25 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    worker1 = workerConfig "worker1";
-    worker2 = workerConfig "worker2";
-    worker3 = workerConfig "worker3";
+    worker1 = common.mkWorkerNode {
+      hostName = "worker1";
+      maxBuilds = 1; # 3 workers × 1 slot each = exactly one derivation each
+      inherit otelEndpoint;
+    };
+    worker2 = common.mkWorkerNode {
+      hostName = "worker2";
+      maxBuilds = 1;
+      inherit otelEndpoint;
+    };
+    worker3 = common.mkWorkerNode {
+      hostName = "worker3";
+      maxBuilds = 1;
+      inherit otelEndpoint;
+    };
 
-    client = {
-      networking.hostName = "client";
-      nix.settings.experimental-features = [
-        "nix-command"
-        "flakes"
-      ];
-      environment.systemPackages = [
-        busybox
-        pkgs.curl
-      ];
-      environment.etc."rio/busybox-closure".source = "${busyboxClosure}";
-      programs.ssh.extraConfig = ''
-        Host control
-          HostName control
-          User root
-          Port 2222
-          IdentityFile /root/.ssh/id_ed25519
-          StrictHostKeyChecking no
-          UserKnownHostsFile /dev/null
-      '';
-      virtualisation.memorySize = 1024;
-      virtualisation.cores = 4;
+    client = common.mkClientNode {
+      gatewayHost = "control";
+      extraPackages = [ pkgs.curl ];
     };
   };
 
@@ -242,12 +186,7 @@ pkgs.testers.runNixOSTest {
     control.wait_for_open_port(9001)
 
     # SSH keys + gateway restart (same dance as phase2a).
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    control.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
-    control.succeed("systemctl restart rio-gateway.service")
-    control.wait_for_unit("rio-gateway.service")
-    control.wait_for_open_port(2222)
+    ${common.sshKeySetup "control"}
 
     # Workers register.
     for w in [worker1, worker2, worker3]:

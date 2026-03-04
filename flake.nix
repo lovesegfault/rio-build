@@ -537,7 +537,7 @@
           #   vm-phase1a — 2 VMs: read-only opcodes (path-info, store ls)
           #   vm-phase1b — 3 VMs: single-worker end-to-end build
           #   vm-phase2a — 4 VMs: distributed build across 2+ workers
-          #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Jaeger
+          #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Tempo (OTLP)
           #   vm-phase2c — 5 VMs: CA + critical-path + size-class + circuit-breaker
           vmTests = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             let
