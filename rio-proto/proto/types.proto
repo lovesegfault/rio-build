@@ -403,6 +403,22 @@ message ContentLookupResponse {
   PathInfo info = 2;                     // Full path info if found
 }
 
+// Resolve a store path from its nixbase32 hash part (32 chars).
+// NOT_FOUND if no path with that hash-part exists.
+message QueryPathFromHashPartRequest {
+  string hash_part = 1;                   // e.g. "abc123..." (32 nixbase32 chars, no /nix/store/ prefix, no name)
+}
+
+// Append signatures to an existing store path. NOT_FOUND if path unknown.
+message AddSignaturesRequest {
+  string store_path = 1;                  // Full /nix/store/... path
+  repeated string signatures = 2;         // Signatures to append (format: "keyname:base64sig")
+}
+
+message AddSignaturesResponse {
+  // Empty — success signaled by OK status, failure by NOT_FOUND/INVALID_ARGUMENT.
+}
+
 // ---------------------------------------------------------------------------
 // Chunk service types (Phase 2a: stub, no chunking)
 // ---------------------------------------------------------------------------

@@ -286,11 +286,9 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
 
 /// wopQueryPathFromHashPart (29): Resolve a store path from its hash part.
 ///
-/// Uses QueryPathInfo with a constructed path. Since the gRPC store doesn't
-/// have a dedicated hash-part lookup, we query FindMissingPaths as a
-/// workaround.
-/// TODO(phase2c): add a dedicated QueryPathFromHashPart store RPC.
-/// Current approach returns empty for any non-full-path query.
+/// Nix sends just the 32-char nixbase32 hash (no /nix/store/ prefix, no
+/// name) and expects the full path back. Wire response: one string —
+/// the full path if found, empty string if not.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_path_from_hash_part<
     R: AsyncRead + Unpin,
@@ -303,15 +301,28 @@ pub(super) async fn handle_query_path_from_hash_part<
     let hash_part = wire::read_string(reader).await?;
     debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
 
-    // Construct a query path from the hash part. The store service should
-    // support this via QueryPathInfo with a hash-part prefix query.
-    // For now, use the hash_part directly as a store path prefix lookup.
-    let result = grpc_query_path_info(store_client, &format!("/nix/store/{hash_part}")).await;
-
-    let path_str = match result {
-        // ValidatedPathInfo.store_path is always non-empty (StorePath can't be empty).
-        Ok(Some(info)) => info.store_path.to_string(),
-        Ok(None) => String::new(),
+    // Dedicated RPC (resolves the old TODO(phase2c) workaround).
+    // The store validates hash_part (32 chars, nixbase32 charset) and
+    // does the LIKE prefix query. NOT_FOUND → empty string to Nix; other
+    // gRPC errors → STDERR_ERROR.
+    let req = types::QueryPathFromHashPartRequest { hash_part };
+    let path_str = match rio_common::grpc::with_timeout(
+        "QueryPathFromHashPart",
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.query_path_from_hash_part(req),
+    )
+    .await
+    {
+        Ok(info) => info.into_inner().store_path,
+        // NOT_FOUND is a normal "no such path" result, not an error. Nix
+        // expects empty string for that case (that's how `nix-store -q`
+        // distinguishes found from not-found).
+        Err(e)
+            if e.downcast_ref::<tonic::Status>()
+                .is_some_and(|s| s.code() == tonic::Code::NotFound) =>
+        {
+            String::new()
+        }
         Err(e) => return send_store_error(stderr, e).await,
     };
 
@@ -322,20 +333,36 @@ pub(super) async fn handle_query_path_from_hash_part<
 
 /// wopAddSignatures (37): Add signatures to an existing store path.
 ///
-/// Since the gRPC store doesn't have a dedicated AddSignatures RPC,
-/// this is a no-op that reads the wire data and returns success.
+/// Wire: path string + strings list. Response: u64(1) on success.
+/// The real daemon returns STDERR_ERROR on unknown path; we do the same.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    _store_client: &mut StoreServiceClient<Channel>,
+    store_client: &mut StoreServiceClient<Channel>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     let sigs = wire::read_strings(reader).await?;
     debug!(path = %path_str, count = sigs.len(), "wopAddSignatures");
 
-    // TODO(phase2c): implement via dedicated AddSignatures store RPC.
-    // Signatures are deferred; currently accept and discard.
+    // Dedicated RPC (resolves the old TODO(phase2c) stub). The store
+    // appends to narinfo.signatures TEXT[]. NOT_FOUND → STDERR_ERROR
+    // (matches the real daemon: signing a path you don't have is an error,
+    // not a silent no-op — `nix store sign` expects to hear about it).
+    let req = types::AddSignaturesRequest {
+        store_path: path_str,
+        signatures: sigs,
+    };
+    if let Err(e) = rio_common::grpc::with_timeout(
+        "AddSignatures",
+        DEFAULT_GRPC_TIMEOUT,
+        store_client.add_signatures(req),
+    )
+    .await
+    {
+        return send_store_error(stderr, e).await;
+    }
+
     stderr.finish().await?;
     wire::write_u64(stderr.inner_mut(), 1).await?;
     Ok(())

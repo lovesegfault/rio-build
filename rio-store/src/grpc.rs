@@ -13,10 +13,11 @@ use tracing::{debug, error, instrument, warn};
 use rio_proto::store::chunk_service_server::ChunkService;
 use rio_proto::store::store_service_server::StoreService;
 use rio_proto::types::{
-    ContentLookupRequest, ContentLookupResponse, FindMissingChunksRequest,
-    FindMissingChunksResponse, FindMissingPathsRequest, FindMissingPathsResponse, GetChunkRequest,
-    GetChunkResponse, GetPathRequest, GetPathResponse, PathInfo, PutChunkRequest, PutChunkResponse,
-    PutPathRequest, PutPathResponse, QueryPathInfoRequest, get_path_response, put_path_request,
+    AddSignaturesRequest, AddSignaturesResponse, ContentLookupRequest, ContentLookupResponse,
+    FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,
+    FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
+    PathInfo, PutChunkRequest, PutChunkResponse, PutPathRequest, PutPathResponse,
+    QueryPathFromHashPartRequest, QueryPathInfoRequest, get_path_response, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -605,6 +606,91 @@ impl StoreService for StoreServiceImpl {
         Err(Status::unimplemented(
             "ContentLookup is not implemented in Phase 2a",
         ))
+    }
+
+    /// Resolve a store path from its 32-char nixbase32 hash part.
+    #[instrument(skip(self, request), fields(rpc = "QueryPathFromHashPart"))]
+    async fn query_path_from_hash_part(
+        &self,
+        request: Request<QueryPathFromHashPartRequest>,
+    ) -> Result<Response<PathInfo>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        // Validate BEFORE touching PG. The hash-part flows into a LIKE
+        // pattern (metadata::query_by_hash_part builds `/nix/store/{hash}-%`);
+        // an unvalidated `%` or `_` would be LIKE-injection. nixbase32's
+        // alphabet has neither (0-9, a-z minus e/o/t/u), so a successful
+        // decode blocks that.
+        //
+        // 32 chars = 20 bytes of hash (Nix's compressHash output). Anything
+        // else is a client bug, not a missing path — INVALID_ARGUMENT, not
+        // NOT_FOUND.
+        //
+        // nixbase32::decode() checks BOTH length-validity AND charset in one
+        // call. We throw away the decoded bytes — it's purely a validator
+        // here. 20-byte allocation + discard; negligible next to the PG query.
+        if req.hash_part.len() != rio_nix::store_path::HASH_CHARS {
+            return Err(Status::invalid_argument(format!(
+                "hash_part must be {} chars (nixbase32), got {}",
+                rio_nix::store_path::HASH_CHARS,
+                req.hash_part.len()
+            )));
+        }
+        if let Err(e) = rio_nix::store_path::nixbase32::decode(&req.hash_part) {
+            return Err(Status::invalid_argument(format!(
+                "hash_part is not valid nixbase32: {e}"
+            )));
+        }
+
+        let info = metadata::query_by_hash_part(&self.pool, &req.hash_part)
+            .await
+            .map_err(|e| internal_error("QueryPathFromHashPart: query_by_hash_part", e))?
+            .ok_or_else(|| {
+                Status::not_found(format!("no path with hash part: {}", req.hash_part))
+            })?;
+
+        Ok(Response::new(info.into()))
+    }
+
+    /// Append signatures to an existing store path.
+    #[instrument(skip(self, request), fields(rpc = "AddSignatures"))]
+    async fn add_signatures(
+        &self,
+        request: Request<AddSignaturesRequest>,
+    ) -> Result<Response<AddSignaturesResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        validate_store_path(&req.store_path)?;
+
+        // Bound the signatures list — a malicious client could send 1M sigs
+        // and we'd append them all. MAX_SIGNATURES matches PutPath's bound.
+        rio_common::grpc::check_bound(
+            "signatures",
+            req.signatures.len(),
+            rio_common::limits::MAX_SIGNATURES,
+        )?;
+
+        // Empty sigs list: no-op. Don't hit PG for nothing. Not an error —
+        // `nix store sign` with no configured keys can legitimately produce
+        // this (it sends the opcode but with zero sigs).
+        if req.signatures.is_empty() {
+            return Ok(Response::new(AddSignaturesResponse {}));
+        }
+
+        let rows = metadata::append_signatures(&self.pool, &req.store_path, &req.signatures)
+            .await
+            .map_err(|e| internal_error("AddSignatures: append_signatures", e))?;
+
+        if rows == 0 {
+            return Err(Status::not_found(format!(
+                "path not found: {}",
+                req.store_path
+            )));
+        }
+
+        Ok(Response::new(AddSignaturesResponse {}))
     }
 }
 
