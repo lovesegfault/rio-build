@@ -13,11 +13,71 @@
 //! invocation, as both operations require it.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nix::mount::{MntFlags, MsFlags};
+
+/// Errors from overlay setup and teardown.
+///
+/// Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only
+/// catches overlay failures — a bare `?` on an unrelated `anyhow::Result`
+/// elsewhere in `execute_build` no longer silently becomes an "overlay
+/// setup failed" message.
+#[derive(Debug, thiserror::Error)]
+pub enum OverlayError {
+    #[error("invalid build_id {0:?}: must be non-empty and contain no '/' or NUL")]
+    InvalidBuildId(String),
+
+    #[error("failed to create directory {path}: {source}")]
+    DirCreate {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("stat({path}) failed: {source}")]
+    Stat {
+        path: PathBuf,
+        #[source]
+        source: nix::errno::Errno,
+    },
+
+    #[error(
+        "overlay upper ({upper}) and FUSE lower ({lower}) are on the same filesystem \
+         (st_dev={st_dev}); the kernel will reject this mount. \
+         Set --overlay-base-dir to a directory on a different mount \
+         (e.g., a local SSD emptyDir volume, not the FUSE mount)."
+    )]
+    SameFilesystem {
+        upper: PathBuf,
+        lower: PathBuf,
+        st_dev: u64,
+    },
+
+    #[error("mount overlay failed: {source} (mount_data: {mount_data})")]
+    Mount {
+        mount_data: String,
+        #[source]
+        source: nix::errno::Errno,
+    },
+
+    #[error("umount2 overlay failed: {source}")]
+    Unmount {
+        #[source]
+        source: nix::errno::Errno,
+    },
+}
+
+/// Shorthand: wrap `fs::create_dir_all` with path context.
+fn mkdir_all(path: &Path) -> Result<(), OverlayError> {
+    fs::create_dir_all(path).map_err(|source| OverlayError::DirCreate {
+        path: path.to_path_buf(),
+        source,
+    })
+}
 
 /// An active overlayfs mount with FUSE lower layer and per-build upper layer.
 ///
@@ -123,12 +183,11 @@ pub fn setup_overlay(
     base_dir: &Path,
     build_id: &str,
     leak_counter: Arc<AtomicUsize>,
-) -> anyhow::Result<OverlayMount> {
+) -> Result<OverlayMount, OverlayError> {
     const HOST_STORE: &str = "/nix/store";
-    anyhow::ensure!(
-        !build_id.contains('/') && !build_id.contains('\0') && !build_id.is_empty(),
-        "build_id must not contain path separators or be empty: {build_id:?}"
-    );
+    if build_id.is_empty() || build_id.contains('/') || build_id.contains('\0') {
+        return Err(OverlayError::InvalidBuildId(build_id.to_string()));
+    }
 
     let build_dir = base_dir.join(build_id);
     let upper = build_dir.join("upper");
@@ -140,28 +199,32 @@ pub fn setup_overlay(
     let work = build_dir.join("work");
     let merged = build_dir.join("merged");
 
-    fs::create_dir_all(&store_upper)?;
-    fs::create_dir_all(&work)?;
-    fs::create_dir_all(&merged)?;
+    mkdir_all(&store_upper)?;
+    mkdir_all(&work)?;
+    mkdir_all(&merged)?;
 
     // The kernel rejects overlayfs mounts where upper and lower share a
     // filesystem when the lower is FUSE. Compare st_dev proactively so we
     // fail with a clear message rather than a cryptic EINVAL from mount(2).
     let lower_dev = nix::sys::stat::stat(lower)
-        .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", lower.display()))?
+        .map_err(|source| OverlayError::Stat {
+            path: lower.to_path_buf(),
+            source,
+        })?
         .st_dev;
     let upper_dev = nix::sys::stat::stat(&store_upper)
-        .map_err(|e| anyhow::anyhow!("stat({}) failed: {e}", store_upper.display()))?
+        .map_err(|source| OverlayError::Stat {
+            path: store_upper.clone(),
+            source,
+        })?
         .st_dev;
-    anyhow::ensure!(
-        lower_dev != upper_dev,
-        "overlay upper ({}) and FUSE lower ({}) are on the same filesystem \
-         (st_dev={lower_dev}); the kernel will reject this mount. \
-         Set --overlay-base-dir to a directory on a different mount \
-         (e.g., a local SSD emptyDir volume, not the FUSE mount).",
-        store_upper.display(),
-        lower.display(),
-    );
+    if lower_dev == upper_dev {
+        return Err(OverlayError::SameFilesystem {
+            upper: store_upper,
+            lower: lower.to_path_buf(),
+            st_dev: lower_dev,
+        });
+    }
 
     // Stacked lowers: host /nix/store first (for nix-daemon + deps), FUSE second.
     // Colon-separated, left-to-right lookup priority.
@@ -188,7 +251,7 @@ pub fn setup_overlay(
         MsFlags::empty(),
         Some(mount_data.as_str()),
     )
-    .map_err(|e| anyhow::anyhow!("mount overlay failed: {e} (mount_data: {mount_data})"))?;
+    .map_err(|source| OverlayError::Mount { mount_data, source })?;
 
     Ok(OverlayMount {
         upper,
@@ -199,11 +262,11 @@ pub fn setup_overlay(
     })
 }
 
-fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> anyhow::Result<()> {
+fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> Result<(), OverlayError> {
     tracing::info!(merged = %merged.display(), "unmounting overlayfs");
 
     nix::mount::umount2(merged, MntFlags::MNT_DETACH)
-        .map_err(|e| anyhow::anyhow!("umount2 overlay failed: {e}"))?;
+        .map_err(|source| OverlayError::Unmount { source })?;
 
     // Clean up directories (best-effort, but log failures)
     for (label, path) in [("upper", upper), ("work", work), ("merged", merged)] {
@@ -225,7 +288,7 @@ fn teardown_overlay_inner(merged: &Path, upper: &Path, work: &Path) -> anyhow::R
 /// On success, sets `mounted=false` so `Drop` is a no-op.
 /// On failure, leaves `mounted=true` so `Drop` will retry teardown and
 /// increment `rio_worker_overlay_teardown_failures_total` (centralized there).
-pub fn teardown_overlay(mut mount: OverlayMount) -> anyhow::Result<()> {
+pub fn teardown_overlay(mut mount: OverlayMount) -> Result<(), OverlayError> {
     teardown_overlay_inner(&mount.merged, &mount.upper, &mount.work)?;
     mount.mounted = false;
     Ok(())
@@ -235,9 +298,9 @@ pub fn teardown_overlay(mut mount: OverlayMount) -> anyhow::Result<()> {
 ///
 /// This creates `nix/var/nix/db/` under the upper directory so the
 /// synthetic SQLite DB can be placed there.
-pub fn prepare_nix_state_dirs(upper: &Path) -> anyhow::Result<PathBuf> {
+pub fn prepare_nix_state_dirs(upper: &Path) -> Result<PathBuf, OverlayError> {
     let db_dir = upper.join("nix/var/nix/db");
-    fs::create_dir_all(&db_dir)?;
+    mkdir_all(&db_dir)?;
     Ok(db_dir)
 }
 
@@ -331,9 +394,15 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let lower = dir.path();
 
-        assert!(setup_overlay(lower, dir.path(), "", dummy_counter()).is_err());
-        assert!(setup_overlay(lower, dir.path(), "foo/bar", dummy_counter()).is_err());
-        assert!(setup_overlay(lower, dir.path(), "foo\0bar", dummy_counter()).is_err());
+        for bad in ["", "foo/bar", "foo\0bar"] {
+            let Err(err) = setup_overlay(lower, dir.path(), bad, dummy_counter()) else {
+                panic!("expected InvalidBuildId for {bad:?}");
+            };
+            assert!(
+                matches!(err, OverlayError::InvalidBuildId(_)),
+                "expected InvalidBuildId for {bad:?}, got {err:?}"
+            );
+        }
         Ok(())
     }
 
@@ -349,6 +418,11 @@ mod tests {
         let Err(e) = setup_overlay(&lower, &base, "test-build", dummy_counter()) else {
             panic!("expected setup_overlay to fail when upper and lower share a filesystem");
         };
+        assert!(
+            matches!(e, OverlayError::SameFilesystem { .. }),
+            "expected SameFilesystem, got {e:?}"
+        );
+        // The Display message must mention it for log readability.
         let msg = e.to_string();
         assert!(msg.contains("same filesystem"), "got: {msg}");
         Ok(())

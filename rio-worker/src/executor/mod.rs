@@ -83,14 +83,22 @@ experimental-features =
 ";
 
 /// Error type for executor operations.
+///
+/// No `#[from] anyhow::Error` — every variant has a typed source. Before
+/// C1, `Overlay(#[from] anyhow::Error)` was the only type-erasing `From`
+/// in the codebase: any `?` on an `anyhow::Result` anywhere in
+/// `execute_build` became "overlay setup failed", even for unrelated
+/// failures. Now the compiler catches those at the `?` site.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
     #[error("overlay setup failed: {0}")]
-    Overlay(#[from] anyhow::Error),
+    Overlay(#[from] overlay::OverlayError),
+    #[error("overlay setup task panicked: {0}")]
+    OverlayTaskPanic(tokio::task::JoinError),
     #[error("synthetic DB generation failed: {0}")]
-    SynthDb(String),
-    #[error("nix.conf setup failed: {0}")]
-    NixConf(String),
+    SynthDb(#[from] sqlx::Error),
+    #[error("failed to write nix.conf: {0}")]
+    NixConf(#[source] std::io::Error),
     #[error("daemon spawn failed: {0}")]
     DaemonSpawn(std::io::Error),
     #[error("daemon handshake failed: {0}")]
@@ -240,7 +248,7 @@ pub async fn execute_build(
         overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned, leak_counter_owned)
     })
     .await
-    .map_err(|e| ExecutorError::Overlay(anyhow::anyhow!("overlay setup task panicked: {e}")))??;
+    .map_err(ExecutorError::OverlayTaskPanic)??;
 
     // 2. Parse the derivation. If drv_content is inline, use it; otherwise
     // fetch the .drv from the store and extract ATerm from the NAR.
@@ -336,9 +344,7 @@ pub async fn execute_build(
         .collect();
     let db_dir = overlay::prepare_nix_state_dirs(overlay_mount.upper_dir())?;
     let db_path = db_dir.join("db.sqlite");
-    synth_db::generate_db(&db_path, &synth_paths, &drv_outputs)
-        .await
-        .map_err(|e| ExecutorError::SynthDb(e.to_string()))?;
+    synth_db::generate_db(&db_path, &synth_paths, &drv_outputs).await?;
 
     // 4. Set up nix.conf in overlay
     setup_nix_conf(overlay_mount.upper_dir())?;
@@ -541,10 +547,8 @@ pub async fn execute_build(
 /// Write nix.conf to the overlay upper layer.
 fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
     let conf_dir = upper_dir.join("etc/nix");
-    std::fs::create_dir_all(&conf_dir)
-        .map_err(|e| ExecutorError::NixConf(format!("failed to create nix conf dir: {e}")))?;
-    std::fs::write(conf_dir.join("nix.conf"), WORKER_NIX_CONF)
-        .map_err(|e| ExecutorError::NixConf(format!("failed to write nix.conf: {e}")))?;
+    std::fs::create_dir_all(&conf_dir).map_err(ExecutorError::NixConf)?;
+    std::fs::write(conf_dir.join("nix.conf"), WORKER_NIX_CONF).map_err(ExecutorError::NixConf)?;
     Ok(())
 }
 
