@@ -4,9 +4,8 @@
 //! the operation via gRPC delegation, and writes the response via the STDERR
 //! streaming loop.
 //!
-//! Compared to the Phase 1b handler in rio-build, all `Store` trait calls
-//! are replaced with `StoreServiceClient` gRPC calls, and all build operations
-//! delegate to the scheduler via `SchedulerServiceClient`.
+//! Store operations delegate to rio-store via `StoreServiceClient` gRPC calls;
+//! build operations delegate to rio-scheduler via `SchedulerServiceClient`.
 
 use std::collections::{HashMap, HashSet};
 

@@ -9,7 +9,7 @@
 //!
 //! - **Inline** (`inline_blob IS NOT NULL`): whole NAR stored directly in the
 //!   manifests row. No `manifest_data` row. Used for small NARs (<256KB by
-//!   default; E1 interim: ALL NARs, chunking lands in C3).
+//!   default).
 //! - **Chunked** (`inline_blob IS NULL`): NAR split by FastCDC; chunks in S3;
 //!   `manifest_data.chunk_list` holds the ordered (blake3, size) list.
 //!
@@ -367,10 +367,6 @@ pub async fn check_manifest_complete(pool: &PgPool, store_path_hash: &[u8]) -> R
 ///
 /// `None` means the path has no complete manifest (either never uploaded,
 /// or stuck in 'uploading' from a crashed PutPath).
-///
-/// E1 interim: chunked arm is a stub. When `inline_blob IS NULL` we return
-/// `Chunked(vec![])` — unreachable in practice since E1's PutPath always
-/// writes inline, but the type is in place for C3/C5.
 #[instrument(skip(pool))]
 pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
     // Single query: join narinfo→manifests, filter status='complete',

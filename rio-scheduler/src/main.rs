@@ -24,8 +24,8 @@ struct Config {
     database_url: String,
     metrics_addr: std::net::SocketAddr,
     tick_interval_secs: u64,
-    /// S3 bucket for build-log flush (phase2b). `None` = flush disabled.
-    /// Env: `RIO_LOG_S3_BUCKET`. Not yet wired to a consumer — C8 does that.
+    /// S3 bucket for build-log flush. `None` = flush disabled.
+    /// Env: `RIO_LOG_S3_BUCKET`. Wired into LogFlusher in main().
     log_s3_bucket: Option<String>,
     log_s3_prefix: String,
     /// Size-class cutoff config. Empty = disabled (all workers get all

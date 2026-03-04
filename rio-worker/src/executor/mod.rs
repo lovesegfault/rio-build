@@ -266,9 +266,9 @@ pub async fn execute_build(
     .await
     .map_err(ExecutorError::OverlayTaskPanic)??;
 
-    // 2. Parse the derivation. If drv_content is inline, use it; otherwise
-    // fetch the .drv from the store and extract ATerm from the NAR.
-    // Phase 2a: scheduler sends drv_content=empty, so we always fetch.
+    // 2. Parse the derivation. Scheduler inlines drv_content for
+    // missing-output nodes (phase2c D8); empty means cache-hit or
+    // inline-budget exceeded, so fall back to store fetch.
     let drv = if assignment.drv_content.is_empty() {
         fetch_drv_from_store(store_client, drv_path).await?
     } else {

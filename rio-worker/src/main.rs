@@ -40,8 +40,8 @@ struct Config {
     fuse_passthrough: bool,
     overlay_base_dir: PathBuf,
     metrics_addr: std::net::SocketAddr,
-    /// Phase2b log limits (configuration.md:68-69). 0 = unlimited.
-    /// Not yet wired to a consumer — C7 does that.
+    /// Log limits (configuration.md:68-69). 0 = unlimited.
+    /// Wired into LogLimits → LogBatcher in main().
     log_rate_limit: u64,
     log_size_limit: u64,
     /// Size-class this worker is deployed as. Empty = unclassified.
@@ -77,8 +77,7 @@ impl Default for Config {
             fuse_passthrough: true,
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: "0.0.0.0:9093".parse().unwrap(),
-            // configuration.md:68-69 specs these; current behavior (unlimited)
-            // is preserved until C7 wires them into LogBatcher.
+            // configuration.md:68-69 specs these defaults.
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),

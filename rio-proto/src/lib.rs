@@ -36,7 +36,7 @@ pub mod worker {
 }
 
 /// Store service: NAR storage and path metadata RPCs.
-/// Also includes ChunkService (stub UNIMPLEMENTED in Phase 2a).
+/// Also includes ChunkService (GetChunk/FindMissingChunks; PutChunk deferred to phase3a).
 pub mod store {
     tonic::include_proto!("rio.store");
 }

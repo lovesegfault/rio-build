@@ -248,10 +248,11 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     };
 
     // Fetch the FULL NAR before sending STDERR_LAST. We can't stream
-    // incrementally because a mid-stream gRPC error would leave the client's
+    // incrementally: a mid-stream gRPC error would leave the client's
     // copyNAR() with a truncated NAR and no way to signal the error (it's
-    // already past the stderr loop). For Phase 2a this is acceptable; Phase 2b
-    // should add NAR framing (length-prefixed) or use wopExportPaths instead.
+    // already past the stderr loop). The Nix protocol has no framing for
+    // this opcode — raw NAR bytes follow STDERR_LAST directly — so buffering
+    // is the only correct behavior.
     let req = types::GetPathRequest {
         store_path: path.to_string(),
     };
@@ -628,7 +629,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         match dp {
             DerivedPath::Built { drv, .. } => {
                 // For Built paths, walk the derivation to find outputs that need building.
-                // For simplicity in phase 2a, we report the raw DerivedPath string.
+                // We report the raw DerivedPath string rather than resolving to outputs.
                 if let Err(e) = resolve_derivation(drv, store_client, drv_cache).await {
                     tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
                 }

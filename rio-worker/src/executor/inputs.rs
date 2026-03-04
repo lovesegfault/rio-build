@@ -117,9 +117,10 @@ pub(super) async fn fetch_input_metadata(
 
 /// Fetch a .drv file from the store and parse it.
 ///
-/// Used when the scheduler sends `drv_content: empty` (Phase 2a default).
-/// The .drv is a single regular file in the store, so we fetch its NAR and
-/// extract the ATerm content via `extract_single_file`.
+/// Fallback when the scheduler sends `drv_content: empty` (cache-hit node
+/// or inline budget exceeded). The .drv is a single regular file in the
+/// store, so we fetch its NAR and extract the ATerm content via
+/// `extract_single_file`.
 #[instrument(skip_all, fields(drv_path = %drv_path))]
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
