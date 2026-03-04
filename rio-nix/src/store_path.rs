@@ -7,6 +7,11 @@ use thiserror::Error;
 /// The Nix store directory.
 pub const STORE_DIR: &str = "/nix/store";
 
+/// The Nix store directory with trailing slash — the prefix to strip when
+/// extracting a basename from a raw `&str` path. Prefer [`StorePath::basename`]
+/// when you have a parsed `StorePath`.
+pub const STORE_PREFIX: &str = "/nix/store/";
+
 /// Length of the nixbase32-encoded hash part in a store path (32 chars = 20 bytes).
 pub const HASH_CHARS: usize = 32;
 
@@ -90,6 +95,23 @@ impl StorePath {
     /// The full path as a string slice (`/nix/store/{hash}-{name}`).
     pub fn as_str(&self) -> &str {
         &self.full
+    }
+
+    /// Returns the basename (`{hash}-{name}`) without the `/nix/store/` prefix.
+    ///
+    /// Infallible: `StorePath` construction guarantees the prefix is present.
+    /// Use this instead of `self.as_str().strip_prefix("/nix/store/").unwrap()`.
+    pub fn basename(&self) -> &str {
+        // STORE_PREFIX = "/nix/store/" (11 bytes). `full` is guaranteed to
+        // start with it by all constructors (parse, from_fingerprint).
+        &self.full[STORE_PREFIX.len()..]
+    }
+
+    /// SHA-256 digest of the full path string. Used as the store database
+    /// primary key (fixed-width, collision-free in practice).
+    pub fn sha256_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.full.as_bytes()).into()
     }
 }
 
@@ -430,6 +452,48 @@ mod tests {
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1";
         let sp = StorePath::parse(path)?;
         assert_eq!(sp.to_string(), path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_basename() -> anyhow::Result<()> {
+        let sp = StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1")?;
+        assert_eq!(
+            sp.basename(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1"
+        );
+        // Invariant: as_str() = STORE_PREFIX + basename()
+        assert_eq!(sp.as_str(), format!("{STORE_PREFIX}{}", sp.basename()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_basename_from_fingerprint() -> anyhow::Result<()> {
+        // from_fingerprint is the other constructor — verify it also
+        // produces a `full` that basename() can slice into correctly.
+        let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
+        let sp = StorePath::make_text("via-fingerprint", &hash, &[])?;
+        assert!(sp.basename().ends_with("-via-fingerprint"));
+        assert!(!sp.basename().starts_with('/'));
+        assert_eq!(
+            sp.basename().len(),
+            HASH_CHARS + 1 + "via-fingerprint".len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sha256_digest() -> anyhow::Result<()> {
+        let sp = StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")?;
+        let digest = sp.sha256_digest();
+        // Must match direct hashing of the full path string — this is the
+        // DB primary key, so stability matters.
+        use sha2::{Digest, Sha256};
+        let expected: [u8; 32] = Sha256::digest(sp.as_str().as_bytes()).into();
+        assert_eq!(digest, expected);
+        // Different paths → different digests (not just hashing a constant).
+        let sp2 = StorePath::parse("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello")?;
+        assert_ne!(sp.sha256_digest(), sp2.sha256_digest());
         Ok(())
     }
 

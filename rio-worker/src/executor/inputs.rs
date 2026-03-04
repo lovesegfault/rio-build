@@ -55,7 +55,7 @@ pub(super) fn verify_fod_hashes(
             // Flat hash — read file from overlay upper and hash contents
             let store_basename = output
                 .path()
-                .strip_prefix("/nix/store/")
+                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
                 .with_context(|| format!("invalid output path: {}", output.path()))?;
             let file_path = overlay_upper.join("nix/store").join(store_basename);
             let content = std::fs::read(&file_path).with_context(|| {

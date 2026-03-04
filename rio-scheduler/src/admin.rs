@@ -362,7 +362,9 @@ fn chunks_to_stream(chunks: Vec<BuildLogChunk>) -> ReceiverStream<Result<BuildLo
 /// `/nix/store/{32-char-hash}-{name}.drv` → `{32-char-hash}-{name}.drv`
 /// Already-hash-shaped input → unchanged.
 fn extract_drv_hash(s: &str) -> String {
-    s.strip_prefix("/nix/store/").unwrap_or(s).to_string()
+    s.strip_prefix(rio_nix::store_path::STORE_PREFIX)
+        .unwrap_or(s)
+        .to_string()
 }
 
 #[cfg(test)]

@@ -39,6 +39,8 @@ use sqlx::PgPool;
 use tracing::{debug, instrument, warn};
 
 use rio_nix::narinfo::NarInfoBuilder;
+#[cfg(test)]
+use rio_nix::store_path::StorePath;
 use rio_nix::store_path::nixbase32;
 
 use crate::cas::ChunkCache;
@@ -144,25 +146,14 @@ async fn narinfo(
     let url = format!("nar/{nar_hash_b32}.nar.zst");
 
     // References in narinfo TEXT are basenames (not full paths — that's
-    // the fingerprint format). StorePath's basename is everything after
-    // `/nix/store/`.
+    // the fingerprint format).
     let ref_basenames: Vec<String> = info
         .references
         .iter()
-        .map(|r| {
-            r.as_str()
-                .strip_prefix("/nix/store/")
-                .unwrap_or(r.as_str())
-                .to_string()
-        })
+        .map(|r| r.basename().to_string())
         .collect();
 
-    let deriver_basename = info.deriver.as_ref().map(|d| {
-        d.as_str()
-            .strip_prefix("/nix/store/")
-            .unwrap_or(d.as_str())
-            .to_string()
-    });
+    let deriver_basename = info.deriver.as_ref().map(|d| d.basename().to_string());
 
     let mut builder = NarInfoBuilder::new(
         info.store_path.as_str(),
@@ -426,7 +417,7 @@ mod tests {
         backend: Arc<MemoryChunkBackend>,
         name: &str,
         signer: Option<Signer>,
-    ) -> (String, [u8; 32], Vec<u8>) {
+    ) -> (StorePath, [u8; 32], Vec<u8>) {
         use rio_test_support::fixtures::{make_nar, make_path_info_for_nar, test_store_path};
 
         // Direct seeding via metadata functions — bypasses the gRPC
@@ -435,28 +426,32 @@ mod tests {
         // awkward; this is simpler and tests what matters (the HTTP
         // side reads the right DB state).
         let _ = (StoreServiceImpl::new, backend); // silence unused-import; kept for doc context
-        let store_path = test_store_path(name);
+        let store_path = StorePath::parse(&test_store_path(name)).unwrap();
         let (nar, _) = make_nar(name.as_bytes());
-        let info = make_path_info_for_nar(&store_path, &nar);
+        let info = make_path_info_for_nar(store_path.as_str(), &nar);
         let nar_hash = info.nar_hash;
 
-        use sha2::{Digest, Sha256};
-        let store_path_hash: Vec<u8> = Sha256::digest(store_path.as_bytes()).to_vec();
+        let store_path_hash = store_path.sha256_digest().to_vec();
 
         // Signature computed manually (same as maybe_sign would do).
         let mut sigs = Vec::new();
         if let Some(ref s) = signer {
-            let fp = rio_nix::narinfo::fingerprint(&store_path, &nar_hash, nar.len() as u64, &[]);
+            let fp = rio_nix::narinfo::fingerprint(
+                store_path.as_str(),
+                &nar_hash,
+                nar.len() as u64,
+                &[],
+            );
             sigs.push(s.sign(&fp));
         }
         let _ = signer;
 
-        metadata::insert_manifest_uploading(pool, &store_path_hash, &store_path)
+        metadata::insert_manifest_uploading(pool, &store_path_hash, store_path.as_str())
             .await
             .unwrap();
 
         let validated = rio_proto::validated::ValidatedPathInfo {
-            store_path: rio_nix::store_path::StorePath::parse(&store_path).unwrap(),
+            store_path: store_path.clone(),
             store_path_hash,
             deriver: None,
             nar_hash,
@@ -502,14 +497,7 @@ mod tests {
     async fn narinfo_found() {
         let (app, db, backend) = setup().await;
         let (store_path, nar_hash, _) = seed_path(&db.pool, backend, "narinfo-test", None).await;
-
-        // Extract hash-part from the store path.
-        let hash_part = store_path
-            .strip_prefix("/nix/store/")
-            .unwrap()
-            .split('-')
-            .next()
-            .unwrap();
+        let hash_part = store_path.hash_part();
 
         let resp = app
             .oneshot(
@@ -558,12 +546,7 @@ mod tests {
         let signer = Signer::parse(&format!("test-cache:{b64}")).unwrap();
 
         let (store_path, _, _) = seed_path(&db.pool, backend, "narinfo-signed", Some(signer)).await;
-        let hash_part = store_path
-            .strip_prefix("/nix/store/")
-            .unwrap()
-            .split('-')
-            .next()
-            .unwrap();
+        let hash_part = store_path.hash_part();
 
         let resp = app
             .oneshot(
