@@ -190,9 +190,9 @@ async fn test_golden_live_is_valid_path_found() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_golden_live_is_valid_path_not_found() -> anyhow::Result<()> {
     let store = MockStore::new();
-    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
+    let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
 
-    let op = golden::build_is_valid_path_bytes(nonexistent).await?;
+    let op = golden::build_is_valid_path_bytes(&nonexistent).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_is_valid_path_fields(data))
     })
@@ -221,9 +221,9 @@ async fn test_golden_live_query_path_info() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_golden_live_query_path_info_not_found() -> anyhow::Result<()> {
     let store = MockStore::new();
-    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
+    let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
 
-    let op = golden::build_query_path_info_bytes(nonexistent).await?;
+    let op = golden::build_query_path_info_bytes(&nonexistent).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_path_info_fields(data))
     })
@@ -238,8 +238,8 @@ async fn test_golden_live_query_valid_paths() -> anyhow::Result<()> {
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
-    let op = golden::build_query_valid_paths_bytes(&[&test_path, nonexistent], false).await?;
+    let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
+    let op = golden::build_query_valid_paths_bytes(&[&test_path, &nonexistent], false).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_valid_paths_fields(data))
     })
@@ -267,8 +267,8 @@ async fn test_golden_live_query_missing() -> anyhow::Result<()> {
     let store = MockStore::new();
     golden::seed_mock_store_from(&store, &[path_info]);
 
-    let nonexistent = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nonexistent-1.0";
-    let op = golden::build_query_missing_bytes(&[&test_path, nonexistent]).await?;
+    let nonexistent = rio_test_support::fixtures::test_store_path("nonexistent-1.0");
+    let op = golden::build_query_missing_bytes(&[&test_path, &nonexistent]).await?;
     run_live_conformance(Some(&op), store, SKIP_FIELDS, |data| {
         Box::pin(golden::parse_query_missing_fields(data))
     })

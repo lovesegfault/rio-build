@@ -607,7 +607,7 @@ mod tests {
         let leak_counter = Arc::new(AtomicUsize::new(999));
 
         let assignment = WorkAssignment {
-            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-test.drv".into(),
+            drv_path: rio_test_support::fixtures::test_drv_path("test"),
             assignment_token: "token-123".into(),
             ..Default::default()
         };

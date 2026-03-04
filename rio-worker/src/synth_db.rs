@@ -591,22 +591,23 @@ mod tests {
     fn test_synth_from_validated() -> anyhow::Result<()> {
         use rio_nix::store_path::StorePath;
         use rio_proto::validated::ValidatedPathInfo;
+        use rio_test_support::fixtures::{test_drv_path, test_store_path};
+
+        let hello = test_store_path("hello");
+        let hello_drv = test_drv_path("hello");
+        let glibc = test_store_path("glibc");
 
         let v = ValidatedPathInfo {
-            store_path: StorePath::parse("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello")?,
+            store_path: StorePath::parse(&hello)?,
             store_path_hash: vec![],
-            deriver: Some(StorePath::parse(
-                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv",
-            )?),
+            deriver: Some(StorePath::parse(&hello_drv)?),
             nar_hash: {
                 let mut h = [0u8; 32];
                 h[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
                 h
             },
             nar_size: 1024,
-            references: vec![StorePath::parse(
-                "/nix/store/cccccccccccccccccccccccccccccccc-glibc",
-            )?],
+            references: vec![StorePath::parse(&glibc)?],
             registration_time: 0,
             ultimate: false,
             signatures: vec!["sig1".to_string()],
@@ -614,23 +615,14 @@ mod tests {
         };
 
         let synth = SynthPathInfo::from(v);
-        assert_eq!(
-            synth.path,
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"
-        );
+        assert_eq!(synth.path, hello);
         assert_eq!(
             synth.nar_hash,
             "sha256:deadbeef00000000000000000000000000000000000000000000000000000000"
         );
         assert_eq!(synth.nar_size, 1024);
-        assert_eq!(
-            synth.deriver,
-            Some("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hello.drv".to_string())
-        );
-        assert_eq!(
-            synth.references,
-            vec!["/nix/store/cccccccccccccccccccccccccccccccc-glibc"]
-        );
+        assert_eq!(synth.deriver, Some(hello_drv));
+        assert_eq!(synth.references, vec![glibc]);
         assert!(synth.ca.is_none());
         Ok(())
     }
