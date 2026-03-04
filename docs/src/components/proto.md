@@ -226,7 +226,7 @@ Worker-facing RPCs are in a separate `WorkerService` (in `worker.proto`) to allo
 
 ## gRPC Configuration
 
-**Max message size:** The default gRPC max message size (4MB) is insufficient for rio-build. A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes (~12MB serialized). All gRPC services must be configured with `max_message_size = 32MB` (configurable via `RIO_GRPC__MAX_MESSAGE_SIZE`).
+**Max message size:** The default gRPC max message size (4MB) is insufficient for rio-build. A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes (~12MB serialized). All gRPC services must be configured with `max_message_size = 32MB` (configurable via `RIO_GRPC_MAX_MESSAGE_SIZE`).
 
 **Why not streaming DAG submission?** Streaming the DAG in batches was considered but rejected for Phase 1 simplicity. The single-message approach is adequate for nixpkgs stdenv and the overwhelming majority of real-world DAGs. If future workloads routinely exceed 32MB, a streaming `SubmitBuild` RPC can be added as a non-breaking protocol extension (new RPC, old one remains).
 

@@ -63,6 +63,13 @@ pub struct ExecutorEnv {
     pub overlay_base_dir: std::path::PathBuf,
     pub worker_id: String,
     pub log_limits: LogLimits,
+    /// Threshold for leaked overlay mounts before refusing new builds.
+    /// A leaked mount means `umount2` failed in `OverlayMount::Drop` —
+    /// typically the mount is stuck busy (open file handles, zombie
+    /// nix-daemon). After N leaks the worker is degraded; refusing builds
+    /// and reporting `InfrastructureFailure` lets the scheduler reassign
+    /// to a healthy worker, and the supervisor can restart this one.
+    pub max_leaked_mounts: usize,
 }
 
 /// Worker nix.conf content for sandbox builds.
@@ -187,7 +194,7 @@ pub async fn execute_build(
     // result overridden just because its own teardown later fails — the
     // NEXT build is what gets refused.
     let leaked = leak_counter.load(Ordering::Relaxed);
-    let threshold = crate::max_leaked_mounts();
+    let threshold = env.max_leaked_mounts;
     if leaked >= threshold {
         tracing::error!(
             leaked,
@@ -615,6 +622,7 @@ mod tests {
             overlay_base_dir: dir.path().to_path_buf(),
             worker_id: "test-worker".into(),
             log_limits: LogLimits::UNLIMITED,
+            max_leaked_mounts: 3,
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

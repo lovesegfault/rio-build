@@ -51,6 +51,11 @@ struct Config {
     /// routes by estimated duration; this just declares which bucket
     /// this worker serves.
     size_class: String,
+    /// Threshold for leaked overlay mounts before refusing new builds.
+    /// After N umount2 failures (stuck-busy mounts), the worker is
+    /// degraded; execute_build short-circuits with InfrastructureFailure
+    /// so the scheduler reassigns and the supervisor can restart.
+    max_leaked_mounts: usize,
 }
 
 impl Default for Config {
@@ -76,6 +81,7 @@ impl Default for Config {
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
+            max_leaked_mounts: 3,
         }
     }
 }
@@ -165,10 +171,17 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     size_class: Option<String>,
+
+    /// Max leaked overlay mounts before refusing builds (default: 3)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_leaked_mounts: Option<usize>,
 }
 
-/// Heartbeat interval.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// Heartbeat interval. Shared source of truth with the scheduler's timeout
+/// check (rio_common::limits::HEARTBEAT_TIMEOUT_SECS derives from this).
+const HEARTBEAT_INTERVAL: Duration =
+    Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
 
 /// Detect the system architecture (e.g. "x86_64-linux").
 fn detect_system() -> String {
@@ -347,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
+        max_leaked_mounts: cfg.max_leaked_mounts,
     };
 
     // Process incoming scheduler messages
@@ -442,6 +456,7 @@ mod tests {
         // Phase2b additions — spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
+        assert_eq!(d.max_leaked_mounts, 3);
     }
 
     #[test]
