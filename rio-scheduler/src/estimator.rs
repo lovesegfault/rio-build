@@ -153,12 +153,13 @@ impl Estimator {
         self.pname_fallback = pname_fallback;
     }
 
-    /// Number of (pname, system) entries. For logging "estimator
-    /// refreshed with N entries" on Tick.
+    /// Number of (pname, system) entries. Test-only.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.history.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.history.is_empty()
     }

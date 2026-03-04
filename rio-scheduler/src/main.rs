@@ -37,7 +37,7 @@ struct Config {
     ///   mem_limit_bytes = 1073741824
     /// No CLI override — this is structural deploy config, not a knob
     /// you tweak per-invocation. Change it in scheduler.toml.
-    size_classes: Vec<rio_scheduler::assignment::SizeClassConfig>,
+    size_classes: Vec<rio_scheduler::SizeClassConfig>,
 }
 
 impl Default for Config {

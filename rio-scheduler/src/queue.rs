@@ -169,12 +169,10 @@ impl ReadyQueue {
     }
 
     /// Number of valid (not-removed) entries.
+    // `is_empty` pair was dead code — `pub(crate) mod queue` revealed it.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.members.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
     }
 
     /// Rebuild the heap without removed/stale entries.
