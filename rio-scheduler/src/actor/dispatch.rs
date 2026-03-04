@@ -247,9 +247,11 @@ impl DagActor {
                 // hits don't bloat this. Worker already handles both
                 // paths (executor/mod.rs:241 branches on is_empty).
                 drv_content: state.drv_content.clone(),
-                // TODO(phase3a): compute closure scheduler-side for prefetch hints.
-                // Phase 2a: worker computes via QueryPathInfo BFS.
-                input_paths: Vec::new(),
+                // TODO(phase3a): compute closure scheduler-side and send as
+                // a PrefetchHint on the BuildExecution stream (types.proto
+                // PrefetchHint message) so the worker's FUSE cache can
+                // pre-warm before the build starts. Not inlined in
+                // WorkAssignment — prefetch is a hint, not a contract.
                 output_names: state.output_names.clone(),
                 build_options: Some(self.build_options_for_derivation(drv_hash)),
                 assignment_token: format!("{}-{}-{}", worker_id, drv_hash, self.generation),

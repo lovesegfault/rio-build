@@ -203,7 +203,6 @@ pub async fn execute_build(
     tracing::info!(
         drv_path = %drv_path,
         build_id = %build_id,
-        input_count = assignment.input_paths.len(),
         is_fod = assignment.is_fixed_output,
         "starting build"
     );
@@ -327,11 +326,14 @@ pub async fn execute_build(
     // static srcs) so nix-daemon's isValidPath() finds dependency outputs.
     // compute_input_closure only seeds from drv.input_srcs() (static), so
     // we merge the resolved set in.
-    let mut input_paths: Vec<String> = if assignment.input_paths.is_empty() {
-        compute_input_closure(&*store_client, &drv, drv_path).await?
-    } else {
-        assignment.input_paths.clone()
-    };
+    //
+    // Worker computes closure via QueryPathInfo BFS. Scheduler-side closure
+    // computation (TODO(phase3a) at dispatch.rs) will arrive as PrefetchHint
+    // on the BuildExecution stream — a warm-cache hint, not a replacement
+    // for this computation (the synth DB needs the FULL closure, not just
+    // what the scheduler thinks is missing from the worker's bloom filter).
+    let mut input_paths: Vec<String> =
+        compute_input_closure(&*store_client, &drv, drv_path).await?;
     // Add resolved inputDrv outputs (their runtime closure is BFS'd via
     // fetch_input_metadata's references, but they need to be in the seed
     // set first). Dedup via set conversion.

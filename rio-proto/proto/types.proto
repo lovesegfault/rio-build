@@ -224,7 +224,12 @@ enum BuildResultStatus {
 message WorkAssignment {
   string drv_path = 1;                    // Store path of the .drv file
   bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); worker fetches via GetPath.
-  repeated string input_paths = 3;        // Store paths needed as build inputs (empty in Phase 2a; worker computes closure via QueryPathInfo)
+  // Field 3 (input_paths) was never populated — scheduler always sent
+  // empty, worker always computed closure via QueryPathInfo BFS. Phase3a
+  // prefetch hints use a separate PrefetchHint message on the
+  // BuildExecution stream, not an inline WorkAssignment field.
+  reserved 3;
+  reserved "input_paths";
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
   string assignment_token = 6;            // Opaque token (NOT cryptographically signed in Phase 2a;
