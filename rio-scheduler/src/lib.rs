@@ -14,7 +14,7 @@
 //! - [`actor`]: DAG actor (single-owner event loop, dispatch)
 //! - [`dag`]: In-memory derivation graph
 //! - [`state`]: Derivation and build state machines
-//! - [`queue`]: FIFO ready queue
+//! - `queue`: FIFO ready queue
 //! - [`db`]: PostgreSQL persistence (sqlx)
 //! - [`grpc`]: SchedulerService + WorkerService gRPC implementations
 

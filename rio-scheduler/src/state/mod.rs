@@ -37,9 +37,9 @@ pub use rio_common::limits::{
 
 /// Priority class for scheduling.
 ///
-/// Interactive builds get [`INTERACTIVE_BOOST`](crate::queue::INTERACTIVE_BOOST)
-/// (+1e9) added to their priority in the [`ReadyQueue`](crate::queue::ReadyQueue)
-/// BinaryHeap, so they dispatch before any realistic critical-path value.
+/// Interactive builds get `INTERACTIVE_BOOST` (+1e9) added to their priority
+/// in the `ReadyQueue` BinaryHeap, so they dispatch before any realistic
+/// critical-path value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PriorityClass {
     /// CI builds: normal priority, scheduled order.

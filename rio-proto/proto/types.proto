@@ -460,7 +460,7 @@ message AddSignaturesResponse {
 // mapping that Nix builds for content-addressed derivations.
 //
 // Wire format note: Nix's Realisation JSON on the wire has an "id" field that's
-// "sha256:<hex>!<name>" combining drv_hash and output_name. We store them
+// `sha256:<hex>!<name>` combining drv_hash and output_name. We store them
 // separately here (cleaner for the DB primary key) and the gateway does the
 // split/join at the protocol boundary.
 message Realisation {

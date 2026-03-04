@@ -224,7 +224,7 @@ impl Cache {
 
     /// Snapshot the bloom filter for heartbeat serialization.
     ///
-    /// Clones the filter under a read lock — cheap (Vec<u8> clone, ~60 KB
+    /// Clones the filter under a read lock — cheap (`Vec<u8>` clone, ~60 KB
     /// for the default sizing). The heartbeat loop calls this every 10s;
     /// the clone avoids holding the read lock across the gRPC send (which
     /// would block `insert()` for the duration of a network roundtrip).
@@ -326,7 +326,7 @@ impl Cache {
     /// Returns `Ok(None)` if the path is not cached, `Err` on index failure.
     ///
     /// An entry returned by this function is protected from eviction for
-    /// [`EVICT_GRACE_SECS`] (5s): `get_and_touch()` stamps `last_access = now`
+    /// `EVICT_GRACE_SECS` (5s): `get_and_touch()` stamps `last_access = now`
     /// atomically in the same DB roundtrip, and `evict_if_needed()` filters
     /// `last_access < now - grace`. The caller's subsequent open/stat has the
     /// full grace window before eviction can select this entry.
