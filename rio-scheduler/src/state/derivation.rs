@@ -338,17 +338,7 @@ mod tests {
     use super::*;
 
     fn dummy_node() -> rio_proto::types::DerivationNode {
-        rio_proto::types::DerivationNode {
-            drv_hash: "h".into(),
-            drv_path: rio_test_support::fixtures::test_drv_path("h"),
-            pname: String::new(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-            drv_content: Vec::new(),
-        }
+        rio_test_support::fixtures::make_derivation_node("h", "x86_64-linux")
     }
 
     #[test]

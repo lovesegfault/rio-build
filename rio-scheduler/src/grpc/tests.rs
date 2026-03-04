@@ -23,23 +23,12 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
 
     // Spin up in-process gRPC server (SchedulerService + WorkerService).
     let grpc = SchedulerGrpc::new(handle.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let router = tonic::transport::Server::builder()
+        .add_service(SchedulerServiceServer::new(grpc.clone()))
+        .add_service(WorkerServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
-    // Fire-and-forget: never joined.
-    let _server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SchedulerServiceServer::new(grpc.clone()))
-            .add_service(WorkerServiceServer::new(grpc))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("test gRPC server should run");
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let endpoint = format!("http://{addr}");
-    let channel = tonic::transport::Channel::from_shared(endpoint)?
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
     let mut worker_client = WorkerServiceClient::new(channel.clone());
@@ -185,21 +174,12 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     // them after sending the LogBatch.
     let log_buffers = grpc.log_buffers();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let _server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(SchedulerServiceServer::new(grpc.clone()))
-            .add_service(WorkerServiceServer::new(grpc))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("test gRPC server should run");
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let router = tonic::transport::Server::builder()
+        .add_service(SchedulerServiceServer::new(grpc.clone()))
+        .add_service(WorkerServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
-    let endpoint = format!("http://{addr}");
-    let channel = tonic::transport::Channel::from_shared(endpoint)?
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
     let mut worker_client = WorkerServiceClient::new(channel.clone());

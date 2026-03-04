@@ -34,19 +34,10 @@ async fn setup_chunk_service(
     // hot for ChunkService's GetChunk. This is the shared-state test.
     let chunk_service = ChunkServiceImpl::new(pool, Some(cache));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(StoreServiceServer::new(store_service))
-            .add_service(ChunkServiceServer::new(chunk_service))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("in-process server");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let router = Server::builder()
+        .add_service(StoreServiceServer::new(store_service))
+        .add_service(ChunkServiceServer::new(chunk_service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
     let channel = Channel::from_shared(format!("http://{addr}"))?
         .connect()
@@ -201,17 +192,8 @@ async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
     // Construct with cache=None explicitly.
     let chunk_service = ChunkServiceImpl::new(db.pool.clone(), None);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(ChunkServiceServer::new(chunk_service))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("in-process server");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let channel = Channel::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;

@@ -67,28 +67,13 @@ pub async fn setup_store_chunked(
 async fn spawn_store_server(
     service: StoreServiceImpl,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    // Bind to a random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let router = Server::builder().add_service(StoreServiceServer::new(service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
-    // Fire-and-forget: aborted at test end, never joined.
-    let server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(StoreServiceServer::new(service))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("in-process store server");
-    });
-
-    // Give the server a moment to start accepting
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let endpoint = format!("http://{addr}");
-    let channel = Channel::from_shared(endpoint)?.connect().await?;
-    let client = StoreServiceClient::new(channel);
-
-    Ok((client, server))
+    let channel = Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    Ok((StoreServiceClient::new(channel), server))
 }
 
 /// Helper: upload a path via PutPath, sending metadata + one nar_chunk.

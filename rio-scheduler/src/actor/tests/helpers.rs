@@ -3,7 +3,14 @@
 use super::*;
 use tokio::sync::mpsc;
 
-pub(super) use rio_test_support::fixtures::{test_drv_path, test_store_path};
+// Re-exports: fixtures imported once here, used by sibling test modules
+// via `use super::*` and by grpc/tests.rs via `crate::actor::tests::*`.
+// `pub(crate)` (not `pub(super)`) so grpc/tests.rs can reach them through
+// the tests/mod.rs `pub(crate) use helpers::*;` re-export.
+pub(crate) use rio_test_support::fixtures::{
+    make_derivation_node as make_test_node, make_edge as make_test_edge, test_drv_path,
+    test_store_path,
+};
 pub(super) use rio_test_support::{TestDb, TestResult};
 pub(super) use std::time::Duration;
 
@@ -53,39 +60,6 @@ pub(crate) async fn setup_with_worker(
     let (db, handle, task) = setup().await;
     let rx = connect_worker(&handle, worker_id, system, max_builds).await?;
     Ok((db, handle, task, rx))
-}
-
-/// Create a minimal test DerivationNode.
-///
-/// `drv_path` is auto-generated from `tag` via [`test_drv_path`], so
-/// callers get a valid /nix/store/{32-char-hash}-{tag}.drv path for free.
-/// Use [`test_drv_path`] directly when you need the path string for
-/// assertions or edge construction.
-pub(crate) fn make_test_node(tag: &str, system: &str) -> rio_proto::types::DerivationNode {
-    rio_proto::types::DerivationNode {
-        drv_hash: tag.into(),
-        drv_path: test_drv_path(tag),
-        pname: "test-pkg".into(),
-        system: system.into(),
-        required_features: vec![],
-        output_names: vec!["out".into()],
-        is_fixed_output: false,
-        expected_output_paths: vec![],
-        drv_content: Vec::new(),
-    }
-}
-
-/// Create a minimal test DerivationEdge from tags.
-///
-/// Generates valid drv_paths internally — same as `make_test_node`.
-pub(crate) fn make_test_edge(
-    parent_tag: &str,
-    child_tag: &str,
-) -> rio_proto::types::DerivationEdge {
-    rio_proto::types::DerivationEdge {
-        parent_drv_path: test_drv_path(parent_tag),
-        child_drv_path: test_drv_path(child_tag),
-    }
 }
 
 /// Connect a worker (stream + heartbeat) so it becomes fully registered.
