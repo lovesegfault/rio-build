@@ -64,11 +64,9 @@ Exports a store path as a NAR archive.
 |-----------|-------|------|-------------|
 | C -> S | `path` | string | Store path to export |
 
-**Canonical nix-daemon behavior:** The daemon sends `STDERR_LAST` to close the STDERR loop, then streams the raw NAR bytes directly on the connection (no STDERR_WRITE framing, no length prefix). The Nix client reads until EOF or the expected `narSize` bytes are received.
+**Behavior:** rio-gateway sends `STDERR_LAST` to close the stderr loop, then streams the raw NAR bytes directly on the connection (no framing, no length prefix). This matches the canonical nix-daemon behavior. The Nix client's `copyNAR()` reads until the NAR is complete.
 
-**rio-build behavior (intentional divergence):** rio-build sends the NAR data inside the STDERR loop using `STDERR_WRITE` (`0x64617416`) messages in 64 KB chunks, followed by `STDERR_LAST`. This is a valid approach because the Nix client handles both `STDERR_WRITE`-based streaming and post-`STDERR_LAST` raw streaming (confirmed by `test_nix_store_ls` integration test).
-
-The `STDERR_WRITE` approach has advantages for rio-build's architecture: it keeps all data within the STDERR framing protocol, which simplifies gateway-to-client streaming when the NAR data is being reassembled from distributed storage chunks. The tradeoff is a slight overhead from the per-chunk framing headers.
+**Historical note (bug #11):** Earlier phases sent the NAR inside the stderr loop via `STDERR_WRITE` chunks, described in this document as an "intentional divergence". That was wrong — the Nix client's `processStderr()` for this opcode passes no sink, so `STDERR_WRITE` frames caused `error: no sink`. Fixed to `STDERR_LAST` + raw bytes. See `handle_nar_from_path` in `rio-gateway/src/handler/opcodes_read.rs`.
 
 ### wopAddToStoreNar (39) Wire Format
 
@@ -86,7 +84,7 @@ For protocol >= 1.25 (always present since we target 1.37+):
 | `sigs` | string collection | Signatures |
 | `ca` | string | Content address (empty for input-addressed) |
 | `repair` | u64 bool | Whether to repair/overwrite existing path |
-| `dontCheckSigs` | u64 bool | Skip signature verification (always treated as false by rio-build) |
+| `dontCheckSigs` | u64 bool | Skip signature verification (always treated as false by rio-gateway) |
 
 After sending the metadata fields, the NAR data is transferred as a **framed byte stream** (protocol >= 1.23, always true for 1.37+):
 
