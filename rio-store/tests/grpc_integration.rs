@@ -718,10 +718,14 @@ async fn test_find_missing_paths_rejects_oversized_batch() -> TestResult {
 // Error-branch coverage: internal_error, blob-missing paths
 // ---------------------------------------------------------------------------
 
-/// internal_error() must NOT leak sqlx/Postgres details to the client.
-/// Server logs the full error; client sees only "storage operation failed".
+/// A connection-level failure (PoolClosed) must surface as UNAVAILABLE
+/// (retriable), NOT Internal. This is the key value-add of MetadataError:
+/// before C4, a transient PG hiccup looked identical to a corrupt database.
+///
+/// Secondary: the message must not leak sqlx/Postgres internals. Server
+/// logs the full error; client sees a generic summary.
 #[tokio::test]
-async fn test_internal_error_hides_sqlx_details() -> TestResult {
+async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, server) = setup_store(db.pool.clone()).await?;
 
@@ -735,11 +739,12 @@ async fn test_internal_error_hides_sqlx_details() -> TestResult {
         .await;
 
     let status = result.expect_err("should fail on closed pool");
-    assert_eq!(status.code(), tonic::Code::Internal);
+    // PoolClosed → MetadataError::Connection → UNAVAILABLE. Client should
+    // retry with backoff. NOT Internal — that would look like corruption.
     assert_eq!(
-        status.message(),
-        "storage operation failed",
-        "message must be generic, not leak DB details"
+        status.code(),
+        tonic::Code::Unavailable,
+        "connection-level failures must be retriable (was Internal before C4)"
     );
     // Belt-and-suspenders: no substring from common sqlx errors.
     assert!(!status.message().to_lowercase().contains("sqlx"));

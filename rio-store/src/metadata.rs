@@ -38,6 +38,105 @@ use rio_proto::validated::{PathInfoValidationError, ValidatedPathInfo};
 use sqlx::PgPool;
 use tracing::{debug, instrument};
 
+/// Typed error for the metadata/DB layer. Replaces `anyhow::Result` so
+/// callers can discriminate retriable failures (connection, serialization)
+/// from permanent ones (corruption) and map to precise gRPC status codes.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataError {
+    /// Row not found. From `sqlx::Error::RowNotFound`. Most metadata
+    /// queries use `fetch_optional` so this is rare; shows up on
+    /// `fetch_one` sites.
+    #[error("not found")]
+    NotFound,
+
+    /// Unique or FK constraint violation (PG codes 23505, 23503).
+    /// Usually means a concurrent writer won the race — the caller's
+    /// operation is a no-op, not a failure. Maps to `already_exists`.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// Connection-level failure: pool exhausted, TCP reset, TLS error.
+    /// Retriable — the operation never reached PG. Maps to `unavailable`.
+    #[error("connection error: {0}")]
+    Connection(#[source] sqlx::Error),
+
+    /// Serialization failure (PG code 40001). Two transactions conflicted
+    /// under REPEATABLE READ or SERIALIZABLE isolation. Retriable — the
+    /// transaction was aborted cleanly, retry will likely succeed.
+    /// Maps to `aborted`.
+    #[error("serialization failure (retry)")]
+    Serialization,
+
+    /// The write-ahead placeholder from `insert_manifest_uploading` is
+    /// gone — `delete_manifest_uploading` raced us and won, or a crashed
+    /// previous upload already cleaned it up. The caller's UPDATE hit
+    /// `rows_affected() == 0`. Retriable. Maps to `aborted`.
+    #[error("placeholder missing for {store_path} (concurrently deleted?)")]
+    PlaceholderMissing { store_path: String },
+
+    /// Database state violates a code-enforced invariant that PG's
+    /// schema can't express (e.g., `inline_blob IS NULL` but no
+    /// `manifest_data` row — PG can't CHECK "row in another table
+    /// exists"). This is corruption: manual DB surgery, a CASCADE we
+    /// didn't expect, or a bug in cleanup ordering. NOT retriable.
+    /// Maps to `internal`.
+    #[error("invariant violation: {0}")]
+    InvariantViolation(String),
+
+    /// A `manifest_data.chunk_list` blob failed to deserialize.
+    /// Written by us, read by us — if it doesn't round-trip, either
+    /// the write was torn or the format version is wrong. NOT
+    /// retriable. Maps to `data_loss`.
+    #[error("corrupt manifest_data for {store_path}: {source}")]
+    CorruptManifest {
+        store_path: String,
+        #[source]
+        source: crate::manifest::ManifestError,
+    },
+
+    /// A narinfo row failed validation (bad store_path, wrong-length
+    /// nar_hash). PG's schema doesn't enforce these as CHECK
+    /// constraints. Caught at the egress boundary. NOT retriable.
+    /// Maps to `internal`.
+    #[error("malformed narinfo row: {0}")]
+    MalformedRow(#[from] PathInfoValidationError),
+
+    /// Unclassified sqlx error. Maps to `internal`.
+    #[error("database error: {0}")]
+    Other(#[source] sqlx::Error),
+}
+
+impl From<sqlx::Error> for MetadataError {
+    /// Classify sqlx errors by their PostgreSQL SQLSTATE code.
+    ///
+    /// Codes per the PG docs, Appendix A:
+    /// - `23505` unique_violation, `23503` foreign_key_violation
+    /// - `40001` serialization_failure
+    ///
+    /// Connection-level errors (`Io`, `Tls`, `PoolTimedOut`, `PoolClosed`)
+    /// are distinguished from query-level errors so callers can retry with
+    /// backoff instead of propagating as internal.
+    fn from(e: sqlx::Error) -> Self {
+        match &e {
+            sqlx::Error::RowNotFound => MetadataError::NotFound,
+            sqlx::Error::Database(db_err) => match db_err.code().as_deref() {
+                Some("23505") | Some("23503") => {
+                    MetadataError::Conflict(db_err.message().to_string())
+                }
+                Some("40001") => MetadataError::Serialization,
+                _ => MetadataError::Other(e),
+            },
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed => MetadataError::Connection(e),
+            _ => MetadataError::Other(e),
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, MetadataError>;
+
 /// How a NAR's content is stored. Returned by [`get_manifest`].
 ///
 /// This is the one place callers branch on inline-vs-chunked. GetPath reads
@@ -73,7 +172,7 @@ pub async fn insert_manifest_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     store_path: &str,
-) -> anyhow::Result<bool> {
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
 
     // narinfo placeholder first (manifests has FK to narinfo). ON CONFLICT
@@ -125,7 +224,7 @@ pub async fn complete_manifest_inline(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     nar_data: Bytes,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
@@ -162,10 +261,9 @@ pub async fn complete_manifest_inline(
         // insert_manifest_uploading MUST have run first. If rows_affected
         // is 0, delete_manifest_uploading raced us and won. The caller's
         // placeholder is gone; bailing here prevents a half-complete write.
-        anyhow::bail!(
-            "complete_manifest_inline: narinfo placeholder missing for {} (concurrently deleted?)",
-            info.store_path.as_str()
-        );
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
     }
 
     // Store NAR + flip status. nar_data is Bytes (Arc-refcounted); sqlx binds
@@ -185,10 +283,9 @@ pub async fn complete_manifest_inline(
     .await?;
 
     if manifest_result.rows_affected() == 0 {
-        anyhow::bail!(
-            "complete_manifest_inline: manifest placeholder missing for {} (concurrently deleted?)",
-            info.store_path.as_str()
-        );
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
     }
 
     tx.commit().await?;
@@ -208,10 +305,7 @@ pub async fn complete_manifest_inline(
 /// CASCADE on the FK would also work but explicit ordering makes intent
 /// clear and doesn't depend on schema details.
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn delete_manifest_uploading(
-    pool: &PgPool,
-    store_path_hash: &[u8],
-) -> anyhow::Result<()> {
+pub async fn delete_manifest_uploading(pool: &PgPool, store_path_hash: &[u8]) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     sqlx::query(
@@ -245,10 +339,7 @@ pub async fn delete_manifest_uploading(
 /// Idempotency pre-check for PutPath: if `true`, the path exists and the
 /// caller should return `created: false` without touching anything.
 #[instrument(skip(pool), fields(store_path_hash = hex::encode(store_path_hash)))]
-pub async fn check_manifest_complete(
-    pool: &PgPool,
-    store_path_hash: &[u8],
-) -> anyhow::Result<bool> {
+pub async fn check_manifest_complete(pool: &PgPool, store_path_hash: &[u8]) -> Result<bool> {
     // EXISTS returns a PG bool, which sqlx decodes cleanly. `SELECT 1` would
     // return int4 and need i32 (not i64) — a type-width footgun that turns
     // into an opaque "ColumnDecode" runtime error. EXISTS sidesteps it
@@ -281,7 +372,7 @@ pub async fn check_manifest_complete(
 /// `Chunked(vec![])` — unreachable in practice since E1's PutPath always
 /// writes inline, but the type is in place for C3/C5.
 #[instrument(skip(pool))]
-pub async fn get_manifest(pool: &PgPool, store_path: &str) -> anyhow::Result<Option<ManifestKind>> {
+pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<ManifestKind>> {
     // Single query: join narinfo→manifests, filter status='complete',
     // pull inline_blob. manifest_data is a second query only if needed
     // (avoids pulling a potentially-large chunk_list we won't use).
@@ -321,14 +412,18 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> anyhow::Result<Opt
             // CASCADE we didn't expect. Surface it — don't silently return
             // None (that would look like "path not found", masking corruption).
             let (chunk_list,) = data.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invariant violation: manifest for {store_path} has NULL inline_blob \
-                     but no manifest_data row (corrupted state)"
-                )
+                MetadataError::InvariantViolation(format!(
+                    "manifest for {store_path} has NULL inline_blob but no manifest_data row"
+                ))
             })?;
 
-            let manifest = crate::manifest::Manifest::deserialize(&chunk_list)
-                .map_err(|e| anyhow::anyhow!("corrupt manifest_data for {store_path}: {e}"))?;
+            let manifest =
+                crate::manifest::Manifest::deserialize(&chunk_list).map_err(|source| {
+                    MetadataError::CorruptManifest {
+                        store_path: store_path.to_string(),
+                        source,
+                    }
+                })?;
 
             // Convert Manifest → Vec<([u8;32], u32)> for the enum variant.
             // ManifestKind predates Manifest (E1 vs C1) so the representation
@@ -350,10 +445,7 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> anyhow::Result<Opt
 /// (status = 'uploading') and orphans (narinfo row but no manifests row)
 /// are invisible.
 #[instrument(skip(pool))]
-pub async fn query_path_info(
-    pool: &PgPool,
-    store_path: &str,
-) -> anyhow::Result<Option<ValidatedPathInfo>> {
+pub async fn query_path_info(pool: &PgPool, store_path: &str) -> Result<Option<ValidatedPathInfo>> {
     let row: Option<NarinfoRow> = sqlx::query_as(
         r#"
         SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
@@ -372,7 +464,7 @@ pub async fn query_path_info(
     // boundary — PG doesn't enforce these as CHECK constraints.
     row.map(|r| r.try_into_validated())
         .transpose()
-        .map_err(|e| anyhow::anyhow!("malformed narinfo row for {store_path}: {e}"))
+        .map_err(MetadataError::MalformedRow)
 }
 
 /// Batch check which store paths are missing.
@@ -380,10 +472,7 @@ pub async fn query_path_info(
 /// "Missing" means no manifests row with `status = 'complete'`. Paths stuck
 /// in 'uploading' (crashed PutPath) are missing — the client should retry.
 #[instrument(skip(pool, store_paths), fields(count = store_paths.len()))]
-pub async fn find_missing_paths(
-    pool: &PgPool,
-    store_paths: &[String],
-) -> anyhow::Result<Vec<String>> {
+pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result<Vec<String>> {
     if store_paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -454,7 +543,7 @@ pub async fn upgrade_manifest_to_chunked(
     chunk_list: &[u8],        // serialized Manifest
     chunk_hashes: &[Vec<u8>], // each is a 32-byte BLAKE3
     chunk_sizes: &[i64],      // parallel to chunk_hashes
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     // Sanity: the manifests row MUST exist with status='uploading'.
@@ -472,11 +561,9 @@ pub async fn upgrade_manifest_to_chunked(
     .fetch_one(&mut *tx)
     .await?;
     if !exists {
-        anyhow::bail!(
-            "upgrade_manifest_to_chunked: no 'uploading' manifest for {} \
-             (placeholder deleted concurrently?)",
-            hex::encode(store_path_hash)
-        );
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: hex::encode(store_path_hash),
+        });
     }
 
     // manifest_data: the chunk list. No ON CONFLICT — the placeholder
@@ -531,10 +618,7 @@ pub async fn upgrade_manifest_to_chunked(
 /// Just the narinfo UPDATE + status flip. Same atomic guarantees as the
 /// inline variant.
 #[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
-pub async fn complete_manifest_chunked(
-    pool: &PgPool,
-    info: &ValidatedPathInfo,
-) -> anyhow::Result<()> {
+pub async fn complete_manifest_chunked(pool: &PgPool, info: &ValidatedPathInfo) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
@@ -568,10 +652,9 @@ pub async fn complete_manifest_chunked(
     .await?;
 
     if narinfo_result.rows_affected() == 0 {
-        anyhow::bail!(
-            "complete_manifest_chunked: narinfo placeholder missing for {}",
-            info.store_path.as_str()
-        );
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
     }
 
     // Flip status. inline_blob stays NULL — that's what makes get_manifest()
@@ -589,10 +672,9 @@ pub async fn complete_manifest_chunked(
     .await?;
 
     if manifest_result.rows_affected() == 0 {
-        anyhow::bail!(
-            "complete_manifest_chunked: manifest placeholder missing for {}",
-            info.store_path.as_str()
-        );
+        return Err(MetadataError::PlaceholderMissing {
+            store_path: info.store_path.to_string(),
+        });
     }
 
     tx.commit().await?;
@@ -615,7 +697,7 @@ pub async fn delete_manifest_chunked_uploading(
     pool: &PgPool,
     store_path_hash: &[u8],
     chunk_hashes: &[Vec<u8>],
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let mut tx = pool.begin().await?;
 
     // Decrement refcounts FIRST. If we deleted manifest_data first and
@@ -684,10 +766,7 @@ pub async fn delete_manifest_chunked_uploading(
 /// Uses `idx_narinfo_nar_hash` (migration 006). Without it, every NAR
 /// fetch would seq-scan narinfo.
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
-pub async fn path_by_nar_hash(
-    pool: &PgPool,
-    nar_hash: &[u8; 32],
-) -> anyhow::Result<Option<String>> {
+pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {
     // Multiple paths CAN have the same nar_hash (two fetchurl of the
     // same file → same content → same NAR). LIMIT 1 picks one
     // arbitrarily — they all reassemble to the same bytes, so it
@@ -716,7 +795,7 @@ pub async fn path_by_nar_hash(
 /// chunks, filter `WHERE refcount > 0 AND deleted = FALSE` — but
 /// that's a different metric (not this one).
 #[instrument(skip(pool))]
-pub async fn count_chunks(pool: &PgPool) -> anyhow::Result<i64> {
+pub async fn count_chunks(pool: &PgPool) -> Result<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
         .fetch_one(pool)
         .await?;
@@ -740,7 +819,7 @@ pub async fn count_chunks(pool: &PgPool) -> anyhow::Result<i64> {
 /// One PG roundtrip for N chunks. Beats N S3 HeadObject calls by ~10×
 /// on latency alone.
 #[instrument(skip(pool, hashes), fields(count = hashes.len()))]
-pub async fn find_missing_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> anyhow::Result<Vec<bool>> {
+pub async fn find_missing_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<Vec<bool>> {
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
@@ -784,7 +863,7 @@ pub async fn find_missing_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> anyhow::R
 pub async fn query_by_hash_part(
     pool: &PgPool,
     hash_part: &str,
-) -> anyhow::Result<Option<ValidatedPathInfo>> {
+) -> Result<Option<ValidatedPathInfo>> {
     // LIKE pattern: the store prefix + hash + dash + anything.
     // The dash is important — without it, a hash-part "aaa...a" would also
     // match a hypothetical "aaa...ab-name" (32-char hash that happens to
@@ -807,7 +886,7 @@ pub async fn query_by_hash_part(
 
     row.map(|r| r.try_into_validated())
         .transpose()
-        .map_err(|e| anyhow::anyhow!("malformed narinfo row for hash-part {hash_part}: {e}"))
+        .map_err(MetadataError::MalformedRow)
 }
 
 /// Append signatures to an existing narinfo.
@@ -820,11 +899,7 @@ pub async fn query_by_hash_part(
 /// Returns the number of rows updated (0 = path not found, 1 = appended).
 /// Caller maps 0 to NOT_FOUND.
 #[instrument(skip(pool, sigs), fields(count = sigs.len()))]
-pub async fn append_signatures(
-    pool: &PgPool,
-    store_path: &str,
-    sigs: &[String],
-) -> anyhow::Result<u64> {
+pub async fn append_signatures(pool: &PgPool, store_path: &str, sigs: &[String]) -> Result<u64> {
     // WHERE ... = $1 (not LIKE): this takes a full path. Only
     // query_by_hash_part does prefix matching.
     //
@@ -866,7 +941,9 @@ pub(crate) struct NarinfoRow {
 }
 
 impl NarinfoRow {
-    pub(crate) fn try_into_validated(self) -> Result<ValidatedPathInfo, PathInfoValidationError> {
+    pub(crate) fn try_into_validated(
+        self,
+    ) -> std::result::Result<ValidatedPathInfo, PathInfoValidationError> {
         use rio_proto::types::PathInfo;
         // Build raw PathInfo then delegate to the centralized TryFrom —
         // keeps validation logic in one place (rio-proto::validated), not
@@ -887,5 +964,188 @@ impl NarinfoRow {
             signatures: self.signatures,
             content_address: self.ca.unwrap_or_default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::TestDb;
+
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
+    // =======================================================================
+    // MetadataError classification (From<sqlx::Error>)
+    // =======================================================================
+
+    #[test]
+    fn classify_row_not_found() {
+        let e: MetadataError = sqlx::Error::RowNotFound.into();
+        assert!(matches!(e, MetadataError::NotFound));
+    }
+
+    #[test]
+    fn classify_pool_timed_out() {
+        let e: MetadataError = sqlx::Error::PoolTimedOut.into();
+        assert!(matches!(e, MetadataError::Connection(_)));
+    }
+
+    #[test]
+    fn classify_pool_closed() {
+        let e: MetadataError = sqlx::Error::PoolClosed.into();
+        assert!(matches!(e, MetadataError::Connection(_)));
+    }
+
+    /// Decode errors, column-type mismatches, protocol weirdness —
+    /// anything not explicitly classified lands in Other.
+    #[test]
+    fn classify_unknown_falls_through_to_other() {
+        let e: MetadataError = sqlx::Error::ColumnNotFound("x".into()).into();
+        assert!(matches!(e, MetadataError::Other(_)));
+    }
+
+    // =======================================================================
+    // Integration: trigger real PG SQLSTATE codes, assert classification
+    // =======================================================================
+
+    /// Real 23505 unique_violation → Conflict. Insert the same PK twice.
+    #[tokio::test]
+    async fn integration_unique_violation_is_conflict() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let hash = vec![0xAAu8; 32];
+
+        // First insert: OK.
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, '/nix/store/a-x', $2, 0)",
+        )
+        .bind(&hash)
+        .bind(vec![0u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Second insert on same PK: 23505.
+        let err: MetadataError = sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, '/nix/store/a-x', $2, 0)",
+        )
+        .bind(&hash)
+        .bind(vec![0u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap_err()
+        .into();
+
+        assert!(
+            matches!(err, MetadataError::Conflict(_)),
+            "expected Conflict for 23505 unique_violation, got {err:?}"
+        );
+    }
+
+    /// Real 23503 foreign_key_violation → Conflict. Insert a manifests
+    /// row whose store_path_hash FK doesn't exist in narinfo.
+    #[tokio::test]
+    async fn integration_fk_violation_is_conflict() {
+        let db = TestDb::new(&MIGRATOR).await;
+
+        let err: MetadataError = sqlx::query("INSERT INTO manifests (store_path_hash) VALUES ($1)")
+            .bind(vec![0xBBu8; 32]) // no matching narinfo row
+            .execute(&db.pool)
+            .await
+            .unwrap_err()
+            .into();
+
+        assert!(
+            matches!(err, MetadataError::Conflict(_)),
+            "expected Conflict for 23503 foreign_key_violation, got {err:?}"
+        );
+    }
+
+    /// PlaceholderMissing: call complete_manifest_inline WITHOUT
+    /// insert_manifest_uploading first. rows_affected() == 0 on both
+    /// UPDATEs → PlaceholderMissing, NOT a sqlx error.
+    #[tokio::test]
+    async fn integration_complete_without_placeholder_is_placeholder_missing() {
+        let db = TestDb::new(&MIGRATOR).await;
+        let info = rio_test_support::fixtures::make_path_info(
+            &rio_test_support::fixtures::test_store_path("noplaceholder"),
+            b"nar",
+            [0xCCu8; 32],
+        );
+
+        let err = complete_manifest_inline(&db.pool, &info, Bytes::from_static(b"nar"))
+            .await
+            .expect_err("should fail without placeholder");
+
+        assert!(
+            matches!(err, MetadataError::PlaceholderMissing { .. }),
+            "expected PlaceholderMissing, got {err:?}"
+        );
+    }
+
+    // =======================================================================
+    // metadata_status gRPC mapping — verified via the actual mapper
+    // =======================================================================
+
+    /// Verifies the grpc.rs metadata_status function produces the right
+    /// codes. Not just the From<sqlx::Error> classification — the
+    /// full chain: sqlx error → MetadataError variant → tonic::Code.
+    #[test]
+    fn grpc_status_code_mapping() {
+        use crate::grpc::metadata_status;
+        use tonic::Code;
+
+        let cases: &[(MetadataError, Code)] = &[
+            (MetadataError::NotFound, Code::NotFound),
+            (MetadataError::Conflict("dup".into()), Code::AlreadyExists),
+            (
+                MetadataError::Connection(sqlx::Error::PoolClosed),
+                Code::Unavailable,
+            ),
+            (MetadataError::Serialization, Code::Aborted),
+            (
+                MetadataError::PlaceholderMissing {
+                    store_path: "/nix/store/x".into(),
+                },
+                Code::Aborted,
+            ),
+            (
+                MetadataError::InvariantViolation("x".into()),
+                Code::Internal,
+            ),
+            (
+                MetadataError::Other(sqlx::Error::RowNotFound),
+                Code::Internal,
+            ),
+        ];
+        for (err, expected_code) in cases {
+            // MetadataError isn't Clone; reconstruct for the call.
+            // (We move out of the match-tuple via shadowing.)
+            let code = metadata_status("test", clone_for_test(err)).code();
+            assert_eq!(
+                code, *expected_code,
+                "wrong code for {err:?}: got {code:?}, expected {expected_code:?}"
+            );
+        }
+    }
+
+    /// Test-only shallow clone. MetadataError can't derive Clone (holds
+    /// sqlx::Error which isn't Clone); this reconstructs equivalent
+    /// variants for the mapping test above.
+    fn clone_for_test(e: &MetadataError) -> MetadataError {
+        match e {
+            MetadataError::NotFound => MetadataError::NotFound,
+            MetadataError::Conflict(s) => MetadataError::Conflict(s.clone()),
+            MetadataError::Connection(_) => MetadataError::Connection(sqlx::Error::PoolClosed),
+            MetadataError::Serialization => MetadataError::Serialization,
+            MetadataError::PlaceholderMissing { store_path } => MetadataError::PlaceholderMissing {
+                store_path: store_path.clone(),
+            },
+            MetadataError::InvariantViolation(s) => MetadataError::InvariantViolation(s.clone()),
+            MetadataError::CorruptManifest { .. } => unreachable!("not in test cases"),
+            MetadataError::MalformedRow(_) => unreachable!("not in test cases"),
+            MetadataError::Other(_) => MetadataError::Other(sqlx::Error::RowNotFound),
+        }
     }
 }

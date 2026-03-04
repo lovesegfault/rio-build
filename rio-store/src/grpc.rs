@@ -83,6 +83,35 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
     Status::internal("storage operation failed")
 }
 
+/// Map a [`MetadataError`] to a gRPC status with a precise code.
+///
+/// The key value of the typed error: retriable failures
+/// (connection/serialization/placeholder-race) get retriable codes
+/// (`unavailable`/`aborted`) so clients back off and retry; corruption
+/// (invariant/malformed/corrupt-manifest) gets non-retriable codes so
+/// clients fail fast. The old `internal_error()` everything-is-internal
+/// mapping made a transient PG hiccup look the same as a corrupt database.
+///
+/// Logs the full error (including sqlx source chain) server-side; the
+/// gRPC message is a scrubbed summary.
+pub(crate) fn metadata_status(context: &str, e: metadata::MetadataError) -> Status {
+    use metadata::MetadataError as M;
+    error!(context, error = %e, "metadata layer error");
+    match e {
+        M::NotFound => Status::not_found("not found"),
+        M::Conflict(_) => Status::already_exists("conflict: path already exists"),
+        M::Connection(_) => Status::unavailable("database connection failed; retry"),
+        M::Serialization => Status::aborted("transaction serialization failure; retry"),
+        M::PlaceholderMissing { .. } => {
+            Status::aborted("upload placeholder concurrently deleted; retry")
+        }
+        M::CorruptManifest { .. } => Status::data_loss("stored manifest data is corrupt"),
+        M::InvariantViolation(_) | M::MalformedRow(_) | M::Other(_) => {
+            Status::internal("storage operation failed")
+        }
+    }
+}
+
 /// The StoreService gRPC server.
 ///
 /// NAR content lives in `manifests.inline_blob` (small NARs) or as
@@ -340,7 +369,7 @@ impl StoreService for StoreServiceImpl {
             Ok(b) => b,
             Err(e) => {
                 drain_stream(&mut stream).await;
-                return Err(internal_error("PutPath: insert_manifest_uploading", e));
+                return Err(metadata_status("PutPath: insert_manifest_uploading", e));
             }
         };
         if !inserted {
@@ -561,7 +590,7 @@ impl StoreService for StoreServiceImpl {
                     .await
             {
                 self.abort_upload(&full_info.store_path_hash).await;
-                return Err(internal_error("PutPath: complete_manifest_inline", e));
+                return Err(metadata_status("PutPath: complete_manifest_inline", e));
             }
             debug!(store_path = %full_info.store_path.as_str(), "PutPath: inline upload completed");
         }
@@ -621,7 +650,7 @@ impl StoreService for StoreServiceImpl {
         // Step 1: narinfo + manifest.
         let info = metadata::query_path_info(&self.pool, &req.store_path)
             .await
-            .map_err(|e| internal_error("GetPath: query_path_info", e))?
+            .map_err(|e| metadata_status("GetPath: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
         // `None` here is defense-in-depth for a race where query_path_info
@@ -629,7 +658,7 @@ impl StoreService for StoreServiceImpl {
         // manifests.status='complete', so in practice they agree.
         let manifest = metadata::get_manifest(&self.pool, &req.store_path)
             .await
-            .map_err(|e| internal_error("GetPath: get_manifest", e))?
+            .map_err(|e| metadata_status("GetPath: get_manifest", e))?
             .ok_or_else(|| {
                 Status::not_found(format!("manifest not found for: {}", req.store_path))
             })?;
@@ -791,7 +820,7 @@ impl StoreService for StoreServiceImpl {
 
         let info = metadata::query_path_info(&self.pool, &req.store_path)
             .await
-            .map_err(|e| internal_error("QueryPathInfo: query_path_info", e))?
+            .map_err(|e| metadata_status("QueryPathInfo: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
         Ok(Response::new(info.into()))
@@ -818,7 +847,7 @@ impl StoreService for StoreServiceImpl {
 
         let missing = metadata::find_missing_paths(&self.pool, &req.store_paths)
             .await
-            .map_err(|e| internal_error("FindMissingPaths: find_missing_paths", e))?;
+            .map_err(|e| metadata_status("FindMissingPaths: find_missing_paths", e))?;
 
         Ok(Response::new(FindMissingPathsResponse {
             missing_paths: missing,
@@ -897,7 +926,7 @@ impl StoreService for StoreServiceImpl {
 
         let info = metadata::query_by_hash_part(&self.pool, &req.hash_part)
             .await
-            .map_err(|e| internal_error("QueryPathFromHashPart: query_by_hash_part", e))?
+            .map_err(|e| metadata_status("QueryPathFromHashPart: query_by_hash_part", e))?
             .ok_or_else(|| {
                 Status::not_found(format!("no path with hash part: {}", req.hash_part))
             })?;
@@ -933,7 +962,7 @@ impl StoreService for StoreServiceImpl {
 
         let rows = metadata::append_signatures(&self.pool, &req.store_path, &req.signatures)
             .await
-            .map_err(|e| internal_error("AddSignatures: append_signatures", e))?;
+            .map_err(|e| metadata_status("AddSignatures: append_signatures", e))?;
 
         if rows == 0 {
             return Err(Status::not_found(format!(
@@ -1222,7 +1251,7 @@ impl ChunkService for ChunkServiceImpl {
         // We need the actual missing DIGESTS. Zip + filter.
         let missing_flags = metadata::find_missing_chunks(&self.pool, &req.digests)
             .await
-            .map_err(|e| internal_error("FindMissingChunks", e))?;
+            .map_err(|e| metadata_status("FindMissingChunks", e))?;
 
         let missing_digests: Vec<Vec<u8>> = req
             .digests
