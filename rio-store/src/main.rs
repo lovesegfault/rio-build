@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -9,9 +6,6 @@ use tracing::{error, info};
 
 use rio_proto::store::chunk_service_server::ChunkServiceServer;
 use rio_proto::store::store_service_server::StoreServiceServer;
-use rio_store::backend::NarBackend;
-use rio_store::backend::filesystem::FilesystemBackend;
-use rio_store::backend::s3::S3Backend;
 use rio_store::grpc::{ChunkServiceStub, StoreServiceImpl};
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
@@ -130,43 +124,32 @@ async fn main() -> anyhow::Result<()> {
         .inspect_err(|e| error!(error = %e, "database migrations failed"))?;
     info!("database migrations applied");
 
-    // Initialize backend
-    let backend: Arc<dyn NarBackend> = match cfg.backend.as_str() {
-        "filesystem" => {
-            info!(base_dir = %cfg.base_dir, "using filesystem backend");
-            Arc::new(FilesystemBackend::new(&cfg.base_dir)?)
-        }
-        "s3" => {
-            let bucket = cfg
-                .s3_bucket
-                .ok_or_else(|| anyhow::anyhow!("s3_bucket is required for S3 backend"))?;
-            info!(
-                bucket = %bucket,
-                prefix = %cfg.s3_prefix,
-                max_retries = cfg.s3_max_retries,
-                attempt_timeout_secs = cfg.s3_attempt_timeout_secs,
-                "using S3 backend"
-            );
-            let retry_config =
-                aws_config::retry::RetryConfig::standard().with_max_attempts(cfg.s3_max_retries);
-            let timeout_config = aws_config::timeout::TimeoutConfig::builder()
-                .operation_attempt_timeout(Duration::from_secs(cfg.s3_attempt_timeout_secs))
-                .build();
-            let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .retry_config(retry_config)
-                .timeout_config(timeout_config)
-                .load()
-                .await;
-            let s3_client = aws_sdk_s3::Client::new(&aws_config);
-            Arc::new(S3Backend::new(s3_client, bucket, cfg.s3_prefix))
-        }
-        other => {
-            anyhow::bail!("unknown backend: {other} (expected 'filesystem' or 's3')");
-        }
-    };
+    // Phase 2c: NarBackend is gone. Inline NARs live in manifests.inline_blob;
+    // chunked NARs (C3) will use a ChunkBackend (S3 or filesystem), constructed
+    // from cfg.backend + cfg.s3_bucket etc. — same config fields, different
+    // trait. The config fields stay so C3's diff is purely additive; they're
+    // read but ignored for now.
+    //
+    // Logging the backend config anyway so operators see what'll be used once
+    // chunking lands — a silent config drift between now and C3 would be
+    // confusing to debug.
+    info!(
+        backend = %cfg.backend,
+        base_dir = %cfg.base_dir,
+        s3_bucket = ?cfg.s3_bucket,
+        "backend config (unused until C3 chunking; inline storage only)"
+    );
+    let _ = (
+        cfg.backend,
+        cfg.base_dir,
+        cfg.s3_bucket,
+        cfg.s3_prefix,
+        cfg.s3_max_retries,
+        cfg.s3_attempt_timeout_secs,
+    );
 
     // Build gRPC services
-    let store_service = StoreServiceImpl::new(backend, pool);
+    let store_service = StoreServiceImpl::new(pool);
     let max_msg_size = rio_proto::max_message_size();
 
     let addr = cfg.listen_addr.parse()?;

@@ -9,12 +9,10 @@ async fn setup_inproc_store(
     pool: sqlx::PgPool,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
     use rio_proto::store::store_service_server::StoreServiceServer;
-    use rio_store::backend::memory::MemoryBackend;
     use rio_store::grpc::StoreServiceImpl;
-    use std::sync::Arc;
 
-    let backend = Arc::new(MemoryBackend::new());
-    let service = StoreServiceImpl::new(backend, pool);
+    // Phase 2c: no NarBackend. Inline storage in manifests.inline_blob.
+    let service = StoreServiceImpl::new(pool);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
