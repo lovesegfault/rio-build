@@ -300,16 +300,46 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> anyhow::Result<Opt
     match row {
         None => Ok(None),
         Some((Some(blob),)) => Ok(Some(ManifestKind::Inline(Bytes::from(blob)))),
-        // inline_blob NULL → chunked. C3/C5 will query manifest_data here.
-        // E1 interim: PutPath always writes inline, so this arm is dead
-        // code — but returning a typed Chunked(empty) means C5's GetPath
-        // rewrite is purely additive (fill in this arm).
+        // inline_blob NULL → chunked. Fetch + deserialize manifest_data.
         Some((None,)) => {
-            debug!(
-                store_path,
-                "manifest has NULL inline_blob; chunked path not yet wired (C3/C5)"
-            );
-            Ok(Some(ManifestKind::Chunked(Vec::new())))
+            let data: Option<(Vec<u8>,)> = sqlx::query_as(
+                r#"
+                SELECT md.chunk_list
+                FROM manifest_data md
+                INNER JOIN narinfo n ON n.store_path_hash = md.store_path_hash
+                WHERE n.store_path = $1
+                "#,
+            )
+            .bind(store_path)
+            .fetch_optional(pool)
+            .await?;
+
+            // manifest exists + inline_blob NULL but NO manifest_data row:
+            // invariant violation (store.md:222 says inline_blob NULL ⇔
+            // manifest_data exists). Possible causes: manual DB surgery,
+            // a bug in delete_manifest_chunked_uploading ordering, or a
+            // CASCADE we didn't expect. Surface it — don't silently return
+            // None (that would look like "path not found", masking corruption).
+            let (chunk_list,) = data.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invariant violation: manifest for {store_path} has NULL inline_blob \
+                     but no manifest_data row (corrupted state)"
+                )
+            })?;
+
+            let manifest = crate::manifest::Manifest::deserialize(&chunk_list)
+                .map_err(|e| anyhow::anyhow!("corrupt manifest_data for {store_path}: {e}"))?;
+
+            // Convert Manifest → Vec<([u8;32], u32)> for the enum variant.
+            // ManifestKind predates Manifest (E1 vs C1) so the representation
+            // is slightly different; this is one allocation, cheap.
+            let entries: Vec<([u8; 32], u32)> = manifest
+                .entries
+                .into_iter()
+                .map(|e| (e.hash, e.size))
+                .collect();
+
+            Ok(Some(ManifestKind::Chunked(entries)))
         }
     }
 }
@@ -377,6 +407,315 @@ pub async fn find_missing_paths(
         .iter()
         .filter(|p| !complete_set.contains(p.as_str()))
         .cloned()
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Chunked manifest ops (phase2c C3)
+// ---------------------------------------------------------------------------
+
+/// Upgrade an existing 'uploading' manifest to chunked: write manifest_data
+/// + increment chunk refcounts.
+///
+/// # Why this takes an EXISTING placeholder
+///
+/// grpc.rs PutPath runs `insert_manifest_uploading()` at step 3, BEFORE
+/// the NAR stream is consumed (it's the idempotency lock — prevents
+/// concurrent uploaders). Only at step 6, after buffering + validating,
+/// do we know the size. At that point we already OWN the placeholder;
+/// this function adds the chunked metadata to it.
+///
+/// A standalone `insert_manifest_chunked_uploading` that creates its own
+/// placeholder would either (a) need to know the size upfront (can't —
+/// stream isn't consumed yet), or (b) delete+recreate the placeholder
+/// (window for another uploader to slip in). Upgrade-in-place avoids both.
+///
+/// # Why refcounts are incremented here (before upload), not at complete
+///
+/// Per `store.md:94`: incrementing before upload protects chunks from GC
+/// sweep immediately. If a GC pass runs between upload and complete, it
+/// sees refcount > 0 and skips. If we waited until complete, a GC between
+/// "chunks uploaded to S3" and "status flipped" would sweep → orphaned.
+///
+/// The tradeoff: if the upload fails and we forget to decrement, refcounts
+/// are leaked. The orphan scanner (future phase) catches this via stale
+/// 'uploading' manifests.
+///
+/// # Refcount UPSERT
+///
+/// `INSERT ... ON CONFLICT DO UPDATE` is row-level atomic — no explicit
+/// SELECT FOR UPDATE needed. Two concurrent PutPaths referencing the same
+/// chunk both increment correctly (PG resolves the conflict, second one
+/// sees the first's row and runs the UPDATE clause).
+#[instrument(skip(pool, chunk_list, chunk_hashes, chunk_sizes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
+pub async fn upgrade_manifest_to_chunked(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    chunk_list: &[u8],        // serialized Manifest
+    chunk_hashes: &[Vec<u8>], // each is a 32-byte BLAKE3
+    chunk_sizes: &[i64],      // parallel to chunk_hashes
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+
+    // Sanity: the manifests row MUST exist with status='uploading'.
+    // If it doesn't, the caller's step-3 placeholder was deleted
+    // (concurrent cleanup? bug?) — fail loudly.
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM manifests
+            WHERE store_path_hash = $1 AND status = 'uploading'
+        )
+        "#,
+    )
+    .bind(store_path_hash)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !exists {
+        anyhow::bail!(
+            "upgrade_manifest_to_chunked: no 'uploading' manifest for {} \
+             (placeholder deleted concurrently?)",
+            hex::encode(store_path_hash)
+        );
+    }
+
+    // manifest_data: the chunk list. No ON CONFLICT — the placeholder
+    // from step 3 didn't write manifest_data, so this row shouldn't
+    // exist. If it does (caller called us twice?), PG errors on PK
+    // conflict — that's a bug, let it fail.
+    sqlx::query(
+        r#"
+        INSERT INTO manifest_data (store_path_hash, chunk_list)
+        VALUES ($1, $2)
+        "#,
+    )
+    .bind(store_path_hash)
+    .bind(chunk_list)
+    .execute(&mut *tx)
+    .await?;
+
+    // Refcount UPSERT. UNNEST over parallel arrays (PG errors if lengths
+    // differ — caller guarantees equal, this is a sanity check).
+    //
+    // The array-of-1s for initial refcount: can't use a literal `1` in
+    // the UNNEST position (not an array). Materializing N×1 is mildly
+    // silly but cleaner than CROSS JOIN with a single-row constant.
+    //
+    // ON CONFLICT DO UPDATE is atomic per-row. PG's conflict resolution
+    // serializes INSERT vs UPDATE — two concurrent PutPaths with
+    // overlapping chunk lists both increment correctly.
+    sqlx::query(
+        r#"
+        INSERT INTO chunks (blake3_hash, refcount, size)
+        SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
+               AS t(hash, one, size)
+        ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1
+        "#,
+    )
+    .bind(chunk_hashes)
+    .bind(vec![1i64; chunk_hashes.len()])
+    .bind(chunk_sizes)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Finalize a chunked upload: fill real narinfo + flip status to 'complete'.
+///
+/// Does NOT write inline_blob (stays NULL — that's the chunked marker).
+/// Does NOT touch manifest_data (already written at uploading time).
+/// Does NOT touch refcounts (already incremented at uploading time).
+///
+/// Just the narinfo UPDATE + status flip. Same atomic guarantees as the
+/// inline variant.
+#[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
+pub async fn complete_manifest_chunked(
+    pool: &PgPool,
+    info: &ValidatedPathInfo,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let deriver_str = info.deriver.as_ref().map(|d| d.to_string());
+    let refs_str: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+    let ca_str = info.content_address.as_deref();
+
+    let narinfo_result = sqlx::query(
+        r#"
+        UPDATE narinfo SET
+            deriver           = $2,
+            nar_hash          = $3,
+            nar_size          = $4,
+            "references"      = $5,
+            signatures        = $6,
+            ca                = $7,
+            registration_time = $8,
+            ultimate          = $9
+        WHERE store_path_hash = $1
+        "#,
+    )
+    .bind(&info.store_path_hash)
+    .bind(deriver_str)
+    .bind(info.nar_hash.as_slice())
+    .bind(info.nar_size as i64)
+    .bind(&refs_str)
+    .bind(&info.signatures)
+    .bind(ca_str)
+    .bind(info.registration_time as i64)
+    .bind(info.ultimate)
+    .execute(&mut *tx)
+    .await?;
+
+    if narinfo_result.rows_affected() == 0 {
+        anyhow::bail!(
+            "complete_manifest_chunked: narinfo placeholder missing for {}",
+            info.store_path.as_str()
+        );
+    }
+
+    // Flip status. inline_blob stays NULL — that's what makes get_manifest()
+    // return Chunked instead of Inline.
+    let manifest_result = sqlx::query(
+        r#"
+        UPDATE manifests SET
+            status     = 'complete',
+            updated_at = now()
+        WHERE store_path_hash = $1
+        "#,
+    )
+    .bind(&info.store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    if manifest_result.rows_affected() == 0 {
+        anyhow::bail!(
+            "complete_manifest_chunked: manifest placeholder missing for {}",
+            info.store_path.as_str()
+        );
+    }
+
+    tx.commit().await?;
+    debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
+    Ok(())
+}
+
+/// Reclaim a failed chunked upload: decrement refcounts + delete rows.
+///
+/// **Must be called with the SAME chunk_hashes that were passed to
+/// insert_manifest_chunked_uploading.** Decrementing a different set
+/// would corrupt refcounts. The caller (cas.rs) holds the Manifest
+/// across the upload, so this invariant is easy to maintain.
+///
+/// Same safety guards as the inline variant: only deletes rows where
+/// `nar_size = 0` / `status = 'uploading'` so a concurrent successful
+/// upload isn't touched.
+#[instrument(skip(pool, chunk_hashes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
+pub async fn delete_manifest_chunked_uploading(
+    pool: &PgPool,
+    store_path_hash: &[u8],
+    chunk_hashes: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+
+    // Decrement refcounts FIRST. If we deleted manifest_data first and
+    // then crashed before decrementing, the refcounts would be leaked
+    // forever (no manifest references them, but count > 0 so GC skips).
+    // Decrementing first means a crash here leaves manifest_data
+    // pointing at chunks with count=0 — the orphan scanner (later phase)
+    // catches that by finding stale 'uploading' manifests.
+    //
+    // `refcount - 1` can go negative if the caller passes wrong hashes.
+    // That's a bug and SHOULD be visible — no GREATEST(0, ...) clamp,
+    // let the -1 show up in monitoring.
+    sqlx::query(
+        r#"
+        UPDATE chunks SET refcount = refcount - 1
+        WHERE blake3_hash = ANY($1)
+        "#,
+    )
+    .bind(chunk_hashes)
+    .execute(&mut *tx)
+    .await?;
+
+    // Delete manifest_data (via CASCADE from manifests, but explicit for
+    // clarity and to not depend on schema details).
+    sqlx::query(
+        r#"
+        DELETE FROM manifest_data
+        WHERE store_path_hash = $1
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    // manifests + narinfo placeholders (same guards as inline variant).
+    sqlx::query(
+        r#"
+        DELETE FROM manifests
+        WHERE store_path_hash = $1 AND status = 'uploading'
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM narinfo
+        WHERE store_path_hash = $1 AND nar_size = 0
+        "#,
+    )
+    .bind(store_path_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Find which chunks are NOT yet in the `chunks` table.
+///
+/// This is the dedup pre-check: PutPath calls this BEFORE uploading to
+/// skip chunks that already exist. Returns a `Vec<bool>` parallel to the
+/// input: `result[i] == true` means `hashes[i]` is missing (upload it).
+///
+/// Checks PG, not S3. The `chunks` table is the source of truth for
+/// "which chunks do we know about" — it's populated at
+/// insert_manifest_chunked_uploading time (step 1), BEFORE S3 upload.
+/// So a chunk can be in PG but not yet in S3 (in-progress upload). That's
+/// fine for the dedup check: another uploader is handling it, we can
+/// skip. If their upload fails, they decrement and we'll see it missing
+/// on the next attempt.
+///
+/// One PG roundtrip for N chunks. Beats N S3 HeadObject calls by ~10×
+/// on latency alone.
+#[instrument(skip(pool, hashes), fields(count = hashes.len()))]
+pub async fn find_missing_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> anyhow::Result<Vec<bool>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // ANY($1) with a bytea[] — returns the hashes that DO exist.
+    let present: Vec<(Vec<u8>,)> = sqlx::query_as(
+        r#"
+        SELECT blake3_hash FROM chunks
+        WHERE blake3_hash = ANY($1)
+        "#,
+    )
+    .bind(hashes)
+    .fetch_all(pool)
+    .await?;
+
+    // Invert: present → missing. HashSet for O(1) membership instead of
+    // O(N) scan per input hash (N² total without the set).
+    let present_set: std::collections::HashSet<&[u8]> =
+        present.iter().map(|(h,)| h.as_slice()).collect();
+
+    Ok(hashes
+        .iter()
+        .map(|h| !present_set.contains(h.as_slice()))
         .collect())
 }
 

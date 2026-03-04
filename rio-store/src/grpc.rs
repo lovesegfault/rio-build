@@ -22,9 +22,13 @@ use rio_proto::types::{
 };
 use rio_proto::validated::ValidatedPathInfo;
 
+use crate::backend::chunk::ChunkBackend;
+use crate::cas;
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
 use crate::validate::validate_nar_digest;
+
+use std::sync::Arc;
 
 use rio_proto::client::NAR_CHUNK_SIZE;
 
@@ -53,16 +57,37 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
 /// The StoreService gRPC server.
 ///
 /// Phase 2c: NAR content lives in `manifests.inline_blob` (small NARs) or
-/// as FastCDC chunks (large NARs, lands in C3). The `NarBackend` field from
-/// phase 2a is gone — inline blobs are stored directly in PG.
+/// as FastCDC chunks (large NARs). The `NarBackend` field from phase 2a
+/// is gone — inline blobs are stored directly in PG.
 pub struct StoreServiceImpl {
     pool: PgPool,
+    /// Chunk storage for NARs ≥ INLINE_THRESHOLD. `None` disables chunking
+    /// entirely (all NARs go inline, regardless of size). Tests use `None`
+    /// or `MemoryChunkBackend`; prod uses `S3ChunkBackend`.
+    chunk_backend: Option<Arc<dyn ChunkBackend>>,
 }
 
 impl StoreServiceImpl {
-    /// Create a new StoreService.
+    /// Create a new StoreService with inline-only storage (no chunking).
+    ///
+    /// All NARs go into `manifests.inline_blob` regardless of size.
+    /// Existing test harnesses call this; they don't need a chunk backend.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            chunk_backend: None,
+        }
+    }
+
+    /// Create a StoreService with chunked storage enabled.
+    ///
+    /// NARs below `INLINE_THRESHOLD` (256 KiB) still go inline; larger
+    /// ones are FastCDC-chunked and uploaded via `backend`.
+    pub fn with_chunk_backend(pool: PgPool, backend: Arc<dyn ChunkBackend>) -> Self {
+        Self {
+            pool,
+            chunk_backend: Some(backend),
+        }
     }
 
     /// Clean up an uploading placeholder after a PutPath error and record
@@ -387,28 +412,62 @@ impl StoreService for StoreServiceImpl {
             )));
         }
 
-        // Step 6: Complete upload — store NAR in inline_blob + flip status.
-        // `info` is already ValidatedPathInfo; just fill in the computed hash.
-        //
-        // complete_manifest_inline takes the NAR directly — no separate
-        // backend write step. This is atomic: either narinfo + manifest both
-        // commit, or neither does. No orphaned-blob cleanup needed (unlike
-        // phase 2a's backend-then-DB two-step, where a crash between them
-        // leaked S3 objects). C3 will add the chunked path here for NARs
-        // ≥ 256KB — THAT path reintroduces the two-step (PG manifest +
-        // S3 chunks), and the orphan-cleanup concern returns with it.
+        // Step 6: Complete upload. Branches on size.
         let full_info = ValidatedPathInfo {
             store_path_hash,
             ..info
         };
-        if let Err(e) =
-            metadata::complete_manifest_inline(&self.pool, &full_info, Bytes::from(nar_data)).await
-        {
-            self.abort_upload(&full_info.store_path_hash).await;
-            return Err(internal_error("PutPath: complete_manifest_inline", e));
+
+        // Size gate: small NARs inline, large NARs chunked (if backend
+        // configured). `None` backend forces inline always — test
+        // harnesses rely on this.
+        //
+        // The gate is on `nar_data.len()`, not `info.nar_size`. They should
+        // match (validate_nar_digest above checks) but nar_data.len() is
+        // what we actually have in hand — no chance of a drift where
+        // info.nar_size says 200KB but we chunk 300KB.
+        let use_chunked = self.chunk_backend.is_some() && nar_data.len() >= cas::INLINE_THRESHOLD;
+
+        if use_chunked {
+            // Chunked path: FastCDC + S3 + refcounts. cas::put_chunked
+            // handles the whole write-ahead flow INCLUDING rollback on
+            // its own errors. It consumed our step-3 placeholder; we
+            // don't call abort_upload() on failure (that'd delete
+            // a placeholder that no longer exists, or worse, one that
+            // put_chunked's rollback just cleaned up).
+            let backend = self.chunk_backend.as_ref().expect("checked is_some above");
+            match cas::put_chunked(&self.pool, backend, &full_info, &nar_data).await {
+                Ok(stats) => {
+                    debug!(
+                        store_path = %full_info.store_path.as_str(),
+                        total_chunks = stats.total_chunks,
+                        deduped = stats.deduped_chunks,
+                        ratio = stats.dedup_ratio(),
+                        "PutPath: chunked upload completed"
+                    );
+                    // The milestone metric. Gauge (per-upload ratio, not a
+                    // running average — Prometheus rate() handles that).
+                    metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
+                }
+                Err(e) => {
+                    // put_chunked already rolled back. Just the error metric.
+                    metrics::counter!("rio_store_put_path_total", "result" => "error").increment(1);
+                    return Err(internal_error("PutPath: put_chunked", e));
+                }
+            }
+        } else {
+            // Inline path: single-tx NAR-in-inline_blob. Atomic — no
+            // orphan cleanup needed (unlike the chunked path's two-step).
+            if let Err(e) =
+                metadata::complete_manifest_inline(&self.pool, &full_info, Bytes::from(nar_data))
+                    .await
+            {
+                self.abort_upload(&full_info.store_path_hash).await;
+                return Err(internal_error("PutPath: complete_manifest_inline", e));
+            }
+            debug!(store_path = %full_info.store_path.as_str(), "PutPath: inline upload completed");
         }
 
-        debug!(store_path = %full_info.store_path.as_str(), "PutPath: upload completed successfully");
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::histogram!("rio_store_put_path_duration_seconds")
             .record(start.elapsed().as_secs_f64());

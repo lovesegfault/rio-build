@@ -16,25 +16,47 @@ use rio_proto::types::{
     put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
+use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
 use rio_store::grpc::StoreServiceImpl;
 use rio_test_support::fixtures::{make_nar, make_path_info_for_nar};
 use rio_test_support::{Context, TestDb, TestResult};
 
+use std::sync::Arc;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
-/// Spawn an in-process store gRPC server and return a connected client.
+/// Spawn an in-process store gRPC server (inline-only) and return a client.
 ///
-/// Phase 2c: no `MemoryBackend` handle is returned — NARs live in
-/// `manifests.inline_blob`. Tests that need to corrupt stored data
-/// (integrity-check tests) do so via direct SQL UPDATE on `inline_blob`.
-///
-/// Uses an ephemeral TCP port on 127.0.0.1. The returned `JoinHandle`
-/// should be aborted at test end (or dropped) to shut down the server.
+/// Phase 2c: no chunk backend → all NARs go inline regardless of size.
+/// Most tests use this; chunked-specific tests use `setup_store_chunked`.
 pub async fn setup_store(
     pool: PgPool,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
     let service = StoreServiceImpl::new(pool);
+    spawn_store_server(service).await
+}
 
+/// Spawn an in-process store WITH chunk backend. NARs ≥ 256 KiB are chunked.
+/// Returns the `Arc<MemoryChunkBackend>` so tests can inspect chunk counts.
+pub async fn setup_store_chunked(
+    pool: PgPool,
+) -> anyhow::Result<(
+    StoreServiceClient<Channel>,
+    Arc<MemoryChunkBackend>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let backend = Arc::new(MemoryChunkBackend::new());
+    let service =
+        StoreServiceImpl::with_chunk_backend(pool, backend.clone() as Arc<dyn ChunkBackend>);
+    let (client, server) = spawn_store_server(service).await?;
+    Ok((client, backend, server))
+}
+
+/// Shared: spawn server + connect client. Extracted so both setup variants
+/// use it.
+async fn spawn_store_server(
+    service: StoreServiceImpl,
+) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
     // Bind to a random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -1219,6 +1241,240 @@ async fn test_add_signatures_empty_is_noop() -> TestResult {
         })
         .await
         .context("empty sigs should be OK")?;
+
+    server.abort();
+    Ok(())
+}
+
+// ===========================================================================
+// Chunked CAS (phase2c C3)
+// ===========================================================================
+
+/// Build a NAR of roughly `size` bytes. Content is pseudo-random enough
+/// for FastCDC to find boundaries but deterministic for reproducible tests.
+///
+/// NOT using make_nar (that wraps a tiny payload in NAR framing). We want
+/// a big payload. The NAR framing adds ~100 bytes; payload dominates.
+fn make_large_nar(seed: u8, payload_size: usize) -> (Vec<u8>, ValidatedPathInfo, String) {
+    // Deterministic pseudo-random payload. seed varies per test so two
+    // NARs with different seeds share SOME chunks (dedup test) but not all.
+    let payload: Vec<u8> = (0u64..payload_size as u64)
+        .map(|i| (i.wrapping_mul(7919).wrapping_add(seed as u64) % 251) as u8)
+        .collect();
+
+    // Wrap in a NAR via the fixture helper (single-file NAR).
+    let (nar, _hash) = make_nar(&payload);
+    let store_path = test_store_path(&format!("large-nar-{seed}"));
+    let info = make_path_info_for_nar(&store_path, &nar);
+    (nar, info, store_path)
+}
+
+/// Small NAR + chunked backend: should STILL go inline (under threshold).
+#[tokio::test]
+async fn test_chunked_small_nar_stays_inline() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+
+    let store_path = test_store_path("chunked-small");
+    let nar = make_nar(b"tiny").0;
+    let info = make_path_info_for_nar(&store_path, &nar);
+
+    let created = put_path(&mut client, info, nar).await?;
+    assert!(created);
+
+    // Chunk backend should be empty — went inline.
+    assert!(
+        backend.is_empty(),
+        "small NAR should not reach chunk backend"
+    );
+
+    // Manifest should be Inline (has inline_blob).
+    let inline_blob: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
+         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(&store_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(inline_blob.is_some(), "small NAR should have inline_blob");
+
+    server.abort();
+    Ok(())
+}
+
+/// Large NAR: chunked path activates. Backend gets chunks, inline_blob NULL,
+/// manifest_data populated.
+#[tokio::test]
+async fn test_chunked_large_nar_chunks() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+
+    // 1 MiB — well over INLINE_THRESHOLD (256 KiB).
+    let (nar, info, store_path) = make_large_nar(1, 1024 * 1024);
+
+    let created = put_path(&mut client, info, nar).await?;
+    assert!(created);
+
+    // Chunk backend should have chunks (1 MiB / 64 KiB avg ≈ 16).
+    let chunk_count = backend.len();
+    assert!(
+        chunk_count > 0,
+        "large NAR should reach chunk backend, got {chunk_count} chunks"
+    );
+    assert!(
+        chunk_count > 4,
+        "1 MiB at 64 KiB avg should be >4 chunks, got {chunk_count}"
+    );
+
+    // inline_blob should be NULL (chunked marker).
+    let inline_blob: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT m.inline_blob FROM manifests m JOIN narinfo n \
+         ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(&store_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        inline_blob.is_none(),
+        "chunked NAR should have NULL inline_blob"
+    );
+
+    // manifest_data should exist.
+    let md_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manifest_data md JOIN narinfo n \
+         ON md.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
+    )
+    .bind(&store_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(md_count, 1, "manifest_data row should exist");
+
+    // chunks table refcounts all == 1 (first upload).
+    let refcounts: Vec<(i32,)> = sqlx::query_as("SELECT refcount FROM chunks")
+        .fetch_all(&db.pool)
+        .await?;
+    assert_eq!(refcounts.len(), chunk_count);
+    for (rc,) in &refcounts {
+        assert_eq!(*rc, 1, "first upload: all refcounts should be 1");
+    }
+
+    server.abort();
+    Ok(())
+}
+
+/// The dedup test: upload two large NARs that share most of their content.
+/// The second upload should skip most chunks (backend chunk count should
+/// NOT double).
+#[tokio::test]
+async fn test_chunked_dedup_across_uploads() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+
+    // Two NARs with IDENTICAL payloads (seed=5 both times). Different
+    // store paths (so they're different PutPath calls) but same content
+    // → same chunks → 100% dedup on the second upload.
+    //
+    // In practice two store paths with the same NAR content would be a
+    // weird nixpkgs thing (two fetchurl of the same file), but it DOES
+    // happen, and it's the clearest dedup test.
+    let (nar_a, info_a, _) = make_large_nar(5, 1024 * 1024);
+    put_path(&mut client, info_a, nar_a).await?;
+    let chunks_after_a = backend.len();
+    assert!(chunks_after_a > 4);
+
+    // Second NAR: same seed = same payload = same chunks.
+    // Different store_path (different name arg) so it's a fresh PutPath.
+    let payload: Vec<u8> = (0u64..1024 * 1024)
+        .map(|i| (i.wrapping_mul(7919).wrapping_add(5) % 251) as u8)
+        .collect();
+    let (nar_b, _) = make_nar(&payload);
+    let path_b = test_store_path("large-nar-5-dup");
+    let info_b = make_path_info_for_nar(&path_b, &nar_b);
+
+    put_path(&mut client, info_b, nar_b).await?;
+    let chunks_after_b = backend.len();
+
+    // THE dedup assertion: chunk count should NOT have doubled.
+    // Identical payloads → identical chunks → zero new uploads.
+    assert_eq!(
+        chunks_after_b, chunks_after_a,
+        "identical content should dedup 100%: {chunks_after_a} chunks after A, \
+         {chunks_after_b} after B (should be equal)"
+    );
+
+    // Refcounts should all be 2 (both manifests reference every chunk).
+    let refcounts: Vec<(i32,)> = sqlx::query_as("SELECT refcount FROM chunks")
+        .fetch_all(&db.pool)
+        .await?;
+    for (rc,) in &refcounts {
+        assert_eq!(*rc, 2, "two uploads of same content: refcount should be 2");
+    }
+
+    server.abort();
+    Ok(())
+}
+
+/// Idempotent PutPath for chunked: second upload of same store path returns
+/// created=false, doesn't touch chunks.
+#[tokio::test]
+async fn test_chunked_idempotent() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+
+    let (nar, info, _) = make_large_nar(7, 512 * 1024);
+
+    let first = put_path(&mut client, info.clone(), nar.clone()).await?;
+    assert!(first);
+    let chunks_first = backend.len();
+
+    // Same path again: idempotency short-circuits at check_manifest_complete,
+    // before any chunking happens.
+    let second = put_path(&mut client, info, nar).await?;
+    assert!(!second, "second PutPath should return created=false");
+    assert_eq!(
+        backend.len(),
+        chunks_first,
+        "idempotent PutPath should not touch chunks"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+/// Hash mismatch rollback: send a large NAR declaring the WRONG hash.
+/// Validation fails → abort_upload. Verify: no manifest_data, no chunks,
+/// refcounts untouched.
+///
+/// This exercises the OLD abort path (pre-chunking) — the validation
+/// failure happens at step 5, BEFORE put_chunked is called. So this is
+/// really testing that the inline abort path still works for large NARs.
+#[tokio::test]
+async fn test_chunked_hash_mismatch_no_leaked_state() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+
+    let (_good_nar, good_info, _) = make_large_nar(9, 512 * 1024);
+    let (bad_nar, _, _) = make_large_nar(10, 512 * 1024);
+
+    // Declare good_nar's hash, send bad_nar → validation fails.
+    let result = put_path(&mut client, good_info, bad_nar).await;
+    assert!(result.is_err(), "hash mismatch should be rejected");
+
+    // No leaked state: chunks empty, no manifest rows.
+    assert!(backend.is_empty());
+    let mf_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manifests")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(mf_count, 0);
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(chunk_count, 0);
+
+    // Retry with correct NAR succeeds.
+    let (good_nar, info, _) = make_large_nar(9, 512 * 1024);
+    let retry = put_path(&mut client, info, good_nar).await?;
+    assert!(retry);
 
     server.abort();
     Ok(())

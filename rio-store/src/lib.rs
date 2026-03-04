@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod cas;
 pub mod chunker;
 pub mod grpc;
 pub mod manifest;
