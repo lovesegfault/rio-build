@@ -11,17 +11,17 @@ use rio_proto::types::{AddSignaturesRequest, QueryPathFromHashPartRequest};
 /// QueryPathFromHashPart: put a path, look it up by its 32-char hash part.
 #[tokio::test]
 async fn test_query_path_from_hash_part_found() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
 
     // Store path with a known nixbase32 hash-part. All-'a' is valid nixbase32.
     let hash_part = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let store_path = format!("/nix/store/{hash_part}-hashpart-test");
     let nar = make_nar(b"hash part test").0;
     let info = make_path_info_for_nar(&store_path, &nar);
-    put_path(&mut client, info, nar).await?;
+    put_path(&mut s.client, info, nar).await?;
 
-    let resp = client
+    let resp = s
+        .client
         .query_path_from_hash_part(QueryPathFromHashPartRequest {
             hash_part: hash_part.into(),
         })
@@ -29,17 +29,16 @@ async fn test_query_path_from_hash_part_found() -> TestResult {
         .context("should find by hash part")?;
     assert_eq!(resp.into_inner().store_path, store_path);
 
-    server.abort();
     Ok(())
 }
 
 /// QueryPathFromHashPart: unknown hash → NOT_FOUND.
 #[tokio::test]
 async fn test_query_path_from_hash_part_not_found() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
 
-    let result = client
+    let result = s
+        .client
         .query_path_from_hash_part(QueryPathFromHashPartRequest {
             hash_part: "00000000000000000000000000000000".into(),
         })
@@ -47,7 +46,6 @@ async fn test_query_path_from_hash_part_not_found() -> TestResult {
     let status = result.expect_err("should be NOT_FOUND");
     assert_eq!(status.code(), tonic::Code::NotFound);
 
-    server.abort();
     Ok(())
 }
 
@@ -56,11 +54,11 @@ async fn test_query_path_from_hash_part_not_found() -> TestResult {
 /// injection. The test proves the validator runs BEFORE the query.
 #[tokio::test]
 async fn test_query_path_from_hash_part_validation() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
 
     // Wrong length (INVALID_ARGUMENT, not NOT_FOUND).
-    let short = client
+    let short = s
+        .client
         .query_path_from_hash_part(QueryPathFromHashPartRequest {
             hash_part: "short".into(),
         })
@@ -77,7 +75,8 @@ async fn test_query_path_from_hash_part_validation() -> TestResult {
     // catch this, the LIKE `/nix/store/%%%-%` would match EVERYTHING.
     // Getting INVALID_ARGUMENT here (not a spurious match or NOT_FOUND)
     // proves the charset check fires.
-    let inject = client
+    let inject = s
+        .client
         .query_path_from_hash_part(QueryPathFromHashPartRequest {
             hash_part: "%".repeat(32),
         })
@@ -90,27 +89,25 @@ async fn test_query_path_from_hash_part_validation() -> TestResult {
         inject.message()
     );
 
-    server.abort();
     Ok(())
 }
 
 /// AddSignatures: append, re-query, verify sigs are persisted.
 #[tokio::test]
 async fn test_add_signatures_roundtrip() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
 
     let store_path = test_store_path("addsig-roundtrip");
     let nar = make_nar(b"addsig test").0;
     let info = make_path_info_for_nar(&store_path, &nar);
-    put_path(&mut client, info, nar).await?;
+    put_path(&mut s.client, info, nar).await?;
 
     // Append two sigs.
     let sigs = vec![
         "cache.example.org-1:SIGNATURE_A".to_string(),
         "cache.example.org-1:SIGNATURE_B".to_string(),
     ];
-    client
+    s.client
         .add_signatures(AddSignaturesRequest {
             store_path: store_path.clone(),
             signatures: sigs.clone(),
@@ -119,7 +116,8 @@ async fn test_add_signatures_roundtrip() -> TestResult {
         .context("add_signatures should succeed")?;
 
     // Re-query: sigs persisted.
-    let info = client
+    let info = s
+        .client
         .query_path_info(QueryPathInfoRequest {
             store_path: store_path.clone(),
         })
@@ -131,30 +129,30 @@ async fn test_add_signatures_roundtrip() -> TestResult {
     );
 
     // Append a third — verifies `signatures || $2` concatenates, not replaces.
-    client
+    s.client
         .add_signatures(AddSignaturesRequest {
             store_path: store_path.clone(),
             signatures: vec!["cache.example.org-1:SIGNATURE_C".to_string()],
         })
         .await?;
-    let info = client
+    let info = s
+        .client
         .query_path_info(QueryPathInfoRequest { store_path })
         .await?
         .into_inner();
     assert_eq!(info.signatures.len(), 3, "third sig should be appended");
     assert_eq!(info.signatures[2], "cache.example.org-1:SIGNATURE_C");
 
-    server.abort();
     Ok(())
 }
 
 /// AddSignatures on unknown path → NOT_FOUND.
 #[tokio::test]
 async fn test_add_signatures_not_found() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
 
-    let result = client
+    let result = s
+        .client
         .add_signatures(AddSignaturesRequest {
             store_path: test_store_path("addsig-missing"),
             signatures: vec!["cache.example.org-1:SIG".to_string()],
@@ -163,7 +161,6 @@ async fn test_add_signatures_not_found() -> TestResult {
     let status = result.expect_err("should be NOT_FOUND");
     assert_eq!(status.code(), tonic::Code::NotFound);
 
-    server.abort();
     Ok(())
 }
 
@@ -171,14 +168,13 @@ async fn test_add_signatures_not_found() -> TestResult {
 /// `nix store sign` runs with no configured signing keys.
 #[tokio::test]
 async fn test_add_signatures_empty_is_noop() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
 
     // Path doesn't exist, but empty-sigs short-circuits before the DB
     // query — so NOT_FOUND is not returned. This is intentional: the
     // no-op should be cheap, not a PG roundtrip just to tell the client
     // "yes, you successfully did nothing to a path that doesn't exist".
-    client
+    s.client
         .add_signatures(AddSignaturesRequest {
             store_path: test_store_path("addsig-empty"),
             signatures: vec![],
@@ -186,6 +182,5 @@ async fn test_add_signatures_empty_is_noop() -> TestResult {
         .await
         .context("empty sigs should be OK")?;
 
-    server.abort();
     Ok(())
 }
