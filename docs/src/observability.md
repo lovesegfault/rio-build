@@ -105,7 +105,6 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_store_chunks_total` | Gauge | Total chunks in storage (piggybacked on FindMissingChunks) |
 | `rio_store_chunk_dedup_ratio` | Gauge | Per-upload dedup ratio (1.0 - missing/total after chunking) |
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |
-| `rio_store_cache_hit_ratio` | Gauge | moka chunk cache hit ratio (per-instance; use `_hits_total`/`_misses_total` counters for aggregation) |
 | `rio_store_chunk_cache_hits_total` | Counter | moka chunk cache hits (for cross-instance aggregation) |
 | `rio_store_chunk_cache_misses_total` | Counter | moka chunk cache misses |
 
@@ -123,7 +122,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
 | `rio_worker_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
 
-> **Note on ratio metrics:** Metrics like `rio_store_cache_hit_ratio` and `rio_worker_fuse_cache_hit_ratio` are shown for local dashboards but should not be relied upon for aggregation across instances. For aggregatable cache metrics, use counter pairs (e.g., `rio_store_cache_hits_total` + `rio_store_cache_misses_total`) and compute ratios at query time. Gauge ratios lose meaning when averaged across instances.
+> **Note on ratio metrics:** For aggregatable cache metrics, use counter pairs (e.g., `rio_store_chunk_cache_hits_total` + `rio_store_chunk_cache_misses_total`) and compute ratios at query time with PromQL's `rate()`. Pre-computed gauge ratios lose meaning when averaged across instances, so rio-build does not emit any.
 
 ### Controller Metrics
 

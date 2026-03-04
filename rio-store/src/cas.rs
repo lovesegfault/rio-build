@@ -559,17 +559,13 @@ impl ChunkCache {
         }
     }
 
-    /// Expose the cache hit ratio for the `rio_store_cache_hit_ratio` gauge.
+    /// Approximate entry count for test assertions.
     ///
-    /// moka doesn't track hit/miss internally; we count via the metrics
-    /// above. This computes the ratio from whatever Prometheus has. For
-    /// local testing, call this after a known number of gets. In prod,
-    /// the counter pair (hits_total / misses_total) is what dashboards
-    /// should query — ratio gauges lose meaning when averaged across
-    /// instances (`observability.md:123`).
-    ///
-    /// This is a placeholder: returns 0.0 until C5 wires the gauge via
-    /// the actual counters. The counters are the real signal.
+    /// moka doesn't track hit/miss internally; we count via the
+    /// `rio_store_chunk_cache_{hits,misses}_total` counters. Dashboards
+    /// compute ratios at query time via PromQL `rate()` — we don't emit
+    /// a pre-computed ratio gauge (loses meaning when averaged across
+    /// instances; observability.md "Note on ratio metrics").
     #[cfg(test)]
     pub fn test_cache_len(&self) -> u64 {
         // moka's entry_count is approximate (eventually consistent with
