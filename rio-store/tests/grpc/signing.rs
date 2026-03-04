@@ -22,8 +22,7 @@ fn make_test_signer() -> Signer {
 /// maybe_sign() runs, the fingerprint is correct, and the sig verifies.
 #[tokio::test]
 async fn test_putpath_signs_narinfo() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store_with_signer(db.pool.clone(), make_test_signer()).await?;
+    let mut s = StoreSession::new_with_signer(make_test_signer()).await?;
 
     let store_path = test_store_path("signed-path");
     let nar = make_nar(b"content for signing").0;
@@ -32,10 +31,11 @@ async fn test_putpath_signs_narinfo() -> TestResult {
     let expected_hash = info.nar_hash;
     let expected_size = info.nar_size;
 
-    put_path(&mut client, info, nar).await?;
+    put_path(&mut s.client, info, nar).await?;
 
     // Fetch back via QueryPathInfo — the sig should be in signatures.
-    let fetched = client
+    let fetched = s
+        .client
         .query_path_info(QueryPathInfoRequest {
             store_path: store_path.clone(),
         })
@@ -69,7 +69,6 @@ async fn test_putpath_signs_narinfo() -> TestResult {
         .verify(fp.as_bytes(), &Signature::from_bytes(&sig_arr))
         .context("signature must verify against reconstructed fingerprint")?;
 
-    server.abort();
     Ok(())
 }
 
@@ -77,16 +76,16 @@ async fn test_putpath_signs_narinfo() -> TestResult {
 /// The baseline test — signing is optional.
 #[tokio::test]
 async fn test_putpath_no_signer_no_sig() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    // Regular setup_store (no signer).
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    // Regular StoreSession (no signer).
+    let mut s = StoreSession::new().await?;
 
     let store_path = test_store_path("unsigned-path");
     let nar = make_nar(b"unsigned content").0;
     let info = make_path_info_for_nar(&store_path, &nar);
-    put_path(&mut client, info, nar).await?;
+    put_path(&mut s.client, info, nar).await?;
 
-    let fetched = client
+    let fetched = s
+        .client
         .query_path_info(QueryPathInfoRequest { store_path })
         .await?
         .into_inner();
@@ -95,7 +94,6 @@ async fn test_putpath_no_signer_no_sig() -> TestResult {
         "no signer → no signature added"
     );
 
-    server.abort();
     Ok(())
 }
 
@@ -104,14 +102,13 @@ async fn test_putpath_no_signer_no_sig() -> TestResult {
 /// proves the fingerprint actually covers references (not just path+hash).
 #[tokio::test]
 async fn test_putpath_sig_covers_references() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store_with_signer(db.pool.clone(), make_test_signer()).await?;
+    let mut s = StoreSession::new_with_signer(make_test_signer()).await?;
 
     // Upload a dependency first (so the ref is a valid path).
     let dep_path = test_store_path("sig-dep");
     let dep_nar = make_nar(b"dependency").0;
     let dep_info = make_path_info_for_nar(&dep_path, &dep_nar);
-    put_path(&mut client, dep_info, dep_nar).await?;
+    put_path(&mut s.client, dep_info, dep_nar).await?;
 
     // Upload the main path WITH a reference.
     let main_path = test_store_path("sig-main");
@@ -121,10 +118,11 @@ async fn test_putpath_sig_covers_references() -> TestResult {
         vec![rio_nix::store_path::StorePath::parse(&dep_path).context("parse dep")?];
     let main_hash = main_info.nar_hash;
     let main_size = main_info.nar_size;
-    put_path(&mut client, main_info, main_nar).await?;
+    put_path(&mut s.client, main_info, main_nar).await?;
 
     // Fetch and verify. The fingerprint MUST include dep_path in refs.
-    let fetched = client
+    let fetched = s
+        .client
         .query_path_info(QueryPathInfoRequest {
             store_path: main_path.clone(),
         })
@@ -164,6 +162,5 @@ async fn test_putpath_sig_covers_references() -> TestResult {
         "signature must NOT verify against fingerprint without ref — refs must be covered"
     );
 
-    server.abort();
     Ok(())
 }

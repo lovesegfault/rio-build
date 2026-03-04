@@ -47,8 +47,7 @@ async fn put_path_trailer_mode(
 /// received" errors deep into the stream.
 #[tokio::test]
 async fn test_metadata_with_hash_rejected() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
     let (nar, info) = trailer_fixture("upfront-mode");
 
     // Build stream manually: metadata with REAL hash (what an old gateway
@@ -69,7 +68,7 @@ async fn test_metadata_with_hash_rejected() -> TestResult {
     .expect("fresh channel");
     drop(tx);
 
-    let result = client.put_path(ReceiverStream::new(rx)).await;
+    let result = s.client.put_path(ReceiverStream::new(rx)).await;
     let status = result.expect_err("non-empty metadata hash should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -78,7 +77,6 @@ async fn test_metadata_with_hash_rejected() -> TestResult {
         status.message()
     );
 
-    server.abort();
     Ok(())
 }
 
@@ -86,8 +84,7 @@ async fn test_metadata_with_hash_rejected() -> TestResult {
 /// Stored hash/size come from the trailer, not the (zero-filled) metadata.
 #[tokio::test]
 async fn test_trailer_mode_correct_hash_succeeds() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
     let (nar, info) = trailer_fixture("trailer-ok");
 
     // Metadata with EMPTY hash/size — triggers trailer mode.
@@ -96,7 +93,7 @@ async fn test_trailer_mode_correct_hash_succeeds() -> TestResult {
     raw.nar_size = 0;
 
     let created = put_path_trailer_mode(
-        &mut client,
+        &mut s.client,
         raw,
         nar.clone(),
         PutPathTrailer {
@@ -110,7 +107,8 @@ async fn test_trailer_mode_correct_hash_succeeds() -> TestResult {
     // The STORED hash must be the trailer's (real) hash, not the zero
     // placeholder. This is the key assertion: server-side info.nar_hash
     // was overwritten correctly before complete_upload.
-    let got = client
+    let got = s
+        .client
         .query_path_info(QueryPathInfoRequest {
             store_path: info.store_path.to_string(),
         })
@@ -123,15 +121,13 @@ async fn test_trailer_mode_correct_hash_succeeds() -> TestResult {
     );
     assert_eq!(got.nar_size, info.nar_size);
 
-    server.abort();
     Ok(())
 }
 
 /// Trailer with WRONG hash → InvalidArgument (hash mismatch).
 #[tokio::test]
 async fn test_trailer_mode_wrong_hash_rejected() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
     let (nar, info) = trailer_fixture("trailer-bad-hash");
 
     let mut raw: PathInfo = info.clone().into();
@@ -139,7 +135,7 @@ async fn test_trailer_mode_wrong_hash_rejected() -> TestResult {
     raw.nar_size = 0;
 
     let result = put_path_trailer_mode(
-        &mut client,
+        &mut s.client,
         raw,
         nar.clone(),
         PutPathTrailer {
@@ -159,12 +155,11 @@ async fn test_trailer_mode_wrong_hash_rejected() -> TestResult {
 
     // Placeholder cleaned up.
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM manifests")
-        .fetch_one(&db.pool)
+        .fetch_one(&s.db.pool)
         .await
         .context("count manifests")?;
     assert_eq!(count.0, 0, "abort_upload should clean up placeholder");
 
-    server.abort();
     Ok(())
 }
 
@@ -172,8 +167,7 @@ async fn test_trailer_mode_wrong_hash_rejected() -> TestResult {
 /// `put_path_raw` now always sends a trailer, so this uses a manual stream.
 #[tokio::test]
 async fn test_trailer_mode_missing_trailer_rejected() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
     let (nar, info) = trailer_fixture("no-trailer");
 
     let mut raw: PathInfo = info.into();
@@ -196,7 +190,7 @@ async fn test_trailer_mode_missing_trailer_rejected() -> TestResult {
     // Stream closed — no trailer.
     drop(tx);
 
-    let result = client.put_path(ReceiverStream::new(rx)).await;
+    let result = s.client.put_path(ReceiverStream::new(rx)).await;
     let status = result.expect_err("missing trailer should fail");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -205,15 +199,13 @@ async fn test_trailer_mode_missing_trailer_rejected() -> TestResult {
         status.message()
     );
 
-    server.abort();
     Ok(())
 }
 
 /// Trailer nar_hash ≠ 32 bytes → InvalidArgument.
 #[tokio::test]
 async fn test_trailer_mode_bad_hash_length_rejected() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
     let (nar, info) = trailer_fixture("bad-hash-len");
 
     let mut raw: PathInfo = info.into();
@@ -221,7 +213,7 @@ async fn test_trailer_mode_bad_hash_length_rejected() -> TestResult {
     raw.nar_size = 0;
 
     let result = put_path_trailer_mode(
-        &mut client,
+        &mut s.client,
         raw,
         nar.clone(),
         PutPathTrailer {
@@ -239,15 +231,13 @@ async fn test_trailer_mode_bad_hash_length_rejected() -> TestResult {
         status.message()
     );
 
-    server.abort();
     Ok(())
 }
 
 /// Chunk AFTER trailer → protocol violation.
 #[tokio::test]
 async fn test_trailer_chunk_after_trailer_rejected() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
+    let mut s = StoreSession::new().await?;
     let (nar, info) = trailer_fixture("late-chunk");
 
     let mut raw: PathInfo = info.clone().into();
@@ -283,7 +273,7 @@ async fn test_trailer_chunk_after_trailer_rejected() -> TestResult {
     .expect("fresh channel");
     drop(tx);
 
-    let result = client.put_path(ReceiverStream::new(rx)).await;
+    let result = s.client.put_path(ReceiverStream::new(rx)).await;
     let status = result.expect_err("chunk after trailer should fail");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
@@ -292,6 +282,5 @@ async fn test_trailer_chunk_after_trailer_rejected() -> TestResult {
         status.message()
     );
 
-    server.abort();
     Ok(())
 }

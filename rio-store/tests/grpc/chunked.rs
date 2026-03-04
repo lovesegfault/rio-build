@@ -5,14 +5,13 @@ use super::*;
 /// Small NAR + chunked backend: should STILL go inline (under threshold).
 #[tokio::test]
 async fn test_chunked_small_nar_stays_inline() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+    let (mut s, backend) = StoreSession::new_chunked().await?;
 
     let store_path = test_store_path("chunked-small");
     let nar = make_nar(b"tiny").0;
     let info = make_path_info_for_nar(&store_path, &nar);
 
-    let created = put_path(&mut client, info, nar).await?;
+    let created = put_path(&mut s.client, info, nar).await?;
     assert!(created);
 
     // Chunk backend should be empty — went inline.
@@ -27,11 +26,10 @@ async fn test_chunked_small_nar_stays_inline() -> TestResult {
          ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
     )
     .bind(&store_path)
-    .fetch_one(&db.pool)
+    .fetch_one(&s.db.pool)
     .await?;
     assert!(inline_blob.is_some(), "small NAR should have inline_blob");
 
-    server.abort();
     Ok(())
 }
 
@@ -39,13 +37,12 @@ async fn test_chunked_small_nar_stays_inline() -> TestResult {
 /// manifest_data populated.
 #[tokio::test]
 async fn test_chunked_large_nar_chunks() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+    let (mut s, backend) = StoreSession::new_chunked().await?;
 
     // 1 MiB — well over INLINE_THRESHOLD (256 KiB).
     let (nar, info, store_path) = make_large_nar(1, 1024 * 1024);
 
-    let created = put_path(&mut client, info, nar).await?;
+    let created = put_path(&mut s.client, info, nar).await?;
     assert!(created);
 
     // Chunk backend should have chunks (1 MiB / 64 KiB avg ≈ 16).
@@ -65,7 +62,7 @@ async fn test_chunked_large_nar_chunks() -> TestResult {
          ON m.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
     )
     .bind(&store_path)
-    .fetch_one(&db.pool)
+    .fetch_one(&s.db.pool)
     .await?;
     assert!(
         inline_blob.is_none(),
@@ -78,20 +75,19 @@ async fn test_chunked_large_nar_chunks() -> TestResult {
          ON md.store_path_hash = n.store_path_hash WHERE n.store_path = $1",
     )
     .bind(&store_path)
-    .fetch_one(&db.pool)
+    .fetch_one(&s.db.pool)
     .await?;
     assert_eq!(md_count, 1, "manifest_data row should exist");
 
     // chunks table refcounts all == 1 (first upload).
     let refcounts: Vec<(i32,)> = sqlx::query_as("SELECT refcount FROM chunks")
-        .fetch_all(&db.pool)
+        .fetch_all(&s.db.pool)
         .await?;
     assert_eq!(refcounts.len(), chunk_count);
     for (rc,) in &refcounts {
         assert_eq!(*rc, 1, "first upload: all refcounts should be 1");
     }
 
-    server.abort();
     Ok(())
 }
 
@@ -100,8 +96,7 @@ async fn test_chunked_large_nar_chunks() -> TestResult {
 /// NOT double).
 #[tokio::test]
 async fn test_chunked_dedup_across_uploads() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+    let (mut s, backend) = StoreSession::new_chunked().await?;
 
     // Two NARs with IDENTICAL payloads (seed=5 both times). Different
     // store paths (so they're different PutPath calls) but same content
@@ -111,7 +106,7 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
     // weird nixpkgs thing (two fetchurl of the same file), but it DOES
     // happen, and it's the clearest dedup test.
     let (nar_a, info_a, _) = make_large_nar(5, 1024 * 1024);
-    put_path(&mut client, info_a, nar_a).await?;
+    put_path(&mut s.client, info_a, nar_a).await?;
     let chunks_after_a = backend.len();
     assert!(chunks_after_a > 4);
 
@@ -124,7 +119,7 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
     let path_b = test_store_path("large-nar-5-dup");
     let info_b = make_path_info_for_nar(&path_b, &nar_b);
 
-    put_path(&mut client, info_b, nar_b).await?;
+    put_path(&mut s.client, info_b, nar_b).await?;
     let chunks_after_b = backend.len();
 
     // THE dedup assertion: chunk count should NOT have doubled.
@@ -137,13 +132,12 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
 
     // Refcounts should all be 2 (both manifests reference every chunk).
     let refcounts: Vec<(i32,)> = sqlx::query_as("SELECT refcount FROM chunks")
-        .fetch_all(&db.pool)
+        .fetch_all(&s.db.pool)
         .await?;
     for (rc,) in &refcounts {
         assert_eq!(*rc, 2, "two uploads of same content: refcount should be 2");
     }
 
-    server.abort();
     Ok(())
 }
 
@@ -151,18 +145,17 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
 /// created=false, doesn't touch chunks.
 #[tokio::test]
 async fn test_chunked_idempotent() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+    let (mut s, backend) = StoreSession::new_chunked().await?;
 
     let (nar, info, _) = make_large_nar(7, 512 * 1024);
 
-    let first = put_path(&mut client, info.clone(), nar.clone()).await?;
+    let first = put_path(&mut s.client, info.clone(), nar.clone()).await?;
     assert!(first);
     let chunks_first = backend.len();
 
     // Same path again: idempotency short-circuits at check_manifest_complete,
     // before any chunking happens.
-    let second = put_path(&mut client, info, nar).await?;
+    let second = put_path(&mut s.client, info, nar).await?;
     assert!(!second, "second PutPath should return created=false");
     assert_eq!(
         backend.len(),
@@ -170,7 +163,6 @@ async fn test_chunked_idempotent() -> TestResult {
         "idempotent PutPath should not touch chunks"
     );
 
-    server.abort();
     Ok(())
 }
 
@@ -183,32 +175,30 @@ async fn test_chunked_idempotent() -> TestResult {
 /// really testing that the inline abort path still works for large NARs.
 #[tokio::test]
 async fn test_chunked_hash_mismatch_no_leaked_state() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, backend, server) = setup_store_chunked(db.pool.clone()).await?;
+    let (mut s, backend) = StoreSession::new_chunked().await?;
 
     let (_good_nar, good_info, _) = make_large_nar(9, 512 * 1024);
     let (bad_nar, _, _) = make_large_nar(10, 512 * 1024);
 
     // Declare good_nar's hash, send bad_nar → validation fails.
-    let result = put_path(&mut client, good_info, bad_nar).await;
+    let result = put_path(&mut s.client, good_info, bad_nar).await;
     assert!(result.is_err(), "hash mismatch should be rejected");
 
     // No leaked state: chunks empty, no manifest rows.
     assert!(backend.is_empty());
     let mf_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manifests")
-        .fetch_one(&db.pool)
+        .fetch_one(&s.db.pool)
         .await?;
     assert_eq!(mf_count, 0);
     let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
-        .fetch_one(&db.pool)
+        .fetch_one(&s.db.pool)
         .await?;
     assert_eq!(chunk_count, 0);
 
     // Retry with correct NAR succeeds.
     let (good_nar, info, _) = make_large_nar(9, 512 * 1024);
-    let retry = put_path(&mut client, info, good_nar).await?;
+    let retry = put_path(&mut s.client, info, good_nar).await?;
     assert!(retry);
 
-    server.abort();
     Ok(())
 }

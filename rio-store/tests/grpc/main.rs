@@ -26,44 +26,62 @@ use std::sync::Arc;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
-/// Spawn an in-process store gRPC server (inline-only) and return a client.
+/// Test harness bundling the three things every gRPC integration test
+/// needs: an ephemeral PG, a connected client, and a server handle.
 ///
-/// Phase 2c: no chunk backend → all NARs go inline regardless of size.
-/// Most tests use this; chunked-specific tests use `setup_store_chunked`.
-pub async fn setup_store(
-    pool: PgPool,
-) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    let service = StoreServiceImpl::new(pool);
-    spawn_store_server(service).await
+/// `Drop` aborts the server — no more `server.abort()` boilerplate at
+/// the end of every test, and no more "forgot to abort, server leaks
+/// until process exit" footgun. The `db` field holds `TestDb` so its
+/// Drop runs too (drops the PG database) — if we stored only
+/// `db.pool.clone()`, `TestDb`'s Drop would fire immediately on return
+/// from `new()` and the test's pool would point at a deleted DB.
+///
+/// Mirrors `GatewaySession` at rio-gateway/tests/common/mod.rs.
+pub struct StoreSession {
+    pub db: TestDb,
+    pub client: StoreServiceClient<Channel>,
+    server: tokio::task::JoinHandle<()>,
 }
 
-/// Spawn a store with a signing key. For B2's signing tests.
-pub async fn setup_store_with_signer(
-    pool: PgPool,
-    signer: rio_store::signing::Signer,
-) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
-    let service = StoreServiceImpl::new(pool).with_signer(signer);
-    spawn_store_server(service).await
+impl StoreSession {
+    /// Inline-only store (no chunk backend). NARs of any size go into
+    /// `manifests.inline_blob`. Most tests use this.
+    pub async fn new() -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let service = StoreServiceImpl::new(db.pool.clone());
+        let (client, server) = spawn_store_server(service).await?;
+        Ok(Self { db, client, server })
+    }
+
+    /// Store with a signing key. For narinfo signing tests.
+    pub async fn new_with_signer(signer: rio_store::signing::Signer) -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let service = StoreServiceImpl::new(db.pool.clone()).with_signer(signer);
+        let (client, server) = spawn_store_server(service).await?;
+        Ok(Self { db, client, server })
+    }
+
+    /// Store WITH chunk backend. NARs ≥ 256 KiB are FastCDC-chunked.
+    /// Returns the `MemoryChunkBackend` so tests can inspect chunk counts.
+    pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let backend = Arc::new(MemoryChunkBackend::new());
+        let service = StoreServiceImpl::with_chunk_backend(
+            db.pool.clone(),
+            backend.clone() as Arc<dyn ChunkBackend>,
+        );
+        let (client, server) = spawn_store_server(service).await?;
+        Ok((Self { db, client, server }, backend))
+    }
 }
 
-/// Spawn an in-process store WITH chunk backend. NARs ≥ 256 KiB are chunked.
-/// Returns the `Arc<MemoryChunkBackend>` so tests can inspect chunk counts.
-pub async fn setup_store_chunked(
-    pool: PgPool,
-) -> anyhow::Result<(
-    StoreServiceClient<Channel>,
-    Arc<MemoryChunkBackend>,
-    tokio::task::JoinHandle<()>,
-)> {
-    let backend = Arc::new(MemoryChunkBackend::new());
-    let service =
-        StoreServiceImpl::with_chunk_backend(pool, backend.clone() as Arc<dyn ChunkBackend>);
-    let (client, server) = spawn_store_server(service).await?;
-    Ok((client, backend, server))
+impl Drop for StoreSession {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
 }
 
-/// Shared: spawn server + connect client. Extracted so both setup variants
-/// use it.
+/// Shared: spawn server + connect client.
 async fn spawn_store_server(
     service: StoreServiceImpl,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
