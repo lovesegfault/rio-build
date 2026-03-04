@@ -268,31 +268,29 @@ impl StoreService for StoreServiceImpl {
             }
         };
 
-        // Two upload modes (see types.proto PutPathRequest doc):
-        //   - Hash-upfront: metadata.nar_hash non-empty. Trailer ignored.
-        //     Used by gateway (wopAddToStoreNar has the hash before bytes).
-        //   - Hash-trailer: metadata.nar_hash empty. Hash arrives in the
-        //     trailer message after all chunks. Used by worker single-pass
-        //     tee upload (C15).
+        // Trailer-mode is the ONLY mode: metadata.nar_hash must be empty,
+        // hash arrives in the PutPathTrailer after all chunks. Both the
+        // gateway (chunk_nar_for_put) and worker (single-pass tee upload)
+        // send trailers. Hash-upfront was deleted in the pre-phase3a
+        // cleanup — a non-empty nar_hash means an un-updated client.
         //
-        // Detect mode NOW — ValidatedPathInfo::try_from hard-fails on empty
-        // nar_hash, so in trailer mode we must fill a placeholder hash,
-        // validate, then overwrite after the trailer arrives. The server
-        // computes the digest either way (NarDigest::from_bytes below), so
-        // the security property (client-declared hash matches server-
-        // computed) holds in both modes.
-        let is_trailer_mode = raw_info.nar_hash.is_empty();
-        let mut raw_info = raw_info;
-        if is_trailer_mode {
-            // Placeholder so TryFrom passes. Overwritten after trailer.
-            // 32 zero bytes — unambiguously NOT a real SHA-256 (would be
-            // the hash of a specific ~2^256-rare preimage).
-            raw_info.nar_hash = vec![0u8; 32];
-            // nar_size=0 in trailer mode too — comes from trailer. Set a
-            // safe upper bound for the chunk-accumulation check below.
-            // We don't use raw_info.nar_size as the bound (client set it
-            // to 0); use MAX_NAR_SIZE directly.
+        // ValidatedPathInfo::try_from hard-fails on empty nar_hash, so we
+        // fill a placeholder, validate, then overwrite after the trailer
+        // arrives. The server computes the digest either way
+        // (NarDigest::from_bytes below), so the security property
+        // (client-declared hash matches server-computed) is unchanged.
+        if !raw_info.nar_hash.is_empty() {
+            return Err(Status::invalid_argument(
+                "PutPath metadata.nar_hash must be empty (hash-upfront mode removed; \
+                 send hash in PutPathTrailer)",
+            ));
         }
+        let mut raw_info = raw_info;
+        // Placeholder so TryFrom passes. Overwritten after trailer.
+        // 32 zero bytes — unambiguously NOT a real SHA-256 (would be
+        // the hash of a specific ~2^256-rare preimage).
+        raw_info.nar_hash = vec![0u8; 32];
+        // nar_size is also 0 here — real value arrives in trailer.
 
         // Bound repeated fields BEFORE validation (TryFrom validates each
         // reference's syntax but doesn't bound the count; an attacker could
@@ -308,19 +306,8 @@ impl StoreService for StoreServiceImpl {
             rio_common::limits::MAX_SIGNATURES,
         )?;
 
-        // Bound nar_size BEFORE allocation. A malicious client declaring
-        // nar_size=u64::MAX would otherwise attempt a huge Vec::with_capacity.
-        // In trailer mode, nar_size is 0 here — fine, we allocate nothing
-        // upfront and grow. The MAX_NAR_SIZE check moves to the trailer.
-        if raw_info.nar_size > MAX_NAR_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "nar_size {} exceeds maximum {} bytes",
-                raw_info.nar_size, MAX_NAR_SIZE
-            )));
-        }
-
         // Centralized validation: store_path parses, nar_hash is 32 bytes
-        // (placeholder in trailer mode), each reference parses.
+        // (placeholder), each reference parses.
         let mut info = ValidatedPathInfo::try_from(raw_info)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -332,8 +319,6 @@ impl StoreService for StoreServiceImpl {
         };
         debug!(
             store_path = %info.store_path.as_str(),
-            nar_size = info.nar_size,
-            is_trailer_mode,
             "PutPath: received metadata"
         );
 
@@ -395,26 +380,9 @@ impl StoreService for StoreServiceImpl {
 
         // Step 4: Accumulate NAR chunks into a buffer.
         // Bound accumulation to prevent a malicious/buggy client OOMing us.
-        // Hash-upfront mode: declared nar_size + tolerance.
-        // Trailer mode: nar_size is 0 (placeholder) → use MAX_NAR_SIZE.
-        const NAR_SIZE_TOLERANCE: u64 = 4096;
-        let max_allowed = if is_trailer_mode {
-            MAX_NAR_SIZE
-        } else {
-            info.nar_size.saturating_add(NAR_SIZE_TOLERANCE)
-        };
-        // nar_size is already bounded by MAX_NAR_SIZE (4 GiB) above, which
-        // fits in usize on 64-bit. try_from is defensive for 32-bit platforms
-        // where MAX_NAR_SIZE (4_294_967_296) exceeds u32::MAX (4_294_967_295).
-        let Ok(capacity) = usize::try_from(info.nar_size) else {
-            // Practically unreachable on 64-bit (MAX_NAR_SIZE check above),
-            // but clean up defensively.
-            self.abort_upload(&store_path_hash).await;
-            return Err(Status::invalid_argument(
-                "nar_size too large for this platform",
-            ));
-        };
-        let mut nar_data = Vec::with_capacity(capacity);
+        // nar_size arrives in the trailer, so bound by MAX_NAR_SIZE during
+        // accumulation; the trailer value is checked after.
+        let mut nar_data = Vec::new();
         let mut trailer: Option<rio_proto::types::PutPathTrailer> = None;
         loop {
             let msg = match stream.message().await {
@@ -438,17 +406,15 @@ impl StoreService for StoreServiceImpl {
                         ));
                     }
                     let new_len = (nar_data.len() as u64).saturating_add(chunk.len() as u64);
-                    if new_len > max_allowed {
+                    if new_len > MAX_NAR_SIZE {
                         warn!(
                             store_path = %info.store_path,
-                            declared = info.nar_size,
                             received = new_len,
-                            is_trailer_mode,
                             "PutPath: NAR chunks exceed size bound, rejecting"
                         );
                         self.abort_upload(&store_path_hash).await;
                         return Err(Status::invalid_argument(format!(
-                            "NAR chunks exceed size bound {max_allowed} (received {new_len}+ bytes)",
+                            "NAR chunks exceed size bound {MAX_NAR_SIZE} (received {new_len}+ bytes)",
                         )));
                     }
                     nar_data.extend_from_slice(&chunk);
@@ -483,34 +449,32 @@ impl StoreService for StoreServiceImpl {
             }
         }
 
-        // Trailer-mode resolution: overwrite the placeholder hash/size with
-        // the trailer values. If metadata had a real hash, the trailer is
-        // IGNORED (backward compat — gateway still uses hash-upfront).
-        if is_trailer_mode {
-            let Some(t) = trailer else {
-                self.abort_upload(&store_path_hash).await;
-                return Err(Status::invalid_argument(
-                    "PutPath: metadata.nar_hash is empty but no trailer received \
-                     (trailer-mode upload requires a PutPathTrailer as the last message)",
-                ));
-            };
-            let Ok(hash): Result<[u8; 32], _> = t.nar_hash.as_slice().try_into() else {
-                self.abort_upload(&store_path_hash).await;
-                return Err(Status::invalid_argument(format!(
-                    "PutPath trailer nar_hash must be 32 bytes (SHA-256), got {}",
-                    t.nar_hash.len()
-                )));
-            };
-            if t.nar_size > MAX_NAR_SIZE {
-                self.abort_upload(&store_path_hash).await;
-                return Err(Status::invalid_argument(format!(
-                    "PutPath trailer nar_size {} exceeds maximum {MAX_NAR_SIZE}",
-                    t.nar_size
-                )));
-            }
-            info.nar_hash = hash;
-            info.nar_size = t.nar_size;
+        // Trailer resolution: overwrite the placeholder hash/size with the
+        // trailer values. Trailer is MANDATORY — stream close without one
+        // is a protocol violation.
+        let Some(t) = trailer else {
+            self.abort_upload(&store_path_hash).await;
+            return Err(Status::invalid_argument(
+                "PutPath: no trailer received \
+                 (PutPathTrailer is required as the last message)",
+            ));
+        };
+        let Ok(hash): Result<[u8; 32], _> = t.nar_hash.as_slice().try_into() else {
+            self.abort_upload(&store_path_hash).await;
+            return Err(Status::invalid_argument(format!(
+                "PutPath trailer nar_hash must be 32 bytes (SHA-256), got {}",
+                t.nar_hash.len()
+            )));
+        };
+        if t.nar_size > MAX_NAR_SIZE {
+            self.abort_upload(&store_path_hash).await;
+            return Err(Status::invalid_argument(format!(
+                "PutPath trailer nar_size {} exceeds maximum {MAX_NAR_SIZE}",
+                t.nar_size
+            )));
         }
+        info.nar_hash = hash;
+        info.nar_size = t.nar_size;
 
         // Step 5: Verify SHA-256. The NAR is already fully buffered in memory,
         // so use from_bytes (single pass over the slice) instead of wrapping in
@@ -522,7 +486,6 @@ impl StoreService for StoreServiceImpl {
             warn!(
                 store_path = %info.store_path,
                 error = %e,
-                is_trailer_mode,
                 "PutPath: NAR validation failed"
             );
             self.abort_upload(&store_path_hash).await;
