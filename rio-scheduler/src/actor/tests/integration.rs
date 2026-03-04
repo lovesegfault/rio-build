@@ -11,7 +11,7 @@ async fn setup_inproc_store(
     use rio_proto::store::store_service_server::StoreServiceServer;
     use rio_store::grpc::StoreServiceImpl;
 
-    // Phase 2c: no NarBackend. Inline storage in manifests.inline_blob.
+    // Inline storage in manifests.inline_blob (no chunk backend needed).
     let service = StoreServiceImpl::new(pool);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

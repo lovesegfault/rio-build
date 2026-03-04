@@ -85,9 +85,8 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
 
 /// The StoreService gRPC server.
 ///
-/// Phase 2c: NAR content lives in `manifests.inline_blob` (small NARs) or
-/// as FastCDC chunks (large NARs). The `NarBackend` field from phase 2a
-/// is gone — inline blobs are stored directly in PG.
+/// NAR content lives in `manifests.inline_blob` (small NARs) or as
+/// FastCDC chunks (large NARs). Inline blobs are stored directly in PG.
 pub struct StoreServiceImpl {
     pool: PgPool,
     /// Chunk storage for NARs ≥ INLINE_THRESHOLD. `None` disables chunking

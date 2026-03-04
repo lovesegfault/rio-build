@@ -18,21 +18,6 @@ in
       description = "gRPC listen address (`RIO_LISTEN_ADDR`).";
     };
 
-    backend = lib.mkOption {
-      type = lib.types.enum [
-        "filesystem"
-        "s3"
-      ];
-      default = "filesystem";
-      description = "Storage backend (`RIO_BACKEND`).";
-    };
-
-    baseDir = lib.mkOption {
-      type = lib.types.path;
-      default = "/var/lib/rio/store";
-      description = "Base directory for filesystem backend (`RIO_BASE_DIR`).";
-    };
-
     databaseUrl = lib.mkOption {
       type = lib.types.str;
       description = ''
@@ -65,8 +50,6 @@ in
       # listen_addr" — no cross-component collision.
       environment = {
         RIO_LISTEN_ADDR = cfg.listenAddr;
-        RIO_BACKEND = cfg.backend;
-        RIO_BASE_DIR = cfg.baseDir;
         RIO_DATABASE_URL = cfg.databaseUrl;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_LOG_FORMAT = config.services.rio.logFormat;
@@ -77,7 +60,7 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
         # `StateDirectory = "rio/store"` creates /var/lib/rio/store with proper
-        # ownership (matches `baseDir` default; filesystem backend writes NARs here).
+        # ownership. Reserved for the phase3a ChunkBackend wiring.
         StateDirectory = "rio/store";
       };
     };
