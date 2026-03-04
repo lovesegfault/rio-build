@@ -6,7 +6,7 @@ use tracing::{error, info};
 
 use rio_proto::store::chunk_service_server::ChunkServiceServer;
 use rio_proto::store::store_service_server::StoreServiceServer;
-use rio_store::grpc::{ChunkServiceStub, StoreServiceImpl};
+use rio_store::grpc::{ChunkServiceImpl, StoreServiceImpl};
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
 
@@ -148,8 +148,19 @@ async fn main() -> anyhow::Result<()> {
         cfg.s3_attempt_timeout_secs,
     );
 
-    // Build gRPC services
-    let store_service = StoreServiceImpl::new(pool);
+    // Build gRPC services.
+    //
+    // ChunkService shares the same pool + cache as StoreService. main.rs
+    // doesn't construct a chunk backend yet (that's the TODO-phase2c line
+    // above — inline-only until C3's wiring lands here); with cache=None,
+    // ChunkService RPCs return FAILED_PRECONDITION, which is the right
+    // answer for an inline-only store.
+    //
+    // TODO(phase3a): when the ChunkBackend construction (from cfg.backend
+    // etc.) lands here, pass the same Arc<ChunkCache> to both services.
+    // One cache, shared — a chunk warmed by GetPath is hot for GetChunk.
+    let store_service = StoreServiceImpl::new(pool.clone());
+    let chunk_service = ChunkServiceImpl::new(pool, None);
     let max_msg_size = rio_proto::max_message_size();
 
     let addr = cfg.listen_addr.parse()?;
@@ -157,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
 
     Server::builder()
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
-        .add_service(ChunkServiceServer::new(ChunkServiceStub))
+        .add_service(ChunkServiceServer::new(chunk_service))
         .serve(addr)
         .await?;
 
