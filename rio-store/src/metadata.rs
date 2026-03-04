@@ -675,6 +675,39 @@ pub async fn delete_manifest_chunked_uploading(
     Ok(())
 }
 
+/// Resolve a store path from its NAR hash.
+///
+/// Used by the binary cache HTTP server's `/nar/{narhash}.nar.zst` route:
+/// the narinfo we serve has `URL: nar/{nixbase32(nar_hash)}.nar.zst`, so
+/// when the client fetches that URL, we need to find the path by nar_hash.
+///
+/// Uses `idx_narinfo_nar_hash` (migration 006). Without it, every NAR
+/// fetch would seq-scan narinfo.
+#[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
+pub async fn path_by_nar_hash(
+    pool: &PgPool,
+    nar_hash: &[u8; 32],
+) -> anyhow::Result<Option<String>> {
+    // Multiple paths CAN have the same nar_hash (two fetchurl of the
+    // same file → same content → same NAR). LIMIT 1 picks one
+    // arbitrarily — they all reassemble to the same bytes, so it
+    // doesn't matter which we serve.
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT n.store_path
+        FROM narinfo n
+        INNER JOIN manifests m ON n.store_path_hash = m.store_path_hash
+        WHERE n.nar_hash = $1 AND m.status = 'complete'
+        LIMIT 1
+        "#,
+    )
+    .bind(nar_hash.as_slice())
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(p,)| p))
+}
+
 /// Total chunks in the store. For the `rio_store_chunks_total` gauge.
 ///
 /// Counts all rows regardless of refcount/deleted — the gauge answers

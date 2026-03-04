@@ -42,6 +42,12 @@ sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 
+# Binary cache HTTP server. axum for routing, zstd for on-the-fly
+# NAR compression (we store uncompressed chunks for dedup; compress
+# only at serve time).
+axum = { workspace = true }
+zstd = { workspace = true }
+
 # Phase 2c chunked CAS
 fastcdc = { workspace = true }
 blake3 = { workspace = true }
@@ -82,3 +88,5 @@ tokio-stream = { workspace = true, features = ["net"] }
 aws-smithy-mocks = "0.2"
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+# For cache_server tests: Router::oneshot (ServiceExt trait).
+tower = { workspace = true, features = ["util"] }

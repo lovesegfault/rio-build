@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod cache_server;
 pub mod cas;
 pub mod chunker;
 pub mod grpc;
