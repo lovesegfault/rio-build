@@ -33,12 +33,10 @@
   rioModules,
 }:
 let
-  inherit (pkgs) lib;
+  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  inherit (common) busybox busyboxClosure databaseUrl;
 
-  inherit (pkgs.pkgsStatic) busybox;
-  busyboxClosure = pkgs.closureInfo { rootPaths = [ busybox ]; };
   testDrvFile = ./phase2c-derivation.nix;
-  databaseUrl = "postgres://postgres@localhost/rio";
 
   # Size-class cutoffs. "small" for quick builds (≤30s), "large" for
   # slow ones. mem_limit is effectively unlimited here (u64::MAX-ish);
@@ -54,36 +52,6 @@ let
     cutoff_secs = 3600.0
     mem_limit_bytes = 68719476736
   '';
-
-  workerConfig = hostName: sizeClass: {
-    imports = [ rioModules.worker ];
-    networking.hostName = hostName;
-
-    services.rio = {
-      package = rio-workspace;
-      logFormat = "pretty";
-      worker = {
-        enable = true;
-        schedulerAddr = "control:9001";
-        storeAddr = "control:9002";
-        maxBuilds = 2;
-        inherit sizeClass;
-      };
-    };
-
-    environment.systemPackages = [ pkgs.curl ];
-
-    virtualisation = {
-      memorySize = 1024;
-      diskSize = 4096;
-      cores = 4;
-      writableStore = false;
-    };
-    fileSystems."/nix/var" = {
-      fsType = "tmpfs";
-      neededForBoot = true;
-    };
-  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase2c";
@@ -94,21 +62,9 @@ pkgs.testers.runNixOSTest {
         rioModules.store
         rioModules.scheduler
         rioModules.gateway
+        common.postgresqlConfig
       ];
       networking.hostName = "control";
-
-      services.postgresql = {
-        enable = true;
-        enableTCPIP = true;
-        authentication = lib.mkForce ''
-          local all all trust
-          host  all all 127.0.0.1/32 trust
-          host  all all ::1/128 trust
-        '';
-        initialScript = pkgs.writeText "rio-init.sql" ''
-          CREATE DATABASE rio;
-        '';
-      };
 
       services.rio = {
         package = rio-workspace;
@@ -136,11 +92,7 @@ pkgs.testers.runNixOSTest {
         };
       };
 
-      systemd.tmpfiles.rules = [
-        "d /var/lib/rio 0755 root root -"
-        "d /var/lib/rio/gateway 0755 root root -"
-        "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
-      ];
+      systemd.tmpfiles.rules = common.gatewayTmpfiles;
 
       environment.systemPackages = [
         pkgs.curl
@@ -163,32 +115,25 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    wsmall1 = workerConfig "wsmall1" "small";
-    wsmall2 = workerConfig "wsmall2" "small";
-    wlarge = workerConfig "wlarge" "large";
+    wsmall1 = common.mkWorkerNode {
+      hostName = "wsmall1";
+      maxBuilds = 2;
+      sizeClass = "small";
+    };
+    wsmall2 = common.mkWorkerNode {
+      hostName = "wsmall2";
+      maxBuilds = 2;
+      sizeClass = "small";
+    };
+    wlarge = common.mkWorkerNode {
+      hostName = "wlarge";
+      maxBuilds = 2;
+      sizeClass = "large";
+    };
 
-    client = {
-      networking.hostName = "client";
-      nix.settings.experimental-features = [
-        "nix-command"
-        "flakes"
-      ];
-      environment.systemPackages = [
-        busybox
-        pkgs.curl
-      ];
-      environment.etc."rio/busybox-closure".source = "${busyboxClosure}";
-      programs.ssh.extraConfig = ''
-        Host control
-          HostName control
-          User root
-          Port 2222
-          IdentityFile /root/.ssh/id_ed25519
-          StrictHostKeyChecking no
-          UserKnownHostsFile /dev/null
-      '';
-      virtualisation.memorySize = 1024;
-      virtualisation.cores = 4;
+    client = common.mkClientNode {
+      gatewayHost = "control";
+      extraPackages = [ pkgs.curl ];
     };
   };
 
@@ -216,12 +161,7 @@ pkgs.testers.runNixOSTest {
     )
 
     # SSH key + gateway restart (same dance as phase2a/2b).
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    control.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
-    control.succeed("systemctl restart rio-gateway.service")
-    control.wait_for_unit("rio-gateway.service")
-    control.wait_for_open_port(2222)
+    ${common.sshKeySetup "control"}
 
     # All 3 workers register. Check they declared size_class.
     for w in [wsmall1, wsmall2, wlarge]:

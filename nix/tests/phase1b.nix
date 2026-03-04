@@ -28,10 +28,8 @@
   rioModules,
 }:
 let
-  inherit (pkgs) lib;
-
-  inherit (pkgs.pkgsStatic) busybox;
-  busyboxClosure = pkgs.closureInfo { rootPaths = [ busybox ]; };
+  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  inherit (common) busybox busyboxClosure databaseUrl;
 
   # Single trivial derivation — one leaf from the phase2a DAG.
   # Reuses the same builder pattern (busybox sh + mkdir + echo).
@@ -51,8 +49,6 @@ let
       ];
     }
   '';
-
-  databaseUrl = "postgres://postgres@localhost/rio";
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase1b";
@@ -63,21 +59,9 @@ pkgs.testers.runNixOSTest {
         rioModules.store
         rioModules.scheduler
         rioModules.gateway
+        common.postgresqlConfig
       ];
       networking.hostName = "control";
-
-      services.postgresql = {
-        enable = true;
-        enableTCPIP = true;
-        authentication = lib.mkForce ''
-          local all all trust
-          host  all all 127.0.0.1/32 trust
-          host  all all ::1/128 trust
-        '';
-        initialScript = pkgs.writeText "rio-init.sql" ''
-          CREATE DATABASE rio;
-        '';
-      };
 
       services.rio = {
         package = rio-workspace;
@@ -99,11 +83,7 @@ pkgs.testers.runNixOSTest {
         };
       };
 
-      systemd.tmpfiles.rules = [
-        "d /var/lib/rio 0755 root root -"
-        "d /var/lib/rio/gateway 0755 root root -"
-        "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
-      ];
+      systemd.tmpfiles.rules = common.gatewayTmpfiles;
 
       environment.systemPackages = [ pkgs.curl ];
 
@@ -120,63 +100,12 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    worker = {
-      imports = [ rioModules.worker ];
-      networking.hostName = "worker";
-
-      services.rio = {
-        package = rio-workspace;
-        logFormat = "pretty";
-        worker = {
-          enable = true;
-          schedulerAddr = "control:9001";
-          storeAddr = "control:9002";
-          maxBuilds = 1;
-        };
-      };
-
-      environment.systemPackages = [ pkgs.curl ];
-
-      virtualisation = {
-        memorySize = 1024;
-        diskSize = 4096;
-        cores = 4;
-        # See phase2a.nix for why writableStore=false on worker VMs.
-        writableStore = false;
-      };
-
-      fileSystems."/nix/var" = {
-        fsType = "tmpfs";
-        neededForBoot = true;
-      };
+    worker = common.mkWorkerNode {
+      hostName = "worker";
+      maxBuilds = 1;
     };
 
-    client = {
-      networking.hostName = "client";
-
-      nix.settings.experimental-features = [
-        "nix-command"
-        "flakes"
-      ];
-
-      environment.systemPackages = [ busybox ];
-      environment.etc."rio/busybox-closure".source = "${busyboxClosure}";
-
-      programs.ssh.extraConfig = ''
-        Host control
-          HostName control
-          User root
-          Port 2222
-          IdentityFile /root/.ssh/id_ed25519
-          StrictHostKeyChecking no
-          UserKnownHostsFile /dev/null
-      '';
-
-      virtualisation = {
-        memorySize = 1024;
-        cores = 4;
-      };
-    };
+    client = common.mkClientNode { gatewayHost = "control"; };
   };
 
   testScript = ''
@@ -190,12 +119,7 @@ pkgs.testers.runNixOSTest {
     control.wait_for_open_port(9001)
 
     # ── SSH key exchange + gateway start ──────────────────────────────
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    control.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
-    control.succeed("systemctl restart rio-gateway.service")
-    control.wait_for_unit("rio-gateway.service")
-    control.wait_for_open_port(2222)
+    ${common.sshKeySetup "control"}
 
     # ── Worker registers ──────────────────────────────────────────────
     worker.wait_for_unit("rio-worker.service")

@@ -25,73 +25,12 @@
   rioModules,
 }:
 let
-  inherit (pkgs) lib;
-
-  # Static busybox: closure of exactly 1 path (no glibc, no runtime deps).
-  # This is the sole input seed — FUSE fetches it on every worker, validating
-  # the lazy-fetch path.
-  inherit (pkgs.pkgsStatic) busybox;
-
-  # closureInfo gives us store-paths + registration (narinfo) for seeding.
-  # Even though pkgsStatic.busybox's closure should be {busybox} alone,
-  # use closureInfo to be defensive against unexpected refs.
-  busyboxClosure = pkgs.closureInfo { rootPaths = [ busybox ]; };
+  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  inherit (common) busybox busyboxClosure databaseUrl;
 
   # The 5-node test DAG. Passed to `nix-build` on the client via
   # `--arg busybox '<storePath>'`.
   testDrvFile = ./phase2a-derivation.nix;
-
-  # PostgreSQL connection URL — both store and scheduler run migrations on
-  # startup (sqlx migrate, advisory-lock serialized), so no separate oneshot.
-  databaseUrl = "postgres://postgres@localhost/rio";
-
-  # Shared NixOS config for worker VMs.
-  workerConfig = hostName: {
-    imports = [ rioModules.worker ];
-    networking.hostName = hostName;
-
-    services.rio = {
-      package = rio-workspace;
-      logFormat = "pretty"; # human-readable in test logs
-      worker = {
-        enable = true;
-        schedulerAddr = "control:9001";
-        storeAddr = "control:9002";
-        maxBuilds = 2;
-      };
-    };
-
-    # curl for metric scraping.
-    environment.systemPackages = [ pkgs.curl ];
-
-    # 4 cores: tokio multi_thread runtime uses num_cpus worker threads.
-    # FUSE callbacks doing Handle::block_on(gRPC) need spare worker threads
-    # to drive the reactor; 4 cores gives headroom at max_builds=2.
-    virtualisation = {
-      memorySize = 1024;
-      diskSize = 4096;
-      cores = 4;
-      # Worker VMs must NOT have a writable /nix/store. With writableStore=true
-      # (the NixOS-test default), /nix/store is itself an overlayfs (tmpfs
-      # upper on 9p lower). Our per-build overlay uses /nix/store as a lower;
-      # overlay-on-overlay breaks copy-up → nix-daemon creates chroot dirs,
-      # builder writes $out, but the parent can't see it → OutputRejected.
-      # With writableStore=false, /nix/store is the plain 9p mount.
-      writableStore = false;
-      # But the host nix-daemon (NixOS module) still wants to create
-      # /nix/var/nix/gcroots etc. — point it at a tmpfs via /nix/var.
-      # (Our per-build daemon uses the overlay's synth DB via bind-mount,
-      # so this only affects the host daemon's state, not builds.)
-    };
-
-    # With writableStore=false, /nix/var is on the RO 9p mount too.
-    # Mount tmpfs there so host nix-daemon + our synth-DB bind target
-    # have writable paths. The per-build overlay handles /nix/store writes.
-    fileSystems."/nix/var" = {
-      fsType = "tmpfs";
-      neededForBoot = true;
-    };
-  };
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase2a";
@@ -102,23 +41,9 @@ pkgs.testers.runNixOSTest {
         rioModules.store
         rioModules.scheduler
         rioModules.gateway
+        common.postgresqlConfig
       ];
       networking.hostName = "control";
-
-      services.postgresql = {
-        enable = true;
-        enableTCPIP = true;
-        # Trust auth inside the VM (no password). Covers local unix socket
-        # AND the 10.0.0.0/8 test network (nixosTest's default vlan range).
-        authentication = lib.mkForce ''
-          local all all trust
-          host  all all 127.0.0.1/32 trust
-          host  all all ::1/128 trust
-        '';
-        initialScript = pkgs.writeText "rio-init.sql" ''
-          CREATE DATABASE rio;
-        '';
-      };
 
       services.rio = {
         package = rio-workspace;
@@ -140,15 +65,7 @@ pkgs.testers.runNixOSTest {
         };
       };
 
-      # Gateway starts after store + scheduler via After= in the module, but
-      # load_authorized_keys() errors if the file is missing. Create an empty
-      # file via tmpfiles so the gateway unit can start; testScript populates
-      # it before the client connects.
-      systemd.tmpfiles.rules = [
-        "d /var/lib/rio 0755 root root -"
-        "d /var/lib/rio/gateway 0755 root root -"
-        "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
-      ];
+      systemd.tmpfiles.rules = common.gatewayTmpfiles;
 
       environment.systemPackages = [ pkgs.curl ];
 
@@ -169,40 +86,18 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    worker1 = workerConfig "worker1";
-    worker2 = workerConfig "worker2";
+    worker1 = common.mkWorkerNode {
+      hostName = "worker1";
+      maxBuilds = 2;
+    };
+    worker2 = common.mkWorkerNode {
+      hostName = "worker2";
+      maxBuilds = 2;
+    };
 
-    client = {
-      networking.hostName = "client";
-
-      nix.settings.experimental-features = [
-        "nix-command"
-        "flakes"
-      ];
-
-      # Busybox + closure must be in the client's local store so `nix copy`
-      # can read + upload them. Referencing them in the config pulls them in.
-      environment.systemPackages = [
-        busybox
-        pkgs.curl
-      ];
-      # Force closureInfo into the VM's store (not otherwise a runtime dep).
-      environment.etc."rio/busybox-closure".source = "${busyboxClosure}";
-
-      # ssh-ng does not support the ?ssh-key= URL query param reliably across
-      # Nix versions; use ~/.ssh/config instead.
-      programs.ssh.extraConfig = ''
-        Host control
-          HostName control
-          User root
-          Port 2222
-          IdentityFile /root/.ssh/id_ed25519
-          StrictHostKeyChecking no
-          UserKnownHostsFile /dev/null
-      '';
-
-      virtualisation.memorySize = 1024;
-      virtualisation.cores = 4;
+    client = common.mkClientNode {
+      gatewayHost = "control";
+      extraPackages = [ pkgs.curl ];
     };
   };
 
@@ -217,15 +112,7 @@ pkgs.testers.runNixOSTest {
     control.wait_for_open_port(9001)
 
     # ── Phase 2: SSH key exchange + gateway start ─────────────────────
-    # Generate client key, install on control, restart gateway to pick it up.
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
-    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
-    control.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
-    # Gateway may have started with the empty authorized_keys file (tmpfiles);
-    # restart so load_authorized_keys() picks up the real key.
-    control.succeed("systemctl restart rio-gateway.service")
-    control.wait_for_unit("rio-gateway.service")
-    control.wait_for_open_port(2222)
+    ${common.sshKeySetup "control"}
 
     # ── Phase 3: Workers register ─────────────────────────────────────
     # Workers restart-on-failure until scheduler is reachable.
