@@ -53,7 +53,7 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix build .#ci-local-fast` | Full local validation: build, clippy, nextest, doc, coverage, pre-commit, 30s fuzz smoke ×7 |
+| `nix build .#ci-local-fast` | Full local validation: build, clippy, nextest, doc, coverage, pre-commit, 30s fuzz smoke ×8 |
 | `nix build .#ci-local-slow` | Same as `ci-local-fast` but with 10-min fuzz instead of 30s smoke |
 | `nix build .#ci-fast` / `.#ci-slow` | Same as `ci-local-*` plus VM tests (Linux+KVM only — typically via `nix-build-remote`) |
 | `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 30s fuzz smoke, VM tests) |
@@ -96,10 +96,11 @@ Pre-commit hooks run treefmt automatically on commit.
 
 ## Fuzzing
 
-Fuzz targets live in `rio-nix/fuzz/` (excluded from workspace, separate `Cargo.lock`). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
+Fuzz targets live in per-crate `fuzz/` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `rio-nix/fuzz/` (protocol/wire parsers) and `rio-store/fuzz/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
 
 ```bash
 nix develop -c bash -c 'cd rio-nix/fuzz && cargo fuzz run wire_primitives'
+nix develop -c bash -c 'cd rio-store/fuzz && cargo fuzz run manifest_deserialize'
 ```
 
 CI equivalents:
@@ -109,10 +110,10 @@ nix build .#fuzz-nightly-wire_primitives                    # 10min (nightly tie
 ```
 
 When adding a new parser, also add a fuzz target:
-1. Add a `[[bin]]` entry in `rio-nix/fuzz/Cargo.toml` + target file in `fuzz_targets/`
-2. Add seed inputs to `rio-nix/fuzz/corpus/<target>/` (NAR seeds: see `gen-nar-corpus.sh`)
-3. Add the target name to `fuzzTargets` in `flake.nix`
-4. If `rio-nix` deps changed, run `cd rio-nix/fuzz && cargo update -p rio-nix` (the fuzz lockfile is independent)
+1. Add a `[[bin]]` entry in the relevant `fuzz/Cargo.toml` + target file in `fuzz_targets/`
+2. Add seed inputs to `fuzz/corpus/<target>/` (must be prefixed `seed-`; NAR seeds: see `gen-nar-corpus.sh`)
+3. Add the target to `fuzzTargets` in `flake.nix` (target name + which `fuzzBuild` + `corpusRoot`)
+4. If the fuzzed crate's deps changed, run `cd <crate>/fuzz && cargo update -p <crate>` (fuzz lockfile is independent)
 
 ## Design Book
 

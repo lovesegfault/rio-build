@@ -1,0 +1,23 @@
+[package]
+name = "rio-store-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace root — excluded from the parent workspace (../../Cargo.toml)
+# but has its own Cargo.lock so Nix can vendor its deps independently.
+# Mirrors rio-nix/fuzz/Cargo.toml.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rio-store = { path = ".." }
+
+[[bin]]
+name = "manifest_deserialize"
+path = "fuzz_targets/manifest_deserialize.rs"
+test = false
+doc = false
