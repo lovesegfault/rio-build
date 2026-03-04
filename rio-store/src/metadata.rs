@@ -852,7 +852,7 @@ pub async fn append_signatures(
 // ---------------------------------------------------------------------------
 
 #[derive(sqlx::FromRow)]
-struct NarinfoRow {
+pub(crate) struct NarinfoRow {
     store_path: String,
     store_path_hash: Vec<u8>,
     deriver: Option<String>,
@@ -866,7 +866,7 @@ struct NarinfoRow {
 }
 
 impl NarinfoRow {
-    fn try_into_validated(self) -> Result<ValidatedPathInfo, PathInfoValidationError> {
+    pub(crate) fn try_into_validated(self) -> Result<ValidatedPathInfo, PathInfoValidationError> {
         use rio_proto::types::PathInfo;
         // Build raw PathInfo then delegate to the centralized TryFrom —
         // keeps validation logic in one place (rio-proto::validated), not
