@@ -1,7 +1,6 @@
 //! StoreService gRPC server implementation.
 //!
-//! Implements PutPath, GetPath, QueryPathInfo, FindMissingPaths.
-//! ContentLookup returns UNIMPLEMENTED (Phase 2a stub).
+//! Implements PutPath, GetPath, QueryPathInfo, FindMissingPaths, ContentLookup.
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -568,6 +567,28 @@ impl StoreService for StoreServiceImpl {
             debug!(store_path = %full_info.store_path.as_str(), "PutPath: inline upload completed");
         }
 
+        // Content-index the upload. nar_hash IS the content identity for
+        // CA purposes: same bytes → same SHA-256. Two input-addressed
+        // builds producing identical output get the same content_hash
+        // entry, pointing at different store_paths (both rows kept, PK
+        // is the pair). Best-effort — failure here doesn't fail the
+        // upload (path is still addressable by store_path); log only.
+        // Done AFTER the manifest commits so lookup's INNER JOIN on
+        // manifests.status='complete' always sees a complete row.
+        if let Err(e) = crate::content_index::insert(
+            &self.pool,
+            &full_info.nar_hash,
+            &full_info.store_path_hash,
+        )
+        .await
+        {
+            tracing::warn!(
+                store_path = %full_info.store_path.as_str(),
+                error = %e,
+                "content_index insert failed (path still addressable by store_path)"
+            );
+        }
+
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::histogram!("rio_store_put_path_duration_seconds")
             .record(start.elapsed().as_secs_f64());
@@ -805,15 +826,39 @@ impl StoreService for StoreServiceImpl {
         }))
     }
 
-    /// Content-addressed lookup: Phase 2a stub, returns UNIMPLEMENTED.
-    #[instrument(skip(self, _request), fields(rpc = "ContentLookup"))]
+    /// Content-addressed lookup: "have we ever seen these bytes?"
+    ///
+    /// Queries the content_index populated by PutPath. Empty
+    /// `store_path` in the response = not found (proto convention;
+    /// caller checks `.is_empty()` not Option).
+    #[instrument(skip(self, request), fields(rpc = "ContentLookup"))]
     async fn content_lookup(
         &self,
-        _request: Request<ContentLookupRequest>,
+        request: Request<ContentLookupRequest>,
     ) -> Result<Response<ContentLookupResponse>, Status> {
-        Err(Status::unimplemented(
-            "ContentLookup is not implemented in Phase 2a",
-        ))
+        let req = request.into_inner();
+
+        // Validate hash length. 32 bytes = SHA-256. Anything else is
+        // a client bug — reject with INVALID_ARGUMENT rather than
+        // silently missing on the PG index.
+        if req.content_hash.len() != 32 {
+            return Err(Status::invalid_argument(format!(
+                "content_hash must be 32 bytes (SHA-256), got {}",
+                req.content_hash.len()
+            )));
+        }
+
+        match crate::content_index::lookup(&self.pool, &req.content_hash).await {
+            Ok(Some(info)) => Ok(Response::new(ContentLookupResponse {
+                store_path: info.store_path.to_string(),
+                info: Some(info.into()),
+            })),
+            Ok(None) => Ok(Response::new(ContentLookupResponse {
+                store_path: String::new(),
+                info: None,
+            })),
+            Err(e) => Err(internal_error("ContentLookup", e)),
+        }
     }
 
     /// Resolve a store path from its 32-char nixbase32 hash part.
@@ -1213,7 +1258,7 @@ impl ChunkService for ChunkServiceImpl {
 // ---------------------------------------------------------------------------
 
 /// Compute SHA-256 hash of the store path string (used as primary key).
-fn compute_store_path_hash(store_path: &str) -> Vec<u8> {
+pub(crate) fn compute_store_path_hash(store_path: &str) -> Vec<u8> {
     Sha256::digest(store_path.as_bytes()).to_vec()
 }
 
