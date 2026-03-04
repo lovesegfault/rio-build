@@ -71,7 +71,15 @@ pub struct ExecutorEnv {
     /// and reporting `InfrastructureFailure` lets the scheduler reassign
     /// to a healthy worker, and the supervisor can restart this one.
     pub max_leaked_mounts: usize,
+    /// Timeout for the local nix-daemon subprocess build. Used when the
+    /// client didn't specify `BuildOptions.build_timeout`. Intentionally
+    /// long (default 2h) — some builds genuinely take that long; the
+    /// purpose is to bound blast radius of a truly stuck daemon.
+    pub daemon_timeout: Duration,
 }
+
+/// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
+pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// Worker nix.conf content for sandbox builds.
 const WORKER_NIX_CONF: &str = "\
@@ -388,7 +396,7 @@ pub async fn execute_build(
                 None
             }
         })
-        .unwrap_or_else(rio_common::grpc::daemon_timeout);
+        .unwrap_or(env.daemon_timeout);
 
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
     let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
@@ -645,6 +653,7 @@ mod tests {
             worker_id: "test-worker".into(),
             log_limits: LogLimits::UNLIMITED,
             max_leaked_mounts: 3,
+            daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

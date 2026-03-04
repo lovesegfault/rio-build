@@ -57,6 +57,12 @@ struct Config {
     /// degraded; execute_build short-circuits with InfrastructureFailure
     /// so the scheduler reassigns and the supervisor can restart.
     max_leaked_mounts: usize,
+    /// Timeout (seconds) for the local nix-daemon subprocess build when
+    /// the client didn't specify BuildOptions.build_timeout. Intentionally
+    /// long (2h default) — some builds genuinely take that long; this is
+    /// a bound on blast radius of a truly stuck daemon, not an expected
+    /// build time.
+    daemon_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -82,6 +88,7 @@ impl Default for Config {
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
             size_class: String::new(),
             max_leaked_mounts: 3,
+            daemon_timeout_secs: rio_worker::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
         }
     }
 }
@@ -176,6 +183,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     max_leaked_mounts: Option<usize>,
+
+    /// Daemon build timeout seconds (default: 7200)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_timeout_secs: Option<u64>,
 }
 
 /// Heartbeat interval. Shared source of truth with the scheduler's timeout
@@ -362,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
             total_bytes: cfg.log_size_limit,
         },
         max_leaked_mounts: cfg.max_leaked_mounts,
+        daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
     };
 
     // Process incoming scheduler messages

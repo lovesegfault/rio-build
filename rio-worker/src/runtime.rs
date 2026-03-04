@@ -105,6 +105,8 @@ pub struct BuildSpawnContext {
     pub log_limits: log_stream::LogLimits,
     /// Leaked overlay mount threshold (from `Config.max_leaked_mounts`).
     pub max_leaked_mounts: usize,
+    /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
+    pub daemon_timeout: std::time::Duration,
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -148,6 +150,7 @@ pub async fn spawn_build_task(
         worker_id: ctx.worker_id.clone(),
         log_limits: ctx.log_limits,
         max_leaked_mounts: ctx.max_leaked_mounts,
+        daemon_timeout: ctx.daemon_timeout,
     };
 
     // Clone for the panic handler before moving into the task.

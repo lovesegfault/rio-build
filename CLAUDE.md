@@ -215,9 +215,9 @@ When adding a recognized opcode as a stub/no-op, **read the expected wire payloa
 
 When spawning `nix-daemon --stdio` for local build execution:
 - Never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` — use `.ok_or_else()`
-- Wrap all daemon communication in `tokio::time::timeout` (default: `DAEMON_BUILD_TIMEOUT`, configurable via `RIO_DAEMON_TIMEOUT_SECS`)
+- Wrap all daemon communication in `tokio::time::timeout` (default: `DEFAULT_DAEMON_TIMEOUT` = 2h, configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` / `worker.toml`)
 - Always `daemon.kill().await` in both success and error paths
-- See `spawn_daemon_in_namespace` + `run_daemon_build` in `rio-worker/src/executor.rs` for the canonical pattern
+- See `spawn_daemon_in_namespace` + `run_daemon_build` in `rio-worker/src/executor/daemon.rs` for the canonical pattern
 
 ## Observability Checklist
 
