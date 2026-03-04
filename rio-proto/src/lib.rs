@@ -1,3 +1,10 @@
+//! Protobuf/gRPC service definitions for the rio workspace.
+//!
+//! Generated tonic stubs for `StoreService`, `SchedulerService`,
+//! `WorkerService`, `ChunkService`, and `AdminService`, plus
+//! [`ValidatedPathInfo`](validated::ValidatedPathInfo) for proto→domain
+//! validation and [`interceptor`] for W3C traceparent propagation.
+
 /// Default max gRPC message size: 32 MB.
 ///
 /// A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes (~12MB serialized).
