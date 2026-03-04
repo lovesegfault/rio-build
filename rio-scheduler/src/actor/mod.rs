@@ -98,6 +98,10 @@ pub enum ActorCommand {
         max_builds: u32,
         /// drv_paths from worker proto (not hashes).
         running_builds: Vec<String>,
+        /// Parsed bloom filter from local_paths. `None` = worker didn't
+        /// send one (old worker, or FUSE not mounted). Stored on
+        /// WorkerState for assignment scoring.
+        bloom: Option<rio_common::bloom::BloomFilter>,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
@@ -480,6 +484,7 @@ impl DagActor {
                     supported_features,
                     max_builds,
                     running_builds,
+                    bloom,
                 } => {
                     self.handle_heartbeat(
                         &worker_id,
@@ -487,6 +492,7 @@ impl DagActor {
                         supported_features,
                         max_builds,
                         running_builds,
+                        bloom,
                     );
                     // Dispatch on heartbeat: new capacity may be available
                     self.dispatch_ready().await;

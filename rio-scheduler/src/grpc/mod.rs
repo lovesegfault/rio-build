@@ -576,12 +576,37 @@ impl WorkerService for SchedulerGrpc {
             MAX_HEARTBEAT_RUNNING_BUILDS,
         )?;
 
+        // Bound the bloom filter. 1 MiB = 8M bits = ~800k items at 1%
+        // FPR — WAY more than any worker would realistically cache.
+        // Above this, the worker is either buggy or hostile.
+        const MAX_BLOOM_BYTES: usize = 1024 * 1024;
+
+        // Parse the bloom filter. from_wire validates algorithm/version/
+        // sizes; reject the whole heartbeat on validation failure
+        // (worker is sending garbage — don't silently drop the filter
+        // and score it as "no locality info"; that masks the bug).
+        let bloom = req
+            .local_paths
+            .map(|p| {
+                rio_common::grpc::check_bound("local_paths.data", p.data.len(), MAX_BLOOM_BYTES)?;
+                rio_common::bloom::BloomFilter::from_wire(
+                    p.data,
+                    p.hash_count,
+                    p.num_bits,
+                    p.hash_algorithm,
+                    p.version,
+                )
+                .map_err(|e| Status::invalid_argument(format!("invalid bloom filter: {e}")))
+            })
+            .transpose()?;
+
         let cmd = ActorCommand::Heartbeat {
             worker_id: req.worker_id.into(),
             system: req.system,
             supported_features: req.supported_features,
             max_builds: req.max_builds,
             running_builds: req.running_builds,
+            bloom,
         };
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

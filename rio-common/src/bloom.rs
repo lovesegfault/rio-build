@@ -36,6 +36,9 @@
 /// NOT resizable after construction — the bit array size is fixed
 /// by `new(expected_items, target_fpr)`. If you need more capacity,
 /// build a fresh filter.
+///
+/// `Debug` is custom — printing a 60KB bit array in `{:?}` output
+/// would be useless. Shows size + hash count instead.
 #[derive(Clone)]
 pub struct BloomFilter {
     /// The bit array. Stored as bytes (8 bits per byte); bit i is
@@ -55,6 +58,18 @@ pub struct BloomFilter {
 /// Format version. Bumped if the index computation changes (which
 /// would invalidate all existing filters on the wire).
 const FORMAT_VERSION: u32 = 1;
+
+impl std::fmt::Debug for BloomFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't dump 60KB of bits. Summary is what you actually want
+        // in tracing output.
+        f.debug_struct("BloomFilter")
+            .field("num_bits", &self.num_bits)
+            .field("hash_count", &self.hash_count)
+            .field("byte_len", &self.bits.len())
+            .finish()
+    }
+}
 
 /// Hard cap on k. Beyond ~16, each extra hash function burns CPU for
 /// negligible FPR improvement (the optimal k for 1% FPR is ~7).
