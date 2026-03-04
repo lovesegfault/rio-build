@@ -352,6 +352,28 @@ impl SchedulerDb {
     // Build history (async/batched)
     // -----------------------------------------------------------------------
 
+    /// Read the full build_history table for estimator refresh.
+    ///
+    /// Returns `(pname, system, ema_duration_secs, ema_peak_memory_bytes)`.
+    /// The estimator loads this into a HashMap at startup and refreshes
+    /// on Tick (every 60s). A full table scan is fine: even 10k distinct
+    /// (pname, system) pairs is ~1 MB and <10ms. The alternative —
+    /// loading on-demand per estimate — would be an async PG roundtrip
+    /// inside the single-threaded actor loop on every dispatch decision.
+    /// Batch-load once, query in-memory.
+    pub async fn read_build_history(
+        &self,
+    ) -> Result<Vec<(String, String, f64, Option<f64>)>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT pname, system, ema_duration_secs, ema_peak_memory_bytes
+            FROM build_history
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Update the build history EMA for a (pname, system) pair.
     pub async fn update_build_history(
         &self,

@@ -22,6 +22,7 @@ pub mod actor;
 pub mod admin;
 pub mod dag;
 pub mod db;
+pub mod estimator;
 pub mod grpc;
 pub mod logs;
 pub mod queue;

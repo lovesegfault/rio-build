@@ -153,7 +153,39 @@ impl DagActor {
     // Tick (periodic housekeeping)
     // -----------------------------------------------------------------------
 
+    /// Refresh the estimator from build_history. Runs every ~6 ticks
+    /// (60s at the default 10s interval). Separated from handle_tick
+    /// so the every-tick housekeeping stays readable.
+    async fn maybe_refresh_estimator(&mut self) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+
+        // Every 6th tick (≈60s with 10s interval). Not configurable:
+        // the estimator is a snapshot, not live; 60s is plenty fresh
+        // for critical-path priorities. Making this tunable is YAGNI
+        // until someone asks.
+        const ESTIMATOR_REFRESH_EVERY: u64 = 6;
+        if !self.tick_count.is_multiple_of(ESTIMATOR_REFRESH_EVERY) {
+            return;
+        }
+
+        // PG read can fail (connection blip). Log and keep the OLD
+        // estimator — stale estimates are better than no estimates.
+        // The next successful refresh catches up.
+        match self.db.read_build_history().await {
+            Ok(rows) => {
+                let n = rows.len();
+                self.estimator.refresh(rows);
+                debug!(entries = n, "estimator refreshed from build_history");
+            }
+            Err(e) => {
+                warn!(error = %e, "estimator refresh failed; keeping previous snapshot");
+            }
+        }
+    }
+
     pub(super) async fn handle_tick(&mut self) {
+        self.maybe_refresh_estimator().await;
+
         // Check for heartbeat timeouts
         let now = Instant::now();
         let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);

@@ -19,6 +19,7 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::DerivationDag;
 use crate::db::SchedulerDb;
+use crate::estimator::Estimator;
 use crate::queue::ReadyQueue;
 use crate::state::{
     BuildInfo, BuildOptions, BuildState, DerivationStatus, DrvHash, HEARTBEAT_TIMEOUT_SECS,
@@ -342,6 +343,15 @@ pub struct DagActor {
     /// the actor (single-threaded, no lock needed). Checked/updated in
     /// `merge.rs::check_cached_outputs`.
     cache_breaker: CacheCheckBreaker,
+    /// Build duration estimator. Snapshot of `build_history`, refreshed
+    /// periodically on Tick. D4 (critical-path) and D7 (size-class) read
+    /// from this. Single-threaded actor owns it — no Arc/lock.
+    estimator: Estimator,
+    /// Tick counter for periodic tasks that run less often than every
+    /// Tick (e.g., estimator refresh every ~60s with a 10s tick interval).
+    /// Wraps at u64::MAX — harmless, just means the 60s cadence drifts
+    /// by one tick after ~5.8 billion years.
+    tick_count: u64,
     /// Whether backpressure is currently active. Shared with ActorHandle
     /// so hysteresis (80%/60%) is honored by send() instead of a simple
     /// threshold check. `Arc<AtomicBool>` for lock-free reads on the hot path.
@@ -384,6 +394,8 @@ impl DagActor {
             db,
             store_client,
             cache_breaker: CacheCheckBreaker::default(),
+            estimator: Estimator::default(),
+            tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
             generation: 1,
             self_tx: None,
