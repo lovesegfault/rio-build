@@ -22,6 +22,14 @@ message DerivationNode {
   // can re-check the store at merge time, closing the TOCTOU window
   // between the gateway's FindMissingPaths and the scheduler's queue.
   repeated string expected_output_paths = 8;
+  // ATerm-serialized .drv content. Empty = scheduler/worker fetches
+  // from store (the pre-D8 path, still works). Populated by the
+  // gateway via filter_and_inline_drv ONLY for nodes whose outputs
+  // are missing from the store (= will actually dispatch). Cache-hit
+  // nodes stay empty — no point inflating SubmitBuild for derivations
+  // that won't build. Per-node ≤64KB (gateway enforces); scheduler
+  // validates ≤256KB defensively. 16MB total budget across the DAG.
+  bytes drv_content = 9;
 }
 
 // A dependency edge in the derivation DAG.

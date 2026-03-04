@@ -237,9 +237,12 @@ impl DagActor {
         if let Some(state) = self.dag.node(drv_hash) {
             let assignment = rio_proto::types::WorkAssignment {
                 drv_path: state.drv_path().to_string(),
-                // TODO(phase2c): inline .drv content to avoid worker->store round-trip.
-                // Phase 2a: worker fetches via GetPath (see rio-worker/src/executor.rs).
-                drv_content: Vec::new(),
+                // Forward what the gateway inlined (or empty → worker
+                // fetches from store). Gateway only inlines for nodes
+                // whose outputs are MISSING (will-dispatch), so cache
+                // hits don't bloat this. Worker already handles both
+                // paths (executor/mod.rs:241 branches on is_empty).
+                drv_content: state.drv_content.clone(),
                 // TODO(phase3a): compute closure scheduler-side for prefetch hints.
                 // Phase 2a: worker computes via QueryPathInfo BFS.
                 input_paths: Vec::new(),

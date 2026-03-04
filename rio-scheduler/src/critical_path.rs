@@ -270,6 +270,7 @@ mod tests {
             output_names: vec!["out".into()],
             is_fixed_output: false,
             expected_output_paths: vec![],
+            drv_content: Vec::new(),
         }
     }
 

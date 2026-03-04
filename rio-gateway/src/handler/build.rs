@@ -289,6 +289,12 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let priority_class = if is_ifd_hint { "interactive" } else { "ci" };
 
+    // Inline .drv content for will-dispatch nodes. Mutable because
+    // this fills node.drv_content in-place. On store error: skips
+    // silently (safe degrade; worker fetches).
+    let mut nodes = nodes;
+    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
+
     let request = translate::build_submit_request(nodes, edges, options.as_ref(), priority_class);
 
     let build_result =
@@ -384,6 +390,10 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     // Deduplicate nodes by drv_path
     let mut seen: HashSet<String> = HashSet::new();
     all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
+
+    // Inline .drv content for will-dispatch nodes (after dedup so we
+    // don't serialize the same derivation twice).
+    translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
     let request = translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
 
@@ -511,6 +521,9 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // Deduplicate nodes
         let mut seen: HashSet<String> = HashSet::new();
         all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
+
+        // Inline .drv content for will-dispatch nodes.
+        translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
         let request = translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
 
