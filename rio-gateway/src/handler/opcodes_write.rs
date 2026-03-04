@@ -381,24 +381,29 @@ pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite
     Ok(())
 }
 
+/// Error from [`parse_cam_str`].
+#[derive(Debug, thiserror::Error)]
+enum CamParseError {
+    #[error("unrecognized content-address method: {0}")]
+    UnknownMethod(String),
+    #[error(transparent)]
+    InvalidAlgo(#[from] rio_nix::hash::HashError),
+}
+
 /// Parse a content-address method string.
-fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), String> {
+fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError> {
     if let Some(algo_str) = cam_str.strip_prefix("text:") {
-        let algo = algo_str.parse::<HashAlgo>().map_err(|e| e.to_string())?;
-        Ok((true, false, algo))
+        Ok((true, false, algo_str.parse()?))
     } else if let Some(rest) = cam_str.strip_prefix("fixed:") {
         if let Some(algo_str) = rest.strip_prefix("r:") {
-            let algo = algo_str.parse::<HashAlgo>().map_err(|e| e.to_string())?;
-            Ok((false, true, algo))
+            Ok((false, true, algo_str.parse()?))
         } else if let Some(algo_str) = rest.strip_prefix("git:") {
-            let algo = algo_str.parse::<HashAlgo>().map_err(|e| e.to_string())?;
-            Ok((false, true, algo))
+            Ok((false, true, algo_str.parse()?))
         } else {
-            let algo = rest.parse::<HashAlgo>().map_err(|e| e.to_string())?;
-            Ok((false, false, algo))
+            Ok((false, false, rest.parse()?))
         }
     } else {
-        Err(format!("unrecognized content-address method: {cam_str}"))
+        Err(CamParseError::UnknownMethod(cam_str.to_string()))
     }
 }
 

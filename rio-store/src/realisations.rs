@@ -107,6 +107,16 @@ pub async fn query(
 // Internal
 // ---------------------------------------------------------------------------
 
+/// A `BYTEA` column that should be 32 bytes (SHA-256) came back a different
+/// length. The DB schema doesn't enforce length on BYTEA, so this catches
+/// corrupt writes at the read boundary instead of panicking in a `try_into()`.
+#[derive(Debug, thiserror::Error)]
+#[error("{field} must be 32 bytes, got {got}")]
+pub(crate) struct RealisationRowError {
+    field: &'static str,
+    got: usize,
+}
+
 #[derive(sqlx::FromRow)]
 struct RealisationRow {
     drv_hash: Vec<u8>,
@@ -117,18 +127,23 @@ struct RealisationRow {
 }
 
 impl RealisationRow {
-    fn try_into_validated(self) -> Result<Realisation, String> {
-        let drv_hash: [u8; 32] = self
-            .drv_hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("drv_hash must be 32 bytes, got {}", self.drv_hash.len()))?;
-        let output_hash: [u8; 32] = self.output_hash.as_slice().try_into().map_err(|_| {
-            format!(
-                "output_hash must be 32 bytes, got {}",
-                self.output_hash.len()
-            )
-        })?;
+    fn try_into_validated(self) -> Result<Realisation, RealisationRowError> {
+        let drv_hash: [u8; 32] =
+            self.drv_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| RealisationRowError {
+                    field: "drv_hash",
+                    got: self.drv_hash.len(),
+                })?;
+        let output_hash: [u8; 32] =
+            self.output_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| RealisationRowError {
+                    field: "output_hash",
+                    got: self.output_hash.len(),
+                })?;
         Ok(Realisation {
             drv_hash,
             output_name: self.output_name,
