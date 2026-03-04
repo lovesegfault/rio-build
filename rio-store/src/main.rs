@@ -110,7 +110,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_defaults_match_phase2a() {
+    fn config_defaults_are_stable() {
         let d = Config::default();
         assert_eq!(d.listen_addr, "0.0.0.0:9002");
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9092");
