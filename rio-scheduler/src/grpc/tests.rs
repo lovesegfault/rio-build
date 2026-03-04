@@ -8,7 +8,7 @@ use rio_test_support::fixtures::test_drv_path;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+use crate::MIGRATOR;
 
 /// T6: End-to-end BuildExecution bidirectional stream.
 ///

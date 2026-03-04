@@ -7,8 +7,7 @@ use super::*;
 #[tokio::test]
 async fn test_is_valid_path_exists() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"hello");
-    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    h.store.seed_with_content(TEST_PATH_A, b"hello");
 
     wire_send!(&mut h.stream;
         u64: 1,                             // wopIsValidPath
@@ -47,8 +46,7 @@ async fn test_is_valid_path_missing() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_ensure_path_exists() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"ensure");
-    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    h.store.seed_with_content(TEST_PATH_A, b"ensure");
 
     wire_send!(&mut h.stream;
         u64: 10,                            // wopEnsurePath
@@ -90,9 +88,7 @@ async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_query_path_info_exists() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"pathinfo");
-    let info = make_path_info(TEST_PATH_A, &nar, hash);
-    h.store.seed(info, nar.clone());
+    let (nar, hash) = h.store.seed_with_content(TEST_PATH_A, b"pathinfo");
 
     wire_send!(&mut h.stream;
         u64: 26,                            // wopQueryPathInfo
@@ -147,8 +143,7 @@ async fn test_query_path_info_missing_returns_invalid() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_query_path_from_hash_part_found() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"hashpart");
-    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    h.store.seed_with_content(TEST_PATH_A, b"hashpart");
 
     // Hash part is the 32-char basename prefix
     let hash_part = "00000000000000000000000000000000";
@@ -205,9 +200,9 @@ async fn test_add_temp_root() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_nar_from_path_streams_chunks() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"nar-from-path content");
-    h.store
-        .seed(make_path_info(TEST_PATH_A, &nar, hash), nar.clone());
+    let (nar, _) = h
+        .store
+        .seed_with_content(TEST_PATH_A, b"nar-from-path content");
 
     wire_send!(&mut h.stream;
         u64: 38,                            // wopNarFromPath
@@ -426,10 +421,8 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
 
     let drv_text = r#"Derive([("out","/nix/store/zzz-output","",""),("dev","/nix/store/yyy-dev","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
-    let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed(make_path_info(drv_path, &drv_nar, drv_hash), drv_nar);
+    h.store.seed_with_content(drv_path, drv_text.as_bytes());
 
     wire_send!(&mut h.stream; u64: 41, string: drv_path);
 
@@ -481,8 +474,7 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"qvp");
-    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    h.store.seed_with_content(TEST_PATH_A, b"qvp");
     // TEST_PATH_MISSING is not seeded.
 
     wire_send!(&mut h.stream;

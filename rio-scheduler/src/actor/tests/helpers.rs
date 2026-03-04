@@ -14,7 +14,7 @@ pub(crate) use rio_test_support::fixtures::{
 pub(super) use rio_test_support::{TestDb, TestResult};
 pub(super) use std::time::Duration;
 
-pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+pub(super) use crate::MIGRATOR;
 
 /// Set up an actor with the given PgPool and return (handle, task).
 /// The caller should drop the handle to shut down the actor.
@@ -175,6 +175,24 @@ pub(crate) async fn try_query_status(
         })
         .await?;
     Ok(rx.await?)
+}
+
+/// Receive the next SchedulerMessage and unwrap it as a WorkAssignment.
+/// Panics on timeout (2s), channel close, or wrong message variant.
+///
+/// Extracts the common `match msg.msg { Some(Msg::Assignment(a)) => a, _ => panic! }`
+/// pattern repeated across coverage/wiring/grpc tests.
+pub(crate) async fn recv_assignment(
+    rx: &mut mpsc::Receiver<rio_proto::types::SchedulerMessage>,
+) -> rio_proto::types::WorkAssignment {
+    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("recv_assignment: timeout waiting for SchedulerMessage")
+        .expect("recv_assignment: channel closed");
+    match msg.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("recv_assignment: expected Assignment, got {other:?}"),
+    }
 }
 
 /// Send a successful completion (Built) with a single `out` output.

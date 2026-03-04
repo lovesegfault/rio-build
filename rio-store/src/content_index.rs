@@ -99,14 +99,12 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
-
     /// Round-trip: insert then lookup finds it. Also verifies the
     /// narinfo+manifests join — a content_index row alone (no narinfo)
     /// would return None, not garbage.
     #[tokio::test]
     async fn test_insert_and_lookup_roundtrip() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
 
         // Need a complete narinfo + manifest for the join. Use
         // complete_manifest_inline for a realistic path.
@@ -150,7 +148,7 @@ mod tests {
     /// Lookup for unknown content → None, not error.
     #[tokio::test]
     async fn test_lookup_missing_returns_none() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let result = lookup(&db.pool, &[0xffu8; 32]).await?;
         assert!(result.is_none());
         Ok(())
@@ -159,7 +157,7 @@ mod tests {
     /// Idempotent: second insert is a no-op, lookup still works.
     #[tokio::test]
     async fn test_insert_idempotent() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
 
         // Minimal narinfo setup.
         let sp = rio_nix::store_path::StorePath::parse(

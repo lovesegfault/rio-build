@@ -159,8 +159,6 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
-
     fn sample() -> Realisation {
         Realisation {
             drv_hash: [0xAA; 32],
@@ -173,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_query_roundtrips() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let r = sample();
 
         let inserted = insert(&db.pool, &r).await?;
@@ -191,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_insert_is_idempotent() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let r = sample();
 
         let first = insert(&db.pool, &r).await?;
@@ -208,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_missing_returns_none() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let found = query(&db.pool, &[0xFF; 32], "out").await?;
         assert!(found.is_none());
         Ok(())
@@ -218,7 +216,7 @@ mod tests {
     /// drv_hash are independent realisations.
     #[tokio::test]
     async fn output_name_is_part_of_key() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let r_out = sample();
         let r_dev = Realisation {
             output_name: "dev".into(),

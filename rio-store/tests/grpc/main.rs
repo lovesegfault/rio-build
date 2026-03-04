@@ -24,6 +24,11 @@ use rio_test_support::{Context, TestDb, TestResult};
 
 use std::sync::Arc;
 
+// Can't use rio_store::MIGRATOR — it's cfg(test) in lib.rs (the
+// rio-store/fuzz/ workspace's source filter excludes migrations/,
+// and sqlx::migrate! reads files at compile time). Integration tests
+// compile the lib without cfg(test), so we keep our own copy. Same
+// migrations dir, same embedded SQL.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 
 /// Test harness bundling the three things every gRPC integration test

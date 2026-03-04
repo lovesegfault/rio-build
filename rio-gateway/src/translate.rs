@@ -576,10 +576,9 @@ mod tests {
     /// derivations that never dispatch.
     #[tokio::test]
     async fn test_filter_and_inline_drv_gates_on_missing() -> anyhow::Result<()> {
-        use rio_test_support::grpc::spawn_mock_store;
+        use rio_test_support::grpc::spawn_mock_store_with_client;
 
-        let (store, addr, _handle) = spawn_mock_store().await?;
-        let mut store_client = rio_proto::client::connect_store(&addr.to_string()).await?;
+        let (store, mut store_client, _handle) = spawn_mock_store_with_client().await?;
 
         // Two derivations: "cached" (output in store), "missing" (not).
         let cached_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-cached.drv");

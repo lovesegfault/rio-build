@@ -400,7 +400,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use rio_test_support::fixtures::{make_nar, make_path_info, test_store_path};
-    use rio_test_support::grpc::{MockStore, spawn_mock_store};
+    use rio_test_support::grpc::{MockStore, spawn_mock_store_with_client};
 
     /// Shorthand for test_store_path — these tests use many paths.
     fn tp(name: &str) -> String {
@@ -408,8 +408,7 @@ mod tests {
     }
 
     async fn spawn_and_connect() -> anyhow::Result<(MockStore, StoreServiceClient<Channel>)> {
-        let (store, addr, _h) = spawn_mock_store().await?;
-        let client = rio_proto::client::connect_store(&addr.to_string()).await?;
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
         Ok((store, client))
     }
 

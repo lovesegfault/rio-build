@@ -107,8 +107,7 @@ async fn test_multi_opcode_sequence() -> anyhow::Result<()> {
     use rio_nix::protocol::stderr::STDERR_LAST;
 
     let mut h = GatewaySession::new_with_handshake().await?;
-    let (nar, hash) = make_nar(b"multi-op");
-    h.store.seed(make_path_info(TEST_PATH_A, &nar, hash), nar);
+    h.store.seed_with_content(TEST_PATH_A, b"multi-op");
 
     // Op 1: IsValidPath (found)
     wire_send!(&mut h.stream; u64: 1, string: TEST_PATH_A);

@@ -379,8 +379,6 @@ mod tests {
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
     use rio_test_support::TestDb;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
-
     /// `(key, body_bytes)` captured from a PutObject call.
     type CapturedPut = (String, Vec<u8>);
     /// Shared sink the `.match_requests` closure fills.
@@ -471,7 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_final_drains_buffer_and_uploads() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
@@ -527,7 +525,7 @@ mod tests {
     async fn flush_final_no_buffer_is_noop() -> anyhow::Result<()> {
         // Silent build (zero log output) or duplicate flush req — buffer
         // doesn't exist. Should not panic, not S3-PUT, not PG-insert.
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let (s3, captured) = mock_s3_capturing_puts();
         let buffers = Arc::new(LogBuffers::new());
         // DON'T push anything.
@@ -558,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_periodic_snapshots_not_drains() -> anyhow::Result<()> {
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let (s3, captured) = mock_s3_capturing_puts();
         let buffers = Arc::new(LogBuffers::new());
         buffers.push(&mk_batch(
@@ -611,7 +609,7 @@ mod tests {
         //
         // BUT: it's still the right SQL for future-proofing (e.g., if we add
         // "retry final flush on S3 failure" later). Test it directly.
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
@@ -646,7 +644,7 @@ mod tests {
     async fn flush_final_multiple_interested_builds_one_blob_n_rows() -> anyhow::Result<()> {
         // The DAG-merging case: 3 builds all want the same derivation.
         // One S3 blob, 3 PG rows, all with the same s3_key.
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let b1 = Uuid::new_v4();
         let b2 = Uuid::new_v4();
         let b3 = Uuid::new_v4();
@@ -698,7 +696,7 @@ mod tests {
         // S3 returns 500. Flusher must NOT panic or hang — it logs, increments
         // the failure metric, and returns. The NEXT flush_final for a different
         // drv should still work. (If the flusher died, all future logs lost.)
-        let db = TestDb::new(&MIGRATOR).await;
+        let db = TestDb::new(&crate::MIGRATOR).await;
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
