@@ -264,10 +264,11 @@ impl DerivationDag {
                     Some(2) => continue,    // already fully explored
                     _ => {
                         // Unvisited: push a new frame (descend).
-                        color.insert(child.to_string(), 1);
                         let grandchildren = children_of(&child);
+                        let node = child.to_string();
+                        color.insert(node.clone(), 1);
                         stack.push(Frame {
-                            node: child.into_inner(),
+                            node,
                             children: grandchildren,
                             next_child: 0,
                         });
