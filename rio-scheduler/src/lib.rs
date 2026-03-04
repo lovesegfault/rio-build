@@ -20,12 +20,16 @@
 
 pub mod actor;
 pub mod admin;
-pub mod assignment;
-pub mod critical_path;
+pub(crate) mod assignment;
+pub(crate) mod critical_path;
 pub mod dag;
 pub mod db;
-pub mod estimator;
+pub(crate) mod estimator;
 pub mod grpc;
 pub mod logs;
-pub mod queue;
+pub(crate) mod queue;
 pub mod state;
+
+// Re-export for main.rs — `assignment` is pub(crate) but the config struct
+// is part of the binary's TOML schema.
+pub use assignment::SizeClassConfig;
