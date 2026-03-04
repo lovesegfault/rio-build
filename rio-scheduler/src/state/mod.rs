@@ -37,14 +37,14 @@ pub use rio_common::limits::{
 
 /// Priority class for scheduling.
 ///
-/// Phase 2a uses binary interactive/scheduled FIFO: interactive builds
-/// push_front the ready queue; all others push_back. Full max(priority)
-/// across interested builds is deferred to Phase 2c with critical-path.
+/// Interactive builds get [`INTERACTIVE_BOOST`](crate::queue::INTERACTIVE_BOOST)
+/// (+1e9) added to their priority in the [`ReadyQueue`](crate::queue::ReadyQueue)
+/// BinaryHeap, so they dispatch before any realistic critical-path value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PriorityClass {
     /// CI builds: normal priority, scheduled order.
     Ci,
-    /// Interactive builds (e.g., IFD during evaluation): push_front.
+    /// Interactive builds (e.g., IFD during evaluation): +1e9 priority boost.
     Interactive,
     /// Scheduled/batch builds: default, lowest priority.
     #[default]
@@ -61,7 +61,7 @@ impl PriorityClass {
         }
     }
 
-    /// Whether this class gets push_front treatment in the ready queue.
+    /// Whether this class gets the INTERACTIVE_BOOST priority bonus.
     pub fn is_interactive(self) -> bool {
         matches!(self, Self::Interactive)
     }

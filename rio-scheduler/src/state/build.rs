@@ -87,9 +87,9 @@ impl std::str::FromStr for BuildState {
 pub struct BuildInfo {
     /// Unique build ID.
     pub build_id: Uuid,
-    /// Tenant ID (unused in Phase 2a).
+    /// Tenant ID. Reserved for Phase 4 multi-tenancy.
     pub tenant_id: Option<String>,
-    /// Priority class. Interactive gets push_front in the ready queue.
+    /// Priority class. Interactive gets INTERACTIVE_BOOST (+1e9) in the ready queue.
     pub priority_class: PriorityClass,
     /// Current build state. Private: use `state()` to read, `transition()` to mutate.
     /// This enforces the BuildState transition validation at every write site.

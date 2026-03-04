@@ -1,4 +1,4 @@
-//! Test harness for rio-build integration tests.
+//! Test harness for rio workspace integration tests.
 //!
 //! - [`pg`]: ephemeral PostgreSQL bootstrap
 //! - [`wire`]: Nix wire protocol client helpers (handshake, setOptions, stderr drain)
@@ -10,7 +10,7 @@ pub mod grpc;
 pub mod pg;
 pub mod wire;
 
-// Re-export the most-used type at crate root for backwards compat
+// Re-export at crate root — TestDb is the most-used type.
 pub use pg::TestDb;
 
 /// Standard return type for `#[test]` / `#[tokio::test]` bodies.

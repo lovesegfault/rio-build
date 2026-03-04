@@ -2,7 +2,7 @@
 //!
 //! Spins up an isolated nix-daemon on a temporary Unix socket,
 //! performs interactive protocol exchanges, and captures both
-//! client and server byte streams for comparison against rio-build.
+//! client and server byte streams for comparison against rio-gateway.
 
 use std::path::Path;
 
@@ -143,7 +143,7 @@ async fn exchange_with_daemon_inner(
     all_server.extend_from_slice(&post_hs);
 
     // --- SetOptions (opcode 19) ---
-    // All option values are zero (defaults) because rio-build ignores option
+    // All option values are zero (defaults) because rio-gateway ignores option
     // values — it accepts and discards them. Testing non-default options would
     // only validate the parsing/discarding path, which is already covered by
     // direct protocol tests (test_set_options_with_overrides).

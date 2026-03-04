@@ -1,8 +1,7 @@
 //! Client-side Nix worker protocol implementation.
 //!
 //! Speaks the Nix worker protocol as a **client** to a local `nix-daemon --stdio`.
-//! Used by the gateway in Phase 1b for local build execution, and by workers
-//! in Phase 2 for the same purpose.
+//! Used by workers to drive nix-daemon --stdio in the build sandbox.
 //!
 //! The client protocol mirrors the server protocol in `handshake.rs` and `stderr.rs`:
 //! - Client sends `WORKER_MAGIC_1`, reads `WORKER_MAGIC_2` + server version
