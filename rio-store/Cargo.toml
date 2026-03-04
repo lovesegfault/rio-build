@@ -41,6 +41,9 @@ sha2 = { workspace = true }
 # Phase 2c chunked CAS
 fastcdc = { workspace = true }
 blake3 = { workspace = true }
+# join_all for bounded-parallel S3 HeadObject batches (exists_batch).
+# Worker already uses this; not a new transitive dep.
+futures-util = "0.3"
 
 # Encoding
 hex = { workspace = true }
