@@ -15,6 +15,10 @@ impl DagActor {
         // queue head blocked all x86_64 dispatch).
         let mut deferred: Vec<DrvHash> = Vec::new();
         let mut dispatched_any = true;
+        // Track how many derivations WANTED each class but got deferred.
+        // Reported as a gauge at the end — operator signal for "class X
+        // is bottlenecked, scale that pool."
+        let mut class_deferred: HashMap<String, u64> = HashMap::new();
 
         // Keep cycling until a full pass with no dispatches AND no stale removals.
         // In practice this terminates quickly: each derivation is either
@@ -23,37 +27,49 @@ impl DagActor {
             dispatched_any = false;
 
             while let Some(drv_hash) = self.ready_queue.pop() {
-                // Find the derivation's requirements
-                let (system, required_features) = match self.dag.node(&drv_hash) {
-                    Some(state) => (state.system.clone(), state.required_features.clone()),
-                    None => continue, // stale entry, drop
+                // Stale-entry guards: drop if not in DAG or not Ready.
+                let Some(state) = self.dag.node(&drv_hash) else {
+                    continue;
                 };
-
-                // Only dispatch if derivation is actually in Ready state
-                if self
-                    .dag
-                    .node(&drv_hash)
-                    .is_none_or(|s| s.status() != DerivationStatus::Ready)
-                {
-                    continue; // stale state, drop
+                if state.status() != DerivationStatus::Ready {
+                    continue;
                 }
 
-                // Score workers by transfer-cost + load. Replaces the
-                // old first-eligible FIFO. Need the full DerivationState
-                // (not just system/features) for the closure lookup.
-                //
-                // target_class=None: D7 will pass the classified size
-                // here. For now, no size-class filtering.
-                let eligible_worker = self.dag.node(&drv_hash).and_then(|drv_state| {
-                    crate::assignment::best_worker(&self.workers, drv_state, &self.dag, None)
-                });
-                // Silence unused warnings — system/features extracted
-                // above for the None=>continue branch; best_worker reads
-                // them from drv_state directly.
-                let _ = (system, required_features);
+                // Classify by estimated duration + memory. None if
+                // size_classes unconfigured (backward compat — no
+                // filter, all workers candidates).
+                let target_class = crate::assignment::classify(
+                    state.est_duration,
+                    self.estimator
+                        .peak_memory(state.pname.as_deref(), &state.system),
+                    &self.size_classes,
+                );
+
+                // Try target class first, then overflow to larger
+                // classes if no worker in target has capacity. A
+                // "small" build CAN go to a "large" worker (just
+                // wasteful); a "large" build CANNOT go to "small"
+                // (would under-provision). So overflow walks UP only.
+                let (eligible_worker, chosen_class) =
+                    self.find_worker_with_overflow(&drv_hash, target_class.as_deref());
 
                 match eligible_worker {
                     Some(worker_id) => {
+                        // Record what class we ACTUALLY routed to (may
+                        // be larger than target if we overflowed).
+                        // Misclassification detector reads this at
+                        // completion time.
+                        if let Some(state) = self.dag.node_mut(&drv_hash) {
+                            state.assigned_size_class = chosen_class.clone();
+                        }
+                        if let Some(class) = &chosen_class {
+                            metrics::counter!(
+                                "rio_scheduler_size_class_assignments_total",
+                                "class" => class.clone()
+                            )
+                            .increment(1);
+                        }
+
                         if self.assign_to_worker(&drv_hash, &worker_id).await {
                             dispatched_any = true;
                         } else {
@@ -65,8 +81,12 @@ impl DagActor {
                         }
                     }
                     None => {
-                        // No eligible worker for this derivation. Defer and
-                        // continue scanning for others we CAN dispatch.
+                        // No eligible worker (even with overflow).
+                        // Defer and track by TARGET class (not chosen —
+                        // chosen is None when there's no eligible).
+                        if let Some(class) = target_class {
+                            *class_deferred.entry(class).or_insert(0) += 1;
+                        }
                         deferred.push(drv_hash);
                     }
                 }
@@ -80,6 +100,81 @@ impl DagActor {
                 self.push_ready(hash);
             }
         }
+
+        // Gauge: per-class deferral count. Snapshot from this dispatch
+        // pass. Fire-and-forget — next dispatch overwrites. An operator
+        // seeing rio_scheduler_class_queue_depth{class="large"}=50 knows
+        // large workers are the bottleneck.
+        //
+        // Classes with zero deferred aren't reported (the map only has
+        // entries we incremented). That's fine — absence of the metric
+        // label means "not bottlenecked," which is the right signal.
+        for (class, count) in class_deferred {
+            metrics::gauge!("rio_scheduler_class_queue_depth", "class" => class).set(count as f64);
+        }
+    }
+
+    /// Find a worker for this derivation, starting at `target_class` and
+    /// overflowing to progressively larger classes if needed.
+    ///
+    /// Returns `(worker_id, class_actually_used)`. Both None if nobody
+    /// can take it (wrong system, all full, no workers).
+    ///
+    /// Overflow direction: small → large only. A slow build on a small
+    /// worker would dominate that worker's single slot; a fast build on
+    /// a large worker is just slightly wasteful. scheduler.md:158.
+    fn find_worker_with_overflow(
+        &self,
+        drv_hash: &str,
+        target_class: Option<&str>,
+    ) -> (Option<WorkerId>, Option<String>) {
+        let Some(drv_state) = self.dag.node(drv_hash) else {
+            return (None, None);
+        };
+
+        // No classification configured → single best_worker call with
+        // no filter. The fast path for pre-D7 deployments.
+        let Some(target) = target_class else {
+            let w = crate::assignment::best_worker(&self.workers, drv_state, &self.dag, None);
+            return (w, None);
+        };
+
+        // Build the overflow chain: target class, then all classes with
+        // cutoff > target's cutoff, sorted ascending. If target cutoff
+        // is 30s, chain is [small(30), medium(300), large(3600)].
+        //
+        // We don't cache this chain because classify() is called fresh
+        // per-dispatch anyway (est_duration can change between ticks
+        // via estimator refresh) and the sort is 2-4 elements.
+        let target_cutoff = crate::assignment::cutoff_for(target, &self.size_classes);
+        let mut chain: Vec<&str> = self
+            .size_classes
+            .iter()
+            .filter(|c| {
+                // Target itself (== cutoff) or larger.
+                // target_cutoff=None shouldn't happen (target came
+                // FROM classify which reads the same config) but be
+                // defensive: if None, include everything.
+                target_cutoff.is_none_or(|t| c.cutoff_secs >= t)
+            })
+            .map(|c| c.name.as_str())
+            .collect();
+        chain.sort_by(|a, b| {
+            let ca = crate::assignment::cutoff_for(a, &self.size_classes).unwrap_or(f64::MAX);
+            let cb = crate::assignment::cutoff_for(b, &self.size_classes).unwrap_or(f64::MAX);
+            ca.partial_cmp(&cb).expect("cutoffs finite")
+        });
+
+        // Walk the chain: first class with an available worker wins.
+        for class in chain {
+            if let Some(w) =
+                crate::assignment::best_worker(&self.workers, drv_state, &self.dag, Some(class))
+            {
+                return (Some(w), Some(class.to_string()));
+            }
+        }
+
+        (None, None)
     }
 
     /// Transition a derivation to Assigned and send it to the worker.

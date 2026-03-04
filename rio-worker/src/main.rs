@@ -44,6 +44,13 @@ struct Config {
     /// Not yet wired to a consumer — C7 does that.
     log_rate_limit: u64,
     log_size_limit: u64,
+    /// Size-class this worker is deployed as. Empty = unclassified
+    /// (wildcard: accepts any class). Operator sets this to match the
+    /// scheduler's size_classes config — e.g. "small" workers on cheap
+    /// spot instances, "large" on memory-optimized. The scheduler
+    /// routes by estimated duration; this just declares which bucket
+    /// this worker serves.
+    size_class: String,
 }
 
 impl Default for Config {
@@ -65,6 +72,7 @@ impl Default for Config {
             // is preserved until C7 wires them into LogBatcher.
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
+            size_class: String::new(),
         }
     }
 }
@@ -149,6 +157,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_size_limit: Option<u64>,
+
+    /// Size-class (matches scheduler config; e.g. "small", "large")
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_class: Option<String>,
 }
 
 /// Heartbeat interval.
@@ -285,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_worker_id = worker_id.clone();
     let heartbeat_system = system.clone();
     let heartbeat_max_builds = cfg.max_builds;
+    let heartbeat_size_class = cfg.size_class.clone();
     let heartbeat_running = running_builds.clone();
     let mut heartbeat_client = scheduler_client.clone();
     let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
@@ -296,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
                 &heartbeat_worker_id,
                 &heartbeat_system,
                 heartbeat_max_builds,
+                &heartbeat_size_class,
                 &heartbeat_running,
                 Some(&heartbeat_bloom),
             )

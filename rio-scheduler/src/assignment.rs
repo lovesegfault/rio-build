@@ -29,8 +29,122 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::dag::DerivationDag;
 use crate::state::{DerivationState, WorkerId, WorkerState};
+
+/// One size-class in the operator's cutoff config.
+///
+/// Classes form an ordered sequence: "small" < "medium" < "large" by
+/// `cutoff_secs`. A derivation is routed to the SMALLEST class whose
+/// cutoff covers its estimated duration — this concentrates quick
+/// builds on cheap workers and reserves big iron for slow builds.
+///
+/// `mem_limit_bytes` is a guard: if a derivation's known peak memory
+/// exceeds its duration-class's limit, it gets bumped to the next class
+/// regardless of duration. A 10-second build that OOMs on a 4GB worker
+/// isn't actually a small build.
+///
+/// Lives here (not main.rs) because the actor needs it: dispatch.rs
+/// calls `classify()` with a ref to the config vec, and completion.rs
+/// looks up `cutoff_for()` for misclassification detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SizeClassConfig {
+    pub name: String,
+    /// Max estimated duration to route here. A build estimated at 25s
+    /// goes to the smallest class with cutoff ≥ 25.
+    pub cutoff_secs: f64,
+    /// If a build's ema_peak_memory exceeds this, bump to the next
+    /// class even if duration fits. `u64::MAX` = no memory check.
+    pub mem_limit_bytes: u64,
+}
+
+/// Classify a derivation into a size-class.
+///
+/// `None` = no classification (empty config, backward-compat).
+/// `Some(name)` = route to workers whose `size_class` matches.
+///
+/// Algorithm:
+/// 1. Empty config → None (no filtering; all workers are candidates)
+/// 2. Sort classes by cutoff (idempotent if already sorted)
+/// 3. Find smallest class where `est_dur ≤ cutoff`
+/// 4. If that class's mem_limit is exceeded → bump to next larger
+/// 5. If est_dur exceeds ALL cutoffs → largest class (builds gotta go
+///    somewhere; the largest class is "everything else")
+///
+/// Taking `&[SizeClassConfig]` owned-sort internally rather than
+/// requiring the caller to pre-sort: classify() is called per-dispatch
+/// and the sort is ~3-element. Cheaper than maintaining an invariant.
+pub fn classify(
+    est_dur: f64,
+    peak_mem: Option<f64>,
+    classes: &[SizeClassConfig],
+) -> Option<String> {
+    if classes.is_empty() {
+        // Gotcha #14: empty config = unconfigured = no filtering.
+        // Backward-compat with pre-D7 deployments (phase1/2a/2b VM
+        // tests have no size_classes in their scheduler.toml).
+        return None;
+    }
+
+    // Sort by cutoff. Small-N (typically 2-4 classes); the clone is
+    // ~100 bytes and the sort is trivial. Not worth caching sorted
+    // order on the actor — this runs once per dispatch decision, not
+    // per-packet.
+    let mut sorted: Vec<&SizeClassConfig> = classes.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.cutoff_secs
+            .partial_cmp(&b.cutoff_secs)
+            .expect("cutoffs are operator-configured finite values")
+    });
+
+    // Find the smallest class whose cutoff covers est_dur, then check
+    // memory. If memory forces a bump, we want the NEXT class — hence
+    // iterating by index so we can peek ahead.
+    for (i, class) in sorted.iter().enumerate() {
+        if est_dur > class.cutoff_secs {
+            // Duration doesn't fit; try next class.
+            continue;
+        }
+        // Duration fits. Check memory.
+        if let Some(mem) = peak_mem
+            && mem > class.mem_limit_bytes as f64
+        {
+            // Memory bump: return the NEXT class if there is one.
+            // If this is already the largest, return it anyway — a
+            // build has to go somewhere, and "largest" is the best
+            // we've got. The misclassification detector will catch
+            // the resulting OOM and log it.
+            return Some(
+                sorted
+                    .get(i + 1)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| class.name.clone()),
+            );
+        }
+        return Some(class.name.clone());
+    }
+
+    // est_dur exceeded every cutoff. Route to the largest class —
+    // that's where slow builds belong. Returning None here would mean
+    // "no worker can take this," which is wrong: a 2-hour build should
+    // go to the big workers, not get stuck.
+    sorted.last().map(|c| c.name.clone())
+}
+
+/// Look up the cutoff for a class name. For misclassification detection:
+/// "did actual duration exceed 2× the cutoff we routed this to?"
+///
+/// `None` if the name isn't in the config (shouldn't happen — we only
+/// store names that came from `classify()`, but be defensive against
+/// config changes mid-run).
+pub fn cutoff_for(class_name: &str, classes: &[SizeClassConfig]) -> Option<f64> {
+    classes
+        .iter()
+        .find(|c| c.name == class_name)
+        .map(|c| c.cutoff_secs)
+}
 
 /// Weight for transfer-cost term. Higher = locality matters more.
 const W_LOCALITY: f64 = 0.7;
@@ -385,4 +499,106 @@ mod tests {
     const _: fn() = || {
         let _: HashSet<()> = HashSet::new();
     };
+
+    // ----- classify() tests -----
+
+    fn classes() -> Vec<SizeClassConfig> {
+        vec![
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: 1 << 30, // 1 GiB
+            },
+            SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: 16 << 30, // 16 GiB
+            },
+        ]
+    }
+
+    #[test]
+    fn classify_empty_config_returns_none() {
+        // Gotcha #14: empty = backward-compat, no filtering.
+        assert_eq!(classify(100.0, None, &[]), None);
+        assert_eq!(classify(0.1, Some(1e12), &[]), None);
+    }
+
+    #[test]
+    fn classify_by_duration() {
+        let c = classes();
+        // 10s → small (smallest class covering 10s)
+        assert_eq!(classify(10.0, None, &c).as_deref(), Some("small"));
+        // 30s exactly → small (≤ is inclusive)
+        assert_eq!(classify(30.0, None, &c).as_deref(), Some("small"));
+        // 31s → large
+        assert_eq!(classify(31.0, None, &c).as_deref(), Some("large"));
+        // 3600s exactly → large
+        assert_eq!(classify(3600.0, None, &c).as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn classify_memory_bump() {
+        let c = classes();
+        // 10s would be small, but 2 GiB > 1 GiB limit → bump to large.
+        assert_eq!(
+            classify(10.0, Some(2.0 * (1 << 30) as f64), &c).as_deref(),
+            Some("large")
+        );
+        // 10s + 500 MiB → small (under limit).
+        assert_eq!(
+            classify(10.0, Some(500.0 * (1 << 20) as f64), &c).as_deref(),
+            Some("small")
+        );
+        // None peak_mem → no bump (no data, don't guess).
+        assert_eq!(classify(10.0, None, &c).as_deref(), Some("small"));
+    }
+
+    #[test]
+    fn classify_memory_bump_at_largest_stays_largest() {
+        let c = classes();
+        // 100s → large. 32 GiB > 16 GiB limit, but there's no larger
+        // class → stays large. Build has to go SOMEWHERE.
+        assert_eq!(
+            classify(100.0, Some(32.0 * (1 << 30) as f64), &c).as_deref(),
+            Some("large")
+        );
+    }
+
+    #[test]
+    fn classify_overflow_duration_picks_largest() {
+        let c = classes();
+        // 10 hours > every cutoff. Goes to largest, not None.
+        // Returning None would strand slow builds forever.
+        assert_eq!(classify(36000.0, None, &c).as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn classify_unsorted_config() {
+        // Operator might list large before small in toml. Sort
+        // internally so order doesn't matter.
+        let c = vec![
+            SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+            },
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+            },
+        ];
+        // 10s must go to small (SMALLEST covering class), not large
+        // (first in config). If we didn't sort, this would pick large.
+        assert_eq!(classify(10.0, None, &c).as_deref(), Some("small"));
+    }
+
+    #[test]
+    fn cutoff_for_lookup() {
+        let c = classes();
+        assert_eq!(cutoff_for("small", &c), Some(30.0));
+        assert_eq!(cutoff_for("large", &c), Some(3600.0));
+        assert_eq!(cutoff_for("nonexistent", &c), None);
+    }
 }

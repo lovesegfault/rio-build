@@ -607,6 +607,12 @@ impl WorkerService for SchedulerGrpc {
             })
             .transpose()?;
 
+        // size_class: empty-string in proto → None. Proto doesn't have
+        // Option for strings; empty is the conventional "unset." An
+        // actually-empty-named class makes no sense (operator config
+        // validation would reject it), so this mapping is lossless.
+        let size_class = (!req.size_class.is_empty()).then_some(req.size_class);
+
         let cmd = ActorCommand::Heartbeat {
             worker_id: req.worker_id.into(),
             system: req.system,
@@ -614,6 +620,7 @@ impl WorkerService for SchedulerGrpc {
             max_builds: req.max_builds,
             running_builds: req.running_builds,
             bloom,
+            size_class,
         };
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

@@ -195,6 +195,40 @@ impl DagActor {
                 {
                     error!(drv_hash, error = %e, "failed to update build history EMA");
                 }
+
+                // Misclassification: routed to "small" but ran like
+                // "large"? Threshold is 2× the assigned class's cutoff —
+                // a build routed to a 30s class that took 61s triggers.
+                // 2× is generous enough to avoid noise from normal
+                // variance (build caches, CPU contention) while still
+                // catching the "this is clearly not a small build" case.
+                //
+                // Penalty: overwrite EMA with actual (not blend). Next
+                // classify() sees the real duration and picks right.
+                // Harsh but self-correcting — a fluke gets blended back
+                // down by the next normal completion.
+                if let Some(assigned_class) = &state.assigned_size_class
+                    && let Some(cutoff) =
+                        crate::assignment::cutoff_for(assigned_class, &self.size_classes)
+                    && duration_secs > 2.0 * cutoff
+                {
+                    warn!(
+                        drv_hash,
+                        pname = %pname,
+                        assigned_class = %assigned_class,
+                        cutoff_secs = cutoff,
+                        actual_secs = duration_secs,
+                        "misclassification: actual > 2× cutoff; penalty-writing EMA"
+                    );
+                    metrics::counter!("rio_scheduler_misclassifications_total").increment(1);
+                    if let Err(e) = self
+                        .db
+                        .update_build_history_misclassified(pname, &state.system, duration_secs)
+                        .await
+                    {
+                        error!(drv_hash, error = %e, "failed to write misclassification penalty");
+                    }
+                }
             }
         }
 

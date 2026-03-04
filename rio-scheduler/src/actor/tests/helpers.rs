@@ -105,6 +105,7 @@ pub(crate) async fn connect_worker(
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             bloom: None,
+            size_class: None,
             worker_id: worker_id.into(),
             system: system.into(),
             supported_features: vec![],
