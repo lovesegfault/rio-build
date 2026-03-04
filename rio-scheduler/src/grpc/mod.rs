@@ -481,6 +481,8 @@ impl WorkerService for SchedulerGrpc {
                                     worker_id: worker_id_for_recv.clone().into(),
                                     drv_key: drv_path,
                                     result,
+                                    peak_memory_bytes: report.peak_memory_bytes,
+                                    output_size_bytes: report.output_size_bytes,
                                 })
                                 .await
                                 .is_err()
@@ -517,13 +519,18 @@ impl WorkerService for SchedulerGrpc {
                             });
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
-                            // TODO(phase2c): ProgressUpdate carries ResourceUsage
-                            // (cpu/mem/disk) + build_phase. Phase 2c's build
-                            // duration estimation uses historical ResourceUsage
-                            // data for size-class routing (ADR-015). Current
-                            // behavior: drop silently (workers don't send these
-                            // yet anyway — worker-side ProgressUpdate emission
-                            // is also phase2c).
+                            // ProgressUpdate still dropped. For size-class
+                            // routing we don't need a live sample stream:
+                            // CompletionReport.peak_memory_bytes carries the
+                            // kernel-tracked VmHWM (lifetime peak, one read
+                            // at build-end) and that's what the estimator
+                            // consumes. Mid-build ResourceUsage would only
+                            // matter for live pre-emption / migration, which
+                            // isn't in scope.
+                            //
+                            // TODO(phase3a): cpu_cores needs polling (no
+                            // kernel-tracked peak equivalent). That's when
+                            // ProgressUpdate becomes load-bearing.
                         }
                     }
                 }

@@ -72,6 +72,12 @@ pub enum ActorCommand {
         /// Workers send drv_path; tests sometimes send drv_hash directly.
         drv_key: String,
         result: rio_proto::types::BuildResult,
+        /// Peak memory (VmHWM) in bytes from the worker. 0 = no signal
+        /// (proc gone, build failed early). Feeds build_history EMA.
+        peak_memory_bytes: u64,
+        /// Sum of uploaded NAR sizes. 0 = no signal (build failed, no
+        /// outputs). Dashboards-only today; column exists so EMA it now.
+        output_size_bytes: u64,
     },
 
     /// Cancel a build.
@@ -458,8 +464,17 @@ impl DagActor {
                     worker_id,
                     drv_key,
                     result,
+                    peak_memory_bytes,
+                    output_size_bytes,
                 } => {
-                    self.handle_completion(&worker_id, &drv_key, result).await;
+                    self.handle_completion(
+                        &worker_id,
+                        &drv_key,
+                        result,
+                        peak_memory_bytes,
+                        output_size_bytes,
+                    )
+                    .await;
                 }
                 ActorCommand::CancelBuild {
                     build_id,

@@ -375,18 +375,49 @@ impl SchedulerDb {
     }
 
     /// Update the build history EMA for a (pname, system) pair.
+    ///
+    /// `peak_memory_bytes`/`output_size_bytes`: None means the worker
+    /// had no signal (proc gone, build failed early). Must NOT drag
+    /// the EMA toward zero — None → column unchanged.
+    ///
+    /// The COALESCE(blend, new, old) pattern handles all four
+    /// old×new nullability combinations:
+    ///   old=Some, new=Some → blend (normal EMA)
+    ///   old=None, new=Some → blend is NULL (NULL*x), falls to new (first sample)
+    ///   old=Some, new=None → blend is NULL (x+NULL), falls to new=NULL, falls to old (keep)
+    ///   old=None, new=None → all NULL (still no signal)
+    ///
+    /// PG: any arithmetic with NULL yields NULL; COALESCE picks first non-NULL.
     pub async fn update_build_history(
         &self,
         pname: &str,
         system: &str,
         actual_duration_secs: f64,
+        peak_memory_bytes: Option<u64>,
+        output_size_bytes: Option<u64>,
     ) -> Result<(), sqlx::Error> {
+        // u64 → f64 for DOUBLE PRECISION binding. Precision loss at
+        // ~2^53 bytes (~9 PB) is not a concern.
+        let peak_mem = peak_memory_bytes.map(|b| b as f64);
+        let out_size = output_size_bytes.map(|b| b as f64);
+
         sqlx::query(
             r#"
-            INSERT INTO build_history (pname, system, ema_duration_secs, sample_count, last_updated)
-            VALUES ($1, $2, $3, 1, now())
+            INSERT INTO build_history
+              (pname, system, ema_duration_secs,
+               ema_peak_memory_bytes, ema_output_size_bytes,
+               sample_count, last_updated)
+            VALUES ($1, $2, $3, $5, $6, 1, now())
             ON CONFLICT (pname, system) DO UPDATE SET
                 ema_duration_secs = build_history.ema_duration_secs * (1.0 - $4) + $3 * $4,
+                ema_peak_memory_bytes = COALESCE(
+                    build_history.ema_peak_memory_bytes * (1.0 - $4) + $5 * $4,
+                    $5,
+                    build_history.ema_peak_memory_bytes),
+                ema_output_size_bytes = COALESCE(
+                    build_history.ema_output_size_bytes * (1.0 - $4) + $6 * $4,
+                    $6,
+                    build_history.ema_output_size_bytes),
                 sample_count = build_history.sample_count + 1,
                 last_updated = now()
             "#,
@@ -395,6 +426,8 @@ impl SchedulerDb {
         .bind(system)
         .bind(actual_duration_secs)
         .bind(EMA_ALPHA)
+        .bind(peak_mem)
+        .bind(out_size)
         .execute(&self.pool)
         .await?;
 
@@ -596,7 +629,7 @@ mod tests {
         let test_db = TestDb::new(&MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
-        db.update_build_history("hello", "x86_64-linux", 10.0)
+        db.update_build_history("hello", "x86_64-linux", 10.0, None, None)
             .await?;
         let (ema1, count1): (f64, i32) = sqlx::query_as(
             "SELECT ema_duration_secs, sample_count FROM build_history \
@@ -607,7 +640,7 @@ mod tests {
         assert!((ema1 - 10.0).abs() < 0.001, "first insert: ema={ema1}");
         assert_eq!(count1, 1);
 
-        db.update_build_history("hello", "x86_64-linux", 20.0)
+        db.update_build_history("hello", "x86_64-linux", 20.0, None, None)
             .await?;
         let (ema2, count2): (f64, i32) = sqlx::query_as(
             "SELECT ema_duration_secs, sample_count FROM build_history \
@@ -621,6 +654,109 @@ mod tests {
             "second update: expected {expected}, got {ema2}"
         );
         assert_eq!(count2, 2);
+        Ok(())
+    }
+
+    /// The COALESCE(blend, new, old) pattern for the nullable resource
+    /// EMAs. All four old×new combinations in one test: the hard part
+    /// is the `None` cases, where a naïve `old*0.7 + 0*0.3` would drag
+    /// a real EMA toward zero on every build with a failed proc read.
+    #[tokio::test]
+    async fn test_update_build_history_memory_ema_none_is_no_signal() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let fetch = || async {
+            sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+                "SELECT ema_peak_memory_bytes, ema_output_size_bytes \
+                 FROM build_history WHERE pname = 'mem' AND system = 'x86_64-linux'",
+            )
+            .fetch_one(&test_db.pool)
+            .await
+        };
+
+        // 1. old=None, new=None → stays None.
+        db.update_build_history("mem", "x86_64-linux", 1.0, None, None)
+            .await?;
+        let (mem, out) = fetch().await?;
+        assert_eq!(mem, None, "None×None: mem should stay NULL");
+        assert_eq!(out, None, "None×None: out should stay NULL");
+
+        // 2. old=None, new=Some → initializes (blend is NULL, falls
+        //    to $new).
+        db.update_build_history("mem", "x86_64-linux", 1.0, Some(100_000_000), Some(5000))
+            .await?;
+        let (mem, out) = fetch().await?;
+        assert!(
+            mem.is_some_and(|m| (m - 100_000_000.0).abs() < 0.001),
+            "None×Some: mem should initialize to 100M, got {mem:?}"
+        );
+        assert!(
+            out.is_some_and(|o| (o - 5000.0).abs() < 0.001),
+            "None×Some: out should initialize to 5000, got {out:?}"
+        );
+
+        // 3. old=Some, new=None → KEEPS old (the important case — no
+        //    signal doesn't drag). blend is NULL (x+NULL), falls to
+        //    $new=NULL, falls to old.
+        db.update_build_history("mem", "x86_64-linux", 1.0, None, None)
+            .await?;
+        let (mem, out) = fetch().await?;
+        assert!(
+            mem.is_some_and(|m| (m - 100_000_000.0).abs() < 0.001),
+            "Some×None: mem should be UNCHANGED at 100M (no drag), got {mem:?}"
+        );
+        assert!(
+            out.is_some_and(|o| (o - 5000.0).abs() < 0.001),
+            "Some×None: out should be UNCHANGED at 5000 (no drag), got {out:?}"
+        );
+
+        // 4. old=Some, new=Some → normal EMA blend.
+        db.update_build_history("mem", "x86_64-linux", 1.0, Some(200_000_000), Some(10_000))
+            .await?;
+        let (mem, out) = fetch().await?;
+        let expect_mem = 100_000_000.0 * (1.0 - EMA_ALPHA) + 200_000_000.0 * EMA_ALPHA;
+        let expect_out = 5000.0 * (1.0 - EMA_ALPHA) + 10_000.0 * EMA_ALPHA;
+        assert!(
+            mem.is_some_and(|m| (m - expect_mem).abs() < 0.001),
+            "Some×Some: mem should blend to {expect_mem}, got {mem:?}"
+        );
+        assert!(
+            out.is_some_and(|o| (o - expect_out).abs() < 0.001),
+            "Some×Some: out should blend to {expect_out}, got {out:?}"
+        );
+
+        Ok(())
+    }
+
+    /// D3's estimator reads `ema_peak_memory_bytes` for D7's memory-bump
+    /// classify(). Verify the write→read roundtrip works end to end.
+    #[tokio::test]
+    async fn test_build_history_memory_roundtrip_read() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        db.update_build_history(
+            "roundtrip",
+            "aarch64-linux",
+            42.0,
+            Some(1_073_741_824),
+            None,
+        )
+        .await?;
+
+        let rows = db.read_build_history().await?;
+        let row = rows
+            .iter()
+            .find(|(p, s, _, _)| p == "roundtrip" && s == "aarch64-linux")
+            .expect("written row should be readable");
+
+        assert!((row.2 - 42.0).abs() < 0.001, "duration: {}", row.2);
+        assert!(
+            row.3.is_some_and(|m| (m - 1_073_741_824.0).abs() < 0.001),
+            "peak mem: {:?}",
+            row.3
+        );
         Ok(())
     }
 }

@@ -14,6 +14,11 @@ impl DagActor {
         // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
         drv_key: &str,
         result: rio_proto::types::BuildResult,
+        // CompletionReport resource fields. 0 = worker had no signal
+        // (proc gone, build failed). Converted to None before the DB
+        // write so the EMA isn't dragged toward zero by non-data.
+        peak_memory_bytes: u64,
+        output_size_bytes: u64,
     ) {
         let status =
             rio_proto::types::BuildResultStatus::try_from(result.status).unwrap_or_else(|_| {
@@ -66,8 +71,14 @@ impl DagActor {
             rio_proto::types::BuildResultStatus::Built
             | rio_proto::types::BuildResultStatus::Substituted
             | rio_proto::types::BuildResultStatus::AlreadyValid => {
-                self.handle_success_completion(drv_hash, &result, worker_id)
-                    .await;
+                self.handle_success_completion(
+                    drv_hash,
+                    &result,
+                    worker_id,
+                    peak_memory_bytes,
+                    output_size_bytes,
+                )
+                .await;
             }
             rio_proto::types::BuildResultStatus::TransientFailure
             | rio_proto::types::BuildResultStatus::InfrastructureFailure => {
@@ -105,6 +116,8 @@ impl DagActor {
         drv_hash: &str,
         result: &rio_proto::types::BuildResult,
         worker_id: &str,
+        peak_memory_bytes: u64,
+        output_size_bytes: u64,
     ) {
         // Transition to completed
         if let Some(state) = self.dag.node_mut(drv_hash) {
@@ -167,14 +180,21 @@ impl DagActor {
             let duration_secs = stop.seconds.saturating_sub(start.seconds) as f64
                 + stop.nanos.saturating_sub(start.nanos) as f64 / 1_000_000_000.0;
             // Sanity bound: reject durations > 30 days (bogus worker timestamps)
-            if duration_secs > 0.0
-                && duration_secs < 30.0 * 86400.0
-                && let Err(e) = self
+            if duration_secs > 0.0 && duration_secs < 30.0 * 86400.0 {
+                // 0 → None: "no signal" must not drag the EMA toward
+                // zero. The worker explicitly uses 0 for proc-gone /
+                // early-fail paths. A real build that uses literally
+                // zero bytes of RSS doesn't exist (nix-daemon alone
+                // is ~10MB), so this mapping loses nothing.
+                let peak_mem = (peak_memory_bytes > 0).then_some(peak_memory_bytes);
+                let out_size = (output_size_bytes > 0).then_some(output_size_bytes);
+                if let Err(e) = self
                     .db
-                    .update_build_history(pname, &state.system, duration_secs)
+                    .update_build_history(pname, &state.system, duration_secs, peak_mem, out_size)
                     .await
-            {
-                error!(drv_hash, error = %e, "failed to update build history EMA");
+                {
+                    error!(drv_hash, error = %e, "failed to update build history EMA");
+                }
             }
         }
 
