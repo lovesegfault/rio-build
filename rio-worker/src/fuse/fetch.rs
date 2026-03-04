@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fuser::Errno;
+use tracing::instrument;
 
 use super::NixStoreFs;
 use super::cache::FetchClaim;
@@ -60,6 +61,13 @@ impl NixStoreFs {
     }
 
     /// Fetch a store path's NAR from remote store and extract to local cache.
+    ///
+    /// Debug-level span: this is the slow path (cache miss → gRPC + NAR
+    /// extract), called at most once per store path per worker lifetime.
+    /// Not on lookup/read (those are hot — kernel caches attr for 1h TTL
+    /// so they fire once per path per process, but still high-volume).
+    /// The `ensure_cached` caller is too broad (fast-path returns early).
+    #[instrument(level = "debug", skip(self), fields(store_basename = %store_basename))]
     fn fetch_and_extract(&self, store_basename: &str) -> Result<PathBuf, Errno> {
         // Increment on miss (entry to this function), not on fetch success:
         // failed fetches (store outage, NAR parse error) are still cache

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
+use tracing::instrument;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use rio_nix::derivation::Derivation;
@@ -166,6 +167,21 @@ fn read_vmhwm_bytes(pid: u32) -> Option<u64> {
 /// This is the main entry point for building a derivation. It handles
 /// the full lifecycle: overlay setup, synthetic DB, daemon invocation,
 /// log streaming, output upload, and cleanup.
+///
+/// This is the ROOT span for the worker's contribution to a build trace.
+/// Per observability.md:152 (trace structure), child spans are:
+/// `fetch_drv_from_store`, `compute_input_closure`, `fetch_input_metadata`,
+/// `generate_db`, `spawn_daemon_in_namespace`, `run_daemon_build`,
+/// `upload_all_outputs`. `drv_path` is the primary identifier (matches
+/// scheduler's `drv_key` span field via the derivation hash substring).
+#[instrument(
+    skip_all,
+    fields(
+        drv_path = %assignment.drv_path,
+        worker_id = %env.worker_id,
+        is_fod = assignment.is_fixed_output,
+    )
+)]
 pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,

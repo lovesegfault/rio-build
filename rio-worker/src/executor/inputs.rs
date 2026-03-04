@@ -4,6 +4,7 @@ use std::path::Path;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tonic::transport::Channel;
+use tracing::instrument;
 
 use rio_nix::derivation::Derivation;
 use rio_proto::StoreServiceClient;
@@ -76,6 +77,7 @@ pub(super) fn verify_fod_hashes(
 }
 
 /// Fetch metadata for all input paths from the store.
+#[instrument(skip_all, fields(input_count = input_paths.len()))]
 pub(super) async fn fetch_input_metadata(
     store_client: &StoreServiceClient<Channel>,
     input_paths: &[String],
@@ -118,6 +120,7 @@ pub(super) async fn fetch_input_metadata(
 /// Used when the scheduler sends `drv_content: empty` (Phase 2a default).
 /// The .drv is a single regular file in the store, so we fetch its NAR and
 /// extract the ATerm content via `extract_single_file`.
+#[instrument(skip_all, fields(drv_path = %drv_path))]
 pub(super) async fn fetch_drv_from_store(
     store_client: &mut StoreServiceClient<Channel>,
     drv_path: &str,
@@ -156,6 +159,7 @@ pub(super) async fn fetch_drv_from_store(
 /// upload time from the NAR content) and walk the reference graph via
 /// QueryPathInfo. Paths not yet in the store (e.g., outputs of not-yet-built
 /// input drvs) are skipped — FUSE will lazy-fetch them at build time.
+#[instrument(skip_all)]
 pub(super) async fn compute_input_closure(
     store_client: &StoreServiceClient<Channel>,
     drv: &Derivation,
