@@ -197,7 +197,7 @@ CREATE TABLE narinfo (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-> **Phase 2a deferral:** The `manifests` + `manifest_data` + `chunks` tables below are the Phase 2c target schema (chunked NAR storage with FastCDC/BLAKE3 dedup). Phase 2a uses a simpler `nar_blobs` table storing full NARs — see `migrations/002_store_tables.sql` for the actual Phase 2a schema.
+> The `manifests` + `manifest_data` + `chunks` tables are the active schema as of Phase 2c (migration `006_phase2c.sql` dropped the Phase 2a `nar_blobs` table). Small NARs (< 256 KiB) store inline in `manifests.inline_blob`; larger NARs are FastCDC-chunked with BLAKE3 dedup. **ChunkBackend wiring in `main.rs` is deferred to Phase 3a** — the chunking library (C1-C6) is complete and tested, but the binary runs inline-only until the backend is constructed from config.
 
 CREATE TABLE manifests (
     store_path_hash  BYTEA PRIMARY KEY
@@ -275,16 +275,17 @@ CREATE INDEX idx_pending_s3_deletes_drain
 ## Key Files (Phase 2a)
 
 - `rio-store/src/grpc.rs` --- StoreService gRPC implementation (PutPath, GetPath, QueryPathInfo, FindMissingPaths)
-- `rio-store/src/metadata.rs` --- PathInfo, narinfo persistence (PostgreSQL)
+- `rio-store/src/metadata.rs` --- narinfo + manifests persistence (PostgreSQL, rewritten for Phase 2c)
 - `rio-store/src/validate.rs` --- NAR hash verification (HashingReader, NarDigest)
-- `rio-store/src/backend/` --- NarBackend trait + filesystem, S3, memory backends
+- `rio-store/src/backend/` --- ChunkBackend trait + S3/filesystem/memory impls
+- `rio-store/src/cas.rs` --- put_chunked, ChunkCache (moka + singleflight + BLAKE3 verify), reassemble
+- `rio-store/src/chunker.rs` --- FastCDC wrapper (16K/64K/256K min/avg/max)
+- `rio-store/src/manifest.rs` --- Chunk manifest (de)serialization, versioned binary format
+- `rio-store/src/content_index.rs` --- nar_hash → store_path reverse index (CA ContentLookup)
+- `rio-store/src/realisations.rs` --- CA (drv_hash, output_name) → output_path mapping
+- `rio-store/src/cache_server.rs` --- axum binary cache HTTP (narinfo + nar.zst routes)
+- `rio-store/src/signing.rs` --- ed25519 narinfo signing at PutPath time
 
-## Planned Files (Phase 2c+)
+## Planned Files (Phase 3a+)
 
-- `rio-store/src/cas.rs` --- Chunked CAS put/get with integrity verification
-- `rio-store/src/chunker.rs` --- FastCDC content-defined chunking
-- `rio-store/src/manifest.rs` --- Chunk manifest (ordered digest list)
-- `rio-store/src/content_index.rs` --- Content hash -> store path index (CA cutoff)
-- `rio-store/src/cache_server.rs` --- Binary cache HTTP server (axum) with `/nix-cache-info`
 - `rio-store/src/gc.rs` --- Garbage collection (mark/grace/sweep + orphan cleanup)
-- `rio-store/src/signing.rs` --- ed25519 NAR signing/verification
