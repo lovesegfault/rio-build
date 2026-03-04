@@ -125,7 +125,7 @@ impl DagActor {
     /// a large worker is just slightly wasteful. scheduler.md:158.
     fn find_worker_with_overflow(
         &self,
-        drv_hash: &str,
+        drv_hash: &DrvHash,
         target_class: Option<&str>,
     ) -> (Option<WorkerId>, Option<String>) {
         let Some(drv_state) = self.dag.node(drv_hash) else {
@@ -180,7 +180,11 @@ impl DagActor {
     /// Transition a derivation to Assigned and send it to the worker.
     /// Returns `true` if the assignment was sent, `false` if it failed
     /// (caller should defer the derivation, not retry immediately).
-    pub(super) async fn assign_to_worker(&mut self, drv_hash: &str, worker_id: &str) -> bool {
+    pub(super) async fn assign_to_worker(
+        &mut self,
+        drv_hash: &DrvHash,
+        worker_id: &WorkerId,
+    ) -> bool {
         // Transition ready -> assigned. Do this FIRST (before recording latency
         // or clearing ready_at) so a rejected transition doesn't pollute metrics.
         if let Some(state) = self.dag.node_mut(drv_hash) {
@@ -189,8 +193,8 @@ impl DagActor {
                 // Caller will defer; the next dispatch pass drops it via the
                 // status != Ready guard. Log so operators can spot races.
                 warn!(
-                    drv_hash,
-                    worker_id,
+                    drv_hash = %drv_hash,
+                    worker_id = %worker_id,
                     current = ?state.status(),
                     error = %e,
                     "Ready->Assigned transition rejected in assign_to_worker (TOCTOU)"
@@ -205,7 +209,7 @@ impl DagActor {
                 metrics::histogram!("rio_scheduler_assignment_latency_seconds")
                     .record(latency.as_secs_f64());
             }
-            state.assigned_worker = Some(worker_id.into());
+            state.assigned_worker = Some(worker_id.clone());
         }
 
         // Update DB (non-terminal: log failure, don't block dispatch)
@@ -214,7 +218,7 @@ impl DagActor {
             .update_derivation_status(drv_hash, DerivationStatus::Assigned, Some(worker_id))
             .await
         {
-            error!(drv_hash, worker_id, error = %e, "failed to persist Assigned status");
+            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e, "failed to persist Assigned status");
         }
 
         // Create assignment in DB
@@ -225,12 +229,12 @@ impl DagActor {
                 .insert_assignment(db_id, worker_id, self.generation)
                 .await
         {
-            error!(drv_hash, worker_id, error = %e, "failed to insert assignment record");
+            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e, "failed to insert assignment record");
         }
 
         // Track on worker
         if let Some(worker) = self.workers.get_mut(worker_id) {
-            worker.running_builds.insert(drv_hash.into());
+            worker.running_builds.insert(drv_hash.clone());
         }
 
         // Send WorkAssignment to worker via stream
@@ -264,8 +268,8 @@ impl DagActor {
                 && let Err(e) = tx.try_send(msg)
             {
                 warn!(
-                    worker_id,
-                    drv_hash,
+                    worker_id = %worker_id,
+                    drv_hash = %drv_hash,
                     error = %e,
                     "failed to send assignment to worker"
                 );
@@ -287,8 +291,8 @@ impl DagActor {
                     // with no worker actually building. Heartbeat reconciliation
                     // may eventually catch this, but it's a visible hang until then.
                     error!(
-                        drv_hash,
-                        worker_id,
+                        drv_hash = %drv_hash,
+                        worker_id = %worker_id,
                         current = ?state.status(),
                         error = %e,
                         "reset_to_ready failed after assignment send failure; derivation orphaned in Assigned"
@@ -309,7 +313,7 @@ impl DagActor {
                     rio_proto::types::DerivationEvent {
                         derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
                             warn!(
-                                drv_hash,
+                                drv_hash = %drv_hash,
                                 "drv_hash_to_path returned None; using hash as fallback"
                             );
                             drv_hash.to_string()
@@ -324,7 +328,7 @@ impl DagActor {
             );
         }
 
-        debug!(drv_hash, worker_id, "assigned derivation to worker");
+        debug!(drv_hash = %drv_hash, worker_id = %worker_id, "assigned derivation to worker");
         metrics::counter!("rio_scheduler_assignments_total").increment(1);
         true
     }

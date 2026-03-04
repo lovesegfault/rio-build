@@ -692,20 +692,20 @@ impl DagActor {
         }
     }
 
-    fn get_interested_builds(&self, drv_hash: &str) -> Vec<Uuid> {
+    fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {
         self.dag
             .node(drv_hash)
             .map(|s| s.interested_builds.iter().copied().collect())
             .unwrap_or_default()
     }
 
-    fn drv_hash_to_path(&self, drv_hash: &str) -> Option<String> {
+    fn drv_hash_to_path(&self, drv_hash: &DrvHash) -> Option<String> {
         self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
     }
 
     /// Whether any interested build for this derivation is interactive (IFD).
     /// Interactive derivations get a priority boost (D5).
-    fn should_prioritize(&self, drv_hash: &str) -> bool {
+    fn should_prioritize(&self, drv_hash: &DrvHash) -> bool {
         self.get_interested_builds(drv_hash).iter().any(|build_id| {
             self.builds
                 .get(build_id)
@@ -723,7 +723,7 @@ impl DagActor {
     /// caller probably shouldn't be pushing it, but 0.0 = lowest
     /// priority = harmless (stale entries get skipped on pop anyway
     /// if status != Ready).
-    fn queue_priority(&self, drv_hash: &str) -> f64 {
+    fn queue_priority(&self, drv_hash: &DrvHash) -> f64 {
         let base = self.dag.node(drv_hash).map(|n| n.priority).unwrap_or(0.0);
         if self.should_prioritize(drv_hash) {
             base + crate::queue::INTERACTIVE_BOOST
@@ -766,24 +766,24 @@ impl DagActor {
     /// re-queued, a new worker builds it from scratch, and that worker's
     /// logs replace the partial ones. The ring buffer gets `discard()`ed
     /// by the BuildExecution recv task on worker disconnect (future: C10).
-    fn trigger_log_flush(&self, drv_hash: &str, interested_builds: Vec<Uuid>) {
+    fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
         let Some(tx) = &self.log_flush_tx else {
             return;
         };
         let Some(drv_path) = self.drv_hash_to_path(drv_hash) else {
             // Should be impossible at this call site (completion handlers
             // already validated the hash exists in the DAG), but defensive.
-            warn!(drv_hash, "trigger_log_flush: hash not in DAG, skipping");
+            warn!(drv_hash = %drv_hash, "trigger_log_flush: hash not in DAG, skipping");
             return;
         };
         let req = crate::logs::FlushRequest {
             drv_path,
-            drv_hash: drv_hash.to_string(),
+            drv_hash: drv_hash.clone(),
             interested_builds,
         };
         if tx.try_send(req).is_err() {
             warn!(
-                drv_hash,
+                drv_hash = %drv_hash,
                 "log flush channel full, dropped; periodic tick will snapshot"
             );
             metrics::counter!("rio_scheduler_log_flush_dropped_total").increment(1);

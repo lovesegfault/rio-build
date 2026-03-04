@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::LogBuffers;
+use crate::state::DrvHash;
 
 /// How often to snapshot active buffers to S3. Per `observability.md:38-40`:
 /// bounds log loss on crash to ≤30s; lower = more S3 PUTs + CPU.
@@ -49,7 +50,7 @@ pub struct FlushRequest {
     /// The buffer key.
     pub drv_path: String,
     /// For the S3 key (`logs/{build_id}/{drv_hash}.log.gz`) and PG row.
-    pub drv_hash: String,
+    pub drv_hash: DrvHash,
     /// One PG row per build, all pointing at the same S3 blob. The derivation
     /// builds exactly once even if N builds want it (DAG merging).
     pub interested_builds: Vec<Uuid>,
@@ -189,7 +190,7 @@ impl LogFlusher {
             let basename = drv_path.rsplit('/').next().unwrap_or(&drv_path).to_string();
             let req = FlushRequest {
                 drv_path,
-                drv_hash: format!("periodic/{basename}"),
+                drv_hash: format!("periodic/{basename}").into(),
                 interested_builds: Vec::new(), // no PG rows for periodic
             };
             self.upload_and_record(req, line_count, raw_bytes, lines, false)
@@ -340,7 +341,7 @@ fn gzip_lines(lines: &[Vec<u8>]) -> std::io::Result<Vec<u8>> {
 async fn insert_log_rows(
     pool: &PgPool,
     build_ids: &[Uuid],
-    drv_hash: &str,
+    drv_hash: &DrvHash,
     s3_key: &str,
     line_count: u64,
     byte_size: u64,
@@ -360,7 +361,7 @@ async fn insert_log_rows(
                  created_at = now()",
         )
         .bind(bid)
-        .bind(drv_hash)
+        .bind(drv_hash.as_str())
         .bind(s3_key)
         .bind(line_count as i64)
         .bind(byte_size as i64)
@@ -614,8 +615,9 @@ mod tests {
         let build_id = Uuid::new_v4();
         seed_build(&db.pool, build_id).await?;
 
-        insert_log_rows(&db.pool, &[build_id], "hash", "key-v1", 10, 100, false).await?;
-        insert_log_rows(&db.pool, &[build_id], "hash", "key-v2", 50, 500, true).await?;
+        let hash = DrvHash::from("hash");
+        insert_log_rows(&db.pool, &[build_id], &hash, "key-v1", 10, 100, false).await?;
+        insert_log_rows(&db.pool, &[build_id], &hash, "key-v2", 50, 500, true).await?;
 
         let row: (String, i64, bool) = sqlx::query_as(
             "SELECT s3_key, line_count, is_complete FROM build_logs

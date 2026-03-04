@@ -10,7 +10,7 @@ impl DagActor {
     #[instrument(skip(self, result), fields(worker_id = %worker_id, drv_key = %drv_key))]
     pub(super) async fn handle_completion(
         &mut self,
-        worker_id: &str,
+        worker_id: &WorkerId,
         // gRPC layer passes CompletionReport.drv_path; may be a drv_hash in tests.
         drv_key: &str,
         result: rio_proto::types::BuildResult,
@@ -30,27 +30,29 @@ impl DagActor {
             });
 
         // Resolve drv_key (which may be a drv_path or a drv_hash) to drv_hash.
-        let resolved_hash: DrvHash;
-        let drv_hash: &str = if self.dag.contains(drv_key) {
-            drv_key
+        // Boundary: construct the typed DrvHash ONCE here, then pass &DrvHash
+        // to all internal handlers. The gRPC layer sends raw &str; internal
+        // functions after this point use the newtype.
+        let drv_hash: DrvHash = if self.dag.contains(drv_key) {
+            drv_key.into()
         } else if let Some(h) = self.drv_path_to_hash(drv_key) {
-            resolved_hash = h;
-            &resolved_hash
+            h
         } else {
             warn!(key = drv_key, "completion for unknown derivation, ignoring");
             return;
         };
+        let drv_hash = &drv_hash;
 
         // Find the derivation in the DAG
         let Some(state) = self.dag.node(drv_hash) else {
-            warn!(drv_hash, "completion for unknown derivation, ignoring");
+            warn!(drv_hash = %drv_hash, "completion for unknown derivation, ignoring");
             return;
         };
         let current_status = state.status();
 
         // Idempotency: completed -> completed is a no-op
         if current_status == DerivationStatus::Completed {
-            debug!(drv_hash, "duplicate completion report, ignoring");
+            debug!(drv_hash = %drv_hash, "duplicate completion report, ignoring");
             return;
         }
 
@@ -60,7 +62,7 @@ impl DagActor {
             DerivationStatus::Assigned | DerivationStatus::Running
         ) {
             warn!(
-                drv_hash,
+                drv_hash = %drv_hash,
                 current_status = %current_status,
                 "completion for derivation not in assigned/running state, ignoring"
             );
@@ -94,7 +96,7 @@ impl DagActor {
             }
             rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
-                    drv_hash,
+                    drv_hash = %drv_hash,
                     status = result.status,
                     "unknown build result status, treating as transient failure"
                 );
@@ -113,9 +115,9 @@ impl DagActor {
 
     pub(super) async fn handle_success_completion(
         &mut self,
-        drv_hash: &str,
+        drv_hash: &DrvHash,
         result: &rio_proto::types::BuildResult,
-        worker_id: &str,
+        worker_id: &WorkerId,
         peak_memory_bytes: u64,
         output_size_bytes: u64,
     ) {
@@ -125,7 +127,7 @@ impl DagActor {
             if state.status() == DerivationStatus::Assigned
                 && let Err(e) = state.transition(DerivationStatus::Running)
             {
-                warn!(drv_hash, error = %e, "Assigned->Running transition failed");
+                warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
             }
             if let Err(e) = state.transition(DerivationStatus::Completed) {
                 // Worker reported success but the in-memory state machine rejected
@@ -133,8 +135,8 @@ impl DagActor {
                 // or reset by heartbeat reconciliation in a race). The build result
                 // is lost; downstream derivations will never be released.
                 error!(
-                    drv_hash,
-                    worker_id,
+                    drv_hash = %drv_hash,
+                    worker_id = %worker_id,
                     current_state = ?state.status(),
                     error = %e,
                     "worker reported success but Running->Completed transition rejected; build will hang"
@@ -158,7 +160,7 @@ impl DagActor {
             .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
             .await
         {
-            error!(drv_hash, error = %e, "failed to update derivation status in DB");
+            error!(drv_hash = %drv_hash, error = %e, "failed to update derivation status in DB");
         }
 
         // Update assignment (non-terminal progress write: log failure, don't block)
@@ -169,7 +171,7 @@ impl DagActor {
                 .update_assignment_status(db_id, crate::db::AssignmentStatus::Completed)
                 .await
         {
-            error!(drv_hash, error = %e, "failed to persist assignment completion");
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist assignment completion");
         }
 
         // Async: update build history EMA (best-effort statistics)
@@ -193,7 +195,7 @@ impl DagActor {
                     .update_build_history(pname, &state.system, duration_secs, peak_mem, out_size)
                     .await
                 {
-                    error!(drv_hash, error = %e, "failed to update build history EMA");
+                    error!(drv_hash = %drv_hash, error = %e, "failed to update build history EMA");
                 }
 
                 // Misclassification: routed to "small" but ran like
@@ -213,7 +215,7 @@ impl DagActor {
                     && duration_secs > 2.0 * cutoff
                 {
                     warn!(
-                        drv_hash,
+                        drv_hash = %drv_hash,
                         pname = %pname,
                         assigned_class = %assigned_class,
                         cutoff_secs = cutoff,
@@ -226,7 +228,7 @@ impl DagActor {
                         .update_build_history_misclassified(pname, &state.system, duration_secs)
                         .await
                     {
-                        error!(drv_hash, error = %e, "failed to write misclassification penalty");
+                        error!(drv_hash = %drv_hash, error = %e, "failed to write misclassification penalty");
                     }
                 }
             }
@@ -247,7 +249,7 @@ impl DagActor {
                     rio_proto::types::DerivationEvent {
                         derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
                             warn!(
-                                drv_hash,
+                                drv_hash = %drv_hash,
                                 "drv_hash_to_path returned None; using hash as fallback"
                             );
                             drv_hash.to_string()
@@ -321,9 +323,13 @@ impl DagActor {
         }
     }
 
-    pub(super) async fn handle_transient_failure(&mut self, drv_hash: &str, worker_id: &str) {
+    pub(super) async fn handle_transient_failure(
+        &mut self,
+        drv_hash: &DrvHash,
+        worker_id: &WorkerId,
+    ) {
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.failed_workers.insert(worker_id.into());
+            state.failed_workers.insert(worker_id.clone());
 
             // Check poison threshold
             if state.failed_workers.len() >= POISON_THRESHOLD {
@@ -331,10 +337,10 @@ impl DagActor {
                 if state.status() == DerivationStatus::Assigned
                     && let Err(e) = state.transition(DerivationStatus::Running)
                 {
-                    warn!(drv_hash, error = %e, "Assigned->Running transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
                 }
                 if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                    warn!(drv_hash, error = %e, "->Poisoned transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
                 }
                 state.poisoned_at = Some(Instant::now());
                 false
@@ -343,10 +349,10 @@ impl DagActor {
                 if state.status() == DerivationStatus::Assigned
                     && let Err(e) = state.transition(DerivationStatus::Running)
                 {
-                    warn!(drv_hash, error = %e, "Assigned->Running transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
                 }
                 if let Err(e) = state.transition(DerivationStatus::Failed) {
-                    warn!(drv_hash, error = %e, "Running->Failed transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
                 }
                 true
             } else {
@@ -354,10 +360,10 @@ impl DagActor {
                 if state.status() == DerivationStatus::Assigned
                     && let Err(e) = state.transition(DerivationStatus::Running)
                 {
-                    warn!(drv_hash, error = %e, "Assigned->Running transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
                 }
                 if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                    warn!(drv_hash, error = %e, "->Poisoned transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
                 }
                 state.poisoned_at = Some(Instant::now());
                 false
@@ -371,7 +377,7 @@ impl DagActor {
 
             // Schedule retry with backoff
             let backoff = self.retry_policy.backoff_duration(retry_count);
-            let drv_hash_owned: DrvHash = drv_hash.into();
+            let drv_hash_owned: DrvHash = drv_hash.clone();
 
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 state.retry_count += 1;
@@ -383,17 +389,17 @@ impl DagActor {
                 .update_derivation_status(drv_hash, DerivationStatus::Failed, None)
                 .await
             {
-                error!(drv_hash, error = %e, "failed to persist Failed status");
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist Failed status");
             }
             if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                error!(drv_hash, error = %e, "failed to persist retry increment");
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
             }
 
             // After backoff, transition failed -> ready
             // For simplicity in Phase 2a, we re-queue immediately with the backoff
             // duration logged. A full implementation would use a timer.
             debug!(
-                drv_hash,
+                drv_hash = %drv_hash,
                 retry_count = retry_count + 1,
                 backoff_secs = backoff.as_secs_f64(),
                 "scheduling retry after transient failure"
@@ -404,7 +410,7 @@ impl DagActor {
             // Phase 2a re-queues immediately (see docs/src/phases/phase2a.md).
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
                 if let Err(e) = state.transition(DerivationStatus::Ready) {
-                    warn!(drv_hash, error = %e, "Failed->Ready transition failed");
+                    warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
                 } else {
                     self.push_ready(drv_hash_owned);
                 }
@@ -415,7 +421,7 @@ impl DagActor {
                 .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
                 .await
             {
-                error!(drv_hash, error = %e, "failed to persist Poisoned status");
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
             }
 
             // Cascade: parents of a poisoned derivation can never complete.
@@ -432,19 +438,19 @@ impl DagActor {
 
     pub(super) async fn handle_permanent_failure(
         &mut self,
-        drv_hash: &str,
+        drv_hash: &DrvHash,
         error_msg: &str,
-        _worker_id: &str,
+        _worker_id: &WorkerId,
     ) {
         if let Some(state) = self.dag.node_mut(drv_hash) {
             if state.status() == DerivationStatus::Assigned
                 && let Err(e) = state.transition(DerivationStatus::Running)
             {
-                warn!(drv_hash, error = %e, "Assigned->Running transition failed");
+                warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
             }
             // Permanent failure -> poisoned (no retry)
             if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                warn!(drv_hash, error = %e, "->Poisoned transition failed");
+                warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
             }
             state.poisoned_at = Some(Instant::now());
         }
@@ -454,7 +460,7 @@ impl DagActor {
             .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
             .await
         {
-            error!(drv_hash, error = %e, "failed to persist Poisoned status");
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
         }
 
         // Cascade: parents of a poisoned derivation can never complete.
@@ -477,7 +483,7 @@ impl DagActor {
                     rio_proto::types::DerivationEvent {
                         derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
                             warn!(
-                                drv_hash,
+                                drv_hash = %drv_hash,
                                 "drv_hash_to_path returned None; using hash as fallback"
                             );
                             drv_hash.to_string()
@@ -502,7 +508,7 @@ impl DagActor {
     ///
     /// Without this, keepGoing builds with a poisoned leaf hang forever:
     /// parents stay Queued, so completed+failed never reaches total.
-    pub(super) async fn cascade_dependency_failure(&mut self, poisoned_hash: &str) {
+    pub(super) async fn cascade_dependency_failure(&mut self, poisoned_hash: &DrvHash) {
         let mut to_visit: Vec<DrvHash> = self.dag.get_parents(poisoned_hash);
         let mut visited: HashSet<DrvHash> = HashSet::new();
 
@@ -554,7 +560,7 @@ impl DagActor {
         }
     }
 
-    pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &str) {
+    pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
         // Sync counts from DAG ground truth. The cascade may have transitioned
         // additional parents to DependencyFailed; those must be counted here.
         self.update_build_counts(build_id);

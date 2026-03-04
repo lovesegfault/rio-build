@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use sqlx::{PgConnection, PgPool, QueryBuilder};
 use uuid::Uuid;
 
-use crate::state::{BuildState, DerivationStatus};
+use crate::state::{BuildState, DerivationStatus, DrvHash, WorkerId};
 
 /// Assignment lifecycle status (assignments table).
 ///
@@ -157,9 +157,9 @@ impl SchedulerDb {
     /// Update a derivation's status.
     pub async fn update_derivation_status(
         &self,
-        drv_hash: &str,
+        drv_hash: &DrvHash,
         status: DerivationStatus,
-        assigned_worker: Option<&str>,
+        assigned_worker: Option<&WorkerId>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -168,9 +168,9 @@ impl SchedulerDb {
             WHERE drv_hash = $1
             "#,
         )
-        .bind(drv_hash)
+        .bind(drv_hash.as_str())
         .bind(status.as_str())
-        .bind(assigned_worker)
+        .bind(assigned_worker.map(WorkerId::as_str))
         .execute(&self.pool)
         .await?;
 
@@ -178,11 +178,11 @@ impl SchedulerDb {
     }
 
     /// Increment the retry count for a derivation.
-    pub async fn increment_retry_count(&self, drv_hash: &str) -> Result<(), sqlx::Error> {
+    pub async fn increment_retry_count(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE derivations SET retry_count = retry_count + 1, updated_at = now() WHERE drv_hash = $1",
         )
-        .bind(drv_hash)
+        .bind(drv_hash.as_str())
         .execute(&self.pool)
         .await?;
 
@@ -294,7 +294,7 @@ impl SchedulerDb {
     pub async fn insert_assignment(
         &self,
         derivation_id: Uuid,
-        worker_id: &str,
+        worker_id: &WorkerId,
         generation: i64,
     ) -> Result<Uuid, sqlx::Error> {
         let row: (Uuid,) = sqlx::query_as(
@@ -305,7 +305,7 @@ impl SchedulerDb {
             "#,
         )
         .bind(derivation_id)
-        .bind(worker_id)
+        .bind(worker_id.as_str())
         .bind(generation)
         .fetch_one(&self.pool)
         .await?;
@@ -617,7 +617,8 @@ mod tests {
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let drv_id = insert_test_derivation(&db, "bbb").await?;
-        db.insert_assignment(drv_id, "worker-1", 1).await?;
+        db.insert_assignment(drv_id, &WorkerId::from("worker-1"), 1)
+            .await?;
 
         db.update_assignment_status(drv_id, AssignmentStatus::Acknowledged)
             .await?;
@@ -640,7 +641,8 @@ mod tests {
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let drv_id = insert_test_derivation(&db, "ccc").await?;
-        db.insert_assignment(drv_id, "worker-1", 1).await?;
+        db.insert_assignment(drv_id, &WorkerId::from("worker-1"), 1)
+            .await?;
 
         db.update_assignment_status(drv_id, AssignmentStatus::Completed)
             .await?;
