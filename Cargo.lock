@@ -3976,14 +3976,17 @@ name = "rio-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "figment",
  "futures-util",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "proptest",
  "serde",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tonic",
  "tracing",
