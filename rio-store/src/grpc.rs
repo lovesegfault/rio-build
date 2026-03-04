@@ -23,10 +23,39 @@ use rio_proto::types::{
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::backend::chunk::ChunkBackend;
-use crate::cas;
+use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
 use crate::validate::validate_nar_digest;
+
+/// Stream a Bytes value to the GetPath channel in NAR_CHUNK_SIZE pieces.
+///
+/// Returns `false` if the client disconnected (send failed) — caller
+/// should stop streaming. This is the one place the "slice into wire-
+/// sized pieces + send" loop lives; both the inline and chunked paths
+/// call it.
+///
+/// `.to_vec()` is one copy into the proto bytes field (protobuf needs
+/// owned `Vec<u8>`, no way around it). The input `Bytes` stays valid
+/// (Arc-refcounted), so for the chunked path this is the only copy
+/// between ChunkCache and the wire.
+async fn stream_bytes(
+    tx: &tokio::sync::mpsc::Sender<Result<GetPathResponse, Status>>,
+    bytes: &Bytes,
+) -> bool {
+    for slice in bytes.chunks(NAR_CHUNK_SIZE) {
+        if tx
+            .send(Ok(GetPathResponse {
+                msg: Some(get_path_response::Msg::NarChunk(slice.to_vec())),
+            }))
+            .await
+            .is_err()
+        {
+            return false; // client disconnected
+        }
+    }
+    true
+}
 
 use std::sync::Arc;
 
@@ -62,9 +91,16 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> Status {
 pub struct StoreServiceImpl {
     pool: PgPool,
     /// Chunk storage for NARs ≥ INLINE_THRESHOLD. `None` disables chunking
-    /// entirely (all NARs go inline, regardless of size). Tests use `None`
-    /// or `MemoryChunkBackend`; prod uses `S3ChunkBackend`.
+    /// entirely (all NARs go inline, regardless of size).
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    /// Cache for chunk reads (GetPath). Created once at construction;
+    /// shared across all GetPath calls (the moka LRU and singleflight map
+    /// are process-wide). `None` iff `chunk_backend` is None — they're
+    /// paired.
+    ///
+    /// `Arc` because the spawned GetPath streaming task needs an owned
+    /// handle (the task outlives the `&self` method call).
+    chunk_cache: Option<Arc<ChunkCache>>,
 }
 
 impl StoreServiceImpl {
@@ -76,17 +112,24 @@ impl StoreServiceImpl {
         Self {
             pool,
             chunk_backend: None,
+            chunk_cache: None,
         }
     }
 
     /// Create a StoreService with chunked storage enabled.
     ///
     /// NARs below `INLINE_THRESHOLD` (256 KiB) still go inline; larger
-    /// ones are FastCDC-chunked and uploaded via `backend`.
+    /// ones are FastCDC-chunked. The cache wraps `backend` for reads.
     pub fn with_chunk_backend(pool: PgPool, backend: Arc<dyn ChunkBackend>) -> Self {
+        // Cache holds its own Arc clone of the backend. `backend` is
+        // also kept directly for the write path (PutPath's put_chunked
+        // calls backend.put(), not cache — no point caching freshly-
+        // written chunks that nothing has asked for yet).
+        let cache = Arc::new(ChunkCache::new(Arc::clone(&backend)));
         Self {
             pool,
             chunk_backend: Some(backend),
+            chunk_cache: Some(cache),
         }
     }
 
@@ -478,15 +521,16 @@ impl StoreService for StoreServiceImpl {
 
     /// Download a store path's NAR data (streaming).
     ///
-    /// GetPath flow (phase 2c inline storage):
+    /// Flow:
     /// 1. Look up narinfo + manifest from PostgreSQL
-    /// 2. First response message: PathInfo metadata
-    /// 3. Subsequent messages: NAR data sliced into NAR_CHUNK_SIZE pieces
-    /// 4. Verify content integrity via SHA-256 (detects DB corruption/bitrot)
+    /// 2. First response: PathInfo metadata
+    /// 3. Stream NAR bytes — branch on inline vs chunked
+    /// 4. Verify whole-NAR SHA-256 (belt-and-suspenders over per-chunk BLAKE3)
     ///
-    /// E1 interim: handles `ManifestKind::Inline` only. The `Chunked` arm is
-    /// unreachable (PutPath always writes inline) but compiles so C5's
-    /// chunked reassembly is purely additive.
+    /// The chunked path streams chunk-by-chunk without materializing the
+    /// full NAR in memory — that's the whole point. K=8 parallel prefetch
+    /// via `buffered()` (NOT `buffer_unordered` — chunk order matters for
+    /// correct NAR reconstruction).
     #[instrument(skip(self, request), fields(rpc = "GetPath"))]
     async fn get_path(
         &self,
@@ -497,18 +541,15 @@ impl StoreService for StoreServiceImpl {
 
         validate_store_path(&req.store_path)?;
 
-        // Step 1: Look up narinfo (for the first response message).
+        // Step 1: narinfo + manifest.
         let info = metadata::query_path_info(&self.pool, &req.store_path)
             .await
             .map_err(|e| internal_error("GetPath: query_path_info", e))?
             .ok_or_else(|| Status::not_found(format!("path not found: {}", req.store_path)))?;
 
-        // Look up the manifest (inline blob or chunk list).
-        //
         // `None` here is defense-in-depth for a race where query_path_info
-        // found the narinfo but get_manifest doesn't find the manifest. Both
-        // queries filter on manifests.status='complete', so in practice they
-        // agree. If they don't, the narinfo is orphaned — treat as NOT_FOUND.
+        // found the narinfo but get_manifest doesn't. Both filter on
+        // manifests.status='complete', so in practice they agree.
         let manifest = metadata::get_manifest(&self.pool, &req.store_path)
             .await
             .map_err(|e| internal_error("GetPath: get_manifest", e))?
@@ -516,17 +557,31 @@ impl StoreService for StoreServiceImpl {
                 Status::not_found(format!("manifest not found for: {}", req.store_path))
             })?;
 
+        // Pre-flight: chunked manifest but no cache configured = we can't
+        // serve this path. Inline-only stores (tests, or a misconfigured
+        // deployment) hitting this means a PREVIOUS store instance wrote
+        // chunked data and this one can't read it. Fail clearly rather
+        // than the spawned task erroring with no context.
+        if matches!(manifest, ManifestKind::Chunked(_)) && self.chunk_cache.is_none() {
+            return Err(Status::failed_precondition(
+                "path is stored chunked but this store instance has no chunk backend configured",
+            ));
+        }
+
         let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
+        // Clone for the spawned task. Arc-clone is cheap; the cache
+        // itself (moka + DashMap) is shared.
+        let cache = self.chunk_cache.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-
         let info_raw: PathInfo = info.into();
+
         rio_common::task::spawn_monitored("get-path-stream", async move {
-            // Bound the entire streaming task. A slow-consuming client can
-            // otherwise keep this task alive forever, leaking resources.
+            // Bound the entire streaming task. A slow client otherwise
+            // keeps this alive forever.
             let stream_fut = async {
-                // First message: PathInfo
+                // Step 2: First message is PathInfo.
                 if tx
                     .send(Ok(GetPathResponse {
                         msg: Some(get_path_response::Msg::Info(info_raw)),
@@ -537,55 +592,90 @@ impl StoreService for StoreServiceImpl {
                     return;
                 }
 
-                // Step 3: Stream the NAR content. Branch on storage kind.
-                let nar_bytes = match manifest {
-                    ManifestKind::Inline(bytes) => bytes,
-                    ManifestKind::Chunked(_chunks) => {
-                        // E1 interim: unreachable (PutPath always inline).
-                        // C5 replaces this with reassemble_nar(chunks).
-                        let _ = tx
-                            .send(Err(Status::internal(
-                                "chunked NAR reassembly not yet implemented (phase2c C5)",
-                            )))
-                            .await;
-                        return;
-                    }
-                };
+                // Step 3+4: stream + verify. Both branches feed the hasher
+                // incrementally and check at the end. The chunked path
+                // streams chunk-by-chunk; the inline path is one blob.
+                let mut hasher = Sha256::new();
+                let mut total_bytes = 0u64;
 
-                // Slice into NAR_CHUNK_SIZE pieces. `Bytes::slice()` is
-                // zero-copy (refcounted Arc-bump + offset); `.to_vec()` is
-                // one copy into the outgoing proto bytes field (protobuf
-                // needs owned Vec<u8>, no way around this one).
-                for slice in nar_bytes.chunks(NAR_CHUNK_SIZE) {
-                    if tx
-                        .send(Ok(GetPathResponse {
-                            msg: Some(get_path_response::Msg::NarChunk(slice.to_vec())),
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        return; // Client disconnected
+                match manifest {
+                    ManifestKind::Inline(bytes) => {
+                        hasher.update(&bytes);
+                        total_bytes = bytes.len() as u64;
+                        if !stream_bytes(&tx, &bytes).await {
+                            return; // client disconnected
+                        }
+                    }
+                    ManifestKind::Chunked(entries) => {
+                        // Pre-flight checked cache is Some.
+                        let cache = cache.expect("pre-flight checked chunk_cache is Some");
+
+                        // K=8 parallel prefetch. `buffered()` preserves
+                        // order — chunk i arrives before chunk i+1 even if
+                        // i+1's fetch finishes first. `buffer_unordered`
+                        // would scramble the NAR.
+                        //
+                        // Each future is a cache.get_verified() call.
+                        // BLAKE3 verify happens inside that; any corrupt
+                        // chunk surfaces as ChunkError here.
+                        use futures_util::stream::{self, StreamExt};
+                        const PREFETCH_K: usize = 8;
+
+                        let mut chunk_stream = stream::iter(entries)
+                            .map(|(hash, _size)| {
+                                let cache = Arc::clone(&cache);
+                                async move { cache.get_verified(&hash).await }
+                            })
+                            .buffered(PREFETCH_K);
+
+                        while let Some(result) = chunk_stream.next().await {
+                            let chunk_bytes = match result {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    error!(error = %e, "GetPath: chunk fetch/verify failed");
+                                    // DATA_LOSS: the manifest says this
+                                    // chunk exists, but we can't get
+                                    // good bytes for it. S3 lost it,
+                                    // or it's corrupt.
+                                    let _ = tx
+                                        .send(Err(Status::data_loss(format!(
+                                            "chunk reassembly failed: {e}"
+                                        ))))
+                                        .await;
+                                    return;
+                                }
+                            };
+                            hasher.update(&chunk_bytes);
+                            total_bytes += chunk_bytes.len() as u64;
+                            if !stream_bytes(&tx, &chunk_bytes).await {
+                                return; // client disconnected
+                            }
+                        }
                     }
                 }
 
-                // Step 4: Verify content integrity — the inline_blob in PG
-                // may have been corrupted (TOAST storage bitrot, manual DB
-                // tampering). SHA-256 over the whole blob; if it doesn't
-                // match narinfo.nar_hash, send DATA_LOSS.
+                // Step 4: whole-NAR SHA-256 verify. The chunked path
+                // already BLAKE3-verified each chunk, so this is belt-
+                // and-suspenders: catches (a) the manifest being WRONG
+                // (right chunks, wrong order / missing one), (b) a bug
+                // in our reassembly, (c) narinfo.nar_hash being stale.
                 //
-                // This is cheap: the blob is already in memory (no disk
-                // re-read), and SHA-256 over a few MB is sub-millisecond.
-                // For the chunked path (C5), per-chunk BLAKE3 verification
-                // happens during reassembly, and this whole-NAR SHA-256
-                // stays as belt-and-suspenders.
-                let digest = crate::validate::NarDigest::from_bytes(&nar_bytes);
-                if let Err(e) = validate_nar_digest(&digest, &expected_hash, expected_size) {
-                    error!(error = %e, "GetPath: content integrity check failed");
+                // For inline, this is the PRIMARY check (no per-piece
+                // verify for inline blobs).
+                let actual: [u8; 32] = hasher.finalize().into();
+                if actual != expected_hash || total_bytes != expected_size {
+                    error!(
+                        expected_hash = %hex::encode(expected_hash),
+                        actual_hash = %hex::encode(actual),
+                        expected_size,
+                        total_bytes,
+                        "GetPath: whole-NAR integrity check failed"
+                    );
                     metrics::counter!("rio_store_integrity_failures_total").increment(1);
                     let _ = tx
-                        .send(Err(Status::data_loss(format!(
-                            "content integrity check failed: {e}"
-                        ))))
+                        .send(Err(Status::data_loss(
+                            "whole-NAR integrity check failed (SHA-256 or size mismatch)",
+                        )))
                         .await;
                 }
             };
