@@ -463,40 +463,53 @@ impl SchedulerService for MockScheduler {
 // spawn helpers
 // ============================================================================
 
+/// Spawn an in-process tonic server on a random port. Returns `(addr, handle)`.
+///
+/// Uses `yield_now()` for synchronization — the listener is already bound
+/// and accepting before `spawn` returns, so a single yield is sufficient to
+/// let the server task enter its accept loop. **Replaces the `sleep(50ms)`**
+/// that ~6 test modules were using after their own hand-rolled spawn,
+/// which was both slower and no more correct.
+///
+/// Accepts a prebuilt [`tonic::transport::server::Router`] so callers can
+/// compose any number of services:
+/// ```ignore
+/// let router = Server::builder()
+///     .add_service(FooServer::new(foo))
+///     .add_service(BarServer::new(bar));
+/// let (addr, handle) = spawn_grpc_server(router).await;
+/// ```
+pub async fn spawn_grpc_server(
+    router: tonic::transport::server::Router,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = tokio::spawn(async move {
+        router
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("in-process gRPC server");
+    });
+    tokio::task::yield_now().await;
+    (addr, handle)
+}
+
 /// Spawn a MockStore on an ephemeral port. Returns `(store, addr, handle)`.
 pub async fn spawn_mock_store()
 -> anyhow::Result<(MockStore, SocketAddr, tokio::task::JoinHandle<()>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
     let store = MockStore::new();
-    let store_clone = store.clone();
-    let handle = tokio::spawn(async move {
-        let incoming = TcpListenerStream::new(listener);
-        Server::builder()
-            .add_service(StoreServiceServer::new(store_clone))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock store server");
-    });
-    tokio::task::yield_now().await;
+    let router = Server::builder().add_service(StoreServiceServer::new(store.clone()));
+    let (addr, handle) = spawn_grpc_server(router).await;
     Ok((store, addr, handle))
 }
 
 /// Spawn a MockScheduler on an ephemeral port. Returns `(scheduler, addr, handle)`.
 pub async fn spawn_mock_scheduler()
 -> anyhow::Result<(MockScheduler, SocketAddr, tokio::task::JoinHandle<()>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
     let sched = MockScheduler::new();
-    let sched_clone = sched.clone();
-    let handle = tokio::spawn(async move {
-        let incoming = TcpListenerStream::new(listener);
-        Server::builder()
-            .add_service(SchedulerServiceServer::new(sched_clone))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock scheduler server");
-    });
-    tokio::task::yield_now().await;
+    let router = Server::builder().add_service(SchedulerServiceServer::new(sched.clone()));
+    let (addr, handle) = spawn_grpc_server(router).await;
     Ok((sched, addr, handle))
 }

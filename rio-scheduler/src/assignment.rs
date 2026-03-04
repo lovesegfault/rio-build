@@ -274,6 +274,7 @@ fn count_missing(worker: &WorkerState, input_paths: &[String]) -> usize {
 mod tests {
     use super::*;
     use rio_common::bloom::BloomFilter;
+    use rio_test_support::fixtures::{make_derivation_node, make_edge};
     use std::time::Instant;
 
     fn make_worker(id: &str, max: u32, running: u32) -> WorkerState {
@@ -296,18 +297,7 @@ mod tests {
     }
 
     fn make_drv() -> DerivationState {
-        let proto = rio_proto::types::DerivationNode {
-            drv_path: rio_test_support::fixtures::test_drv_path("test-drv"),
-            drv_hash: "test-drv".into(),
-            pname: "test".into(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-            drv_content: Vec::new(),
-        };
-        DerivationState::try_from_node(&proto).unwrap()
+        DerivationState::try_from_node(&make_derivation_node("test-drv", "x86_64-linux")).unwrap()
     }
 
     fn workers_map(ws: Vec<WorkerState>) -> HashMap<WorkerId, WorkerState> {
@@ -359,34 +349,14 @@ mod tests {
         // Build a DAG: drv depends on child, child has the input paths.
         let mut dag = DerivationDag::new();
         let child_proto = rio_proto::types::DerivationNode {
-            drv_path: rio_test_support::fixtures::test_drv_path("child"),
-            drv_hash: "child".into(),
-            pname: "child".into(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
             expected_output_paths: vec!["/nix/store/input-a".into(), "/nix/store/input-b".into()],
-            drv_content: Vec::new(),
+            ..make_derivation_node("child", "x86_64-linux")
         };
-        let drv_proto = rio_proto::types::DerivationNode {
-            drv_path: rio_test_support::fixtures::test_drv_path("test-drv"),
-            drv_hash: "test-drv".into(),
-            pname: "test".into(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-            drv_content: Vec::new(),
-        };
+        let drv_proto = make_derivation_node("test-drv", "x86_64-linux");
         dag.merge(
             uuid::Uuid::new_v4(),
             &[drv_proto.clone(), child_proto],
-            &[rio_proto::types::DerivationEdge {
-                parent_drv_path: rio_test_support::fixtures::test_drv_path("test-drv"),
-                child_drv_path: rio_test_support::fixtures::test_drv_path("child"),
-            }],
+            &[make_edge("test-drv", "child")],
         )
         .unwrap();
 
@@ -415,28 +385,14 @@ mod tests {
         // DAG with one input path that only A has.
         let mut dag = DerivationDag::new();
         let child_proto = rio_proto::types::DerivationNode {
-            drv_path: rio_test_support::fixtures::test_drv_path("child"),
-            drv_hash: "child".into(),
-            pname: "child".into(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
             expected_output_paths: vec!["/nix/store/big-input".into()],
-            drv_content: Vec::new(),
+            ..make_derivation_node("child", "x86_64-linux")
         };
-        let drv_proto = rio_proto::types::DerivationNode {
-            drv_path: rio_test_support::fixtures::test_drv_path("test-drv"),
-            drv_hash: "test-drv".into(),
-            ..make_drv_proto()
-        };
+        let drv_proto = make_derivation_node("test-drv", "x86_64-linux");
         dag.merge(
             uuid::Uuid::new_v4(),
             &[drv_proto.clone(), child_proto],
-            &[rio_proto::types::DerivationEdge {
-                parent_drv_path: rio_test_support::fixtures::test_drv_path("test-drv"),
-                child_drv_path: rio_test_support::fixtures::test_drv_path("child"),
-            }],
+            &[make_edge("test-drv", "child")],
         )
         .unwrap();
 
@@ -496,20 +452,6 @@ mod tests {
         let worker = make_worker("w", 4, 0); // bloom = None
         let inputs = vec!["/a".into(), "/b".into(), "/c".into()];
         assert_eq!(count_missing(&worker, &inputs), 3); // all missing
-    }
-
-    fn make_drv_proto() -> rio_proto::types::DerivationNode {
-        rio_proto::types::DerivationNode {
-            drv_path: rio_test_support::fixtures::test_drv_path("test-drv"),
-            drv_hash: "test-drv".into(),
-            pname: "test".into(),
-            system: "x86_64-linux".into(),
-            required_features: vec![],
-            output_names: vec!["out".into()],
-            is_fixed_output: false,
-            expected_output_paths: vec![],
-            drv_content: Vec::new(),
-        }
     }
 
     // ----- classify() tests -----

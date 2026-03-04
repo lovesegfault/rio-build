@@ -1,6 +1,7 @@
 //! NAR and PathInfo builders for tests, plus valid-store-path generators.
 
 use rio_nix::nar::NarNode;
+use rio_proto::types::{DerivationEdge, DerivationNode};
 use rio_proto::validated::ValidatedPathInfo;
 use sha2::{Digest, Sha256};
 
@@ -25,6 +26,41 @@ pub fn test_store_path(name: &str) -> String {
 /// Generate a valid full .drv store path (`/nix/store/{hash}-{name}.drv`).
 pub fn test_drv_path(name: &str) -> String {
     test_store_path(&format!("{name}.drv"))
+}
+
+/// Build a minimal `DerivationNode` for scheduler/DAG tests.
+///
+/// `drv_path` is auto-generated from `tag` via [`test_drv_path`], so
+/// callers get a valid `/nix/store/{32-char-hash}-{tag}.drv` path for free.
+/// `drv_hash` is set to `tag` (scheduler tests key on the hash string).
+///
+/// Consolidates five near-identical copies that were scattered across
+/// rio-scheduler test modules. The only variation among the originals was
+/// `pname` (`""` / `"test"` / `"test-pkg"`); none of the tests assert on
+/// it, so this uses `"test-pkg"` uniformly.
+pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
+    DerivationNode {
+        drv_hash: tag.into(),
+        drv_path: test_drv_path(tag),
+        pname: "test-pkg".into(),
+        system: system.into(),
+        required_features: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        expected_output_paths: vec![],
+        drv_content: Vec::new(),
+    }
+}
+
+/// Build a minimal `DerivationEdge` from tags.
+///
+/// Both `drv_path` fields are auto-generated via [`test_drv_path`],
+/// matching [`make_derivation_node`]'s path generation.
+pub fn make_edge(parent_tag: &str, child_tag: &str) -> DerivationEdge {
+    DerivationEdge {
+        parent_drv_path: test_drv_path(parent_tag),
+        child_drv_path: test_drv_path(child_tag),
+    }
 }
 
 /// Build a minimal NAR (single regular file) from raw contents.

@@ -1,21 +1,6 @@
 use super::*;
 use rio_proto::types::{DerivationEdge, DerivationNode};
-use rio_test_support::fixtures::test_drv_path;
-
-/// Build a test node. `drv_path` is auto-generated from `tag` via [`test_drv_path`].
-fn make_node(tag: &str, system: &str) -> DerivationNode {
-    DerivationNode {
-        drv_path: test_drv_path(tag),
-        drv_hash: tag.to_string(),
-        pname: String::new(),
-        system: system.to_string(),
-        required_features: vec![],
-        output_names: vec!["out".to_string()],
-        is_fixed_output: false,
-        expected_output_paths: vec![],
-        drv_content: Vec::new(),
-    }
-}
+use rio_test_support::fixtures::{make_derivation_node as make_node, make_edge, test_drv_path};
 
 /// Build a test node with an EXPLICIT `drv_path` (for deep-chain tests
 /// that generate their own valid 32-char-hash paths).
@@ -23,21 +8,7 @@ fn make_node_with_path(drv_hash: &str, drv_path: &str, system: &str) -> Derivati
     DerivationNode {
         drv_path: drv_path.to_string(),
         drv_hash: drv_hash.to_string(),
-        pname: String::new(),
-        system: system.to_string(),
-        required_features: vec![],
-        output_names: vec!["out".to_string()],
-        is_fixed_output: false,
-        expected_output_paths: vec![],
-        drv_content: Vec::new(),
-    }
-}
-
-/// Build a test edge from tags. Paths are auto-generated via [`test_drv_path`].
-fn make_edge(parent_tag: &str, child_tag: &str) -> DerivationEdge {
-    DerivationEdge {
-        parent_drv_path: test_drv_path(parent_tag),
-        child_drv_path: test_drv_path(child_tag),
+        ..make_node(drv_hash, system)
     }
 }
 

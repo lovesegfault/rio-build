@@ -13,21 +13,8 @@ async fn setup_inproc_store(
 
     // Inline storage in manifests.inline_blob (no chunk backend needed).
     let service = StoreServiceImpl::new(pool);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    // Fire-and-forget: aborted at test end, never joined.
-    let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(StoreServiceServer::new(service))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("test store gRPC server should run");
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let router = tonic::transport::Server::builder().add_service(StoreServiceServer::new(service));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
 
     let channel = Channel::from_shared(format!("http://{addr}"))?
         .connect()
