@@ -26,7 +26,6 @@
 }:
 let
   common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
-  inherit (common) busybox busyboxClosure databaseUrl;
 
   # The 5-node test DAG. Passed to `nix-build` on the client via
   # `--arg busybox '<storePath>'`.
@@ -36,54 +35,14 @@ pkgs.testers.runNixOSTest {
   name = "rio-phase2a";
 
   nodes = {
-    control = {
-      imports = [
-        rioModules.store
-        rioModules.scheduler
-        rioModules.gateway
-        common.postgresqlConfig
-      ];
-      networking.hostName = "control";
-
-      services.rio = {
-        package = rio-workspace;
-        logFormat = "pretty";
-        store = {
-          enable = true;
-          inherit databaseUrl;
-        };
-        scheduler = {
-          enable = true;
-          storeAddr = "localhost:9002";
-          inherit databaseUrl;
-        };
-        gateway = {
-          enable = true;
-          schedulerAddr = "localhost:9001";
-          storeAddr = "localhost:9002";
-          authorizedKeysPath = "/var/lib/rio/gateway/authorized_keys";
-        };
-      };
-
-      systemd.tmpfiles.rules = common.gatewayTmpfiles;
-
-      environment.systemPackages = [ pkgs.curl ];
-
-      # Open ports for cross-VM gRPC + SSH.
-      networking.firewall.allowedTCPPorts = [
-        2222
-        9001
-        9002
+    control = common.mkControlNode {
+      hostName = "control";
+      # 9090-9092: Prometheus metrics ports (gateway/scheduler/store).
+      extraFirewallPorts = [
         9090
         9091
         9092
       ];
-
-      virtualisation = {
-        memorySize = 1024;
-        diskSize = 4096;
-        cores = 4;
-      };
     };
 
     worker1 = common.mkWorkerNode {
@@ -105,11 +64,7 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Phase 1: Bootstrap control plane ──────────────────────────────
-    control.wait_for_unit("postgresql.service")
-    control.wait_for_unit("rio-store.service")
-    control.wait_for_open_port(9002)
-    control.wait_for_unit("rio-scheduler.service")
-    control.wait_for_open_port(9001)
+    ${common.waitForControlPlane "control"}
 
     # ── Phase 2: SSH key exchange + gateway start ─────────────────────
     ${common.sshKeySetup "control"}
@@ -125,33 +80,17 @@ pkgs.testers.runNixOSTest {
     )
 
     # ── Phase 4: Seed store via gateway ───────────────────────────────
-    # Sanity: busybox is in the client's local store.
-    client.succeed("ls ${busybox}")
-    # Upload busybox closure through the gateway (exercises wopAddToStoreNar /
-    # wopAddMultipleToStore). `--no-check-sigs` because the client's local
-    # store paths aren't signed.
-    client.succeed(
-        "nix copy --no-check-sigs --to 'ssh-ng://control' "
-        "$(cat ${busyboxClosure}/store-paths)"
-    )
+    ${common.seedBusybox "control"}
 
     # ── Phase 5: Milestone build ──────────────────────────────────────
-    # Build the 5-node fan-out DAG. `--no-link` to avoid pulling results back.
-    # `nix-build` (not `nix build`) for simpler --arg passing without flakes.
-    # On failure, dump worker journals before raising (testScript catches the
-    # exception from `succeed()` and re-raises after printing).
-    try:
-        client.succeed(
-            "nix-build --no-out-link "
-            "--store 'ssh-ng://control' "
-            "--arg busybox '(builtins.storePath ${busybox})' "
-            "${testDrvFile}"
-        )
-    except Exception:
-        for w in [worker1, worker2]:
-            w.execute("journalctl -u rio-worker --no-pager -n 200 >&2")
-        control.execute("journalctl -u rio-scheduler --no-pager -n 100 >&2")
-        raise
+    # Build the 5-node fan-out DAG. `--no-link` to avoid pulling results
+    # back. `nix-build` (not `nix build`) for simpler --arg passing
+    # without flakes. On failure, worker + scheduler journals are dumped.
+    ${common.mkBuildHelper {
+      gatewayHost = "control";
+      inherit testDrvFile;
+    }}
+    build([worker1, worker2])
 
     # ── Phase 6: Verification ─────────────────────────────────────────
     # Build succeeded (exit code already checked by succeed()).

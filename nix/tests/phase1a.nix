@@ -25,50 +25,17 @@
 }:
 let
   common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
-  inherit (common) busybox busyboxClosure databaseUrl;
+  inherit (common) busybox;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase1a";
 
   nodes = {
-    gateway = {
-      imports = [
-        rioModules.store
-        rioModules.scheduler
-        rioModules.gateway
-        common.postgresqlConfig
-      ];
-      networking.hostName = "gateway";
-
-      services.rio = {
-        package = rio-workspace;
-        logFormat = "pretty";
-        store = {
-          enable = true;
-          inherit databaseUrl;
-        };
-        scheduler = {
-          enable = true;
-          storeAddr = "localhost:9002";
-          inherit databaseUrl;
-        };
-        gateway = {
-          enable = true;
-          schedulerAddr = "localhost:9001";
-          storeAddr = "localhost:9002";
-          authorizedKeysPath = "/var/lib/rio/gateway/authorized_keys";
-        };
-      };
-
-      systemd.tmpfiles.rules = common.gatewayTmpfiles;
-
-      networking.firewall.allowedTCPPorts = [ 2222 ];
-
-      virtualisation = {
-        memorySize = 1024;
-        diskSize = 2048;
-        cores = 4;
-      };
+    # No workers → 9001/9002 firewall entries from mkControlNode are
+    # unused cross-VM, but harmless. diskSize=2048 suffices (no builds).
+    gateway = common.mkControlNode {
+      hostName = "gateway";
+      diskSize = 2048;
     };
 
     client = common.mkClientNode { gatewayHost = "gateway"; };
@@ -78,11 +45,7 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Bootstrap ─────────────────────────────────────────────────────
-    gateway.wait_for_unit("postgresql.service")
-    gateway.wait_for_unit("rio-store.service")
-    gateway.wait_for_open_port(9002)
-    gateway.wait_for_unit("rio-scheduler.service")
-    gateway.wait_for_open_port(9001)
+    ${common.waitForControlPlane "gateway"}
 
     # SSH key exchange + gateway restart
     ${common.sshKeySetup "gateway"}
@@ -93,11 +56,7 @@ pkgs.testers.runNixOSTest {
     client.succeed("nix store info --store 'ssh-ng://gateway'")
 
     # ── Seed store (for read-only queries to return real data) ────────
-    client.succeed("ls ${busybox}")
-    client.succeed(
-        "nix copy --no-check-sigs --to 'ssh-ng://gateway' "
-        "$(cat ${busyboxClosure}/store-paths)"
-    )
+    ${common.seedBusybox "gateway"}
 
     # ── Milestone: `nix path-info` ────────────────────────────────────
     # Exercises wopQueryPathInfo. Response should contain the store path.
