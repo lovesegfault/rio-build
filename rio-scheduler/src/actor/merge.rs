@@ -178,12 +178,6 @@ impl DagActor {
             .collect();
         let initial_states = self.dag.compute_initial_states(&remaining_new);
 
-        // Interactive builds (IFD) get priority: push_front instead of push_back
-        let is_interactive = self
-            .builds
-            .get(&build_id)
-            .is_some_and(|b| b.priority_class.is_interactive());
-
         // Track whether any newly inserted node was immediately marked
         // DependencyFailed (because a dep is already poisoned). If so, the
         // build may need to fail (!keepGoing) or terminate early (keepGoing).
@@ -207,11 +201,10 @@ impl DagActor {
                         {
                             error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status (build is Active; continuing)");
                         }
-                        if is_interactive {
-                            self.ready_queue.push_front(drv_hash.clone());
-                        } else {
-                            self.ready_queue.push_back(drv_hash.clone());
-                        }
+                        // push_ready computes critical-path priority +
+                        // interactive boost. Old push_front/push_back
+                        // split is now a number, not a position.
+                        self.push_ready(drv_hash.clone());
                     }
                     DerivationStatus::Queued => {
                         if let Err(e) = state.transition(DerivationStatus::Queued) {

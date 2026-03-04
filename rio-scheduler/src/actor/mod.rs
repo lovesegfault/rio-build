@@ -653,13 +653,39 @@ impl DagActor {
     }
 
     /// Whether any interested build for this derivation is interactive (IFD).
-    /// Interactive derivations get push_front on the ready queue.
+    /// Interactive derivations get a priority boost (D5).
     fn should_prioritize(&self, drv_hash: &str) -> bool {
         self.get_interested_builds(drv_hash).iter().any(|build_id| {
             self.builds
                 .get(build_id)
                 .is_some_and(|b| b.priority_class.is_interactive())
         })
+    }
+
+    /// Compute the effective queue priority for a derivation: its
+    /// critical-path priority + interactive boost if applicable.
+    ///
+    /// All queue pushes go through this. Replaces the old `push_front`/
+    /// `push_back` split — interactive is now a number, not a position.
+    ///
+    /// Returns 0.0 if the node isn't in the DAG (stale hash). The
+    /// caller probably shouldn't be pushing it, but 0.0 = lowest
+    /// priority = harmless (stale entries get skipped on pop anyway
+    /// if status != Ready).
+    fn queue_priority(&self, drv_hash: &str) -> f64 {
+        let base = self.dag.node(drv_hash).map(|n| n.priority).unwrap_or(0.0);
+        if self.should_prioritize(drv_hash) {
+            base + crate::queue::INTERACTIVE_BOOST
+        } else {
+            base
+        }
+    }
+
+    /// Push a derivation onto the ready queue with its computed priority.
+    /// Centralizes the priority lookup so call sites are simple.
+    fn push_ready(&mut self, drv_hash: DrvHash) {
+        let prio = self.queue_priority(&drv_hash);
+        self.ready_queue.push(drv_hash, prio);
     }
 
     /// Resolve a drv_path to its drv_hash via the DAG's reverse index.

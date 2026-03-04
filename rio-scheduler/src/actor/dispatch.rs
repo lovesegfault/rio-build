@@ -22,7 +22,7 @@ impl DagActor {
         while dispatched_any {
             dispatched_any = false;
 
-            while let Some(drv_hash) = self.ready_queue.pop_front() {
+            while let Some(drv_hash) = self.ready_queue.pop() {
                 // Find the derivation's requirements
                 let (system, required_features) = match self.dag.node(&drv_hash) {
                     Some(state) => (state.system.clone(), state.required_features.clone()),
@@ -65,9 +65,12 @@ impl DagActor {
                 }
             }
 
-            // Re-queue deferred derivations at the front, preserving order.
-            for hash in std::mem::take(&mut deferred).into_iter().rev() {
-                self.ready_queue.push_front(hash);
+            // Re-queue deferred derivations. push_ready recomputes their
+            // priority (unchanged since we just popped them), so they
+            // slot back into the same position. The old "push_front to
+            // preserve order" doesn't apply — priority IS the order.
+            for hash in std::mem::take(&mut deferred) {
+                self.push_ready(hash);
             }
         }
     }

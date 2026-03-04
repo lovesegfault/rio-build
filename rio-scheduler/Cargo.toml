@@ -30,6 +30,10 @@ rand = { workspace = true }
 prost-types = { workspace = true }
 rio-nix = { workspace = true }
 
+# phase2c D5: priority queue. f64 doesn't impl Ord (NaN);
+# OrderedFloat wraps it with a total ordering.
+ordered-float = { workspace = true }
+
 # phase2b: build-log S3 flush (gzip + PUT logs/{build_id}/{drv_hash}.log.gz)
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
