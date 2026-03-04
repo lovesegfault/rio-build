@@ -61,9 +61,35 @@ in
       default = "logs";
       description = "S3 key prefix for build logs (`RIO_LOG_S3_PREFIX`).";
     };
+
+    extraConfig = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Extra TOML appended to `/etc/rio/scheduler.toml`. figment reads
+        this with lower precedence than env vars and CLI. Use for nested
+        config that doesn't map to env vars (e.g. `[[size_classes]]`
+        arrays). Example:
+
+            extraConfig = ${"''"}
+              [[size_classes]]
+              name = "small"
+              cutoff_secs = 30.0
+              mem_limit_bytes = 1073741824
+            ${"''"};
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    # TOML config for settings that don't map to flat env vars (nested
+    # arrays like size_classes). figment layers: compiled defaults <
+    # /etc/rio/scheduler.toml < RIO_* env < CLI. So env vars above
+    # still override anything here.
+    environment.etc."rio/scheduler.toml" = lib.mkIf (cfg.extraConfig != "") {
+      text = cfg.extraConfig;
+    };
+
     systemd.services.rio-scheduler = {
       description = "rio-scheduler DAG-aware build scheduler";
       wantedBy = [ "multi-user.target" ];

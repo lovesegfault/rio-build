@@ -441,6 +441,7 @@
           #   vm-phase1b — 3 VMs: single-worker end-to-end build
           #   vm-phase2a — 4 VMs: distributed build across 2+ workers
           #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Jaeger
+          #   vm-phase2c — 5 VMs: CA + critical-path + size-class + circuit-breaker
           vmTests = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
             let
               vmTestArgs = {
@@ -453,6 +454,7 @@
               vm-phase1b = import ./nix/tests/phase1b.nix vmTestArgs;
               vm-phase2a = import ./nix/tests/phase2a.nix vmTestArgs;
               vm-phase2b = import ./nix/tests/phase2b.nix vmTestArgs;
+              vm-phase2c = import ./nix/tests/phase2c.nix vmTestArgs;
             }
           );
 

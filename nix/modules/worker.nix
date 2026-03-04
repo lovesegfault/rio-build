@@ -80,6 +80,17 @@ in
       default = "0.0.0.0:9093";
       description = "Prometheus metrics listen address (`RIO_METRICS_ADDR`).";
     };
+
+    sizeClass = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Size-class this worker is deployed as (`RIO_SIZE_CLASS`). Matches
+        a name in the scheduler's `size_classes` config. Empty = wildcard
+        (accepts any-class work). Scheduler routes builds by estimated
+        duration; this declares which bucket this worker serves.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -120,6 +131,9 @@ in
         RIO_OVERLAY_BASE_DIR = cfg.overlayBaseDir;
         RIO_METRICS_ADDR = cfg.metricsAddr;
         RIO_LOG_FORMAT = config.services.rio.logFormat;
+      }
+      // lib.optionalAttrs (cfg.sizeClass != "") {
+        RIO_SIZE_CLASS = cfg.sizeClass;
       }
       // lib.optionalAttrs (cfg.workerId != null) {
         RIO_WORKER_ID = cfg.workerId;
