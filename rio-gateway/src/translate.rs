@@ -112,40 +112,65 @@ pub async fn reconstruct_dag(
     Ok((nodes, edges))
 }
 
+/// Fields of `DerivationNode` that are extracted identically from both
+/// `BasicDerivation` and `Derivation`. Both types have `.outputs()`,
+/// `.env()`, `.platform()`; the iterator chains are structurally the
+/// same, just called on different receiver types.
+struct NodeCommonFields {
+    output_names: Vec<String>,
+    expected_output_paths: Vec<String>,
+    pname: String,
+    system: String,
+    required_features: Vec<String>,
+}
+
+/// Extract the fields that are computed identically for both derivation
+/// kinds. The `outputs` iterator yields `(name, path)` pairs — callers
+/// adapt their output type's accessors into that shape.
+fn node_common_fields(
+    outputs: impl Iterator<Item = (String, String)>,
+    env: &std::collections::BTreeMap<String, String>,
+    platform: &str,
+) -> NodeCommonFields {
+    let (output_names, expected_output_paths) = outputs.unzip();
+    NodeCommonFields {
+        output_names,
+        expected_output_paths,
+        pname: env.get("pname").cloned().unwrap_or_default(),
+        system: platform.to_string(),
+        required_features: env
+            .get("requiredSystemFeatures")
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default(),
+    }
+}
+
 /// Create a single-node DAG from a BasicDerivation (no inputDrvs).
 /// Used as fallback when the full Derivation is not available.
 pub fn single_node_from_basic(
     drv_path: &str,
     basic_drv: &BasicDerivation,
 ) -> Vec<types::DerivationNode> {
-    let output_names: Vec<String> = basic_drv
-        .outputs()
-        .iter()
-        .map(|o| o.name().to_string())
-        .collect();
-    let expected_output_paths: Vec<String> = basic_drv
-        .outputs()
-        .iter()
-        .map(|o| o.path().to_string())
-        .collect();
-
-    let pname = basic_drv.env().get("pname").cloned().unwrap_or_default();
+    let f = node_common_fields(
+        basic_drv
+            .outputs()
+            .iter()
+            .map(|o| (o.name().to_string(), o.path().to_string())),
+        basic_drv.env(),
+        basic_drv.platform(),
+    );
 
     vec![types::DerivationNode {
         drv_path: drv_path.to_string(),
         // Use drv_path as drv_hash fallback (input-addressed derivations
         // already use the store path as the hash; this is consistent)
         drv_hash: drv_path.to_string(),
-        pname,
-        system: basic_drv.platform().to_string(),
-        required_features: basic_drv
-            .env()
-            .get("requiredSystemFeatures")
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default(),
-        output_names,
+        pname: f.pname,
+        system: f.system,
+        required_features: f.required_features,
+        output_names: f.output_names,
         is_fixed_output: basic_drv.outputs().iter().any(|o| o.is_fixed_output()),
-        expected_output_paths,
+        expected_output_paths: f.expected_output_paths,
         // Single-node fallback: BasicDerivation has no inputDrvs. We
         // COULD serialize it, but this path is the "full drv not
         // available" fallback — if we don't have the full thing, the
@@ -156,29 +181,25 @@ pub fn single_node_from_basic(
 
 /// Convert a Derivation into a proto DerivationNode.
 fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::DerivationNode {
-    let output_names: Vec<String> = drv.outputs().iter().map(|o| o.name().to_string()).collect();
-    let expected_output_paths: Vec<String> =
-        drv.outputs().iter().map(|o| o.path().to_string()).collect();
-
-    let pname = drv.env().get("pname").cloned().unwrap_or_default();
-
-    let required_features: Vec<String> = drv
-        .env()
-        .get("requiredSystemFeatures")
-        .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_default();
+    let f = node_common_fields(
+        drv.outputs()
+            .iter()
+            .map(|o| (o.name().to_string(), o.path().to_string())),
+        drv.env(),
+        drv.platform(),
+    );
 
     types::DerivationNode {
         drv_path: drv_path.to_string(),
         // Input-addressed derivations use the store path as the drv_hash.
         // This ensures every node has a unique, non-empty key in the DAG.
         drv_hash: drv_path.to_string(),
-        pname,
-        system: drv.platform().to_string(),
-        required_features,
-        output_names,
+        pname: f.pname,
+        system: f.system,
+        required_features: f.required_features,
+        output_names: f.output_names,
         is_fixed_output: drv.is_fixed_output(),
-        expected_output_paths,
+        expected_output_paths: f.expected_output_paths,
         // Empty here — filter_and_inline_drv() populates AFTER the
         // FindMissingPaths check. Inlining now would waste bytes on
         // cache-hit nodes that never dispatch.
