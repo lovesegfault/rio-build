@@ -371,6 +371,18 @@ impl DerivationDag {
             .unwrap_or_default()
     }
 
+    /// Get all child drv_hashes that the given parent depends on.
+    ///
+    /// Mirror of `get_parents`. Critical-path computation walks DOWN
+    /// (children), completion handling walks UP (parents). Both
+    /// directions needed.
+    pub fn get_children(&self, parent_hash: &str) -> Vec<DrvHash> {
+        self.children
+            .get(parent_hash)
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Find all derivations that become ready (all deps completed) after a
     /// given derivation completes. Only returns derivations currently in Queued state.
     pub fn find_newly_ready(&self, completed_hash: &str) -> Vec<DrvHash> {
