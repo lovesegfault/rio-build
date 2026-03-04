@@ -7,7 +7,7 @@ use super::*;
 /// wopBuildPaths (9): reads strings(paths) + u64(build_mode), writes u64(1).
 #[tokio::test]
 async fn test_build_paths_success() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         send_completed: true,
         ..Default::default()
@@ -42,7 +42,7 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
 /// wopBuildPaths with scheduler error: should send STDERR_ERROR.
 #[tokio::test]
 async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         submit_error: Some(tonic::Code::Unavailable),
         ..Default::default()
@@ -82,7 +82,7 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
 /// fail or the stream would desync.
 #[tokio::test]
 async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         close_stream_early: true,
         ..Default::default()
@@ -120,7 +120,7 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyho
 /// u64(count) + per-entry (string:DerivedPath, BuildResult).
 #[tokio::test]
 async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         send_completed: true,
         ..Default::default()
@@ -186,7 +186,7 @@ async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
 /// args + env_pairs.
 #[tokio::test]
 async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         send_completed: true,
         ..Default::default()
@@ -260,7 +260,7 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
 /// But invalid DerivedPath strings DO cause per-entry failures.
 #[tokio::test]
 async fn test_build_paths_with_results_invalid_derived_path() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
 
     wire_send!(&mut h.stream;
         u64: 46,
@@ -333,7 +333,7 @@ fn ev(e: build_event::Event) -> types::BuildEvent {
 
 /// Seed a minimal .drv and return its store path. Every scripted-event test
 /// needs this so translate::reconstruct_dag has something to resolve.
-fn seed_minimal_drv(h: &TestHarness) -> &'static str {
+fn seed_minimal_drv(h: &GatewaySession) -> &'static str {
     let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let (drv_nar, drv_hash) = make_nar(drv_text.as_bytes());
     let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
@@ -358,7 +358,7 @@ async fn collect_stderr_frames(stream: &mut tokio::io::DuplexStream) -> Vec<Stde
 /// BuildLogBatch lines become STDERR_NEXT frames.
 #[tokio::test]
 async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
             ev(build_event::Event::Started(types::BuildStarted {
@@ -406,7 +406,7 @@ async fn test_build_paths_log_events_become_stderr_next() -> anyhow::Result<()> 
 /// STDERR_STOP_ACTIVITY with matching IDs.
 #[tokio::test]
 async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/aaa-activity-test.drv".to_string();
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
@@ -473,7 +473,7 @@ async fn test_build_paths_derivation_lifecycle_activities() -> anyhow::Result<()
 /// DerivationEvent::Failed stops the activity AND emits a STDERR_NEXT log line.
 #[tokio::test]
 async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     let target = "/nix/store/bbb-failed.drv".to_string();
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
@@ -543,7 +543,7 @@ async fn test_build_paths_derivation_failed_emits_log_and_stop() -> anyhow::Resu
 /// Use opcode 46 (BuildPathsWithResults) so we can read the BuildResult back.
 #[tokio::test]
 async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
             ev(build_event::Event::Started(types::BuildStarted {
@@ -585,7 +585,7 @@ async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()>
 /// Progress + Derivation{Cached,Queued} are silent — no STDERR frames.
 #[tokio::test]
 async fn test_build_paths_silent_events_no_stderr() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![
             ev(build_event::Event::Started(types::BuildStarted {
@@ -640,7 +640,7 @@ async fn test_build_paths_silent_events_no_stderr() -> anyhow::Result<()> {
 /// First event is Completed (no Started) → short-circuit return.
 #[tokio::test]
 async fn test_build_paths_first_event_completed_short_circuit() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Completed(
             types::BuildCompleted {
@@ -667,7 +667,7 @@ async fn test_build_paths_first_event_completed_short_circuit() -> anyhow::Resul
 /// First event is Failed (no Started) → short-circuit failure.
 #[tokio::test]
 async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<()> {
-    let mut h = TestHarness::setup().await?;
+    let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
         scripted_events: Some(vec![ev(build_event::Event::Failed(types::BuildFailed {
             error_message: "instant fail".into(),
