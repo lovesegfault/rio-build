@@ -162,18 +162,25 @@ impl Filesystem for NixStoreFs {
                 // If it's a known store path, try ensuring it's cached
                 if let Some(basename) = self.store_basename_for_inode(ino.0) {
                     match self.ensure_cached(&basename) {
-                        Ok(_) => {
-                            if let Ok(meta) = path.symlink_metadata() {
+                        Ok(_) => match path.symlink_metadata() {
+                            Ok(meta) => {
                                 let attr = stat_to_attr(ino.0, &meta);
                                 reply.attr(&ATTR_TTL, &attr);
-                                return;
                             }
-                        }
+                            Err(fresh) => {
+                                // Cache says it materialized but the stat
+                                // STILL fails — reply with the fresh error,
+                                // not the pre-cache `e` (which is stale and
+                                // misleading; typically ENOENT when the real
+                                // post-cache failure might be EACCES/EIO).
+                                reply.error(io_error_to_errno(&fresh));
+                            }
+                        },
                         Err(errno) => {
                             reply.error(errno);
-                            return;
                         }
                     }
+                    return;
                 }
                 reply.error(io_error_to_errno(&e));
             }
