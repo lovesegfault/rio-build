@@ -13,8 +13,7 @@ use tracing::info;
 //
 // Two-struct split per rio-common/src/config.rs module docs:
 //   - `Config`: merged result, all fields concrete, Default = compiled-in
-//     defaults (must match the old clap `default_value=` values exactly —
-//     see `tests::config_defaults_match_phase2a`).
+//     defaults (see `tests::config_defaults_are_stable`).
 //   - `CliArgs`: clap-parsed, all fields Option, no env= (figment's Env
 //     provider handles that), no default_value (absence = None = don't
 //     overlay).
@@ -34,13 +33,15 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:2222".parse().unwrap(),
-            // scheduler_addr/store_addr have no sensible default — they're
-            // deployment-specific. Empty string here + a post-load check in
-            // main() gives a clear "required" error that names the field.
+            // scheduler_addr/store_addr/host_key/authorized_keys have no
+            // sensible default — they're deployment-specific. Empty here +
+            // a post-load check in main() gives a clear "required" error
+            // that names the field. The old /tmp/rio_* defaults were
+            // footguns: silent key-generation in world-writable /tmp.
             scheduler_addr: String::new(),
             store_addr: String::new(),
-            host_key: "/tmp/rio_host_key".into(),
-            authorized_keys: "/tmp/rio_authorized_keys".into(),
+            host_key: std::path::PathBuf::new(),
+            authorized_keys: std::path::PathBuf::new(),
             metrics_addr: "0.0.0.0:9090".parse().unwrap(),
         }
     }
@@ -100,6 +101,14 @@ async fn main() -> anyhow::Result<()> {
         !cfg.store_addr.is_empty(),
         "store_addr is required (set --store-addr, RIO_STORE_ADDR, or gateway.toml)"
     );
+    anyhow::ensure!(
+        !cfg.host_key.as_os_str().is_empty(),
+        "host_key is required (set --host-key, RIO_HOST_KEY, or gateway.toml)"
+    );
+    anyhow::ensure!(
+        !cfg.authorized_keys.as_os_str().is_empty(),
+        "authorized_keys is required (set --authorized-keys, RIO_AUTHORIZED_KEYS, or gateway.toml)"
+    );
 
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
@@ -136,23 +145,21 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Regression guard: `Config::default()` must exactly match the old
-    /// clap `#[arg(default_value = ...)]` values from phase 2a. A silent
-    /// drift here would change behavior under VM tests (which set only the
-    /// required fields via env and rely on defaults for the rest).
+    /// Regression guard: a silent drift in `Config::default()` would change
+    /// behavior under VM tests (which set only the required fields via env
+    /// and rely on defaults for the rest).
     #[test]
-    fn config_defaults_match_phase2a() {
+    fn config_defaults_are_stable() {
         let d = Config::default();
         assert_eq!(d.listen_addr.to_string(), "0.0.0.0:2222");
-        assert_eq!(d.host_key, std::path::PathBuf::from("/tmp/rio_host_key"));
-        assert_eq!(
-            d.authorized_keys,
-            std::path::PathBuf::from("/tmp/rio_authorized_keys")
-        );
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9090");
-        // scheduler_addr/store_addr had no default in phase2a (required).
+        // All four of these are deployment-specific: empty default + a
+        // post-load ensure! in main(). Non-empty default here = silent
+        // wrong-value at runtime instead of a clear startup error.
         assert!(d.scheduler_addr.is_empty());
         assert!(d.store_addr.is_empty());
+        assert!(d.host_key.as_os_str().is_empty());
+        assert!(d.authorized_keys.as_os_str().is_empty());
     }
 
     /// clap --help must still work (no panics in derive expansion).

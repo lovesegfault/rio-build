@@ -61,7 +61,10 @@ impl Default for Config {
             store_addr: String::new(),
             max_builds: 1,
             system: String::new(),
-            fuse_mount_point: "/nix/store".into(),
+            // Matches nix/modules/worker.nix. NEVER default to /nix/store:
+            // mounting FUSE there shadows the host store, breaking every
+            // process on the machine (including the worker itself).
+            fuse_mount_point: "/var/rio/fuse-store".into(),
             fuse_cache_dir: "/var/rio/cache".into(),
             fuse_cache_size_gb: 50,
             fuse_threads: 4,
@@ -409,14 +412,13 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Regression guard: `Config::default()` must exactly match the old
-    /// clap `#[arg(default_value = ...)]` values from phase 2a. CRITICAL
-    /// case: `fuse_passthrough` defaults to `true` — NOT the serde bool
-    /// default. A drift to `false` here adds a userspace copy per FUSE
-    /// read (~2× per-build latency) and would only show up as a vm-phase2a
-    /// timing regression, not a hard failure.
+    /// Regression guard against silent default drift. CRITICAL case:
+    /// `fuse_passthrough` defaults to `true` — NOT the serde bool default.
+    /// A drift to `false` adds a userspace copy per FUSE read (~2× per-build
+    /// latency) and would only show up as a vm-phase2a timing regression,
+    /// not a hard failure.
     #[test]
-    fn config_defaults_match_phase2a() {
+    fn config_defaults_are_stable() {
         let d = Config::default();
         assert!(
             d.worker_id.is_empty(),
@@ -426,7 +428,7 @@ mod tests {
         assert!(d.store_addr.is_empty(), "required, no default");
         assert_eq!(d.max_builds, 1);
         assert!(d.system.is_empty(), "system auto-detects");
-        assert_eq!(d.fuse_mount_point, PathBuf::from("/nix/store"));
+        assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
         assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
         assert_eq!(d.fuse_cache_size_gb, 50);
         assert_eq!(d.fuse_threads, 4);
