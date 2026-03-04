@@ -268,8 +268,10 @@ async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// QueryRealisation: malformed id → empty set (soft-fail, same as the old
+/// stub). "abc" is 3 hex chars, not 64.
 #[tokio::test]
-async fn test_query_realisation_stub_returns_empty() -> anyhow::Result<()> {
+async fn test_query_realisation_malformed_id_returns_empty() -> anyhow::Result<()> {
     let mut h = TestHarness::setup().await?;
 
     wire_send!(&mut h.stream;
@@ -279,7 +281,81 @@ async fn test_query_realisation_stub_returns_empty() -> anyhow::Result<()> {
 
     drain_stderr_until_last(&mut h.stream).await?;
     let count = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(count, 0, "QueryRealisation stub should return empty set");
+    assert_eq!(count, 0, "malformed id should return empty set");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// QueryRealisation: valid id but not in MockStore → empty set (cache miss).
+#[tokio::test]
+async fn test_query_realisation_miss_returns_empty() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
+
+    let drv_hash_hex = "bb".repeat(32);
+    wire_send!(&mut h.stream;
+        u64: 43,
+        string: &format!("sha256:{drv_hash_hex}!out"),
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 0, "cache miss should return empty set");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// QueryRealisation: hit. Returns count=1 + Realisation JSON with the
+/// outPath from MockStore. This is the actual cache-hit path that makes
+/// CA derivations skip rebuilds.
+#[tokio::test]
+async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
+    let mut h = TestHarness::setup().await?;
+
+    let drv_hash_hex = "cc".repeat(32);
+    let drv_hash = hex::decode(&drv_hash_hex)?;
+    let out_path = "/nix/store/11111111111111111111111111111111-ca-hit";
+
+    // Seed MockStore's realisations map directly.
+    h.store.realisations.write().unwrap().insert(
+        (drv_hash.clone(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash,
+            output_name: "out".into(),
+            output_path: out_path.into(),
+            output_hash: vec![0xDDu8; 32],
+            signatures: vec!["sig:seeded".into()],
+        },
+    );
+
+    let id = format!("sha256:{drv_hash_hex}!out");
+    wire_send!(&mut h.stream;
+        u64: 43,
+        string: &id,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1, "cache hit should return count=1");
+
+    let json_str = wire::read_string(&mut h.stream).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+    // The id echoes what we sent (gateway reconstructs it from the same
+    // string, not from the store response).
+    assert_eq!(parsed["id"], id);
+    // outPath comes from MockStore — this is the payload that matters for
+    // the cache hit.
+    assert_eq!(parsed["outPath"], out_path);
+    // Sigs roundtrip.
+    assert_eq!(parsed["signatures"][0], "sig:seeded");
+    // dependentRealisations always empty (phase5 fills this).
+    assert!(
+        parsed["dependentRealisations"]
+            .as_object()
+            .is_some_and(|o| o.is_empty()),
+        "dependentRealisations should be empty object"
+    );
 
     h.finish().await;
     Ok(())
