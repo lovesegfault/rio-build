@@ -157,6 +157,17 @@ impl DagActor {
             }
         }
 
+        // Compute critical-path priorities for newly-inserted nodes.
+        // Done AFTER cache-hit transitions so completed derivations
+        // are correctly excluded from their parents' max-child (a
+        // cached dep doesn't block anything — it's done).
+        //
+        // This sets est_duration (from estimator) + priority (bottom-up)
+        // for new nodes, and propagates to existing nodes if the new
+        // subgraph raises their priority. D5 reads these for BinaryHeap
+        // ordering.
+        crate::critical_path::compute_initial(&mut self.dag, &self.estimator, newly_inserted);
+
         // Compute initial states for the remaining (non-cached) newly-inserted
         // derivations. Cached derivations above are now Completed, so their
         // dependents will correctly be computed as Ready here.

@@ -215,6 +215,33 @@ impl DagActor {
         // gap between Completed and the S3 upload landing.
         self.trigger_log_flush(drv_hash, interested_builds.clone());
 
+        // Update ancestor priorities: this node is now terminal, so it
+        // no longer contributes to its parents' max-child-priority.
+        // Parents' priorities DROP. Propagates up until unchanged
+        // (dirty-flag stop).
+        //
+        // Done BEFORE releasing downstream because the newly-ready
+        // nodes will be pushed to the queue (D5: by priority), and
+        // their priority is already correct from compute_initial at
+        // merge time. The ancestors that change are NOT newly-ready
+        // (they were already in the queue or beyond) — D5's lazy
+        // invalidation handles re-pushing them if needed.
+        //
+        // Also emit the accuracy metric: how close was our estimate?
+        // Histogram of actual/estimated. 1.0 = perfect, >1.0 = took
+        // longer than expected. Helps tune the estimator.
+        if let Some(state) = self.dag.node(drv_hash)
+            && state.est_duration > 0.0
+            && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
+        {
+            let actual_secs = stop.seconds.saturating_sub(start.seconds) as f64;
+            if actual_secs > 0.0 {
+                metrics::histogram!("rio_scheduler_critical_path_accuracy")
+                    .record(actual_secs / state.est_duration);
+            }
+        }
+        crate::critical_path::update_ancestors(&mut self.dag, drv_hash);
+
         // Release downstream: find newly ready derivations.
         // Interactive (IFD) derivations go to the front of the queue.
         let newly_ready = self.dag.find_newly_ready(drv_hash);

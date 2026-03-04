@@ -181,6 +181,12 @@ impl DagActor {
                 warn!(error = %e, "estimator refresh failed; keeping previous snapshot");
             }
         }
+
+        // Full critical-path sweep (same 60s cadence). Belt-and-
+        // suspenders over the incremental update_ancestors calls: any
+        // drift (float accumulation, missed edge case) corrects here.
+        // O(V+E); ~1ms for a 10k-node DAG.
+        crate::critical_path::full_sweep(&mut self.dag, &self.estimator);
     }
 
     pub(super) async fn handle_tick(&mut self) {

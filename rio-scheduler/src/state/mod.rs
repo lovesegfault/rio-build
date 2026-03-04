@@ -324,6 +324,23 @@ pub struct DerivationState {
     pub poisoned_at: Option<Instant>,
     /// Realized output store paths (filled on completion).
     pub output_paths: Vec<String>,
+    /// Expected output paths (from the proto node at merge time).
+    /// Used for: cache-check (merge.rs), transfer-cost scoring (D6),
+    /// and as the closure approximation for locality (children's
+    /// expected_output_paths = parent's inputs).
+    pub expected_output_paths: Vec<String>,
+    /// Estimated build duration (from Estimator). Set at merge time;
+    /// never updated after. The critical-path priority uses this;
+    /// stale is fine (a build taking longer than estimated doesn't
+    /// change the OPTIMAL schedule mid-execution — what's queued is
+    /// queued).
+    pub est_duration: f64,
+    /// Critical-path priority: `est_duration + max(children's priority)`.
+    /// Bottom-up: leaves have `priority = est_duration`; roots have
+    /// the sum along the longest path. Higher = more urgent (dispatch
+    /// first). Recomputed incrementally on completion (D4) via
+    /// ancestor-walk. D5 uses this for BinaryHeap ordering.
+    pub priority: f64,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
     /// When the derivation entered Ready state (for assignment latency metric).
@@ -356,6 +373,12 @@ impl DerivationState {
             failed_workers: HashSet::new(),
             poisoned_at: None,
             output_paths: Vec::new(),
+            expected_output_paths: node.expected_output_paths.clone(),
+            // Placeholder — merge.rs sets this from the Estimator right
+            // after try_from_node (try_from_node doesn't have estimator
+            // access). 0.0 is a visible "not yet set" marker.
+            est_duration: 0.0,
+            priority: 0.0,
             db_id: None,
             ready_at: None,
         })

@@ -20,6 +20,7 @@
 
 pub mod actor;
 pub mod admin;
+pub mod critical_path;
 pub mod dag;
 pub mod db;
 pub mod estimator;
