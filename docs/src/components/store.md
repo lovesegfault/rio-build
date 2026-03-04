@@ -145,7 +145,7 @@ rio-store serves the standard Nix binary cache protocol so Nix clients can use i
 - Per-instance signing key stored in a Kubernetes Secret (recommend KMS/Vault for production)
 - Signatures are computed at `PutPath` time --- the binary cache server does not need private key access at serve time
 - Narinfo `Sig:` field format: `<key-name>:<base64-ed25519-signature>` (compatible with `nix.settings.trusted-public-keys`)
-- Signed message: canonical fingerprint `<store-path>:<nar-hash-base32>:<nar-size>:<sorted-references>`
+- Signed message: canonical fingerprint `1;<store-path>;sha256:<nar-hash-nixbase32>;<nar-size>;<sorted-refs-comma-sep>` — semicolon separator, `1;` version prefix, `sha256:` algorithm tag, references are full paths (not basenames) joined by comma. Matches Nix's `ValidPathInfo::fingerprint()` in `path-info.cc`. See `fingerprint()` in `rio-nix/src/narinfo.rs`.
 - Multi-tenant: each tenant can have their own signing key for their paths
 
 ### Key Rotation
@@ -232,12 +232,13 @@ CREATE TABLE chunks (
 CREATE INDEX idx_chunks_gc ON chunks (blake3_hash)
     WHERE refcount = 0 AND deleted = FALSE;
 
+-- Multi-tenancy deferred: tenant_id columns are nullable, not in PK (Phase 4).
 CREATE TABLE content_index (
     content_hash     BYTEA NOT NULL,           -- SHA-256 output content hash
     store_path_hash  BYTEA NOT NULL
-                     REFERENCES narinfo(store_path_hash),
-    tenant_id        UUID NOT NULL,
-    PRIMARY KEY (content_hash, tenant_id, store_path_hash)
+                     REFERENCES narinfo(store_path_hash) ON DELETE CASCADE,
+    tenant_id        UUID,
+    PRIMARY KEY (content_hash, store_path_hash)
 );
 
 -- CA derivation realisations (Phase 5: populated; proactively created)
@@ -247,7 +248,7 @@ CREATE TABLE realisations (
     output_path      TEXT NOT NULL,
     output_hash      BYTEA NOT NULL,              -- SHA-256 content hash of output NAR
     signatures       TEXT[] NOT NULL DEFAULT '{}', -- ed25519 realisation signatures
-    tenant_id        UUID NOT NULL,
+    tenant_id        UUID,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (drv_hash, output_name)
 );
