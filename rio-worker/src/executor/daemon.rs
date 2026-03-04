@@ -17,6 +17,8 @@ use rio_nix::protocol::stderr::ResultField;
 use rio_nix::protocol::wire;
 use rio_proto::types::{WorkerMessage, worker_message};
 
+use tracing::instrument;
+
 use crate::log_stream::{AddLineResult, BATCH_TIMEOUT, LogBatcher};
 use crate::overlay;
 
@@ -82,6 +84,7 @@ fn bind_mount(src: &Path, target: &str) -> std::io::Result<()> {
 /// are direct syscall wrappers (no allocation). `std::io::Error::from(Errno)`
 /// stores only an i32 (no allocation). PathBufs are cloned OUTSIDE the closure
 /// and captured by move (the clone happens in the parent, pre-fork).
+#[instrument(skip_all)]
 pub(super) async fn spawn_daemon_in_namespace(
     overlay_mount: &overlay::OverlayMount,
 ) -> Result<tokio::process::Child, ExecutorError> {
@@ -173,6 +176,11 @@ pub(super) async fn spawn_daemon_in_namespace(
 /// Caller MUST kill the daemon after this returns (whether Ok or Err).
 /// This is the only function that should touch daemon stdin/stdout —
 /// keeping it isolated ensures the caller's always-kill path is reliable.
+///
+/// Span duration ≈ actual sandbox build time — this is the hot zone in
+/// a trace (e.g., 95% of a slow build's wall time). `build_timeout` in
+/// span fields so Tempo can correlate slow builds with timeout config.
+#[instrument(skip_all, fields(build_timeout_secs = build_timeout.as_secs()))]
 pub(super) async fn run_daemon_build(
     daemon: &mut tokio::process::Child,
     drv_path: &str,

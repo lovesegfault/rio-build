@@ -12,6 +12,7 @@ use futures_util::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
+use tracing::instrument;
 
 use rio_nix::nar;
 use rio_proto::StoreServiceClient;
@@ -117,6 +118,7 @@ pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
 /// that's worst-case 3× disk reads. Retries are rare (transient S3/gRPC
 /// blips); the extra reads cost seconds on NVMe for a 4GiB file — trivial
 /// vs. the 32GiB memory saving.
+#[instrument(skip_all, fields(store_path = %format!("/nix/store/{output_basename}")))]
 async fn upload_output(
     store_client: &mut StoreServiceClient<Channel>,
     upper_dir: &Path,
@@ -189,6 +191,7 @@ async fn upload_output(
 
 /// One upload attempt: spawn_blocking(dump_streaming → HashingChannelWriter)
 /// → mpsc → tonic gRPC. Returns (hash, size) on success.
+#[instrument(skip_all)]
 async fn do_upload_streaming(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
@@ -392,6 +395,7 @@ impl Write for HashingChannelWriter {
 /// Result order is **not** guaranteed. Callers must not assume results
 /// correspond positionally to any input list; use `UploadResult.store_path`
 /// to identify outputs.
+#[instrument(skip_all)]
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
     upper_dir: &Path,

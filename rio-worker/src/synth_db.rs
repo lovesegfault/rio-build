@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use sqlx::{Connection, SqliteConnection};
+use tracing::instrument;
 
 /// Path metadata for synthetic DB insertion.
 ///
@@ -86,6 +87,7 @@ const SCHEMA_VERSION: &str = "10";
 /// The database contains the minimum schema required for Nix 2.20+
 /// to recognize store paths: Config, ValidPaths, Refs, DerivationOutputs,
 /// and Realisations (empty, for future CA support).
+#[instrument(skip_all, fields(path_count = paths.len(), drv_output_count = drv_outputs.len()))]
 pub async fn generate_db(
     db_path: &Path,
     paths: &[SynthPathInfo],
