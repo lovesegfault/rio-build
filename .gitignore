@@ -13,12 +13,7 @@ target/
 **/*.rs.bk
 *.pdb
 
-
 # mdbook output
 docs/book/
-
-# Added by cargo
-
-/target
 
 .claude/settings.local.json

@@ -159,3 +159,12 @@ tempfile = "3"
 
 [profile.release]
 lto = "thin"
+
+# Compile dependencies with optimization even in dev/test profile.
+# Speeds up crypto-heavy tests (zstd/blake3/sha2/ed25519/fastcdc) — those
+# are inner-loop bytes-per-cycle code that's 10-50× slower unoptimized.
+# Deps rebuild rarely (cached by Crane's buildDepsOnly), so the one-time
+# compile cost is amortized. Workspace crates stay at opt-level=0 for
+# fast incremental rebuilds + usable debuginfo.
+[profile.dev.package."*"]
+opt-level = 2
