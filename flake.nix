@@ -677,13 +677,26 @@
           // {
 
             # HTML coverage report generated from the lcov tracefile.
-            # The lcov file embeds sandbox-local source paths; strip the
-            # build-dir prefix and run genhtml from the real source root
-            # so the report shows annotated code. View: `xdg-open result/index.html`.
+            # View: `xdg-open result/index.html`.
+            #
+            # The coverage derivation's $out is a DIRECTORY (crane's
+            # cargoNextest does `mkdir -p $out`), with the tracefile
+            # at $out/lcov.info — see cargoLlvmCovExtraArgs on the
+            # `coverage` check above. The old cargoLlvmCov wrote lcov
+            # to $out itself (a plain file).
+            #
+            # The tracefile embeds absolute sandbox paths like
+            # /build/nix-build-rio-nextest-*.drv-*/source/rio-foo/src/bar.rs
+            # Strip everything up through `source/` so genhtml can resolve
+            # against ${commonArgs.src}. The pattern anchors on `source/`
+            # (not a specific sandbox dir layout) so it survives builder
+            # differences — the old cargoLlvmCov had /nix/var/nix/builds/,
+            # nixbuild.net's, crane's cargoNextest uses /build/. All share
+            # the unpackPhase convention of unpacking into `source/`.
             coverage-html = pkgs.runCommand "rio-coverage-html" { } ''
               ${pkgs.lcov}/bin/lcov \
-                --substitute 's|^/nix/var/nix/builds/[^/]*/source/||' \
-                --extract ${cargoChecks.coverage} 'rio-*' \
+                --substitute 's|^/[^[:space:]]*/source/||' \
+                --extract ${cargoChecks.coverage}/lcov.info 'rio-*' \
                 --output-file $TMPDIR/cleaned.lcov
               cd ${commonArgs.src}
               ${pkgs.lcov}/bin/genhtml $TMPDIR/cleaned.lcov \
