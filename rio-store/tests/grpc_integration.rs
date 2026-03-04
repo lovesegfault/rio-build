@@ -1,8 +1,9 @@
 //! gRPC-level integration tests for StoreService.
 //!
-//! These tests spin up an in-process tonic server backed by [`MemoryBackend`]
-//! and an ephemeral PostgreSQL database (bootstrapped by `rio-test-support`),
-//! then exercise the full gRPC request/response path including streaming.
+//! These tests spin up an in-process tonic server (inline storage or
+//! [`MemoryChunkBackend`]) with an ephemeral PostgreSQL database
+//! (bootstrapped by `rio-test-support`), then exercise the full gRPC
+//! request/response path including streaming.
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;

@@ -6,7 +6,7 @@
 //! rename, delete only via GC (not this trait's concern; that's the
 //! `pending_s3_deletes` outbox pattern in a later phase).
 //!
-//! # Key differences from the old NarBackend
+//! # Design
 //!
 //! - Keys are `[u8; 32]` (BLAKE3), not string. No path-traversal concern
 //!   (hex-encoding a fixed-width array can't contain `../`).
@@ -83,7 +83,8 @@ fn chunk_key(hash: &[u8; 32]) -> String {
 /// In-memory chunk storage. Test-only.
 ///
 /// Uses `[u8; 32]` as the HashMap key directly — no hex-encoding needed.
-/// `RwLock` poison recovery mirrors `MemoryBackend` in `memory.rs`.
+/// Recovers from `RwLock` poison (warns + uses into_inner) so a panicking
+/// test doesn't cascade into all other tests sharing the backend.
 #[derive(Default)]
 pub struct MemoryChunkBackend {
     inner: RwLock<HashMap<[u8; 32], Bytes>>,
@@ -179,8 +180,8 @@ impl ChunkBackend for FilesystemChunkBackend {
         let path = self.chunk_path(hash);
         debug!(path = %path.display(), size = data.len(), "FilesystemChunkBackend: storing chunk");
 
-        // Same atomic-write pattern as FilesystemBackend: temp + fsync +
-        // rename + dir-fsync. If we skip any of these, a crash between
+        // Atomic-write pattern: temp + fsync + rename + dir-fsync.
+        // If we skip any of these, a crash between
         // put() returning and complete_manifest() committing leaves the
         // manifest claiming a chunk exists that's zero-length or absent.
         //
@@ -586,8 +587,8 @@ mod tests {
         Ok(())
     }
 
-    /// NoSuchKey → Ok(None), not Err. Same distinction as the old S3
-    /// NarBackend test: "not there" vs "can't tell" are different.
+    /// NoSuchKey → Ok(None), not Err. "Not there" vs "can't tell" are
+    /// different — callers need to distinguish miss from transient error.
     #[tokio::test]
     async fn s3_get_nosuchkey_none() -> anyhow::Result<()> {
         let rule = mock!(Client::get_object)
