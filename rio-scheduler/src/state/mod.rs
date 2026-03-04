@@ -321,6 +321,12 @@ pub struct DerivationState {
     /// duration > 2× the class cutoff). `None` = size-classes not
     /// configured, or never assigned.
     pub assigned_size_class: Option<String>,
+    /// ATerm-serialized .drv content, inlined by the gateway for
+    /// nodes that will actually dispatch (outputs missing from store).
+    /// Empty = worker fetches from store via GetPath (the pre-D8
+    /// path, still works). Forwarded verbatim into WorkAssignment.
+    /// ≤256 KB bound enforced at gRPC ingress.
+    pub drv_content: Vec<u8>,
     /// Number of retry attempts so far.
     pub retry_count: u32,
     /// Workers that have failed building this derivation (for poison tracking).
@@ -375,6 +381,7 @@ impl DerivationState {
             interested_builds: HashSet::new(),
             assigned_worker: None,
             assigned_size_class: None,
+            drv_content: node.drv_content.clone(),
             retry_count: 0,
             failed_workers: HashSet::new(),
             poisoned_at: None,
@@ -713,6 +720,7 @@ mod tests {
             output_names: vec!["out".into()],
             is_fixed_output: false,
             expected_output_paths: vec![],
+            drv_content: Vec::new(),
         }
     }
 

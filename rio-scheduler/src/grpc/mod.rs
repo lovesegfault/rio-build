@@ -216,6 +216,16 @@ impl SchedulerService for SchedulerGrpc {
                     node.drv_hash
                 )));
             }
+            // Gateway caps per-node at 64 KB; this is a defensive
+            // upper bound (256 KB). Per-node — the 16 MB TOTAL budget
+            // is gateway-enforced; here we just stop one malformed
+            // node from being pathological.
+            const MAX_DRV_CONTENT_BYTES: usize = 256 * 1024;
+            rio_common::grpc::check_bound(
+                "node.drv_content",
+                node.drv_content.len(),
+                MAX_DRV_CONTENT_BYTES,
+            )?;
         }
 
         // UUID v7 (time-ordered, RFC 9562): the high 48 bits are Unix-ms

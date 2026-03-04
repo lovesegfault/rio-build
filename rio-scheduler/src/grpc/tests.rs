@@ -379,6 +379,36 @@ async fn test_submit_build_rejects_empty_system() {
     );
 }
 
+/// Oversized drv_content (>256 KB) should be rejected at gRPC ingress.
+/// The gateway caps at 64 KB, but a buggy/hostile client could bypass
+/// that — this is the defensive bound.
+#[tokio::test]
+async fn test_submit_build_rejects_oversized_drv_content() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new(handle);
+
+    let mut bad_node = make_test_node("h", "x86_64-linux");
+    // 256 KB + 1 byte → over limit.
+    bad_node.drv_content = vec![b'a'; 256 * 1024 + 1];
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![bad_node],
+        edges: vec![],
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(result.is_err(), "oversized drv_content should be rejected");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("drv_content"),
+        "error should mention drv_content: {}",
+        status.message()
+    );
+}
+
 /// SubmitBuild with an unrecognized priority_class should be rejected
 /// at the gRPC boundary (PriorityClass::FromStr). Previously this leaked
 /// as a PostgreSQL CHECK constraint violation in Status::internal.

@@ -11,7 +11,20 @@ use rio_nix::store_path::StorePath;
 use rio_proto::store::store_service_client::StoreServiceClient;
 use rio_proto::types;
 use tonic::transport::Channel;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Per-node inline threshold. Most .drv files are 1-10 KB; 64 KB is
+/// a generous cap. Anything larger is probably a generated derivation
+/// with a huge env (flake inputs serialized) — not worth the bandwidth
+/// savings, let the worker fetch it.
+const MAX_INLINE_DRV_BYTES: usize = 64 * 1024;
+
+/// Total budget across ALL inlined nodes in one SubmitBuild. Half the
+/// gRPC message limit (32 MB). Cold cache with 10k drvs × 10 KB each
+/// = 100 MB — WAY over. The budget means we inline the first ~1600
+/// average-size drvs, then the rest fall back to worker-fetch. That's
+/// still a huge win over inlining zero.
+const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 use crate::handler::{ClientOptions, resolve_derivation};
 
@@ -133,6 +146,11 @@ pub fn single_node_from_basic(
         output_names,
         is_fixed_output: basic_drv.outputs().iter().any(|o| o.is_fixed_output()),
         expected_output_paths,
+        // Single-node fallback: BasicDerivation has no inputDrvs. We
+        // COULD serialize it, but this path is the "full drv not
+        // available" fallback — if we don't have the full thing, the
+        // worker will fetch it from store. Keep the fallback simple.
+        drv_content: Vec::new(),
     }]
 }
 
@@ -161,7 +179,126 @@ fn derivation_to_node(drv_path: &StorePath, drv: &Derivation) -> types::Derivati
         output_names,
         is_fixed_output: drv.is_fixed_output(),
         expected_output_paths,
+        // Empty here — filter_and_inline_drv() populates AFTER the
+        // FindMissingPaths check. Inlining now would waste bytes on
+        // cache-hit nodes that never dispatch.
+        drv_content: Vec::new(),
     }
+}
+
+/// Inline .drv content into nodes whose outputs are missing from the
+/// store — i.e., nodes that will actually dispatch. Saves one worker
+/// → store round-trip per dispatched derivation (the `GetPath` fetch
+/// in `fetch_drv_from_store`).
+///
+/// Gated by FindMissingPaths: cache-hit nodes stay empty (the scheduler
+/// short-circuits them to Completed, they never dispatch). This is the
+/// difference between "inline everything" (100 MB for a cold 10k-node
+/// DAG) and "inline what's needed" (usually a handful of nodes).
+///
+/// Budget-capped at 16 MB total. First-come-first-serve — if we blow
+/// the budget, remaining nodes fall back to worker-fetch. Not optimal
+/// ordering (critical-path would be nice) but simple and correct.
+///
+/// On any error (FindMissingPaths timeout, store down, etc.): log and
+/// skip inlining entirely. The worker-fetch path is the SAFE DEFAULT
+/// — this is an optimization, not a correctness requirement.
+pub async fn filter_and_inline_drv(
+    nodes: &mut [types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+    store_client: &mut StoreServiceClient<Channel>,
+) {
+    // Collect all expected output paths across the DAG. One batched
+    // FindMissingPaths call instead of N.
+    let all_outputs: Vec<String> = nodes
+        .iter()
+        .flat_map(|n| n.expected_output_paths.iter().cloned())
+        .collect();
+
+    if all_outputs.is_empty() {
+        // No expected outputs (all BasicDerivation fallbacks, or
+        // unusual derivations). Nothing to gate on; don't inline.
+        return;
+    }
+
+    // Single FindMissingPaths. Timeout matches the other gateway
+    // store calls. On any error: skip inlining (safe degrade).
+    let missing: HashSet<String> = match tokio::time::timeout(
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        store_client.find_missing_paths(types::FindMissingPathsRequest {
+            store_paths: all_outputs,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+        Ok(Err(e)) => {
+            warn!(error = %e, "FindMissingPaths failed; skipping .drv inlining (worker will fetch)");
+            return;
+        }
+        Err(_) => {
+            warn!("FindMissingPaths timed out; skipping .drv inlining (worker will fetch)");
+            return;
+        }
+    };
+
+    // Walk nodes; inline those with ANY missing output.
+    let mut total_inlined: usize = 0;
+    let mut inlined_count: usize = 0;
+    let mut skipped_budget: usize = 0;
+
+    for node in nodes.iter_mut() {
+        // At least one output missing → this node will dispatch.
+        // All outputs present → cache hit → never dispatches → skip.
+        let will_dispatch = node
+            .expected_output_paths
+            .iter()
+            .any(|p| missing.contains(p));
+        if !will_dispatch {
+            continue;
+        }
+
+        // Look up the Derivation. drv_path is the key we used in
+        // reconstruct_dag. If it's not in cache (shouldn't happen —
+        // reconstruct_dag populates it) or won't parse, skip.
+        let Ok(sp) = StorePath::parse(&node.drv_path) else {
+            continue;
+        };
+        let Some(drv) = drv_cache.get(&sp) else {
+            continue;
+        };
+
+        // Serialize. to_aterm() is deterministic (BTreeMap iteration)
+        // so this is the same bytes the store has.
+        let aterm = drv.to_aterm();
+        let aterm_bytes = aterm.into_bytes();
+
+        // Per-node size gate. Huge derivations (flake inputs dumped
+        // into env) aren't worth it — worker fetches those.
+        if aterm_bytes.len() > MAX_INLINE_DRV_BYTES {
+            continue;
+        }
+
+        // Budget gate. Once we hit 16 MB, stop inlining. Remaining
+        // nodes fall back to worker-fetch. "Stop" not "skip" — there
+        // could be hundreds more small ones, not worth looping to find
+        // them when we're already over budget.
+        if total_inlined + aterm_bytes.len() > INLINE_BUDGET_BYTES {
+            skipped_budget += 1;
+            continue;
+        }
+
+        total_inlined += aterm_bytes.len();
+        inlined_count += 1;
+        node.drv_content = aterm_bytes;
+    }
+
+    debug!(
+        inlined = inlined_count,
+        bytes = total_inlined,
+        skipped_over_budget = skipped_budget,
+        "inlined .drv content for will-dispatch nodes"
+    );
 }
 
 /// Build a `SubmitBuildRequest` from nodes, edges, and client options.
@@ -406,5 +543,131 @@ mod tests {
 
         assert_eq!(nodes.len(), 3, "A->B->C chain -> 3 nodes");
         assert_eq!(edges.len(), 2, "A->B and B->C -> 2 edges");
+    }
+
+    // -------------------------------------------------------------------
+    // filter_and_inline_drv
+    // -------------------------------------------------------------------
+
+    /// Core behavior: only nodes with MISSING outputs get inlined.
+    /// Cache-hit nodes stay empty → SubmitBuild doesn't bloat for
+    /// derivations that never dispatch.
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_gates_on_missing() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store;
+
+        let (store, addr, _handle) = spawn_mock_store().await?;
+        let mut store_client = rio_proto::client::connect_store(&addr.to_string()).await?;
+
+        // Two derivations: "cached" (output in store), "missing" (not).
+        let cached_path = sp("/nix/store/cccccccccccccccccccccccccccccccc-cached.drv");
+        let cached_out = "/nix/store/cccccccccccccccccccccccccccccccc-cached-out";
+        let missing_path = sp("/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-missing.drv");
+        let missing_out = "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-missing-out";
+
+        let cached_drv = make_test_derivation(cached_out, &[]);
+        let missing_drv = make_test_derivation(missing_out, &[]);
+
+        // Seed the "cached" output into MockStore so FindMissingPaths
+        // reports it as present. Content doesn't matter — just the key.
+        store.seed(
+            rio_proto::validated::ValidatedPathInfo {
+                store_path: rio_nix::store_path::StorePath::parse(cached_out)?,
+                nar_hash: [0u8; 32],
+                nar_size: 1,
+                store_path_hash: vec![],
+                deriver: None,
+                references: vec![],
+                signatures: vec![],
+                content_address: None,
+                registration_time: 0,
+                ultimate: false,
+            },
+            vec![0u8; 1],
+        );
+
+        let mut cache = HashMap::new();
+        cache.insert(cached_path.clone(), cached_drv.clone());
+        cache.insert(missing_path.clone(), missing_drv.clone());
+
+        let mut nodes = vec![
+            derivation_to_node(&cached_path, &cached_drv),
+            derivation_to_node(&missing_path, &missing_drv),
+        ];
+
+        // Pre: both empty.
+        assert!(nodes[0].drv_content.is_empty());
+        assert!(nodes[1].drv_content.is_empty());
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut store_client).await;
+
+        // Post: cached stays empty (won't dispatch), missing is inlined.
+        assert!(
+            nodes[0].drv_content.is_empty(),
+            "cache-hit node should NOT be inlined (won't dispatch)"
+        );
+        assert!(
+            !nodes[1].drv_content.is_empty(),
+            "missing-output node SHOULD be inlined (will dispatch)"
+        );
+
+        // The inlined content is the ATerm — roundtrip-parse to prove
+        // it's real, not garbage.
+        let inlined = std::str::from_utf8(&nodes[1].drv_content)?;
+        let reparsed = Derivation::parse(inlined)?;
+        assert_eq!(reparsed.platform(), "x86_64-linux");
+        assert_eq!(
+            inlined,
+            missing_drv.to_aterm(),
+            "inlined bytes = exactly what to_aterm() produces"
+        );
+
+        Ok(())
+    }
+
+    /// Store unreachable → skip inlining entirely. Safe degrade:
+    /// worker will fetch. This is an OPTIMIZATION, not correctness.
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_store_error_skips_safely() {
+        let drv_path = sp("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv");
+        let drv = make_test_derivation("/nix/store/aaa-out", &[]);
+
+        let mut cache = HashMap::new();
+        cache.insert(drv_path.clone(), drv.clone());
+
+        let mut nodes = vec![derivation_to_node(&drv_path, &drv)];
+
+        // Dead store — FindMissingPaths will fail.
+        let mut dead_store = unreachable_store();
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
+
+        // On error: nothing inlined, no panic, function just returns.
+        // Worker-fetch path handles this.
+        assert!(
+            nodes[0].drv_content.is_empty(),
+            "store error → skip inlining (safe degrade)"
+        );
+    }
+
+    /// Empty expected_output_paths → nothing to gate on → skip.
+    /// (single_node_from_basic fallback has no expected outputs.)
+    #[tokio::test]
+    async fn test_filter_and_inline_drv_no_expected_outputs_skips() {
+        let mut dead_store = unreachable_store();
+        let cache = HashMap::new();
+
+        // Node with no expected_output_paths (like single_node_from_basic).
+        let mut nodes = vec![types::DerivationNode {
+            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into(),
+            drv_hash: "x".into(),
+            expected_output_paths: vec![], // KEY: empty
+            ..Default::default()
+        }];
+
+        filter_and_inline_drv(&mut nodes, &cache, &mut dead_store).await;
+
+        // Early return on empty — doesn't even hit the (dead) store.
+        assert!(nodes[0].drv_content.is_empty());
     }
 }

@@ -13,6 +13,7 @@ fn make_node(tag: &str, system: &str) -> DerivationNode {
         output_names: vec!["out".to_string()],
         is_fixed_output: false,
         expected_output_paths: vec![],
+        drv_content: Vec::new(),
     }
 }
 
@@ -28,6 +29,7 @@ fn make_node_with_path(drv_hash: &str, drv_path: &str, system: &str) -> Derivati
         output_names: vec!["out".to_string()],
         is_fixed_output: false,
         expected_output_paths: vec![],
+        drv_content: Vec::new(),
     }
 }
 
