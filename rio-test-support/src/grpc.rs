@@ -46,6 +46,9 @@ pub struct MockStore {
     /// If true, find_missing_paths returns Unavailable. For scheduler
     /// cache-check error-path tests.
     pub fail_find_missing: Arc<AtomicBool>,
+    /// If true, query_path_info returns Unavailable. For worker input-fetch
+    /// error-path tests (distinguishing real gRPC errors from NotFound).
+    pub fail_query_path_info: Arc<AtomicBool>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// For E4's gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
@@ -165,6 +168,11 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::QueryPathInfoRequest>,
     ) -> Result<Response<types::PathInfo>, Status> {
+        if self.fail_query_path_info.load(Ordering::SeqCst) {
+            return Err(Status::unavailable(
+                "mock: injected query_path_info failure",
+            ));
+        }
         let store_path = request.into_inner().store_path;
         let paths = self.paths.read().unwrap();
         // Exact match first, then prefix match (for QueryPathFromHashPart,
