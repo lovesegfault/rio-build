@@ -371,7 +371,7 @@ impl DagActor {
     /// constraints are satisfied. Zero means "unset" (no timeout).
     pub(super) fn build_options_for_derivation(
         &self,
-        drv_hash: &str,
+        drv_hash: &DrvHash,
     ) -> rio_proto::types::BuildOptions {
         let interested = self.get_interested_builds(drv_hash);
 

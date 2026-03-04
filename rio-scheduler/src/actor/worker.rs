@@ -27,8 +27,8 @@ impl DagActor {
         }
     }
 
-    pub(super) async fn handle_worker_disconnected(&mut self, worker_id: &str) {
-        info!(worker_id, "worker disconnected");
+    pub(super) async fn handle_worker_disconnected(&mut self, worker_id: &WorkerId) {
+        info!(worker_id = %worker_id, "worker disconnected");
 
         let Some(worker) = self.workers.remove(worker_id) else {
             return; // unknown worker, no-op (and no gauge decrement)
@@ -43,7 +43,7 @@ impl DagActor {
         // reset_to_ready() handles Assigned -> Ready and Running -> Failed -> Ready,
         // maintaining state-machine invariants.
         for drv_hash in &worker.running_builds {
-            if let Some(state) = self.dag.node_mut(drv_hash.as_str()) {
+            if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
                         drv_hash = %drv_hash, error = %e,
@@ -233,22 +233,22 @@ impl DagActor {
         }
 
         // Check for poisoned derivations that should expire (24h TTL)
-        let mut expired_poisons = Vec::new();
+        let mut expired_poisons: Vec<DrvHash> = Vec::new();
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
                 && let Some(poisoned_at) = state.poisoned_at
                 && now.duration_since(poisoned_at) > POISON_TTL
             {
-                expired_poisons.push(drv_hash.to_string());
+                expired_poisons.push(drv_hash.into());
             }
         }
 
         for drv_hash in expired_poisons {
-            info!(drv_hash, "poison TTL expired, resetting to created");
+            info!(drv_hash = %drv_hash, "poison TTL expired, resetting to created");
             if let Some(state) = self.dag.node_mut(&drv_hash)
                 && let Err(e) = state.reset_from_poison()
             {
-                warn!(drv_hash, error = %e, "poison reset failed");
+                warn!(drv_hash = %drv_hash, error = %e, "poison reset failed");
                 continue;
             }
             if let Err(e) = self
@@ -256,7 +256,7 @@ impl DagActor {
                 .update_derivation_status(&drv_hash, DerivationStatus::Created, None)
                 .await
             {
-                error!(drv_hash, error = %e, "failed to persist poison reset");
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist poison reset");
             }
         }
 
