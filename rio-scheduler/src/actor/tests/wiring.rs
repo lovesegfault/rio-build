@@ -11,7 +11,6 @@ use super::*;
 async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
         setup_with_worker("test-worker-1", "x86_64-linux", 2).await?;
-    settle().await;
 
     let workers = handle.debug_query_workers().await?;
     assert_eq!(workers.len(), 1);
@@ -42,8 +41,6 @@ async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    settle().await;
-
     // Worker should have received an assignment (derivation is ready, worker has capacity)
     // Now send completion using drv_PATH (mimics what grpc.rs does with report.drv_path)
     // Note: PATH, not hash — tests that grpc.rs drv_path resolves correctly.
@@ -54,8 +51,6 @@ async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
         &test_store_path("xyz-foo"),
     )
     .await?;
-
-    settle().await;
 
     // Query build status — should be Succeeded (single derivation, completed)
     let status = query_status(&handle, build_id).await?;
@@ -90,7 +85,6 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
     let drv_hash = "disconnect-test-hash";
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Worker should have received an assignment
     let assignment = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
@@ -125,7 +119,6 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
             worker_id: "test-worker".into(),
         })
         .await?;
-    settle().await;
 
     // Derivation should be back in Ready state, and retry_count
     // should be incremented (disconnect during Assigned/Running is a
@@ -165,7 +158,6 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Send completion with InfrastructureFailure (what gRPC layer sends
     // for None result)
@@ -177,7 +169,6 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
         "worker sent CompletionReport with no result",
     )
     .await?;
-    settle().await;
 
     // The derivation should have gone through Failed -> Ready (retry) and
     // then been immediately re-dispatched to the worker (Assigned again).
@@ -216,7 +207,6 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Send completion with extreme timestamps that would overflow i64 subtraction.
     // Pre-fix: stop.seconds - start.seconds = i64::MAX - i64::MIN overflows (panic in debug).
@@ -245,12 +235,13 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
             output_size_bytes: 0,
         })
         .await?;
-    settle().await;
 
-    // If we got here, the actor didn't panic. Verify completion was processed
-    // (build succeeded) and actor is still alive.
-    assert!(handle.is_alive(), "actor must survive extreme timestamps");
+    // Verify completion was processed (build succeeded). query_status is
+    // the barrier — it queues after ProcessCompletion, so by the time it
+    // replies the completion has been handled. If the actor panicked,
+    // this errors (channel closed).
     let status = query_status(&handle, build_id).await?;
+    assert!(handle.is_alive(), "actor must survive extreme timestamps");
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
@@ -280,7 +271,6 @@ async fn test_interactive_builds_pushed_to_front() -> TestResult {
         PriorityClass::Scheduled,
     )
     .await?;
-    settle().await;
 
     // The normal build gets assigned first (only one in queue)
     let first = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
@@ -307,11 +297,9 @@ async fn test_interactive_builds_pushed_to_front() -> TestResult {
     let p_ifd = test_drv_path("hash-ifd");
     let _rx3 =
         merge_single_node(&handle, build_ifd, "hash-ifd", PriorityClass::Interactive).await?;
-    settle().await;
 
     // Complete the first build to free worker capacity
     complete_success_empty(&handle, "test-worker", &p_normal).await?;
-    settle().await;
 
     // The next assignment should be the IFD derivation (was pushed to front)
     let second = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())

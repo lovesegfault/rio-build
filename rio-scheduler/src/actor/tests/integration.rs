@@ -93,7 +93,6 @@ async fn test_scheduler_cache_check_skips_build() -> TestResult {
     node.expected_output_paths = vec![cached_output.to_string()];
 
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    settle().await;
 
     // Derivation should have gone Created → Completed (scheduler cache hit).
     let info = handle
@@ -133,7 +132,6 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
     node.expected_output_paths = vec![test_store_path("uncached-out")];
 
     let _event_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    settle().await;
 
     // Without store client, derivation should proceed normally to dispatch.
     let info = handle
@@ -167,7 +165,6 @@ async fn test_db_failure_during_completion_logged() -> TestResult {
     let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-    settle().await;
 
     // Sanity check: derivation was dispatched.
     let pre = handle
@@ -188,7 +185,6 @@ async fn test_db_failure_during_completion_logged() -> TestResult {
         &test_store_path("fake-output"),
     )
     .await?;
-    settle().await;
 
     // In-memory state should have transitioned despite DB failure.
     let post = handle
@@ -402,7 +398,6 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
         false,
     )
     .await?;
-    settle().await;
 
     // Worker should have EXACTLY 1 running build (the successful assign),
     // not 2 (which would indicate the failed assign leaked into running_builds).
@@ -444,7 +439,6 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
             running_builds: vec![sent_hash.clone()],
         })
         .await?;
-    settle().await;
 
     // Now both should be assigned.
     let workers = handle.debug_query_workers().await?;
