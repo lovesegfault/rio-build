@@ -272,7 +272,6 @@ fn count_missing(worker: &WorkerState, input_paths: &[String]) -> usize {
 mod tests {
     use super::*;
     use rio_common::bloom::BloomFilter;
-    use std::collections::HashSet;
     use std::time::Instant;
 
     fn make_worker(id: &str, max: u32, running: u32) -> WorkerState {
@@ -499,11 +498,6 @@ mod tests {
             drv_content: Vec::new(),
         }
     }
-
-    // Ensure the import of HashSet is used (WorkerState construction uses it indirectly via make_worker).
-    const _: fn() = || {
-        let _: HashSet<()> = HashSet::new();
-    };
 
     // ----- classify() tests -----
 

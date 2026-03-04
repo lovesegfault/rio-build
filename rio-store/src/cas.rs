@@ -387,16 +387,6 @@ pub enum ChunkError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
-
-    /// Backend transient error (S3 5xx, network). Retriable.
-    ///
-    /// NOTE: currently unused — singleflight flattens backend errors to
-    /// None (same as NotFound) for simplicity. The log inside the spawned
-    /// task captures the actual error. This variant stays for C5's direct
-    /// backend path (if any) and to document the intent.
-    #[error("backend fetch failed: {0}")]
-    #[allow(dead_code)]
-    Backend(anyhow::Error),
 }
 
 impl ChunkCache {

@@ -1160,11 +1160,6 @@ impl ChunkService for ChunkServiceImpl {
                     "chunk {} failed BLAKE3 verification: {e}",
                     hex::encode(hash)
                 )),
-                // Backend variant currently unreachable (singleflight
-                // flattens to None), but handle it for future-proofing.
-                ChunkError::Backend(_) => {
-                    internal_error("GetChunk: backend fetch", anyhow::anyhow!("{e}"))
-                }
             }
         })?;
 

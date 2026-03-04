@@ -78,7 +78,7 @@ impl std::fmt::Debug for NarDigest {
 pub struct HashingReader<R> {
     inner: R,
     hasher: Sha256,
-    bytes_read: u64,
+    pub(crate) bytes_read: u64,
     seen_eof: bool,
 }
 
@@ -91,12 +91,6 @@ impl<R> HashingReader<R> {
             bytes_read: 0,
             seen_eof: false,
         }
-    }
-
-    /// Total bytes delivered to the caller so far.
-    #[cfg_attr(not(test), allow(dead_code))] // used by tests; useful for diagnostics in future Store backends
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
     }
 
     /// Consume this reader and return the accumulated digest.
@@ -276,16 +270,16 @@ mod tests {
     async fn hashing_reader_bytes_read_tracks_progress() -> anyhow::Result<()> {
         let data = b"abcdefghij"; // 10 bytes
         let mut hashing = HashingReader::new(std::io::Cursor::new(data.as_slice()));
-        assert_eq!(hashing.bytes_read(), 0);
+        assert_eq!(hashing.bytes_read, 0);
 
         let mut buf = [0u8; 5];
         let n = hashing.read(&mut buf).await?;
         assert_eq!(n, 5);
-        assert_eq!(hashing.bytes_read(), 5);
+        assert_eq!(hashing.bytes_read, 5);
 
         let n = hashing.read(&mut buf).await?;
         assert_eq!(n, 5);
-        assert_eq!(hashing.bytes_read(), 10);
+        assert_eq!(hashing.bytes_read, 10);
         Ok(())
     }
 
@@ -320,7 +314,7 @@ mod tests {
         let err = hashing.read_to_end(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         // Should have read the 5 bytes before the error
-        assert_eq!(hashing.bytes_read(), 5);
+        assert_eq!(hashing.bytes_read, 5);
     }
 
     #[tokio::test]
