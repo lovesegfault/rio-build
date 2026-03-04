@@ -419,6 +419,36 @@ message AddSignaturesResponse {
   // Empty — success signaled by OK status, failure by NOT_FOUND/INVALID_ARGUMENT.
 }
 
+// A CA derivation output realisation: the (drv_hash, output_name) -> output_path
+// mapping that Nix builds for content-addressed derivations.
+//
+// Wire format note: Nix's Realisation JSON on the wire has an "id" field that's
+// "sha256:<hex>!<name>" combining drv_hash and output_name. We store them
+// separately here (cleaner for the DB primary key) and the gateway does the
+// split/join at the protocol boundary.
+message Realisation {
+  bytes drv_hash = 1;         // Modular derivation hash (hashDerivationModulo output, 32 bytes SHA-256)
+  string output_name = 2;     // e.g. "out", "dev", "doc"
+  string output_path = 3;     // Realized /nix/store/... path
+  bytes output_hash = 4;      // SHA-256 of the output NAR (32 bytes)
+  repeated string signatures = 5;  // ed25519 sigs over (drv_hash, output_name, output_path, nar_hash) — Phase 5 signs these
+}
+
+message RegisterRealisationRequest {
+  Realisation realisation = 1;
+}
+
+message RegisterRealisationResponse {
+  // Empty — success signaled by OK status. ON CONFLICT DO NOTHING means
+  // duplicate registrations silently succeed (they're deterministic, so
+  // there's nothing to warn about).
+}
+
+message QueryRealisationRequest {
+  bytes drv_hash = 1;         // 32-byte SHA-256 modular derivation hash
+  string output_name = 2;     // which output to look up
+}
+
 // ---------------------------------------------------------------------------
 // Chunk service types (Phase 2a: stub, no chunking)
 // ---------------------------------------------------------------------------

@@ -17,11 +17,13 @@ use rio_proto::types::{
     FindMissingChunksRequest, FindMissingChunksResponse, FindMissingPathsRequest,
     FindMissingPathsResponse, GetChunkRequest, GetChunkResponse, GetPathRequest, GetPathResponse,
     PathInfo, PutChunkRequest, PutChunkResponse, PutPathRequest, PutPathResponse,
-    QueryPathFromHashPartRequest, QueryPathInfoRequest, get_path_response, put_path_request,
+    QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
+    RegisterRealisationRequest, RegisterRealisationResponse, get_path_response, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::metadata::{self, ManifestKind};
+use crate::realisations;
 use crate::validate::validate_nar_digest;
 
 use rio_proto::client::NAR_CHUNK_SIZE;
@@ -691,6 +693,106 @@ impl StoreService for StoreServiceImpl {
         }
 
         Ok(Response::new(AddSignaturesResponse {}))
+    }
+
+    /// Register a CA derivation realisation.
+    #[instrument(skip(self, request), fields(rpc = "RegisterRealisation"))]
+    async fn register_realisation(
+        &self,
+        request: Request<RegisterRealisationRequest>,
+    ) -> Result<Response<RegisterRealisationResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let proto = request
+            .into_inner()
+            .realisation
+            .ok_or_else(|| Status::invalid_argument("realisation field is required"))?;
+
+        // Validate hash lengths at the trust boundary. Proto bytes fields
+        // are unbounded Vec<u8>; the DB layer expects [u8; 32]. Doing the
+        // try_into here (not in realisations::insert) keeps the DB layer
+        // free of proto-specific validation and gives a useful gRPC status
+        // back to the client instead of an internal error.
+        let drv_hash: [u8; 32] = proto.drv_hash.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "drv_hash must be 32 bytes (SHA-256), got {}",
+                proto.drv_hash.len()
+            ))
+        })?;
+        let output_hash: [u8; 32] = proto.output_hash.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "output_hash must be 32 bytes (SHA-256), got {}",
+                proto.output_hash.len()
+            ))
+        })?;
+
+        if proto.output_name.is_empty() {
+            return Err(Status::invalid_argument("output_name must not be empty"));
+        }
+        // output_path validation: must be a well-formed store path. Same
+        // check as PutPath — rejects traversal, bad nixbase32, etc.
+        validate_store_path(&proto.output_path)?;
+
+        // Bound sigs list. Same limit as narinfo.signatures.
+        rio_common::grpc::check_bound(
+            "signatures",
+            proto.signatures.len(),
+            rio_common::limits::MAX_SIGNATURES,
+        )?;
+
+        let r = realisations::Realisation {
+            drv_hash,
+            output_name: proto.output_name,
+            output_path: proto.output_path,
+            output_hash,
+            signatures: proto.signatures,
+        };
+
+        realisations::insert(&self.pool, &r)
+            .await
+            .map_err(|e| internal_error("RegisterRealisation: insert", e))?;
+
+        Ok(Response::new(RegisterRealisationResponse {}))
+    }
+
+    /// Look up a CA derivation realisation.
+    #[instrument(skip(self, request), fields(rpc = "QueryRealisation"))]
+    async fn query_realisation(
+        &self,
+        request: Request<QueryRealisationRequest>,
+    ) -> Result<Response<Realisation>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+
+        let drv_hash: [u8; 32] = req.drv_hash.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "drv_hash must be 32 bytes (SHA-256), got {}",
+                req.drv_hash.len()
+            ))
+        })?;
+        if req.output_name.is_empty() {
+            return Err(Status::invalid_argument("output_name must not be empty"));
+        }
+
+        let r = realisations::query(&self.pool, &drv_hash, &req.output_name)
+            .await
+            .map_err(|e| internal_error("QueryRealisation: query", e))?
+            .ok_or_else(|| {
+                // Cache miss, not an error. Gateway maps this to an
+                // empty-set wire response.
+                Status::not_found(format!(
+                    "no realisation for ({}, {})",
+                    hex::encode(drv_hash),
+                    req.output_name
+                ))
+            })?;
+
+        Ok(Response::new(Realisation {
+            drv_hash: r.drv_hash.to_vec(),
+            output_name: r.output_name,
+            output_path: r.output_path,
+            output_hash: r.output_hash.to_vec(),
+            signatures: r.signatures,
+        }))
     }
 }
 
