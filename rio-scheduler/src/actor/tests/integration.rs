@@ -35,12 +35,14 @@ async fn setup_inproc_store(
     Ok((StoreServiceClient::new(channel), server))
 }
 
-/// Build a minimal single-file NAR and upload it to the store.
+/// Build a minimal single-file NAR and upload it to the store (trailer mode).
 async fn put_test_path(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
 ) -> anyhow::Result<()> {
-    use rio_proto::types::{PathInfo, PutPathMetadata, PutPathRequest, put_path_request};
+    use rio_proto::types::{
+        PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
+    };
     use sha2::{Digest, Sha256};
 
     let node = rio_nix::nar::NarNode::Regular {
@@ -51,10 +53,10 @@ async fn put_test_path(
     rio_nix::nar::serialize(&mut nar, &node)?;
 
     let nar_hash = Sha256::digest(&nar).to_vec();
+    let nar_size = nar.len() as u64;
+    // nar_hash/nar_size MUST be empty in metadata; real values go in trailer.
     let info = PathInfo {
         store_path: store_path.to_string(),
-        nar_hash,
-        nar_size: nar.len() as u64,
         ..Default::default()
     };
 
@@ -67,6 +69,13 @@ async fn put_test_path(
     .await?;
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await?;
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(PutPathTrailer {
+            nar_hash,
+            nar_size,
+        })),
     })
     .await?;
     drop(tx);

@@ -14,7 +14,7 @@ use tonic::transport::Channel;
 
 use crate::StoreServiceClient;
 use crate::types::{
-    GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest,
+    GetPathRequest, GetPathResponse, PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer,
     QueryPathInfoRequest, get_path_response, put_path_request,
 };
 use crate::validated::ValidatedPathInfo;
@@ -115,8 +115,12 @@ pub async fn collect_nar_stream(
     Ok((info, nar))
 }
 
-/// Build a `PutPath` request stream: metadata message first, then
-/// [`NAR_CHUNK_SIZE`] chunks of the NAR.
+/// Build a `PutPath` request stream: metadata first, then [`NAR_CHUNK_SIZE`]
+/// chunks of the NAR, then a `PutPathTrailer` with the hash/size.
+///
+/// Trailer-mode only: `nar_hash`/`nar_size` are zeroed in the metadata
+/// PathInfo and sent in the trailer. This is the ONLY PutPath mode the
+/// store accepts (hash-upfront was deleted in the pre-phase3a cleanup).
 ///
 /// Takes `Arc<[u8]>` so chunks borrow without eagerly materializing
 /// a `Vec<PutPathRequest>`. The returned stream is lazy — chunks are
@@ -126,9 +130,19 @@ pub fn chunk_nar_for_put(
     info: ValidatedPathInfo,
     nar: Arc<[u8]>,
 ) -> impl Stream<Item = PutPathRequest> + Send + 'static {
+    // Extract hash/size for the trailer, then zero them in the metadata.
+    // The store fills a placeholder, reads all chunks, then validates
+    // against the trailer (same security property as before — server-
+    // computed digest must match client-declared).
+    let mut raw: PathInfo = info.into();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut raw.nar_hash),
+        nar_size: std::mem::take(&mut raw.nar_size),
+    };
+
     let metadata = PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info.into()),
+            info: Some(raw),
         })),
     };
 
@@ -140,7 +154,13 @@ pub fn chunk_nar_for_put(
         }
     });
 
-    tokio_stream::once(metadata).chain(chunks)
+    let trailer = PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    };
+
+    tokio_stream::once(metadata)
+        .chain(chunks)
+        .chain(tokio_stream::once(trailer))
 }
 
 // ===========================================================================

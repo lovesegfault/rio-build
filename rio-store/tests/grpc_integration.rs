@@ -13,8 +13,8 @@ use tonic::transport::{Channel, Server};
 use rio_proto::StoreServiceClient;
 use rio_proto::StoreServiceServer;
 use rio_proto::types::{
-    FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, QueryPathInfoRequest,
-    put_path_request,
+    FindMissingPathsRequest, PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer,
+    QueryPathInfoRequest, put_path_request,
 };
 use rio_proto::validated::ValidatedPathInfo;
 use rio_store::backend::chunk::{ChunkBackend, MemoryChunkBackend};
@@ -107,15 +107,25 @@ pub async fn put_path(
 
 /// Raw variant: takes unvalidated `PathInfo` directly. Use this to test
 /// server-side rejection of malformed input (e.g., bad reference strings).
+///
+/// Trailer-mode: extracts `nar_hash`/`nar_size` from `info`, zeroes them
+/// in the metadata, and sends them in a `PutPathTrailer`. (Hash-upfront
+/// was deleted — store rejects non-empty metadata nar_hash.)
 pub async fn put_path_raw(
     client: &mut StoreServiceClient<Channel>,
-    info: PathInfo,
+    mut info: PathInfo,
     nar: Vec<u8>,
 ) -> Result<bool, tonic::Status> {
     let (tx, rx) = mpsc::channel(8);
 
-    // Send metadata first
-    // Fresh channel with buffer=8, receiver alive: these sends cannot fail.
+    // Extract hash/size for trailer, zero them in metadata.
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+
+    // Send metadata first. Fresh channel, buffer=8, receiver alive:
+    // these sends cannot fail.
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
             info: Some(info),
@@ -127,6 +137,13 @@ pub async fn put_path_raw(
     // Send NAR data as one chunk
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .expect("fresh channel");
+
+    // Send trailer
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
     })
     .await
     .expect("fresh channel");
@@ -438,23 +455,29 @@ async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     Ok(())
 }
 
-/// PutPath with chunks exceeding declared nar_size should be rejected.
+/// Trailer nar_size disagreeing with actual NAR bytes → size mismatch.
+///
+/// Pre-trailer-mode this tested "chunks exceed declared nar_size". With
+/// trailer mode there's no metadata size to exceed; the equivalent
+/// protection is (a) MAX_NAR_SIZE bounds accumulation, and (b)
+/// validate_nar_digest checks trailer.nar_size == actual bytes received.
+/// This tests (b).
 #[tokio::test]
 async fn test_put_path_rejects_oversized_nar() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, server) = setup_store(db.pool.clone()).await?;
 
-    // Declare nar_size=100 but send 100_000 bytes (well over + 4KB tolerance)
+    // Declare nar_size=100 in trailer but send 100_000 bytes.
     let mut info = make_path_info_for_nar(
         "/nix/store/44444444444444444444444444444444-oversized-test",
         &[0u8; 100],
     );
-    info.nar_size = 100; // Lie about the size
+    info.nar_size = 100; // trailer will claim 100; NAR is 100_000 → mismatch
 
     let oversized_data = vec![0u8; 100_000];
     let result = put_path(&mut client, info, oversized_data).await;
 
-    assert!(result.is_err(), "oversized NAR should be rejected");
+    assert!(result.is_err(), "size mismatch should be rejected");
     let status = result.unwrap_err();
     assert_eq!(
         status.code(),
@@ -462,8 +485,8 @@ async fn test_put_path_rejects_oversized_nar() -> TestResult {
         "should be INVALID_ARGUMENT, got: {status:?}"
     );
     assert!(
-        status.message().contains("exceed"),
-        "error message should mention size exceeded: {}",
+        status.message().contains("size mismatch"),
+        "error message should mention size mismatch: {}",
         status.message()
     );
 
@@ -521,18 +544,24 @@ async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
     let nar = make_nar(b"dup metadata test").0;
     let info = make_path_info_for_nar(store_path, &nar);
 
+    // First metadata must have empty hash (else the new hash-upfront guard
+    // fires before we reach the dup-metadata check).
+    let mut raw: PathInfo = info.into();
+    raw.nar_hash = Vec::new();
+    raw.nar_size = 0;
+
     let (tx, rx) = mpsc::channel(8);
-    // Metadata #1
+    // Metadata #1 (valid)
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info.clone().into()),
+            info: Some(raw.clone()),
         })),
     })
     .await?;
     // Metadata #2 (protocol violation)
     tx.send(PutPathRequest {
         msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(info.into()),
+            info: Some(raw),
         })),
     })
     .await?;
@@ -557,8 +586,9 @@ async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
     Ok(())
 }
 
-/// PutPath with absurdly large declared nar_size should be rejected BEFORE
-/// allocation (prevents OOM from malicious clients).
+/// Trailer with nar_size > MAX_NAR_SIZE is rejected. Chunk accumulation
+/// is independently bounded by MAX_NAR_SIZE (no pre-alloc from declared
+/// size anymore), so this checks the trailer validation specifically.
 #[tokio::test]
 async fn test_put_path_rejects_absurd_nar_size() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -568,7 +598,7 @@ async fn test_put_path_rejects_absurd_nar_size() -> TestResult {
         "/nix/store/55555555555555555555555555555555-absurd-size-test",
         &[0u8; 10],
     );
-    info.nar_size = u64::MAX; // Attempt to trigger huge Vec::with_capacity
+    info.nar_size = u64::MAX; // trailer.nar_size > MAX_NAR_SIZE → rejected
 
     let result = put_path(&mut client, info, vec![0u8; 10]).await;
 
@@ -771,7 +801,6 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
 // PutPathTrailer tests (phase2b C14 — hash-trailer upload mode)
 // ===========================================================================
 
-use rio_proto::types::PutPathTrailer;
 use rio_test_support::fixtures::test_store_path;
 
 /// Build a (nar, ValidatedPathInfo) pair for trailer tests.
@@ -813,24 +842,42 @@ async fn put_path_trailer_mode(
     Ok(resp.into_inner().created)
 }
 
-/// Hash-upfront mode (existing behavior) still works — backward-compat guard.
-/// Trailer not sent; metadata has the real hash.
+/// Hash-upfront was deleted: metadata with non-empty nar_hash is now
+/// REJECTED (un-updated client, deploy error). Loud failure, not silent
+/// ignore — otherwise an old gateway would get inexplicable "no trailer
+/// received" errors deep into the stream.
 #[tokio::test]
-async fn test_trailer_hash_upfront_mode_unchanged() -> TestResult {
+async fn test_metadata_with_hash_rejected() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (mut client, server) = setup_store(db.pool.clone()).await?;
     let (nar, info) = trailer_fixture("upfront-mode");
 
-    let created = put_path(&mut client, info.clone(), nar.clone()).await?;
-    assert!(created, "hash-upfront upload should succeed");
+    // Build stream manually: metadata with REAL hash (what an old gateway
+    // would send), no trailer.
+    let raw: PathInfo = info.into();
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(raw),
+        })),
+    })
+    .await
+    .expect("fresh channel");
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
 
-    let got = client
-        .query_path_info(QueryPathInfoRequest {
-            store_path: info.store_path.to_string(),
-        })
-        .await?
-        .into_inner();
-    assert_eq!(got.nar_hash, info.nar_hash.to_vec());
+    let result = client.put_path(ReceiverStream::new(rx)).await;
+    let status = result.expect_err("non-empty metadata hash should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("hash-upfront mode removed"),
+        "got: {}",
+        status.message()
+    );
 
     server.abort();
     Ok(())
@@ -922,7 +969,8 @@ async fn test_trailer_mode_wrong_hash_rejected() -> TestResult {
     Ok(())
 }
 
-/// Empty metadata hash + NO trailer → InvalidArgument.
+/// Stream closes without trailer → InvalidArgument. Trailer is mandatory.
+/// `put_path_raw` now always sends a trailer, so this uses a manual stream.
 #[tokio::test]
 async fn test_trailer_mode_missing_trailer_rejected() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -933,10 +981,30 @@ async fn test_trailer_mode_missing_trailer_rejected() -> TestResult {
     raw.nar_hash = Vec::new();
     raw.nar_size = 0;
 
-    let result = put_path_raw(&mut client, raw, nar).await;
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(raw),
+        })),
+    })
+    .await
+    .expect("fresh channel");
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .expect("fresh channel");
+    // Stream closed — no trailer.
+    drop(tx);
+
+    let result = client.put_path(ReceiverStream::new(rx)).await;
     let status = result.expect_err("missing trailer should fail");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(status.message().contains("trailer"), "{}", status.message());
+    assert!(
+        status.message().contains("no trailer received"),
+        "{}",
+        status.message()
+    );
 
     server.abort();
     Ok(())
@@ -1023,50 +1091,6 @@ async fn test_trailer_chunk_after_trailer_rejected() -> TestResult {
         status.message().contains("trailer must be last"),
         "{}",
         status.message()
-    );
-
-    server.abort();
-    Ok(())
-}
-
-/// Metadata has real hash AND trailer sent → trailer IGNORED.
-/// If the garbage trailer were used, validation would fail. Success proves
-/// it was ignored (backward-compat contract).
-#[tokio::test]
-async fn test_trailer_ignored_when_metadata_has_hash() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (mut client, server) = setup_store(db.pool.clone()).await?;
-    let (nar, info) = trailer_fixture("both-hashes");
-
-    let raw: PathInfo = info.clone().into(); // REAL hash in metadata
-
-    let (tx, rx) = mpsc::channel(8);
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
-            info: Some(raw),
-        })),
-    })
-    .await
-    .expect("fresh channel");
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::NarChunk(nar.clone())),
-    })
-    .await
-    .expect("fresh channel");
-    tx.send(PutPathRequest {
-        msg: Some(put_path_request::Msg::Trailer(PutPathTrailer {
-            nar_hash: vec![0xDEu8; 32], // garbage — would fail if used
-            nar_size: 999_999,
-        })),
-    })
-    .await
-    .expect("fresh channel");
-    drop(tx);
-
-    let resp = client.put_path(ReceiverStream::new(rx)).await?;
-    assert!(
-        resp.into_inner().created,
-        "garbage trailer should be IGNORED when metadata has real hash"
     );
 
     server.abort();
