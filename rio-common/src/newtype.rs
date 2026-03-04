@@ -56,3 +56,28 @@ macro_rules! string_newtype {
         }
     };
 }
+
+// ---------------------------------------------------------------------------
+// Shared newtype instances
+// ---------------------------------------------------------------------------
+//
+// These identifiers cross crate boundaries (scheduler <-> worker <-> proto),
+// so they live here rather than in a single consumer crate.
+
+string_newtype! {
+    /// Derivation hash newtype. The 32-char nixbase32 hash part of a .drv
+    /// store path, plus the name component (`{hash}-{name}.drv`).
+    ///
+    /// Distinct from `drv_path` (full `/nix/store/HASH-name.drv` string).
+    /// Prevents accidental swaps — see the post-2a `drv_key` rename where
+    /// `handle_completion` took a `drv_hash: String` that was sometimes
+    /// actually a path.
+    ///
+    /// Implements `Borrow<str>` so `HashMap<DrvHash, _>::get(&str)` works.
+    pub struct DrvHash
+}
+
+string_newtype! {
+    /// Worker identifier newtype (e.g., `"worker-0"` or a UUID).
+    pub struct WorkerId
+}
