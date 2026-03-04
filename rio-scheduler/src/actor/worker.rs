@@ -79,6 +79,7 @@ impl DagActor {
         supported_features: Vec<String>,
         max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
+        bloom: Option<rio_common::bloom::BloomFilter>,
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -142,6 +143,12 @@ impl DagActor {
         worker.last_heartbeat = Instant::now();
         worker.missed_heartbeats = 0;
         worker.running_builds = reconciled;
+        // Bloom: overwrite unconditionally. A heartbeat without a
+        // filter (None) clears the old one — the worker stopped
+        // sending it, maybe FUSE unmounted. Better to score it as
+        // "unknown locality" than use a stale filter that claims
+        // paths are cached when they might have been evicted.
+        worker.bloom = bloom;
 
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");

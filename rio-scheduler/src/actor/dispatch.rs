@@ -38,12 +38,19 @@ impl DagActor {
                     continue; // stale state, drop
                 }
 
-                // Find first eligible worker with capacity (FIFO - no scoring)
-                let eligible_worker = self
-                    .workers
-                    .values()
-                    .find(|w| w.has_capacity() && w.can_build(&system, &required_features))
-                    .map(|w| w.worker_id.clone());
+                // Score workers by transfer-cost + load. Replaces the
+                // old first-eligible FIFO. Need the full DerivationState
+                // (not just system/features) for the closure lookup.
+                //
+                // target_class=None: D7 will pass the classified size
+                // here. For now, no size-class filtering.
+                let eligible_worker = self.dag.node(&drv_hash).and_then(|drv_state| {
+                    crate::assignment::best_worker(&self.workers, drv_state, &self.dag, None)
+                });
+                // Silence unused warnings — system/features extracted
+                // above for the None=>continue branch; best_worker reads
+                // them from drv_state directly.
+                let _ = (system, required_features);
 
                 match eligible_worker {
                     Some(worker_id) => {

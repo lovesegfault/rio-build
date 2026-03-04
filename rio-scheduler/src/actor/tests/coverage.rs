@@ -705,6 +705,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // race: worker sent heartbeat before receiving/acking the assignment.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            bloom: None,
             worker_id: "toctou-worker".into(),
             system: "x86_64-linux".into(),
             supported_features: vec![],

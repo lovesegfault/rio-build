@@ -567,6 +567,21 @@ pub struct WorkerState {
     pub last_heartbeat: Instant,
     /// Number of consecutive missed heartbeats.
     pub missed_heartbeats: u32,
+    /// Bloom filter of store paths this worker has cached (from heartbeat).
+    /// `None` until the first heartbeat with a filter arrives. Used by
+    /// `assignment::best_worker()` for transfer-cost scoring — a worker
+    /// that already has most of a derivation's inputs is preferred.
+    ///
+    /// Stale-by-design: updated every 10s (heartbeat interval), so the
+    /// snapshot is up to 10s behind. That's fine for a scoring HINT —
+    /// the actual fetch still happens on the worker if the filter lied
+    /// (false positive) or was stale (evicted since last heartbeat).
+    pub bloom: Option<rio_common::bloom::BloomFilter>,
+    /// Size class (e.g., "small", "large") reported by the worker.
+    /// `None` = worker doesn't declare a class (backward compat with
+    /// pre-D7 workers, and deployments without size-class config).
+    /// D7 uses this to filter candidate workers.
+    pub size_class: Option<String>,
 }
 
 impl WorkerState {
@@ -583,6 +598,8 @@ impl WorkerState {
             stream_tx: None,
             last_heartbeat: Instant::now(),
             missed_heartbeats: 0,
+            bloom: None,
+            size_class: None,
         }
     }
 
