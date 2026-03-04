@@ -98,6 +98,41 @@ flate2 = "1"
 # BuildExecution recv tasks outside the actor loop)
 dashmap = "6"
 
+# --- phase2c: chunked CAS ---
+# Content-defined chunking. v2020 algorithm — Chunker::new(data, min, avg, max)
+# slices at statistically-stable boundaries so small edits only perturb the
+# chunk they touch (dedup-friendly).
+fastcdc = "3"
+# Chunk addressing (internal only — never exposed to Nix). Also reused for
+# bloom-filter hashing (split 256-bit output into k double-hash indices;
+# portable across architectures, unlike AES-NI-based non-crypto hashes).
+blake3 = "1"
+# In-process chunk cache. Lock-free, weight-based eviction — moka tracks
+# byte-size per entry so the 2GB cap is a real memory bound, not just an
+# entry count. Singleflight wraps the miss path.
+moka = { version = "0.12", features = ["future"] }
+# On-the-fly NAR compression for the binary-cache HTTP endpoint. NARs are
+# stored uncompressed (chunked) for dedup; zstd only at serve time.
+zstd = "0.13"
+
+# --- phase2c: binary cache HTTP server ---
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+# narinfo signing. pkcs8 for key encode/decode; rand_core for keygen in tests.
+# Nix binary caches sign the fingerprint `1;path;narHash;narSize;refs` —
+# sigs are stored at PutPath time so the HTTP server never touches the privkey.
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+# stream! macro for pipelining reassemble_nar → zstd::Encoder → axum Body.
+# Without this the NAR would have to materialize fully in memory before
+# compression starts — defeats the whole chunk-streaming design for large NARs.
+async-stream = "0.3"
+
+# --- phase2c: priority scheduling ---
+# BinaryHeap over f64 critical-path priority. f64 doesn't impl Ord (NaN);
+# OrderedFloat<f64> is the standard workaround.
+ordered-float = "5"
+
 # Crypto
 sha1 = "0.10"
 sha2 = "0.10"
