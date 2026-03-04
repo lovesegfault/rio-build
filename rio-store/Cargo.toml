@@ -37,6 +37,10 @@ bytes = { workspace = true }
 
 # Crypto
 sha2 = { workspace = true }
+# narinfo signing. Signatures are computed at PutPath time and stored
+# in narinfo.signatures so the HTTP cache server never touches the privkey.
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 # Phase 2c chunked CAS
 fastcdc = { workspace = true }

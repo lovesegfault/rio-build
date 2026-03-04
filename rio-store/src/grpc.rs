@@ -26,6 +26,7 @@ use crate::backend::chunk::ChunkBackend;
 use crate::cas::{self, ChunkCache};
 use crate::metadata::{self, ManifestKind};
 use crate::realisations;
+use crate::signing::Signer;
 use crate::validate::validate_nar_digest;
 
 /// Stream a Bytes value to the GetPath channel in NAR_CHUNK_SIZE pieces.
@@ -101,6 +102,11 @@ pub struct StoreServiceImpl {
     /// `Arc` because the spawned GetPath streaming task needs an owned
     /// handle (the task outlives the `&self` method call).
     chunk_cache: Option<Arc<ChunkCache>>,
+    /// ed25519 signing key for narinfo. `None` = signing disabled (paths
+    /// stored without our signature; still serveable, just unverified).
+    /// Arc because both PutPath branches need it and the inline branch
+    /// doesn't have a good place to hold a reference across the await.
+    signer: Option<Arc<Signer>>,
 }
 
 impl StoreServiceImpl {
@@ -113,6 +119,7 @@ impl StoreServiceImpl {
             pool,
             chunk_backend: None,
             chunk_cache: None,
+            signer: None,
         }
     }
 
@@ -130,7 +137,49 @@ impl StoreServiceImpl {
             pool,
             chunk_backend: Some(backend),
             chunk_cache: Some(cache),
+            signer: None,
         }
+    }
+
+    /// Enable narinfo signing with the given key.
+    ///
+    /// Builder-style: `StoreServiceImpl::new(pool).with_signer(key)`.
+    /// Chains after either `new()` or `with_chunk_backend()`.
+    pub fn with_signer(mut self, signer: Signer) -> Self {
+        self.signer = Some(Arc::new(signer));
+        self
+    }
+
+    /// If a signer is configured, compute the narinfo fingerprint and
+    /// push a signature onto `info.signatures`.
+    ///
+    /// Called just before complete_manifest_* writes narinfo to PG —
+    /// the signature goes into the DB, and the HTTP cache server serves
+    /// it as a `Sig:` line without ever touching the privkey.
+    ///
+    /// No-op if signer is None. No error path: signing can't fail
+    /// (ed25519 signing is pure math on valid inputs, and we control
+    /// all inputs).
+    fn maybe_sign(&self, info: &mut ValidatedPathInfo) {
+        let Some(signer) = &self.signer else {
+            return;
+        };
+
+        // References for the fingerprint are FULL store paths (not
+        // basenames — that's a narinfo-text-format thing). ValidatedPathInfo
+        // stores them as StorePath, which stringifies to full paths.
+        let refs: Vec<String> = info.references.iter().map(|r| r.to_string()).collect();
+
+        let fp = rio_nix::narinfo::fingerprint(
+            info.store_path.as_str(),
+            &info.nar_hash,
+            info.nar_size,
+            &refs,
+        );
+
+        let sig = signer.sign(&fp);
+        debug!(key = %signer.key_name(), "signed narinfo fingerprint");
+        info.signatures.push(sig);
     }
 
     /// Clean up an uploading placeholder after a PutPath error and record
@@ -456,10 +505,18 @@ impl StoreService for StoreServiceImpl {
         }
 
         // Step 6: Complete upload. Branches on size.
-        let full_info = ValidatedPathInfo {
+        let mut full_info = ValidatedPathInfo {
             store_path_hash,
             ..info
         };
+
+        // Sign BEFORE writing narinfo. The signature goes into PG
+        // alongside the other narinfo fields; the HTTP cache server
+        // serves it from there without touching the privkey. Signing
+        // now (not at serve time) means key rotation doesn't re-sign
+        // old paths — they keep their old-key sig, which stays valid
+        // as long as the old pubkey is in trusted-public-keys.
+        self.maybe_sign(&mut full_info);
 
         // Size gate: small NARs inline, large NARs chunked (if backend
         // configured). `None` backend forces inline always — test
