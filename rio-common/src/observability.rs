@@ -217,7 +217,7 @@ pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
 }
 
 /// Parse `RIO_LOG_FORMAT` environment variable, defaulting to JSON.
-pub fn log_format_from_env() -> LogFormat {
+fn log_format_from_env() -> LogFormat {
     match std::env::var("RIO_LOG_FORMAT") {
         Ok(val) => match val.parse() {
             Ok(fmt) => fmt,

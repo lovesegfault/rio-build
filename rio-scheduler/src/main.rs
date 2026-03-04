@@ -220,8 +220,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Create gRPC services. All three get the SAME Arc<LogBuffers>:
     // SchedulerGrpc writes, AdminService reads (live), LogFlusher drains
-    // (on completion). SchedulerGrpc::new() would make a SEPARATE buffer,
-    // silently breaking the whole pipeline — hence with_log_buffers().
+    // (on completion). The test-only new_for_tests() constructor makes a
+    // SEPARATE buffer — it's cfg(test) gated so prod can't accidentally
+    // use it and silently break the pipeline.
     let grpc_service = SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers.clone());
     let admin_service = AdminServiceImpl::new(log_buffers, admin_s3, pool);
 

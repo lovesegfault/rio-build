@@ -22,7 +22,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     let (handle, _actor_task) = setup_actor(db.pool.clone());
 
     // Spin up in-process gRPC server (SchedulerService + WorkerService).
-    let grpc = SchedulerGrpc::new(handle.clone());
+    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
     let router = tonic::transport::Server::builder()
         .add_service(SchedulerServiceServer::new(grpc.clone()))
         .add_service(WorkerServiceServer::new(grpc));
@@ -162,14 +162,15 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
 ///
 /// The ring-buffer write (hop 2) is also asserted — proves the
 /// SAME-Arc<LogBuffers> sharing between the recv task and the rest of
-/// the system works (the "don't use SchedulerGrpc::new() in prod" gotcha).
+/// the system works (the old "don't use new() in prod" footgun — now
+/// prevented by cfg(test) on new_for_tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _actor_task) = setup_actor(db.pool.clone());
 
     // In-process gRPC server. Same setup as test_build_execution_stream_end_to_end.
-    let grpc = SchedulerGrpc::new(handle.clone());
+    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
     // Grab the ring buffers BEFORE the server moves grpc — we assert on
     // them after sending the LogBatch.
     let log_buffers = grpc.log_buffers();
@@ -264,8 +265,10 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
 
     // Assert 2: Ring buffer was written. This proves the recv-task's
     // log_buffers.push() call sees the same DashMap we do (the shared-Arc
-    // invariant). If SchedulerGrpc::new() had allocated a separate buffer,
-    // THIS one would be empty.
+    // invariant). If the recv task had a separate buffer, THIS one
+    // would be empty. new_for_tests() makes a fresh DashMap but we
+    // grabbed a handle to it via log_buffers() above, so we're
+    // asserting against the same one the recv task writes to.
     let buffered = log_buffers.read_since(&work.drv_path, 0);
     assert_eq!(
         buffered.len(),
@@ -285,7 +288,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
 async fn test_submit_build_rejects_empty_drv_hash() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_hash = String::new(); // empty!
@@ -312,7 +315,7 @@ async fn test_submit_build_rejects_empty_drv_hash() {
 async fn test_submit_build_rejects_empty_drv_path() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.drv_path = String::new(); // empty!
@@ -335,7 +338,7 @@ async fn test_submit_build_rejects_empty_drv_path() {
 async fn test_submit_build_rejects_empty_system() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     bad_node.system = String::new(); // empty!
@@ -364,7 +367,7 @@ async fn test_submit_build_rejects_empty_system() {
 async fn test_submit_build_rejects_oversized_drv_content() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mut bad_node = make_test_node("h", "x86_64-linux");
     // 256 KB + 1 byte → over limit.
@@ -394,7 +397,7 @@ async fn test_submit_build_rejects_oversized_drv_content() {
 async fn test_submit_build_rejects_invalid_priority_class() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
@@ -420,7 +423,7 @@ async fn test_submit_build_rejects_invalid_priority_class() {
 async fn test_submit_build_rejects_invalid_tenant_id() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
@@ -446,7 +449,7 @@ async fn test_submit_build_rejects_invalid_tenant_id() {
 async fn test_submit_build_rejects_too_many_edges() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     // Construct MAX_DAG_EDGES+1 edges. Content doesn't matter — rejection
     // happens before any path validation.
@@ -481,7 +484,7 @@ async fn test_submit_build_rejects_too_many_edges() {
 async fn test_heartbeat_rejects_too_many_running_builds() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let too_many: Vec<String> = (0..1001).map(|i| format!("/nix/store/{i}.drv")).collect();
 
@@ -619,7 +622,7 @@ async fn test_bridge_build_events_lagged_sends_data_loss() {
 async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _actor_task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new(handle);
+    let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mk_req = |tag: &str| rio_proto::types::SubmitBuildRequest {
         tenant_id: String::new(),

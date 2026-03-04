@@ -169,17 +169,13 @@ impl StoreService for MockStore {
         }
         let store_path = request.into_inner().store_path;
         let paths = self.paths.read().unwrap();
-        // Exact match first, then prefix match (for QueryPathFromHashPart,
-        // which queries /nix/store/{hash_part} expecting a prefix lookup).
-        if let Some((info, _)) = paths.get(&store_path) {
-            return Ok(Response::new(info.clone()));
-        }
-        for (k, (info, _)) in paths.iter() {
-            if k.starts_with(&store_path) {
-                return Ok(Response::new(info.clone()));
-            }
-        }
-        Err(Status::not_found(format!("not found: {store_path}")))
+        // Exact match only. Hash-part prefix lookups go through
+        // query_path_from_hash_part (below), not here — the gateway
+        // switched to that dedicated RPC in phase2c.
+        paths
+            .get(&store_path)
+            .map(|(info, _)| Response::new(info.clone()))
+            .ok_or_else(|| Status::not_found(format!("not found: {store_path}")))
     }
 
     async fn find_missing_paths(
