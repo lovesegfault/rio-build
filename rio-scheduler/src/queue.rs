@@ -1,96 +1,223 @@
-//! FIFO ready queue for derivations awaiting worker assignment.
+//! Priority ready queue for derivation dispatch.
 //!
-//! Phase 2a uses a simple FIFO (VecDeque). IFD derivations are pushed to the
-//! front of the queue for priority treatment.
+//! Replaces the phase-2a FIFO VecDeque. Derivations are popped in
+//! critical-path priority order (highest first): dispatch the work
+//! that unblocks the most downstream, not just the oldest.
+//!
+//! # BinaryHeap + lazy invalidation
+//!
+//! `BinaryHeap` can't do `remove(x)` in O(log n) — only pop. But we
+//! NEED remove (cancellation, re-prioritization). The standard
+//! workaround: keep a `removed` set alongside the heap. `remove(x)`
+//! just marks x in the set; `pop()` skips over marked entries. Same
+//! amortized complexity, way simpler than a hand-rolled indexed heap.
+//!
+//! The `removed` set grows until `compact()` rebuilds the heap
+//! without marked entries. Called on Tick when the garbage exceeds
+//! 50% of the heap — bounded memory, amortized O(1) per operation.
+//!
+//! # Priority representation
+//!
+//! `(OrderedFloat<f64>, Reverse<u64>, DrvHash)`:
+//! - `OrderedFloat`: f64 doesn't impl Ord (NaN). Wrapper fixes it.
+//! - `Reverse<u64>`: FIFO tiebreak for equal priority. Without this,
+//!   ties are broken by DrvHash (alphabetical), which is arbitrary.
+//!   `Reverse` because lower sequence number = older = first; but
+//!   BinaryHeap is max-heap, so Reverse makes lower sort higher.
+//! - `DrvHash`: the actual payload.
+//!
+//! # Interactive boost
+//!
+//! Phase 2a used `push_front` for interactive (IFD) builds. That
+//! doesn't translate to a heap. Instead: add a large constant to
+//! interactive builds' priority. `INTERACTIVE_BOOST = 1e6` dwarfs
+//! any realistic critical-path value (even a 10k-derivation DAG at
+//! 300s each is only 3e6... hmm, that's close). Use 1e9 to be safe.
 
-use std::collections::{HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
+
+use ordered_float::OrderedFloat;
 
 use crate::state::DrvHash;
 
-/// A FIFO queue of derivation hashes that are ready to be assigned to workers.
+/// Priority boost for interactive (IFD) builds. Large enough to
+/// dominate any realistic critical-path sum. A 100k-node DAG with
+/// every node estimated at 1 hour is 3.6e8 total — 1e9 still wins.
 ///
-/// Maintains a companion `HashSet` for O(1) membership checks: the
-/// `dispatch_ready` defer loop re-queues all deferred items via
-/// `push_front`, which would be O(n²) on a large queue with the naive
-/// `VecDeque::contains` approach. The HashSet keeps `push_back` O(1)
-/// average and short-circuits the "not present" case in `remove`.
+/// Not `f64::MAX` because that would make ALL interactive builds
+/// tie on priority (then break on sequence), losing the relative
+/// critical-path ordering WITHIN interactive. We want interactive
+/// builds to also be ordered among themselves.
+pub const INTERACTIVE_BOOST: f64 = 1e9;
+
+/// Entry in the BinaryHeap. Tuple so derived Ord works
+/// (lexicographic: priority first, then reverse sequence, then hash).
+type Entry = (OrderedFloat<f64>, Reverse<u64>, DrvHash);
+
+/// Priority queue of ready derivations.
+///
+/// `push(hash, priority)` and `pop()` are O(log n). `remove(hash)`
+/// is O(1) (just marks in a set). `len()` is O(1) and accounts for
+/// the removed markers.
 #[derive(Debug)]
 pub struct ReadyQueue {
-    /// The queue itself. Front is highest priority.
-    queue: VecDeque<DrvHash>,
-    /// Membership index for O(1) dedup. Invariant: `members` contains
-    /// exactly the elements of `queue`.
+    /// Max-heap: highest priority pops first.
+    heap: BinaryHeap<Entry>,
+    /// Hashes marked as removed. `pop()` skips these. Cleared on
+    /// `compact()`.
+    removed: HashSet<DrvHash>,
+    /// Monotonic counter for FIFO tiebreak. Wraps at u64::MAX —
+    /// after 1.8e19 pushes, the tiebreak order flips once. Don't care.
+    seq: u64,
+    /// Members currently in the heap (not removed). For O(1) dedup
+    /// in `push()` — same HashSet-for-dedup pattern as the old FIFO.
     members: HashSet<DrvHash>,
 }
 
 impl ReadyQueue {
-    /// Create an empty ready queue.
     pub fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
+            heap: BinaryHeap::new(),
+            removed: HashSet::new(),
+            seq: 0,
             members: HashSet::new(),
         }
     }
 
-    /// Push a derivation hash to the back of the queue (normal priority).
-    /// O(1) average (HashSet membership check + insert).
-    pub fn push_back(&mut self, drv_hash: DrvHash) {
-        if self.members.insert(drv_hash.clone()) {
-            self.queue.push_back(drv_hash);
+    /// Push a derivation with the given priority.
+    ///
+    /// If `hash` is already in the queue, this RE-PUSHES with the new
+    /// priority. The old entry is lazily invalidated (removed set);
+    /// `pop()` will skip it. This is how re-prioritization works
+    /// (e.g., a new interested build raises a shared derivation's
+    /// priority).
+    ///
+    /// Different from the old `push_back`/`push_front` dedup: that
+    /// was "ignore if present". This is "update priority if present".
+    /// The D4 critical-path machinery can change a node's priority
+    /// after it's already queued.
+    pub fn push(&mut self, hash: DrvHash, priority: f64) {
+        if self.members.contains(&hash) {
+            // Already present — mark the OLD entry as removed (we
+            // can't find it in the heap to edit it). The new entry
+            // goes in with the new priority. The old entry's hash is
+            // in `removed`, so pop() skips it... but wait, the NEW
+            // entry has the same hash. pop() would skip it too.
+            //
+            // Fix: don't add to removed; just push again. pop()
+            // will see two entries for the same hash. The FIRST one
+            // popped (higher priority) is returned; members.remove()
+            // marks the hash as gone; the SECOND one pops later and
+            // is skipped (not in members). This works because pop()
+            // checks members, not removed, for the final gate.
+            //
+            // Actually, let me re-check the pop logic. It needs to
+            // be: skip if (in removed) OR (not in members). Let me
+            // simplify: just use members. removed is redundant if
+            // we check members in pop.
+        }
+        // Insert returns true if newly added. Either way we push.
+        self.members.insert(hash.clone());
+        self.seq = self.seq.wrapping_add(1);
+        self.heap
+            .push((OrderedFloat(priority), Reverse(self.seq), hash));
+    }
+
+    /// Pop the highest-priority derivation.
+    ///
+    /// Skips entries that were removed (lazy invalidation) or that
+    /// are duplicate pushes of a hash already popped.
+    pub fn pop(&mut self) -> Option<DrvHash> {
+        loop {
+            let (_, _, hash) = self.heap.pop()?;
+            // Two reasons to skip:
+            // 1. Explicitly removed (cancellation).
+            // 2. Duplicate push — a later push() with the same hash
+            //    went into the heap; an earlier pop already returned
+            //    it. Members was removed then; this stale entry skips.
+            //
+            // Both reduce to: "is this hash still in members?" If
+            // yes, pop it (remove from members, return). If no, skip.
+            if self.members.remove(&hash) {
+                // Was in members → valid pop. Also remove from
+                // removed (in case it was there from a remove() call
+                // that was superseded by a re-push... actually no,
+                // remove() takes it out of members too. So if it's
+                // in members, it's not in removed. Still, remove()
+                // on a non-present key is a cheap no-op.)
+                self.removed.remove(&hash);
+                return Some(hash);
+            }
+            // Not in members: stale entry (removed or duplicate). Skip.
         }
     }
 
-    /// Push a derivation hash to the front of the queue (IFD priority).
-    /// O(1) for new items; O(n) for move-to-front (rare: IFD re-prioritization
-    /// of already-queued item).
-    pub fn push_front(&mut self, drv_hash: DrvHash) {
-        if self.members.insert(drv_hash.clone()) {
-            // New item: just push to front.
-            self.queue.push_front(drv_hash);
-        } else {
-            // Already in queue: move to front. O(n) scan unavoidable
-            // without an index, but rare (IFD re-prioritization).
-            if let Some(pos) = self.queue.iter().position(|h| h == &drv_hash) {
-                self.queue.remove(pos);
-                self.queue.push_front(drv_hash);
-            }
-        }
-    }
-
-    /// Pop the next ready derivation hash from the front of the queue.
-    /// O(1) average.
-    pub fn pop_front(&mut self) -> Option<DrvHash> {
-        let h = self.queue.pop_front()?;
-        self.members.remove(h.as_str());
-        Some(h)
-    }
-    /// Remove a specific derivation hash from the queue (e.g., on cancellation).
-    /// O(1) for the "not present" case (HashSet check); O(n) for the
-    /// present case (VecDeque position scan).
-    pub fn remove(&mut self, drv_hash: &str) -> bool {
-        if self.members.remove(drv_hash) {
-            if let Some(pos) = self.queue.iter().position(|h| h.as_str() == drv_hash) {
-                self.queue.remove(pos);
-            }
+    /// Mark a derivation as removed. Lazy: doesn't touch the heap.
+    ///
+    /// Returns `true` if it was in the queue, `false` otherwise
+    /// (same signature as the old remove).
+    pub fn remove(&mut self, hash: &str) -> bool {
+        // Take out of members (so pop skips it) + add to removed
+        // (for compact() to know it's garbage).
+        if self.members.remove(hash) {
+            self.removed.insert(hash.into());
             true
         } else {
             false
         }
     }
 
-    /// Current number of items in the queue.
+    /// Number of valid (not-removed) entries.
     pub fn len(&self) -> usize {
-        debug_assert_eq!(
-            self.queue.len(),
-            self.members.len(),
-            "ReadyQueue invariant violated: queue/members size mismatch"
-        );
-        self.queue.len()
+        self.members.len()
     }
 
-    /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.members.is_empty()
+    }
+
+    /// Rebuild the heap without removed/stale entries.
+    ///
+    /// Called on Tick when garbage (heap.len() - members.len()) exceeds
+    /// 50% of the heap. O(n log n) but amortized over many cheap
+    /// remove()/push() calls. Without this, a long-running scheduler
+    /// with lots of cancellations would leak heap memory unboundedly.
+    pub fn compact(&mut self) {
+        // Threshold: skip if garbage is <50% of heap. Compacting
+        // every Tick when there's 1 stale entry is wasteful.
+        let garbage = self.heap.len().saturating_sub(self.members.len());
+        if garbage * 2 < self.heap.len() {
+            return;
+        }
+
+        // Drain the heap, keep only entries that are in members.
+        // For duplicates (same hash, multiple pushes), keep only
+        // the FIRST occurrence (highest priority — drain is in
+        // arbitrary order but we track seen hashes).
+        //
+        // Actually drain() is arbitrary order, so "first occurrence"
+        // isn't "highest priority". We need to keep the HIGHEST
+        // priority entry for each hash. Collect by hash, max by
+        // priority.
+        let mut best: std::collections::HashMap<DrvHash, Entry> =
+            std::collections::HashMap::with_capacity(self.members.len());
+        for entry in self.heap.drain() {
+            let (prio, _, ref hash) = entry;
+            if !self.members.contains(hash) {
+                continue; // removed or stale
+            }
+            best.entry(hash.clone())
+                .and_modify(|existing| {
+                    if prio > existing.0 {
+                        *existing = entry.clone();
+                    }
+                })
+                .or_insert(entry);
+        }
+
+        self.heap = best.into_values().collect();
+        self.removed.clear();
     }
 }
 
@@ -105,97 +232,173 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fifo_order() {
+    fn pops_in_priority_order() {
         let mut q = ReadyQueue::new();
-        q.push_back("a".into());
-        q.push_back("b".into());
-        q.push_back("c".into());
+        q.push("low".into(), 10.0);
+        q.push("high".into(), 100.0);
+        q.push("mid".into(), 50.0);
 
-        assert_eq!(q.pop_front(), Some("a".into()));
-        assert_eq!(q.pop_front(), Some("b".into()));
-        assert_eq!(q.pop_front(), Some("c".into()));
-        assert_eq!(q.pop_front(), None);
+        assert_eq!(q.pop(), Some("high".into()));
+        assert_eq!(q.pop(), Some("mid".into()));
+        assert_eq!(q.pop(), Some("low".into()));
+        assert_eq!(q.pop(), None);
     }
 
     #[test]
-    fn test_ifd_priority() {
+    fn fifo_tiebreak() {
+        // Same priority → FIFO order (older sequence pops first).
         let mut q = ReadyQueue::new();
-        q.push_back("normal1".into());
-        q.push_back("normal2".into());
-        q.push_front("ifd".into());
+        q.push("first".into(), 50.0);
+        q.push("second".into(), 50.0);
+        q.push("third".into(), 50.0);
 
-        assert_eq!(q.pop_front(), Some("ifd".into()));
-        assert_eq!(q.pop_front(), Some("normal1".into()));
-        assert_eq!(q.pop_front(), Some("normal2".into()));
+        assert_eq!(q.pop(), Some("first".into()));
+        assert_eq!(q.pop(), Some("second".into()));
+        assert_eq!(q.pop(), Some("third".into()));
     }
 
     #[test]
-    fn test_no_duplicates() {
+    fn remove_skips_on_pop() {
         let mut q = ReadyQueue::new();
-        q.push_back("a".into());
-        q.push_back("a".into()); // duplicate
-        assert_eq!(q.len(), 1);
-
-        q.push_back("b".into());
-        q.push_front("b".into()); // moves b to front
-        assert_eq!(q.len(), 2);
-        assert_eq!(q.pop_front(), Some("b".into()));
-        assert_eq!(q.pop_front(), Some("a".into()));
-    }
-
-    #[test]
-    fn test_remove() {
-        let mut q = ReadyQueue::new();
-        q.push_back("a".into());
-        q.push_back("b".into());
-        q.push_back("c".into());
+        q.push("a".into(), 30.0);
+        q.push("b".into(), 20.0);
+        q.push("c".into(), 10.0);
 
         assert!(q.remove("b"));
-        assert!(!q.remove("b")); // already removed
         assert_eq!(q.len(), 2);
-        assert_eq!(q.pop_front(), Some("a".into()));
-        assert_eq!(q.pop_front(), Some("c".into()));
+
+        assert_eq!(q.pop(), Some("a".into()));
+        assert_eq!(q.pop(), Some("c".into())); // b skipped
+        assert_eq!(q.pop(), None);
     }
 
-    /// Stress test: 10k pushes of the same key should never duplicate
-    /// (HashSet dedup), and the membership invariant should hold.
     #[test]
-    fn test_no_duplicates_with_10k_pushes() {
+    fn remove_nonexistent() {
         let mut q = ReadyQueue::new();
-        for i in 0..10_000 {
-            if i % 2 == 0 {
-                q.push_back("same".into());
-            } else {
-                q.push_front("same".into());
-            }
+        assert!(!q.remove("not-there"));
+    }
+
+    #[test]
+    fn repush_updates_priority() {
+        // Push at low priority, re-push at high → should pop high first.
+        let mut q = ReadyQueue::new();
+        q.push("x".into(), 10.0);
+        q.push("other".into(), 50.0);
+        q.push("x".into(), 100.0); // re-push, higher
+
+        // x at 100 should pop before other at 50.
+        assert_eq!(q.pop(), Some("x".into()));
+        assert_eq!(q.pop(), Some("other".into()));
+        // The stale x@10 entry is still in the heap but x is no
+        // longer in members → skipped.
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn interactive_boost_dominates() {
+        // A 100k-node chain at 3600s each has cumulative priority
+        // 3.6e8. INTERACTIVE_BOOST (1e9) should still win.
+        let mut q = ReadyQueue::new();
+        q.push("huge-chain-root".into(), 3.6e8);
+        q.push("interactive-leaf".into(), 5.0 + INTERACTIVE_BOOST);
+
+        assert_eq!(q.pop(), Some("interactive-leaf".into()));
+    }
+
+    #[test]
+    fn compact_threshold() {
+        let mut q = ReadyQueue::new();
+        for i in 0..100 {
+            q.push(format!("item-{i}").into(), i as f64);
         }
-        assert_eq!(q.len(), 1);
-        assert_eq!(q.pop_front(), Some("same".into()));
-        assert!(q.is_empty());
+        // Remove 40 (< 50% garbage). compact() should skip.
+        for i in 0..40 {
+            q.remove(&format!("item-{i}"));
+        }
+        let heap_before = q.heap.len();
+        q.compact();
+        assert_eq!(q.heap.len(), heap_before, "below threshold → no compact");
+
+        // Remove 20 more (60 total, 60% garbage). compact() runs.
+        for i in 40..60 {
+            q.remove(&format!("item-{i}"));
+        }
+        q.compact();
+        assert_eq!(q.heap.len(), 40, "above threshold → compacted to members");
+        assert!(q.removed.is_empty());
     }
 
-    /// Stress test: 10k distinct pushes + removes should not desync
-    /// queue/members (invariant debug_assert in len()).
     #[test]
-    fn test_queue_members_invariant_stress() {
+    fn compact_preserves_pop_order() {
+        let mut q = ReadyQueue::new();
+        q.push("a".into(), 30.0);
+        q.push("b".into(), 20.0);
+        q.push("c".into(), 10.0);
+        // Create garbage to trigger compact.
+        for i in 0..10 {
+            q.push(format!("junk-{i}").into(), 5.0);
+            q.remove(&format!("junk-{i}"));
+        }
+
+        q.compact();
+
+        // Pop order preserved.
+        assert_eq!(q.pop(), Some("a".into()));
+        assert_eq!(q.pop(), Some("b".into()));
+        assert_eq!(q.pop(), Some("c".into()));
+    }
+
+    #[test]
+    fn compact_keeps_highest_of_duplicates() {
+        let mut q = ReadyQueue::new();
+        q.push("x".into(), 10.0);
+        q.push("x".into(), 100.0); // re-push, creates duplicate in heap
+        // Add garbage to trigger compact.
+        for i in 0..10 {
+            q.push(format!("junk-{i}").into(), 5.0);
+            q.remove(&format!("junk-{i}"));
+        }
+
+        q.compact();
+
+        // After compact, only one x entry, and it's the high-priority one.
+        assert_eq!(q.heap.len(), 1);
+        assert_eq!(q.pop(), Some("x".into()));
+        assert_eq!(q.pop(), None);
+    }
+
+    /// Stress: 10k pushes/removes, invariants hold.
+    #[test]
+    fn stress_invariants() {
         let mut q = ReadyQueue::new();
         for i in 0..10_000 {
-            q.push_back(format!("item{i}").into());
+            q.push(format!("item-{i}").into(), (i % 100) as f64);
         }
         assert_eq!(q.len(), 10_000);
 
-        // Remove every other item.
         for i in (0..10_000).step_by(2) {
-            assert!(q.remove(&format!("item{i}")));
+            assert!(q.remove(&format!("item-{i}")));
         }
         assert_eq!(q.len(), 5_000);
 
-        // Pop the rest; invariant checked in len() and at end.
-        let mut drained = 0;
-        while q.pop_front().is_some() {
-            drained += 1;
+        q.compact();
+        assert_eq!(q.len(), 5_000);
+
+        let mut popped = 0;
+        let mut last_prio = f64::INFINITY;
+        while let Some(hash) = q.pop() {
+            // Verify: monotonically non-increasing priority.
+            let i: u64 = hash
+                .as_str()
+                .strip_prefix("item-")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let prio = (i % 100) as f64;
+            assert!(prio <= last_prio, "pop order violated at {hash}");
+            last_prio = prio;
+            popped += 1;
         }
-        assert_eq!(drained, 5_000);
-        assert!(q.is_empty());
+        assert_eq!(popped, 5_000);
     }
 }

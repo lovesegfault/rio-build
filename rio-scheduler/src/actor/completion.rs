@@ -243,10 +243,9 @@ impl DagActor {
         crate::critical_path::update_ancestors(&mut self.dag, drv_hash);
 
         // Release downstream: find newly ready derivations.
-        // Interactive (IFD) derivations go to the front of the queue.
+        // push_ready handles interactive boost via priority.
         let newly_ready = self.dag.find_newly_ready(drv_hash);
         for ready_hash in &newly_ready {
-            let prioritize = self.should_prioritize(ready_hash);
             if let Some(state) = self.dag.node_mut(ready_hash)
                 && state.transition(DerivationStatus::Ready).is_ok()
             {
@@ -257,11 +256,7 @@ impl DagActor {
                 {
                     error!(drv_hash = %ready_hash, error = %e, "failed to update status");
                 }
-                if prioritize {
-                    self.ready_queue.push_front(ready_hash.clone());
-                } else {
-                    self.ready_queue.push_back(ready_hash.clone());
-                }
+                self.push_ready(ready_hash.clone());
             }
         }
 
@@ -357,7 +352,7 @@ impl DagActor {
                 if let Err(e) = state.transition(DerivationStatus::Ready) {
                     warn!(drv_hash, error = %e, "Failed->Ready transition failed");
                 } else {
-                    self.ready_queue.push_back(drv_hash_owned);
+                    self.push_ready(drv_hash_owned);
                 }
             }
         } else {

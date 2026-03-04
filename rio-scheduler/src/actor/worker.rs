@@ -63,7 +63,7 @@ impl DagActor {
                 {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status");
                 }
-                self.ready_queue.push_back(drv_hash.clone());
+                self.push_ready(drv_hash.clone());
             }
         }
 
@@ -187,6 +187,11 @@ impl DagActor {
         // drift (float accumulation, missed edge case) corrects here.
         // O(V+E); ~1ms for a 10k-node DAG.
         crate::critical_path::full_sweep(&mut self.dag, &self.estimator);
+
+        // Compact the ready queue (remove lazy-invalidated garbage).
+        // No-op if garbage <50% of heap. Without this, a long-running
+        // scheduler with lots of cancellations leaks heap memory.
+        self.ready_queue.compact();
     }
 
     pub(super) async fn handle_tick(&mut self) {

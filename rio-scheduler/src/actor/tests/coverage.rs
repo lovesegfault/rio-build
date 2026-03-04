@@ -1151,11 +1151,14 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
     Ok(())
 }
 
-/// Interactive builds get push_front on the ready queue. After a dependency
-/// completes, an Interactive build's newly-ready derivation dispatches
-/// BEFORE already-queued Scheduled derivations.
+/// Interactive builds get a priority boost (D5: +1e9 instead of the old
+/// push_front). After a dependency completes, an Interactive build's
+/// newly-ready derivation dispatches BEFORE already-queued Scheduled work.
+///
+/// Same observable behavior as the old push_front test; different
+/// mechanism underneath (priority number vs queue position).
 #[tokio::test]
-async fn test_interactive_priority_push_front() -> TestResult {
+async fn test_interactive_priority_boost() -> TestResult {
     // Worker with 1 slot so dispatch order is observable.
     let (_db, handle, _task, mut worker_rx) =
         setup_with_worker("prio-worker", "x86_64-linux", 1).await?;
@@ -1206,8 +1209,8 @@ async fn test_interactive_priority_push_front() -> TestResult {
     // in a way that makes A newly-ready.
     //
     // Strategy: complete EVERYTHING currently assigned with success until
-    // prioB is completed. Then A becomes newly-ready with push_front, and
-    // the NEXT dispatch should be A (not a leftover Q/R).
+    // prioB is completed. Then A becomes newly-ready with INTERACTIVE_BOOST,
+    // and the NEXT dispatch should be A (not a leftover Q/R).
     let mut seen_paths = Vec::new();
     for _ in 0..4 {
         // Receive one assignment.
@@ -1222,7 +1225,7 @@ async fn test_interactive_priority_push_front() -> TestResult {
         // Complete it.
         complete_success(&handle, "prio-worker", &path, &test_store_path("out")).await?;
         settle().await;
-        // If we just completed B, the NEXT dispatch should be A (push_front).
+        // If we just completed B, the NEXT dispatch should be A (priority boost).
         if path == p_prio_b {
             let next = worker_rx.recv().await.expect("should get next assignment");
             let Some(rio_proto::types::scheduler_message::Msg::Assignment(next_a)) = next.msg
