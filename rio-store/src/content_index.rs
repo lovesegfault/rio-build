@@ -77,7 +77,7 @@ pub async fn insert(
 pub async fn lookup(
     pool: &PgPool,
     content_hash: &[u8],
-) -> anyhow::Result<Option<ValidatedPathInfo>> {
+) -> crate::metadata::Result<Option<ValidatedPathInfo>> {
     let row: Option<crate::metadata::NarinfoRow> = sqlx::query_as(
         r#"
         SELECT n.store_path, n.store_path_hash, n.deriver, n.nar_hash, n.nar_size,
@@ -95,7 +95,7 @@ pub async fn lookup(
 
     row.map(|r| r.try_into_validated())
         .transpose()
-        .map_err(|e| anyhow::anyhow!("malformed narinfo row in content lookup: {e}"))
+        .map_err(crate::metadata::MetadataError::MalformedRow)
 }
 
 #[cfg(test)]

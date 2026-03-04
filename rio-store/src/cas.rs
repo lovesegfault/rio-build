@@ -152,7 +152,7 @@ pub async fn put_chunked(
         // phase). Deleting now races with a concurrent uploader that
         // just incremented the same chunk.
         rollback(pool, store_path_hash, &chunk_hashes).await;
-        return Err(e);
+        return Err(e.into());
     }
 
     Ok(stats)
