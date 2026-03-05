@@ -67,7 +67,11 @@ pub fn compute_initial(
     // --- Step 1: set est_duration for new nodes ---
     for hash in newly_inserted {
         if let Some(state) = dag.node_mut(hash) {
-            let est = estimator.estimate(state.pname.as_deref(), &state.system);
+            let est = estimator.estimate(
+                state.pname.as_deref(),
+                &state.system,
+                state.input_srcs_nar_size,
+            );
             state.est_duration = est;
         }
     }
