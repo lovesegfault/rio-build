@@ -214,21 +214,78 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Spawn the DAG actor
-    let actor = ActorHandle::spawn(db, store_client, log_flush_tx, cfg.size_classes);
+    // ---- Leader election (gated on RIO_LEASE_NAME) ----
+    // None → non-K8s mode: is_leader=true immediately, generation
+    // stays at 1. VM tests and single-scheduler deployments hit
+    // this path — zero behavior change from pre-C2.
+    //
+    // Some → K8s mode: is_leader=false until the lease loop
+    // acquires. Standby replicas merge DAGs (state warm) but
+    // don't dispatch (dispatch_ready early-returns). On acquire,
+    // the lease loop increments generation and flips is_leader;
+    // workers see the new gen in their next heartbeat and reject
+    // stale-gen assignments from the old leader.
+    //
+    // The generation Arc is constructed HERE (not inside the
+    // actor) so both the actor and the lease task share the same
+    // instance. spawn_with_leader injects it into the actor,
+    // REPLACING the actor's default Arc(1) — same init value,
+    // shared reference.
+    let lease_cfg = rio_scheduler::lease::LeaseConfig::from_env();
+    let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let leader = match &lease_cfg {
+        Some(cfg) => {
+            info!(
+                lease = %cfg.lease_name,
+                namespace = %cfg.namespace,
+                holder = %cfg.holder_id,
+                "lease-based leader election enabled"
+            );
+            rio_scheduler::lease::LeaderState::pending(generation.clone())
+        }
+        None => {
+            info!("no RIO_LEASE_NAME set; running as sole leader (non-K8s mode)");
+            rio_scheduler::lease::LeaderState::always_leader(generation.clone())
+        }
+    };
+    // Clone for the health toggle loop (C3) BEFORE moving into spawn.
+    let is_leader_for_health = leader.is_leader.clone();
+
+    // Spawn the DAG actor — now with the shared leader state.
+    let actor = ActorHandle::spawn_with_leader(
+        db,
+        store_client,
+        log_flush_tx,
+        cfg.size_classes,
+        Some(leader),
+    );
     info!("DAG actor spawned");
 
-    // grpc.health.v1.Health. SERVING once the actor is up — that's the
-    // one thing every scheduler RPC depends on. PG was checked above
-    // (migrations would have bailed); store connect is soft-fail
-    // (warn+None, actor skips cache checks) so we don't gate on it.
-    //
-    // C3 replaces this one-shot set_serving with a background task that
-    // toggles SERVING/NOT_SERVING based on is_leader — standby replicas
-    // stay NOT_SERVING so the K8s Service routes only to the leader.
-    // For now (no lease task): SERVING unconditionally. VM tests and
-    // single-instance deployments unaffected.
+    // Spawn the lease loop (if configured). AFTER actor spawn so
+    // the actor's generation is already the shared Arc — when the
+    // lease acquires and increments, the actor sees it.
+    if let Some(lease_cfg) = lease_cfg {
+        // Reconstruct LeaderState from the SAME Arcs. We moved
+        // the original into spawn_with_leader; clone the
+        // underlying atomics back out. (They're Arc<Atomic*>;
+        // clone is cheap and shares the instance.)
+        let lease_state = rio_scheduler::lease::LeaderState {
+            generation,
+            is_leader: is_leader_for_health.clone(),
+        };
+        rio_common::task::spawn_monitored(
+            "lease-loop",
+            rio_scheduler::lease::run_lease_loop(lease_cfg, lease_state),
+        );
+    }
+
+    // grpc.health.v1.Health. SERVING once the actor is up AND
+    // (in K8s mode) we're leading. C3's toggle loop below tracks
+    // is_leader; for non-K8s mode it's true immediately so the
+    // first iteration sets SERVING.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    // C3: toggle loop tracks is_leader. Spawned below.
+    let _ = &is_leader_for_health; // used in C3 block below
     health_reporter
         .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
         .await;

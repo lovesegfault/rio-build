@@ -52,11 +52,59 @@ impl ActorHandle {
         log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
         size_classes: Vec<crate::assignment::SizeClassConfig>,
     ) -> Self {
+        // Non-K8s default: always leader, generation stays at 1.
+        // For K8s deployments main.rs calls spawn_with_lease().
+        Self::spawn_with_leader(db, store_client, log_flush_tx, size_classes, None)
+    }
+
+    /// Spawn with an external leader state. main.rs uses this
+    /// when `RIO_LEASE_NAME` is set — the lease task writes to
+    /// `leader.generation` and `leader.is_leader`; the actor
+    /// reads both.
+    ///
+    /// `leader = None` → construct a fresh `LeaderState::always_leader`
+    /// internally (same as the default `spawn()`). `Some` → share
+    /// the caller's state.
+    ///
+    /// Separate fn rather than adding a param to `spawn()`: the
+    /// test callsites (setup_actor etc) all use `spawn()` with no
+    /// lease; keeping that signature stable avoids updating ~8
+    /// test helpers.
+    pub fn spawn_with_leader(
+        db: SchedulerDb,
+        store_client: Option<StoreServiceClient<Channel>>,
+        log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+        size_classes: Vec<crate::assignment::SizeClassConfig>,
+        leader: Option<crate::lease::LeaderState>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let mut actor = DagActor::new(db, store_client).with_size_classes(size_classes);
         if let Some(flush_tx) = log_flush_tx {
             actor = actor.with_log_flusher(flush_tx);
         }
+
+        // Wire leader state. With None: the actor's default
+        // is_leader=true is fine, and we just clone the actor's
+        // own generation Arc for the reader (no external writer).
+        // With Some: inject the SHARED is_leader and verify the
+        // generation Arc is the one we expect (caller must have
+        // built LeaderState from actor.generation_arc()... but
+        // we haven't given them that yet. Chicken-and-egg.)
+        //
+        // RESOLVED: LeaderState carries its OWN generation Arc.
+        // The caller builds it BEFORE spawn. We inject BOTH into
+        // the actor, REPLACING the actor's default. The actor's
+        // generation reader and dispatch.rs then see the shared
+        // Arc. No chicken-and-egg.
+        if let Some(leader) = leader {
+            // This replaces the actor's default Arc(AtomicU64(1))
+            // with the caller's. Caller initializes it to 1 too
+            // (LeaderState constructors do). Same init, shared ref.
+            actor = actor
+                .with_leader_flag(leader.is_leader)
+                .with_generation(leader.generation);
+        }
+
         let backpressure = actor.backpressure_flag();
         let generation = actor.generation_reader();
         let self_tx = tx.downgrade();
