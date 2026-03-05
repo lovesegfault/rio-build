@@ -1,0 +1,116 @@
+# NetworkPolicy: workers can't reach the internet or K8s API.
+#
+# Defense in depth. A compromised builder (malicious .drv
+# somehow gets through the sandbox, or a sandbox escape) should
+# only be able to hit rio-scheduler and rio-store — not exfil
+# data, not hit the cloud metadata endpoint, not talk to the
+# K8s apiserver.
+#
+# ONE policy per selector. K8s merges policies additively
+# (allow-lists union), so multiple policies for the same
+# selector are confusing. One per component.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-worker-egress
+spec:
+  # Matches pods created by the WorkerPool reconciler
+  # (build_statefulset sets this label).
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-worker
+  policyTypes:
+    - Egress
+  egress:
+    # DNS. Without this, the worker can't resolve
+    # `rio-scheduler` → everything fails. CoreDNS in kube-system
+    # serves cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Scheduler gRPC. 9001 only — no need for metrics (9091).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-scheduler
+      ports:
+        - protocol: TCP
+          port: 9001
+    # Store gRPC. Workers fetch NARs (GetPath) and upload
+    # outputs (PutPath).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-store
+      ports:
+        - protocol: TCP
+          port: 9002
+  # No rule for 169.254.169.254 (cloud metadata) or 0.0.0.0/0
+  # (internet) → DENIED. NetworkPolicy is default-deny for
+  # policyTypes listed: anything not matched by an `egress`
+  # rule is blocked. The metadata endpoint block is implicit.
+  #
+  # What about FODs (fetchurl etc)? They need internet. Two
+  # options: (a) fetch on the GATEWAY (which has egress) and
+  # upload to the store before submitting — that's the "upload
+  # via nix copy first" model the Build CRD assumes; (b) a
+  # separate `rio-worker-fod` pool with a relaxed policy. (a)
+  # is the design; (b) is an escape hatch if needed.
+---
+# Controller egress: K8s API + scheduler + store.
+#
+# The controller NEEDS the apiserver (watch CRDs, patch
+# StatefulSets). Workers don't (automountServiceAccountToken:
+# false in build_pod_spec).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-controller-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-controller
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # K8s API. `ipBlock` not `podSelector`: the apiserver isn't
+    # a pod (it runs on the control plane, outside the cluster
+    # network on managed K8s). The kubernetes Service's
+    # ClusterIP is stable (.1 in the service CIDR on most
+    # distributions, but not guaranteed). Safer: allow egress
+    # to the whole cluster (internal IPs) + block the metadata
+    # endpoint specifically.
+    #
+    # This is less tight than the worker policy. The controller
+    # is a trusted component (it manages infra); the tradeoff
+    # is "block metadata + internet, allow cluster" vs
+    # "enumerate every internal IP the controller needs." The
+    # former is maintainable.
+    - to:
+        - ipBlock:
+            # RFC1918 — covers most cluster CIDRs. Adjust if
+            # your cluster uses a different range.
+            cidr: 10.0.0.0/8
+            except:
+              # AWS metadata endpoint. GCP is the same IP.
+              # Azure is 169.254.169.254 too. Blocking this
+              # prevents IMDS credential theft even if the
+              # controller is compromised.
+              - 169.254.169.254/32
+    - to:
+        - ipBlock:
+            cidr: 172.16.0.0/12
+            except:
+              - 169.254.169.254/32

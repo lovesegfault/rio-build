@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rio-system
+  labels:
+    # Pod Security Admission: `privileged` is needed because
+    # workers use SYS_ADMIN (FUSE mount). `restricted` would
+    # reject them. `baseline` rejects SYS_ADMIN too. Workers
+    # live in THIS namespace (the WorkerPool CRD is namespaced
+    # and the reconciler creates StatefulSets in the same ns
+    # as the CRD). If that feels too permissive, split workers
+    # into a dedicated namespace with privileged PSA and keep
+    # the control plane in a baseline one.
+    pod-security.kubernetes.io/enforce: privileged

@@ -1,0 +1,47 @@
+# PodDisruptionBudgets: protect against node drain eviction.
+#
+# Without these, `kubectl drain <node>` can evict ALL scheduler
+# replicas at once (if both landed on the same node — unlikely
+# but possible without anti-affinity). PDBs make the drain
+# WAIT until at least N pods are healthy elsewhere.
+#
+# Workers don't get a PDB here — the WorkerPool controller
+# could manage per-pool PDBs (WorkerPool.spec.replicas.min
+# maps naturally to minAvailable). TODO(phase4): add PDB
+# management to the WorkerPool reconciler.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rio-scheduler
+spec:
+  # At most 1 unavailable: with replicas=2, one stays up during
+  # a drain. Leader election handles the failover (15s Lease
+  # TTL → ~15s blip).
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rio-scheduler
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rio-gateway
+spec:
+  # At least 1 available: SSH ingress must stay up. Killing
+  # both gateways = no way to submit builds (the K8s Build CRD
+  # path still works, but most clients use SSH).
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rio-gateway
+---
+# No PDB for controller (replicas=1). A PDB on a single-replica
+# Deployment doesn't help: minAvailable=1 blocks drain forever
+# (can't evict the only pod), minAvailable=0 is a no-op. The
+# controller tolerates a 30s restart gap — just let it evict.
+#
+# No PDB for store (replicas=1) — same reasoning. A store
+# outage means PutPath/GetPath fail, but the scheduler's
+# circuit-breaker (cache_check_circuit_open_total) handles it
+# gracefully. Workers retry.
