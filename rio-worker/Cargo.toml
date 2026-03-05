@@ -31,6 +31,10 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true }
 futures-util = { workspace = true }
+# /healthz + /readyz HTTP endpoints. Worker has no gRPC server
+# (it's a gRPC CLIENT of the scheduler) so tonic-health doesn't fit.
+# axum on a separate port. K8s readinessProbe hits /readyz.
+axum = { workspace = true }
 scopeguard = "1"
 rand = { workspace = true }
 serde = { workspace = true }
@@ -39,3 +43,5 @@ serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-test-support = { workspace = true }
+# Router::oneshot for health.rs tests (ServiceExt trait).
+tower = { workspace = true, features = ["util"] }

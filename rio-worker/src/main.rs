@@ -40,6 +40,11 @@ struct Config {
     fuse_passthrough: bool,
     overlay_base_dir: PathBuf,
     metrics_addr: std::net::SocketAddr,
+    /// HTTP /healthz + /readyz listen address. Worker has no gRPC
+    /// server so tonic-health doesn't fit — plain HTTP via axum.
+    /// K8s readinessProbe hits /readyz (200 after first accepted
+    /// heartbeat), livenessProbe hits /healthz (always 200).
+    health_addr: std::net::SocketAddr,
     /// Log limits (configuration.md:68-69). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
     log_rate_limit: u64,
@@ -83,6 +88,10 @@ impl Default for Config {
             fuse_passthrough: true,
             overlay_base_dir: "/var/rio/overlays".into(),
             metrics_addr: "0.0.0.0:9093".parse().unwrap(),
+            // 9193 = metrics (9093) + 100. Same +100 pattern as
+            // gateway (9090→9190). Scheduler/store piggyback health
+            // on their gRPC ports; worker+gateway have no gRPC server.
+            health_addr: "0.0.0.0:9193".parse().unwrap(),
             // configuration.md:68-69 specs these defaults.
             log_rate_limit: 10_000,
             log_size_limit: 100 * 1024 * 1024, // 100 MiB
@@ -254,6 +263,14 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_worker::describe_metrics();
 
+    // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
+    // so liveness passes as soon as the process is up (connect may take
+    // seconds if scheduler DNS is slow to resolve). Readiness stays
+    // false until the first heartbeat comes back accepted — that's the
+    // right gate: a worker that can't heartbeat is not useful capacity.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    rio_worker::health::spawn_health_server(cfg.health_addr, ready.clone());
+
     // Connect to gRPC services
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
     let mut scheduler_client = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
@@ -329,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_max_builds = cfg.max_builds;
     let heartbeat_size_class = cfg.size_class.clone();
     let heartbeat_running = running_builds.clone();
+    let heartbeat_ready = ready.clone();
     let mut heartbeat_client = scheduler_client.clone();
     let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -348,12 +366,31 @@ async fn main() -> anyhow::Result<()> {
             match heartbeat_client.heartbeat(request).await {
                 Ok(response) => {
                     let resp = response.into_inner();
-                    if !resp.accepted {
+                    if resp.accepted {
+                        // READY. Set unconditionally — it's idempotent
+                        // (already-true → true is a no-op at the atomic
+                        // level) and cheaper than a load-then-store.
+                        heartbeat_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
                         tracing::warn!("heartbeat rejected by scheduler");
+                        // NOT READY: scheduler is reachable but rejecting
+                        // us. Could mean the scheduler doesn't recognize
+                        // our worker_id (stale registration, scheduler
+                        // restarted and lost in-memory state). The
+                        // BuildExecution stream reconnect logic handles
+                        // the actual recovery; readiness flag just
+                        // reflects the current state.
+                        heartbeat_ready.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "heartbeat failed");
+                    // NOT READY: gRPC error. Scheduler unreachable or
+                    // overloaded. Don't flip liveness (restarting won't
+                    // fix the network) but do flip readiness. The next
+                    // successful heartbeat flips back — this tracks
+                    // the scheduler's availability from our perspective.
+                    heartbeat_ready.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -637,6 +674,7 @@ mod tests {
         );
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9093");
+        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9193");
         // Phase2b additions — spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
