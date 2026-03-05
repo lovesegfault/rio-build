@@ -52,8 +52,8 @@
 //! Build CRDs (K8s-native build submission alternative to SSH).
 
 pub mod crds;
-
-// Reconcilers + scaling land in F2-F7.
+pub mod error;
+pub mod reconcilers;
 
 pub use crds::build::{Build, BuildSpec, BuildStatus};
 pub use crds::workerpool::{WorkerPool, WorkerPoolSpec, WorkerPoolStatus};
