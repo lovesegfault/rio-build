@@ -4167,6 +4167,7 @@ name = "rio-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "fuser",
  "futures-util",
@@ -4187,6 +4188,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
 ]
 
