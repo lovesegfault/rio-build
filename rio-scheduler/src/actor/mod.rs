@@ -151,6 +151,24 @@ pub enum ActorCommand {
         batch: rio_proto::types::BuildLogBatch,
     },
 
+    /// Snapshot cluster state for `AdminService.ClusterStatus`.
+    ///
+    /// Counts are computed by iterating actor-owned collections
+    /// (`workers`, `builds`, `ready_queue`, `dag`). That's O(n) in
+    /// workers+derivations per call — fine for the controller's 30s
+    /// autoscaling poll. If this ever gets hot (dashboard refresh at
+    /// 1Hz × many clients), the actor could maintain running counters
+    /// incremented on state transitions instead. Not a concern today.
+    ///
+    /// `send_unchecked` — bypasses backpressure like Heartbeat. The
+    /// controller's autoscaling loop needs a reading even (especially!)
+    /// when the scheduler is saturated; dropping the snapshot under
+    /// backpressure would blind the autoscaler exactly when it needs
+    /// to scale up.
+    ClusterSnapshot {
+        reply: oneshot::Sender<ClusterSnapshot>,
+    },
+
     /// Test-only: query worker states.
     #[cfg(test)]
     DebugQueryWorkers {
@@ -163,6 +181,39 @@ pub enum ActorCommand {
         drv_hash: String,
         reply: oneshot::Sender<Option<DebugDerivationInfo>>,
     },
+}
+
+/// Point-in-time cluster state counts for `AdminService.ClusterStatus`.
+///
+/// Internal (not proto) so the actor doesn't depend on proto-type
+/// construction details. `admin.rs` translates. All `u32` — a cluster
+/// with >4B workers would have other problems first.
+///
+/// NOT `Copy`: `u32 × 6` is 24 bytes, comfortably `Copy`-sized, but
+/// the reply oneshot MOVES it anyway so Copy gains nothing. Derive
+/// conservatively; adding a field later that isn't Copy (e.g.,
+/// per-class queue depth Vec) would be a silent semantic break if
+/// callers had started relying on implicit copies.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterSnapshot {
+    /// `workers.len()`. Includes unregistered (stream-only or
+    /// heartbeat-only) and draining.
+    pub total_workers: u32,
+    /// `is_registered() && !draining`. The dispatchable population.
+    /// E2 adds the draining flag; until then this equals registered.
+    pub active_workers: u32,
+    /// `draining` flag set. 0 until E2.
+    pub draining_workers: u32,
+    /// `BuildState::Pending` — merged but not yet active.
+    pub pending_builds: u32,
+    /// `BuildState::Active` — at least one derivation dispatched.
+    pub active_builds: u32,
+    /// `ready_queue.len()`. Ready-to-dispatch derivations waiting for
+    /// worker capacity. This is the autoscaling input signal.
+    pub queued_derivations: u32,
+    /// `DerivationStatus::{Assigned|Running}` across the DAG. Workers
+    /// currently occupied.
+    pub running_derivations: u32,
 }
 
 /// Errors from the actor.
@@ -448,6 +499,9 @@ impl DagActor {
                 ActorCommand::CleanupTerminalBuild { build_id } => {
                     self.handle_cleanup_terminal_build(build_id);
                 }
+                ActorCommand::ClusterSnapshot { reply } => {
+                    let _ = reply.send(self.compute_cluster_snapshot());
+                }
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
                     // Resolve drv_path → drv_hash → interested_builds, then
                     // emit BuildEvent::Log on each build's broadcast channel.
@@ -554,6 +608,65 @@ impl DagActor {
     /// into ActorHandle. The actor keeps the writable Arc<AtomicBool>.
     pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
         BackpressureReader::new(self.backpressure_active.clone())
+    }
+
+    /// Compute counts for `AdminService.ClusterStatus`.
+    ///
+    /// O(workers + builds + dag_nodes) per call. The autoscaler polls
+    /// every 30s; even with 10k active derivations that's ~300μs/call —
+    /// not worth maintaining incremental counters. Revisit if dashboards
+    /// start polling at 1Hz.
+    ///
+    /// `as u32` casts: if any collection exceeds 4B entries, truncation
+    /// is the LEAST of our problems. The `ready_queue.len()` is bounded
+    /// by `ACTOR_CHANNEL_CAPACITY × derivations_per_submit` anyway (you
+    /// can't enqueue what you can't merge).
+    fn compute_cluster_snapshot(&self) -> ClusterSnapshot {
+        let mut active_workers = 0u32;
+        // `draining` field lands in E2; until then all registered = active.
+        // Loop once rather than two filter().count() passes.
+        for w in self.workers.values() {
+            if w.is_registered() {
+                active_workers += 1;
+            }
+        }
+
+        let mut pending_builds = 0u32;
+        let mut active_builds = 0u32;
+        for b in self.builds.values() {
+            match b.state() {
+                BuildState::Pending => pending_builds += 1,
+                BuildState::Active => active_builds += 1,
+                // Terminal builds stay in the map until CleanupTerminalBuild
+                // (delayed ~30s). Don't count them — they're not "active"
+                // in any autoscaling sense.
+                BuildState::Succeeded | BuildState::Failed | BuildState::Cancelled => {}
+            }
+        }
+
+        // Running = Assigned | Running. Both mean "a worker slot is taken."
+        // Assigned hasn't acked yet but the slot is reserved; for "how
+        // busy are workers" they're equivalent.
+        let running_derivations = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Assigned | DerivationStatus::Running
+                )
+            })
+            .count() as u32;
+
+        ClusterSnapshot {
+            total_workers: self.workers.len() as u32,
+            active_workers,
+            draining_workers: 0, // E2 populates
+            pending_builds,
+            active_builds,
+            queued_derivations: self.ready_queue.len() as u32,
+            running_derivations,
+        }
     }
 
     // -----------------------------------------------------------------------

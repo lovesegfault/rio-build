@@ -1,10 +1,10 @@
 //! AdminService gRPC implementation.
 //!
-//! First real AdminService impl (phase2b). Only `GetBuildLogs` is fully
-//! implemented; the other six RPCs return `UNIMPLEMENTED`. They'll land
-//! in phase 4 (dashboard) — stubbing them here means the tonic server
-//! wiring is already in place, and adding each one later is a pure
-//! body-swap with no main.rs/wiring churn.
+//! `GetBuildLogs` (phase2b) and `ClusterStatus` (phase3a) are fully
+//! implemented. `DrainWorker` lands in E2. The remaining RPCs return
+//! `UNIMPLEMENTED` and will land in phase4 (dashboard). Stubbing them
+//! here means the tonic server wiring is already in place — adding each
+//! one later is a pure body-swap with no main.rs churn.
 //!
 //! `GetBuildLogs` has two data sources (per `observability.md:44-50`):
 //!
@@ -20,11 +20,12 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
 use flate2::read::GzDecoder;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument};
@@ -36,6 +37,7 @@ use rio_proto::types::{
     ListBuildsRequest, ListBuildsResponse, ListWorkersRequest, ListWorkersResponse,
 };
 
+use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
 /// Chunk size for streaming S3-fetched log lines back to the client.
@@ -52,15 +54,48 @@ pub struct AdminServiceImpl {
     /// buffer still serves active builds.
     s3: Option<(S3Client, String)>, // (client, bucket)
     pool: PgPool,
+    /// For `ClusterStatus` / `DrainWorker` — sends query commands into
+    /// the actor event loop. `ClusterSnapshot` bypasses backpressure
+    /// (`send_unchecked`): the autoscaler needs a reading especially
+    /// when saturated. Dropping the query under load would blind the
+    /// controller exactly when it needs to scale up.
+    actor: ActorHandle,
+    /// Process start time. `ClusterStatusResponse.uptime_since` wants a
+    /// wall-clock `Timestamp`, but we don't want to capture `SystemTime`
+    /// at startup and risk it being wrong if the system clock jumps
+    /// forward during boot. Instead: `Instant` is monotonic; compute
+    /// `SystemTime::now() - started_at.elapsed()` at request time.
+    /// That's the correct "when did we start, in CURRENT wall-clock
+    /// terms" answer even across NTP adjustments.
+    started_at: Instant,
 }
 
 impl AdminServiceImpl {
-    pub fn new(log_buffers: Arc<LogBuffers>, s3: Option<(S3Client, String)>, pool: PgPool) -> Self {
+    pub fn new(
+        log_buffers: Arc<LogBuffers>,
+        s3: Option<(S3Client, String)>,
+        pool: PgPool,
+        actor: ActorHandle,
+    ) -> Self {
         Self {
             log_buffers,
             s3,
             pool,
+            actor,
+            started_at: Instant::now(),
         }
+    }
+
+    /// Actor-dead check. Same pattern as `SchedulerGrpc::check_actor_alive`
+    /// (grpc/mod.rs:~180) — if the actor panicked, all commands would
+    /// hang on a closed channel. Return UNAVAILABLE early instead.
+    fn check_actor_alive(&self) -> Result<(), Status> {
+        if !self.actor.is_alive() {
+            return Err(Status::unavailable(
+                "scheduler actor not running (internal error)",
+            ));
+        }
+        Ok(())
     }
 
     /// Try the ring buffer. Returns `Some` if the derivation has any lines
@@ -294,16 +329,67 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Stubs — return UNIMPLEMENTED. Phase 4 (dashboard) implements these.
-    // -----------------------------------------------------------------------
-
+    /// Cluster-wide counts for the controller's autoscaling loop.
+    ///
+    /// The controller computes `desired_replicas = queued_derivations /
+    /// target_value` (clamped to `[min, max]`) and patches the worker
+    /// StatefulSet. `queued_derivations` is the primary signal — that's
+    /// how many ready-to-build derivations are waiting for worker slots.
+    /// `running_derivations` is secondary (for "scale-down is safe when
+    /// queue=0 AND running is below capacity").
+    ///
+    /// `store_size_bytes` is 0: the scheduler doesn't track store
+    /// size; that would be a store-service RPC and this endpoint is
+    /// on the autoscaler's hot path (30s poll). If the dashboard
+    /// wants store size, it can query the store's /metrics directly.
+    /// `TODO(phase3b)`: add a best-effort store-size field populated
+    /// via a separate slow-refresh background task, NOT inline here.
+    #[instrument(skip(self, _request), fields(rpc = "ClusterStatus"))]
     async fn cluster_status(
         &self,
         _request: Request<()>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
-        Err(Status::unimplemented("ClusterStatus: phase4 dashboard"))
+        self.check_actor_alive()?;
+
+        let (tx, rx) = oneshot::channel();
+        // send_unchecked: autoscaler MUST get a reading under saturation.
+        // See ActorCommand::ClusterSnapshot doc for rationale.
+        self.actor
+            .send_unchecked(ActorCommand::ClusterSnapshot { reply: tx })
+            .await
+            .map_err(|_| Status::unavailable("actor channel closed"))?;
+
+        // rx.await fails only if the actor dropped the oneshot::Sender
+        // without replying — which means the actor task panicked mid-
+        // handler (impossible for ClusterSnapshot, it's a pure read
+        // with no .await points, but be robust anyway).
+        let snap = rx
+            .await
+            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+
+        // SystemTime::now() - elapsed → "start time in CURRENT wall-clock
+        // terms." checked_sub: if elapsed > now (clock jumped way back),
+        // UNIX_EPOCH is a less-wrong answer than panicking.
+        let uptime_since = SystemTime::now()
+            .checked_sub(self.started_at.elapsed())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        Ok(Response::new(ClusterStatusResponse {
+            total_workers: snap.total_workers,
+            active_workers: snap.active_workers,
+            draining_workers: snap.draining_workers,
+            pending_builds: snap.pending_builds,
+            active_builds: snap.active_builds,
+            queued_derivations: snap.queued_derivations,
+            running_derivations: snap.running_derivations,
+            store_size_bytes: 0,
+            uptime_since: Some(prost_types::Timestamp::from(uptime_since)),
+        }))
     }
+
+    // -----------------------------------------------------------------------
+    // Stubs — return UNIMPLEMENTED. Phase 4 (dashboard) implements these.
+    // -----------------------------------------------------------------------
 
     async fn list_workers(
         &self,
@@ -370,12 +456,39 @@ fn extract_drv_hash(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::tests::setup_actor;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
     use rio_proto::types::BuildLogBatch;
     use rio_test_support::TestDb;
     use tokio_stream::StreamExt;
+
+    /// Set up `AdminServiceImpl` with a live actor but no S3.
+    ///
+    /// The GetBuildLogs tests don't exercise the actor (they hit ring
+    /// buffer or S3 directly), but the constructor needs a handle since
+    /// E1. `setup_actor` gives a real actor backed by the same PG — no
+    /// mocks needed. The `_task` keeps the actor task alive; dropping
+    /// the returned tuple drops the handle → channel closes → actor
+    /// shuts down cleanly.
+    ///
+    /// Returns `(svc, actor_handle, task)`. The handle is separate so
+    /// ClusterStatus tests can also send actor commands directly.
+    async fn setup_svc(
+        buffers: Arc<LogBuffers>,
+        s3: Option<(S3Client, String)>,
+    ) -> (
+        AdminServiceImpl,
+        ActorHandle,
+        tokio::task::JoinHandle<()>,
+        TestDb,
+    ) {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let (actor, task) = setup_actor(db.pool.clone());
+        let svc = AdminServiceImpl::new(buffers, s3, db.pool.clone(), actor.clone());
+        (svc, actor, task, db)
+    }
 
     fn mk_batch(drv_path: &str, first_line: u64, lines: &[&[u8]]) -> BuildLogBatch {
         BuildLogBatch {
@@ -394,7 +507,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_from_ring_buffer() -> anyhow::Result<()> {
-        let db = TestDb::new(&crate::MIGRATOR).await;
         let buffers = Arc::new(LogBuffers::new());
         buffers.push(&mk_batch(
             "/nix/store/abc-test.drv",
@@ -402,7 +514,7 @@ mod tests {
             &[b"line0", b"line1", b"line2"],
         ));
 
-        let svc = AdminServiceImpl::new(buffers, None, db.pool.clone());
+        let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
 
         let resp = svc
             .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -426,7 +538,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_since_line_filters() -> anyhow::Result<()> {
-        let db = TestDb::new(&crate::MIGRATOR).await;
         let buffers = Arc::new(LogBuffers::new());
         buffers.push(&mk_batch(
             "/nix/store/abc-test.drv",
@@ -434,7 +545,7 @@ mod tests {
             &[b"l0", b"l1", b"l2", b"l3", b"l4"],
         ));
 
-        let svc = AdminServiceImpl::new(buffers, None, db.pool.clone());
+        let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
 
         let resp = svc
             .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -495,8 +606,18 @@ mod tests {
         let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
 
         // Ring buffer is EMPTY — forces S3 fallback.
+        //
+        // Can't use setup_svc here: this test seeds PG rows BEFORE
+        // constructing svc (the flusher-written build_logs row), and
+        // setup_svc creates its own TestDb. Wire manually.
         let buffers = Arc::new(LogBuffers::new());
-        let svc = AdminServiceImpl::new(buffers, Some((s3, "test-bucket".into())), db.pool.clone());
+        let (actor, _task) = setup_actor(db.pool.clone());
+        let svc = AdminServiceImpl::new(
+            buffers,
+            Some((s3, "test-bucket".into())),
+            db.pool.clone(),
+            actor,
+        );
 
         let resp = svc
             .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -520,10 +641,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
-        let db = TestDb::new(&crate::MIGRATOR).await;
         let buffers = Arc::new(LogBuffers::new());
         // No S3 configured, buffer empty.
-        let svc = AdminServiceImpl::new(buffers, None, db.pool.clone());
+        let (svc, _actor, _task, _db) = setup_svc(buffers, None).await;
 
         let result = svc
             .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -540,8 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let svc = AdminServiceImpl::new(Arc::new(LogBuffers::new()), None, db.pool.clone());
+        let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
 
         let result = svc
             .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -559,16 +678,9 @@ mod tests {
 
     #[tokio::test]
     async fn stubs_return_unimplemented() -> anyhow::Result<()> {
-        let db = TestDb::new(&crate::MIGRATOR).await;
-        let svc = AdminServiceImpl::new(Arc::new(LogBuffers::new()), None, db.pool.clone());
+        let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
 
-        assert_eq!(
-            svc.cluster_status(Request::new(()))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unimplemented
-        );
+        // ClusterStatus is no longer a stub — E1 implemented it.
         assert_eq!(
             svc.list_workers(Request::new(ListWorkersRequest::default()))
                 .await
@@ -651,6 +763,156 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].lines.len(), 2, "since=3 → lines 3,4 only");
         assert_eq!(chunks[0].first_line_number, 3);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // ClusterStatus (E1)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_status_empty() -> anyhow::Result<()> {
+        let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+
+        assert_eq!(resp.total_workers, 0);
+        assert_eq!(resp.active_workers, 0);
+        assert_eq!(resp.draining_workers, 0);
+        assert_eq!(resp.pending_builds, 0);
+        assert_eq!(resp.active_builds, 0);
+        assert_eq!(resp.queued_derivations, 0);
+        assert_eq!(resp.running_derivations, 0);
+        assert_eq!(
+            resp.store_size_bytes, 0,
+            "scheduler doesn't track store size"
+        );
+
+        // uptime_since is "now minus elapsed since construction" → within
+        // a few hundred ms of now. Wide tolerance (10s) to survive slow CI.
+        let uptime = resp.uptime_since.expect("uptime_since always set");
+        let now = prost_types::Timestamp::from(SystemTime::now());
+        let delta = now.seconds - uptime.seconds;
+        assert!(
+            (0..10).contains(&delta),
+            "uptime_since should be recent (within 10s), got delta={delta}s"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
+        use crate::actor::tests::connect_worker;
+
+        let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        // Stream-only worker (no heartbeat) → total=1, active=0.
+        // is_registered() requires BOTH stream_tx AND system; this has
+        // only the stream. The autoscaler should NOT count it as
+        // available capacity.
+        let (stream_tx, _rx1) = mpsc::channel(16);
+        actor
+            .send_unchecked(ActorCommand::WorkerConnected {
+                worker_id: "stream-only".into(),
+                stream_tx,
+            })
+            .await?;
+
+        // Fully registered worker (stream + heartbeat) → active.
+        let _rx2 = connect_worker(&actor, "full", "x86_64-linux", 4).await?;
+
+        let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+
+        assert_eq!(resp.total_workers, 2);
+        assert_eq!(
+            resp.active_workers, 1,
+            "only 'full' is registered (stream+heartbeat); 'stream-only' has no heartbeat"
+        );
+        assert_eq!(resp.draining_workers, 0, "E2 adds draining; 0 until then");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
+        use crate::actor::tests::{connect_worker, merge_single_node};
+        use crate::state::PriorityClass;
+
+        let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        // Worker with max_builds=1: will accept exactly one assignment,
+        // leaving the second derivation in ready_queue.
+        let mut worker_rx = connect_worker(&actor, "w1", "x86_64-linux", 1).await?;
+
+        // Two independent single-node DAGs. First dispatches (worker has
+        // capacity 1), second stays queued.
+        let _ev1 =
+            merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
+        let _ev2 =
+            merge_single_node(&actor, uuid::Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
+
+        // Drain the assignment for 'a' — dispatch happened synchronously
+        // during merge (dispatch_ready is called after merge completes),
+        // but the message is in the channel. Receiving it doesn't change
+        // actor state (worker ack → Running requires a separate
+        // ProcessCompletion roundtrip we're not doing here), it just
+        // proves the assignment went out.
+        let msg = worker_rx.recv().await.expect("assignment for first drv");
+        assert!(matches!(
+            msg.msg,
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+        ));
+
+        let resp = svc.cluster_status(Request::new(())).await?.into_inner();
+
+        // First derivation is Assigned (worker slot reserved, not yet acked
+        // → Running). Second is in ready_queue (no capacity). BOTH builds
+        // transition to Active on merge (merge.rs sets Active as soon as
+        // derivations are tracked, not waiting for dispatch).
+        assert_eq!(
+            resp.active_builds, 2,
+            "both builds transitioned to Active on merge"
+        );
+        assert_eq!(resp.pending_builds, 0);
+        assert_eq!(
+            resp.queued_derivations, 1,
+            "second drv waiting for capacity (worker max_builds=1 full)"
+        );
+        assert_eq!(
+            resp.running_derivations, 1,
+            "first drv is Assigned → counts as running (slot reserved)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
+        // Set up, then drop the handle + abort the task → actor channel closes.
+        // check_actor_alive() catches this before the oneshot would hang.
+        let (svc, actor, task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+        drop(actor);
+        task.abort();
+        // Give tokio a tick to process the abort.
+        tokio::task::yield_now().await;
+
+        // The svc still holds an ActorHandle clone. is_alive() checks
+        // tx.is_closed() which becomes true when the receiver drops
+        // (actor task gone). Abort + drop(actor) both contribute — abort
+        // kills the task (receiver drops), drop(actor) removes one of
+        // the two senders. The svc's clone is the last sender.
+        //
+        // Poll is_closed via the svc's handle until it flips. Bounded
+        // loop (if it never flips in 100 yields, something's wrong).
+        for _ in 0..100 {
+            if !svc.actor.is_alive() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = svc.cluster_status(Request::new(())).await;
+        let status = result.expect_err("should be Unavailable");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("actor"));
         Ok(())
     }
 }
