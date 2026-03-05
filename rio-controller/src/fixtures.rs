@@ -21,8 +21,9 @@
 //! (rio-test-support already has one, but not wired for
 //! AdminService). Scope: K8s mocks only. Scheduler integration
 //! is what vm-phase3a (H2) is for.
-
-#![cfg(test)]
+//!
+//! `#[cfg(test)]` is on the `mod fixtures;` in lib.rs — not
+//! here (stable clippy flags the duplicate).
 
 use std::pin::pin;
 
