@@ -121,16 +121,22 @@ impl Estimator {
     /// system + two f64s, ~80 bytes each); 10k rows = 800 KB. Full
     /// replace is simpler than diffing and fast enough.
     ///
-    /// The input tuple shape matches `SchedulerDb::read_build_history`
+    /// The input shape matches `SchedulerDb::read_build_history`
     /// exactly — callers just pipe the query result through.
-    pub fn refresh(&mut self, rows: Vec<(String, String, f64, Option<f64>)>) {
+    ///
+    /// `_ema_cpu` is accepted but not stored — `HistoryEntry` doesn't
+    /// have a cpu field yet. size-class routing currently bumps on
+    /// MEMORY only (not cpu). When cpu-bump lands, adding the
+    /// `HistoryEntry` field is a pure-estimator change; the DB
+    /// roundtrip is already done.
+    pub fn refresh(&mut self, rows: Vec<crate::db::BuildHistoryRow>) {
         let mut history = HashMap::with_capacity(rows.len());
         // pname → (sum, count) for mean calculation. Mean not median:
         // median would need sorting per-pname; mean is one pass. For
         // a fallback estimate, mean is plenty.
         let mut pname_acc: HashMap<String, (f64, u32)> = HashMap::new();
 
-        for (pname, system, ema_duration, ema_mem) in rows {
+        for (pname, system, ema_duration, ema_mem, _ema_cpu) in rows {
             let (sum, count) = pname_acc.entry(pname.clone()).or_insert((0.0, 0));
             *sum += ema_duration;
             *count += 1;
@@ -182,7 +188,13 @@ mod tests {
     #[test]
     fn exact_match_wins() {
         let mut est = Estimator::default();
-        est.refresh(vec![("gcc".into(), "x86_64-linux".into(), 120.0, None)]);
+        est.refresh(vec![(
+            "gcc".into(),
+            "x86_64-linux".into(),
+            120.0,
+            None,
+            None,
+        )]);
 
         assert_eq!(est.estimate(Some("gcc"), "x86_64-linux"), 120.0);
     }
@@ -191,7 +203,13 @@ mod tests {
     fn pname_fallback_cross_system() {
         let mut est = Estimator::default();
         // Only aarch64 data; query for x86_64 → cross-system fallback.
-        est.refresh(vec![("gcc".into(), "aarch64-linux".into(), 150.0, None)]);
+        est.refresh(vec![(
+            "gcc".into(),
+            "aarch64-linux".into(),
+            150.0,
+            None,
+            None,
+        )]);
 
         assert_eq!(
             est.estimate(Some("gcc"), "x86_64-linux"),
@@ -204,8 +222,8 @@ mod tests {
     fn pname_fallback_is_mean() {
         let mut est = Estimator::default();
         est.refresh(vec![
-            ("gcc".into(), "x86_64-linux".into(), 100.0, None),
-            ("gcc".into(), "aarch64-linux".into(), 200.0, None),
+            ("gcc".into(), "x86_64-linux".into(), 100.0, None, None),
+            ("gcc".into(), "aarch64-linux".into(), 200.0, None, None),
         ]);
 
         // Query for a THIRD system: fallback is mean(100, 200) = 150.
@@ -215,7 +233,13 @@ mod tests {
     #[test]
     fn no_pname_skips_to_default() {
         let mut est = Estimator::default();
-        est.refresh(vec![("gcc".into(), "x86_64-linux".into(), 120.0, None)]);
+        est.refresh(vec![(
+            "gcc".into(),
+            "x86_64-linux".into(),
+            120.0,
+            None,
+            None,
+        )]);
 
         // pname=None → can't look anything up, even though history exists.
         assert_eq!(est.estimate(None, "x86_64-linux"), DEFAULT_DURATION_SECS);
@@ -224,7 +248,13 @@ mod tests {
     #[test]
     fn unknown_pname_falls_through() {
         let mut est = Estimator::default();
-        est.refresh(vec![("gcc".into(), "x86_64-linux".into(), 120.0, None)]);
+        est.refresh(vec![(
+            "gcc".into(),
+            "x86_64-linux".into(),
+            120.0,
+            None,
+            None,
+        )]);
 
         assert_eq!(
             est.estimate(Some("unheard-of-package"), "x86_64-linux"),
@@ -236,8 +266,14 @@ mod tests {
     fn peak_memory_lookup() {
         let mut est = Estimator::default();
         est.refresh(vec![
-            ("firefox".into(), "x86_64-linux".into(), 3600.0, Some(8e9)),
-            ("hello".into(), "x86_64-linux".into(), 5.0, None),
+            (
+                "firefox".into(),
+                "x86_64-linux".into(),
+                3600.0,
+                Some(8e9),
+                None,
+            ),
+            ("hello".into(), "x86_64-linux".into(), 5.0, None, None),
         ]);
 
         assert_eq!(est.peak_memory(Some("firefox"), "x86_64-linux"), Some(8e9));
@@ -261,6 +297,7 @@ mod tests {
             "aarch64-linux".into(),
             3600.0,
             Some(8e9),
+            None,
         )]);
 
         // x86_64 lookup: no exact match → None (NOT the aarch64 value).
@@ -270,11 +307,23 @@ mod tests {
     #[test]
     fn refresh_replaces_not_merges() {
         let mut est = Estimator::default();
-        est.refresh(vec![("gcc".into(), "x86_64-linux".into(), 100.0, None)]);
+        est.refresh(vec![(
+            "gcc".into(),
+            "x86_64-linux".into(),
+            100.0,
+            None,
+            None,
+        )]);
         assert_eq!(est.estimate(Some("gcc"), "x86_64-linux"), 100.0);
 
         // Second refresh with DIFFERENT data: old entry gone.
-        est.refresh(vec![("clang".into(), "x86_64-linux".into(), 80.0, None)]);
+        est.refresh(vec![(
+            "clang".into(),
+            "x86_64-linux".into(),
+            80.0,
+            None,
+            None,
+        )]);
         assert_eq!(est.estimate(Some("clang"), "x86_64-linux"), 80.0);
         // gcc no longer in history → default.
         assert_eq!(
@@ -290,8 +339,8 @@ mod tests {
         assert_eq!(est.len(), 0);
 
         est.refresh(vec![
-            ("a".into(), "x".into(), 1.0, None),
-            ("b".into(), "x".into(), 2.0, None),
+            ("a".into(), "x".into(), 1.0, None, None),
+            ("b".into(), "x".into(), 2.0, None, None),
         ]);
         assert!(!est.is_empty());
         assert_eq!(est.len(), 2);

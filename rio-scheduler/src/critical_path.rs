@@ -285,9 +285,9 @@ mod tests {
     fn test_estimator() -> Estimator {
         let mut e = Estimator::default();
         e.refresh(vec![
-            ("a".into(), "x86_64-linux".into(), 10.0, None),
-            ("b".into(), "x86_64-linux".into(), 20.0, None),
-            ("c".into(), "x86_64-linux".into(), 30.0, None),
+            ("a".into(), "x86_64-linux".into(), 10.0, None, None),
+            ("b".into(), "x86_64-linux".into(), 20.0, None, None),
+            ("c".into(), "x86_64-linux".into(), 30.0, None, None),
         ]);
         e
     }

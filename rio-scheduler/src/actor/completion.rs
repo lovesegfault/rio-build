@@ -15,10 +15,13 @@ impl DagActor {
         drv_key: &str,
         result: rio_proto::types::BuildResult,
         // CompletionReport resource fields. 0 = worker had no signal
-        // (proc gone, build failed). Converted to None before the DB
-        // write so the EMA isn't dragged toward zero by non-data.
-        peak_memory_bytes: u64,
-        output_size_bytes: u64,
+        // (build failed before cgroup populated). Converted to None
+        // before the DB write so the EMA isn't dragged toward zero.
+        //
+        // Tuple to stay under clippy's 7-arg limit. All three are
+        // "resource measurements from the cgroup" with identical
+        // zero-means-no-signal semantics; unpacked immediately.
+        (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
     ) {
         let status =
             rio_proto::types::BuildResultStatus::try_from(result.status).unwrap_or_else(|_| {
@@ -77,8 +80,7 @@ impl DagActor {
                     drv_hash,
                     &result,
                     worker_id,
-                    peak_memory_bytes,
-                    output_size_bytes,
+                    (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
                 )
                 .await;
             }
@@ -118,8 +120,8 @@ impl DagActor {
         drv_hash: &DrvHash,
         result: &rio_proto::types::BuildResult,
         worker_id: &WorkerId,
-        peak_memory_bytes: u64,
-        output_size_bytes: u64,
+        // Same tuple pattern as handle_completion — clippy 7-arg limit.
+        (peak_memory_bytes, output_size_bytes, peak_cpu_cores): (u64, u64, f64),
     ) {
         // Transition to completed
         if let Some(state) = self.dag.node_mut(drv_hash) {
@@ -184,15 +186,30 @@ impl DagActor {
             // Sanity bound: reject durations > 30 days (bogus worker timestamps)
             if duration_secs > 0.0 && duration_secs < 30.0 * 86400.0 {
                 // 0 → None: "no signal" must not drag the EMA toward
-                // zero. The worker explicitly uses 0 for proc-gone /
-                // early-fail paths. A real build that uses literally
-                // zero bytes of RSS doesn't exist (nix-daemon alone
-                // is ~10MB), so this mapping loses nothing.
+                // zero. Worker uses 0 for build-failed-before-cgroup-
+                // populated paths. A real build using 0 bytes doesn't
+                // exist (nix-daemon alone is ~10MB cgroup peak); 0.0
+                // CPU cores likewise means "no samples taken" (build
+                // exited in <1s before the 1Hz poller fired).
+                //
+                // Phase2c correction: prior values in build_history
+                // are the WRONG memory (~10MB for every build, from
+                // daemon-PID VmHWM). cgroup memory.peak is correct.
+                // EMA alpha=0.3 → 0.7^10 ≈ 2.8% old value after 10
+                // completions. No migration; time heals.
                 let peak_mem = (peak_memory_bytes > 0).then_some(peak_memory_bytes);
                 let out_size = (output_size_bytes > 0).then_some(output_size_bytes);
+                let peak_cpu = (peak_cpu_cores > 0.0).then_some(peak_cpu_cores);
                 if let Err(e) = self
                     .db
-                    .update_build_history(pname, &state.system, duration_secs, peak_mem, out_size)
+                    .update_build_history(
+                        pname,
+                        &state.system,
+                        duration_secs,
+                        peak_mem,
+                        out_size,
+                        peak_cpu,
+                    )
                     .await
                 {
                     error!(drv_hash = %drv_hash, error = %e, "failed to update build history EMA");

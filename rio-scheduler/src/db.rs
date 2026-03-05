@@ -13,6 +13,18 @@ use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus, DrvHash, WorkerId};
 
+/// One row from `build_history`. Fields in SELECT order:
+/// `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores)`.
+///
+/// Type alias not struct: `sqlx::query_as` maps to tuples by ordinal
+/// position, and a struct would need `#[derive(FromRow)]` + named
+/// columns — more ceremony than a tuple for what's just a pipe from
+/// the DB read into `Estimator::refresh()`. The alias exists because
+/// 5-element tuples trip clippy's type-complexity lint, and naming
+/// it documents the field order where it matters (3 float-ish fields
+/// are easy to mix up).
+pub type BuildHistoryRow = (String, String, f64, Option<f64>, Option<f64>);
+
 /// Assignment lifecycle status (assignments table).
 ///
 /// Only `Pending` and `Completed` are currently set from Rust. The schema
@@ -354,19 +366,27 @@ impl SchedulerDb {
 
     /// Read the full build_history table for estimator refresh.
     ///
-    /// Returns `(pname, system, ema_duration_secs, ema_peak_memory_bytes)`.
+    /// Return tuple: `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores)`.
+    /// Aliased as [`BuildHistoryRow`] — 5-element tuples trip clippy's
+    /// type-complexity lint, and naming it documents the field order
+    /// at the one place where it's easy to mix up (3 f64-ish fields).
+    ///
+    /// 5-tuple as of I3 (cpu added). Estimator::refresh signature
+    /// changes to match. The estimator doesn't USE cpu_cores yet
+    /// (size-class routing bumps on memory only, not cpu) but reading
+    /// it now means future cpu-bump logic is a pure-estimator change,
+    /// no DB roundtrip.
+    ///
     /// The estimator loads this into a HashMap at startup and refreshes
     /// on Tick (every 60s). A full table scan is fine: even 10k distinct
     /// (pname, system) pairs is ~1 MB and <10ms. The alternative —
     /// loading on-demand per estimate — would be an async PG roundtrip
     /// inside the single-threaded actor loop on every dispatch decision.
     /// Batch-load once, query in-memory.
-    pub async fn read_build_history(
-        &self,
-    ) -> Result<Vec<(String, String, f64, Option<f64>)>, sqlx::Error> {
+    pub async fn read_build_history(&self) -> Result<Vec<BuildHistoryRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT pname, system, ema_duration_secs, ema_peak_memory_bytes
+            SELECT pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores
             FROM build_history
             "#,
         )
@@ -376,9 +396,10 @@ impl SchedulerDb {
 
     /// Update the build history EMA for a (pname, system) pair.
     ///
-    /// `peak_memory_bytes`/`output_size_bytes`: None means the worker
-    /// had no signal (proc gone, build failed early). Must NOT drag
-    /// the EMA toward zero — None → column unchanged.
+    /// `peak_memory_bytes`/`output_size_bytes`/`peak_cpu_cores`:
+    /// None means the worker had no signal (build failed before cgroup
+    /// populated, or exited in <1s before CPU poll sampled). Must NOT
+    /// drag the EMA toward zero — None → column unchanged.
     ///
     /// The COALESCE(blend, new, old) pattern handles all four
     /// old×new nullability combinations:
@@ -388,6 +409,15 @@ impl SchedulerDb {
     ///   old=None, new=None → all NULL (still no signal)
     ///
     /// PG: any arithmetic with NULL yields NULL; COALESCE picks first non-NULL.
+    ///
+    /// # Phase2c memory correction
+    ///
+    /// Prior to I2 the worker sent VmHWM of nix-daemon (~10MB
+    /// regardless of builder memory). cgroup memory.peak fixes that.
+    /// Existing build_history rows have the WRONG memory values. With
+    /// EMA alpha=0.3, ~10 completions per (pname,system) washes the
+    /// bad data out (0.7^10 ≈ 2.8% of the old value remains). No
+    /// migration needed — time heals it.
     pub async fn update_build_history(
         &self,
         pname: &str,
@@ -395,9 +425,10 @@ impl SchedulerDb {
         actual_duration_secs: f64,
         peak_memory_bytes: Option<u64>,
         output_size_bytes: Option<u64>,
+        peak_cpu_cores: Option<f64>,
     ) -> Result<(), sqlx::Error> {
         // u64 → f64 for DOUBLE PRECISION binding. Precision loss at
-        // ~2^53 bytes (~9 PB) is not a concern.
+        // ~2^53 bytes (~9 PB) is not a concern. cpu is already f64.
         let peak_mem = peak_memory_bytes.map(|b| b as f64);
         let out_size = output_size_bytes.map(|b| b as f64);
 
@@ -406,8 +437,9 @@ impl SchedulerDb {
             INSERT INTO build_history
               (pname, system, ema_duration_secs,
                ema_peak_memory_bytes, ema_output_size_bytes,
+               ema_peak_cpu_cores,
                sample_count, last_updated)
-            VALUES ($1, $2, $3, $5, $6, 1, now())
+            VALUES ($1, $2, $3, $5, $6, $7, 1, now())
             ON CONFLICT (pname, system) DO UPDATE SET
                 ema_duration_secs = build_history.ema_duration_secs * (1.0 - $4) + $3 * $4,
                 ema_peak_memory_bytes = COALESCE(
@@ -418,6 +450,10 @@ impl SchedulerDb {
                     build_history.ema_output_size_bytes * (1.0 - $4) + $6 * $4,
                     $6,
                     build_history.ema_output_size_bytes),
+                ema_peak_cpu_cores = COALESCE(
+                    build_history.ema_peak_cpu_cores * (1.0 - $4) + $7 * $4,
+                    $7,
+                    build_history.ema_peak_cpu_cores),
                 sample_count = build_history.sample_count + 1,
                 last_updated = now()
             "#,
@@ -428,6 +464,7 @@ impl SchedulerDb {
         .bind(EMA_ALPHA)
         .bind(peak_mem)
         .bind(out_size)
+        .bind(peak_cpu_cores)
         .execute(&self.pool)
         .await?;
 
@@ -664,7 +701,7 @@ mod tests {
         let test_db = TestDb::new(&crate::MIGRATOR).await;
         let db = SchedulerDb::new(test_db.pool.clone());
 
-        db.update_build_history("hello", "x86_64-linux", 10.0, None, None)
+        db.update_build_history("hello", "x86_64-linux", 10.0, None, None, None)
             .await?;
         let (ema1, count1): (f64, i32) = sqlx::query_as(
             "SELECT ema_duration_secs, sample_count FROM build_history \
@@ -675,7 +712,7 @@ mod tests {
         assert!((ema1 - 10.0).abs() < 0.001, "first insert: ema={ema1}");
         assert_eq!(count1, 1);
 
-        db.update_build_history("hello", "x86_64-linux", 20.0, None, None)
+        db.update_build_history("hello", "x86_64-linux", 20.0, None, None, None)
             .await?;
         let (ema2, count2): (f64, i32) = sqlx::query_as(
             "SELECT ema_duration_secs, sample_count FROM build_history \
@@ -711,7 +748,7 @@ mod tests {
         };
 
         // 1. old=None, new=None → stays None.
-        db.update_build_history("mem", "x86_64-linux", 1.0, None, None)
+        db.update_build_history("mem", "x86_64-linux", 1.0, None, None, None)
             .await?;
         let (mem, out) = fetch().await?;
         assert_eq!(mem, None, "None×None: mem should stay NULL");
@@ -719,8 +756,15 @@ mod tests {
 
         // 2. old=None, new=Some → initializes (blend is NULL, falls
         //    to $new).
-        db.update_build_history("mem", "x86_64-linux", 1.0, Some(100_000_000), Some(5000))
-            .await?;
+        db.update_build_history(
+            "mem",
+            "x86_64-linux",
+            1.0,
+            Some(100_000_000),
+            Some(5000),
+            None,
+        )
+        .await?;
         let (mem, out) = fetch().await?;
         assert!(
             mem.is_some_and(|m| (m - 100_000_000.0).abs() < 0.001),
@@ -734,7 +778,7 @@ mod tests {
         // 3. old=Some, new=None → KEEPS old (the important case — no
         //    signal doesn't drag). blend is NULL (x+NULL), falls to
         //    $new=NULL, falls to old.
-        db.update_build_history("mem", "x86_64-linux", 1.0, None, None)
+        db.update_build_history("mem", "x86_64-linux", 1.0, None, None, None)
             .await?;
         let (mem, out) = fetch().await?;
         assert!(
@@ -747,8 +791,15 @@ mod tests {
         );
 
         // 4. old=Some, new=Some → normal EMA blend.
-        db.update_build_history("mem", "x86_64-linux", 1.0, Some(200_000_000), Some(10_000))
-            .await?;
+        db.update_build_history(
+            "mem",
+            "x86_64-linux",
+            1.0,
+            Some(200_000_000),
+            Some(10_000),
+            None,
+        )
+        .await?;
         let (mem, out) = fetch().await?;
         let expect_mem = 100_000_000.0 * (1.0 - EMA_ALPHA) + 200_000_000.0 * EMA_ALPHA;
         let expect_out = 5000.0 * (1.0 - EMA_ALPHA) + 10_000.0 * EMA_ALPHA;
@@ -773,7 +824,7 @@ mod tests {
         let db = SchedulerDb::new(test_db.pool.clone());
 
         // Seed: EMA at 10s (would classify as "small").
-        db.update_build_history("slowpoke", "x86_64-linux", 10.0, None, None)
+        db.update_build_history("slowpoke", "x86_64-linux", 10.0, None, None, None)
             .await?;
 
         // Actual took 200s. Penalty write.
@@ -823,13 +874,14 @@ mod tests {
             42.0,
             Some(1_073_741_824),
             None,
+            Some(4.5), // peak_cpu_cores
         )
         .await?;
 
         let rows = db.read_build_history().await?;
         let row = rows
             .iter()
-            .find(|(p, s, _, _)| p == "roundtrip" && s == "aarch64-linux")
+            .find(|(p, s, _, _, _)| p == "roundtrip" && s == "aarch64-linux")
             .expect("written row should be readable");
 
         assert!((row.2 - 42.0).abs() < 0.001, "duration: {}", row.2);
@@ -838,6 +890,74 @@ mod tests {
             "peak mem: {:?}",
             row.3
         );
+        // I3: cpu_cores round-trips too. Verifies the new column is
+        // in both the INSERT and the SELECT.
+        assert!(
+            row.4.is_some_and(|c| (c - 4.5).abs() < 0.001),
+            "peak cpu cores: {:?}",
+            row.4
+        );
+        Ok(())
+    }
+
+    /// I3: cpu_cores uses the same COALESCE(blend, new, old) pattern as
+    /// memory. A build that exits in <1s (before the 1Hz poller
+    /// samples) reports 0.0 → None → column unchanged. The next real
+    /// build blends properly. Same "no signal doesn't drag" semantics.
+    ///
+    /// Separate test from the memory one: checks the NEW column's
+    /// COALESCE specifically (easy to forget to add it to the UPSERT).
+    #[tokio::test]
+    async fn test_update_build_history_cpu_cores_coalesce() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        let fetch_cpu = || async {
+            sqlx::query_scalar::<_, Option<f64>>(
+                "SELECT ema_peak_cpu_cores FROM build_history \
+                 WHERE pname = 'cpu' AND system = 'x86_64-linux'",
+            )
+            .fetch_one(&test_db.pool)
+            .await
+        };
+
+        // First: None (short build, no samples) → column stays NULL.
+        db.update_build_history("cpu", "x86_64-linux", 0.5, None, None, None)
+            .await?;
+        assert_eq!(fetch_cpu().await?, None, "None initializes to NULL");
+
+        // Second: Some(4.0) → initializes.
+        db.update_build_history("cpu", "x86_64-linux", 120.0, None, None, Some(4.0))
+            .await?;
+        let cpu = fetch_cpu().await?;
+        assert!(
+            cpu.is_some_and(|c| (c - 4.0).abs() < 0.001),
+            "Some initializes: expected 4.0, got {cpu:?}"
+        );
+
+        // Third: None again (another short build) → UNCHANGED at 4.0.
+        // This is the bug-catcher: if COALESCE is missing from the
+        // UPSERT for this column, NULL*0.7 + NULL*0.3 = NULL would
+        // clobber the good data.
+        db.update_build_history("cpu", "x86_64-linux", 0.5, None, None, None)
+            .await?;
+        let cpu = fetch_cpu().await?;
+        assert!(
+            cpu.is_some_and(|c| (c - 4.0).abs() < 0.001),
+            "Some×None: UNCHANGED (no drag). If this fails, \
+             COALESCE for ema_peak_cpu_cores is missing: {cpu:?}"
+        );
+
+        // Fourth: Some(8.0) → blends: 4.0*0.7 + 8.0*0.3 = 5.2.
+        db.update_build_history("cpu", "x86_64-linux", 300.0, None, None, Some(8.0))
+            .await?;
+        let cpu = fetch_cpu().await?;
+        let expected = 4.0 * (1.0 - EMA_ALPHA) + 8.0 * EMA_ALPHA;
+        assert!(
+            cpu.is_some_and(|c| (c - expected).abs() < 0.001),
+            "Some×Some blends: expected {expected}, got {cpu:?}"
+        );
+
         Ok(())
     }
 }

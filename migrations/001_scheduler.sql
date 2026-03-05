@@ -102,18 +102,27 @@ CREATE INDEX assignments_worker_idx ON assignments (worker_id, status);
 -- ----------------------------------------------------------------------------
 -- Duration + resource estimation: running EMA per (pname, system)
 --
--- Workers report peak_memory_bytes (from /proc/{pid}/status VmHWM) and
--- output_size_bytes in CompletionReport. Scheduler maintains EMA here
--- alongside ema_duration_secs (same alpha=0.3).
+-- Workers report resource fields in CompletionReport from per-build cgroup v2:
+--   peak_memory_bytes   <- cgroup memory.peak (tree-wide, kernel-tracked)
+--   peak_cpu_cores      <- cgroup cpu.stat usage_usec, polled 1Hz, delta/elapsed
+--   output_size_bytes   <- sum of uploaded NAR sizes
+-- Scheduler maintains EMA here alongside ema_duration_secs (same alpha=0.3).
 --
--- ema_peak_cpu_cores: column present per spec but TODO(phase3a) -- CPU%
--- needs polling during the build; VmHWM is a one-shot read at the end.
+-- Phase2c correction: ema_peak_memory_bytes rows written before I2 measured
+-- the nix-daemon's RSS (~10MB regardless of builder memory -- daemon forks
+-- the builder, waitpid()s, builder footprint never in daemon's /proc).
+-- cgroup memory.peak fixes that. No migration: EMA alpha=0.3 washes bad
+-- data out in ~10 completions (0.7^10 ~= 2.8% old value remains).
+--
+-- ema_peak_cpu_cores: wired as of I3. Not yet used for size-class routing
+-- (classify() bumps on memory only) but the data accumulates now so future
+-- cpu-bump logic is a pure-estimator change.
 --
 -- size_class: last class this (pname,system) was routed to. Informational
 -- for dashboards; classify() reads ema_duration + ema_peak_memory, not this.
 --
 -- misclassification_count: incremented when a build exceeds 2x its class
--- cutoff. Phase 3a's adaptive rebalancer (deferred) uses this to detect
+-- cutoff. Phase 4 adaptive rebalancer uses this to detect
 -- systematically-wrong cutoffs.
 -- ----------------------------------------------------------------------------
 

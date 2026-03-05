@@ -72,12 +72,19 @@ pub enum ActorCommand {
         /// Workers send drv_path; tests sometimes send drv_hash directly.
         drv_key: String,
         result: rio_proto::types::BuildResult,
-        /// Peak memory (VmHWM) in bytes from the worker. 0 = no signal
-        /// (proc gone, build failed early). Feeds build_history EMA.
+        /// Peak memory from cgroup `memory.peak`, bytes. 0 = no signal
+        /// (build failed before cgroup populated). Feeds
+        /// `build_history.ema_peak_memory_bytes` for size-class
+        /// memory-bump.
         peak_memory_bytes: u64,
         /// Sum of uploaded NAR sizes. 0 = no signal (build failed, no
         /// outputs). Dashboards-only today; column exists so EMA it now.
         output_size_bytes: u64,
+        /// Peak CPU cores-equivalent, polled 1Hz from cgroup
+        /// `cpu.stat`. 0.0 = no signal (exited before first sample).
+        /// Feeds `build_history.ema_peak_cpu_cores` — not used for
+        /// routing yet (size-class bumps on memory only).
+        peak_cpu_cores: f64,
     },
 
     /// Cancel a build.
@@ -524,13 +531,13 @@ impl DagActor {
                     result,
                     peak_memory_bytes,
                     output_size_bytes,
+                    peak_cpu_cores,
                 } => {
                     self.handle_completion(
                         &worker_id,
                         &drv_key,
                         result,
-                        peak_memory_bytes,
-                        output_size_bytes,
+                        (peak_memory_bytes, output_size_bytes, peak_cpu_cores),
                     )
                     .await;
                 }
