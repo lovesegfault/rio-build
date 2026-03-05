@@ -4487,6 +4487,7 @@ dependencies = [
  "kube",
  "metrics",
  "rio-common",
+ "rio-nix",
  "rio-proto",
  "schemars",
  "serde",

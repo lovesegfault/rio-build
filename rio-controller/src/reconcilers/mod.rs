@@ -10,6 +10,7 @@
 //! scratch, reads current state, computes desired, applies the
 //! diff via server-side apply. Reconciling twice is a no-op.
 
+pub mod build;
 pub mod workerpool;
 
 use kube::Client;
@@ -30,4 +31,8 @@ pub struct Ctx {
     /// SchedulerService (SubmitBuild, CancelBuild) are on the
     /// same port.
     pub scheduler_addr: String,
+    /// rio-store gRPC address (e.g., "rio-store:9002"). The Build
+    /// reconciler fetches .drv content from here to construct the
+    /// DerivationNode. Same lazy-connect rationale as scheduler.
+    pub store_addr: String,
 }
