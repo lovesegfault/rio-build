@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "rio-common",
+  "rio-controller",
   "rio-gateway",
   "rio-nix",
   "rio-proto",
