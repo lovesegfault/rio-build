@@ -97,6 +97,14 @@ in
 pkgs.testers.runNixOSTest {
   name = "rio-phase3a";
 
+  # Hard timeout on the whole test. Without this, a crash-
+  # looping worker pod means wait_until_succeeds loops forever
+  # (individual calls have timeouts but the outer retry doesn't).
+  # 600s = 10min: k3s startup (~60s) + airgap import (~30s) +
+  # pod scheduling + FUSE mount (~30s) + build (~30s) + drain
+  # (~30s) = ~3min happy path. 10min gives 3× headroom.
+  globalTimeout = 600;
+
   nodes = {
     control = common.mkControlNode {
       hostName = "control";
@@ -133,6 +141,22 @@ pkgs.testers.runNixOSTest {
         # NixOS default kernel has it but the module isn't
         # always auto-loaded.
         boot.kernelModules = [ "fuse" ];
+
+        # cgroup v2 unified hierarchy. NixOS defaults to this on
+        # modern systemd, but make it explicit — if it silently
+        # fell back to hybrid, the worker's own_cgroup() parser
+        # would fail with "multiple lines in /proc/self/cgroup".
+        boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+
+        # k3s's kubelet needs cgroup delegation from systemd so
+        # containerd can create pod cgroups. On NixOS this is
+        # usually automatic (systemd 254+ does it), but the
+        # NixOS test VM's minimal config may strip it. Force it
+        # via k3s.service's slice.
+        #
+        # Without this: containerd can't write pod cgroups →
+        # pods stuck in ContainerCreating → test hangs.
+        systemd.services.k3s.serviceConfig.Delegate = "yes";
 
         services.k3s = {
           enable = true;
