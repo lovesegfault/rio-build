@@ -1,0 +1,137 @@
+# rio-scheduler: DAG actor + leader election.
+#
+# replicas=2 for HA. Leader election via K8s Lease means ONE
+# replica dispatches; the other merges DAGs (state warm) but
+# dispatch_ready early-returns until it acquires. Readiness
+# gates on is_leader → Service routes only to the leader.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-scheduler
+  labels:
+    app.kubernetes.io/name: rio-scheduler
+    app.kubernetes.io/component: scheduler
+spec:
+  # 2 replicas: one leader, one hot standby. The standby's
+  # readinessProbe fails (tonic-health NOT_SERVING when
+  # !is_leader) → Service excludes it → all client traffic
+  # hits the leader. On leader death: standby acquires the
+  # Lease → is_leader=true → readiness passes → traffic flows.
+  # ~15s failover (Lease TTL).
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rio-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rio-scheduler
+        app.kubernetes.io/component: scheduler
+    spec:
+      serviceAccountName: rio-scheduler
+      containers:
+        - name: scheduler
+          image: rio-scheduler:latest
+          # imagePullPolicy: overlays set Never (dev, airgap-
+          # loaded) or Always (prod, registry).
+          ports:
+            - name: grpc
+              containerPort: 9001
+            - name: metrics
+              containerPort: 9091
+          env:
+            # Lease name: all replicas contend for the SAME
+            # lease. First to acquire wins. Presence of this
+            # env var is what ENABLES lease mode (LeaseConfig::
+            # from_env returns None without it → always-leader
+            # mode, which would be wrong with replicas=2).
+            - name: RIO_LEASE_NAME
+              value: rio-scheduler-leader
+            # Namespace via downward API — matches wherever
+            # kustomize deploys us. Without this, the lease
+            # code reads /var/run/secrets/.../namespace
+            # (works but explicit is clearer).
+            - name: RIO_LEASE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Holder ID = pod name. Unique per replica (K8s
+            # guarantees it). HOSTNAME is how K8s exposes it
+            # by default; the lease code reads this.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RIO_LISTEN_ADDR
+              value: "0.0.0.0:9001"
+            - name: RIO_STORE_ADDR
+              value: "rio-store:9002"
+            # PG_URL: overlays inject the real connection string
+            # (CloudNativePG secret in dev, RDS in prod). Empty
+            # here → scheduler fails fast at startup with a
+            # clear error, not a silent hang.
+            - name: RIO_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rio-postgres
+                  key: url
+          # gRPC readiness: tonic-health reports SERVING only
+          # when is_leader=true (the health-toggle loop in
+          # main.rs). MUST specify the service name —
+          # set_not_serving::<S>() affects only the NAMED
+          # service, not empty-string "". The proto package is
+          # `rio.scheduler`, no `.v1` suffix.
+          readinessProbe:
+            grpc:
+              port: 9001
+              service: rio.scheduler.SchedulerService
+            periodSeconds: 5
+            failureThreshold: 3
+          # Liveness: same check but LONGER threshold. A
+          # non-leader standby is NOT_SERVING (not ready) but
+          # ALIVE — don't restart it. Liveness only fires if
+          # the gRPC server itself is dead (actor panicked,
+          # server hung).
+          #
+          # Actually: liveness with grpc.service set would ALSO
+          # fail on standby. Wrong. Use TCP liveness instead —
+          # "is port 9001 listening at all." That's what
+          # liveness should check: process up, not "is leader."
+          livenessProbe:
+            tcpSocket:
+              port: 9001
+            periodSeconds: 10
+            failureThreshold: 6
+          # Startup: gRPC health, generous threshold. Scheduler
+          # runs migrations + connects to PG + connects to store
+          # on startup — 60s worst case (slow migration on a
+          # big event_log table).
+          startupProbe:
+            grpc:
+              port: 9001
+              service: rio.scheduler.SchedulerService
+            periodSeconds: 5
+            # 60s total (12 × 5s). Ignored once this passes.
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-scheduler
+  labels:
+    app.kubernetes.io/name: rio-scheduler
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rio-scheduler
+  ports:
+    - name: grpc
+      port: 9001
+      targetPort: grpc

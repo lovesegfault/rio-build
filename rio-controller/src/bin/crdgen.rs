@@ -17,7 +17,10 @@ fn main() {
         serde_yaml::to_string(&rio_controller::WorkerPool::crd()).expect("WorkerPool serializes");
     let build = serde_yaml::to_string(&rio_controller::Build::crd()).expect("Build serializes");
 
-    // serde_yaml's output starts with `---\n` already (document
-    // marker). Joining with a blank line between is cosmetic.
-    print!("{workerpool}\n{build}");
+    // serde_yaml does NOT emit the `---` document separator
+    // (verified: output starts with `apiVersion:` directly).
+    // Concat with explicit separator. The leading `---` on the
+    // first doc is optional per YAML spec but kustomize is
+    // stricter with multi-doc files — include it.
+    print!("---\n{workerpool}---\n{build}");
 }
