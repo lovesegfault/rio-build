@@ -107,6 +107,12 @@ pub struct BuildSpawnContext {
     pub max_leaked_mounts: usize,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     pub daemon_timeout: std::time::Duration,
+    /// Parent cgroup (`cgroup::own_cgroup()`), validated at startup.
+    /// Each build creates a sub-cgroup under here. Set ONCE in main.rs
+    /// after `enable_subtree_controllers` succeeds — if that fails,
+    /// main.rs bails with `?` and we never get here. So this is
+    /// always a valid, delegated cgroup2 path.
+    pub cgroup_parent: PathBuf,
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -151,6 +157,7 @@ pub async fn spawn_build_task(
         log_limits: ctx.log_limits,
         max_leaked_mounts: ctx.max_leaked_mounts,
         daemon_timeout: ctx.daemon_timeout,
+        cgroup_parent: ctx.cgroup_parent.clone(),
     };
 
     // Clone for the panic handler before moving into the task.
@@ -190,10 +197,7 @@ pub async fn spawn_build_task(
                 assignment_token: exec_result.assignment_token,
                 peak_memory_bytes: exec_result.peak_memory_bytes,
                 output_size_bytes: exec_result.output_size_bytes,
-                // I2 adds ExecutionResult.peak_cpu_cores. Until then:
-                // 0.0 = no-signal (scheduler's 0→None mapping keeps
-                // the EMA stable). One-commit window — I2 lands next.
-                peak_cpu_cores: 0.0,
+                peak_cpu_cores: exec_result.peak_cpu_cores,
             },
             Err(e) => {
                 tracing::error!(

@@ -263,6 +263,25 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_worker::describe_metrics();
 
+    // cgroup v2 setup. HARD REQUIREMENT — `?` on both. Fail startup
+    // loudly rather than silently fall back to broken metrics (the
+    // phase2c VmHWM bug measured ~10MB for every build; poisoning
+    // build_history like that takes ~10 EMA cycles to wash out).
+    //
+    // own_cgroup() parses /proc/self/cgroup (fails on cgroup v1).
+    // enable_subtree_controllers writes +memory +cpu (fails on EACCES
+    // = delegation not configured, or EBUSY = worker process in the
+    // same cgroup as the subtree — needs DelegateSubgroup; see H1).
+    //
+    // BEFORE the health server: if cgroup fails, we don't want
+    // liveness passing while startup is hung on `?` propagation.
+    // Pod goes straight to CrashLoopBackOff with a clear log line.
+    let cgroup_parent =
+        rio_worker::cgroup::own_cgroup().map_err(|e| anyhow::anyhow!("cgroup v2 required: {e}"))?;
+    rio_worker::cgroup::enable_subtree_controllers(&cgroup_parent)
+        .map_err(|e| anyhow::anyhow!("cgroup delegation required: {e}"))?;
+    info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
+
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
     // seconds if scheduler DNS is slow to resolve). Readiness stays
@@ -412,6 +431,7 @@ async fn main() -> anyhow::Result<()> {
         },
         max_leaked_mounts: cfg.max_leaked_mounts,
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
+        cgroup_parent,
     };
 
     // Process incoming scheduler messages + SIGTERM for graceful drain.

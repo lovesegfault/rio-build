@@ -76,6 +76,13 @@ pub struct ExecutorEnv {
     /// long (default 2h) — some builds genuinely take that long; the
     /// purpose is to bound blast radius of a truly stuck daemon.
     pub daemon_timeout: Duration,
+    /// Parent cgroup for per-build sub-cgroups. This is
+    /// `cgroup::own_cgroup()` — the worker's own cgroup. main.rs
+    /// computes it ONCE at startup (and calls
+    /// `enable_subtree_controllers` on it, which fail-fasts on
+    /// delegation misconfig). Each build gets a sub-cgroup named
+    /// by drv hash. cgroup v2 is a hard requirement — no Option.
+    pub cgroup_parent: std::path::PathBuf,
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -124,6 +131,8 @@ pub enum ExecutorError {
     MetadataFetch { path: String, source: tonic::Status },
     #[error("wire protocol error: {0}")]
     Wire(#[from] rio_nix::protocol::wire::WireError),
+    #[error("cgroup resource tracking failed: {0}")]
+    Cgroup(String),
 }
 
 /// Result of executing a single build.
@@ -135,39 +144,29 @@ pub struct ExecutionResult {
     pub result: ProtoBuildResult,
     /// Assignment token from the WorkAssignment.
     pub assignment_token: String,
-    /// Peak memory (RSS) in bytes, sampled from VmHWM before daemon
-    /// kill. 0 = couldn't read (proc gone, build failed early).
+    /// Peak memory in bytes from the per-build cgroup's `memory.peak`.
+    /// Tree-wide: daemon + builder + every child compiler. 0 = build
+    /// failed before cgroup populated (executor error before spawn).
     pub peak_memory_bytes: u64,
     /// Total bytes uploaded (sum of NAR sizes). 0 on failure.
     pub output_size_bytes: u64,
+    /// Peak CPU cores-equivalent, polled 1Hz from cgroup `cpu.stat`
+    /// usage_usec. `delta_usec / elapsed_usec`, max over build lifetime.
+    /// Tree-wide. 0.0 = build failed before any sample (exited <1s).
+    pub peak_cpu_cores: f64,
 }
 
-/// Read VmHWM from /proc/{pid}/status. The kernel tracks process-
-/// lifetime peak RSS here — no polling needed, one read gives the max.
+/// Read `cpu.stat` `usage_usec` from a cgroup path. Free fn (not a
+/// method on BuildCgroup) so the CPU poll task can clone the PATH
+/// and call this without holding a `&BuildCgroup` across the
+/// `run_daemon_build` await.
 ///
-/// Returns `None` on any failure (file missing = process dead, parse
-/// fail = kernel format changed). Caller treats None as "no signal"
-/// and reports 0 to the scheduler.
-///
-/// Format: `VmHWM:    123456 kB` (whitespace-separated, always kB).
-/// We parse the number and convert kB → bytes. The "always kB" is a
-/// Linux kernel guarantee (fs/proc/task_mmu.c) — no unit parsing needed.
-fn read_vmhwm_bytes(pid: u32) -> Option<u64> {
-    let path = format!("/proc/{pid}/status");
-    let content = std::fs::read_to_string(&path).ok()?;
-
-    // Find the VmHWM line. Lines look like "VmHWM:\t   12345 kB".
-    // split_whitespace handles any mix of tabs/spaces.
-    content
-        .lines()
-        .find(|line| line.starts_with("VmHWM:"))
-        .and_then(|line| {
-            // ["VmHWM:", "12345", "kB"] — we want index 1.
-            line.split_whitespace().nth(1)
-        })
-        .and_then(|kb_str| kb_str.parse::<u64>().ok())
-        // kB → bytes. The kernel ALWAYS reports in kB for VmHWM.
-        .map(|kb| kb * 1024)
+/// Thin wrapper over the pure parser in cgroup.rs. `None` on read
+/// fail (cgroup directory removed mid-poll — shouldn't happen, the
+/// executor drops BuildCgroup AFTER the poll task is aborted).
+fn read_cpu_stat(cgroup_path: &Path) -> Option<u64> {
+    let content = std::fs::read_to_string(cgroup_path.join("cpu.stat")).ok()?;
+    crate::cgroup::parse_cpu_stat_usage_usec(&content)
 }
 
 /// Execute a single build assignment.
@@ -243,9 +242,11 @@ pub async fn execute_build(
                 ..Default::default()
             },
             assignment_token: assignment.assignment_token.clone(),
-            // Infra failure before daemon spawn = no memory, no outputs.
+            // Infra failure before daemon spawn → cgroup never
+            // created, never populated. All resource fields = 0.
             peak_memory_bytes: 0,
             output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
         });
     }
 
@@ -402,31 +403,139 @@ pub async fn execute_build(
     let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
     tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
 
+    // Per-build cgroup. Created AFTER spawn (we need the PID) but
+    // BEFORE run_daemon_build — critical ordering: the daemon must
+    // be in the cgroup BEFORE it forks the builder (step 4 of
+    // run_daemon_build's handshake), otherwise the builder inherits
+    // the PARENT cgroup and we measure only daemon RSS — right back
+    // to the phase2c VmHWM bug. The handshake hasn't started yet
+    // (run_daemon_build does it), so this is safe.
+    //
+    // `?` on both create and add_process: if cgroup setup fails here,
+    // the build fails. cgroup v2 is a hard requirement — we already
+    // validated the parent cgroup at startup, so failure here is
+    // exceptional (stale directory from a crash that we couldn't
+    // rmdir because it has a stuck process, or daemon died between
+    // spawn and now). Both are real errors the operator should see.
+    //
+    // build_id = sanitize_build_id(drv_path). nixbase32 hash chars
+    // are valid cgroup names; sanitize replaces '.' (from ".drv")
+    // with '_'. Same name as the overlay directory — easy to
+    // correlate in debugging.
+    let build_cgroup = crate::cgroup::BuildCgroup::create(&env.cgroup_parent, &build_id)
+        .map_err(|e| ExecutorError::Cgroup(format!("create sub-cgroup: {e}")))?;
+    let daemon_pid = daemon
+        .id()
+        .ok_or_else(|| ExecutorError::Cgroup("daemon PID unavailable (died at spawn?)".into()))?;
+    build_cgroup
+        .add_process(daemon_pid)
+        .map_err(|e| ExecutorError::Cgroup(format!("add daemon to cgroup: {e}")))?;
+
+    // CPU polling task. Runs concurrently with run_daemon_build
+    // below (which awaits). Samples cpu.stat usage_usec every second,
+    // computes instantaneous cores = delta_usec/elapsed_usec, tracks
+    // max. The cgroup's usage_usec is tree-cumulative, so this
+    // captures the builder's CPU too.
+    //
+    // Stores max as f64 bits in an AtomicU64 — there's no AtomicF64.
+    // compare_exchange loop for max (fetch_max on u64 bits would
+    // compare BIT PATTERNS, not float values — 2.0_f64.to_bits() >
+    // 8.0_f64.to_bits() is NOT guaranteed). Standard f64-atomic
+    // pattern.
+    //
+    // Clone the cgroup PATH (not the BuildCgroup — moving it would
+    // put Drop in the task, which we don't want; Drop must run after
+    // daemon.wait() below).
+    let peak_cpu_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cpu_poll_path = build_cgroup.path().to_path_buf();
+    let cpu_poll_peak = peak_cpu_atomic.clone();
+    let cpu_poll = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        // First tick fires immediately — skip it, we want a 1s baseline.
+        interval.tick().await;
+        let mut prev_usec = read_cpu_stat(&cpu_poll_path);
+        let mut prev_instant = std::time::Instant::now();
+        loop {
+            interval.tick().await;
+            let now_usec = read_cpu_stat(&cpu_poll_path);
+            let now_instant = std::time::Instant::now();
+            // Both samples must be Some. If the first read failed
+            // (cgroup not populated yet — daemon hasn't forked),
+            // prev is None and we just advance. If THIS read fails
+            // (cgroup removed? shouldn't happen until Drop), skip.
+            if let (Some(prev), Some(now)) = (prev_usec, now_usec) {
+                let delta_usec = now.saturating_sub(prev);
+                let elapsed_usec = now_instant.duration_since(prev_instant).as_micros() as u64;
+                // elapsed_usec is ~1_000_000 (1s interval) but
+                // jitters. Guard /0 for the impossible case where
+                // two ticks fire at the same instant.
+                if elapsed_usec > 0 {
+                    let cores = delta_usec as f64 / elapsed_usec as f64;
+                    // Compare-exchange max: load, if cores > current,
+                    // try to swap. Loop until success or current >= cores.
+                    let mut current_bits = cpu_poll_peak.load(Ordering::Relaxed);
+                    loop {
+                        if f64::from_bits(current_bits) >= cores {
+                            break; // already higher, done
+                        }
+                        match cpu_poll_peak.compare_exchange_weak(
+                            current_bits,
+                            cores.to_bits(),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,                       // we set it
+                            Err(actual) => current_bits = actual, // raced, retry
+                        }
+                    }
+                }
+            }
+            prev_usec = now_usec;
+            prev_instant = now_instant;
+        }
+    });
+
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
     // Previously, any `?` between spawn and kill leaked the daemon process.
     let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string(), log_limits);
     let build_result =
         run_daemon_build(&mut daemon, drv_path, &basic_drv, timeout, batcher, log_tx).await;
 
-    // Sample VmHWM (peak RSS) BEFORE killing — /proc/{pid} goes away
-    // on exit. The kernel tracks VmHWM for us (no polling needed);
-    // one read at build-end gives the lifetime peak. This feeds
-    // build_history.ema_peak_memory_bytes for D7's size-class routing.
+    // Stop CPU polling. The last sample is up to 1s stale; good
+    // enough (peak CPU doesn't change in the last second of a
+    // multi-minute build). abort() doesn't wait — the task is
+    // pure read, no cleanup needed.
+    cpu_poll.abort();
+    let peak_cpu_cores = f64::from_bits(peak_cpu_atomic.load(Ordering::Acquire));
+
+    // Read cgroup memory.peak. Kernel-tracked lifetime max of the
+    // WHOLE TREE — daemon + builder + every child. One read, no
+    // polling. This FIXES the phase2c bug: VmHWM on daemon.id()
+    // measured ~10MB (daemon's own RSS) because the builder was a
+    // FORKED child, not exec'd — the builder's memory never showed
+    // in daemon's /proc.
     //
-    // 0 on any failure (pid None = already dead, file gone, parse fail).
-    // Scheduler treats 0 as "no signal" — doesn't drag the EMA.
-    let peak_memory_bytes = daemon.id().and_then(read_vmhwm_bytes).unwrap_or(0);
+    // 0 on None (file missing would mean memory controller not
+    // enabled, but enable_subtree_controllers at startup would have
+    // caught that — this is a belt-and-suspenders default).
+    let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
 
     // ALWAYS kill the daemon, regardless of success/failure.
     if let Err(e) = daemon.kill().await {
         tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
     }
-    // Reap the zombie (bounded wait).
+    // Reap the zombie (bounded wait). After this, cgroup is empty
+    // and build_cgroup Drop can rmdir cleanly.
     match tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(error = %e, "daemon.wait() failed after kill"),
         Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
     }
+    // build_cgroup drops here (end of scope). rmdir should succeed
+    // now that daemon.wait() reaped the tree. If the wait timed out
+    // (zombie), rmdir fails EBUSY → warn! + leak (cleared on pod
+    // restart).
+    drop(build_cgroup);
 
     // (Final log flush happens inside read_build_stderr_loop, which now
     // owns the batcher.)
@@ -462,10 +571,12 @@ pub async fn execute_build(
                             ..Default::default()
                         },
                         assignment_token: assignment.assignment_token.clone(),
-                        // Build DID run (FOD verification is post-build),
-                        // so VmHWM is meaningful even though we reject.
+                        // Build DID run (FOD verification is post-build).
+                        // cgroup was populated → memory+cpu are meaningful
+                        // even though we reject the output.
                         peak_memory_bytes,
                         output_size_bytes: 0,
+                        peak_cpu_cores,
                     });
                 }
 
@@ -567,6 +678,7 @@ pub async fn execute_build(
         assignment_token: assignment.assignment_token.clone(),
         peak_memory_bytes,
         output_size_bytes,
+        peak_cpu_cores,
     })
 }
 
@@ -654,6 +766,9 @@ mod tests {
             log_limits: LogLimits::UNLIMITED,
             max_leaked_mounts: 3,
             daemon_timeout: DEFAULT_DAEMON_TIMEOUT,
+            // Short-circuit path never reaches cgroup setup (bails at
+            // the leak-threshold check). Tempdir is fine.
+            cgroup_parent: dir.path().to_path_buf(),
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;
@@ -684,34 +799,7 @@ mod tests {
         Ok(())
     }
 
-    /// VmHWM parse against a real /proc entry: this process. The test
-    /// process itself has a nonzero RSS, so VmHWM must be > 0. This
-    /// exercises the whole path (file read, line scan, whitespace
-    /// split, kB→bytes) without needing to spawn a daemon.
-    #[test]
-    fn test_read_vmhwm_bytes_self() {
-        let pid = std::process::id();
-        let hwm = read_vmhwm_bytes(pid).expect("/proc/self/status should exist and parse");
-
-        // The test binary's peak RSS is at LEAST a few hundred KB
-        // (stack + heap + mapped libs). 64 KiB is a safe floor; a
-        // real value is typically tens of MB. This guards against
-        // silently parsing the wrong field or dropping the ×1024.
-        assert!(
-            hwm > 64 * 1024,
-            "VmHWM for self should be well over 64 KiB, got {hwm} bytes"
-        );
-
-        // Kernel reports in whole kB, so bytes MUST be a multiple of
-        // 1024. Catches "forgot to ×1024" and "parsed wrong number"
-        // classes of bug.
-        assert_eq!(hwm % 1024, 0, "VmHWM should be kB-aligned, got {hwm}");
-    }
-
-    /// Nonexistent PID → None (not panic, not Err). PID 1 billion is
-    /// way past pid_max (default ~4M on Linux), so guaranteed absent.
-    #[test]
-    fn test_read_vmhwm_bytes_nonexistent_pid() {
-        assert_eq!(read_vmhwm_bytes(1_000_000_000), None);
-    }
+    // read_vmhwm_bytes tests removed — function replaced by cgroup
+    // memory.peak (I2). The equivalent canary (real-system parse)
+    // is cgroup::tests::own_cgroup_parses_on_this_system.
 }
