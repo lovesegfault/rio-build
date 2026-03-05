@@ -190,6 +190,16 @@ pub struct DerivationState {
     /// change the OPTIMAL schedule mid-execution — what's queued is
     /// queued).
     pub est_duration: f64,
+    /// Sum of input_srcs nar_sizes from the proto (J1). Passed to
+    /// `Estimator::estimate()` for the closure-size-as-proxy fallback
+    /// when there's no `build_history` entry. 0 = no-signal (empty
+    /// srcs, or gateway's QueryPathInfo batch failed).
+    ///
+    /// Stored separately from `est_duration` even though it's only
+    /// USED to compute est_duration: the estimator call happens in
+    /// merge.rs AFTER try_from_node (estimator not in scope here),
+    /// and merge.rs needs the raw value to pass through.
+    pub input_srcs_nar_size: u64,
     /// Critical-path priority: `est_duration + max(children's priority)`.
     /// Bottom-up: leaves have `priority = est_duration`; roots have
     /// the sum along the longest path. Higher = more urgent (dispatch
@@ -235,6 +245,7 @@ impl DerivationState {
             // after try_from_node (try_from_node doesn't have estimator
             // access). 0.0 is a visible "not yet set" marker.
             est_duration: 0.0,
+            input_srcs_nar_size: node.input_srcs_nar_size,
             priority: 0.0,
             db_id: None,
             ready_at: None,

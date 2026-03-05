@@ -12,13 +12,10 @@
 //!    of the same package usually take similar time)
 //! 3. Default: 30 seconds (configurable constant)
 //!
-//! Closure-size-as-proxy (scheduler.md fallback 2) is deferred —
-//! `TODO(phase3b)`: needs per-path nar_size tracked scheduler-side,
-//! which requires a gateway change (batch QueryPathInfo on input_srcs
-//! during reconstruct_dag) + proto field 10 on DerivationNode. Design
-//! in the phase3a plan (J1+J2). The 30s default covers cold-start
-//! adequately; PrefetchHint (B3, landed) improves the common case
-//! more than this fallback would.
+//! Closure-size-as-proxy (scheduler.md fallback 2): now wired via
+//! `input_srcs_nar_size` from the gateway (J1+J2). "A derivation
+//! with 10GB of sources probably takes longer than one with 100MB."
+//! Slots between the pname fallback and the 30s default.
 //!
 //! # Refresh, not live
 //!
@@ -64,42 +61,80 @@ pub struct Estimator {
 /// real sample arrives.
 pub const DEFAULT_DURATION_SECS: f64 = 30.0;
 
+/// Rough "processing speed" for closure-size-as-proxy. 10 MB/s —
+/// chosen as a deliberately CONSERVATIVE lower bound on "bytes
+/// touched per second during a build." Real builds are faster (a
+/// compiler reads source at disk speed then spends most time in
+/// CPU), but we want the proxy to OVER-estimate, not under. An
+/// over-estimate might give an unknown build higher priority than
+/// it deserves (scheduled sooner); an under-estimate might put a
+/// 30-minute build behind a 5-second one.
+///
+/// Tuned by observation: a 1GB source tarball (chromium-ish)
+/// typically builds in ~100s minimum (unpack + configure + a
+/// token compile). 1e9 / 1e7 = 100s. Checks out.
+const CLOSURE_BYTES_PER_SEC_PROXY: f64 = 10_000_000.0;
+
+/// Floor for the closure-size proxy. Even a tiny-srcs build has
+/// to fork the builder, write $out. 5s is "the build actually
+/// ran" vs the 30s default which is "we know literally nothing."
+const CLOSURE_PROXY_MIN_SECS: f64 = 5.0;
+
 impl Estimator {
     /// Estimate build duration in seconds.
     ///
     /// `pname` is `Option` because not every derivation has one (FODs,
     /// raw derivations without the stdenv `pname` attr). `None` skips
-    /// straight to the default — there's nothing to key a lookup on.
+    /// the history lookups — there's nothing to key on. But the
+    /// closure-size proxy (fallback #2.5) still applies: even a
+    /// pname-less derivation has input_srcs.
     ///
     /// `system` is required (every derivation has one). But it only
     /// matters for fallback #1; fallback #2 ignores it.
-    pub fn estimate(&self, pname: Option<&str>, system: &str) -> f64 {
-        let Some(pname) = pname else {
-            // No pname = no lookup key. Default.
-            return DEFAULT_DURATION_SECS;
-        };
+    ///
+    /// `input_srcs_nar_size` from the proto (J1). 0 = no-signal
+    /// (empty srcs, or gateway's batch QueryPathInfo failed).
+    pub fn estimate(&self, pname: Option<&str>, system: &str, input_srcs_nar_size: u64) -> f64 {
+        // Fallbacks #1, #2: history-based. Require pname. If None,
+        // skip to the closure-size proxy.
+        if let Some(pname) = pname {
+            // Fallback #1: exact (pname, system).
+            //
+            // The tuple-key lookup allocates two Strings. For a hot path
+            // (called once per dispatch decision, ~1000/sec under load),
+            // that's ~2k small allocs/sec — measurable but not dominant.
+            // A Cow-based key or string-interning would fix it; deferred
+            // until profiling says it matters.
+            if let Some(entry) = self.history.get(&(pname.to_string(), system.to_string())) {
+                return entry.ema_duration_secs;
+            }
 
-        // Fallback #1: exact (pname, system).
-        //
-        // The tuple-key lookup allocates two Strings. For a hot path
-        // (called once per dispatch decision, ~1000/sec under load),
-        // that's ~2k small allocs/sec — measurable but not dominant.
-        // A Cow-based key or string-interning would fix it; deferred
-        // until profiling says it matters.
-        if let Some(entry) = self.history.get(&(pname.to_string(), system.to_string())) {
-            return entry.ema_duration_secs;
+            // Fallback #2: same pname, any system. ARM and x86 builds
+            // of gcc take roughly the same time — the algorithm
+            // dominates, not the target.
+            if let Some(&dur) = self.pname_fallback.get(pname) {
+                return dur;
+            }
         }
 
-        // Fallback #2: same pname, any system. ARM and x86 builds of
-        // gcc take roughly the same time — the algorithm dominates,
-        // not the target.
-        if let Some(&dur) = self.pname_fallback.get(pname) {
-            return dur;
+        // Fallback #2.5: closure-size-as-proxy. The "big source
+        // tarball → probably long build" heuristic. Better than a
+        // blind 30s when we at least know how many bytes the
+        // builder will touch.
+        //
+        // Floor: even a 1-byte src doesn't estimate to 0.0001s.
+        // 5s is the overhead floor (fork, write $out).
+        //
+        // Slot BETWEEN pname fallback and default: history is
+        // always better (real data for THIS package); closure
+        // size is better than nothing but it's a proxy.
+        if input_srcs_nar_size > 0 {
+            let raw = input_srcs_nar_size as f64 / CLOSURE_BYTES_PER_SEC_PROXY;
+            return raw.max(CLOSURE_PROXY_MIN_SECS);
         }
 
-        // Fallback #3: cold-start default.
-        //
-        // TODO(phase3b): closure-size-as-proxy (see module doc).
+        // Fallback #3: cold-start default. No history, no pname,
+        // no srcs (or gateway batch failed). 30s.
         DEFAULT_DURATION_SECS
     }
 
@@ -179,10 +214,10 @@ mod tests {
     fn empty_returns_default() {
         let est = Estimator::default();
         assert_eq!(
-            est.estimate(Some("gcc"), "x86_64-linux"),
+            est.estimate(Some("gcc"), "x86_64-linux", 0),
             DEFAULT_DURATION_SECS
         );
-        assert_eq!(est.estimate(None, "x86_64-linux"), DEFAULT_DURATION_SECS);
+        assert_eq!(est.estimate(None, "x86_64-linux", 0), DEFAULT_DURATION_SECS);
     }
 
     #[test]
@@ -196,7 +231,7 @@ mod tests {
             None,
         )]);
 
-        assert_eq!(est.estimate(Some("gcc"), "x86_64-linux"), 120.0);
+        assert_eq!(est.estimate(Some("gcc"), "x86_64-linux", 0), 120.0);
     }
 
     #[test]
@@ -212,7 +247,7 @@ mod tests {
         )]);
 
         assert_eq!(
-            est.estimate(Some("gcc"), "x86_64-linux"),
+            est.estimate(Some("gcc"), "x86_64-linux", 0),
             150.0,
             "no x86_64 data → use aarch64 EMA for same pname"
         );
@@ -227,7 +262,7 @@ mod tests {
         ]);
 
         // Query for a THIRD system: fallback is mean(100, 200) = 150.
-        assert_eq!(est.estimate(Some("gcc"), "riscv64-linux"), 150.0);
+        assert_eq!(est.estimate(Some("gcc"), "riscv64-linux", 0), 150.0);
     }
 
     #[test]
@@ -242,7 +277,7 @@ mod tests {
         )]);
 
         // pname=None → can't look anything up, even though history exists.
-        assert_eq!(est.estimate(None, "x86_64-linux"), DEFAULT_DURATION_SECS);
+        assert_eq!(est.estimate(None, "x86_64-linux", 0), DEFAULT_DURATION_SECS);
     }
 
     #[test]
@@ -257,7 +292,7 @@ mod tests {
         )]);
 
         assert_eq!(
-            est.estimate(Some("unheard-of-package"), "x86_64-linux"),
+            est.estimate(Some("unheard-of-package"), "x86_64-linux", 0),
             DEFAULT_DURATION_SECS
         );
     }
@@ -314,7 +349,7 @@ mod tests {
             None,
             None,
         )]);
-        assert_eq!(est.estimate(Some("gcc"), "x86_64-linux"), 100.0);
+        assert_eq!(est.estimate(Some("gcc"), "x86_64-linux", 0), 100.0);
 
         // Second refresh with DIFFERENT data: old entry gone.
         est.refresh(vec![(
@@ -324,10 +359,10 @@ mod tests {
             None,
             None,
         )]);
-        assert_eq!(est.estimate(Some("clang"), "x86_64-linux"), 80.0);
+        assert_eq!(est.estimate(Some("clang"), "x86_64-linux", 0), 80.0);
         // gcc no longer in history → default.
         assert_eq!(
-            est.estimate(Some("gcc"), "x86_64-linux"),
+            est.estimate(Some("gcc"), "x86_64-linux", 0),
             DEFAULT_DURATION_SECS
         );
     }
@@ -344,5 +379,73 @@ mod tests {
         ]);
         assert!(!est.is_empty());
         assert_eq!(est.len(), 2);
+    }
+
+    // ---- J2: closure-size-as-proxy fallback (#2.5) ----
+
+    #[test]
+    fn closure_proxy_between_history_and_default() {
+        let est = Estimator::default();
+        // 1 GB of srcs, no history. 1e9 / 1e7 = 100s.
+        let got = est.estimate(Some("unknown"), "x86_64-linux", 1_000_000_000);
+        assert!(
+            (got - 100.0).abs() < 0.001,
+            "1GB / 10MB/s = 100s, got {got}"
+        );
+        // Check it's NOT the default — proves the proxy actually fires.
+        assert_ne!(got, DEFAULT_DURATION_SECS);
+    }
+
+    #[test]
+    fn closure_proxy_floor() {
+        let est = Estimator::default();
+        // Tiny srcs: 1 byte / 10MB/s = 0.0000001s. Floor kicks in.
+        let got = est.estimate(Some("unknown"), "x86_64-linux", 1);
+        assert_eq!(
+            got, CLOSURE_PROXY_MIN_SECS,
+            "even 1 byte of srcs → 5s floor (fork + write $out overhead)"
+        );
+    }
+
+    #[test]
+    fn closure_proxy_zero_is_no_signal() {
+        let est = Estimator::default();
+        // 0 = empty srcs OR gateway batch failed. Skip to default.
+        let got = est.estimate(Some("unknown"), "x86_64-linux", 0);
+        assert_eq!(
+            got, DEFAULT_DURATION_SECS,
+            "0 = no-signal → skip proxy, use 30s default"
+        );
+    }
+
+    #[test]
+    fn closure_proxy_lower_priority_than_history() {
+        let mut est = Estimator::default();
+        est.refresh(vec![(
+            "gcc".into(),
+            "x86_64-linux".into(),
+            120.0,
+            None,
+            None,
+        )]);
+        // History says 120s. Pass a closure size that would compute
+        // to 1000s. History WINS — it's real data for THIS package.
+        let got = est.estimate(Some("gcc"), "x86_64-linux", 10_000_000_000);
+        assert_eq!(
+            got, 120.0,
+            "history is real data; closure size is a proxy. History wins."
+        );
+    }
+
+    #[test]
+    fn closure_proxy_works_without_pname() {
+        let est = Estimator::default();
+        // pname=None skips history lookups but the proxy still
+        // applies — even a pname-less derivation has srcs.
+        let got = est.estimate(None, "x86_64-linux", 1_000_000_000);
+        assert!(
+            (got - 100.0).abs() < 0.001,
+            "no pname, but 1GB srcs → 100s via proxy (not 30s default)"
+        );
     }
 }
