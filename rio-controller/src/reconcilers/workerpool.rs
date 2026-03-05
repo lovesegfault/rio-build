@@ -498,13 +498,30 @@ fn build_pod_spec(
     cache_gb: u64,
     cache_quantity: Quantity,
 ) -> PodSpec {
+    // cgroup handling: we do NOT hostPath-mount /sys/fs/cgroup.
+    // containerd cgroup-namespaces the container by default:
+    // /proc/self/cgroup shows 0::/ and /sys/fs/cgroup is the
+    // NAMESPACED view (container's cgroup appears as root).
+    // With privileged, that namespaced mount is RW (runc default).
+    //
+    // If we hostPath-mounted the HOST's /sys/fs/cgroup over it:
+    // /proc/self/cgroup STILL shows 0::/ (cgroupns is independent
+    // of mount ns), but /sys/fs/cgroup now shows the HOST root.
+    // The worker's ns-root-detection would mkdir+move into
+    // /sys/fs/cgroup/leaf/ on the HOST — clobbering host systemd.
+    //
+    // Instead: worker's delegated_root() detects the ns-root case
+    // and moves itself into a /leaf/ sub-cgroup WITHIN the
+    // namespaced view. Safe (writes stay in the container's
+    // cgroup subtree). privileged → rw → writes succeed.
+
     PodSpec {
         containers: vec![build_container(wp, scheduler_addr, cache_gb)],
         // hostNetwork from spec. None → K8s default (false).
         // Some(false) → explicit false (same effect). Some(true)
-        // → pod shares node netns. `or` not `unwrap_or`: we want
-        // the PodSpec field to be None (not Some(false)) when
-        // unset — less diff noise in `kubectl get -o yaml`.
+        // → pod shares node netns. `filter`: PodSpec field is
+        // None (not Some(false)) when unset — less diff noise
+        // in `kubectl get -o yaml`.
         host_network: wp.spec.host_network.filter(|&h| h),
 
         volumes: Some(vec![

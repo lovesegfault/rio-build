@@ -205,26 +205,101 @@ impl Drop for BuildCgroup {
 ///     memory.peak, cpu.stat       ← resource tracking
 /// ```
 ///
-/// In K8s pods: same shape. kubelet puts the container in a sub-cgroup
-/// of the pod cgroup; `/proc/self/cgroup` points to the container
-/// cgroup; the parent is the pod cgroup (empty, just a hierarchy
-/// node). Per-build cgroups become siblings of the container.
+/// In K8s pods WITHOUT cgroup namespacing: same shape as systemd.
+/// kubelet puts the container in a sub-cgroup of the pod cgroup;
+/// `/proc/self/cgroup` points to the container cgroup; parent is
+/// the pod cgroup (empty hierarchy node). Per-build cgroups
+/// become siblings of the container.
+///
+/// In K8s pods WITH cgroup namespacing (containerd default):
+/// `/proc/self/cgroup` shows `0::/` — the namespace root. We're
+/// PID 1 in the CGROUP NS root. There IS no parent from our
+/// perspective. Handling: replicate what `DelegateSubgroup=` does
+/// — move ourselves into a `/leaf/` sub-cgroup, leaving the ns
+/// root empty. Then the ns root IS the delegated root.
+///
+/// ```text
+/// (container's namespace view)
+/// /sys/fs/cgroup/              ← ns root, RETURNED as delegated_root
+///   cgroup.subtree_control     ← enable_subtree_controllers works (empty now)
+///   leaf/                      ← we created + moved ourselves here
+///     cgroup.procs             ← worker PID (was in ns root)
+///   <drv-hash>/                ← BuildCgroup::create per build
+/// ```
 ///
 /// Fails if:
 /// - `/proc/self/cgroup` is cgroup v1 format (multiple lines)
 /// - the parent path doesn't exist or isn't a cgroup
-/// - we're in the ROOT cgroup (no parent — unusual, means running
-///   outside systemd/containers)
+/// - we're at ns root AND moving ourselves fails (ro mount,
+///   no-delegation — shouldn't happen with privileged)
 ///
 /// All mean cgroup v2 isn't properly set up. Hard error — startup fails.
 pub fn delegated_root() -> io::Result<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup")?;
     let own = parse_own_cgroup(&content)?;
 
-    // Parent. If we're in the root cgroup (`/sys/fs/cgroup` itself),
-    // .parent() returns `/sys/fs` which is NOT a cgroup. Catch this
-    // explicitly — running outside any cgroup hierarchy is a config
-    // problem (no systemd, no container runtime).
+    // ---- cgroup namespace root: /proc/self/cgroup = "0::/" ----
+    // own == /sys/fs/cgroup exactly. Containerd (k3s, kind, EKS
+    // with cgroup-driver=systemd) namespaces cgroups — the
+    // container sees ONLY its own subtree, rooted at
+    // /sys/fs/cgroup. We're PID 1 IN that root. .parent() would
+    // be /sys/fs (not a cgroup).
+    //
+    // Replicate systemd DelegateSubgroup=: move ourselves into a
+    // leaf sub-cgroup. The ns root becomes empty → subtree
+    // controllers can be enabled → per-build cgroups become
+    // siblings of leaf/.
+    //
+    // `own == Path::new(CGROUP_ROOT)` — Path comparison handles
+    // trailing slashes correctly. Don't string-compare.
+    if own == Path::new(CGROUP_ROOT) {
+        let leaf = own.join("leaf");
+        // EEXIST: prior worker crashed after mkdir before
+        // move-procs. Treat as already-created (we're about to
+        // move ourselves into it anyway). Any other error —
+        // ro mount, no perms — bubbles.
+        if let Err(e) = fs::create_dir(&leaf)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(io::Error::other(format!(
+                "cannot create leaf cgroup {} in namespace root: {e} \
+                 (cgroup ns root not writable — is the pod privileged? \
+                 is /sys/fs/cgroup mounted rw?)",
+                leaf.display()
+            )));
+        }
+        // Move ALL processes from the ns root into leaf/. In
+        // practice "all" = us (PID 1 in container) + maybe a
+        // few kernel threads that containerd didn't move. Write
+        // each PID one at a time (cgroup.procs takes one PID
+        // per write, EINVAL on multiple).
+        //
+        // Writing our own PID is enough for the no-internal-
+        // processes rule (kernel threads don't count). But if
+        // there ARE user threads in the root for some reason
+        // (init shim?), moving them too is harmless.
+        let own_pid = std::process::id();
+        fs::write(leaf.join("cgroup.procs"), own_pid.to_string()).map_err(|e| {
+            io::Error::other(format!(
+                "cannot move self (pid {own_pid}) into leaf cgroup {}: {e}",
+                leaf.display()
+            ))
+        })?;
+
+        tracing::info!(
+            leaf = %leaf.display(),
+            "cgroup namespace root detected; moved self into leaf sub-cgroup"
+        );
+        // The ns root is now our delegated root. It's empty
+        // (we just moved out), so enable_subtree_controllers
+        // will succeed.
+        return Ok(own);
+    }
+
+    // ---- Non-namespaced: systemd or pod without cgroupns ----
+    // Parent. If we're in the fs root cgroup (`/sys/fs/cgroup`
+    // itself), handled above. If somehow .parent() is None (can't
+    // happen for /sys/fs/cgroup/..., but Path API is Option):
     let parent = own.parent().ok_or_else(|| {
         io::Error::other(
             "worker is in the root cgroup (no parent) — \
@@ -234,8 +309,10 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         )
     })?;
 
-    // The parent() of /sys/fs/cgroup is /sys/fs — catch that too.
-    // Check that parent has cgroup.controllers (proves it IS a cgroup).
+    // The parent() of /sys/fs/cgroup is /sys/fs — but the
+    // equality check above catches that case before here.
+    // This check is for "parent cgroup exists but isn't a
+    // cgroup" — weird hybrid hierarchies.
     if !parent.join("cgroup.controllers").exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
