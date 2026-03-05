@@ -21,6 +21,9 @@ path = "src/bin/crdgen.rs"
 [dependencies]
 rio-common = { workspace = true }
 rio-proto = { workspace = true }
+# Derivation::parse_from_nar for the Build CRD reconciler (F5).
+# Fetches .drv from rio-store → parse ATerm → DerivationNode.
+rio-nix = { workspace = true }
 
 # --- Kubernetes ---
 # kube 3.0 notes: chrono → jiff timestamps, schemars MUST be 1.x

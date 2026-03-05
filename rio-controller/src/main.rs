@@ -4,8 +4,9 @@
 //! driven reconcile) and the Autoscaler::run (30s poll loop).
 //! Merged via `futures::select` — either can make progress.
 //!
-//! Build reconciler (F5) is TODO — stub registered for now so
-//! the CRD is recognized but does nothing.
+//! Build reconciler runs as a second Controller::run, merged
+//! with the WorkerPool controller via futures::join. Both
+//! terminate on SIGTERM (shutdown_on_signal).
 
 use std::sync::Arc;
 
@@ -17,8 +18,9 @@ use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use rio_controller::crds::build::Build;
 use rio_controller::crds::workerpool::WorkerPool;
-use rio_controller::reconcilers::{Ctx, workerpool};
+use rio_controller::reconcilers::{Ctx, build, workerpool};
 use rio_controller::scaling::Autoscaler;
 
 // ----- config (figment two-struct) --------------------------------------------
@@ -29,6 +31,11 @@ struct Config {
     /// rio-scheduler gRPC address. AdminService + SchedulerService
     /// on the same port. Required — no sensible default.
     scheduler_addr: String,
+    /// rio-store gRPC address. Build reconciler fetches .drv
+    /// content from here. Required for Build CRDs; WorkerPool-
+    /// only deployments can leave it empty (Build reconciler
+    /// errors on first apply, operator sees it in logs).
+    store_addr: String,
     /// Prometheus metrics listen address.
     metrics_addr: std::net::SocketAddr,
     /// HTTP /healthz listen address. K8s livenessProbe hits this.
@@ -39,6 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scheduler_addr: String::new(),
+            store_addr: String::new(),
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
             metrics_addr: "0.0.0.0:9094".parse().unwrap(),
@@ -54,6 +62,10 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduler_addr: Option<String>,
+
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_addr: Option<String>,
 
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
+        store_addr: cfg.store_addr.clone(),
     });
 
     // ---- WorkerPool controller ----
@@ -139,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     let wp_controller = Controller::new(pools, watcher::Config::default())
         .owns(stses, watcher::Config::default())
         .shutdown_on_signal()
-        .run(workerpool::reconcile, workerpool::error_policy, ctx)
+        .run(workerpool::reconcile, workerpool::error_policy, ctx.clone())
         .for_each(|res| async move {
             match res {
                 Ok((obj, _action)) => {
@@ -159,14 +172,29 @@ async fn main() -> anyhow::Result<()> {
     // Separate task. spawn_monitored: if it panics, logged;
     // controller keeps reconciling (spec changes still apply),
     // just no autoscale. Better than the whole pod dying.
-    let autoscaler = Autoscaler::new(client, scheduler);
+    let autoscaler = Autoscaler::new(client.clone(), scheduler);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run());
 
-    // F5 adds: Build controller here, merged via stream::select
-    // with wp_controller. For now: just WorkerPool.
+    // ---- Build controller ----
+    // No `.owns()` — Builds don't own K8s children. The watch
+    // task patches status directly; no need for child-triggered
+    // re-reconcile.
+    let builds: Api<Build> = Api::all(client);
+    let build_controller = Controller::new(builds, watcher::Config::default())
+        .shutdown_on_signal()
+        .run(build::reconcile, build::error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok((obj, _)) => tracing::debug!(build = %obj.name, "reconciled"),
+                Err(e) => tracing::debug!(error = %e, "Build reconcile loop error"),
+            }
+        });
 
     info!("controller running");
-    wp_controller.await;
+    // Both controllers run until SIGTERM. `join!` not `select!`:
+    // both should drain in-flight reconciles on shutdown, not
+    // whichever finishes first kills the other.
+    futures_util::future::join(wp_controller, build_controller).await;
 
     info!("controller shutting down");
     Ok(())
