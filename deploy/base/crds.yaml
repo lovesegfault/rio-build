@@ -96,6 +96,24 @@ spec:
                   Why not u64 bytes directly: operators write "100Gi" in
                   kustomize; making them write 107374182400 is hostile.
                 type: string
+              hostNetwork:
+                description: |-
+                  Use the node's network namespace (`hostNetwork: true`).
+                  None/false = pod has its own netns (the default, CNI-
+                  assigned IP). true = pod shares the node's IP + DNS +
+                  /etc/hosts.
+
+                  When to set true: VM tests where scheduler/store run on
+                  a separate VM reachable by node hostname but not cluster
+                  DNS; or bare-metal where pod networking adds unwanted
+                  latency (worker → store is NAR-heavy).
+
+                  Caveat: hostNetwork pods can't use containerPort-based
+                  Services. The worker doesn't serve anything inbound
+                  (metrics/health are scraped from the node), so this
+                  doesn't break it.
+                nullable: true
+                type: boolean
               image:
                 description: |-
                   Container image ref. Required — there's no sensible
@@ -118,6 +136,19 @@ spec:
                   `rio.build/worker: "true"` to confine to tainted nodes.
                 nullable: true
                 type: object
+              privileged:
+                description: |-
+                  Run the worker container privileged. None/false = the
+                  default granular caps (SYS_ADMIN + SYS_CHROOT), which is
+                  sufficient on most clusters. true = full privileged,
+                  which disables seccomp and grants ALL caps.
+
+                  When to set true: k3s/kind often have containerd seccomp
+                  profiles that block mount(2) even with SYS_ADMIN.
+                  Production on EKS/GKE with proper runtime config should
+                  NOT need this.
+                nullable: true
+                type: boolean
               replicas:
                 description: |-
                   Replica bounds. Autoscaler clamps to [min, max].

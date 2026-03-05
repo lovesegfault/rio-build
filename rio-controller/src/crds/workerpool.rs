@@ -120,6 +120,35 @@ pub struct WorkerPoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<Vec<serde_json::Value>>")]
     pub tolerations: Option<Vec<Toleration>>,
+
+    /// Run the worker container privileged. None/false = the
+    /// default granular caps (SYS_ADMIN + SYS_CHROOT), which is
+    /// sufficient on most clusters. true = full privileged,
+    /// which disables seccomp and grants ALL caps.
+    ///
+    /// When to set true: k3s/kind often have containerd seccomp
+    /// profiles that block mount(2) even with SYS_ADMIN.
+    /// Production on EKS/GKE with proper runtime config should
+    /// NOT need this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privileged: Option<bool>,
+
+    /// Use the node's network namespace (`hostNetwork: true`).
+    /// None/false = pod has its own netns (the default, CNI-
+    /// assigned IP). true = pod shares the node's IP + DNS +
+    /// /etc/hosts.
+    ///
+    /// When to set true: VM tests where scheduler/store run on
+    /// a separate VM reachable by node hostname but not cluster
+    /// DNS; or bare-metal where pod networking adds unwanted
+    /// latency (worker → store is NAR-heavy).
+    ///
+    /// Caveat: hostNetwork pods can't use containerPort-based
+    /// Services. The worker doesn't serve anything inbound
+    /// (metrics/health are scraped from the node), so this
+    /// doesn't break it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_network: Option<bool>,
 }
 
 /// Replica bounds with cross-field CEL.

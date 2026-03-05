@@ -351,6 +351,21 @@
               vm-phase2a = withMinCpu 4 (import ./nix/tests/phase2a.nix vmTestArgs);
               vm-phase2b = withMinCpu 5 (import ./nix/tests/phase2b.nix vmTestArgs);
               vm-phase2c = withMinCpu 5 (import ./nix/tests/phase2c.nix vmTestArgs);
+              # vm-phase3a needs extended args: dockerImages (airgap
+              # preload into k3s) + crds (auto-deployed via
+              # services.k3s.manifests). Both are defined below in
+              # this same let-block's scope, so pass them through.
+              # 3 VMs but k8s is 8-core (k3s + worker pod) → higher
+              # MIN_CPU than the count would suggest.
+              vm-phase3a = withMinCpu 4 (
+                import ./nix/tests/phase3a.nix (
+                  vmTestArgs
+                  // {
+                    inherit dockerImages;
+                    inherit (inputs.self.packages.${system}) crds;
+                  }
+                )
+              );
             }
           );
 
