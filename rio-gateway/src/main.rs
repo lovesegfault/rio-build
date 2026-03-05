@@ -27,6 +27,15 @@ struct Config {
     host_key: std::path::PathBuf,
     authorized_keys: std::path::PathBuf,
     metrics_addr: std::net::SocketAddr,
+    /// gRPC health check listen address. The gateway's main protocol is
+    /// SSH (russh), not gRPC, so we can't piggyback health on an
+    /// existing tonic server. This spawns a dedicated one with ONLY
+    /// `grpc.health.v1.Health`. K8s readinessProbe hits this port.
+    ///
+    /// Separate from metrics_addr: metrics is HTTP (Prometheus scrape),
+    /// health is gRPC. Could multiplex with tonic's accept_http1 +
+    /// a route, but that's more complexity than a second listener.
+    health_addr: std::net::SocketAddr,
 }
 
 impl Default for Config {
@@ -43,6 +52,11 @@ impl Default for Config {
             host_key: std::path::PathBuf::new(),
             authorized_keys: std::path::PathBuf::new(),
             metrics_addr: "0.0.0.0:9090".parse().unwrap(),
+            // 9190 = gateway's metrics port (9090) + 100. Scheduler
+            // health piggybacks on its gRPC port (9001), store on 9002.
+            // Gateway has no gRPC port so needs its own. The +100
+            // pattern keeps it discoverable without a doc lookup.
+            health_addr: "0.0.0.0:9190".parse().unwrap(),
         }
     }
 }
@@ -82,6 +96,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_addr: Option<std::net::SocketAddr>,
+
+    /// gRPC health check listen address
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health_addr: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -123,6 +142,42 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %cfg.scheduler_addr, "connecting to scheduler service");
     let scheduler_client = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
 
+    // gRPC health server. Dedicated tonic instance — the gateway's main
+    // protocol is SSH (russh), no existing tonic server to attach to.
+    //
+    // SERVING gate: both gRPC connects above succeeded. That's the right
+    // signal — a gateway that can't reach the scheduler would accept SSH
+    // connections and then hang every wopBuild* opcode. Better to fail
+    // readiness so K8s doesn't route to this pod until it's actually
+    // usable. store/scheduler connect are `.await?` (fail-fast) so by
+    // the time we're here, both are up.
+    //
+    // spawn_monitored: the SSH server's `.run().await` below blocks
+    // forever. Health must run concurrently. If the health server dies
+    // (port conflict, etc), spawn_monitored logs it — K8s readiness
+    // probe starts failing, pod restarts. Self-healing.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    // Generic param: we don't have a "GatewayService" proto. Use the
+    // tonic-health server's own type as a stand-in — the empty-string
+    // "whole server" health check (which K8s sends) doesn't care about
+    // the service name, it just wants ANY service marked SERVING.
+    health_reporter
+        .set_serving::<tonic_health::pb::health_server::HealthServer<
+            tonic_health::server::HealthService,
+        >>()
+        .await;
+    let health_addr = cfg.health_addr;
+    rio_common::task::spawn_monitored("health-server", async move {
+        info!(addr = %health_addr, "starting gRPC health server");
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(health_service)
+            .serve(health_addr)
+            .await
+        {
+            tracing::error!(error = %e, "health server failed");
+        }
+    });
+
     // Load SSH keys
     let host_key = rio_gateway::load_or_generate_host_key(&cfg.host_key)?;
     let authorized_keys = rio_gateway::load_authorized_keys(&cfg.authorized_keys)?;
@@ -154,6 +209,7 @@ mod tests {
         let d = Config::default();
         assert_eq!(d.listen_addr.to_string(), "0.0.0.0:2222");
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9090");
+        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9190");
         // All four of these are deployment-specific: empty default + a
         // post-load ensure! in main(). Non-empty default here = silent
         // wrong-value at runtime instead of a clear startup error.

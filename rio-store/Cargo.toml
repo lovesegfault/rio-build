@@ -24,6 +24,9 @@ async-trait = { workspace = true }
 # gRPC
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+# grpc.health.v1.Health for K8s readiness probes. SERVING after PG
+# migrations complete — before that, every store RPC would fail.
+tonic-health = { workspace = true }
 
 # Database
 sqlx = { workspace = true }
