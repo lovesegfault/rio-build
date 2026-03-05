@@ -212,6 +212,19 @@ impl DagActor {
             state.assigned_worker = Some(worker_id.clone());
         }
 
+        // Single atomic load. The lease task (C2) may fetch_add the
+        // generation between the DB insert and the WorkAssignment send
+        // below (there's an await in between). Without this snapshot,
+        // dispatch.rs:229 and :258 would read DIFFERENT generations —
+        // the PG row says "assigned under gen N" but the worker
+        // receives "gen N+1." The worker then rejects its own
+        // assignment as stale. Loading once and reusing closes the tear.
+        //
+        // Acquire pairs with the lease task's Release fetch_add. Sees
+        // the generation AND any writes the lease task did before it
+        // (is_leader=true, which dispatch_ready checked at loop top).
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+
         // Update DB (non-terminal: log failure, don't block dispatch)
         if let Err(e) = self
             .db
@@ -221,12 +234,15 @@ impl DagActor {
             error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e, "failed to persist Assigned status");
         }
 
-        // Create assignment in DB
+        // Create assignment in DB. PG BIGINT is signed; cast at THIS
+        // boundary, not at the proto-encode sites below. One cast
+        // instead of two, and the proto sites are hotter (this PG
+        // write is best-effort anyway — log+continue on error).
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(db_id) = state.db_id
             && let Err(e) = self
                 .db
-                .insert_assignment(db_id, worker_id, self.generation)
+                .insert_assignment(db_id, worker_id, generation as i64)
                 .await
         {
             error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e, "failed to insert assignment record");
@@ -254,8 +270,8 @@ impl DagActor {
                 // WorkAssignment — prefetch is a hint, not a contract.
                 output_names: state.output_names.clone(),
                 build_options: Some(self.build_options_for_derivation(drv_hash)),
-                assignment_token: format!("{}-{}-{}", worker_id, drv_hash, self.generation),
-                generation: self.generation as u64,
+                assignment_token: format!("{worker_id}-{drv_hash}-{generation}"),
+                generation,
                 is_fixed_output: state.is_fixed_output,
             };
 

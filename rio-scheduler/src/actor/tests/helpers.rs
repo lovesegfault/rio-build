@@ -31,9 +31,17 @@ pub(crate) fn setup_actor_with_store(
     let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
     let actor = DagActor::new(db, store_client);
     let backpressure = actor.backpressure_flag();
+    let generation = actor.generation_reader();
     let self_tx = tx.downgrade();
     let task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-    (ActorHandle { tx, backpressure }, task)
+    (
+        ActorHandle {
+            tx,
+            backpressure,
+            generation,
+        },
+        task,
+    )
 }
 
 /// Bootstrap an ephemeral PG + actor. The returned `TestDb` MUST be held

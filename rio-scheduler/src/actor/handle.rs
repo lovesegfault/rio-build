@@ -36,6 +36,10 @@ pub struct ActorHandle {
     /// send() and is_backpressured(). Without hysteresis, the handle used a
     /// simple threshold -> flapping under load near 80%.
     pub(super) backpressure: BackpressureReader,
+    /// Leader generation for `HeartbeatResponse`. Lease task writes,
+    /// gRPC layer reads via `leader_generation()`. See
+    /// [`GenerationReader`] for ordering semantics.
+    pub(super) generation: GenerationReader,
 }
 
 impl ActorHandle {
@@ -54,9 +58,14 @@ impl ActorHandle {
             actor = actor.with_log_flusher(flush_tx);
         }
         let backpressure = actor.backpressure_flag();
+        let generation = actor.generation_reader();
         let self_tx = tx.downgrade();
         rio_common::task::spawn_monitored("dag-actor", actor.run_with_self_tx(rx, self_tx));
-        Self { tx, backpressure }
+        Self {
+            tx,
+            backpressure,
+            generation,
+        }
     }
     /// Whether the actor task is still alive. Returns false if the actor
     /// panicked or exited (its receiver dropped, closing the channel).
@@ -90,6 +99,16 @@ impl ActorHandle {
     /// Check if the actor is under backpressure (hysteresis-aware).
     pub fn is_backpressured(&self) -> bool {
         self.backpressure.is_active()
+    }
+
+    /// Current leader generation for `HeartbeatResponse.generation`.
+    ///
+    /// Workers compare this against `WorkAssignment.generation` to
+    /// detect stale assignments after leader failover. Both reads come
+    /// from the same `Arc<AtomicU64>` (actor for WorkAssignment, handle
+    /// for heartbeat) so they agree modulo the atomic-load instant.
+    pub fn leader_generation(&self) -> u64 {
+        self.generation.get()
     }
 
     /// Send a command without backpressure check (for worker lifecycle events).
