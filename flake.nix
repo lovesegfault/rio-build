@@ -332,13 +332,25 @@
                 inherit pkgs rio-workspace;
                 rioModules = inputs.self.nixosModules;
               };
+              # Request a minimum CPU allocation from nixbuild.net. Each
+              # VM has `virtualisation.cores = 4` in common.nix; without
+              # this, nixbuild.net's heuristic allocation can under-provision
+              # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
+              # physical, 2 VMs fell back to TCG, worker1's kernel boot
+              # starved at PCI enumeration → Shell disconnected flake).
+              # numVMs × 4 (cores per VM) + 1 for the test driver itself.
+              withMinCpu =
+                numVMs: test:
+                test.overrideTestDerivation {
+                  NIXBUILDNET_MIN_CPU = toString (numVMs * 4 + 1);
+                };
             in
             {
-              vm-phase1a = import ./nix/tests/phase1a.nix vmTestArgs;
-              vm-phase1b = import ./nix/tests/phase1b.nix vmTestArgs;
-              vm-phase2a = import ./nix/tests/phase2a.nix vmTestArgs;
-              vm-phase2b = import ./nix/tests/phase2b.nix vmTestArgs;
-              vm-phase2c = import ./nix/tests/phase2c.nix vmTestArgs;
+              vm-phase1a = withMinCpu 2 (import ./nix/tests/phase1a.nix vmTestArgs);
+              vm-phase1b = withMinCpu 3 (import ./nix/tests/phase1b.nix vmTestArgs);
+              vm-phase2a = withMinCpu 4 (import ./nix/tests/phase2a.nix vmTestArgs);
+              vm-phase2b = withMinCpu 5 (import ./nix/tests/phase2b.nix vmTestArgs);
+              vm-phase2c = withMinCpu 5 (import ./nix/tests/phase2c.nix vmTestArgs);
             }
           );
 
