@@ -14,15 +14,15 @@ pub mod cache;
 pub mod lookup;
 pub mod read;
 
-mod fetch;
+pub mod fetch;
 mod inode;
 mod ops;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 
 use fuser::{BackingId, Config, INodeNo, MountOption, SessionACL};
 use tokio::runtime::Handle;
@@ -52,7 +52,16 @@ pub struct NixStoreFs {
     /// Passthrough failure count.
     passthrough_failures: AtomicU64,
     /// LRU cache on local SSD.
-    cache: Cache,
+    ///
+    /// `Arc` so main.rs can clone a handle BEFORE moving into
+    /// `mount_fuse_background` (same pattern as `bloom_handle()`).
+    /// The clone goes to the PrefetchHint handler (B2). All Cache
+    /// methods use `runtime.block_on` internally — they're SYNC,
+    /// designed for FUSE callbacks (dedicated blocking threads).
+    /// The prefetch handler calls them via `spawn_blocking` to
+    /// avoid nested-runtime panic. Auto-deref through Arc means
+    /// `self.cache.foo()` call sites are unchanged.
+    cache: Arc<Cache>,
     /// gRPC client for remote store.
     store_client: StoreServiceClient<Channel>,
     /// Tokio runtime handle for async-in-sync bridging.
@@ -73,7 +82,7 @@ impl NixStoreFs {
     /// tests never actually mounted) until the VM milestone test called
     /// `overlay::setup_overlay`, which stats the FUSE mount as the overlay lower.
     pub fn new(
-        cache: Cache,
+        cache: Arc<Cache>,
         store_client: StoreServiceClient<Channel>,
         runtime: Handle,
         passthrough: bool,
@@ -190,7 +199,7 @@ fn make_fuse_config(n_threads: u32) -> Config {
 /// Returns the `BackgroundSession` handle. Dropping it unmounts the filesystem.
 pub fn mount_fuse_background(
     mount_point: &Path,
-    cache: Cache,
+    cache: Arc<Cache>,
     store_client: StoreServiceClient<Channel>,
     runtime: Handle,
     passthrough: bool,
