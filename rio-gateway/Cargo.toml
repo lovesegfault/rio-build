@@ -19,6 +19,11 @@ rio-proto = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
+# grpc.health.v1.Health for K8s readiness probes. Gateway's main
+# protocol is SSH (russh, no tonic server), so we spawn a separate
+# tonic server on health_addr with ONLY the health service. The K8s
+# readinessProbe hits that port, not 22.
+tonic-health = { workspace = true }
 russh = { workspace = true }
 ssh-key = { workspace = true }
 hex = { workspace = true }

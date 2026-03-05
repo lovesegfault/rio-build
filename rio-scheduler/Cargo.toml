@@ -19,6 +19,9 @@ rio-proto = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+# grpc.health.v1.Health for K8s readiness probes. C3 gates SERVING on
+# is_leader so the K8s Service routes only to the leader replica.
+tonic-health = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }

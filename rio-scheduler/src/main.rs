@@ -218,6 +218,21 @@ async fn main() -> anyhow::Result<()> {
     let actor = ActorHandle::spawn(db, store_client, log_flush_tx, cfg.size_classes);
     info!("DAG actor spawned");
 
+    // grpc.health.v1.Health. SERVING once the actor is up — that's the
+    // one thing every scheduler RPC depends on. PG was checked above
+    // (migrations would have bailed); store connect is soft-fail
+    // (warn+None, actor skips cache checks) so we don't gate on it.
+    //
+    // C3 replaces this one-shot set_serving with a background task that
+    // toggles SERVING/NOT_SERVING based on is_leader — standby replicas
+    // stay NOT_SERVING so the K8s Service routes only to the leader.
+    // For now (no lease task): SERVING unconditionally. VM tests and
+    // single-instance deployments unaffected.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+        .await;
+
     // Create gRPC services. All three get the SAME Arc<LogBuffers>:
     // SchedulerGrpc writes, AdminService reads (live), LogFlusher drains
     // (on completion). The test-only new_for_tests() constructor makes a
@@ -258,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     tonic::transport::Server::builder()
+        .add_service(health_service)
         .add_service(
             SchedulerServiceServer::new(grpc_service.clone())
                 .max_decoding_message_size(max_message_size)
@@ -303,5 +319,196 @@ mod tests {
     fn cli_args_parse_help() {
         use clap::CommandFactory;
         CliArgs::command().debug_assert();
+    }
+
+    // -----------------------------------------------------------------------
+    // D2: gRPC health service wiring smoke tests.
+    //
+    // These validate the tonic-health integration pattern used by all
+    // three binaries (scheduler/store/gateway). They live HERE (not in
+    // each crate) because the pattern is identical and testing it once
+    // proves the wiring — the per-crate variation is just WHEN
+    // set_serving is called (post-migrations vs post-connect), which
+    // main() sequences and the VM tests cover e2e.
+    // -----------------------------------------------------------------------
+
+    /// Spin up a tonic server with ONLY the health service on an
+    /// ephemeral port, return the address + reporter handle.
+    ///
+    /// The server task is detached — fine for tests; the process exits
+    /// when the test fn returns. No graceful shutdown needed (no
+    /// resources to clean up; the listener's socket closes on drop).
+    async fn spawn_health_server() -> (std::net::SocketAddr, tonic_health::server::HealthReporter) {
+        let (reporter, service) = tonic_health::server::health_reporter();
+        // Port 0 → kernel assigns. Read back the bound addr before
+        // spawning — serve() consumes the listener so we can't ask later.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (addr, reporter)
+    }
+
+    /// Fresh health_reporter() → NOT_SERVING until set_serving is called.
+    /// K8s readiness probe failing during boot is correct: the Service
+    /// shouldn't route to a half-initialized pod.
+    ///
+    /// tonic-health's DEFAULT behavior for a service that was never
+    /// registered is "Unknown" (gRPC NotFound). The empty-string "" check
+    /// (whole server) defaults to SERVING unless explicitly set otherwise.
+    /// So we check a NAMED service that hasn't been set — that's the
+    /// realistic boot race: K8s probes before main() reaches set_serving.
+    #[tokio::test]
+    async fn health_not_serving_before_set() -> anyhow::Result<()> {
+        use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
+
+        let (addr, _reporter) = spawn_health_server().await;
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(channel);
+
+        // Named service, never registered → NotFound (which K8s treats
+        // as a probe failure, same as NOT_SERVING for readiness purposes).
+        let result = client
+            .check(HealthCheckRequest {
+                service: "rio.scheduler.SchedulerService".into(),
+            })
+            .await;
+        let status = result.expect_err("unregistered service should be NotFound");
+        assert_eq!(
+            status.code(),
+            tonic::Code::NotFound,
+            "probe failure before boot completes — K8s won't route to this pod"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_serving_after_set() -> anyhow::Result<()> {
+        use tonic_health::pb::{
+            HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+        };
+
+        let (addr, reporter) = spawn_health_server().await;
+
+        // The same call main() makes. Type param = the service impl.
+        reporter
+            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+            .await;
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(channel);
+
+        // tonic-health derives the name from S::NAME (NamedService trait,
+        // tonic-generated from proto `package rio.scheduler; service
+        // SchedulerService`). The test originally guessed ".v1" — there
+        // isn't one. This assertion CATCHES proto-package drift: if
+        // someone adds versioning to scheduler.proto, this fails and
+        // whoever did it updates the K8s probe config to match.
+        let resp = client
+            .check(HealthCheckRequest {
+                service: "rio.scheduler.SchedulerService".into(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            ServingStatus::try_from(resp.status)?,
+            ServingStatus::Serving,
+            "set_serving → SERVING → K8s routes to this pod"
+        );
+
+        // The empty-string "whole server" check — K8s probes send this
+        // when no service name is configured (the common case; per-
+        // service granularity is rarely needed). tonic-health registers
+        // under BOTH the named service AND "" on any set_serving call.
+        let resp_empty = client
+            .check(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            ServingStatus::try_from(resp_empty.status)?,
+            ServingStatus::Serving,
+            "empty-string check also SERVING after any set_serving"
+        );
+        Ok(())
+    }
+
+    /// set_not_serving flips back. C3 uses this to gate on is_leader:
+    /// standby replicas stay NOT_SERVING so the K8s Service routes only
+    /// to the leader.
+    #[tokio::test]
+    async fn health_toggle_not_serving() -> anyhow::Result<()> {
+        use tonic_health::pb::{
+            HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+        };
+
+        let (addr, reporter) = spawn_health_server().await;
+        reporter
+            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+            .await;
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(channel);
+
+        // SERVING → NOT_SERVING → SERVING. The C3 leader-toggle pattern.
+        //
+        // IMPORTANT for C3 + G1: `set_not_serving::<S>()` only flips the
+        // NAMED service, NOT the empty-string "" check. The first
+        // `set_serving` registers "" as SERVING and nothing toggles it
+        // back. So the K8s readinessProbe MUST be configured with
+        // `grpc.service: rio.scheduler.SchedulerService` explicitly.
+        // The kustomize manifest in G1 needs this. Without it, a standby
+        // scheduler would pass readiness on the "" check and K8s would
+        // route to a non-leader.
+        //
+        // async fn not closure: a closure borrowing `&mut client` +
+        // returning an async block that uses the borrow doesn't have a
+        // stable-Rust spelling (the borrow's lifetime can't outlive the
+        // closure call but the async block escapes). `async fn` dodges
+        // this entirely.
+        async fn check(
+            client: &mut HealthClient<tonic::transport::Channel>,
+        ) -> Result<ServingStatus, tonic::Status> {
+            client
+                .check(HealthCheckRequest {
+                    // NAMED service, not "" — set_not_serving only
+                    // affects this. See above for why this matters.
+                    service: "rio.scheduler.SchedulerService".into(),
+                })
+                .await
+                .map(|r| ServingStatus::try_from(r.into_inner().status).unwrap())
+        }
+
+        assert_eq!(check(&mut client).await?, ServingStatus::Serving);
+
+        reporter
+            .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+            .await;
+        assert_eq!(
+            check(&mut client).await?,
+            ServingStatus::NotServing,
+            "set_not_serving → K8s stops routing (standby scheduler)"
+        );
+
+        reporter
+            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+            .await;
+        assert_eq!(
+            check(&mut client).await?,
+            ServingStatus::Serving,
+            "re-acquired leadership → resume traffic"
+        );
+        Ok(())
     }
 }
