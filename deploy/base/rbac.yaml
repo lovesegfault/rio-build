@@ -1,0 +1,102 @@
+# RBAC for rio-controller + rio-scheduler.
+#
+# Controller: ClusterRole (watches CRDs + StatefulSets cluster-
+# wide). Scheduler: namespaced Role for Leases only (leader
+# election — kube-leader-election creates/updates one Lease).
+#
+# Principle of least privilege: the scheduler doesn't need
+# ClusterRole (it touches ONE Lease in ONE namespace), so a
+# namespaced Role + RoleBinding suffices. The controller needs
+# cluster-wide (CRDs can live in any namespace).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rio-controller
+rules:
+  # CRDs: full lifecycle. `update` needed for finalizer add/remove
+  # (finalizer() patches metadata.finalizers).
+  - apiGroups: ["rio.build"]
+    resources: ["workerpools", "builds"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Status subresource: separate permission (K8s treats /status
+  # as a distinct resource). Patch only — we never GET /status
+  # separately (it's in the main GET).
+  - apiGroups: ["rio.build"]
+    resources: ["workerpools/status", "builds/status"]
+    verbs: ["get", "patch"]
+  # StatefulSets: owned children. `delete` for cleanup; `create`
+  # via server-side apply (PATCH with a full object creates it
+  # if missing, but some clusters still check `create` perm).
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Pods: list only (cleanup enumerates pods by label to
+  # DrainWorker each). No mutation — pod lifecycle is the
+  # StatefulSet controller's job, not ours.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Services: the headless service per WorkerPool. Created by
+  # apply(), deleted by ownerRef GC.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Events: `kubectl describe workerpool` shows our events.
+  # create/patch for event aggregation (K8s dedups by key).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rio-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rio-controller
+subjects:
+  - kind: ServiceAccount
+    name: rio-controller
+    # kustomize overlays set the real namespace. Base uses a
+    # placeholder that overlays patch via `namespace:` directive.
+    namespace: rio-system
+---
+# Scheduler service account + Lease permissions. Separate from
+# controller — different pod, different trust boundary (the
+# scheduler runs builds, the controller manages infra).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-scheduler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rio-scheduler-lease
+rules:
+  # kube-leader-election: GET the Lease to check holder, CREATE
+  # if missing (first startup), UPDATE to renew/acquire. No
+  # `delete` — leases expire via TTL, never deleted.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rio-scheduler-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rio-scheduler-lease
+subjects:
+  - kind: ServiceAccount
+    name: rio-scheduler
+    namespace: rio-system

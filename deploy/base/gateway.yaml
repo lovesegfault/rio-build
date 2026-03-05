@@ -1,0 +1,100 @@
+# rio-gateway: SSH server speaking the Nix worker protocol.
+#
+# `nix copy --to ssh-ng://` and `nix build --store ssh-ng://`
+# hit this. Translates worker-protocol opcodes into scheduler
+# SubmitBuild + store PutPath calls.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-gateway
+  labels:
+    app.kubernetes.io/name: rio-gateway
+    app.kubernetes.io/component: gateway
+spec:
+  # 2 replicas: stateless (session state is in-memory per-
+  # connection, no shared state). The LB distributes SSH
+  # connections round-robin. A dying gateway kills its sessions
+  # (nix client retries).
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rio-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rio-gateway
+        app.kubernetes.io/component: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: rio-gateway:latest
+          ports:
+            - name: ssh
+              containerPort: 2222
+            - name: metrics
+              containerPort: 9090
+            # health_addr: tonic-health on a separate port
+            # (gateway uses russh for SSH, not tonic).
+            - name: health
+              containerPort: 9190
+          env:
+            - name: RIO_LISTEN_ADDR
+              value: "0.0.0.0:2222"
+            - name: RIO_SCHEDULER_ADDR
+              value: "rio-scheduler:9001"
+            - name: RIO_STORE_ADDR
+              value: "rio-store:9002"
+            # SSH host key: overlays mount a Secret. Without it
+            # the gateway generates an ephemeral key on startup
+            # (fine for dev, breaks known_hosts on restart).
+          readinessProbe:
+            # Gateway's tonic-health server (added in D2) —
+            # reports SERVING after connect_scheduler succeeds.
+            grpc:
+              port: 9190
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            # SSH port listening = process alive.
+            tcpSocket:
+              port: 2222
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              # Gateway buffers NAR uploads in-memory (streaming
+              # via tee — ~1MB per concurrent upload since
+              # phase2b's dump_path_streaming). 256Mi handles
+              # dozens of concurrent uploads.
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-gateway
+  labels:
+    app.kubernetes.io/name: rio-gateway
+  annotations:
+    # NLB not ALB: SSH is TCP, ALB is HTTP-only. NLB preserves
+    # source IP (useful for per-client rate limiting later).
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    # SSH sessions are long-lived (nix build can run hours).
+    # Default NLB idle timeout is 350s — too short. 3600s = 1h;
+    # builds longer than that re-send STDERR_NEXT keepalives
+    # anyway (nix-daemon does this).
+    service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout: "3600"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: rio-gateway
+  ports:
+    - name: ssh
+      # External port 22 (standard SSH) → container 2222.
+      # Running on 2222 inside means no CAP_NET_BIND_SERVICE
+      # (ports < 1024 need it). The Service remap is free.
+      port: 22
+      targetPort: ssh

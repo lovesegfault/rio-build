@@ -1,0 +1,84 @@
+# rio-store: content-addressed NAR store + PG metadata.
+#
+# Single replica — the store is stateless (PG + S3/filesystem
+# hold everything), but concurrent migrations from multiple
+# replicas would race. Scale horizontally later if PutPath
+# throughput becomes a bottleneck; needs a migration-lock
+# mechanism first.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-store
+  labels:
+    app.kubernetes.io/name: rio-store
+    app.kubernetes.io/component: store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rio-store
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rio-store
+        app.kubernetes.io/component: store
+    spec:
+      containers:
+        - name: store
+          image: rio-store:latest
+          ports:
+            - name: grpc
+              containerPort: 9002
+            - name: metrics
+              containerPort: 9092
+          env:
+            - name: RIO_LISTEN_ADDR
+              value: "0.0.0.0:9002"
+            - name: RIO_PG_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rio-postgres
+                  key: url
+            # Chunk backend: overlays set the kind + params.
+            # Base uses inline (bytes in PG) — works out of
+            # the box but doesn't scale. Prod overlays S3.
+          # No leader election → readiness = "PG connected +
+          # migrations done." tonic-health set_serving() runs
+          # AFTER migrations in main.rs.
+          readinessProbe:
+            grpc:
+              port: 9002
+              service: rio.store.StoreService
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 9002
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              # NAR uploads buffer up to one chunk (4MB) per
+              # concurrent stream. 10 concurrent × 4MB = 40MB
+              # working set, plus the ChunkCache (default 2GB).
+              # 4Gi limit gives headroom; prod overlays tune.
+              memory: "4Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-store
+  labels:
+    app.kubernetes.io/name: rio-store
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rio-store
+  ports:
+    - name: grpc
+      port: 9002
+      targetPort: grpc
