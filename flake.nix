@@ -566,12 +566,33 @@
             docker-scheduler = dockerImages.scheduler;
             docker-store = dockerImages.store;
             docker-worker = dockerImages.worker;
+            docker-controller = dockerImages.controller;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList (name: drv: {
                 name = "${name}.tar.gz";
                 path = drv;
               }) dockerImages
             );
+
+            # CRD YAML for kustomize. runCommand invokes the crdgen
+            # binary (serde_yaml write-only) and dumps two YAML
+            # documents (WorkerPool + Build) to $out. Kustomize
+            # references this via `nix build .#crds` → result is a
+            # file, copy to deploy/base/crds.yaml and commit.
+            #
+            # NOT a derivation that the kustomize base depends on
+            # directly (kustomize needs real files, not /nix/store
+            # paths). It's a convenience for regeneration:
+            #   nix build .#crds && cp result deploy/base/crds.yaml
+            #
+            # Why not auto-regenerate in CI: the committed YAML is
+            # what operators `kubectl apply`. Regenerating on every
+            # commit means a CRD schema change silently updates the
+            # deployed file — we want that change REVIEWED (it may
+            # be backward-incompatible).
+            crds = pkgs.runCommand "rio-crds.yaml" { } ''
+              ${rio-workspace}/bin/crdgen > $out
+            '';
           }
           // {
 
