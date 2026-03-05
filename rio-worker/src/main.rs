@@ -377,63 +377,233 @@ async fn main() -> anyhow::Result<()> {
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
     };
 
-    // Process incoming scheduler messages
+    // Process incoming scheduler messages + SIGTERM for graceful drain.
+    //
+    // select! is biased toward sigterm: poll it FIRST each iteration.
+    // Without `biased;`, select! picks a ready branch pseudorandomly —
+    // under heavy assignment traffic, SIGTERM could starve behind
+    // stream messages. K8s sends SIGTERM then starts the grace period
+    // clock; we want to react immediately, not after the next gap in
+    // assignments.
+    //
+    // The loop body is identical to the old while-let; SIGTERM just
+    // breaks out so the drain sequence below runs.
     let mut build_stream = build_stream;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    while let Some(msg_result) = tokio_stream::StreamExt::next(&mut build_stream).await {
+    let drain_reason = loop {
         // A worker without a live heartbeat is a liability (scheduler will
         // time it out and re-dispatch its builds). Die fast rather than
-        // silently duplicate work.
+        // silently duplicate work. Check BEFORE awaiting select — if
+        // heartbeat died mid-iteration, don't process another message.
         if heartbeat_handle.is_finished() {
             tracing::error!("heartbeat loop terminated unexpectedly; exiting");
             std::process::exit(1);
         }
 
-        let msg = match msg_result {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(error = %e, "build execution stream error");
-                break;
+        tokio::select! {
+            biased;
+
+            _ = sigterm.recv() => {
+                break DrainReason::Sigterm;
             }
-        };
 
-        match msg.msg {
-            Some(scheduler_message::Msg::Assignment(assignment)) => {
-                info!(drv_path = %assignment.drv_path, "received work assignment");
-
-                // Acquire permit BEFORE ACKing: don't tell the scheduler we
-                // accepted work we can't immediately start.
-                let permit = match build_semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
+            msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
+                let Some(msg_result) = msg_result else {
+                    // Stream closed by server (scheduler shutdown/restart).
+                    // Not a SIGTERM drain — just exit. The scheduler
+                    // will reassign via WorkerDisconnected.
+                    break DrainReason::StreamClosed;
+                };
+                let msg = match msg_result {
+                    Ok(m) => m,
                     Err(e) => {
-                        tracing::error!(error = %e, "semaphore closed");
-                        break;
+                        tracing::error!(error = %e, "build execution stream error");
+                        break DrainReason::StreamError;
                     }
                 };
 
-                spawn_build_task(assignment, permit, &build_ctx).await;
+                match msg.msg {
+                    Some(scheduler_message::Msg::Assignment(assignment)) => {
+                        info!(drv_path = %assignment.drv_path, "received work assignment");
+
+                        // Acquire permit BEFORE ACKing: don't tell the
+                        // scheduler we accepted work we can't immediately
+                        // start. On Err(Closed): semaphore.close() was
+                        // called — impossible here (close happens in the
+                        // drain path below, AFTER loop exit), so this is
+                        // a bug. Break with a distinct reason.
+                        let permit = match build_semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::error!("semaphore closed mid-loop (bug)");
+                                break DrainReason::StreamError;
+                            }
+                        };
+
+                        spawn_build_task(assignment, permit, &build_ctx).await;
+                    }
+                    Some(scheduler_message::Msg::Cancel(cancel)) => {
+                        tracing::warn!(
+                            drv_path = %cancel.drv_path,
+                            reason = %cancel.reason,
+                            "received cancel signal (cancel not yet implemented)"
+                        );
+                    }
+                    Some(scheduler_message::Msg::Prefetch(prefetch)) => {
+                        tracing::debug!(
+                            paths = prefetch.store_paths.len(),
+                            "received prefetch hint (prefetch not yet implemented)"
+                        );
+                    }
+                    None => {
+                        tracing::warn!("received empty scheduler message");
+                    }
+                }
             }
-            Some(scheduler_message::Msg::Cancel(cancel)) => {
-                tracing::warn!(
-                    drv_path = %cancel.drv_path,
-                    reason = %cancel.reason,
-                    "received cancel signal (cancel not yet implemented)"
-                );
+        }
+    };
+
+    // ---- Drain sequence -------------------------------------------------
+    //
+    // K8s preStop (controller.md:211-216):
+    //   1. DrainWorker: scheduler stops sending assignments
+    //   2. Wait for in-flight builds
+    //   3. (Outputs already uploaded by each build task — no step here)
+    //   4. Exit 0
+    //
+    // terminationGracePeriodSeconds=7200 (2h). If we exceed that,
+    // SIGKILL — builds lost. 2h is enough for ~any single build; the
+    // ones that take longer (LLVM+ccache-cold) are rare.
+    //
+    // Only DrainReason::Sigterm does the full sequence. Stream close/
+    // error means the scheduler is gone — DrainWorker would fail, and
+    // WorkerDisconnected already reassigned our builds. Just exit.
+    match drain_reason {
+        DrainReason::Sigterm => {
+            info!(
+                in_flight = cfg.max_builds as usize - build_semaphore.available_permits(),
+                "SIGTERM received, draining"
+            );
+
+            // Step 1: DrainWorker. Best-effort — if it fails (scheduler
+            // unreachable, actor dead), log and continue. The scheduler
+            // will eventually time us out via heartbeat (we're still
+            // heartbeating until exit) and WorkerDisconnected will
+            // reassign. We lose nothing by trying.
+            //
+            // Fresh admin client: could clone the scheduler_client's
+            // channel, but that's internal to WorkerServiceClient.
+            // Simpler to just connect — the address is in cfg, and
+            // connect is cheap (happy path: one TCP handshake, ~1ms
+            // on localhost, ~RTT over network). This is a one-shot
+            // call at shutdown, not a hot path.
+            match rio_proto::client::connect_admin(&cfg.scheduler_addr).await {
+                Ok(mut admin) => {
+                    match admin
+                        .drain_worker(rio_proto::types::DrainWorkerRequest {
+                            worker_id: build_ctx.worker_id.clone(),
+                            force: false,
+                        })
+                        .await
+                    {
+                        Ok(resp) => {
+                            let r = resp.into_inner();
+                            info!(
+                                accepted = r.accepted,
+                                running = r.running_builds,
+                                "drain acknowledged by scheduler"
+                            );
+                            // accepted=false means the scheduler already
+                            // removed us (WorkerDisconnected raced). Fine —
+                            // our builds are reassigned, but our local
+                            // nix-daemons are still running. We still
+                            // wait for them below (they'll complete,
+                            // upload outputs, and CompletionReport will
+                            // be dropped by the scheduler as "unknown
+                            // drv" — wasted but correct).
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DrainWorker RPC failed; continuing drain");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "admin connect failed; continuing drain without DrainWorker");
+                }
             }
-            Some(scheduler_message::Msg::Prefetch(prefetch)) => {
-                tracing::debug!(
-                    paths = prefetch.store_paths.len(),
-                    "received prefetch hint (prefetch not yet implemented)"
-                );
+
+            // Step 2: wait for in-flight. close() makes future
+            // acquire_owned() return Err(Closed) — if the scheduler
+            // DOES send more assignments (DrainWorker raced), the
+            // Assignment arm's acquire fails and... well, we already
+            // broke out of the loop, so the stream is undriven.
+            // Messages queue in the gRPC buffer and are dropped on
+            // drop(build_stream) below. The scheduler sees stream
+            // close → WorkerDisconnected → reassigns those. Correct.
+            //
+            // acquire_many(max_builds) succeeds when ALL permits are
+            // returned — every build task dropped its OwnedPermit on
+            // completion. This is the synchronization point: when this
+            // returns, no build is mid-upload.
+            //
+            // close() BEFORE acquire_many: close doesn't affect already-
+            // issued permits (they return on drop as usual), it just
+            // rejects new acquires. With the loop broken, no new
+            // acquires happen anyway — close() is belt-and-suspenders.
+            // close() BEFORE the wait has a subtle interaction (see
+            // drain_wait_semaphore_synchronization test): a CLOSED
+            // semaphore returns Err to waiters even when permits DO
+            // return. So if any build is still running when we hit
+            // acquire_many, we get Err — but the builds still complete
+            // (their OwnedPermit Drop works fine; close doesn't affect
+            // that). We just can't OBSERVE completion via acquire.
+            //
+            // Fix: DON'T close() before waiting. close() was meant to
+            // reject new acquires, but we already broke out of the
+            // loop — no new acquires can happen. Skip close() entirely
+            // and acquire_many works as the synchronization primitive
+            // it's meant to be.
+            match build_semaphore.acquire_many(cfg.max_builds).await {
+                Ok(_all_permits) => {
+                    info!("all in-flight builds complete");
+                }
+                Err(_) => {
+                    // Err on a non-closed semaphore is impossible
+                    // (acquire only errs on close). If we hit this,
+                    // someone else closed it — a bug. Exit anyway:
+                    // hanging here is worse than abandoning a build
+                    // that may-or-may-not be stuck.
+                    tracing::error!("semaphore closed unexpectedly (bug); exiting anyway");
+                }
             }
-            None => {
-                tracing::warn!("received empty scheduler message");
-            }
+
+            // _fuse_session Drop handles unmount. build_stream Drop
+            // closes the gRPC stream → scheduler WorkerDisconnected
+            // → removes our entry (if DrainWorker didn't already).
+            info!("drain complete, exiting");
+        }
+        DrainReason::StreamClosed => {
+            info!("build execution stream closed, shutting down");
+        }
+        DrainReason::StreamError => {
+            info!("build execution stream error, shutting down");
         }
     }
 
-    info!("build execution stream closed, shutting down");
     Ok(())
+}
+
+/// Why the event loop exited. Determines whether to run the full
+/// drain sequence (SIGTERM) or just exit (scheduler gone).
+enum DrainReason {
+    /// K8s preStop → full drain: DrainWorker + wait for in-flight.
+    Sigterm,
+    /// Server closed stream (scheduler restart). Scheduler-side
+    /// WorkerDisconnected already reassigned; just exit.
+    StreamClosed,
+    /// gRPC error on stream. Same treatment as StreamClosed.
+    StreamError,
 }
 
 #[cfg(test)]
@@ -489,5 +659,100 @@ mod tests {
         // Absent → None (layering: don't overlay).
         let args = CliArgs::try_parse_from(["rio-worker"]).unwrap();
         assert_eq!(args.fuse_passthrough, None);
+    }
+
+    /// The drain-wait synchronization: `acquire_many(max)` succeeds
+    /// exactly when all in-flight build tasks have dropped their
+    /// OwnedPermits.
+    ///
+    /// This test CAUGHT A BUG in the initial D3 implementation. The
+    /// original drain sequence was:
+    ///   1. `sem.close()`   (reject new acquires)
+    ///   2. `sem.acquire_many(max)` (wait for in-flight)
+    ///
+    /// The bug: close() makes ANY waiting acquire return Err, even
+    /// when permits DO become available. So step 2 returned Err
+    /// immediately (the wait got cancelled), and the drain logged
+    /// a spurious "stuck permit?" warning on EVERY sigterm that
+    /// arrived while builds were running — which is the normal case.
+    /// The builds still completed (OwnedPermit Drop isn't affected
+    /// by close), we just couldn't observe it. Mostly cosmetic but
+    /// the Err path exited without confirming completion.
+    ///
+    /// Fix: DON'T close. The loop already broke out — no new acquires
+    /// can happen. close() was belt-and-suspenders that tripped itself.
+    /// Without close, acquire_many blocks until permits return, then
+    /// returns Ok. This test asserts the fixed behavior.
+    ///
+    /// Not testing SIGTERM-to-self: signal delivery under cargo test
+    /// is nondeterministic, and nextest's per-process model means a
+    /// stray SIGTERM kills the test binary. vm-phase3a does real
+    /// SIGTERM via `k3s kubectl delete pod`.
+    #[tokio::test]
+    async fn drain_wait_semaphore_synchronization() {
+        const MAX: u32 = 4;
+        let sem = Arc::new(Semaphore::new(MAX as usize));
+
+        // Acquire 3 permits as "in-flight builds." Hold them.
+        let permit_a = sem.clone().acquire_owned().await.unwrap();
+        let permit_b = sem.clone().acquire_owned().await.unwrap();
+        let permit_c = sem.clone().acquire_owned().await.unwrap();
+        assert_eq!(sem.available_permits(), 1, "1 of 4 free");
+
+        // Drain: acquire_many (NO close — that was the bug). Spawn so
+        // we can drop permits from the test thread while it waits.
+        //
+        // acquire_many returns SemaphorePermit<'_> (borrows the sem)
+        // which can't escape the task. Return just the discriminant.
+        let drain_sem = sem.clone();
+        let drain = tokio::spawn(async move { drain_sem.acquire_many(MAX).await.is_ok() });
+
+        // Give drain a tick to reach the wait point.
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "acquire_many waiting (3 permits held)"
+        );
+
+        // Drop permits one at a time. Drain waits until ALL return.
+        drop(permit_a);
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "2 still held — not all MAX available");
+
+        drop(permit_b);
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished(), "1 still held");
+
+        drop(permit_c);
+        // NOW all 4 permits are available → drain completes with Ok.
+        let ok = tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("drain completes once all permits return")
+            .expect("task didn't panic");
+        assert!(
+            ok,
+            "WITHOUT close(), acquire_many succeeds when permits return. \
+             This is the fixed drain sequence: wait observes completion."
+        );
+    }
+
+    /// Regression: `close()` + waiting `acquire_many` → Err. This is
+    /// why main.rs does NOT call close() before the drain wait. Keep
+    /// this test so if someone adds close() back (it looks safe!),
+    /// this fails and they read the comment.
+    #[tokio::test]
+    async fn drain_wait_close_is_a_footgun() {
+        let sem = Arc::new(Semaphore::new(2));
+        let _held = sem.clone().acquire_owned().await.unwrap();
+
+        sem.close();
+        // 1 permit held, 1 available. acquire_many(2) would wait.
+        // On a closed sem, waiting acquire → Err immediately.
+        let result = sem.acquire_many(2).await;
+        assert!(
+            result.is_err(),
+            "close() cancels waiting acquires even when permits would return. \
+             This is why main.rs skips close() — it was the D3 bug."
+        );
     }
 }

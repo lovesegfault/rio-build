@@ -60,6 +60,19 @@ pub async fn connect_worker(addr: &str) -> anyhow::Result<crate::WorkerServiceCl
         .max_encoding_message_size(crate::max_message_size()))
 }
 
+/// Connect to the admin service (controller + worker preStop).
+///
+/// Same address as `connect_worker` — AdminService is hosted on the
+/// scheduler's gRPC port alongside SchedulerService/WorkerService.
+/// The worker's SIGTERM handler uses this for `DrainWorker` (step 1
+/// of preStop); the controller uses it for `ClusterStatus` autoscaling.
+pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClient<Channel>> {
+    let ch = connect_channel(addr).await?;
+    Ok(crate::AdminServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
+}
+
 // ===========================================================================
 // NAR stream helpers
 // ===========================================================================
