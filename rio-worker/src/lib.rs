@@ -25,6 +25,7 @@
 //! +-- Heartbeat loop (runtime.rs, 10s interval)
 //! ```
 
+pub mod cgroup;
 pub mod executor;
 pub mod fuse;
 pub mod health;
