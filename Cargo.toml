@@ -130,6 +130,48 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 # OrderedFloat<f64> is the standard workaround.
 ordered-float = "5"
 
+# --- phase3a: Kubernetes operator ---
+# kube 3.0 breaking from 2.x: chrono→jiff timestamps, ErrorResponse folded
+# into Status. runtime = Controller abstraction + watcher. derive =
+# #[derive(CustomResource)] + #[kube(...)]. client = kube::Client::try_default
+# reads in-cluster service-account token.
+kube = { version = "3.0", features = ["runtime", "derive", "client"] }
+# k8s-openapi types are feature-gated by K8s API version. v1_35 is the
+# highest this release supports. The feature pins which struct fields
+# exist (e.g., ephemeralContainers moved GA in different versions).
+k8s-openapi = { version = "0.27", features = ["v1_35"] }
+# schemars 1.x NOT 0.8 — kube 3.0 requires the major break. CRD JSON
+# schema generation for #[derive(JsonSchema)].
+schemars = "1"
+# Lease-based leader election. Thin wrapper over coordination.k8s.io/v1
+# Lease. No fencing — if two replicas briefly believe they're leader,
+# both dispatch. Acceptable: dispatch is idempotent (drv_hash dedup in
+# DAG merge, workers ignore stale-generation assignments).
+kube-leader-election = "0.43"
+# Deprecated (2024-03) but write-only usage = no attack surface (the
+# advisory is about parsing untrusted YAML). crdgen binary only SERIALIZES
+# our own CRD structs. serde_norway is the maintained fork if we ever
+# need deserialization.
+serde_yaml = "0.9"
+
+# --- phase3a: health + streaming ---
+# grpc.health.v1.Health service. K8s readiness probes hit this.
+tonic-health = "0.14"
+# Streaming zstd for the binary-cache /nar/ endpoint. Replaces the
+# buffered encode_all (4GB peak for 4GB NAR) with O(chunk) pipeline.
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+# StreamReader: turn a Stream<Item=Bytes> into an AsyncRead. Feeds
+# async-compression's ZstdEncoder which needs AsyncBufRead.
+tokio-util = { version = "0.7", features = ["io"] }
+
+# --- phase3a: controller testing (dev) ---
+# mock::pair() gives a tower Service + Handle. Wrap the Service in
+# kube::Client::new() and the reconciler talks to a fake API server.
+tower-test = "0.4"
+# .collect().await on kube::client::Body for mock response assembly.
+http-body-util = "0.1"
+http = "1"
+
 # Crypto
 sha1 = "0.10"
 sha2 = "0.10"

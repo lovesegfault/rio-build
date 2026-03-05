@@ -84,6 +84,13 @@ ignore = [
   #
   # Re-audit when russh bumps its rsa dep or a fixed release lands.
   { id = "RUSTSEC-2023-0071", reason = "russh->rsa: we use ed25519 host keys + ed25519 client auth; no RSA private key is ever held by rio-gateway. Advisory concerns private-key timing leaks — does not apply." },
+
+  # RUSTSEC-2024-0320: serde_yaml unmaintained. Our usage is WRITE-ONLY
+  # (rio-controller's crdgen binary serializes CustomResourceExt::crd()
+  # to YAML for kustomize). No deserialization of untrusted input = no
+  # attack surface. serde_norway is the maintained fork if we ever need
+  # parsing; for serialization-only, serde_yaml is still correct.
+  { id = "RUSTSEC-2024-0320", reason = "serde_yaml: write-only in crdgen binary (serializes our own CRD structs to YAML). No deserialization = no attack surface. Migrate to serde_norway if parsing is ever needed." },
 ]
 
 # ---------------------------------------------------------------------------
