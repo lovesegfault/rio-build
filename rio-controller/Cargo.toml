@@ -30,6 +30,9 @@ rio-nix = { workspace = true }
 # (0.8 breaks #[derive(CustomResource)]). #[x_kube(validation=...)]
 # for CEL, not schemars extend.
 kube = { workspace = true }
+# Direct dep for CryptoProvider::install_default() in main.rs.
+# See workspace Cargo.toml for the ring-vs-aws-lc-rs rationale.
+rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
 

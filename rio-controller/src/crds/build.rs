@@ -112,7 +112,7 @@ pub struct BuildStatus {
     /// lastTransitionTime + reason + message. Succeeded and
     /// Failed are terminal and mutually exclusive.
     #[serde(default)]
-    #[schemars(with = "Vec<serde_json::Value>")]
+    #[schemars(schema_with = "crate::crds::any_object_array")]
     pub conditions: Vec<Condition>,
 }
 
