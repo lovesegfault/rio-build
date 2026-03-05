@@ -268,16 +268,22 @@ async fn main() -> anyhow::Result<()> {
     // phase2c VmHWM bug measured ~10MB for every build; poisoning
     // build_history like that takes ~10 EMA cycles to wash out).
     //
-    // own_cgroup() parses /proc/self/cgroup (fails on cgroup v1).
+    // delegated_root() returns the PARENT of /proc/self/cgroup —
+    // NOT own_cgroup(). cgroup v2's no-internal-processes rule means
+    // per-build cgroups must be SIBLINGS of where the worker process
+    // is, not children. systemd DelegateSubgroup=builds puts the
+    // worker in .../service/builds/; delegated_root() returns
+    // .../service/ (empty, writable via Delegate=yes); per-build
+    // cgroups go there as siblings of builds/.
+    //
     // enable_subtree_controllers writes +memory +cpu (fails on EACCES
-    // = delegation not configured, or EBUSY = worker process in the
-    // same cgroup as the subtree — needs DelegateSubgroup; see H1).
+    // = Delegate=yes not configured).
     //
     // BEFORE the health server: if cgroup fails, we don't want
     // liveness passing while startup is hung on `?` propagation.
     // Pod goes straight to CrashLoopBackOff with a clear log line.
-    let cgroup_parent =
-        rio_worker::cgroup::own_cgroup().map_err(|e| anyhow::anyhow!("cgroup v2 required: {e}"))?;
+    let cgroup_parent = rio_worker::cgroup::delegated_root()
+        .map_err(|e| anyhow::anyhow!("cgroup v2 required: {e}"))?;
     rio_worker::cgroup::enable_subtree_controllers(&cgroup_parent)
         .map_err(|e| anyhow::anyhow!("cgroup delegation required: {e}"))?;
     info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
