@@ -336,11 +336,14 @@ pub async fn execute_build(
     // compute_input_closure only seeds from drv.input_srcs() (static), so
     // we merge the resolved set in.
     //
-    // Worker computes closure via QueryPathInfo BFS. Scheduler-side closure
-    // computation (TODO(phase3a) at dispatch.rs) will arrive as PrefetchHint
-    // on the BuildExecution stream — a warm-cache hint, not a replacement
-    // for this computation (the synth DB needs the FULL closure, not just
-    // what the scheduler thinks is missing from the worker's bloom filter).
+    // Worker computes closure via QueryPathInfo BFS. The scheduler ALSO
+    // sends a PrefetchHint (approx_input_closure — DAG children's outputs,
+    // bloom-filtered) before the WorkAssignment, so the FUSE cache starts
+    // warming while we parse the .drv here. That's a HINT, not a
+    // replacement for THIS computation: the synth DB needs the FULL
+    // closure (transitive deps + input_srcs), not just the direct
+    // dependency outputs the scheduler knows about. The hint gets ahead
+    // on the common-case paths; this BFS covers the rest.
     let mut input_paths: Vec<String> =
         compute_input_closure(&*store_client, &drv, drv_path).await?;
     // Add resolved inputDrv outputs (their runtime closure is BFS'd via

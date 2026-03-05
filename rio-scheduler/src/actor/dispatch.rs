@@ -253,6 +253,26 @@ impl DagActor {
             worker.running_builds.insert(drv_hash.clone());
         }
 
+        // PrefetchHint BEFORE WorkAssignment: the worker starts
+        // warming its FUSE cache while still parsing the .drv
+        // (which it fetches or extracts from drv_content below).
+        // A few seconds of head-start on a multi-minute fetch
+        // is the win.
+        //
+        // Same closure approximation as best_worker's bloom
+        // scoring (approx_input_closure) — if scoring said "w1
+        // has most of these," the hint should be "the few w1
+        // DOESN'T have." Consistent approximation = consistent
+        // filtering.
+        //
+        // Best-effort: try_send, failure logs debug not warn
+        // (hint not contract). If the channel is full (worker's
+        // recv loop busy), the assignment that follows will
+        // likely also fail → the reset_to_ready cleanup below
+        // handles it. If only the HINT fails, the build still
+        // works, just fetches on-demand via FUSE.
+        self.send_prefetch_hint(worker_id, drv_hash);
+
         // Send WorkAssignment to worker via stream
         if let Some(state) = self.dag.node(drv_hash) {
             let assignment = rio_proto::types::WorkAssignment {
@@ -263,11 +283,6 @@ impl DagActor {
                 // hits don't bloat this. Worker already handles both
                 // paths (executor/mod.rs:241 branches on is_empty).
                 drv_content: state.drv_content.clone(),
-                // TODO(phase3a): compute closure scheduler-side and send as
-                // a PrefetchHint on the BuildExecution stream (types.proto
-                // PrefetchHint message) so the worker's FUSE cache can
-                // pre-warm before the build starts. Not inlined in
-                // WorkAssignment — prefetch is a hint, not a contract.
                 output_names: state.output_names.clone(),
                 build_options: Some(self.build_options_for_derivation(drv_hash)),
                 assignment_token: format!("{worker_id}-{drv_hash}-{generation}"),
@@ -349,5 +364,111 @@ impl DagActor {
         debug!(drv_hash = %drv_hash, worker_id = %worker_id, "assigned derivation to worker");
         metrics::counter!("rio_scheduler_assignments_total").increment(1);
         true
+    }
+
+    /// Send a PrefetchHint for the chosen worker to warm its FUSE
+    /// cache. Best-effort: `try_send`, failure logs at debug.
+    ///
+    /// Same closure approximation as [`best_worker`]'s scoring
+    /// (both call `approx_input_closure`). Bloom-filtered against
+    /// the worker's last heartbeat filter: skip paths the worker
+    /// PROBABLY has. False positives (bloom says yes, worker
+    /// doesn't have it) mean we skip a hint we should have sent
+    /// — the build's FUSE op fetches it on-demand. False negatives
+    /// are impossible (bloom never false-negative on a positive
+    /// insert). So we only ever UNDER-hint, never OVER-hint.
+    /// Under-hinting is a missed optimization; over-hinting would
+    /// waste worker bandwidth on paths it already has.
+    ///
+    /// No bloom = send everything (pessimistic, same as scoring).
+    /// Empty hint (everything filtered) = don't send the message
+    /// at all (saves one try_send for the common case where
+    /// best_worker picked a warm worker — that's the point of
+    /// bloom-locality scoring).
+    ///
+    /// [`best_worker`]: crate::assignment::best_worker
+    fn send_prefetch_hint(&self, worker_id: &WorkerId, drv_hash: &DrvHash) {
+        let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+        if input_paths.is_empty() {
+            // Leaf derivation (no DAG children). Nothing to prefetch.
+            // Common for .drv fetches and source tarballs.
+            return;
+        }
+
+        // Bloom filter. Same logic as count_missing: skip paths the
+        // worker claims to have. The filter is up to 10s stale
+        // (heartbeat interval) but that's fine — a stale positive
+        // means we skip hinting for a path the worker evicted
+        // since last heartbeat; the build fetches it on-demand.
+        let Some(worker) = self.workers.get(worker_id.as_str()) else {
+            // Worker gone between best_worker and here? Actor is
+            // single-threaded so this shouldn't happen, but be
+            // defensive (the if-let Some(state) at the top of the
+            // caller is the same kind of guard).
+            return;
+        };
+        let to_prefetch: Vec<String> = match &worker.bloom {
+            Some(bloom) => input_paths
+                .into_iter()
+                .filter(|p| !bloom.maybe_contains(p))
+                .collect(),
+            // No bloom = worker didn't send one. Pessimistic: send
+            // all. Same "incentivize sending the filter" policy as
+            // count_missing.
+            None => input_paths,
+        };
+
+        // Cap: bound message size. A derivation with 200 deps ×
+        // 3 outputs = 600 paths × ~80 bytes = 48 KB. Fine for gRPC
+        // but let's not surprise anyone with a 1 MB hint for a
+        // pathological case. 100 covers the 95th percentile; the
+        // rest fetch on-demand (we cap by truncating, not by
+        // "pick the best 100" — that would need per-path nar_size
+        // which we don't have. Arbitrary 100 is better than
+        // nothing).
+        const MAX_PREFETCH_PATHS: usize = 100;
+        let mut to_prefetch = to_prefetch;
+        if to_prefetch.len() > MAX_PREFETCH_PATHS {
+            to_prefetch.truncate(MAX_PREFETCH_PATHS);
+        }
+
+        if to_prefetch.is_empty() {
+            // Everything filtered = best_worker picked a warm worker.
+            // Exactly what bloom-locality scoring is FOR. No hint
+            // message needed.
+            return;
+        }
+
+        let hint_len = to_prefetch.len();
+        let hint = rio_proto::types::PrefetchHint {
+            store_paths: to_prefetch,
+        };
+        let msg = rio_proto::types::SchedulerMessage {
+            msg: Some(rio_proto::types::scheduler_message::Msg::Prefetch(hint)),
+        };
+
+        // try_send: if the channel is full, drop the hint. The
+        // assignment that follows uses the SAME channel — if it's
+        // full, that assignment also fails and reset_to_ready cleans
+        // up. If only this fails (race: channel had 1 slot, hint
+        // lost, assignment fit), the build works without prefetch.
+        // debug not warn: this is a hint, not a contract.
+        if let Some(tx) = &worker.stream_tx {
+            match tx.try_send(msg) {
+                Ok(()) => {
+                    metrics::counter!("rio_scheduler_prefetch_hints_sent_total").increment(1);
+                    metrics::counter!("rio_scheduler_prefetch_paths_sent_total")
+                        .increment(hint_len as u64);
+                }
+                Err(e) => {
+                    debug!(
+                        worker_id = %worker_id,
+                        drv_hash = %drv_hash,
+                        error = %e,
+                        "prefetch hint dropped (channel full; assignment may also fail)"
+                    );
+                }
+            }
+        }
     }
 }

@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dag::DerivationDag;
-use crate::state::{DerivationState, WorkerId, WorkerState};
+use crate::state::{DerivationState, DrvHash, WorkerId, WorkerState};
 
 /// One size-class in the operator's cutoff config.
 ///
@@ -204,12 +204,7 @@ pub fn best_worker(
     // Collected into a Vec (not iterating lazily) because we scan it
     // once per candidate. For N candidates × M paths, that's N*M bloom
     // queries. M is typically <100; N is typically <10. Cheap.
-    let input_paths: Vec<String> = dag
-        .get_children(&drv.drv_hash)
-        .into_iter()
-        .filter_map(|child| dag.node(&child))
-        .flat_map(|child| child.expected_output_paths.iter().cloned())
-        .collect();
+    let input_paths = approx_input_closure(dag, &drv.drv_hash);
 
     // --- Score each candidate ---
     // Normalize transfer_cost: divide by max across candidates. This
@@ -257,6 +252,39 @@ pub fn best_worker(
 /// No bloom = worst case (assume missing everything). Better to
 /// over-estimate transfer cost than under-estimate — over means we
 /// might pick a less-optimal worker, under means we pick one that'll
+/// Approximate input closure: the derivation's DAG children's
+/// expected output paths.
+///
+/// This is what the derivation NEEDS as inputs — its dependencies'
+/// outputs. Not perfect (misses `input_srcs` and transitive closure),
+/// but covers the bulk of what the worker's FUSE will actually fetch.
+///
+/// Used by:
+/// - [`best_worker`] for bloom-locality scoring (workers with these
+///   paths cached are preferred)
+/// - dispatch.rs for [`PrefetchHint`] (tell the chosen worker to
+///   warm these before the build starts)
+///
+/// Both callers want the SAME approximation — if the scoring says
+/// "w1 has most of these cached," the prefetch hint for w1 should
+/// be "the few it DOESN'T have" (bloom-filtered). Inconsistent
+/// approximations would mean scoring on one set, hinting from
+/// another. Extracting this fn guarantees they agree.
+///
+/// Cheap: DAG iteration only, no store RPCs, no ATerm parse. The
+/// scheduler has all this state in memory already (populated at
+/// merge time). For a derivation with 20 dependencies each with
+/// 2 outputs: 40 string clones, ~1μs.
+///
+/// [`PrefetchHint`]: rio_proto::types::PrefetchHint
+pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> Vec<String> {
+    dag.get_children(drv_hash)
+        .into_iter()
+        .filter_map(|child| dag.node(&child))
+        .flat_map(|child| child.expected_output_paths.iter().cloned())
+        .collect()
+}
+
 /// spend time fetching we didn't account for.
 fn count_missing(worker: &WorkerState, input_paths: &[String]) -> usize {
     let Some(bloom) = &worker.bloom else {
