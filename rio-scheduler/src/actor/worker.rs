@@ -39,19 +39,41 @@ impl DagActor {
         // but never sent a heartbeat (increment fires on full registration only).
         let was_registered = worker.is_registered();
 
-        // Reassign all derivations that were assigned to this worker.
-        // reset_to_ready() handles Assigned -> Ready and Running -> Failed -> Ready,
-        // maintaining state-machine invariants.
-        for drv_hash in &worker.running_builds {
+        // Reassign everything that was on this worker. The worker is
+        // gone; whether it was draining or not doesn't matter now.
+        // Clone the set so we can call reassign (which borrows self mut).
+        let to_reassign: Vec<DrvHash> = worker.running_builds.iter().cloned().collect();
+        self.reassign_derivations(&to_reassign).await;
+
+        if was_registered {
+            metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
+        }
+    }
+
+    /// Reset a set of derivations to Ready and re-enqueue.
+    ///
+    /// Extracted from `handle_worker_disconnected` so `handle_drain_worker`
+    /// (force=true) can reuse it. Both callers have already decided these
+    /// derivations should be retried elsewhere — this is the mechanism.
+    ///
+    /// `reset_to_ready()` handles both Assigned → Ready and Running →
+    /// Failed → Ready (the latter increments retry_count because Running
+    /// means the build actually started — that's a failed attempt). A
+    /// derivation in any other state (Completed, Poisoned, DepFailed) is
+    /// skipped with a warn — it shouldn't be in `running_builds` but
+    /// split-brain or delayed heartbeat reconcile can produce it.
+    async fn reassign_derivations(&mut self, drv_hashes: &[DrvHash]) {
+        for drv_hash in drv_hashes {
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
                         drv_hash = %drv_hash, error = %e,
-                        "invalid state for worker-lost recovery, skipping"
+                        "invalid state for reassignment, skipping"
                     );
                     continue;
                 }
-                // Worker disconnect during build is a failed attempt: count it.
+                // Worker-loss mid-build is a failed attempt: count it.
+                // retry_count → poison threshold (3 different workers).
                 state.retry_count += 1;
                 if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
@@ -66,9 +88,93 @@ impl DagActor {
                 self.push_ready(drv_hash.clone());
             }
         }
+    }
 
-        if was_registered {
-            metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
+    /// Mark a worker draining. In-flight builds continue; no new
+    /// assignments. `force=true` additionally reassigns in-flight.
+    ///
+    /// Returns `accepted=false` only for unknown worker_id. That's not
+    /// an error — the worker's preStop (D3) calls this AFTER receiving
+    /// SIGTERM, which may race with the BuildExecution stream closing
+    /// (SIGTERM → select! break → stream drop → WorkerDisconnected →
+    /// entry removed). In that race, drain is a no-op: the disconnect
+    /// already reassigned everything.
+    ///
+    /// Idempotent on `draining=true`: setting the flag again is a
+    /// no-op, same running count returned. The worker's preStop may
+    /// retry; the controller's finalizer may ALSO call this for the
+    /// same worker. Both succeed.
+    ///
+    /// `force=true` with draining already set: DOES reassign. Use case:
+    /// operator first drains gracefully, builds take too long, operator
+    /// force-drains. The builds on the worker will complete (wasted)
+    /// but the scheduler stops waiting and redispatches — fresh workers
+    /// may finish faster anyway.
+    pub(super) async fn handle_drain_worker(
+        &mut self,
+        worker_id: &WorkerId,
+        force: bool,
+    ) -> DrainResult {
+        let Some(worker) = self.workers.get_mut(worker_id.as_str()) else {
+            // Unknown. Not an error — worker may have disconnected first.
+            // running=0: caller proceeds immediately (nothing to wait for).
+            debug!(worker_id = %worker_id, "drain request for unknown worker");
+            return DrainResult {
+                accepted: false,
+                running_builds: 0,
+            };
+        };
+
+        let was_draining = worker.draining;
+        worker.draining = true;
+
+        // Log the transition once. Repeat calls at debug.
+        if !was_draining {
+            info!(
+                worker_id = %worker_id,
+                running = worker.running_builds.len(),
+                force,
+                "worker draining"
+            );
+            // E1's active_workers counts `is_registered() && !draining` —
+            // but the gauge tracks is_registered() only (drain doesn't
+            // decrement it; disconnect does). That's intentional: a
+            // draining worker is still connected, still heartbeating,
+            // still "active" in the "pod is alive" sense. The controller
+            // cares about the DISTINCTION (active vs draining) which
+            // ClusterStatus provides separately.
+        } else {
+            debug!(worker_id = %worker_id, force, "drain request for already-draining worker");
+        }
+
+        if force {
+            // Reassign in-flight. The worker's nix-daemon is still
+            // running these builds (we can't reach into its process
+            // tree), but we stop caring about the result and redispatch.
+            // Wasteful but unblocks forward progress when a worker is
+            // wedged-but-heartbeating.
+            //
+            // Clone the set out before calling reassign (borrows self
+            // mut through dag.node_mut). Then clear the worker's set —
+            // it's not running anything WE care about anymore. If the
+            // worker later sends CompletionReports for these, the
+            // completion handler's "unknown drv_hash" path drops them
+            // (the DAG node has a different assigned_worker by then).
+            let to_reassign: Vec<DrvHash> = worker.running_builds.drain().collect();
+            // NOTE: worker borrow drops here (before the await). No
+            // await-holding-lock concern — workers is a plain HashMap,
+            // not a Mutex.
+            self.reassign_derivations(&to_reassign).await;
+
+            return DrainResult {
+                accepted: true,
+                running_builds: 0, // reassigned: caller doesn't wait
+            };
+        }
+
+        DrainResult {
+            accepted: true,
+            running_builds: worker.running_builds.len() as u32,
         }
     }
 

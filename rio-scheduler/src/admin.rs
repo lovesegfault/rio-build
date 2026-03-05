@@ -412,11 +412,55 @@ impl AdminService for AdminServiceImpl {
         Err(Status::unimplemented("TriggerGC: phase4 controller"))
     }
 
+    /// Mark a worker draining: `has_capacity()` returns false, dispatch
+    /// skips it. In-flight builds continue. Called by:
+    ///   - Worker's SIGTERM handler (D3 preStop step 1)
+    ///   - Controller's WorkerPool finalizer (F6)
+    ///
+    /// `force=true` reassigns in-flight builds — the worker's nix-daemon
+    /// keeps running them (we can't reach into its process tree) but the
+    /// scheduler redispatches to fresh workers. Wasteful but unblocks.
+    ///
+    /// Unknown worker_id → `accepted=false, running=0`. NOT an error:
+    /// SIGTERM may race with stream close (WorkerDisconnected removes
+    /// the entry). The caller proceeds as if drain succeeded.
+    ///
+    /// Empty worker_id → InvalidArgument. Catches the proto-default
+    /// (empty string) before it gets interpreted as "worker named ''
+    /// not found."
+    #[instrument(skip(self, request), fields(rpc = "DrainWorker"))]
     async fn drain_worker(
         &self,
-        _request: Request<DrainWorkerRequest>,
+        request: Request<DrainWorkerRequest>,
     ) -> Result<Response<DrainWorkerResponse>, Status> {
-        Err(Status::unimplemented("DrainWorker: phase3a controller"))
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+
+        if req.worker_id.is_empty() {
+            return Err(Status::invalid_argument("worker_id is required"));
+        }
+
+        let (tx, rx) = oneshot::channel();
+        // send_unchecked: drain MUST land even under backpressure. A
+        // shutting-down worker accepting new assignments is a feedback
+        // loop into MORE load — exactly what we don't want.
+        self.actor
+            .send_unchecked(ActorCommand::DrainWorker {
+                worker_id: req.worker_id.into(),
+                force: req.force,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("actor channel closed"))?;
+
+        let result = rx
+            .await
+            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+
+        Ok(Response::new(DrainWorkerResponse {
+            accepted: result.accepted,
+            running_builds: result.running_builds,
+        }))
     }
 
     async fn clear_poison(
@@ -680,7 +724,7 @@ mod tests {
     async fn stubs_return_unimplemented() -> anyhow::Result<()> {
         let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
 
-        // ClusterStatus is no longer a stub — E1 implemented it.
+        // ClusterStatus (E1) and DrainWorker (E2) are no longer stubs.
         assert_eq!(
             svc.list_workers(Request::new(ListWorkersRequest::default()))
                 .await
@@ -697,13 +741,6 @@ mod tests {
         );
         assert_eq!(
             svc.trigger_gc(Request::new(GcRequest::default()))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unimplemented
-        );
-        assert_eq!(
-            svc.drain_worker(Request::new(DrainWorkerRequest::default()))
                 .await
                 .unwrap_err()
                 .code(),
@@ -913,6 +950,199 @@ mod tests {
         let status = result.expect_err("should be Unavailable");
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("actor"));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // DrainWorker (E2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn drain_worker_empty_id_invalid() -> anyhow::Result<()> {
+        let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        let result = svc
+            .drain_worker(Request::new(DrainWorkerRequest {
+                worker_id: String::new(),
+                force: false,
+            }))
+            .await;
+
+        let status = result.expect_err("empty worker_id should be InvalidArgument");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("worker_id"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
+        // Unknown worker → accepted=false, running=0. NOT gRPC error:
+        // preStop may race with WorkerDisconnected (SIGTERM → select!
+        // break → stream drop → actor removes entry → preStop's drain
+        // call arrives to an empty slot). The worker proceeds as if
+        // drain succeeded — nothing to wait for.
+        let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        let resp = svc
+            .drain_worker(Request::new(DrainWorkerRequest {
+                worker_id: "ghost".into(),
+                force: false,
+            }))
+            .await?
+            .into_inner();
+
+        assert!(!resp.accepted, "unknown worker → accepted=false");
+        assert_eq!(resp.running_builds, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
+        use crate::actor::tests::{connect_worker, merge_single_node};
+        use crate::state::PriorityClass;
+
+        let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        // Worker with max_builds=4: plenty of capacity.
+        let mut worker_rx = connect_worker(&actor, "w1", "x86_64-linux", 4).await?;
+
+        // First drv: dispatches normally.
+        let _ev1 =
+            merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
+        let msg1 = worker_rx.recv().await.expect("first assignment");
+        assert!(matches!(
+            msg1.msg,
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+        ));
+
+        // Drain. running=1 (the drv we just dispatched is Assigned on w1).
+        let resp = svc
+            .drain_worker(Request::new(DrainWorkerRequest {
+                worker_id: "w1".into(),
+                force: false,
+            }))
+            .await?
+            .into_inner();
+        assert!(resp.accepted);
+        assert_eq!(
+            resp.running_builds, 1,
+            "the first drv is in-flight (Assigned)"
+        );
+
+        // Second drv: should NOT dispatch. Worker has capacity (1/4 slots
+        // used) but has_capacity() now returns false (draining).
+        let _ev2 =
+            merge_single_node(&actor, uuid::Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
+
+        // Can't easily assert "nothing arrived" without a timeout. Instead,
+        // check ClusterStatus: the second drv should be queued, not running.
+        let status = svc.cluster_status(Request::new(())).await?.into_inner();
+        assert_eq!(status.queued_derivations, 1, "second drv waiting (drained)");
+        assert_eq!(status.running_derivations, 1, "only first drv on worker");
+        assert_eq!(status.draining_workers, 1);
+        assert_eq!(
+            status.active_workers, 0,
+            "draining worker is NOT active — controller sees capacity=0"
+        );
+
+        // Idempotent: second drain → same running count, still accepted.
+        let resp2 = svc
+            .drain_worker(Request::new(DrainWorkerRequest {
+                worker_id: "w1".into(),
+                force: false,
+            }))
+            .await?
+            .into_inner();
+        assert!(resp2.accepted);
+        assert_eq!(resp2.running_builds, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
+        use crate::actor::tests::{connect_worker, merge_single_node};
+        use crate::state::PriorityClass;
+
+        let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+        // Two workers: w1 gets the first dispatch, then we force-drain it.
+        // The reassigned drv should go to w2 on the next dispatch.
+        let mut rx1 = connect_worker(&actor, "w1", "x86_64-linux", 2).await?;
+        let mut rx2 = connect_worker(&actor, "w2", "x86_64-linux", 2).await?;
+
+        let _ev =
+            merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
+
+        // ONE of them got it. With two equal-score workers (no bloom,
+        // both 0/2 load), best_worker's tiebreak is HashMap iteration
+        // order → nondeterministic. Poll both with try_recv to find which.
+        let (first_worker, other_rx) = if let Ok(msg) = rx1.try_recv() {
+            assert!(matches!(
+                msg.msg,
+                Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+            ));
+            ("w1", &mut rx2)
+        } else {
+            let msg = rx2
+                .try_recv()
+                .expect("one of w1/w2 must have the assignment");
+            assert!(matches!(
+                msg.msg,
+                Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+            ));
+            ("w2", &mut rx1)
+        };
+
+        // Force-drain the worker that got it. running=0 in response:
+        // force reassigns then replies, so nothing is left.
+        let resp = svc
+            .drain_worker(Request::new(DrainWorkerRequest {
+                worker_id: first_worker.into(),
+                force: true,
+            }))
+            .await?
+            .into_inner();
+        assert!(resp.accepted);
+        assert_eq!(
+            resp.running_builds, 0,
+            "force=true reassigned → running=0 (caller doesn't wait)"
+        );
+
+        // reassign_derivations pushes to ready_queue but dispatch_ready
+        // isn't called from handle_drain_worker — it fires on the NEXT
+        // heartbeat/merge/completion. Send a heartbeat to trigger it.
+        actor
+            .send_unchecked(ActorCommand::Heartbeat {
+                worker_id: first_worker.into(),
+                system: "x86_64-linux".into(),
+                supported_features: vec![],
+                max_builds: 2,
+                running_builds: vec![],
+                bloom: None,
+                size_class: None,
+            })
+            .await?;
+
+        // The OTHER worker should now get the reassigned drv.
+        let msg = other_rx
+            .recv()
+            .await
+            .expect("reassigned drv to other worker");
+        assert!(matches!(
+            msg.msg,
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+        ));
+
+        // ClusterStatus: 1 draining, 1 active, 1 running (on the other
+        // worker now), 0 queued.
+        let status = svc.cluster_status(Request::new(())).await?.into_inner();
+        assert_eq!(status.draining_workers, 1);
+        assert_eq!(status.active_workers, 1);
+        assert_eq!(
+            status.running_derivations, 1,
+            "drv re-Assigned to other worker"
+        );
+        assert_eq!(status.queued_derivations, 0);
         Ok(())
     }
 }
