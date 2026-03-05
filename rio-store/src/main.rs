@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,11 @@ use tracing::{error, info};
 
 use rio_proto::ChunkServiceServer;
 use rio_proto::StoreServiceServer;
+use rio_store::backend::chunk::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
+use rio_store::cache_server::{self, CacheServerState};
+use rio_store::cas::ChunkCache;
 use rio_store::grpc::{ChunkServiceImpl, StoreServiceImpl};
+use rio_store::signing::Signer;
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
 
@@ -148,17 +153,105 @@ async fn main() -> anyhow::Result<()> {
     // migrations failed, the `?` above already bailed.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // Build gRPC services.
+    // Construct the chunk backend + ONE shared ChunkCache. The cache
+    // Arc is cloned into all three consumers (StoreServiceImpl,
+    // ChunkServiceImpl, CacheServerState) — a chunk warmed by GetPath
+    // is hot for GetChunk and for the binary-cache /nar/ endpoint.
     //
-    // TODO(phase3a): construct ChunkBackend from config, wrap in ChunkCache,
-    // pass the SAME Arc<ChunkCache> to both StoreServiceImpl (via
-    // with_chunk_backend) and ChunkServiceImpl. One cache, shared — a chunk
-    // warmed by GetPath is hot for GetChunk. Also spawn cache_server if
-    // cache_http_addr is configured (needs ChunkCache for reassembly).
-    // With cache=None below, ChunkService returns FAILED_PRECONDITION,
-    // which is the right answer for an inline-only store.
-    let store_service = StoreServiceImpl::new(pool.clone());
-    let chunk_service = ChunkServiceImpl::new(pool, None);
+    // `?` on backend construction: filesystem mkdir fail or S3
+    // bad-region means we can't store chunks — startup error, not
+    // degraded mode. Inline backend can't fail (just None).
+    let chunk_cache: Option<Arc<ChunkCache>> = match &cfg.chunk_backend {
+        ChunkBackendKind::Inline => {
+            info!("chunk backend: inline (all NARs in PG manifests.inline_blob)");
+            None
+        }
+        ChunkBackendKind::Filesystem { base_dir } => {
+            info!(base_dir = %base_dir.display(), "chunk backend: filesystem");
+            // Eagerly creates the 256-subdir fanout. `?` — if the
+            // disk is read-only or the path is garbage, better to
+            // fail here than on the first PutPath with a cryptic
+            // ENOENT deep in the put() call.
+            let backend: Arc<dyn ChunkBackend> = Arc::new(FilesystemChunkBackend::new(base_dir)?);
+            Some(Arc::new(ChunkCache::with_capacity(
+                backend,
+                cfg.chunk_cache_capacity_bytes,
+            )))
+        }
+        ChunkBackendKind::S3 { bucket, prefix } => {
+            info!(%bucket, %prefix, "chunk backend: S3");
+            // Credentials from the aws-sdk default chain (env vars,
+            // IMDS, etc). NOT in our config — we don't want secrets
+            // in TOML. If credentials are missing, the first PutPath
+            // will fail with a clear AWS error; we don't eagerly
+            // verify here (would need a HeadBucket or similar, and
+            // credentials might not be available YET if IMDS is
+            // slow — better to start serving and fail the first
+            // chunk op than to race IMDS).
+            let aws_cfg = aws_config::load_from_env().await;
+            let client = aws_sdk_s3::Client::new(&aws_cfg);
+            let backend: Arc<dyn ChunkBackend> =
+                Arc::new(S3ChunkBackend::new(client, bucket.clone(), prefix.clone()));
+            Some(Arc::new(ChunkCache::with_capacity(
+                backend,
+                cfg.chunk_cache_capacity_bytes,
+            )))
+        }
+    };
+
+    // Load the narinfo signing key. `None` path → `None` signer (not
+    // an error — signing is optional). Bad path / bad format → `?`
+    // (operator configured a key; failing silently = unsigned paths
+    // = security surprise).
+    let signer = Signer::load(cfg.signing_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("signing key load failed: {e}"))?;
+    if signer.is_some() {
+        info!(path = ?cfg.signing_key_path, "narinfo signing enabled");
+    }
+
+    // StoreServiceImpl: inline-only vs chunked based on cache. The
+    // signer chains after either constructor (builder-style).
+    let store_service = match &chunk_cache {
+        None => StoreServiceImpl::new(pool.clone()),
+        Some(cache) => StoreServiceImpl::with_chunk_cache(pool.clone(), Arc::clone(cache)),
+    };
+    let store_service = match signer {
+        Some(s) => store_service.with_signer(s),
+        None => store_service,
+    };
+
+    // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
+    // on GetChunk, which is correct for an inline-only store (there
+    // ARE no chunks to get).
+    let chunk_service = ChunkServiceImpl::new(pool.clone(), chunk_cache.clone());
+
+    // Binary-cache HTTP server (narinfo + nar.zst routes). Spawned
+    // concurrently with the gRPC server (which blocks on serve()
+    // below). Only if configured — this is optional; the gRPC
+    // store works without it.
+    if let Some(http_addr) = cfg.cache_http_addr {
+        let state = Arc::new(CacheServerState {
+            pool: pool.clone(),
+            // Same Arc again. /nar/ reassembly hits the same moka
+            // LRU as GetPath.
+            chunk_cache: chunk_cache.clone(),
+        });
+        let router = cache_server::router(state);
+        rio_common::task::spawn_monitored("cache-http-server", async move {
+            info!(addr = %http_addr, "starting binary-cache HTTP server");
+            match tokio::net::TcpListener::bind(http_addr).await {
+                Ok(listener) => {
+                    if let Err(e) = axum::serve(listener, router).await {
+                        error!(error = %e, "cache HTTP server failed");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, addr = %http_addr, "cache HTTP bind failed");
+                }
+            }
+        });
+    }
+
     let max_msg_size = rio_proto::max_message_size();
 
     let addr = cfg.listen_addr.parse()?;

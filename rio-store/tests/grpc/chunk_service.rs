@@ -24,14 +24,19 @@ async fn setup_chunk_service(
     tokio::task::JoinHandle<()>,
 )> {
     let backend = Arc::new(MemoryChunkBackend::new());
+    // ONE cache, shared. The previous version of this setup was
+    // buggy: with_chunk_backend creates its OWN cache internally,
+    // so StoreService had cache #1 and ChunkService had cache #2.
+    // The "same cache" comment was aspirational, not real. It
+    // passed anyway because both caches miss → both hit the same
+    // MemoryChunkBackend → same chunks. But "warmed by GetPath is
+    // hot for GetChunk" wasn't being exercised.
+    //
+    // with_chunk_cache accepts an Arc<ChunkCache> — now ACTUALLY
+    // shared. test_shared_cache_warms_across_services proves it.
     let cache = Arc::new(ChunkCache::new(backend.clone() as Arc<dyn ChunkBackend>));
 
-    let store_service = StoreServiceImpl::with_chunk_backend(
-        pool.clone(),
-        backend.clone() as Arc<dyn ChunkBackend>,
-    );
-    // Same cache instance — a chunk warmed by StoreService's GetPath is
-    // hot for ChunkService's GetChunk. This is the shared-state test.
+    let store_service = StoreServiceImpl::with_chunk_cache(pool.clone(), Arc::clone(&cache));
     let chunk_service = ChunkServiceImpl::new(pool, Some(cache));
 
     let router = Server::builder()
@@ -222,4 +227,76 @@ async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
 
     server.abort();
     Ok(())
+}
+
+/// A2: prove StoreService and ChunkService ACTUALLY share one cache.
+///
+/// The previous setup_chunk_service was buggy: with_chunk_backend
+/// creates its own cache internally, so the two services had DIFFERENT
+/// caches. It passed because both miss → both hit MemoryChunkBackend
+/// → same data. But "warmed by GetPath is hot for GetChunk" wasn't
+/// really tested.
+///
+/// This test proves sharing: GetChunk populates moka, then CORRUPT
+/// the backend, then GetChunk again. If the cache is real, the second
+/// read comes from moka (good bytes, BLAKE3 verify passes). If there's
+/// no cache sharing (or no cache at all), the second read goes to
+/// backend (corrupted bytes, verify fails).
+///
+/// This mirrors what main.rs does: one Arc<ChunkCache> cloned into
+/// all consumers.
+#[tokio::test]
+async fn test_shared_cache_warms_across_services() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (mut store_client, mut chunk_client, backend, server) =
+        setup_chunk_service(db.pool.clone()).await?;
+
+    // Upload something large enough to chunk.
+    let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    put_path(&mut store_client, info, nar).await?;
+
+    // Grab one chunk's hash.
+    let hash: Vec<u8> = sqlx::query_scalar("SELECT blake3_hash FROM chunks LIMIT 1")
+        .fetch_one(&db.pool)
+        .await?;
+    let hash_arr: [u8; 32] = hash.as_slice().try_into().expect("32-byte hash");
+
+    // First GetChunk: cold → backend → moka insert.
+    let first = collect_get_chunk(&mut chunk_client, hash.clone()).await?;
+    assert!(!first.is_empty(), "chunk has content");
+
+    // Corrupt the backend. If the cache is shared and populated, the
+    // next read should NOT hit this. If setup had two caches (the old
+    // bug), OR if sharing was broken, the next read goes to backend
+    // and BLAKE3 verify fails → gRPC error.
+    backend.corrupt_for_test(&hash_arr, bytes::Bytes::from_static(b"garbage"));
+
+    // Second GetChunk: if cache is real, this is a moka hit (original
+    // good bytes). If not, it reads the corrupted backend → verify
+    // fail → gRPC Internal error.
+    let second = collect_get_chunk(&mut chunk_client, hash).await?;
+    assert_eq!(
+        second, first,
+        "second read came from SHARED moka cache (same bytes), not \
+         corrupted backend. If this fails: cache is NOT shared."
+    );
+
+    server.abort();
+    Ok(())
+}
+
+/// Helper: GetChunk stream → flatten to bytes.
+async fn collect_get_chunk(
+    client: &mut ChunkServiceClient<Channel>,
+    digest: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut stream = client
+        .get_chunk(GetChunkRequest { digest })
+        .await?
+        .into_inner();
+    let mut out = Vec::new();
+    while let Some(resp) = stream.message().await? {
+        out.extend_from_slice(&resp.data);
+    }
+    Ok(out)
 }
