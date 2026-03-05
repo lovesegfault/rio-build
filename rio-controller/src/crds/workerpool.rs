@@ -58,12 +58,15 @@ pub struct WorkerPoolSpec {
     /// this — unbounded workers on a shared node is a noisy-
     /// neighbor risk.
     ///
-    /// schemars(with): k8s-openapi types don't impl JsonSchema
-    /// (kube-rs doesn't own them). `Value` = "whatever the K8s
-    /// OpenAPI schema says." The apiserver validates against its
-    /// own schema; we just pass through.
+    /// schemars(schema_with): k8s-openapi types don't impl
+    /// JsonSchema. `any_object` emits `type: object` +
+    /// `x-kubernetes-preserve-unknown-fields: true` — the
+    /// apiserver validates against its OWN schema (it knows
+    /// ResourceRequirements), we just tell it "object, don't
+    /// strip unknowns." `serde_json::Value` emitted `{}` which
+    /// the apiserver REJECTS (`type: Required value`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<serde_json::Value>")]
+    #[schemars(schema_with = "crate::crds::any_object")]
     pub resources: Option<ResourceRequirements>,
 
     /// Maximum concurrent builds per worker pod. Maps to
@@ -118,7 +121,7 @@ pub struct WorkerPoolSpec {
     /// node_selector: tolerate the `rio.build/worker:NoSchedule`
     /// taint so workers (and only workers) land on those nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<Vec<serde_json::Value>>")]
+    #[schemars(schema_with = "crate::crds::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
     /// Run the worker container privileged. None/false = the
@@ -225,7 +228,7 @@ pub struct WorkerPoolStatus {
     /// AtMaxCapacity. Helps operators see WHY replicas is what
     /// it is ("at max, queue still deep" → raise spec.replicas.max).
     #[serde(default)]
-    #[schemars(with = "Vec<serde_json::Value>")]
+    #[schemars(schema_with = "crate::crds::any_object_array")]
     pub conditions: Vec<Condition>,
 }
 

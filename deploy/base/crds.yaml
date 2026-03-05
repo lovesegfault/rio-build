@@ -182,10 +182,16 @@ spec:
                   this — unbounded workers on a shared node is a noisy-
                   neighbor risk.
 
-                  schemars(with): k8s-openapi types don't impl JsonSchema
-                  (kube-rs doesn't own them). `Value` = "whatever the K8s
-                  OpenAPI schema says." The apiserver validates against its
-                  own schema; we just pass through.
+                  schemars(schema_with): k8s-openapi types don't impl
+                  JsonSchema. `any_object` emits `type: object` +
+                  `x-kubernetes-preserve-unknown-fields: true` — the
+                  apiserver validates against its OWN schema (it knows
+                  ResourceRequirements), we just tell it "object, don't
+                  strip unknowns." `serde_json::Value` emitted `{}` which
+                  the apiserver REJECTS (`type: Required value`).
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
               sizeClass:
                 default: ''
                 description: |-
@@ -213,7 +219,9 @@ spec:
                   Tolerations for the StatefulSet pod spec. Pairs with
                   node_selector: tolerate the `rio.build/worker:NoSchedule`
                   taint so workers (and only workers) land on those nodes.
-                items: {}
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
                 nullable: true
                 type: array
             required:
@@ -238,7 +246,10 @@ spec:
                   Standard K8s Conditions. ScalingActive / AtMinCapacity /
                   AtMaxCapacity. Helps operators see WHY replicas is what
                   it is ("at max, queue still deep" → raise spec.replicas.max).
-                items: {}
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                nullable: true
                 type: array
               desiredReplicas:
                 default: 0
@@ -385,7 +396,10 @@ spec:
                   Building / Succeeded / Failed. Each with
                   lastTransitionTime + reason + message. Succeeded and
                   Failed are terminal and mutually exclusive.
-                items: {}
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                nullable: true
                 type: array
               phase:
                 default: ''

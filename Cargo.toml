@@ -137,6 +137,15 @@ ordered-float = "5"
 # #[derive(CustomResource)] + #[kube(...)]. client = kube::Client::try_default
 # reads in-cluster service-account token.
 kube = { version = "3.0", features = ["runtime", "derive", "client"] }
+# rustls direct: kube pulls it via hyper-rustls (ring feature), aws-sdk
+# pulls it via aws-lc-rs feature. With BOTH features active, rustls 0.23
+# can't auto-select a CryptoProvider → panic at first TLS use. Binaries
+# that use both (rio-controller: kube + rio-proto which has aws-sdk
+# transitively) must call install_default() early. Direct dep lets us
+# access rustls::crypto without relying on transitive re-exports.
+rustls = { version = "0.23", default-features = false, features = [
+  "aws-lc-rs",
+] }
 # k8s-openapi types are feature-gated by K8s API version. v1_35 is the
 # highest this release supports. The feature pins which struct fields
 # exist (e.g., ephemeralContainers moved GA in different versions).
