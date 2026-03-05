@@ -54,6 +54,7 @@
 pub mod crds;
 pub mod error;
 pub mod reconcilers;
+pub mod scaling;
 
 pub use crds::build::{Build, BuildSpec, BuildStatus};
 pub use crds::workerpool::{WorkerPool, WorkerPoolSpec, WorkerPoolStatus};
