@@ -364,6 +364,251 @@ async fn test_generation_starts_at_one_not_zero() -> TestResult {
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// B3: PrefetchHint before WorkAssignment
+// -----------------------------------------------------------------------------
+
+/// PrefetchHint arrives BEFORE the WorkAssignment on the stream.
+/// Worker starts warming while still parsing the .drv — a few
+/// seconds of head start on multi-minute fetches.
+///
+/// Setup: two-node chain (child → parent). Dispatch the parent;
+/// the hint should contain the child's output path (parent's input).
+/// The child itself is a leaf (no children → no hint → the first
+/// message for it IS the assignment).
+#[tokio::test]
+async fn test_prefetch_hint_before_assignment() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+
+    // Two-node chain: child (leaf) → parent (depends on child).
+    // merge_dag edges point parent→child (parent's input is child's output).
+    //
+    // make_test_node leaves expected_output_paths EMPTY by default —
+    // most tests don't care about it. approx_input_closure DOES care
+    // (that's what it iterates). Populate explicitly.
+    let child_out = rio_test_support::fixtures::test_store_path("child-out");
+    let mut child = make_test_node("child", "x86_64-linux");
+    child.expected_output_paths = vec![child_out.clone()];
+    let parent = make_test_node("parent", "x86_64-linux");
+    let edge = make_test_edge("parent", "child");
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![edge],
+        false,
+    )
+    .await?;
+
+    // First message: child is a leaf (no DAG children → no inputs
+    // to prefetch → send_prefetch_hint early-returns). So the FIRST
+    // thing we get is the child's Assignment.
+    let first = rx.recv().await.expect("first message");
+    match first.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => {
+            assert!(
+                a.drv_path.contains("child"),
+                "leaf dispatches first (no deps), no hint precedes it: {a:?}"
+            );
+        }
+        other => panic!("expected Assignment for leaf child, got {other:?}"),
+    }
+
+    // Complete the child so parent becomes ready.
+    complete_success_empty(&handle, "w1", "child").await?;
+
+    // Parent has one child in the DAG (the completed "child"). Its
+    // approx_input_closure = child's expected_output_paths. Worker
+    // has no bloom → pessimistic → send all. Hint arrives FIRST.
+    let second = rx.recv().await.expect("prefetch hint");
+    let hint = match second.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => h,
+        other => panic!("expected PrefetchHint before parent's Assignment, got {other:?}"),
+    };
+    assert_eq!(
+        hint.store_paths,
+        vec![child_out],
+        "hint = child's output path (parent's direct input via DAG children)"
+    );
+
+    // THEN the assignment.
+    let third = rx.recv().await.expect("parent assignment");
+    match third.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => {
+            assert!(a.drv_path.contains("parent"));
+        }
+        other => panic!("expected Assignment after hint, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+/// Bloom filter skips paths the worker claims to have. Scoring and
+/// hinting use the SAME approx_input_closure — so if scoring picks
+/// a warm worker (most paths cached), the hint should be SMALL
+/// (only what's actually missing). That's the optimization working
+/// together.
+///
+/// We construct a bloom that claims to have ONE of two input paths.
+/// The hint should contain only the OTHER.
+#[tokio::test]
+async fn test_prefetch_hint_bloom_filters() -> TestResult {
+    use rio_common::bloom::BloomFilter;
+
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+
+    // Three-node: parent depends on child_a AND child_b. After
+    // both complete, parent dispatches with 2 input paths.
+    let out_a = rio_test_support::fixtures::test_store_path("ca-out");
+    let out_b = rio_test_support::fixtures::test_store_path("cb-out");
+    let mut child_a = make_test_node("ca", "x86_64-linux");
+    child_a.expected_output_paths = vec![out_a.clone()];
+    let mut child_b = make_test_node("cb", "x86_64-linux");
+    child_b.expected_output_paths = vec![out_b.clone()];
+    let parent = make_test_node("parent", "x86_64-linux");
+    let edges = vec![
+        make_test_edge("parent", "ca"),
+        make_test_edge("parent", "cb"),
+    ];
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child_a, child_b, parent],
+        edges,
+        false,
+    )
+    .await?;
+
+    // Drain leaf assignments (2 children, no hints — leaves).
+    // Order nondeterministic (same priority, HashMap iteration).
+    for _ in 0..2 {
+        let msg = rx.recv().await.expect("leaf assignment");
+        assert!(matches!(
+            msg.msg,
+            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
+        ));
+    }
+
+    // ORDER MATTERS: bloom heartbeat BEFORE the last completion.
+    // complete_success fires dispatch_ready internally; if parent
+    // becomes ready then, it dispatches with whatever bloom the
+    // worker had AT THAT MOMENT. Send the bloom first, so when
+    // the second completion makes parent ready, the filter is live.
+    //
+    // Complete ONE child first (parent not yet ready — still
+    // waiting on cb).
+    complete_success_empty(&handle, "w1", "ca").await?;
+
+    // Now the bloom. Size for 10 items at 1% FPR — way bigger than
+    // needed for 1 insert, so false positives on out_b are
+    // astronomically unlikely.
+    let mut bloom = BloomFilter::new(10, 0.01);
+    bloom.insert(&out_a);
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            worker_id: "w1".into(),
+            system: "x86_64-linux".into(),
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+            bloom: Some(bloom),
+            size_class: None,
+        })
+        .await?;
+
+    // NOW the second completion. Parent becomes ready → dispatch
+    // fires → send_prefetch_hint reads the bloom we just sent.
+    complete_success_empty(&handle, "w1", "cb").await?;
+
+    // Parent dispatches.
+    // Hint should skip out_a (bloom says worker has it), include
+    // out_b (bloom says missing).
+    let hint_msg = rx.recv().await.expect("filtered hint");
+    let hint = match hint_msg.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => h,
+        other => panic!("expected filtered PrefetchHint, got {other:?}"),
+    };
+    assert_eq!(
+        hint.store_paths,
+        vec![out_b],
+        "bloom filtered out_a (worker has it); hint only out_b. \
+         If both present: filter not applied. If only out_a: filter inverted."
+    );
+
+    Ok(())
+}
+
+/// Worker with a bloom claiming EVERYTHING → empty filtered set →
+/// no hint message at all. This is the best case: best_worker picked
+/// a fully-warm worker, nothing to prefetch. Saves one try_send.
+#[tokio::test]
+async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
+    use rio_common::bloom::BloomFilter;
+
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+
+    let child_out = rio_test_support::fixtures::test_store_path("child-out");
+    let mut child = make_test_node("child", "x86_64-linux");
+    child.expected_output_paths = vec![child_out.clone()];
+    let parent = make_test_node("parent", "x86_64-linux");
+    let edge = make_test_edge("parent", "child");
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![edge],
+        false,
+    )
+    .await?;
+
+    // Drain child's assignment (leaf).
+    let _ = rx.recv().await.expect("child assignment");
+
+    // Bloom BEFORE completion (same ordering as the filter test —
+    // completion fires dispatch, so bloom must be in place first).
+    let mut bloom = BloomFilter::new(10, 0.01);
+    bloom.insert(&child_out);
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            worker_id: "w1".into(),
+            system: "x86_64-linux".into(),
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+            bloom: Some(bloom),
+            size_class: None,
+        })
+        .await?;
+
+    // NOW complete. Parent ready → dispatch → hint filtered → empty
+    // → not sent.
+    complete_success_empty(&handle, "w1", "child").await?;
+
+    // Parent dispatches. Hint filtered to empty → NOT sent. First
+    // message is the Assignment directly.
+    let msg = rx.recv().await.expect("parent message");
+    match msg.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => {
+            assert!(
+                a.drv_path.contains("parent"),
+                "no hint when bloom covers all inputs — straight to Assignment"
+            );
+        }
+        Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => {
+            panic!(
+                "hint sent despite bloom covering all inputs: {h:?}. \
+                 Empty-hint early-return in send_prefetch_hint not working."
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    Ok(())
+}
+
 /// Two assignments within the same dispatch pass carry the same
 /// generation. This is the single-load-per-assignment guarantee —
 /// without a lease writer, it's trivially true (nothing changes
