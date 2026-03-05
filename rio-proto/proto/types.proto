@@ -30,6 +30,25 @@ message DerivationNode {
   // that won't build. Per-node ≤64KB (gateway enforces); scheduler
   // validates ≤256KB defensively. 16MB total budget across the DAG.
   bytes drv_content = 9;
+
+  // Sum of nar_sizes of this derivation's input_srcs (static source
+  // paths referenced by the .drv, NOT inputDrvs — those are covered
+  // by the DAG edges). Populated by gateway batch QueryPathInfo after
+  // reconstruct_dag. Used by Estimator fallback #2.5: a derivation
+  // with 10GB of sources probably takes longer than one with 100MB —
+  // the "closure-size-as-proxy" when no build_history exists yet.
+  //
+  // 0 = no-signal: either no input_srcs (pure inputDrv chain, common),
+  // or QueryPathInfo failed (store transient — best-effort, gateway
+  // logs and continues). The estimator treats 0 as "skip this
+  // fallback, use the 30s default."
+  //
+  // This is input_srcs ONLY, not transitive closure. Transitive
+  // would need a full QueryPathInfo BFS (N RPCs, slow on big DAGs).
+  // Direct srcs is one batched call and covers the "big source
+  // tarball → probably long build" signal, which is the main case
+  // where this fallback helps (fresh (pname,system) with no history).
+  uint64 input_srcs_nar_size = 10;
 }
 
 // A dependency edge in the derivation DAG.
