@@ -500,6 +500,12 @@ fn build_pod_spec(
 ) -> PodSpec {
     PodSpec {
         containers: vec![build_container(wp, scheduler_addr, cache_gb)],
+        // hostNetwork from spec. None → K8s default (false).
+        // Some(false) → explicit false (same effect). Some(true)
+        // → pod shares node netns. `or` not `unwrap_or`: we want
+        // the PodSpec field to be None (not Some(false)) when
+        // unset — less diff noise in `kubectl get -o yaml`.
+        host_network: wp.spec.host_network.filter(|&h| h),
 
         volumes: Some(vec![
             // /dev/fuse character device. hostPath not because
@@ -622,6 +628,14 @@ fn build_container(wp: &WorkerPool, scheduler_addr: &str, cache_gb: u64) -> Cont
         ]),
 
         security_context: Some(SecurityContext {
+            // Granular caps are the default. privileged=true
+            // overrides — it disables seccomp and grants ALL
+            // caps (the capabilities list below becomes
+            // irrelevant but harmless). Set BOTH: if an
+            // operator flips privileged back to false later,
+            // the caps are still there and the pod keeps
+            // working.
+            privileged: wp.spec.privileged.filter(|&p| p),
             capabilities: Some(Capabilities {
                 add: Some(vec!["SYS_ADMIN".into(), "SYS_CHROOT".into()]),
                 ..Default::default()
@@ -783,6 +797,8 @@ mod tests {
             image: "rio-worker:test".into(),
             node_selector: None,
             tolerations: None,
+            privileged: None,
+            host_network: None,
         };
         let mut wp = WorkerPool::new("test-pool", spec);
         // UID + namespace: controller_owner_ref needs these. In
