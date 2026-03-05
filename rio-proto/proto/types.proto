@@ -166,14 +166,24 @@ message CompletionReport {
   BuildResult result = 2;                  // Build result details
   string assignment_token = 3;             // From the WorkAssignment
 
-  // Peak memory (RSS) in bytes, sampled from /proc/{pid}/status VmHWM at
-  // build end. VmHWM is kernel-tracked process-lifetime peak — no polling
-  // needed, one read. Feeds into build_history.ema_peak_memory_bytes for
-  // size-class memory-bump decisions: a derivation that fits the "small"
-  // duration class but historically OOM-kills on small workers gets bumped.
+  // Peak memory in bytes from the per-build cgroup's memory.peak
+  // (cgroup v2). Kernel-tracked lifetime peak of the WHOLE process
+  // tree under nix-daemon — the daemon itself + the builder it forks
+  // + every compiler sub-process. One read at build end, no polling.
   //
-  // 0 means "couldn't read" (proc gone before we sampled, or build failed
-  // before the daemon spawned). Scheduler treats 0 as "no signal" — the EMA
+  // Prior to phase3a this read /proc/{daemon_pid}/status VmHWM, which
+  // measured nix-daemon's RSS (~10MB regardless of builder memory —
+  // the daemon forks the builder and waitpid()s, so the builder's
+  // footprint never appeared in daemon's /proc). cgroup memory.peak
+  // fixes that: it captures the TREE, not a single PID.
+  //
+  // Feeds build_history.ema_peak_memory_bytes for size-class
+  // memory-bump: a derivation that fits the "small" duration class
+  // but historically OOMs on small workers gets bumped to medium.
+  //
+  // 0 means "couldn't read" — cgroup setup failed (see
+  // resource_metrics_degraded below), or build failed before the
+  // cgroup was populated. Scheduler treats 0 as no-signal: EMA
   // keeps its prior value, doesn't drag toward zero.
   uint64 peak_memory_bytes = 4;
 
@@ -182,10 +192,29 @@ message CompletionReport {
   // yet — informational for dashboards / capacity planning.
   uint64 output_size_bytes = 5;
 
-  // TODO(phase3a): peak_cpu_cores. CPU% needs polling during the build
-  // (VmHWM is a one-shot read at the end; there's no CpuHWM equivalent).
-  // The build_history.ema_peak_cpu_cores column exists (migration 006)
-  // but stays NULL until the worker-side poller lands.
+  // Peak CPU usage in cores-equivalent, sampled 1Hz from the
+  // per-build cgroup's cpu.stat usage_usec. Unlike memory, there's
+  // no kernel-tracked "peak CPU" — usage_usec is cumulative, so the
+  // worker polls it every second and computes:
+  //
+  //   cores = (usage_usec_now - usage_usec_prev) / elapsed_usec
+  //
+  // Max over the build's lifetime. Cumulative over the whole tree
+  // (cgroup semantics), so a parallel make -j8 that pins 8 cores
+  // reports ~8.0. Feeds build_history.ema_peak_cpu_cores for
+  // potential future size-class CPU-bump (not wired yet).
+  //
+  // 0.0 = build failed before the cgroup was populated (executor
+  // error before spawn, or daemon exited too fast to poll). Same
+  // sentinel as peak_memory_bytes=0 — scheduler treats it as
+  // no-signal, EMA keeps prior. double not uint: fractional cores
+  // are real (a build that averages 2.5 cores is useful to know).
+  //
+  // cgroup v2 is a HARD REQUIREMENT. Worker fails startup if
+  // /sys/fs/cgroup isn't cgroup2fs or the subtree isn't delegated.
+  // No degraded-mode flag — if you see a worker pod Running, the
+  // cgroup setup succeeded.
+  double peak_cpu_cores = 6;
 }
 
 // Result of building a single derivation.

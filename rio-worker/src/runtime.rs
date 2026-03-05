@@ -181,8 +181,8 @@ pub async fn spawn_build_task(
         )
         .await;
 
-        // Send CompletionReport. peak_memory_bytes (VmHWM) and
-        // output_size_bytes flow from the executor.
+        // Send CompletionReport. Resource fields flow from the executor
+        // (cgroup memory.peak + polled cpu.stat — wired in I2).
         let completion = match result {
             Ok(exec_result) => CompletionReport {
                 drv_path: exec_result.drv_path,
@@ -190,6 +190,10 @@ pub async fn spawn_build_task(
                 assignment_token: exec_result.assignment_token,
                 peak_memory_bytes: exec_result.peak_memory_bytes,
                 output_size_bytes: exec_result.output_size_bytes,
+                // I2 adds ExecutionResult.peak_cpu_cores. Until then:
+                // 0.0 = no-signal (scheduler's 0→None mapping keeps
+                // the EMA stable). One-commit window — I2 lands next.
+                peak_cpu_cores: 0.0,
             },
             Err(e) => {
                 tracing::error!(
@@ -205,8 +209,11 @@ pub async fn spawn_build_task(
                         ..Default::default()
                     }),
                     assignment_token,
+                    // Executor error → cgroup never populated.
+                    // All resource fields = 0 = no-signal.
                     peak_memory_bytes: 0,
                     output_size_bytes: 0,
+                    peak_cpu_cores: 0.0,
                 }
             }
         };
@@ -245,9 +252,11 @@ pub async fn spawn_build_task(
                     ..Default::default()
                 }),
                 assignment_token: panic_token,
-                // Panic = no VmHWM to read. 0 = "no signal".
+                // Panic = cgroup file descriptor likely dropped mid-
+                // read, or we never got past spawn. 0 = no-signal.
                 peak_memory_bytes: 0,
                 output_size_bytes: 0,
+                peak_cpu_cores: 0.0,
             };
             let msg = WorkerMessage {
                 msg: Some(worker_message::Msg::Completion(completion)),
