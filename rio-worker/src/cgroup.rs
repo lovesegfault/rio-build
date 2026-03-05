@@ -181,17 +181,84 @@ impl Drop for BuildCgroup {
     }
 }
 
-/// Find the worker process's own cgroup.
+/// Find the delegated cgroup ROOT for per-build sub-cgroups.
+///
+/// This is the PARENT of the worker process's own cgroup. Why parent:
+///
+/// With systemd `DelegateSubgroup=builds`, the worker process runs in
+/// `.../rio-worker.service/builds/`. `/proc/self/cgroup` points there.
+/// But cgroup v2's no-internal-processes rule means `.../builds/`
+/// cannot have BOTH the worker process AND sub-cgroups with enabled
+/// controllers. So per-build cgroups go in `.../rio-worker.service/`
+/// (the PARENT) as SIBLINGS of `builds/`. The service cgroup is
+/// empty (DelegateSubgroup moved the worker out), so enabling
+/// controllers on it succeeds.
+///
+/// Layout:
+/// ```text
+/// .../rio-worker.service/         ← delegated_root() returns THIS
+///   cgroup.subtree_control        ← enable_subtree_controllers writes here (empty cgroup, no EBUSY)
+///   builds/                       ← DelegateSubgroup; /proc/self/cgroup points here
+///     cgroup.procs                ← worker PID
+///   <drv-hash>/                   ← BuildCgroup::create per build (SIBLING of builds/)
+///     cgroup.procs                ← nix-daemon PID
+///     memory.peak, cpu.stat       ← resource tracking
+/// ```
+///
+/// In K8s pods: same shape. kubelet puts the container in a sub-cgroup
+/// of the pod cgroup; `/proc/self/cgroup` points to the container
+/// cgroup; the parent is the pod cgroup (empty, just a hierarchy
+/// node). Per-build cgroups become siblings of the container.
+///
+/// Fails if:
+/// - `/proc/self/cgroup` is cgroup v1 format (multiple lines)
+/// - the parent path doesn't exist or isn't a cgroup
+/// - we're in the ROOT cgroup (no parent — unusual, means running
+///   outside systemd/containers)
+///
+/// All mean cgroup v2 isn't properly set up. Hard error — startup fails.
+pub fn delegated_root() -> io::Result<PathBuf> {
+    let content = fs::read_to_string("/proc/self/cgroup")?;
+    let own = parse_own_cgroup(&content)?;
+
+    // Parent. If we're in the root cgroup (`/sys/fs/cgroup` itself),
+    // .parent() returns `/sys/fs` which is NOT a cgroup. Catch this
+    // explicitly — running outside any cgroup hierarchy is a config
+    // problem (no systemd, no container runtime).
+    let parent = own.parent().ok_or_else(|| {
+        io::Error::other(
+            "worker is in the root cgroup (no parent) — \
+             rio-worker expects to run under systemd with Delegate=yes + \
+             DelegateSubgroup=, or inside a container. \
+             Running as a bare process is not supported.",
+        )
+    })?;
+
+    // The parent() of /sys/fs/cgroup is /sys/fs — catch that too.
+    // Check that parent has cgroup.controllers (proves it IS a cgroup).
+    if !parent.join("cgroup.controllers").exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "parent of own cgroup ({}) is not a cgroup \
+                 (missing cgroup.controllers). Worker's own cgroup: {}. \
+                 Likely running in the root cgroup — configure systemd \
+                 Delegate=yes + DelegateSubgroup= on the rio-worker unit.",
+                parent.display(),
+                own.display()
+            ),
+        ));
+    }
+
+    Ok(parent.to_path_buf())
+}
+
+/// Find the worker process's own cgroup (where `/proc/self/cgroup`
+/// points). Most callers want [`delegated_root`] instead — this is
+/// exposed for diagnostics/tests.
 ///
 /// `/proc/self/cgroup` on cgroup v2 is a single line `0::/<path>`.
 /// Join with `/sys/fs/cgroup` to get the filesystem path.
-///
-/// Fails if:
-/// - the file format is cgroup v1 (multiple lines with subsystems)
-/// - `/sys/fs/cgroup/<path>` doesn't exist (mount issue)
-///
-/// Both mean cgroup v2 isn't properly set up. Hard error — the
-/// worker main.rs propagates with `?` and startup fails.
 pub fn own_cgroup() -> io::Result<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup")?;
     let path = parse_own_cgroup(&content)?;

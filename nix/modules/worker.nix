@@ -150,6 +150,40 @@ in
         # Allow opening /dev/fuse (device cgroup allowlist; DevicePolicy=auto
         # so pseudo-devices like /dev/null are always allowed).
         DeviceAllow = [ "/dev/fuse rw" ];
+
+        # cgroup v2 per-build resource tracking. The worker creates a
+        # sub-cgroup per build and moves the spawned nix-daemon into
+        # it. memory.peak + polled cpu.stat give tree-wide peak memory
+        # and CPU (fixes the phase2c bug where VmHWM measured ~10MB
+        # nix-daemon RSS instead of the builder's actual footprint).
+        #
+        # Delegate=yes: grants the service ownership of its cgroup
+        # subtree. Without this, cgroup.subtree_control writes fail
+        # EACCES and the worker DIES AT STARTUP (cgroup v2 is a hard
+        # requirement — no broken-metrics fallback).
+        #
+        # DelegateSubgroup=builds: systemd v254+. cgroup v2 forbids a
+        # cgroup having BOTH processes AND sub-cgroups with enabled
+        # controllers (the "no internal processes" rule). This makes
+        # systemd run the worker in a `builds/` SUB-cgroup of the
+        # service cgroup, leaving the service cgroup EMPTY.
+        #
+        # The worker's delegated_root() reads /proc/self/cgroup (which
+        # points to `.../builds/`) and returns the PARENT
+        # (`.../rio-worker.service/`). Per-build cgroups are created
+        # there as SIBLINGS of `builds/` — the service cgroup is
+        # empty, so enabling +memory +cpu on it succeeds; `builds/`
+        # has the worker process but no controller-enabled children
+        # (per-build cgroups are not under it). No rule violation.
+        #
+        # /sys/fs/cgroup/system.slice/rio-worker.service/:
+        #   cgroup.subtree_control  ← worker writes "+memory +cpu" (EMPTY cgroup: no EBUSY)
+        #   builds/                 ← DelegateSubgroup; worker PID lives here
+        #   <drv-hash>/             ← per-build SIBLING (nix-daemon PID → forks builder)
+        #     memory.peak           ← tree-wide peak, read at build end
+        #     cpu.stat              ← tree-wide cumulative, polled 1Hz
+        Delegate = "yes";
+        DelegateSubgroup = "builds";
         # Worker connects to scheduler at startup; scheduler might not be
         # ready yet (remote host, no `After=` ordering across machines).
         # Retry on failure with backoff.
