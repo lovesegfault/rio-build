@@ -3,10 +3,9 @@
 # Milestone (docs/src/phases/phase2c.md:32):
 #   Chunk dedup ratio > 30% on nixpkgs rebuild; scheduling latency p99 < 5s.
 #
-# Chunk dedup + binary cache HTTP are LIBRARY-complete (C1-C6, B1-B3
-# all unit/integration tested) but main.rs wiring is deferred to
-# phase3a per TODO(phase3a) at rio-store/src/main.rs:159. This VM test
-# validates what IS observable end-to-end:
+# Chunk dedup + binary cache HTTP: main.rs wiring landed in phase3a
+# (A2). This VM test enables the filesystem chunk backend and asserts
+# the dedup metric after a build. Validates end-to-end:
 #
 #   1. Size-class config load: cutoff_seconds gauge from /etc/rio/scheduler.toml
 #   2. Critical-path priority: chain-a dispatched before standalone solo
@@ -66,6 +65,20 @@ pkgs.testers.runNixOSTest {
         # Short tick = faster estimator refresh. Default 10s × 6 = 60s
         # wait for estimator; 2s × 6 = 12s is tolerable for a VM test.
         tickIntervalSecs = 2;
+      };
+      extraStoreConfig = {
+        # [chunk_backend] via /etc/rio/store.toml (same figment
+        # pattern as scheduler size_classes). Env vars don't express
+        # serde internally-tagged enums cleanly.
+        #
+        # /var/lib/rio/store is StateDirectory (systemd creates it
+        # with proper ownership). FilesystemChunkBackend::new creates
+        # the chunks/ subdir + 256-way fanout at startup.
+        extraConfig = ''
+          [chunk_backend]
+          kind = "filesystem"
+          base_dir = "/var/lib/rio/store/chunks"
+        '';
       };
       # 9090-9092: Prometheus metrics ports.
       extraFirewallPorts = [
@@ -248,5 +261,34 @@ pkgs.testers.runNixOSTest {
         "sudo -u postgres psql rio -t -c 'SELECT count(*) FROM content_index'"
     ).strip()
     assert int(ci_count) > 0, f"content_index should have entries after builds; got {ci_count}"
+
+    # ── A3: chunk backend wired (main.rs A2 landed) ──────────────────
+    # The filesystem backend is enabled via extraStoreConfig above.
+    # After the builds, there should be chunks on disk. Not asserting
+    # a specific dedup ratio (VM test builds are tiny, mostly-unique
+    # scripts — meaningful dedup needs real nixpkgs overlap). Just
+    # prove the wiring: chunks/ has content.
+    #
+    # `find -type f | wc -l` > 0: at least one chunk written. The
+    # chunks table in PG would also prove this, but checking DISK
+    # proves the filesystem backend path specifically (not inline).
+    chunk_count = control.succeed(
+        "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
+    ).strip()
+    assert int(chunk_count) > 0, (
+        f"filesystem chunk backend should have written chunks to "
+        f"/var/lib/rio/store/chunks; got {chunk_count} files. "
+        f"Either backend not wired, or all NARs were under "
+        f"INLINE_THRESHOLD (256 KiB)."
+    )
+
+    # The dedup metric should also be present (non-zero is fine,
+    # even if ratio is low — proves the gauge is registered and
+    # the chunked PutPath path ran at least once).
+    metrics = control.succeed("curl -s http://localhost:9092/metrics")
+    assert "rio_store_chunk_dedup_ratio" in metrics, (
+        "rio_store_chunk_dedup_ratio metric should be exported "
+        "(chunked PutPath path ran)"
+    )
   '';
 }

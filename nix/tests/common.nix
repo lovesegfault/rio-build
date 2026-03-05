@@ -105,6 +105,9 @@ rec {
       # Merged into services.rio.scheduler via // — phase2c passes
       # extraConfig + tickIntervalSecs for size-class TOML routing.
       extraSchedulerConfig ? { },
+      # Merged into services.rio.store via // — phase2c (post-A3)
+      # passes extraConfig for [chunk_backend] TOML.
+      extraStoreConfig ? { },
       # Appended to the base set [ 2222 9001 9002 ]. phase2a/2c open
       # metrics ports; phase2b also opens Tempo's OTLP + query ports.
       extraFirewallPorts ? [ ],
@@ -128,7 +131,8 @@ rec {
         store = {
           enable = true;
           inherit databaseUrl;
-        };
+        }
+        // extraStoreConfig;
         scheduler = {
           enable = true;
           storeAddr = "localhost:9002";
