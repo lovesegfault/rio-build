@@ -26,6 +26,7 @@ pub mod dag;
 pub mod db;
 pub(crate) mod estimator;
 pub mod grpc;
+pub mod lease;
 pub mod logs;
 pub(crate) mod queue;
 pub mod state;

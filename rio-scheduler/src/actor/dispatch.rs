@@ -9,6 +9,15 @@ impl DagActor {
 
     /// Dispatch ready derivations to available workers (FIFO).
     pub(super) async fn dispatch_ready(&mut self) {
+        // Standby scheduler: merge DAGs (state warm for fast
+        // takeover) but DON'T dispatch. The lease task flips this
+        // on acquire/lose. Relaxed load: a one-pass lag either way
+        // is harmless (see DagActor.is_leader field doc). In non-
+        // K8s mode this is always true — no-op check.
+        if !self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
         // Drain the queue, dispatching eligible derivations and deferring
         // ineligible ones. Previously, `None => break` on the first ineligible
         // derivation blocked all subsequent work (e.g., an aarch64 drv at

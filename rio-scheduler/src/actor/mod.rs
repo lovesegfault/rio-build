@@ -436,6 +436,17 @@ pub struct DagActor {
     /// A dropped final-flush is a downgrade to "periodic snapshot only"
     /// for that one derivation, not a hang.
     log_flush_tx: Option<mpsc::Sender<crate::logs::FlushRequest>>,
+    /// Leader flag from the lease task. `dispatch_ready` early-
+    /// returns if false → standby schedulers merge DAGs (state
+    /// stays warm) but don't send assignments. Default `true` for
+    /// non-K8s mode (no lease task = always leader).
+    ///
+    /// Relaxed load: it's a standalone flag with no other state to
+    /// synchronize. A one-pass lag on false→true is harmless (next
+    /// dispatch pass works); true→false means one lame-duck
+    /// dispatch (idempotent — workers reject stale-gen assignments
+    /// after the new leader increments).
+    is_leader: Arc<AtomicBool>,
 }
 
 impl DagActor {
@@ -465,6 +476,9 @@ impl DagActor {
             self_tx: None,
             size_classes: Vec::new(),
             log_flush_tx: None,
+            // Default true: non-K8s mode, always leader.
+            // with_leader_flag() overrides for K8s deployments.
+            is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -733,8 +747,27 @@ impl DagActor {
         GenerationReader::new(self.generation.clone())
     }
 
-    // C2 adds `generation_arc() -> Arc<AtomicU64>` for the lease task's
-    // write access. Deferred to avoid dead_code warning in the interim.
+    /// Inject the shared `is_leader` flag. The lease task writes;
+    /// `dispatch_ready` reads. Builder-style — call before
+    /// `run_with_self_tx`. Default (no call) is `true` (non-K8s
+    /// mode: always leader).
+    pub fn with_leader_flag(mut self, is_leader: Arc<AtomicBool>) -> Self {
+        self.is_leader = is_leader;
+        self
+    }
+
+    /// Inject the shared generation Arc. The lease task writes
+    /// via `fetch_add`; dispatch reads for WorkAssignment;
+    /// ActorHandle reads for HeartbeatResponse. REPLACES the
+    /// default `Arc::new(AtomicU64::new(1))` — caller initializes
+    /// to 1 too so behavior is identical, but now shared.
+    ///
+    /// Paired with `with_leader_flag` — both come from the same
+    /// `LeaderState`. spawn_with_leader calls both.
+    pub fn with_generation(mut self, generation: Arc<AtomicU64>) -> Self {
+        self.generation = generation;
+        self
+    }
 
     /// Compute counts for `AdminService.ClusterStatus`.
     ///

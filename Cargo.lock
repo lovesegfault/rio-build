@@ -2959,6 +2959,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kube-leader-election"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6768feabf1008b50aa8b96835865b5d18971e031de74d9f29d1c1061571c9283"
+dependencies = [
+ "jiff",
+ "k8s-openapi",
+ "kube",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "kube-runtime"
 version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4558,7 +4573,11 @@ dependencies = [
  "aws-smithy-mocks",
  "clap",
  "dashmap",
+ "figment",
  "flate2",
+ "k8s-openapi",
+ "kube",
+ "kube-leader-election",
  "metrics",
  "ordered-float 5.1.0",
  "prost-types",
