@@ -251,6 +251,13 @@ async fn main() -> anyhow::Result<()> {
     // Clone for the health toggle loop (C3) BEFORE moving into spawn.
     let is_leader_for_health = leader.is_leader.clone();
 
+    // Spawn the event-log persister. Bounded mpsc + single drain
+    // task → FIFO write ordering (fire-and-forget spawns would
+    // race on the PG pool). emit_build_event try_sends here; if
+    // backed up, the broadcast still carries the event — only a
+    // mid-backlog gateway reconnect loses it.
+    let event_persist_tx = rio_scheduler::event_log::spawn(pool.clone());
+
     // Spawn the DAG actor — now with the shared leader state.
     let actor = ActorHandle::spawn_with_leader(
         db,
@@ -258,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
         log_flush_tx,
         cfg.size_classes,
         Some(leader),
+        Some(event_persist_tx),
     );
     info!("DAG actor spawned");
 

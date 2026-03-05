@@ -39,6 +39,7 @@ metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 rio-nix = { workspace = true }
 

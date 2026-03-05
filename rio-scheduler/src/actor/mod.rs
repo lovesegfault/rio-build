@@ -447,6 +447,12 @@ pub struct DagActor {
     /// dispatch (idempotent — workers reject stale-gen assignments
     /// after the new leader increments).
     is_leader: Arc<AtomicBool>,
+    /// Channel to the event-log persister task. emit_build_event
+    /// try_sends (build_id, seq, prost-encoded BuildEvent) here
+    /// AFTER the broadcast. Event::Log is filtered out — those
+    /// flood PG (~20/sec chatty rustc) and S3 already durables
+    /// them via log_flush_tx. None in tests without PG.
+    event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
 }
 
 impl DagActor {
@@ -479,7 +485,20 @@ impl DagActor {
             // Default true: non-K8s mode, always leader.
             // with_leader_flag() overrides for K8s deployments.
             is_leader: Arc::new(AtomicBool::new(true)),
+            event_persist_tx: None,
         }
+    }
+
+    /// Inject the event-log persister channel. Call before
+    /// `run_with_self_tx`. Separate from `new()` (same rationale as
+    /// `with_log_flusher`): tests without PG leave it None →
+    /// emit_build_event skips the try_send, broadcast still works.
+    pub fn with_event_persister(
+        mut self,
+        tx: mpsc::Sender<crate::event_log::EventLogEntry>,
+    ) -> Self {
+        self.event_persist_tx = Some(tx);
+        self
     }
 
     /// Inject the log flusher channel. Call before `run_with_self_tx`.
@@ -838,15 +857,47 @@ impl DagActor {
     // -----------------------------------------------------------------------
 
     fn emit_build_event(&mut self, build_id: Uuid, event: rio_proto::types::build_event::Event) {
+        use rio_proto::types::build_event::Event;
+
         let seq = self.build_sequences.entry(build_id).or_insert(0);
         *seq += 1;
+        let seq = *seq;
 
         let build_event = rio_proto::types::BuildEvent {
             build_id: build_id.to_string(),
-            sequence: *seq,
+            sequence: seq,
             timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             event: Some(event),
         };
+
+        // Persist to PG for since_sequence replay. BEFORE the
+        // broadcast: the prost encode borrows build_event, and the
+        // broadcast consumes it. Ordering doesn't matter for
+        // correctness (the persister is a separate FIFO task; a
+        // watcher that subscribes between try_send and tx.send below
+        // still sees this event via broadcast).
+        //
+        // Event::Log filtered: ~20/sec under a chatty rustc would
+        // flood PG. Log lines are already durable via S3 (the
+        // LogFlusher, same pattern). Gateway reconnect cares about
+        // state-machine events (Started/Completed/Derivation*), not
+        // log lines — those it re-fetches from S3.
+        if let Some(tx) = &self.event_persist_tx
+            && !matches!(build_event.event, Some(Event::Log(_)))
+        {
+            use prost::Message;
+            let bytes = build_event.encode_to_vec();
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send((build_id, seq, bytes)) {
+                // Persister backed up (PG slow/down). The broadcast
+                // below still carries the event to live watchers;
+                // only a mid-backlog reconnect loses it. 1000 events
+                // of backlog = ~200s at steady-state — if we're
+                // here, PG is probably unreachable anyway.
+                metrics::counter!("rio_scheduler_event_persist_dropped_total").increment(1);
+            }
+            // Closed variant: persister task died. Don't spam the
+            // metric — spawn_monitored already logged the panic.
+        }
 
         if let Some(tx) = self.build_events.get(&build_id) {
             // broadcast::send returns Err only if there are no receivers, which is fine

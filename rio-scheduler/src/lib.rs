@@ -25,6 +25,7 @@ pub(crate) mod critical_path;
 pub mod dag;
 pub mod db;
 pub(crate) mod estimator;
+pub mod event_log;
 pub mod grpc;
 pub mod lease;
 pub mod logs;
@@ -150,5 +151,10 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_scheduler_cache_check_circuit_open_total",
         "Circuit-breaker open transitions (store unreachable for 5 consecutive checks); alert if > 0"
+    );
+    describe_counter!(
+        "rio_scheduler_event_persist_dropped_total",
+        "BuildEvents dropped from PG persister (channel backpressure). \
+         Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
     );
 }

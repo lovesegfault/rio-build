@@ -362,6 +362,30 @@ impl DagActor {
         if reaped > 0 {
             debug!(build_id = %build_id, reaped, "reaped orphaned terminal DAG nodes");
         }
+
+        // GC the persisted event log. Fire-and-forget: this is
+        // cleanup of replay state for a build that's already
+        // terminal — if PG is down the rows just age out via
+        // created_at (TODO(phase3b) time-based sweep on Tick).
+        // Spawned (not awaited in the actor loop): a slow PG
+        // doesn't stall the next command. Unlike emit_build_event's
+        // persister (which needs FIFO ordering), DELETE ordering
+        // doesn't matter — there are no writes for this build_id
+        // anymore (build_sequences just removed above).
+        //
+        // Skip if no persister configured (tests without PG).
+        if self.event_persist_tx.is_some() {
+            let pool = self.db.pool().clone();
+            tokio::spawn(async move {
+                if let Err(e) = sqlx::query("DELETE FROM build_event_log WHERE build_id = $1")
+                    .bind(build_id)
+                    .execute(&pool)
+                    .await
+                {
+                    debug!(build_id = %build_id, error = %e, "event-log GC failed (rows will age out)");
+                }
+            });
+        }
     }
 
     /// Compute build options for a derivation from its interested builds.
