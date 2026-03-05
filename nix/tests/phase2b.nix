@@ -97,7 +97,13 @@ pkgs.testers.runNixOSTest {
         tempo = {
           description = "Tempo trace backend for OTLP validation";
           wantedBy = [ "multi-user.target" ];
+          # after + wants together: 'after' alone produces an eval
+          # warning (unit ordered after a target it doesn't depend
+          # on). network-online.target is passive — nothing pulls it
+          # in unless a unit wants it. Without wants, the After= is
+          # a no-op (target never activates, ordering never applies).
           after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
           serviceConfig = {
             ExecStart = "${pkgs.tempo}/bin/tempo -config.file=/etc/tempo.yaml";
             StateDirectory = "tempo";
