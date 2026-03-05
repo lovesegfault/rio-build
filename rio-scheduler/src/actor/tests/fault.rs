@@ -48,6 +48,7 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
             },
             peak_memory_bytes: 0,
             output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
         })
         .await?;
 

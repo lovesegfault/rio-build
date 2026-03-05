@@ -495,6 +495,7 @@ impl WorkerService for SchedulerGrpc {
                                     result,
                                     peak_memory_bytes: report.peak_memory_bytes,
                                     output_size_bytes: report.output_size_bytes,
+                                    peak_cpu_cores: report.peak_cpu_cores,
                                 })
                                 .await
                                 .is_err()
