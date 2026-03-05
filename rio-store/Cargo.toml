@@ -27,6 +27,12 @@ tokio-stream = { workspace = true }
 # grpc.health.v1.Health for K8s readiness probes. SERVING after PG
 # migrations complete — before that, every store RPC would fail.
 tonic-health = { workspace = true }
+# Streaming zstd for the cache_server /nar/ route. Replaces buffered
+# encode_all (4GB peak for 4GB NAR) with O(chunk*K) pipeline.
+async-compression = { workspace = true }
+# StreamReader (Stream<Bytes> → AsyncRead) + ReaderStream (AsyncRead
+# → Stream<Bytes>). The round-trip lets zstd sit in the middle.
+tokio-util = { workspace = true }
 
 # Database
 sqlx = { workspace = true }

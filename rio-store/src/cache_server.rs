@@ -27,15 +27,19 @@
 
 use std::sync::Arc;
 
+use async_compression::tokio::bufread::ZstdEncoder;
 use axum::{
     Router,
+    body::Body,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use bytes::Bytes;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use sqlx::PgPool;
+use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, instrument, warn};
 
 use rio_nix::narinfo::NarInfoBuilder;
@@ -215,22 +219,33 @@ async fn narinfo(
 // /nar/{narhash}.nar.zst
 // ============================================================================
 
-/// Serve a NAR, zstd-compressed on the fly.
+/// Serve a NAR, zstd-compressed as a true stream.
 ///
 /// URL is `/nar/{nixbase32(nar_hash)}.nar.zst` — the narinfo's `URL:`
 /// field points here. The client already knows what nar_hash to expect
 /// (from the narinfo it just fetched); we look up the path by nar_hash,
 /// reassemble the NAR (inline or chunked), compress, stream.
 ///
-/// # Buffered, not streamed
+/// # Streaming pipeline
 ///
-/// This version buffers the full NAR, compresses it, then responds.
-/// For a 4 GiB NAR, that's 4 GiB of memory — not great. True streaming
-/// (reassemble → compress → respond in lockstep) needs the async-stream
-/// + zstd::stream::Encoder pipeline, which is fiddly to get right.
+/// The pipe is `chunk-stream → StreamReader → ZstdEncoder →
+/// ReaderStream → Body`. Memory is O(chunk_size × K=8 + zstd
+/// window) instead of O(nar_size). For a 4 GiB NAR: ~2 MB live
+/// instead of 4 GB.
 ///
-/// TODO(phase3a): streaming compression. For now, buffered is correct
-/// and most NARs are <100 MB. The memory concern is real but deferred.
+/// The round-trip through AsyncRead (StreamReader then ReaderStream)
+/// is because `async-compression::ZstdEncoder` wants an `AsyncBufRead`
+/// input and produces an `AsyncRead` output, but axum's Body wants a
+/// `Stream<Bytes>`. tokio-util provides both adapters.
+///
+/// Error handling: if a chunk fetch fails mid-stream (S3 transient,
+/// corruption detected by BLAKE3 verify), the stream yields an `Err`
+/// → the HTTP response is ALREADY partially sent, so the connection
+/// just drops. The client sees a truncated zstd stream and fails its
+/// own decompression. Not elegant but correct — we can't go back
+/// and change the 200 to a 500. The alternative (buffer everything
+/// to detect errors before sending headers) is the old O(nar_size)
+/// design we're replacing.
 #[instrument(skip(state), fields(filename = %filename))]
 async fn nar(State(state): State<Arc<CacheServerState>>, Path(filename): Path<String>) -> Response {
     // Strip `.nar.zst`. Other compressions (`.nar.xz`, `.nar`) are not
@@ -275,42 +290,41 @@ async fn nar(State(state): State<Arc<CacheServerState>>, Path(filename): Path<St
         }
     };
 
-    // Reassemble. Same branching as GetPath but into a buffer instead
-    // of streaming to gRPC.
-    let nar_bytes = match reassemble(manifest, state.chunk_cache.as_ref()).await {
-        Ok(b) => b,
+    // Build the chunk stream. For inline, it's a trivial 1-element
+    // stream. For chunked, it's the K=8 buffered reassembly (same
+    // concurrency as GetPath). Chunked-without-cache is the one
+    // hard error we catch BEFORE sending headers (config bug,
+    // deterministic — every request for this path would fail).
+    let nar_stream = match nar_chunk_stream(manifest, state.chunk_cache.clone()) {
+        Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, store_path, "nar: reassembly failed");
-            // DATA_LOSS-equivalent: chunk missing or corrupt. 500 is
-            // the right HTTP status — it's OUR problem, not the client's.
+            warn!(error = %e, store_path, "nar: cannot stream");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
-    // Compress. Level 3 is the zstd default — good ratio, fast
-    // (~500 MB/s). Level 1 would be faster but larger; level 19
-    // would be smaller but glacial. 3 is the sweet spot for
-    // "compress once, send over the wire" which is exactly our use.
+    // Pipeline: Stream<Result<Bytes, io::Error>> → AsyncBufRead
+    // → zstd compress → AsyncRead → Stream<Result<Bytes, io::Error>>
+    // → axum Body.
     //
-    // encode_all is blocking (CPU-bound loop). spawn_blocking keeps
-    // the async executor responsive — a 1 GiB NAR at 500 MB/s is 2
-    // seconds of CPU; holding an async task for that starves other
-    // requests on the same worker thread.
-    let compressed =
-        match tokio::task::spawn_blocking(move || zstd::encode_all(&nar_bytes[..], 3)).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                warn!(error = %e, "nar: zstd compression failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            Err(e) => {
-                // JoinError — spawn_blocking task panicked. zstd encode
-                // shouldn't panic on valid input (and we just reassembled
-                // valid bytes), so this is a library bug.
-                warn!(error = %e, "nar: compression task panicked");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+    // map_err: StreamReader wants io::Error. ChunkError carries the
+    // interesting info (which hash, NotFound vs Corrupt) — we log
+    // it here and pass a generic "other" to the io layer. The log
+    // line is the operator's signal; the client just sees a dropped
+    // connection either way.
+    //
+    // ZstdEncoder default level = 3 (same as encode_all's default).
+    // ~500 MB/s, good ratio. async-compression yields to the runtime
+    // between its internal buffer flushes so no spawn_blocking needed
+    // — it's not a tight CPU loop like zstd::encode_all, it compresses
+    // buffer-by-buffer as poll_read is called.
+    let io_stream = nar_stream.map_err(|e| {
+        warn!(error = %e, "nar: chunk fetch failed mid-stream (response truncated)");
+        std::io::Error::other(e)
+    });
+    let reader = StreamReader::new(io_stream);
+    let compressed = ZstdEncoder::new(reader);
+    let body_stream = ReaderStream::new(compressed);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -327,51 +341,70 @@ async fn nar(State(state): State<Arc<CacheServerState>>, Path(filename): Path<St
         HeaderValue::from_str(&format!("\"{}\"", hex::encode(nar_hash)))
             .expect("hex is valid header"),
     );
+    // NO Content-Length: we don't know the compressed size until the
+    // stream finishes. axum sends `Transfer-Encoding: chunked`
+    // automatically. The buffered version COULD set it (compressed
+    // bytes were in hand before responding); streaming can't. Clients
+    // don't need it — Nix reads until EOF.
 
-    (headers, compressed).into_response()
+    (headers, Body::from_stream(body_stream)).into_response()
 }
 
-/// Reassemble a NAR from its manifest. Buffered into Bytes.
+/// Build a stream of NAR bytes (uncompressed) from a manifest.
 ///
-/// Shared between the HTTP NAR route and (hypothetically) a future
-/// pre-compression task. Same logic as GetPath's streaming task but
-/// collects into a buffer instead of sending to a channel.
-async fn reassemble(
+/// Inline: 1-element stream wrapping the Bytes. Boxed to unify the
+/// return type with the chunked path (two different stream types;
+/// impl Trait can't handle "one of two" without boxing or an
+/// enum-of-streams, and boxing is simpler).
+///
+/// Chunked: K=8 buffered fetch, same concurrency as GetPath. Order
+/// preserved. Errors (ChunkError) propagate as stream items — the
+/// caller maps them to io::Error before feeding StreamReader.
+///
+/// The ONLY error returned synchronously (before streaming starts)
+/// is "chunked manifest but no cache" — a config bug that's
+/// deterministic per-path. We catch that before sending headers so
+/// the client gets a 500, not a truncated body.
+///
+/// Takes `Option<Arc<ChunkCache>>` by value (clones in the caller):
+/// the returned stream is 'static (Body::from_stream needs that) so
+/// it can't borrow. Inline doesn't use the cache; passing None is
+/// fine for it.
+type NarStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<Bytes, crate::cas::ChunkError>> + Send>,
+>;
+
+fn nar_chunk_stream(
     manifest: ManifestKind,
-    cache: Option<&Arc<ChunkCache>>,
-) -> anyhow::Result<Bytes> {
+    cache: Option<Arc<ChunkCache>>,
+) -> anyhow::Result<NarStream> {
     match manifest {
-        ManifestKind::Inline(bytes) => Ok(bytes),
+        ManifestKind::Inline(bytes) => {
+            // `once` + `ready` → a stream that yields one item then ends.
+            // The item is `Ok(bytes)` to match the chunked arm's
+            // `Result<Bytes, ChunkError>` shape. ChunkError is a bit
+            // odd for inline (there ARE no chunks) but it unifies the
+            // type and the Ok path is all that matters here.
+            Ok(Box::pin(stream::once(std::future::ready(Ok(bytes)))))
+        }
         ManifestKind::Chunked(entries) => {
             let cache = cache
                 .ok_or_else(|| anyhow::anyhow!("chunked manifest but no chunk cache configured"))?;
-
-            // buffered(8): same K=8 prefetch as GetPath. Order preserved.
-            use futures_util::stream::{self, StreamExt};
-            let chunk_stream = stream::iter(entries)
-                .map(|(hash, _size)| {
-                    let cache = Arc::clone(cache);
-                    async move { cache.get_verified(&hash).await }
-                })
-                .buffered(8);
-
-            // Collect with error propagation. Any ChunkError (NotFound,
-            // Corrupt) aborts the whole reassembly.
-            let chunks: Vec<Bytes> = chunk_stream
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<_, _>>()?;
-
-            // Concatenate. One allocation for the final buffer; each
-            // chunk is one memcpy. For a 1 GiB NAR that's ~16k memcpys
-            // of 64 KiB each — a few ms.
-            let total_len: usize = chunks.iter().map(|c| c.len()).sum();
-            let mut out = Vec::with_capacity(total_len);
-            for chunk in chunks {
-                out.extend_from_slice(&chunk);
-            }
-            Ok(Bytes::from(out))
+            // buffered(8) preserves order. Each future resolves to
+            // `Result<Bytes, ChunkError>` directly from get_verified.
+            // The stream is lazy: chunks are fetched as the downstream
+            // (zstd encoder) pulls. With K=8, at most 8 chunks in
+            // flight = ~8 × 256 KiB = 2 MB live. Plus zstd's window
+            // (~8 MB default). That's the memory bound.
+            let cache = Arc::clone(&cache);
+            Ok(Box::pin(
+                stream::iter(entries)
+                    .map(move |(hash, _size)| {
+                        let cache = Arc::clone(&cache);
+                        async move { cache.get_verified(&hash).await }
+                    })
+                    .buffered(8),
+            ))
         }
     }
 }
@@ -664,4 +697,64 @@ mod tests {
             );
         }
     }
+
+    /// A4: streaming response has NO Content-Length header.
+    ///
+    /// The buffered version COULD set it (compressed bytes in hand
+    /// before responding). The streaming version CAN'T (compressed
+    /// size unknown until stream ends). Absence of Content-Length
+    /// proves we're actually streaming, not secretly buffering.
+    ///
+    /// axum sends `Transfer-Encoding: chunked` automatically when
+    /// Content-Length is absent. Nix clients read until EOF so they
+    /// don't need the length.
+    #[tokio::test]
+    async fn nar_streaming_no_content_length() {
+        let (app, db, backend) = setup().await;
+        let (_, nar_hash, _) = seed_path(&db.pool, backend, "streaming", None).await;
+
+        let hash_b32 = nixbase32::encode(&nar_hash);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/nar/{hash_b32}.nar.zst"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The observable difference from buffered: no Content-Length.
+        // If this fails with a Content-Length present, someone
+        // regressed back to buffering (or axum started adding it
+        // for streams, which would be weird).
+        assert!(
+            resp.headers().get(header::CONTENT_LENGTH).is_none(),
+            "streaming response should NOT set Content-Length \
+             (compressed size unknown until stream ends). \
+             Got: {:?}",
+            resp.headers().get(header::CONTENT_LENGTH)
+        );
+
+        // Body still decompresses correctly — roundtrip sanity.
+        let compressed = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            zstd::decode_all(&compressed[..]).is_ok(),
+            "streamed zstd is still valid"
+        );
+    }
+
+    // Note: the "chunked without cache → 500" case needs a CHUNKED
+    // seed (seed_path always goes inline via complete_manifest_inline).
+    // Chunked seeding via gRPC PutPath requires a real transport
+    // (constructing tonic Streaming by hand is awkward — see seed_path
+    // comment). The inline path works without cache (correct: inline
+    // bytes are in PG, no chunks to fetch). The chunked-no-cache
+    // synchronous Err in nar_chunk_stream is covered by the code's
+    // structure; a unit test on nar_chunk_stream directly would need
+    // a synthetic ManifestKind::Chunked which is pub-in-crate
+    // metadata — doable but the integration test in chunk_service.rs
+    // exercises the chunked path end-to-end already.
 }
