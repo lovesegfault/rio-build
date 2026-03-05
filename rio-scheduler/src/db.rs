@@ -506,6 +506,43 @@ impl SchedulerDb {
     }
 }
 
+/// Read persisted build events for since_sequence replay.
+///
+/// Returns events in the half-open range `(since, until]` — strictly
+/// after `since` (the gateway's last-seen seq), at most `until`
+/// (the actor's last-emitted seq at subscribe time). `until` bounds
+/// the replay so we don't duplicate what the broadcast will carry:
+/// everything with seq > until was emitted AFTER subscribe and is
+/// guaranteed to be on the broadcast channel.
+///
+/// Free fn (not `SchedulerDb` method): `bridge_build_events` is a
+/// free fn in grpc/mod.rs that only has a `PgPool`, not a
+/// `SchedulerDb`. Adding `SchedulerDb` to `SchedulerGrpc` would
+/// drag the whole db module into grpc; a bare pool is cheaper.
+///
+/// u64 → i64 cast: PG BIGINT is signed. See event_log.rs for the
+/// same rationale (2^63 events per build is not a real concern).
+pub async fn read_event_log(
+    pool: &PgPool,
+    build_id: Uuid,
+    since: u64,
+    until: u64,
+) -> Result<Vec<(u64, Vec<u8>)>, sqlx::Error> {
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT sequence, event_bytes FROM build_event_log \
+         WHERE build_id = $1 AND sequence > $2 AND sequence <= $3 \
+         ORDER BY sequence",
+    )
+    .bind(build_id)
+    .bind(since as i64)
+    .bind(until as i64)
+    .fetch_all(pool)
+    .await?;
+    // i64 → u64: rows were written with `seq as i64` from a u64, so
+    // they round-trip exactly. No values < 0 exist (seq starts at 1).
+    Ok(rows.into_iter().map(|(s, b)| (s as u64, b)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

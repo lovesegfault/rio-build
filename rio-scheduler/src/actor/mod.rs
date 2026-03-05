@@ -130,12 +130,23 @@ pub enum ActorCommand {
         reply: oneshot::Sender<Result<rio_proto::types::BuildStatus, ActorError>>,
     },
 
-    /// Subscribe to an existing build's events.
+    /// Subscribe to an existing build's events. Reply carries
+    /// `(receiver, last_seq)` — `last_seq` is the sequence of the
+    /// last-emitted event at the moment of subscribe. The gRPC
+    /// layer uses it to (a) bound PG replay (`WHERE seq <= last_seq`)
+    /// and (b) dedup the broadcast stream (skip `seq <= last_seq` —
+    /// those may ALSO be in the broadcast ring's 1024 buffer, and
+    /// PG already delivered them).
+    ///
+    /// `since_sequence` is NOT read by the actor — it's passed
+    /// through to the gRPC layer for the PG replay range's lower
+    /// bound. The actor only knows about the broadcast.
     WatchBuild {
         build_id: Uuid,
         since_sequence: u64,
-        reply:
-            oneshot::Sender<Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError>>,
+        reply: oneshot::Sender<
+            Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError>,
+        >,
     },
 
     /// Internal: clean up terminal build state (maps + DAG interest) after
@@ -620,15 +631,9 @@ impl DagActor {
                 }
                 ActorCommand::WatchBuild {
                     build_id,
-                    // TODO(phase3b): since_sequence needs the persistent
-                    // event log (build_event_log table) + subscribe-first
-                    // dedup in bridge_build_events. Design is in the
-                    // phase3a plan (C4+C5) but deferred: the Lease leader
-                    // election (C2) also didn't land, and since_sequence
-                    // only matters for gateway reconnect to a NEW leader.
-                    // With the current single-scheduler deployment the
-                    // 1024-event broadcast buffer handles late subscribers.
-                    // Land together with C2 lease + scheduler replicas=2.
+                    // Actor doesn't use this — it's the gRPC layer's
+                    // lower bound for PG replay. We only supply the
+                    // upper bound (last_seq, inside handle_watch_build).
                     since_sequence: _,
                     reply,
                 } => {

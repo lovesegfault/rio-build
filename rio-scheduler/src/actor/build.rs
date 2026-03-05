@@ -102,14 +102,22 @@ impl DagActor {
     pub(super) fn handle_watch_build(
         &self,
         build_id: Uuid,
-    ) -> Result<broadcast::Receiver<rio_proto::types::BuildEvent>, ActorError> {
+    ) -> Result<(broadcast::Receiver<rio_proto::types::BuildEvent>, u64), ActorError> {
         let tx = self
             .build_events
             .get(&build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
 
-        // Subscribe first so we receive anything sent after this point.
+        // Subscribe FIRST so we receive anything sent after this point.
+        // Then capture last_seq. The actor is single-threaded and
+        // this fn is synchronous (no .await between subscribe and
+        // sequence read) — no event can be emitted in between. So
+        // last_seq is an exact watermark: everything ≤ last_seq was
+        // emitted before subscribe (PG replay covers it; may also be
+        // in the broadcast ring → gRPC dedups); everything > last_seq
+        // was emitted after (guaranteed on broadcast, not in PG yet).
         let rx = tx.subscribe();
+        let last_seq = self.build_sequences.get(&build_id).copied().unwrap_or(0);
 
         // If the build is already terminal, the BuildCompleted/Failed/Cancelled
         // event was already sent (possibly to zero receivers). A late subscriber
@@ -161,10 +169,19 @@ impl DagActor {
             };
             // broadcast::send takes &self; Err means no receivers, but we just
             // subscribed so there's at least one.
+            //
+            // This re-send uses seq == last_seq. With PG replay
+            // active (C5), the gRPC bridge dedups seq ≤ last_seq
+            // from broadcast — so this event is SKIPPED there. That's
+            // fine: PG replay already delivered the real terminal
+            // event (emit_build_event persisted it). This re-send is
+            // now a safety net for when PG replay FAILS (store down)
+            // — the bridge falls through to broadcast-only, and THIS
+            // event is what the watcher sees.
             let _ = tx.send(event);
         }
 
-        Ok(rx)
+        Ok((rx, last_seq))
     }
 
     pub(super) fn update_build_counts(&mut self, build_id: Uuid) {
