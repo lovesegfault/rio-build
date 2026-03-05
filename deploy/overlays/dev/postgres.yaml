@@ -1,0 +1,43 @@
+# CloudNativePG Cluster for dev. Single instance, small storage.
+#
+# Requires the CNPG operator installed cluster-wide:
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.1.yaml
+#
+# Why CNPG not a bare StatefulSet + bitnami image: CNPG handles
+# initdb, backups, failover, connection pooling. Even in dev,
+# "just use the operator" is simpler than hand-rolling.
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: rio-pg
+spec:
+  instances: 1
+  # Dev: small. Prod overlays bump this.
+  storage:
+    size: 5Gi
+  # CNPG creates a Secret `rio-pg-app` with the app user's
+  # creds, but we want a SPECIFIC database + user to match the
+  # secretGenerator literal above. Bootstrap does that.
+  bootstrap:
+    initdb:
+      database: rio
+      owner: rio
+      # Dev password hardcoded. CNPG would generate one and put
+      # it in a Secret, but then kustomize's secretGenerator
+      # can't reference it (secretGenerator runs at build time,
+      # CNPG's Secret is runtime). Hardcoded-in-dev avoids the
+      # chicken-and-egg; prod uses external PG (no CNPG).
+      secret:
+        name: rio-pg-bootstrap
+---
+# The password CNPG uses for the `rio` user. Referenced above.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rio-pg-bootstrap
+type: kubernetes.io/basic-auth
+stringData:
+  username: rio
+  password: rio

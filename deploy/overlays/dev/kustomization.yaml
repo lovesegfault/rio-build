@@ -1,0 +1,95 @@
+# Dev overlay: CloudNativePG + MinIO, airgap images, 1 scheduler.
+#
+# For local k3s/kind clusters. Everything self-contained — no
+# external PG or S3 needed. Images loaded via `k3s ctr images
+# import` or `kind load docker-image` (imagePullPolicy: Never).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: rio-system
+
+resources:
+  - ../../base
+  - namespace.yaml
+  - postgres.yaml
+  - minio.yaml
+  - workerpool-example.yaml
+
+patches:
+  # Dev: 1 scheduler replica. No HA needed for local dev; the
+  # lease still works (it acquires immediately, no contention).
+  # Faster iteration (1 pod to restart, not 2).
+  - target:
+      kind: Deployment
+      name: rio-scheduler
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  # Gateway: 1 replica, ClusterIP. LoadBalancer needs a real
+  # cloud LB controller (metallb in dev clusters, or just skip
+  # it and port-forward for testing).
+  - target:
+      kind: Deployment
+      name: rio-gateway
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target:
+      kind: Service
+      name: rio-gateway
+    patch: |
+      - op: replace
+        path: /spec/type
+        value: ClusterIP
+  # MinIO creds + S3 chunk backend. The MinIO deployment in
+  # this overlay uses these same creds (hardcoded; dev only).
+  - target:
+      kind: Deployment
+      name: rio-store
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: AWS_ACCESS_KEY_ID
+          value: rio-dev
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: AWS_SECRET_ACCESS_KEY
+          value: rio-dev-secret
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: AWS_ENDPOINT_URL
+          value: http://rio-minio:9000
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RIO_CHUNK_BACKEND
+          value: '{"kind":"s3","bucket":"rio-chunks","prefix":""}'
+
+# Airgap: images are preloaded, not pulled. Never → fail if not
+# preloaded (clear error vs pull timeout).
+images:
+  - name: rio-scheduler
+    newTag: latest
+  - name: rio-store
+    newTag: latest
+  - name: rio-gateway
+    newTag: latest
+  - name: rio-controller
+    newTag: latest
+  - name: rio-worker
+    newTag: latest
+
+# PG connection secret: generated from literals (dev creds,
+# matches postgres.yaml's CloudNativePG Cluster). In prod
+# this comes from the external RDS connection string.
+secretGenerator:
+  - name: rio-postgres
+    literals:
+      - url=postgres://rio:rio@rio-pg-rw:5432/rio
+    options:
+      disableNameSuffixHash: true
