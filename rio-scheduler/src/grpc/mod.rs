@@ -651,9 +651,10 @@ impl WorkerService for SchedulerGrpc {
 
         Ok(Response::new(rio_proto::types::HeartbeatResponse {
             accepted: true,
-            // TODO(phase3a): actual leader generation from Kubernetes Lease.
-            // Phase 2a has a single scheduler instance; constant 1 is correct.
-            generation: 1,
+            // Same Arc<AtomicU64> the actor reads for WorkAssignment.generation
+            // (dispatch.rs single-load). Lease task (C2) writes on each
+            // leadership acquisition. Non-K8s mode: stays at 1.
+            generation: self.actor.leader_generation(),
         }))
     }
 }

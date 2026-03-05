@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -320,6 +320,39 @@ impl BackpressureReader {
     }
 }
 
+/// Read-only view of the leader generation counter.
+///
+/// Same pattern as [`BackpressureReader`]: the lease task (C2) is the
+/// sole writer (via `fetch_add` on the inner Arc it holds directly);
+/// everyone else observes. `HeartbeatResponse.generation` and
+/// `WorkAssignment.generation` both read from here — workers compare
+/// to detect stale assignments after leader failover.
+///
+/// `Acquire` not `Relaxed`: the generation is a fence. When the lease
+/// task acquires leadership and increments, it also sets
+/// `is_leader=true` (C2). A reader seeing the new generation should
+/// also see the new leader state. Relaxed would be fine in practice
+/// (the atomic itself has no reordering peers here) but Acquire makes
+/// the pairing with the lease task's Release store explicit.
+///
+/// Starts at 1 (not 0): generation=0 is the proto-default, so a worker
+/// receiving `generation=0` knows the field was unset (old scheduler)
+/// rather than "first generation." Non-K8s mode (no lease) stays at 1
+/// forever — correct for a single scheduler.
+#[derive(Clone)]
+pub struct GenerationReader(Arc<AtomicU64>);
+
+impl GenerationReader {
+    fn new(inner: Arc<AtomicU64>) -> Self {
+        Self(inner)
+    }
+
+    /// Current leader generation.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// The DAG actor state.
 pub struct DagActor {
     /// The global derivation DAG.
@@ -358,8 +391,24 @@ pub struct DagActor {
     /// so hysteresis (80%/60%) is honored by send() instead of a simple
     /// threshold check. `Arc<AtomicBool>` for lock-free reads on the hot path.
     backpressure_active: Arc<AtomicBool>,
-    /// Leader generation counter (for assignment tokens).
-    generation: i64,
+    /// Leader generation counter (for assignment tokens + stale-work
+    /// detection at workers).
+    ///
+    /// `Arc<AtomicU64>` not `i64`: the lease task (C2, spawned in
+    /// main.rs) is the sole WRITER — it `fetch_add(1, Release)` on
+    /// each leadership acquisition. The actor reads via the same Arc
+    /// for dispatch; `ActorHandle` clones a `GenerationReader` for
+    /// gRPC's `HeartbeatResponse.generation`. Same cross-task sharing
+    /// pattern as `backpressure_active`.
+    ///
+    /// u64 not i64: the proto is `uint64` (WorkAssignment, Heartbeat).
+    /// The prior `i64 as u64` cast at dispatch.rs was a silent sign-
+    /// reinterpret — harmless in practice (Lease transitions can't go
+    /// negative) but a latent footgun. PG's `assignments.generation`
+    /// is BIGINT (signed); cast `u64 as i64` at THAT single boundary
+    /// instead of at every proto-encode site. One cast, edge not hot
+    /// path.
+    generation: Arc<AtomicU64>,
     /// Weak clone of the actor's own command sender, for scheduling delayed
     /// internal commands (e.g., terminal build cleanup). Weak so the actor
     /// doesn't prevent channel close when all external handles are dropped.
@@ -403,7 +452,9 @@ impl DagActor {
             estimator: Estimator::default(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
-            generation: 1,
+            // 1 not 0: proto-default is 0. gen=0 tells workers "field
+            // unset" (old scheduler); gen=1 is the real first generation.
+            generation: Arc::new(AtomicU64::new(1)),
             self_tx: None,
             size_classes: Vec::new(),
             log_flush_tx: None,
@@ -660,6 +711,18 @@ impl DagActor {
     pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
         BackpressureReader::new(self.backpressure_active.clone())
     }
+
+    /// Clone the generation counter as a read-only reader for
+    /// `ActorHandle::leader_generation()`. The lease task (C2) holds a
+    /// direct `Arc<AtomicU64>` clone for writing — not through this
+    /// reader. The reader type has no store/fetch_add methods, so
+    /// handle consumers can't accidentally increment.
+    pub(crate) fn generation_reader(&self) -> GenerationReader {
+        GenerationReader::new(self.generation.clone())
+    }
+
+    // C2 adds `generation_arc() -> Arc<AtomicU64>` for the lease task's
+    // write access. Deferred to avoid dead_code warning in the interim.
 
     /// Compute counts for `AdminService.ClusterStatus`.
     ///

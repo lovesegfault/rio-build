@@ -39,9 +39,14 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
         },
     ]);
     let backpressure = actor.backpressure_flag();
+    let generation = actor.generation_reader();
     let self_tx = tx.downgrade();
     let _task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-    let handle = ActorHandle { tx, backpressure };
+    let handle = ActorHandle {
+        tx,
+        backpressure,
+        generation,
+    };
 
     // Connect TWO workers: one small (will NOT get the big build),
     // one large (will). Both idle with capacity.
@@ -296,4 +301,107 @@ async fn test_interactive_priority_boost() -> TestResult {
         }
     }
     panic!("never dispatched prioB within 4 completions. Dispatch history: {seen_paths:?}");
+}
+
+// -----------------------------------------------------------------------------
+// C1: Leader generation — Arc<AtomicU64>, single-load consistency
+// -----------------------------------------------------------------------------
+
+/// The generation in a WorkAssignment must equal the generation a
+/// heartbeat would return at the same moment. Both read from the same
+/// `Arc<AtomicU64>`. With no lease task running (no writer), both see
+/// the init value.
+///
+/// This catches the previous design's hardcoded-1 bug: if
+/// `HeartbeatResponse` and `WorkAssignment` used DIFFERENT generation
+/// sources (one hardcoded, one from actor state), this test fails.
+#[tokio::test]
+async fn test_generation_consistent_between_heartbeat_and_assignment() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
+    let assignment = recv_assignment(&mut rx).await;
+
+    // Both sourced from the same Arc<AtomicU64>. No writer → both = 1.
+    assert_eq!(assignment.generation, 1, "init value, no lease task");
+    assert_eq!(handle.leader_generation(), 1);
+    assert_eq!(
+        assignment.generation,
+        handle.leader_generation(),
+        "WorkAssignment and HeartbeatResponse read the same atomic"
+    );
+
+    // The assignment_token embeds the generation too (format string).
+    // Trailing suffix check — the token is "{worker_id}-{drv_hash}-{gen}",
+    // drv_hash is variable-length so we can't split cleanly, but the
+    // suffix is reliable.
+    assert!(
+        assignment.assignment_token.ends_with("-1"),
+        "token embeds generation as suffix: {}",
+        assignment.assignment_token
+    );
+    Ok(())
+}
+
+/// The generation starts at 1, not 0. Proto-default is 0; a worker
+/// receiving `generation=0` should interpret it as "field unset (old
+/// scheduler version)" not "first generation."
+///
+/// Catches the off-by-one if someone changes `AtomicU64::new(1)` → `new(0)`
+/// during a refactor. Without this, the bug would only surface as workers
+/// treating EVERY first-leadership assignment as unset/stale.
+#[tokio::test]
+async fn test_generation_starts_at_one_not_zero() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Not dispatching anything — just reading the reader directly.
+    // This IS the value HeartbeatResponse.generation would carry.
+    assert_eq!(
+        handle.leader_generation(),
+        1,
+        "gen=0 is proto-default (unset); gen=1 is the real first generation"
+    );
+    Ok(())
+}
+
+/// Two assignments within the same dispatch pass carry the same
+/// generation. This is the single-load-per-assignment guarantee —
+/// without a lease writer, it's trivially true (nothing changes
+/// between loads), but it exercises the dispatch.rs load-once path.
+///
+/// The REAL torn-read test (concurrent lease fetch_add racing with
+/// dispatch) lands in C2 with the lease task. This is the structural
+/// precursor: proves the single load is what gets used throughout
+/// send_assignment.
+#[tokio::test]
+async fn test_generation_single_load_within_assignment() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux", 4).await?;
+
+    // Two independent derivations in the same dispatch pass (worker has
+    // capacity 4, both merge before capacity exhausts).
+    let _ev1 = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
+    let _ev2 = merge_single_node(&handle, Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
+
+    let a1 = recv_assignment(&mut rx).await;
+    let a2 = recv_assignment(&mut rx).await;
+
+    // Same generation across both, and token suffix agrees with field.
+    // If the load happened twice per assignment (e.g., once for token,
+    // once for the field), a concurrent writer could split them —
+    // token says "-1", field says 2. No writer here, so this asserts
+    // STRUCTURAL consistency (same local used for both), not concurrent
+    // safety (C2's job).
+    assert_eq!(a1.generation, a2.generation);
+    let expected_suffix = format!("-{}", a1.generation);
+    assert!(
+        a1.assignment_token.ends_with(&expected_suffix),
+        "token suffix matches generation field: {} ends with {}",
+        a1.assignment_token,
+        expected_suffix
+    );
+    assert!(
+        a2.assignment_token.ends_with(&expected_suffix),
+        "same suffix on both assignments (single load per dispatch)"
+    );
+    Ok(())
 }
