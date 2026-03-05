@@ -279,16 +279,77 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // grpc.health.v1.Health. SERVING once the actor is up AND
-    // (in K8s mode) we're leading. C3's toggle loop below tracks
-    // is_leader; for non-K8s mode it's true immediately so the
-    // first iteration sets SERVING.
+    // grpc.health.v1.Health. SERVING iff is_leader. K8s Service
+    // routes only to SERVING pods → only to the leader. Standby
+    // replicas stay live (liveness probe passes) but not ready.
+    //
+    // Toggle loop tracks is_leader every 1s. In non-K8s mode
+    // is_leader=true immediately → first iteration sets SERVING.
+    // In K8s standby mode: stays NOT_SERVING until lease acquire.
+    //
+    // CRITICAL: the K8s readinessProbe MUST specify
+    // `grpc.service: rio.scheduler.SchedulerService` — the named
+    // service, not empty-string. set_not_serving only affects the
+    // named service (see D2's health_toggle_not_serving test).
+    // Empty-string stays SERVING forever after the first
+    // set_serving, so a standby would pass readiness on "" and
+    // K8s would route to it. G1's scheduler.yaml MUST have:
+    //   readinessProbe:
+    //     grpc:
+    //       port: 9001
+    //       service: rio.scheduler.SchedulerService
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    // C3: toggle loop tracks is_leader. Spawned below.
-    let _ = &is_leader_for_health; // used in C3 block below
-    health_reporter
-        .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
-        .await;
+    {
+        // Own task for the toggle loop. Captures the reporter
+        // clone (HealthReporter is Clone) and the is_leader Arc.
+        // Checks every second — short enough that leadership
+        // transitions surface quickly (K8s readiness probe period
+        // is typically 5-10s, so we update before it checks).
+        //
+        // Why not watch the AtomicBool directly: there's no async
+        // wake-on-change for atomics. A tokio::sync::watch channel
+        // would give that, but then the lease task and
+        // dispatch_ready both need to be adapted to use watch
+        // instead of AtomicBool. Polling at 1Hz is simpler and
+        // the 1s lag is imperceptible (K8s probes poll slower).
+        //
+        // Edge-triggered: only call set_serving/set_not_serving
+        // on a TRANSITION, not every iteration. tonic-health
+        // set_* is an async RwLock write + broadcast to Watch
+        // subscribers — not expensive, but calling it 1Hz for
+        // no reason wakes any grpc Health.Watch clients (K8s
+        // probes don't use Watch, but other tooling might).
+        let reporter = health_reporter.clone();
+        let is_leader = is_leader_for_health;
+        rio_common::task::spawn_monitored("health-toggle-loop", async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            // `prev`: what we LAST set the reporter to. Starts
+            // None so the first iteration unconditionally sets
+            // (either SERVING or NOT_SERVING depending on
+            // is_leader at that moment). Option<bool> not bool:
+            // "haven't set anything yet" is distinct from both
+            // true and false.
+            let mut prev: Option<bool> = None;
+            loop {
+                interval.tick().await;
+                let now = is_leader.load(std::sync::atomic::Ordering::Relaxed);
+                if prev != Some(now) {
+                    if now {
+                        reporter
+                            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                            .await;
+                        tracing::debug!("health: SERVING (is_leader=true)");
+                    } else {
+                        reporter
+                            .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                            .await;
+                        tracing::debug!("health: NOT_SERVING (is_leader=false, standby)");
+                    }
+                    prev = Some(now);
+                }
+            }
+        });
+    }
 
     // Create gRPC services. All three get the SAME Arc<LogBuffers>:
     // SchedulerGrpc writes, AdminService reads (live), LogFlusher drains
