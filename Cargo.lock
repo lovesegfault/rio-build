@@ -4123,6 +4123,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "fastcdc",
+ "figment",
  "futures-util",
  "hex",
  "metrics",
