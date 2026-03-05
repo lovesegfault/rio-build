@@ -47,6 +47,30 @@ pub struct WorkerState {
     /// workers (misconfiguration — visible failure, not silent wildcard).
     /// If the scheduler has no size_classes, this field is ignored.
     pub size_class: Option<String>,
+    /// Stop accepting new assignments (graceful shutdown).
+    ///
+    /// Set by `AdminService.DrainWorker` which the worker's SIGTERM
+    /// handler calls as step 1 of preStop. `has_capacity()` checks this
+    /// so `best_worker()` filters draining workers out — no explicit
+    /// filter in assignment.rs needed. In-flight builds continue; no
+    /// new work. The worker then waits for in-flight completion (step
+    /// 2) and exits. terminationGracePeriodSeconds=7200 gives 2h.
+    ///
+    /// One-way: no "un-drain." A draining worker is on its way out; the
+    /// only recovery is a fresh pod (new worker_id). This simplifies the
+    /// state machine — no drain/undrain race with dispatch.
+    ///
+    /// NOT cleared on reconnect: if a draining worker's stream drops and
+    /// reopens (transient network blip inside the grace period), it stays
+    /// draining. Reconnect creates a fresh WorkerState (draining=false by
+    /// default) only if `handle_worker_disconnected` ran first (removes
+    /// the entry). If the stream blips without full disconnect, the
+    /// existing entry (with draining=true) is reused by `handle_heartbeat`
+    /// via `entry().or_insert_with()`. Either behavior is acceptable:
+    /// worst case, a reconnected-during-drain worker briefly accepts one
+    /// assignment before the next DrainWorker call (which the preStop
+    /// hook sends on every SIGTERM, so it would re-drain).
+    pub draining: bool,
 }
 
 impl WorkerState {
@@ -65,6 +89,7 @@ impl WorkerState {
             missed_heartbeats: 0,
             bloom: None,
             size_class: None,
+            draining: false,
         }
     }
 
@@ -76,8 +101,14 @@ impl WorkerState {
     }
 
     /// Whether this worker has available build capacity.
+    ///
+    /// `!draining` first: short-circuit the arithmetic for draining
+    /// workers. `best_worker()` calls this in a hot-ish loop over
+    /// candidates; a draining worker is common during scale-down.
     pub fn has_capacity(&self) -> bool {
-        self.is_registered() && (self.running_builds.len() as u32) < self.max_builds
+        !self.draining
+            && self.is_registered()
+            && (self.running_builds.len() as u32) < self.max_builds
     }
 
     /// Whether this worker can build the given derivation based on system and features.

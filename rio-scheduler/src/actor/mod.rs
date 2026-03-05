@@ -151,6 +151,33 @@ pub enum ActorCommand {
         batch: rio_proto::types::BuildLogBatch,
     },
 
+    /// Mark a worker draining: stop sending new assignments.
+    ///
+    /// Called by the worker itself (step 1 of SIGTERM preStop — D3) or
+    /// by the controller (WorkerPool finalizer — F6). Idempotent: an
+    /// already-draining worker replies `accepted=true` with the same
+    /// running count. Unknown worker → `accepted=false, running=0`
+    /// (not an error; the worker may have already disconnected).
+    ///
+    /// `force=true` additionally reassigns in-flight builds (same path
+    /// as `WorkerDisconnected`). Use case: operator-initiated forced
+    /// drain when the worker is unhealthy but still heartbeating —
+    /// don't wait 2h for builds to complete, reassign now. The
+    /// worker's builds will still run to completion on the worker
+    /// (nix-daemon is already spawned) but the scheduler stops caring
+    /// about the result and re-dispatches elsewhere. Wasteful but
+    /// correct: deterministic builds, same output either way.
+    ///
+    /// `send_unchecked`: same reasoning as Heartbeat. A drain request
+    /// MUST land — dropping it under backpressure would leave a
+    /// shutting-down worker accepting new assignments right when
+    /// capacity is shrinking. That's a feedback loop into MORE load.
+    DrainWorker {
+        worker_id: WorkerId,
+        force: bool,
+        reply: oneshot::Sender<DrainResult>,
+    },
+
     /// Snapshot cluster state for `AdminService.ClusterStatus`.
     ///
     /// Counts are computed by iterating actor-owned collections
@@ -181,6 +208,22 @@ pub enum ActorCommand {
         drv_hash: String,
         reply: oneshot::Sender<Option<DebugDerivationInfo>>,
     },
+}
+
+/// Reply for `ActorCommand::DrainWorker`.
+///
+/// `accepted=false` only for unknown worker_id — NOT an error, the
+/// worker may have disconnected (preStop races with stream close on
+/// SIGTERM). Caller treats `accepted=false, running=0` as "nothing to
+/// wait for, proceed."
+#[derive(Debug, Clone, Copy)]
+pub struct DrainResult {
+    pub accepted: bool,
+    /// Builds still in-flight on the worker after drain. For
+    /// `force=false`, these will complete normally. For `force=true`,
+    /// this is 0 (reassigned). The worker's preStop hook uses this to
+    /// decide whether to wait.
+    pub running_builds: u32,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.
@@ -502,6 +545,14 @@ impl DagActor {
                 ActorCommand::ClusterSnapshot { reply } => {
                     let _ = reply.send(self.compute_cluster_snapshot());
                 }
+                ActorCommand::DrainWorker {
+                    worker_id,
+                    force,
+                    reply,
+                } => {
+                    let result = self.handle_drain_worker(&worker_id, force).await;
+                    let _ = reply.send(result);
+                }
                 ActorCommand::ForwardLogBatch { drv_path, batch } => {
                     // Resolve drv_path → drv_hash → interested_builds, then
                     // emit BuildEvent::Log on each build's broadcast channel.
@@ -623,10 +674,15 @@ impl DagActor {
     /// can't enqueue what you can't merge).
     fn compute_cluster_snapshot(&self) -> ClusterSnapshot {
         let mut active_workers = 0u32;
-        // `draining` field lands in E2; until then all registered = active.
-        // Loop once rather than two filter().count() passes.
+        let mut draining_workers = 0u32;
+        // Single pass: registered ∧ ¬draining → active. draining →
+        // draining (regardless of registered — a draining worker that
+        // lost its stream mid-drain is still "draining" for the
+        // controller's "how many pods are shutting down" question).
         for w in self.workers.values() {
-            if w.is_registered() {
+            if w.draining {
+                draining_workers += 1;
+            } else if w.is_registered() {
                 active_workers += 1;
             }
         }
@@ -661,7 +717,7 @@ impl DagActor {
         ClusterSnapshot {
             total_workers: self.workers.len() as u32,
             active_workers,
-            draining_workers: 0, // E2 populates
+            draining_workers,
             pending_builds,
             active_builds,
             queued_derivations: self.ready_queue.len() as u32,
