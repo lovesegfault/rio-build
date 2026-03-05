@@ -31,7 +31,7 @@ gRPC handler tasks send commands to the DAG actor and `await` responses. This el
 
 ## Scheduling Algorithm
 
-The scheduling algorithm below is implemented as of Phase 2c: critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value) rather than the Phase 2a `push_front`. **CutoffRebalancer (adaptive cutoffs) and WorkerPoolSet CRD are deferred to Phase 3a** — size-class cutoffs are operator-configured static values.
+The scheduling algorithm below is implemented as of Phase 2c: critical-path priority (BinaryHeap ReadyQueue), size-class routing with memory-bump and overflow, bloom-filter locality scoring, build-history Estimator with fallback chain. Interactive builds get a +1e9 priority boost (dwarfs any critical-path value) rather than the Phase 2a `push_front`. **CutoffRebalancer (adaptive cutoffs) and WorkerPoolSet CRD are deferred to Phase 4** (see [phases/phase4.md](../phases/phase4.md)) — size-class cutoffs are operator-configured static values. Phase 3a added: PrefetchHint (scheduler sends `approx_input_closure` bloom-filtered before WorkAssignment), leader generation via `Arc<AtomicU64>` (Lease task C2 lands in 3b), `AdminService.ClusterStatus`/`DrainWorker` for the controller.
 
 ```
 1. Receive derivation DAG from gateway

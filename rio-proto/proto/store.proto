@@ -63,7 +63,7 @@ service StoreService {
 }
 
 // Chunk-level storage service for content-defined chunking.
-// PutChunk is UNIMPLEMENTED (server-side chunking only; see TODO(phase3a) in chunk.rs).
+// PutChunk is UNIMPLEMENTED (server-side chunking only; see chunk.rs).
 service ChunkService {
   // Upload a chunk.
   rpc PutChunk(stream rio.types.PutChunkRequest) returns (rio.types.PutChunkResponse);
