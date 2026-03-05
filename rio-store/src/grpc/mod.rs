@@ -139,15 +139,34 @@ impl StoreServiceImpl {
     ///
     /// NARs below `INLINE_THRESHOLD` (256 KiB) still go inline; larger
     /// ones are FastCDC-chunked. The cache wraps `backend` for reads.
+    ///
+    /// Convenience wrapper over `with_chunk_cache` — creates a fresh
+    /// `ChunkCache` with default capacity. Use `with_chunk_cache` if
+    /// you need a SHARED cache (same Arc across StoreServiceImpl +
+    /// ChunkServiceImpl + CacheServerState: "a chunk warmed by GetPath
+    /// is hot for GetChunk") or a custom capacity.
     pub fn with_chunk_backend(pool: PgPool, backend: Arc<dyn ChunkBackend>) -> Self {
-        // Cache holds its own Arc clone of the backend. `backend` is
-        // also kept directly for the write path (PutPath's put_chunked
-        // calls backend.put(), not cache — no point caching freshly-
-        // written chunks that nothing has asked for yet).
-        let cache = Arc::new(ChunkCache::new(Arc::clone(&backend)));
+        Self::with_chunk_cache(pool, Arc::new(ChunkCache::new(backend)))
+    }
+
+    /// Create a StoreService with an externally-owned `ChunkCache`.
+    ///
+    /// The cache carries its backend inside (accessible via
+    /// `ChunkCache::backend()`). StoreServiceImpl extracts it for
+    /// the write path — PutPath calls `backend.put()` directly
+    /// (no point caching freshly-written chunks nothing asked for).
+    ///
+    /// Use this when you want ONE cache shared across multiple
+    /// services. main.rs constructs one `Arc<ChunkCache>`, passes
+    /// clones here + to `ChunkServiceImpl::new` + to
+    /// `CacheServerState` — a chunk warmed by any service is hot
+    /// for all. `with_chunk_backend` creates a PRIVATE cache (each
+    /// service has its own moka LRU + singleflight map), which
+    /// defeats the cross-service-warm benefit.
+    pub fn with_chunk_cache(pool: PgPool, cache: Arc<ChunkCache>) -> Self {
         Self {
             pool,
-            chunk_backend: Some(backend),
+            chunk_backend: Some(cache.backend()),
             chunk_cache: Some(cache),
             signer: None,
         }

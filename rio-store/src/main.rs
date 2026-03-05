@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -10,12 +12,56 @@ use rio_store::grpc::{ChunkServiceImpl, StoreServiceImpl};
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
 
+/// Chunk storage backend selection.
+///
+/// Serde internally-tagged (`kind`): TOML writes
+/// `[chunk_backend]\nkind = "s3"\nbucket = "..."`. The tag field is
+/// `kind` not the serde default `type` — `type` is a Rust keyword
+/// and would need `r#type` everywhere we match on it.
+///
+/// Default is `Inline`: backward-compatible with existing deployments
+/// that have no chunk-backend config. All NARs go into PG
+/// `manifests.inline_blob` regardless of size. Fine for dev/CI;
+/// production wants `s3` or `filesystem`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ChunkBackendKind {
+    /// No chunk backend. All NARs inline in PG. ChunkService returns
+    /// FAILED_PRECONDITION. cache_server can only serve inline paths.
+    #[default]
+    Inline,
+    /// Local filesystem. 256-subdir fanout by hash prefix (same layout
+    /// as git objects). `base_dir` is created at startup.
+    Filesystem { base_dir: PathBuf },
+    /// S3-compatible. Credentials come from the aws-sdk's default chain
+    /// (env vars, instance profile, etc) — NOT in this config. We're
+    /// not putting secrets in a TOML file.
+    S3 { bucket: String, prefix: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
     listen_addr: String,
     database_url: String,
     metrics_addr: std::net::SocketAddr,
+    /// Where chunks live. Default: inline (no backend). See
+    /// [`ChunkBackendKind`] for TOML syntax.
+    chunk_backend: ChunkBackendKind,
+    /// moka LRU capacity for chunk reads, in bytes. Default 2 GiB.
+    /// One cache shared by StoreService + ChunkService + cache_server
+    /// — a chunk warmed by any is hot for all. Only relevant when
+    /// chunk_backend != inline.
+    chunk_cache_capacity_bytes: u64,
+    /// ed25519 narinfo signing key path (Nix secret-key format:
+    /// `name:base64-seed`). None = signing disabled (paths stored
+    /// without our signature; still serveable, just unverified). The
+    /// key file should be mode 0600 and NOT in git.
+    signing_key_path: Option<PathBuf>,
+    /// Binary-cache HTTP listen address (narinfo + nar.zst routes).
+    /// None = don't spawn. Separate from listen_addr (that's gRPC);
+    /// Nix clients hit this with plain HTTP GETs.
+    cache_http_addr: Option<std::net::SocketAddr>,
 }
 
 impl Default for Config {
@@ -24,6 +70,13 @@ impl Default for Config {
             listen_addr: "0.0.0.0:9002".into(),
             database_url: String::new(),
             metrics_addr: "0.0.0.0:9092".parse().unwrap(),
+            chunk_backend: ChunkBackendKind::default(),
+            // 2 GiB. Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES
+            // — the constant is crate-private so duplicated here,
+            // but the config_defaults_are_stable test catches drift.
+            chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            signing_key_path: None,
+            cache_http_addr: None,
         }
     }
 }
@@ -143,6 +196,88 @@ mod tests {
         assert_eq!(d.listen_addr, "0.0.0.0:9002");
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9092");
         assert!(d.database_url.is_empty());
+        // Phase3a: chunk backend off by default (backward-compat).
+        assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
+        // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
+        // constant changes, update this — the test catches drift.
+        assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(d.signing_key_path.is_none());
+        assert!(d.cache_http_addr.is_none());
+    }
+
+    /// TOML parsing for the tagged enum via figment (what main.rs
+    /// actually uses via rio_common::config::load). The `kind` tag +
+    /// lowercase variant names are load-bearing — the NixOS module
+    /// writes TOML with these exact strings. A silent rename would
+    /// break every deployment with chunk_backend configured.
+    ///
+    /// Testing via figment (not raw toml crate) catches figment-
+    /// specific deserialization quirks. figment's tagged-enum
+    /// handling is a known past pain point.
+    fn parse_toml(s: &str) -> Config {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        Figment::from(Toml::string(s)).extract().unwrap()
+    }
+
+    #[test]
+    fn chunk_backend_kind_toml_inline() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "inline"
+            "#,
+        );
+        assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
+    }
+
+    #[test]
+    fn chunk_backend_kind_toml_filesystem() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio-store/chunks"
+            "#,
+        );
+        match cfg.chunk_backend {
+            ChunkBackendKind::Filesystem { base_dir } => {
+                assert_eq!(base_dir, PathBuf::from("/var/lib/rio-store/chunks"));
+            }
+            other => panic!("expected Filesystem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunk_backend_kind_toml_s3() {
+        let cfg = parse_toml(
+            r#"
+            [chunk_backend]
+            kind = "s3"
+            bucket = "my-nar-chunks"
+            prefix = "prod/"
+            "#,
+        );
+        match cfg.chunk_backend {
+            ChunkBackendKind::S3 { bucket, prefix } => {
+                assert_eq!(bucket, "my-nar-chunks");
+                assert_eq!(prefix, "prod/");
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+    }
+
+    /// No [chunk_backend] section at all → default (Inline). This is
+    /// the backward-compat path: pre-phase3a configs have no such
+    /// section and should keep working.
+    #[test]
+    fn chunk_backend_kind_absent_defaults_inline() {
+        let cfg = parse_toml(
+            r#"
+            listen_addr = "0.0.0.0:9002"
+            "#,
+        );
+        assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
     }
 
     #[test]

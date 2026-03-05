@@ -395,6 +395,18 @@ impl ChunkCache {
         Self::with_capacity(backend, DEFAULT_CACHE_CAPACITY_BYTES)
     }
 
+    /// Clone the inner backend Arc. For the write path: PutPath calls
+    /// `backend.put()` directly (no point caching freshly-written
+    /// chunks nothing has asked for). With this accessor, main.rs can
+    /// construct ONE ChunkCache and share it with StoreServiceImpl +
+    /// ChunkServiceImpl + CacheServerState — the main.rs TODO wanted
+    /// "a chunk warmed by GetPath is hot for GetChunk" which means
+    /// one cache. StoreServiceImpl needs the raw backend for writes;
+    /// it gets it via this accessor instead of a separate Arc.
+    pub fn backend(&self) -> Arc<dyn ChunkBackend> {
+        Arc::clone(&self.backend)
+    }
+
     /// Create a cache with a custom capacity (bytes, not entry count).
     pub fn with_capacity(backend: Arc<dyn ChunkBackend>, capacity_bytes: u64) -> Self {
         let lru = moka::future::Cache::builder()
