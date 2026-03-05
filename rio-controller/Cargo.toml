@@ -1,0 +1,59 @@
+[package]
+name = "rio-controller"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Kubernetes operator for rio-build: WorkerPool + Build CRDs"
+
+[[bin]]
+name = "rio-controller"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"
+# crdgen is write-only serde_yaml (see deny.toml RUSTSEC-2024-0320).
+# Separate binary so the YAML dep doesn't leak into the controller itself.
+
+[dependencies]
+rio-common = { workspace = true }
+rio-proto = { workspace = true }
+
+# --- Kubernetes ---
+# kube 3.0 notes: chrono → jiff timestamps, schemars MUST be 1.x
+# (0.8 breaks #[derive(CustomResource)]). #[x_kube(validation=...)]
+# for CEL, not schemars extend.
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+
+# --- gRPC client (scheduler AdminService) ---
+tonic = { workspace = true }
+tokio = { workspace = true }
+
+# --- Serialization ---
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Write-only for crdgen. Deprecated but safe (no deserialization =
+# no attack surface). See deny.toml.
+serde_yaml = { workspace = true }
+
+# --- Observability ---
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+# --- Misc ---
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+futures-util = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+# tower-test mock::pair() for kube::Client fake API server.
+tower-test = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
