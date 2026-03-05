@@ -309,13 +309,24 @@ async fn main() -> anyhow::Result<()> {
         "connected to gRPC services"
     );
 
-    // Set up FUSE cache and mount
-    let cache = fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?;
-    // Extract the bloom handle BEFORE cache moves into mount_fuse_background.
-    // The heartbeat loop reads from the same RwLock that cache.insert() writes
-    // to — inserts by FUSE ops show up in subsequent heartbeat snapshots.
+    // Set up FUSE cache and mount. Arc so we can clone handles
+    // BEFORE moving into mount_fuse_background: bloom_handle for
+    // heartbeat, and the Arc itself for B2's prefetch handler.
+    // Same extract-before-move pattern as bloom_handle always used.
+    let cache =
+        Arc::new(fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?);
+    // Extract the bloom handle. The heartbeat loop reads from the
+    // same RwLock that cache.insert() writes to — inserts by FUSE
+    // ops show up in subsequent heartbeat snapshots.
     let heartbeat_bloom = cache.bloom_handle();
+    // Clone for prefetch (B2). Cache methods use runtime.block_on
+    // internally (sync, designed for FUSE callbacks on dedicated
+    // threads). The prefetch handler will call them via
+    // spawn_blocking — async → nested-runtime panic.
+    let prefetch_cache = Arc::clone(&cache);
+    let prefetch_store = store_client.clone();
     let runtime = tokio::runtime::Handle::current();
+    let prefetch_runtime = runtime.clone();
 
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
@@ -328,6 +339,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.fuse_passthrough,
         cfg.fuse_threads,
     )?;
+    // Suppress unused until B2 wires them. One-commit window.
+    let _ = (&prefetch_cache, &prefetch_store, &prefetch_runtime);
 
     info!(
         mount_point = %cfg.fuse_mount_point.display(),

@@ -1,14 +1,29 @@
 //! Fetch and materialize store paths into the local cache.
+//!
+//! Two entry points:
+//! - `NixStoreFs::ensure_cached`: called from FUSE callbacks
+//!   (lookup, getattr). Handles singleflight WAIT semantics — if
+//!   another thread is fetching, block on condvar until it finishes.
+//! - [`prefetch_path_blocking`]: called from the PrefetchHint
+//!   handler (B2) via spawn_blocking. Same singleflight but with
+//!   RETURN-EARLY on WaitFor — prefetch is a hint, not a dependency;
+//!   if FUSE already has it in flight, we're done.
+//!
+//! Both delegate to `fetch_extract_insert` for the actual work.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use fuser::Errno;
+use tokio::runtime::Handle;
+use tonic::transport::Channel;
 use tracing::instrument;
 
+use rio_proto::StoreServiceClient;
+
 use super::NixStoreFs;
-use super::cache::FetchClaim;
+use super::cache::{Cache, FetchClaim};
 
 impl NixStoreFs {
     /// Ensure a store path is cached locally, fetching from remote if needed.
@@ -30,7 +45,13 @@ impl NixStoreFs {
             FetchClaim::Fetch(_guard) => {
                 // We own the fetch. _guard notifies waiters on drop (success,
                 // error, or panic) — no explicit cleanup needed.
-                self.fetch_and_extract(store_basename)
+                // Delegate to the free fn — same code path prefetch uses.
+                fetch_extract_insert(
+                    &self.cache,
+                    &self.store_client,
+                    &self.runtime,
+                    store_basename,
+                )
             }
             FetchClaim::WaitFor(entry) => {
                 // Another thread is fetching. Wait for it with a timeout as
@@ -59,123 +80,214 @@ impl NixStoreFs {
             }
         }
     }
+}
 
-    /// Fetch a store path's NAR from remote store and extract to local cache.
-    ///
-    /// Debug-level span: this is the slow path (cache miss → gRPC + NAR
-    /// extract), called at most once per store path per worker lifetime.
-    /// Not on lookup/read (those are hot — kernel caches attr for 1h TTL
-    /// so they fire once per path per process, but still high-volume).
-    /// The `ensure_cached` caller is too broad (fast-path returns early).
-    #[instrument(level = "debug", skip(self), fields(store_basename = %store_basename))]
-    fn fetch_and_extract(&self, store_basename: &str) -> Result<PathBuf, Errno> {
-        // Increment on miss (entry to this function), not on fetch success:
-        // failed fetches (store outage, NAR parse error) are still cache
-        // misses. The metric should spike during store outages so dashboards
-        // surface the problem; incrementing only on success hides it.
-        metrics::counter!("rio_worker_fuse_cache_misses_total").increment(1);
-        let store_path = format!("/nix/store/{store_basename}");
-        let local_path = self.cache.cache_dir().join(store_basename);
+/// Why a prefetch returned without fetching. Not an error — both
+/// mean "somebody else is/has handling/handled it."
+///
+/// Exposed so the B2 metric can distinguish the cases (cache-hit
+/// vs in-flight). Both are "success" from prefetch's perspective.
+#[derive(Debug, Clone, Copy)]
+pub enum PrefetchSkip {
+    /// `cache.get_path()` returned Some — already on disk. The
+    /// scheduler's bloom filter should have caught this (it doesn't
+    /// send hints for paths the worker has), but bloom false
+    /// negatives + stale filter (10s heartbeat interval) mean some
+    /// slip through. Cheap check, harmless.
+    AlreadyCached,
+    /// `try_start_fetch` returned WaitFor — FUSE or another
+    /// prefetch already owns it. We DON'T wait (that's
+    /// ensure_cached's job for FUSE; prefetch is a hint). Return
+    /// the semaphore permit + blocking-pool thread immediately.
+    AlreadyInFlight,
+}
 
-        tracing::debug!(store_path = %store_path, "fetching from remote store");
-
-        // Fetch NAR data via gRPC (async bridged to sync). Timeout bounds the
-        // entire fetch (initial call + stream drain) — a stalled store would
-        // otherwise block this FUSE thread forever, and a few stalls exhaust
-        // the FUSE thread pool and freeze the whole mount.
-        let fetch_start = std::time::Instant::now();
-        let nar_data = self.runtime.block_on(async {
-            let mut client = self.store_client.clone();
-            match rio_proto::client::get_path_nar(
-                &mut client,
-                &store_path,
-                rio_common::grpc::GRPC_STREAM_TIMEOUT,
-                rio_common::limits::MAX_NAR_SIZE,
-            )
-            .await
-            {
-                Ok(Some((_info, nar))) => Ok(nar),
-                Ok(None) => {
-                    // Path not in remote store. lookup() probes unknown names
-                    // (.lock files, tmp paths); ENOENT is normal here.
-                    Err(Errno::ENOENT)
-                }
-                Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
-                    tracing::error!(
-                        store_path = %store_path,
-                        size = got,
-                        limit,
-                        "NAR exceeds MAX_NAR_SIZE"
-                    );
-                    Err(Errno::EFBIG)
-                }
-                Err(e) if e.is_not_found() => Err(Errno::ENOENT),
-                Err(e) => {
-                    tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
-                    Err(Errno::EIO)
-                }
-            }
-        })?;
-        metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
-            .record(fetch_start.elapsed().as_secs_f64());
-
-        // Parse and extract NAR to local disk
-        let node = rio_nix::nar::parse(&mut io::Cursor::new(&nar_data)).map_err(|e| {
-            tracing::warn!(store_path = %store_path, error = %e, "NAR parse failed");
-            Errno::EIO
-        })?;
-
-        // Extract to a temp sibling dir, then atomically rename into place.
-        // If extraction fails mid-way (disk full, etc.), the partial tree stays
-        // in the tmp dir and is cleaned up on next cache init, rather than
-        // being served as a broken store path by subsequent lookups.
-        let tmp_path = local_path.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
-        rio_nix::nar::extract_to_path(&node, &tmp_path).map_err(|e| {
-            tracing::warn!(
-                store_path = %store_path,
-                tmp_path = %tmp_path.display(),
-                error = %e,
-                "NAR extraction failed"
-            );
-            // Best-effort: remove the partial tmp tree.
-            let _ = std::fs::remove_dir_all(&tmp_path);
-            Errno::EIO
-        })?;
-        std::fs::rename(&tmp_path, &local_path).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&tmp_path);
-            tracing::error!(
-                store_path = %store_path,
-                tmp_path = %tmp_path.display(),
-                local_path = %local_path.display(),
-                error = %e,
-                "failed to rename extracted NAR into cache"
-            );
-            Errno::EIO
-        })?;
-
-        // Record in cache index. If this fails, the path is on disk but
-        // invisible to contains() — every subsequent access would re-fetch
-        // the NAR, creating an infinite re-fetch loop under DB failure.
-        // Fail loudly (EIO) so the build surfaces the real problem instead
-        // of silently amplifying network traffic.
-        let size = dir_size(&local_path);
-        if let Err(e) = self.cache.insert(store_basename, size) {
-            tracing::error!(
-                store_path = %store_basename,
-                local_path = %local_path.display(),
-                error = %e,
-                "failed to record in cache index; path on disk but untracked"
-            );
+/// Prefetch a store path. SYNC — call via `spawn_blocking`.
+///
+/// Cache methods use `runtime.block_on` internally (designed for
+/// FUSE callbacks on dedicated blocking threads). Calling from an
+/// async context would panic with nested-runtime. So this fn is
+/// sync and the B2 handler wraps it in spawn_blocking.
+///
+/// Returns:
+/// - `Ok(None)`: fetched successfully, path is now in cache
+/// - `Ok(Some(skip))`: didn't fetch, someone else has/had it
+/// - `Err(errno)`: fetch failed (store error, disk full, etc)
+///
+/// `Err` is an actual problem the operator should see in metrics.
+/// The B2 caller logs at debug (prefetch is a hint — if the store
+/// is flaky, the build's own FUSE ops will surface the real error).
+///
+/// Singleflight: shared with ensure_cached via the same `inflight`
+/// map in Cache. If FUSE is fetching when prefetch arrives, we
+/// get WaitFor and return immediately. If PREFETCH is fetching
+/// when FUSE arrives, FUSE waits on our guard — which is fine,
+/// we're in spawn_blocking so the wait doesn't starve the async
+/// executor.
+pub fn prefetch_path_blocking(
+    cache: &Cache,
+    store_client: &StoreServiceClient<Channel>,
+    runtime: &Handle,
+    store_basename: &str,
+) -> Result<Option<PrefetchSkip>, Errno> {
+    // Fast-path: already cached. Bloom should have caught this
+    // scheduler-side but stale filters happen.
+    match cache.get_path(store_basename) {
+        Ok(Some(_)) => return Ok(Some(PrefetchSkip::AlreadyCached)),
+        Ok(None) => {} // not cached, proceed
+        Err(e) => {
+            tracing::debug!(store_path = store_basename, error = %e, "prefetch: cache query failed");
             return Err(Errno::EIO);
         }
-
-        // Evict old entries if needed (best-effort)
-        if let Err(e) = self.cache.evict_if_needed() {
-            tracing::warn!(error = %e, "cache eviction failed");
-        }
-
-        Ok(local_path)
     }
+
+    match cache.try_start_fetch(store_basename) {
+        FetchClaim::Fetch(_guard) => {
+            // We own it. _guard's Drop notifies FUSE waiters (if any
+            // arrive while we're fetching). Same free-fn delegation
+            // as ensure_cached.
+            fetch_extract_insert(cache, store_client, runtime, store_basename).map(|_| None)
+        }
+        FetchClaim::WaitFor(_entry) => {
+            // Someone else has it. Don't wait — we'd hold the
+            // blocking-pool thread and a semaphore permit for
+            // something that's already happening. The whole point
+            // of prefetch is to GET AHEAD; waiting defeats that.
+            //
+            // Dropping _entry (not calling .wait()) is fine — it's
+            // just an Arc<InflightEntry>, dropping decrements the
+            // refcount. The fetcher's guard still notifies OTHER
+            // waiters (FUSE threads that called ensure_cached).
+            Ok(Some(PrefetchSkip::AlreadyInFlight))
+        }
+    }
+}
+
+/// The actual fetch: gRPC → NAR parse → extract to tmp → rename →
+/// cache.insert → evict. Shared by ensure_cached and prefetch.
+///
+/// Free fn (not a method on NixStoreFs) so prefetch can call it
+/// without a NixStoreFs (which is consumed by fuser::spawn_mount2).
+/// Takes the three things it actually needs: cache, client, runtime.
+///
+/// SYNC with internal block_on — caller is either a FUSE thread
+/// (dedicated blocking) or spawn_blocking. Never call from async.
+///
+/// Debug-level span: this is the slow path (cache miss → gRPC + NAR
+/// extract), called at most once per store path per worker lifetime.
+#[instrument(level = "debug", skip(cache, store_client, runtime), fields(store_basename = %store_basename))]
+fn fetch_extract_insert(
+    cache: &Cache,
+    store_client: &StoreServiceClient<Channel>,
+    runtime: &Handle,
+    store_basename: &str,
+) -> Result<PathBuf, Errno> {
+    // Increment on miss (entry to this function), not on fetch success:
+    // failed fetches (store outage, NAR parse error) are still cache
+    // misses. The metric should spike during store outages so dashboards
+    // surface the problem; incrementing only on success hides it.
+    metrics::counter!("rio_worker_fuse_cache_misses_total").increment(1);
+    let store_path = format!("/nix/store/{store_basename}");
+    let local_path = cache.cache_dir().join(store_basename);
+
+    tracing::debug!(store_path = %store_path, "fetching from remote store");
+
+    // Fetch NAR data via gRPC (async bridged to sync). Timeout bounds the
+    // entire fetch (initial call + stream drain) — a stalled store would
+    // otherwise block this FUSE thread forever, and a few stalls exhaust
+    // the FUSE thread pool and freeze the whole mount.
+    let fetch_start = std::time::Instant::now();
+    let nar_data = runtime.block_on(async {
+        let mut client = store_client.clone();
+        match rio_proto::client::get_path_nar(
+            &mut client,
+            &store_path,
+            rio_common::grpc::GRPC_STREAM_TIMEOUT,
+            rio_common::limits::MAX_NAR_SIZE,
+        )
+        .await
+        {
+            Ok(Some((_info, nar))) => Ok(nar),
+            Ok(None) => {
+                // Path not in remote store. lookup() probes unknown names
+                // (.lock files, tmp paths); ENOENT is normal here.
+                Err(Errno::ENOENT)
+            }
+            Err(rio_proto::client::NarCollectError::SizeExceeded { got, limit }) => {
+                tracing::error!(
+                    store_path = %store_path,
+                    size = got,
+                    limit,
+                    "NAR exceeds MAX_NAR_SIZE"
+                );
+                Err(Errno::EFBIG)
+            }
+            Err(e) if e.is_not_found() => Err(Errno::ENOENT),
+            Err(e) => {
+                tracing::warn!(store_path = %store_path, error = %e, "GetPath failed");
+                Err(Errno::EIO)
+            }
+        }
+    })?;
+    metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
+        .record(fetch_start.elapsed().as_secs_f64());
+
+    // Parse and extract NAR to local disk
+    let node = rio_nix::nar::parse(&mut io::Cursor::new(&nar_data)).map_err(|e| {
+        tracing::warn!(store_path = %store_path, error = %e, "NAR parse failed");
+        Errno::EIO
+    })?;
+
+    // Extract to a temp sibling dir, then atomically rename into place.
+    // If extraction fails mid-way (disk full, etc.), the partial tree stays
+    // in the tmp dir and is cleaned up on next cache init, rather than
+    // being served as a broken store path by subsequent lookups.
+    let tmp_path = local_path.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
+    rio_nix::nar::extract_to_path(&node, &tmp_path).map_err(|e| {
+        tracing::warn!(
+            store_path = %store_path,
+            tmp_path = %tmp_path.display(),
+            error = %e,
+            "NAR extraction failed"
+        );
+        // Best-effort: remove the partial tmp tree.
+        let _ = std::fs::remove_dir_all(&tmp_path);
+        Errno::EIO
+    })?;
+    std::fs::rename(&tmp_path, &local_path).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&tmp_path);
+        tracing::error!(
+            store_path = %store_path,
+            tmp_path = %tmp_path.display(),
+            local_path = %local_path.display(),
+            error = %e,
+            "failed to rename extracted NAR into cache"
+        );
+        Errno::EIO
+    })?;
+
+    // Record in cache index. If this fails, the path is on disk but
+    // invisible to contains() — every subsequent access would re-fetch
+    // the NAR, creating an infinite re-fetch loop under DB failure.
+    // Fail loudly (EIO) so the build surfaces the real problem instead
+    // of silently amplifying network traffic.
+    let size = dir_size(&local_path);
+    if let Err(e) = cache.insert(store_basename, size) {
+        tracing::error!(
+            store_path = %store_basename,
+            local_path = %local_path.display(),
+            error = %e,
+            "failed to record in cache index; path on disk but untracked"
+        );
+        return Err(Errno::EIO);
+    }
+
+    // Evict old entries if needed (best-effort)
+    if let Err(e) = cache.evict_if_needed() {
+        tracing::warn!(error = %e, "cache eviction failed");
+    }
+
+    Ok(local_path)
 }
 
 /// Recursively compute the size of a directory tree.
