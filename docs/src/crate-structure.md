@@ -15,9 +15,10 @@ rio-build/
 └── rio-worker/          # Build executor + FUSE store
 ```
 
+- **rio-controller/** — Kubernetes operator (WorkerPool + Build CRDs, reconciler, autoscaler)
+
 Not yet built (future phases):
 
-- **rio-controller/** — Phase 3 Kubernetes operator
 - **rio-cli/** — Phase 4 operator CLI
 - **rio-dashboard/** — TypeScript SPA, not a Rust crate
 

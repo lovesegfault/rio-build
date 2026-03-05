@@ -59,9 +59,10 @@ impl ChunkService for ChunkServiceImpl {
     /// If/when a client-side chunker lands (worker chunks locally, sends
     /// chunks + manifest separately), this becomes real. Tag for that.
     ///
-    /// TODO(phase3a): implement if client-side chunking lands. Needs
+    /// TODO(phase3b): implement if client-side chunking lands. Needs
     /// refcount policy for standalone chunks (probably: chunk without
-    /// manifest gets a short grace TTL before GC).
+    /// manifest gets a short grace TTL before GC). No client-side
+    /// chunker exists yet so this stays UNIMPLEMENTED.
     async fn put_chunk(
         &self,
         _request: Request<Streaming<PutChunkRequest>>,

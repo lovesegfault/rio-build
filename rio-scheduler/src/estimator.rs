@@ -13,8 +13,12 @@
 //! 3. Default: 30 seconds (configurable constant)
 //!
 //! Closure-size-as-proxy (scheduler.md fallback 2) is deferred —
-//! `TODO(phase3a)`: needs per-path nar_size which the scheduler doesn't
-//! currently track. The 30s default covers the cold-start case adequately.
+//! `TODO(phase3b)`: needs per-path nar_size tracked scheduler-side,
+//! which requires a gateway change (batch QueryPathInfo on input_srcs
+//! during reconstruct_dag) + proto field 10 on DerivationNode. Design
+//! in the phase3a plan (J1+J2). The 30s default covers cold-start
+//! adequately; PrefetchHint (B3, landed) improves the common case
+//! more than this fallback would.
 //!
 //! # Refresh, not live
 //!
@@ -95,11 +99,7 @@ impl Estimator {
 
         // Fallback #3: cold-start default.
         //
-        // TODO(phase3a): closure-size-as-proxy. A derivation with a
-        // 10 GB closure probably takes longer than one with a 100 MB
-        // closure — use the sum of input nar_sizes as a rough signal.
-        // Needs the scheduler to track nar_size per path, which it
-        // doesn't yet. The 30s default is acceptable until then.
+        // TODO(phase3b): closure-size-as-proxy (see module doc).
         DEFAULT_DURATION_SECS
     }
 

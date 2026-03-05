@@ -538,18 +538,19 @@ impl WorkerService for SchedulerGrpc {
                             }
                         }
                         rio_proto::types::worker_message::Msg::Progress(_progress) => {
-                            // ProgressUpdate still dropped. For size-class
-                            // routing we don't need a live sample stream:
-                            // CompletionReport.peak_memory_bytes carries the
-                            // kernel-tracked VmHWM (lifetime peak, one read
-                            // at build-end) and that's what the estimator
-                            // consumes. Mid-build ResourceUsage would only
-                            // matter for live pre-emption / migration, which
-                            // isn't in scope.
+                            // ProgressUpdate still dropped. cpu_cores
+                            // landed via CompletionReport.peak_cpu_cores
+                            // (cgroup-polled worker-side, one f64 at end)
+                            // — the estimator doesn't need a live stream
+                            // for that. Size-class routing's needs
+                            // (peak mem + peak cpu) are fully covered
+                            // by CompletionReport now.
                             //
-                            // TODO(phase3a): cpu_cores needs polling (no
-                            // kernel-tracked peak equivalent). That's when
-                            // ProgressUpdate becomes load-bearing.
+                            // TODO(phase4): live preemption/migration
+                            // would want mid-build ResourceUsage to
+                            // detect "this build is about to OOM, move
+                            // it." That's when ProgressUpdate matters.
+                            // Not in scope.
                         }
                     }
                 }
