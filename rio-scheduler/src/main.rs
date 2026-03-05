@@ -364,7 +364,8 @@ async fn main() -> anyhow::Result<()> {
     // (on completion). The test-only new_for_tests() constructor makes a
     // SEPARATE buffer — it's cfg(test) gated so prod can't accidentally
     // use it and silently break the pipeline.
-    let grpc_service = SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers.clone());
+    let grpc_service =
+        SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers.clone(), pool.clone());
     let admin_service = AdminServiceImpl::new(log_buffers, admin_s3, pool, actor.clone());
 
     // Start periodic tick task

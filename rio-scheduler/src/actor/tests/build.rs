@@ -31,7 +31,7 @@ async fn test_watch_build_after_completion_receives_terminal_event() -> TestResu
             reply: reply_tx,
         })
         .await?;
-    let mut watch_rx = reply_rx.await??;
+    let (mut watch_rx, _last_seq) = reply_rx.await??;
 
     // Should get a terminal event within a short timeout, not hang.
     let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.recv())
@@ -180,7 +180,7 @@ async fn test_watch_build_receives_events() -> TestResult {
             reply: reply_tx,
         })
         .await?;
-    let mut watch_rx = reply_rx.await??;
+    let (mut watch_rx, _last_seq) = reply_rx.await??;
 
     // Complete the build; watcher should see BuildCompleted.
     complete_success_empty(

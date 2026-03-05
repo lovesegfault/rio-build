@@ -29,6 +29,11 @@ pub struct SchedulerGrpc {
     /// completion. `Arc` because `SchedulerGrpc` is `Clone`d per-connection
     /// and all handlers + the spawned recv tasks need the same buffers.
     log_buffers: Arc<LogBuffers>,
+    /// PG pool for WatchBuild's event-log replay. `Option` so
+    /// `new_for_tests` can skip it (None → broadcast-only, no
+    /// replay, pre-C5 behavior). Production always sets it —
+    /// main.rs already has the pool for the DB handle.
+    pool: Option<sqlx::PgPool>,
 }
 
 impl SchedulerGrpc {
@@ -44,14 +49,26 @@ impl SchedulerGrpc {
         Self {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
+            pool: None,
         }
     }
 
     /// Create with an externally-owned `LogBuffers`. Production `main.rs`
     /// uses this so the LogFlusher (separate task) drains the SAME buffers
     /// that the BuildExecution recv task writes to.
-    pub fn with_log_buffers(actor: ActorHandle, log_buffers: Arc<LogBuffers>) -> Self {
-        Self { actor, log_buffers }
+    ///
+    /// `pool`: for WatchBuild's PG event-log replay. main.rs already
+    /// has it (same pool as `SchedulerDb`).
+    pub fn with_log_buffers(
+        actor: ActorHandle,
+        log_buffers: Arc<LogBuffers>,
+        pool: sqlx::PgPool,
+    ) -> Self {
+        Self {
+            actor,
+            log_buffers,
+            pool: Some(pool),
+        }
     }
 
     /// Access the shared log ring buffers. Exposed for `AdminService` (C9).
@@ -114,7 +131,36 @@ impl SchedulerGrpc {
     }
 }
 
+/// Parameters for PG-backed event replay on WatchBuild.
+///
+/// Set only when `since < last_seq` (gap exists) AND a pool is
+/// available. SubmitBuild never sets this: fresh build, last_seq=0,
+/// no gap possible.
+pub(crate) struct EventReplay {
+    pub pool: sqlx::PgPool,
+    pub build_id: Uuid,
+    /// Gateway's last-seen sequence. PG replay lower bound (exclusive).
+    pub since: u64,
+    /// Actor's last-emitted sequence at subscribe time. PG replay
+    /// upper bound (inclusive) AND broadcast dedup watermark.
+    pub last_seq: u64,
+}
+
 /// Bridge a `broadcast::Receiver<BuildEvent>` into a tonic streaming response.
+///
+/// Two-phase when `replay` is set:
+///   1. PG replay: stream `WHERE seq > since AND seq <= last_seq`
+///      from `build_event_log`. Closes the gap between what the
+///      gateway saw before disconnect and what the new subscribe
+///      will carry. Best-effort — if PG is down, fall through to
+///      broadcast-only (the terminal-event re-send in
+///      handle_watch_build is the safety net).
+///   2. Broadcast drain with dedup: skip `seq <= last_seq`. Those
+///      may ALSO be in the broadcast ring (1024-event buffer), and
+///      PG already delivered them in phase 1. Without dedup the
+///      gateway sees events twice.
+///
+/// `replay = None` → pure broadcast drain, no dedup (SubmitBuild).
 ///
 /// On `Lagged`, sends `DATA_LOSS` so the client fails cleanly instead of
 /// silently hanging on a missed terminal event. Lagged means we permanently
@@ -123,12 +169,75 @@ impl SchedulerGrpc {
 pub(crate) fn bridge_build_events(
     task_name: &'static str,
     mut bcast: broadcast::Receiver<rio_proto::types::BuildEvent>,
+    replay: Option<EventReplay>,
 ) -> ReceiverStream<Result<rio_proto::types::BuildEvent, Status>> {
     let (tx, rx) = mpsc::channel(256);
     rio_common::task::spawn_monitored(task_name, async move {
+        // Phase 1: PG replay. Best-effort — on error, fall through.
+        // `dedup_watermark` starts at 0 (no dedup) and is raised to
+        // last_seq ONLY if replay succeeds. On PG failure we DON'T
+        // dedup — the broadcast ring might have events we'd otherwise
+        // skip, and a double is better than a hole.
+        let mut dedup_watermark = 0u64;
+        if let Some(r) = replay {
+            match crate::db::read_event_log(&r.pool, r.build_id, r.since, r.last_seq).await {
+                Ok(rows) => {
+                    // Replay succeeded (even if empty — the
+                    // persister may have dropped some under
+                    // backpressure, but we know nothing NEW is
+                    // coming ≤ last_seq). Safe to dedup.
+                    dedup_watermark = r.last_seq;
+                    for (seq, bytes) in rows {
+                        use prost::Message;
+                        match rio_proto::types::BuildEvent::decode(&bytes[..]) {
+                            Ok(event) => {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return; // client gone
+                                }
+                            }
+                            Err(e) => {
+                                // Corrupt row — written by us, so
+                                // this is a bug. Skip it; the seq
+                                // gap is visible to the client.
+                                warn!(
+                                    build_id = %r.build_id,
+                                    seq,
+                                    error = %e,
+                                    "event-log replay: prost decode failed (corrupt row, skipping)"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // PG unreachable. Fall through to broadcast-only.
+                    // handle_watch_build's terminal re-send covers
+                    // the "build already done" case. Non-terminal
+                    // builds: the gateway misses some history but
+                    // sees live events. Degraded, not dead.
+                    warn!(
+                        build_id = %r.build_id,
+                        since = r.since,
+                        last_seq = r.last_seq,
+                        error = %e,
+                        "event-log replay failed (PG unreachable?); \
+                         falling through to broadcast-only, gap possible"
+                    );
+                }
+            }
+        }
+
+        // Phase 2: broadcast drain.
         loop {
             match bcast.recv().await {
                 Ok(event) => {
+                    // Dedup: PG already delivered seq ≤ watermark.
+                    // The broadcast ring (1024 cap) holds recent
+                    // events — some were emitted BEFORE subscribe
+                    // and have seq ≤ last_seq. Skip those.
+                    if event.sequence <= dedup_watermark {
+                        continue;
+                    }
                     if tx.send(Ok(event)).await.is_err() {
                         break; // client disconnected
                     }
@@ -287,9 +396,12 @@ impl SchedulerService for SchedulerGrpc {
         // Per observability.md:204 this is a required structured-log field.
         tracing::Span::current().record("build_id", build_id.to_string());
         info!(build_id = %build_id, "build submitted");
+        // No replay: fresh build, MergeDag subscribed BEFORE seq=1
+        // (Started) was emitted. last_seq=0, no gap. Pure broadcast.
         Ok(Response::new(bridge_build_events(
             "submit-build-bridge",
             bcast,
+            None,
         )))
     }
 
@@ -313,10 +425,27 @@ impl SchedulerService for SchedulerGrpc {
             reply: reply_tx,
         };
 
-        let bcast = self.send_and_await(cmd, reply_rx).await?;
+        let (bcast, last_seq) = self.send_and_await(cmd, reply_rx).await?;
+
+        // Replay IF: pool available AND there's a gap to fill.
+        // `since_sequence >= last_seq` → gateway already saw
+        // everything, empty range, skip the PG round-trip.
+        // `since_sequence == 0 && last_seq == 0` → build just
+        // started, nothing emitted yet — common case, cheap exit.
+        let replay = match &self.pool {
+            Some(pool) if req.since_sequence < last_seq => Some(EventReplay {
+                pool: pool.clone(),
+                build_id,
+                since: req.since_sequence,
+                last_seq,
+            }),
+            _ => None,
+        };
+
         Ok(Response::new(bridge_build_events(
             "watch-build-bridge",
             bcast,
+            replay,
         )))
     }
 
