@@ -339,8 +339,22 @@ async fn main() -> anyhow::Result<()> {
         cfg.fuse_passthrough,
         cfg.fuse_threads,
     )?;
-    // Suppress unused until B2 wires them. One-commit window.
-    let _ = (&prefetch_cache, &prefetch_store, &prefetch_runtime);
+
+    // Prefetch concurrency limit. Separate from build_semaphore —
+    // prefetch shouldn't compete with builds for slots. 8 is
+    // conservative: each holds a tokio blocking-pool thread (default
+    // pool is 512, so no starvation concern) AND pins an in-flight
+    // gRPC stream to the store (which is what we're bounding —
+    // don't DDoS the store with 100 parallel NARs when the scheduler
+    // sends a big hint list).
+    //
+    // Why not max_builds? Prefetch is OPPORTUNISTIC — it's about
+    // warming the cache BEFORE the build needs those paths. If we
+    // limited to max_builds, a worker with max_builds=1 would
+    // prefetch serially (one at a time) which defeats "get ahead."
+    // 8 is enough parallelism to saturate a typical store without
+    // overwhelming it.
+    let prefetch_sem = Arc::new(Semaphore::new(8));
 
     info!(
         mount_point = %cfg.fuse_mount_point.display(),
@@ -529,8 +543,88 @@ async fn main() -> anyhow::Result<()> {
                     Some(scheduler_message::Msg::Prefetch(prefetch)) => {
                         tracing::debug!(
                             paths = prefetch.store_paths.len(),
-                            "received prefetch hint (prefetch not yet implemented)"
+                            "received prefetch hint"
                         );
+                        // Spawn one task per path. Don't await — the
+                        // whole point is to NOT block the stream loop
+                        // on prefetch. The semaphore bounds concurrent
+                        // in-flight; excess queue in tokio's task
+                        // scheduler (cheap — no blocking-pool thread
+                        // is held until the permit is acquired).
+                        //
+                        // No JoinHandle tracking: prefetch is fire-and-
+                        // forget. If the worker SIGTERMs mid-prefetch,
+                        // the tasks abort with the runtime — the
+                        // partial fetch is in a .tmp-XXXX sibling dir
+                        // (see fetch_extract_insert) which cache init
+                        // cleans up on next start.
+                        for store_path in prefetch.store_paths {
+                            // Scheduler sends full paths; we need
+                            // basename. Malformed (no /nix/store/
+                            // prefix) → skip with debug log. Don't
+                            // fail the loop — one bad path in a
+                            // batch shouldn't poison the rest.
+                            let Some(basename) = store_path.strip_prefix("/nix/store/") else {
+                                tracing::debug!(
+                                    path = %store_path,
+                                    "prefetch: malformed path (no /nix/store/ prefix), skipping"
+                                );
+                                metrics::counter!("rio_worker_prefetch_total", "result" => "malformed")
+                                    .increment(1);
+                                continue;
+                            };
+                            let basename = basename.to_string();
+
+                            // Clone handles into the task. All cheap:
+                            // Arc clone, tonic Channel is Arc-internal,
+                            // tokio Handle is a lightweight token.
+                            let cache = Arc::clone(&prefetch_cache);
+                            let client = prefetch_store.clone();
+                            let rt = prefetch_runtime.clone();
+                            let sem = Arc::clone(&prefetch_sem);
+
+                            tokio::spawn(async move {
+                                // Permit BEFORE spawn_blocking: if the
+                                // semaphore is saturated, this task
+                                // waits here (cheap async wait) not
+                                // in the blocking pool. Tasks queue
+                                // in tokio's scheduler; blocking
+                                // threads only taken when a permit
+                                // is available.
+                                //
+                                // On Err(Closed): semaphore closed →
+                                // worker shutting down. Drop the
+                                // prefetch silently — it was a hint.
+                                let Ok(_permit) = sem.acquire_owned().await else {
+                                    return;
+                                };
+
+                                // spawn_blocking: Cache methods use
+                                // block_on internally (nested-runtime
+                                // panic from async). The permit moves
+                                // into the blocking closure and drops
+                                // when it returns — next queued task
+                                // wakes.
+                                let result = tokio::task::spawn_blocking(move || {
+                                    use rio_worker::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
+                                    let _permit = _permit; // hold through blocking work
+                                    match prefetch_path_blocking(&cache, &client, &rt, &basename) {
+                                        Ok(None) => "fetched",
+                                        Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
+                                        Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",
+                                        Err(_) => "error",
+                                    }
+                                })
+                                .await;
+
+                                // JoinError (panic in blocking) →
+                                // record as "panic". Don't re-panic
+                                // — we're fire-and-forget.
+                                let label = result.unwrap_or("panic");
+                                metrics::counter!("rio_worker_prefetch_total", "result" => label)
+                                    .increment(1);
+                            });
+                        }
                     }
                     None => {
                         tracing::warn!("received empty scheduler message");

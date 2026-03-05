@@ -83,4 +83,11 @@ pub fn describe_metrics() {
         "rio_worker_overlay_teardown_failures_total",
         "Overlay unmount failures (leaked mount); alert if rate > 0"
     );
+    describe_counter!(
+        "rio_worker_prefetch_total",
+        "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|error|malformed|panic. \
+         High already_cached rate = scheduler bloom filter stale (10s heartbeat lag is normal; \
+         sustained high = check bloom sizing). error = store fetch failed (debug-only log; \
+         build's own FUSE ops surface the real problem if store is flaky)."
+    );
 }
