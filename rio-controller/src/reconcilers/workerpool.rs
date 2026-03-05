@@ -1013,4 +1013,202 @@ mod tests {
             other => panic!("expected InvalidSpec with helpful message, got {other:?}"),
         }
     }
+
+    // =========================================================
+    // Mock-apiserver integration tests (F8)
+    //
+    // These test the WIRING: apply() calls Service PATCH then
+    // StatefulSet PATCH then WorkerPool/status PATCH, in that
+    // order, with server-side-apply params. The builder tests
+    // above cover WHAT gets patched; these cover WHEN/HOW.
+    // =========================================================
+
+    use crate::fixtures::{ApiServerVerifier, Scenario, apply_ok_scenarios};
+
+    fn test_ctx(client: kube::Client) -> Arc<Ctx> {
+        Arc::new(Ctx {
+            client,
+            // Unreachable — apply() doesn't touch the scheduler,
+            // and cleanup() treats connect failure as best-effort
+            // skip. Using an address that fails fast (port 1 is
+            // never listened on) vs one that times out.
+            scheduler_addr: "http://127.0.0.1:1".into(),
+            store_addr: "http://127.0.0.1:1".into(),
+        })
+    }
+
+    /// apply() hits Service → StatefulSet → WorkerPool/status,
+    /// server-side apply all three. Wrong order or missing call
+    /// → verifier panics.
+    #[tokio::test]
+    async fn apply_patches_in_order() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let ctx = test_ctx(client);
+        let wp = Arc::new(test_wp());
+
+        let task = verifier.run(apply_ok_scenarios("test-pool", "rio", 2));
+
+        // Call apply() directly (not reconcile() — finalizer()
+        // would do its own GET + PATCH of metadata.finalizers
+        // first, which adds scenarios we don't care about here).
+        let action = apply(wp, &ctx).await.expect("apply succeeds");
+
+        // Requeue in 5m — the fallback re-reconcile.
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("verifier consumed all scenarios (right number of calls)")
+            .expect("verifier assertions passed");
+    }
+
+    /// Server-side apply params in the query string. SSA is
+    /// what makes reconcile idempotent — if we accidentally
+    /// switch to PUT or merge-patch, this fails.
+    #[tokio::test]
+    async fn apply_uses_server_side_apply() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let ctx = test_ctx(client);
+        let wp = Arc::new(test_wp());
+
+        // Custom scenarios that assert fieldManager=rio-controller
+        // in the query string (SSA puts it there; merge patch
+        // doesn't). path_contains is a substring match so
+        // embedding the query param works.
+        let task = verifier.run(vec![
+            Scenario::ok(
+                http::Method::PATCH,
+                "fieldManager=rio-controller",
+                serde_json::json!({"metadata":{"name":"test-pool-workers"}}).to_string(),
+            ),
+            Scenario::ok(
+                http::Method::PATCH,
+                "fieldManager=rio-controller",
+                serde_json::json!({
+                    "metadata":{"name":"test-pool-workers"},
+                    "status":{"replicas":0}
+                })
+                .to_string(),
+            ),
+            Scenario::ok(
+                http::Method::PATCH,
+                "workerpools/test-pool/status",
+                serde_json::json!({
+                    "apiVersion":"rio.build/v1alpha1","kind":"WorkerPool",
+                    "metadata":{"name":"test-pool"},
+                    "spec":{"replicas":{"min":1,"max":1},"autoscaling":{"metric":"x","targetValue":1},
+                        "maxConcurrentBuilds":1,"fuseCacheSize":"1Gi","features":[],
+                        "systems":["x"],"sizeClass":"x","image":"x"}
+                })
+                .to_string(),
+            ),
+        ]);
+
+        apply(wp, &ctx).await.expect("apply succeeds");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// cleanup with STS already gone → 404 → short-circuit.
+    /// Proves the "STS not found → done" branch doesn't hang
+    /// on the poll loop.
+    #[tokio::test]
+    async fn cleanup_tolerates_missing_statefulset() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let ctx = test_ctx(client);
+        let wp = Arc::new(test_wp());
+
+        // Phase 1: pod list (empty — no pods to drain). Phase
+        // 2: STS scale PATCH → 404. cleanup() short-circuits.
+        // No phase 3 GET.
+        let task = verifier.run(vec![
+            // Pod list. Empty — cleanup skips the DrainWorker
+            // loop (scheduler unreachable anyway with port 1).
+            Scenario::ok(
+                http::Method::GET,
+                "/pods?&labelSelector=rio.build",
+                serde_json::json!({"apiVersion":"v1","kind":"PodList","items":[]}).to_string(),
+            ),
+            // STS PATCH → 404. K8s 404 body is a Status object.
+            Scenario {
+                method: http::Method::PATCH,
+                path_contains: "/statefulsets/test-pool-workers",
+                status: 404,
+                body_json: serde_json::json!({
+                    "apiVersion":"v1","kind":"Status","status":"Failure",
+                    "reason":"NotFound","code":404,
+                    "message":"statefulsets.apps \"test-pool-workers\" not found"
+                })
+                .to_string(),
+            },
+        ]);
+
+        let action = cleanup(wp, &ctx).await.expect("cleanup tolerates 404");
+        assert_eq!(action, Action::await_change());
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// cleanup poll loop: first GET shows replicas=1, second
+    /// shows 0 → break. Proves we poll `status.replicas` not
+    /// `readyReplicas` (the latter would see 0 immediately on
+    /// a terminating pod — wrong).
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_polls_until_replicas_zero() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let ctx = test_ctx(client);
+        let wp = Arc::new(test_wp());
+
+        // start_paused + tokio::time means the 5s sleep between
+        // polls auto-advances. Without it, this test would take
+        // 5 real seconds.
+        let sts_with = |replicas: i32| {
+            serde_json::json!({
+                "apiVersion":"apps/v1","kind":"StatefulSet",
+                "metadata":{"name":"test-pool-workers"},
+                "status":{"replicas": replicas, "readyReplicas": 0}
+            })
+            .to_string()
+        };
+
+        let task = verifier.run(vec![
+            Scenario::ok(
+                http::Method::GET,
+                "/pods?&labelSelector=rio.build",
+                serde_json::json!({"apiVersion":"v1","kind":"PodList","items":[]}).to_string(),
+            ),
+            Scenario::ok(
+                http::Method::PATCH,
+                "/statefulsets/test-pool-workers",
+                sts_with(1),
+            ),
+            // First poll: replicas=1 (pod still terminating).
+            // readyReplicas=0 but we DON'T break — proves we
+            // read the right field.
+            Scenario::ok(
+                http::Method::GET,
+                "/statefulsets/test-pool-workers",
+                sts_with(1),
+            ),
+            // Second poll: replicas=0. Break.
+            Scenario::ok(
+                http::Method::GET,
+                "/statefulsets/test-pool-workers",
+                sts_with(0),
+            ),
+        ]);
+
+        let action = cleanup(wp, &ctx).await.expect("cleanup completes");
+        assert_eq!(action, Action::await_change());
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

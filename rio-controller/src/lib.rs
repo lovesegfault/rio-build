@@ -53,6 +53,8 @@
 
 pub mod crds;
 pub mod error;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod reconcilers;
 pub mod scaling;
 
