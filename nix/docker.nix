@@ -66,6 +66,13 @@ in
   scheduler = mkImage { name = "scheduler"; };
   store = mkImage { name = "store"; };
 
+  # Controller is the lightest — it only talks to the K8s API and
+  # the scheduler's gRPC. No nix, no fuse, no PG. Just cacert for
+  # the in-cluster TLS connection (kube-apiserver serves HTTPS;
+  # the service-account CA is mounted separately but kube-rs also
+  # reads SSL_CERT_FILE for the initial client config probe).
+  controller = mkImage { name = "controller"; };
+
   # Worker needs the nix toolchain + FUSE runtime + mount utilities.
   worker = mkImage {
     name = "worker";
