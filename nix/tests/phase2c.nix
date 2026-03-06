@@ -209,8 +209,20 @@ pkgs.testers.runNixOSTest {
         "VALUES ('rio-2c-bigthing', 'x86_64-linux', 120.0, 1, now())\""
     )
 
-    # Wait for estimator refresh. 6 ticks × 2s = 12s + slop.
-    control.sleep(15)
+    # Wait for estimator refresh to pick up the seed. The estimator
+    # refreshes every 6 ticks (12s at tickInterval=2s). Previously:
+    # sleep(15) and hope. Now: poll the refresh counter. ≥2 refreshes
+    # since test start = at least one after the INSERT above (the
+    # first may have raced). The counter starts at 0 on scheduler
+    # startup and increments only on SUCCESSFUL refresh (PG read +
+    # estimator.refresh() — not on error). Prometheus counters only
+    # appear after first .increment(), so `grep ...total [2-9]`
+    # implicitly asserts ≥2 (not just "registered").
+    control.wait_until_succeeds(
+        "curl -sf http://localhost:9091/metrics | "
+        "grep -E 'rio_scheduler_estimator_refresh_total [2-9]'",
+        timeout=30
+    )
 
     # Build bigthing (pname="rio-2c-bigthing" in env — estimator keys
     # on that). With the 120s seeded EMA and 30s small cutoff,

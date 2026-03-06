@@ -480,6 +480,28 @@ pkgs.testers.runNixOSTest {
             "grep -qE '^[0-9]{7,}$'",
             timeout=10
         )
+
+        # ── cgroup cpu.stat → build_history (G2) ──────────────────
+        # The derivation sleeps 2s specifically so the 1Hz CPU poll
+        # (executor/mod.rs:456) fires at least once. Previously only
+        # memory was asserted — the CPU chain (poll → peak_cpu_cores
+        # → CompletionReport → COALESCE blend → ema_peak_cpu_cores)
+        # was never end-to-end tested. `> 0` (not =0): sleep uses
+        # negligible CPU but the poll baseline captures daemon
+        # overhead; a value > 0 proves the chain ran. Non-null is
+        # the real signal (completion.rs:202 filters 0 → None).
+        #
+        # NUMERIC::text not DOUBLE PRECISION: psql's -tA prints
+        # floats with full precision (e.g., "0.00123456") which
+        # the regex matches; NULL → empty line, fails grep.
+        control.wait_until_succeeds(
+            "sudo -u postgres psql rio -tA -c "
+            "\"SELECT ema_peak_cpu_cores FROM build_history "
+            "WHERE pname IN ('rio-3a-child','rio-3a-parent') "
+            "AND ema_peak_cpu_cores IS NOT NULL AND ema_peak_cpu_cores > 0\" | "
+            "grep -qE '^[0-9]'",
+            timeout=10
+        )
     except Exception:
         dump_logs()
         raise
@@ -508,25 +530,33 @@ pkgs.testers.runNixOSTest {
     # autoscaler's actual 30s+30s stabilization loop is unit-tested
     # in scaling.rs; this proves the SSA field-ownership handoff.
     k8s.succeed("k3s kubectl scale statefulset default-workers --replicas=2")
-    # Give the reconciler time to run (triggered by .owns() watch on
-    # STS change). The reconcile itself is fast (<100ms); 5s is plenty
-    # for the watch event to deliver. Without the fix, replicas would
-    # be back at 1 after this sleep.
-    import time; time.sleep(5)
-    k8s.succeed(
-        "test \"$(k3s kubectl get statefulset default-workers "
-        "-o jsonpath='{.spec.replicas}')\" = 2"
-    )
-    # And WorkerPool.status.desiredReplicas should reflect the
-    # scaled value (reconciler reads it from STS.spec.replicas
-    # before patching status). Previously hardcoded to min.
+    # Wait for the reconciler to observe the change (triggered by
+    # .owns() watch on STS). desiredReplicas=2 proves the reconcile
+    # RAN (it reads STS.spec.replicas and patches WorkerPool.status).
+    # Once this succeeds, the reconciler has had its chance to stomp
+    # on STS.spec.replicas — the followup assertion checks it didn't.
+    #
+    # This ordering replaces the previous `time.sleep(5)` hack:
+    # before, we slept hoping the reconciler ran in that window,
+    # then asserted replicas=2. Now we POSITIVELY wait for the
+    # reconciler's own status patch, then assert replicas. No
+    # timing race; the negative assertion (replicas STILL 2) is
+    # reliable once we've seen the positive signal (reconciler ran).
     k8s.wait_until_succeeds(
         "test \"$(k3s kubectl get workerpool default "
         "-o jsonpath='{.status.desiredReplicas}')\" = 2",
         timeout=15
     )
+    # Reconciler ran + updated status. Now assert it did NOT revert
+    # STS.spec.replicas back to min (the regression). This is a
+    # synchronous check — if the reconciler were going to stomp,
+    # it would have done so in the reconcile that patched status.
+    k8s.succeed(
+        "test \"$(k3s kubectl get statefulset default-workers "
+        "-o jsonpath='{.spec.replicas}')\" = 2"
+    )
 
-    # ── Finalizer drain (F6) ───────────────────────────────────────
+    # ── Finalizer drain ────────────────────────────────────────────
     # Delete the WorkerPool → finalizer runs → DrainWorker +
     # scale STS to 0 + wait → finalizer removed → GC. The pod
     # should disappear gracefully (build completed, nothing to
