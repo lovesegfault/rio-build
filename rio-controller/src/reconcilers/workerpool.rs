@@ -36,7 +36,7 @@ use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crds::workerpool::WorkerPool;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
 
 /// Finalizer name. Must be unique across the cluster — prefixed
@@ -53,7 +53,32 @@ const MANAGER: &str = "rio-controller";
 /// Top-level reconcile. Wrapped in `finalizer()` which handles
 /// the metadata.finalizers dance: Apply on normal reconcile,
 /// Cleanup when deletionTimestamp is set.
+///
+/// `#[instrument]` creates a span carrying pool/ns for every
+/// log line inside. Histogram records duration — the
+/// observability spec (observability.md:132) calls for
+/// `rio_controller_reconcile_duration_seconds` labeled by
+/// reconciler; this provides it.
+#[tracing::instrument(
+    skip(wp, ctx),
+    fields(reconciler = "workerpool", pool = %wp.name_any(), ns = wp.namespace().as_deref().unwrap_or(""))
+)]
 pub async fn reconcile(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
+    let start = std::time::Instant::now();
+    let result = reconcile_inner(wp, ctx).await;
+    // Record duration regardless of success/error — error-path
+    // duration is a useful signal (slow apiserver timeouts show
+    // as long durations + error).
+    metrics::histogram!("rio_controller_reconcile_duration_seconds",
+        "reconciler" => "workerpool")
+    .record(start.elapsed().as_secs_f64());
+    result
+}
+
+/// Actual reconcile body. Separate from the metric-wrapped
+/// `reconcile()` so `?` exits at the right scope (after the
+/// histogram record, not short-circuiting it).
+async fn reconcile_inner(wp: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action> {
     let ns = wp.namespace().ok_or_else(|| {
         // WorkerPool is #[kube(namespaced)] so this can't happen
         // via normal apiserver paths (it'd reject a cluster-
@@ -416,6 +441,10 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
 /// backoff. InvalidSpec → longer (operator needs to fix it;
 /// retrying fast is noise).
 pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action {
+    metrics::counter!("rio_controller_reconcile_errors_total",
+        "reconciler" => "workerpool", "error_kind" => error_kind(err))
+    .increment(1);
+
     match err {
         Error::InvalidSpec(msg) => {
             // Operator error. Requeue slow — they need to edit

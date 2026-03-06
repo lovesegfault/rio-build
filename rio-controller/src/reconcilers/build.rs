@@ -45,7 +45,7 @@ use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
 use crate::crds::build::{Build, BuildStatus};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, error_kind};
 use crate::reconcilers::Ctx;
 
 const FINALIZER: &str = "rio.build/build-cleanup";
@@ -61,7 +61,20 @@ const MAX_DRV_NAR_SIZE: u64 = 256 * 1024;
 /// Builds queue behind this one in the controller's work queue).
 const DRV_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[tracing::instrument(
+    skip(b, ctx),
+    fields(reconciler = "build", build = %b.name_any(), ns = b.namespace().as_deref().unwrap_or(""))
+)]
 pub async fn reconcile(b: Arc<Build>, ctx: Arc<Ctx>) -> Result<Action> {
+    let start = std::time::Instant::now();
+    let result = reconcile_inner(b, ctx).await;
+    metrics::histogram!("rio_controller_reconcile_duration_seconds",
+        "reconciler" => "build")
+    .record(start.elapsed().as_secs_f64());
+    result
+}
+
+async fn reconcile_inner(b: Arc<Build>, ctx: Arc<Ctx>) -> Result<Action> {
     let ns = b
         .namespace()
         .ok_or_else(|| Error::InvalidSpec("Build has no namespace".into()))?;
@@ -238,6 +251,14 @@ async fn cleanup(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 }
 
 pub fn error_policy(_b: Arc<Build>, err: &Error, _ctx: Arc<Ctx>) -> Action {
+    // Per observability.md:133. error_kind uses the variant
+    // discriminator — coarse but stable (won't change when inner
+    // error messages do). Dashboards can slice on kind without
+    // getting a cardinality explosion from dynamic messages.
+    metrics::counter!("rio_controller_reconcile_errors_total",
+        "reconciler" => "build", "error_kind" => error_kind(err))
+    .increment(1);
+
     match err {
         Error::InvalidSpec(msg) => {
             warn!(error = %msg, "invalid Build spec; fix the CRD");

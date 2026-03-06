@@ -39,3 +39,19 @@ pub enum Error {
 
 /// Result alias used throughout reconcilers.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Discriminator string for metric labels. Stable across
+/// error-message changes; low cardinality (4 values).
+///
+/// `rio_controller_reconcile_errors_total{error_kind=...}` uses
+/// this. Don't switch to Display — error messages contain
+/// dynamic data (addresses, status codes) that would explode
+/// metric cardinality.
+pub fn error_kind(err: &Error) -> &'static str {
+    match err {
+        Error::Kube(_) => "kube",
+        Error::Finalizer(_) => "finalizer",
+        Error::InvalidSpec(_) => "invalid_spec",
+        Error::SchedulerUnavailable(_) => "scheduler_unavailable",
+    }
+}
