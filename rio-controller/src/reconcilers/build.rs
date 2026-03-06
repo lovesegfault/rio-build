@@ -235,7 +235,11 @@ pub fn error_policy(_b: Arc<Build>, err: &Error, _ctx: Arc<Ctx>) -> Action {
             Action::requeue(Duration::from_secs(300))
         }
         _ => {
-            debug!(error = %err, "Build reconcile failed; retrying");
+            // warn! not debug! — a 30s silent retry loop at debug
+            // is invisible at INFO and cost us ~10min of vm-phase3a
+            // debugging once (workerpool.rs had the fix + this
+            // comment; build.rs never got it).
+            warn!(error = %err, "Build reconcile failed; retrying");
             Action::requeue(Duration::from_secs(30))
         }
     }
