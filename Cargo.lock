@@ -4590,6 +4590,7 @@ dependencies = [
  "rio-proto",
  "rio-store",
  "rio-test-support",
+ "rustls 0.23.37",
  "serde",
  "sha2 0.10.9",
  "sqlx",

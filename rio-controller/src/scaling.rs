@@ -234,7 +234,8 @@ impl Autoscaler {
                 // apply with a DIFFERENT field manager than the
                 // reconciler — we own `spec.replicas`, reconciler
                 // owns everything else. Two managers, no conflict.
-                let patch = serde_json::json!({ "spec": { "replicas": desired } });
+                //
+                let patch = sts_replicas_patch(desired);
                 match sts_api
                     .patch(
                         &sts_name,
@@ -274,6 +275,26 @@ impl Autoscaler {
             }
         }
     }
+}
+
+/// Build the SSA patch body for `StatefulSet.spec.replicas`.
+///
+/// apiVersion + kind are MANDATORY in SSA bodies: without them
+/// the apiserver returns 400 "apiVersion must be set". Same
+/// pattern as workerpool.rs's status patch and build.rs's
+/// patch_status — but previously forgotten here. vm-phase3a
+/// used `kubectl scale` directly, bypassing this path, so the
+/// missing fields were never caught against a real apiserver.
+///
+/// Extracted as a free fn so a unit test can assert the body
+/// shape without spinning up a full mock-apiserver + mock
+/// AdminService gRPC.
+pub(crate) fn sts_replicas_patch(replicas: i32) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "spec": { "replicas": replicas },
+    })
 }
 
 /// Compute desired replicas from queue metrics.
@@ -402,6 +423,37 @@ fn pool_key(pool: &WorkerPool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- sts_replicas_patch: SSA body shape ----
+
+    /// SSA patches MUST carry apiVersion + kind, or the apiserver
+    /// returns 400 "apiVersion must be set". Previously the
+    /// autoscaler sent `{"spec":{"replicas":N}}` and silently
+    /// failed every scale (vm-phase3a used `kubectl scale` direct,
+    /// bypassing this path). This test is a tripwire: if someone
+    /// strips the GVK fields "for brevity," this breaks.
+    #[test]
+    fn sts_replicas_patch_has_gvk() {
+        let patch = sts_replicas_patch(5);
+        assert_eq!(
+            patch.get("apiVersion").and_then(|v| v.as_str()),
+            Some("apps/v1"),
+            "SSA body without apiVersion → apiserver 400"
+        );
+        assert_eq!(
+            patch.get("kind").and_then(|v| v.as_str()),
+            Some("StatefulSet"),
+            "SSA body without kind → apiserver 400"
+        );
+        assert_eq!(
+            patch
+                .get("spec")
+                .and_then(|s| s.get("replicas"))
+                .and_then(|r| r.as_i64()),
+            Some(5),
+            "the actual payload"
+        );
+    }
 
     // ---- compute_desired: pure arithmetic ----
 
