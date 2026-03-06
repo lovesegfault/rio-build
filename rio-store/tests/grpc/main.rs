@@ -71,10 +71,10 @@ impl StoreSession {
     pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
         let db = TestDb::new(&MIGRATOR).await;
         let backend = Arc::new(MemoryChunkBackend::new());
-        let service = StoreServiceImpl::with_chunk_backend(
-            db.pool.clone(),
-            backend.clone() as Arc<dyn ChunkBackend>,
-        );
+        let cache = Arc::new(rio_store::cas::ChunkCache::new(
+            backend.clone() as Arc<dyn ChunkBackend>
+        ));
+        let service = StoreServiceImpl::with_chunk_cache(db.pool.clone(), cache);
         let (client, server) = spawn_store_server(service).await?;
         Ok((Self { db, client, server }, backend))
     }

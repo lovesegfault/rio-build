@@ -24,16 +24,13 @@ async fn setup_chunk_service(
     tokio::task::JoinHandle<()>,
 )> {
     let backend = Arc::new(MemoryChunkBackend::new());
-    // ONE cache, shared. The previous version of this setup was
-    // buggy: with_chunk_backend creates its OWN cache internally,
-    // so StoreService had cache #1 and ChunkService had cache #2.
-    // The "same cache" comment was aspirational, not real. It
-    // passed anyway because both caches miss → both hit the same
-    // MemoryChunkBackend → same chunks. But "warmed by GetPath is
-    // hot for GetChunk" wasn't being exercised.
-    //
-    // with_chunk_cache accepts an Arc<ChunkCache> — now ACTUALLY
-    // shared. test_shared_cache_warms_across_services proves it.
+    // ONE cache, shared across StoreService and ChunkService.
+    // A previous convenience constructor (since removed) created
+    // a private cache per service — two caches that both missed
+    // → both hit the same backend → correct data but no cross-
+    // service warming. with_chunk_cache takes an Arc so callers
+    // MUST decide sharing explicitly. test_shared_cache_warms_
+    // across_services proves it works.
     let cache = Arc::new(ChunkCache::new(backend.clone() as Arc<dyn ChunkBackend>));
 
     let store_service = StoreServiceImpl::with_chunk_cache(pool.clone(), Arc::clone(&cache));
@@ -231,11 +228,10 @@ async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
 
 /// A2: prove StoreService and ChunkService ACTUALLY share one cache.
 ///
-/// The previous setup_chunk_service was buggy: with_chunk_backend
-/// creates its own cache internally, so the two services had DIFFERENT
-/// caches. It passed because both miss → both hit MemoryChunkBackend
-/// → same data. But "warmed by GetPath is hot for GetChunk" wasn't
-/// really tested.
+/// A previous API (since removed) created a private cache per service,
+/// so the two had DIFFERENT moka LRUs. That passed incidentally: both
+/// miss → both hit the shared MemoryChunkBackend → same data. But
+/// "warmed by GetPath is hot for GetChunk" wasn't really tested.
 ///
 /// This test proves sharing: GetChunk populates moka, then CORRUPT
 /// the backend, then GetChunk again. If the cache is real, the second

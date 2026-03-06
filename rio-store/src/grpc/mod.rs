@@ -135,20 +135,6 @@ impl StoreServiceImpl {
         }
     }
 
-    /// Create a StoreService with chunked storage enabled.
-    ///
-    /// NARs below `INLINE_THRESHOLD` (256 KiB) still go inline; larger
-    /// ones are FastCDC-chunked. The cache wraps `backend` for reads.
-    ///
-    /// Convenience wrapper over `with_chunk_cache` — creates a fresh
-    /// `ChunkCache` with default capacity. Use `with_chunk_cache` if
-    /// you need a SHARED cache (same Arc across StoreServiceImpl +
-    /// ChunkServiceImpl + CacheServerState: "a chunk warmed by GetPath
-    /// is hot for GetChunk") or a custom capacity.
-    pub fn with_chunk_backend(pool: PgPool, backend: Arc<dyn ChunkBackend>) -> Self {
-        Self::with_chunk_cache(pool, Arc::new(ChunkCache::new(backend)))
-    }
-
     /// Create a StoreService with an externally-owned `ChunkCache`.
     ///
     /// The cache carries its backend inside (accessible via
@@ -160,7 +146,7 @@ impl StoreServiceImpl {
     /// services. main.rs constructs one `Arc<ChunkCache>`, passes
     /// clones here + to `ChunkServiceImpl::new` + to
     /// `CacheServerState` — a chunk warmed by any service is hot
-    /// for all. `with_chunk_backend` creates a PRIVATE cache (each
+    /// for all. Constructing a fresh `ChunkCache` per service (each
     /// service has its own moka LRU + singleflight map), which
     /// defeats the cross-service-warm benefit.
     pub fn with_chunk_cache(pool: PgPool, cache: Arc<ChunkCache>) -> Self {
@@ -175,7 +161,7 @@ impl StoreServiceImpl {
     /// Enable narinfo signing with the given key.
     ///
     /// Builder-style: `StoreServiceImpl::new(pool).with_signer(key)`.
-    /// Chains after either `new()` or `with_chunk_backend()`.
+    /// Chains after either `new()` or `with_chunk_cache()`.
     pub fn with_signer(mut self, signer: Signer) -> Self {
         self.signer = Some(Arc::new(signer));
         self
