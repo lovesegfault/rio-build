@@ -138,21 +138,9 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 
     let stream = sched.submit_build(req).await?.into_inner();
 
-    // ---- Spawn watch task ----
-    // Runs until the stream ends (build terminal) or PATCH fails
-    // (RBAC revoked, apiserver gone). spawn_monitored: if it
-    // panics, logged; the reconciler keeps going (this Build's
-    // status goes stale, other Builds unaffected).
-    //
-    // The task owns the stream. We DON'T await it here —
-    // returning from apply() lets the controller move on to the
-    // next reconcile. The stream drains in the background.
     let api: Api<Build> = Api::namespaced(ctx.client.clone(), &ns);
-    rio_common::task::spawn_monitored(
-        "build-watch",
-        drain_stream(name.clone(), api.clone(), stream),
-    );
 
+    // ---- Sentinel patch FIRST, then spawn watch ----
     // Set phase=Pending immediately so the idempotence gate
     // above doesn't fire AGAIN if we're re-reconciled before the
     // first BuildStarted arrives. build_id is set by the watch
@@ -165,6 +153,16 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // The watch task overwrites with the real UUID on first
     // event. The idempotence gate checks !is_empty(), not
     // validity — sentinel passes.
+    //
+    // ORDER MATTERS: the sentinel patch MUST land before the
+    // watch task's first patch. Previously the spawn came first,
+    // which meant a fast build's first event (BuildStarted with
+    // real UUID) could race the sentinel: drain_stream patches
+    // {phase:Building, build_id:<uuid>}, then apply() overwrites
+    // with {phase:Pending, build_id:"submitted"}. For a build
+    // that completes before the next event (already cached), the
+    // CRD would be stuck at Pending/submitted despite success.
+    // Awaiting this patch first eliminates the race.
     patch_status(
         &api,
         &name,
@@ -175,6 +173,17 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         },
     )
     .await?;
+
+    // ---- Spawn watch task ----
+    // Runs until the stream ends (build terminal) or PATCH fails
+    // (RBAC revoked, apiserver gone). spawn_monitored: if it
+    // panics, logged; the reconciler keeps going (this Build's
+    // status goes stale, other Builds unaffected).
+    //
+    // The task owns the stream. We DON'T await it here —
+    // returning from apply() lets the controller move on to the
+    // next reconcile. The stream drains in the background.
+    rio_common::task::spawn_monitored("build-watch", drain_stream(name.clone(), api, stream));
 
     Ok(Action::await_change())
 }
