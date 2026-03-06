@@ -22,7 +22,12 @@ spec:
     # dev so autoscale triggers easily (submit 5 parallel
     # builds, watch it scale to 3).
     targetValue: 2
-  image: rio-worker:latest
+  image: rio-worker:dev
+  # Airgap clusters (k3s/kind with `ctr images import`) need
+  # IfNotPresent — K8s would default :latest to Always (pull
+  # docker.io, fail). Controller-managed STS can't be kustomize-
+  # patched, so this knob lives on the CRD.
+  imagePullPolicy: IfNotPresent
   maxConcurrentBuilds: 2
   fuseCacheSize: 10Gi
   sizeClass: small
