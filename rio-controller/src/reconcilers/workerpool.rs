@@ -606,9 +606,11 @@ fn build_container(wp: &WorkerPool, scheduler_addr: &str, cache_gb: u64) -> Cont
     Container {
         name: "worker".into(),
         image: Some(wp.spec.image.clone()),
-        // imagePullPolicy defaults to IfNotPresent for tagged
-        // images, Always for :latest. Let K8s decide — operators
-        // override via kustomize if they need Always for a tag.
+        // imagePullPolicy: K8s defaults to Always for :latest,
+        // IfNotPresent otherwise. Airgap clusters need an explicit
+        // IfNotPresent/Never — kustomize can't patch the generated
+        // STS (only the CRD), so the spec has this knob.
+        image_pull_policy: wp.spec.image_pull_policy.clone(),
         env: Some(vec![
             env("RIO_SCHEDULER_ADDR", scheduler_addr),
             env("RIO_STORE_ADDR", &store_addr),
@@ -812,6 +814,7 @@ mod tests {
             systems: vec!["x86_64-linux".into()],
             size_class: "small".into(),
             image: "rio-worker:test".into(),
+            image_pull_policy: None,
             node_selector: None,
             tolerations: None,
             privileged: None,
@@ -966,6 +969,24 @@ mod tests {
             Some(2),
             "starts at spec.replicas.min; F4 autoscaler adjusts"
         );
+    }
+
+    #[test]
+    fn statefulset_image_pull_policy_passthrough() {
+        // None stays None — K8s applies its tag-based default
+        // (IfNotPresent for non-:latest, Always for :latest).
+        let wp = test_wp();
+        let sts = build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "s:9001").unwrap();
+        let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+        assert_eq!(container.image_pull_policy, None);
+
+        // Explicit value passes through. Airgap k3s/kind need
+        // IfNotPresent or Never to use ctr-imported images.
+        let mut wp = test_wp();
+        wp.spec.image_pull_policy = Some("IfNotPresent".into());
+        let sts = build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "s:9001").unwrap();
+        let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+        assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
     }
 
     // ----- quantity parsing -----

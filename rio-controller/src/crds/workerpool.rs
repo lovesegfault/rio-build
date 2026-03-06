@@ -112,6 +112,17 @@ pub struct WorkerPoolSpec {
     /// default (depends on how operators build/tag).
     pub image: String,
 
+    /// Container imagePullPolicy. None = K8s default (IfNotPresent
+    /// for tagged images, Always for `:latest`). Airgap/dev clusters
+    /// (k3s/kind with `ctr images import`) MUST set "IfNotPresent"
+    /// or "Never" — `:latest` otherwise tries docker.io and fails.
+    ///
+    /// Controller-managed StatefulSets can't be kustomize-patched
+    /// (the CRD is patched, not the generated STS), so this has to
+    /// be a CRD field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<String>,
+
     /// Node selector for the StatefulSet pod spec. Common:
     /// `rio.build/worker: "true"` to confine to tainted nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
