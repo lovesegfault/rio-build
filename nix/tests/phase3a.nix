@@ -2,9 +2,11 @@
 #
 # Milestone (docs/src/phases/phase3a.md):
 #   WorkerPool CRD reconciles to a running worker pod that
-#   registers with the scheduler and completes a build. FUSE
-#   works inside the pod. PrefetchHint fires. cgroup v2
-#   resource tracking writes ema_peak_memory_bytes.
+#   registers with the scheduler and completes a 2-derivation
+#   build chain. FUSE works inside the pod. PrefetchHint fires
+#   (parent's dispatch → child's output path). cgroup v2
+#   memory.peak → build_history.ema_peak_memory_bytes end-to-end
+#   (the phase2c VmHWM fix, verified via psql). Finalizer drain.
 #
 # Topology (3 VMs):
 #   k8s     — k3s server + rio-controller (systemd, not pod).
@@ -45,21 +47,47 @@
 let
   common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
 
-  # Same trivial derivation as phase1b. One leaf, busybox builder.
+  # 2-node chain: child → parent. Parent's dispatch triggers
+  # send_prefetch_hint with child's output path (approx_input_closure
+  # reads DAG children's expected_output_paths — assignment.rs:280).
+  # Both have pname in env so build_history gets 2 rows — end-to-end
+  # proof that cgroup memory.peak → CompletionReport → scheduler's
+  # db.update_build_history (the phase3a headline deliverable).
+  #
+  # sleep 2: cgroup cpu.stat poll is 1Hz (executor/mod.rs:456).
+  # Build exits <1s → peak_cpu_cores stays 0 → completion.rs:202
+  # guard skips the write. 2s guarantees ≥1 sample.
+  #
+  # Escaping: ''${x} → ${x} in the WRITTEN file (inner .nix reads
+  # its own let-bound child, its own busybox arg). ''' → '' (the
+  # inner .nix's own indented string for builder args).
   testDrvFile = pkgs.writeText "phase3a-derivation.nix" ''
     { busybox }:
-    derivation {
-      name = "rio-phase3a-trivial";
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      child = derivation {
+        name = "rio-3a-child";
+        pname = "rio-3a-child";  # gateway reads env.pname (translate.rs:257)
+        system = builtins.currentSystem;
+        builder = sh;
+        args = [ "-c" '''
+          ''${bb} mkdir -p $out
+          ''${bb} echo "phase3a child" > $out/stamp
+          ''${bb} sleep 2
+        ''' ];
+      };
+    in derivation {
+      name = "rio-3a-parent";
+      pname = "rio-3a-parent";
       system = builtins.currentSystem;
-      builder = "''${busybox}/bin/sh";
-      args = [
-        "-c"
-        '''
-          set -ex
-          ''${busybox}/bin/busybox mkdir -p $out
-          ''${busybox}/bin/busybox echo "phase3a milestone: built in a k8s pod" > $out/stamp
-        '''
-      ];
+      builder = sh;
+      args = [ "-c" '''
+        ''${bb} mkdir -p $out
+        ''${bb} cat ''${child}/stamp > $out/stamp
+        ''${bb} echo "phase3a parent: built in a k8s pod" >> $out/stamp
+        ''${bb} sleep 2
+      ''' ];
     }
   '';
 
@@ -376,60 +404,93 @@ pkgs.testers.runNixOSTest {
 
     # ── Phase 3a assertions ────────────────────────────────────────
 
-    # PrefetchHint fired. The scheduler sends it before
-    # WorkAssignment (B3) for derivations with DAG children.
-    # Our trivial derivation has NO children (leaf) — so the
-    # hint is sent with ZERO paths (approx_input_closure on a
-    # leaf returns []). The metric counts HINTS, not paths...
-    #
-    # Actually: dispatch.rs send_prefetch_hint early-returns if
-    # to_prefetch.is_empty(). For a leaf, no hint is sent. This
-    # assertion would fail on a trivial derivation.
-    #
-    # Assert it's >= 0 (gauge exists, counter defined) — weaker
-    # but still proves the metric is registered. A multi-node
-    # DAG (phase2a-style) would actually fire hints; deferred
-    # to keep this test's closure small.
-    control.succeed(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep -q rio_scheduler_prefetch_hints_sent_total"
-    )
+    try:
+        # ── PrefetchHint fired (B3) ───────────────────────────────
+        # Parent has 1 DAG child (rio-3a-child). When parent
+        # dispatches, approx_input_closure(dag, parent) returns
+        # [child's output path]. send_prefetch_hint checks
+        # worker's bloom — worker is cold (first build), bloom
+        # miss → hint sent. Assert ≥1 (not just registered).
+        #
+        # Prometheus counters only appear in /metrics AFTER first
+        # increment (describe_counter! just attaches help text).
+        # So grep >= 1 is the only form that works.
+        control.succeed(
+            "curl -sf http://localhost:9091/metrics | "
+            "grep -E 'rio_scheduler_prefetch_hints_sent_total [1-9]'"
+        )
 
-    # cgroup v2 resource tracking: build_history has peak memory.
-    # This is THE FIX for the phase2c VmHWM bug (daemon.id() was
-    # nix-daemon's PID, not the builder's — measured ~10MB
-    # instead of actual tree-wide peak). cgroup memory.peak
-    # captures the WHOLE TREE.
-    #
-    # The derivation has pname embedded (actually... no it
-    # doesn't — `derivation {}` primitive doesn't set pname,
-    # only `name`). The scheduler keys build_history on
-    # (pname, system). Without pname, no row. Check the metric
-    # instead: the completion handler reads cgroup and logs.
-    #
-    # Check worker logs for cgroup activation. If the pod's
-    # cgroup parent isn't writable (no delegation), the worker
-    # ERRORS at startup (cgroupv2 is a hard requirement — "if
-    # it isn't available, we don't support the system"). Pod
-    # went Ready → startup passed → cgroup worked. But assert
-    # the LOG too as a positive signal (Ready could pass for
-    # the wrong reason if someone breaks the hard-requirement).
-    k8s.succeed(
-        "k3s kubectl logs default-workers-0 | "
-        "grep -q 'cgroup' || "
-        # If the log line format changes, fall through to
-        # checking the pod didn't crash on a cgroup error —
-        # which the Ready wait above already proved. This
-        # grep is a WEAK assertion, intentionally.
-        "true"
-    )
+        # ── cgroup v2 per-build: the phase3a headline ─────────────
+        # main.rs:289 info! after delegated_root() +
+        # enable_subtree_controllers() both succeed. Fails fast
+        # (worker exits) if cgroup v2 unavailable or delegation
+        # broken. Pod-Ready already proves it at the coarse level;
+        # this grep proves the CODEPATH (no silent hard-requirement
+        # regression where Ready passes for wrong reasons).
+        #
+        # Note on de1cb87's "cgroup namespace root" codepath: that
+        # fires when /proc/self/cgroup shows 0::/ (containerd cgroupns).
+        # With privileged=true, containerd DOESN'T namespace cgroups
+        # — we see the host's kubepods.slice/... path. The ns-root
+        # fix matters for non-privileged production pods (granular
+        # caps); we can't exercise it here (k3s seccomp blocks
+        # mount(2) without privileged). "subtree ready" fires for
+        # BOTH codepaths — it's the unified positive signal.
+        #
+        # NOT grep -q: `-q` exits on first match → kubectl logs
+        # still writing → SIGPIPE → exit 141 → pipefail fails
+        # the whole pipeline. Plain grep reads ALL input first.
+        k8s.succeed(
+            "k3s kubectl logs default-workers-0 | "
+            "grep 'cgroup v2 subtree ready' >/dev/null"
+        )
 
-    # Worker metric: build completed successfully INSIDE the pod.
-    # With hostNetwork=true, the pod's :9093 metrics port is on
-    # the NODE's IP. Scrape from the k8s VM itself (localhost).
+        # ── cgroup memory.peak → build_history (end-to-end) ───────
+        # THE FIX for phase2c VmHWM bug: daemon.id() was nix-daemon's
+        # PID, measured ~10MB. cgroup memory.peak captures the WHOLE
+        # TREE (daemon + builder + every compiler subprocess).
+        #
+        # Chain: BuildCgroup.memory_peak() → ExecutionResult →
+        # CompletionReport → scheduler handle_completion (filters
+        # 0 → None at completion.rs:200) → db.update_build_history
+        # COALESCE blend (db.rs:445; first sample → just $new).
+        #
+        # Both derivations have pname in env → 2 rows keyed on
+        # (pname, system). Even a trivial busybox build + sleep
+        # has ~3-10MB tree RSS (daemon alone).
+        #
+        # psql -tA = tuples-only, unaligned. One value per line.
+        # NULL → empty (not "NULL"). grep matches ≥7 digits = ≥1MB.
+        #
+        # Assert >=1 not =2: completion.rs:181 guards on
+        # state.pname.is_some(). The gateway extracts pname from the
+        # ROOT derivation's env (the one nix-build directly targets);
+        # intermediate deps' pname may be None depending on how the
+        # DAG is walked. One row with ≥1MB still proves the full
+        # cgroup → CompletionReport → DB chain for at least one build,
+        # which IS the phase3a deliverable. (Observed value ~14MB —
+        # daemon + builder + sleep process tree.)
+        #
+        # wait_until_succeeds: small window between client-sees-built
+        # and actor-DB-commit. 10s is overkill but costs nothing.
+        control.wait_until_succeeds(
+            "sudo -u postgres psql rio -tA -c "
+            "\"SELECT ema_peak_memory_bytes::bigint FROM build_history "
+            "WHERE pname IN ('rio-3a-child','rio-3a-parent')\" | "
+            "grep -qE '^[0-9]{7,}$'",
+            timeout=10
+        )
+    except Exception:
+        dump_logs()
+        raise
+
+    # Worker metric: BOTH builds completed successfully INSIDE the
+    # pod. With hostNetwork=true, the pod's :9093 metrics port is
+    # on the NODE's IP. Scrape from the k8s VM itself (localhost).
+    # [2-9] not [1-9]: we built 2 derivations (child + parent).
     k8s.succeed(
         "curl -sf http://localhost:9093/metrics | "
-        "grep -E 'rio_worker_builds_total\\{outcome=\"success\"\\} [1-9]'"
+        "grep -E 'rio_worker_builds_total\\{outcome=\"success\"\\} [2-9]'"
     )
 
     # Output queryable via ssh-ng (round-trips through rio-store).
