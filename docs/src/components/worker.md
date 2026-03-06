@@ -312,13 +312,16 @@ A future improvement would split the worker into two processes:
 
 ## Key Files
 
-- `rio-worker/src/executor.rs` --- Build execution (invokes nix within overlay)
+- `rio-worker/src/executor/` --- Build execution (spawns nix-daemon in mount namespace, drives protocol)
 - `rio-worker/src/overlay.rs` --- overlayfs setup and teardown
 - `rio-worker/src/fuse/mod.rs` --- FUSE daemon lifecycle and mount management
 - `rio-worker/src/fuse/lookup.rs` --- Path existence and metadata queries
 - `rio-worker/src/fuse/read.rs` --- File content serving and prefetch
 - `rio-worker/src/fuse/cache.rs` --- LRU cache management (SSD-backed)
+- `rio-worker/src/fuse/fetch.rs` --- Fetch + extract NAR from rio-store (prefetch + on-demand)
 - `rio-worker/src/synth_db.rs` --- Synthetic SQLite DB generation for nix-daemon
-- `rio-worker/src/upload.rs` --- Chunk and upload build outputs
-- `rio-worker/src/log_stream.rs` --- Build log streaming via gRPC
-- `rio-worker/src/resource.rs` (Phase 2b) --- CPU/memory/disk accounting
+- `rio-worker/src/upload.rs` --- Chunk and upload build outputs (streaming NAR → rio-store PutPath)
+- `rio-worker/src/log_stream.rs` --- Build log batching (64-line/100ms) and streaming via gRPC
+- `rio-worker/src/cgroup.rs` (Phase 3a) --- cgroup v2 per-build subtree: memory.peak + polled cpu.stat. Fixes the Phase 2c VmHWM bug (daemon-PID measured ~10MB; cgroup is tree-wide).
+- `rio-worker/src/health.rs` (Phase 3a) --- axum `/healthz` + `/readyz` (worker has no gRPC server; K8s probes hit HTTP). Readiness tracks heartbeat-accepted.
+- `rio-worker/src/runtime.rs` (Phase 3a) --- Heartbeat request builder + build-spawn context + prefetch-hint handler. Extracted glue between `main.rs` and the subsystems.

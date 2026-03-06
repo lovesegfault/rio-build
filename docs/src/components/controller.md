@@ -23,9 +23,10 @@ status:
   totalDerivations: 47
   completedDerivations: 31
   cachedDerivations: 12
-  criticalPathRemaining: 45s
   startedAt: 2026-02-13T06:00:00Z
-  workers: [worker-0, worker-2, worker-5]
+  # Phase 3b deferral: criticalPathRemaining + workers not yet
+  # surfaced in BuildStatus. Scheduler has the data (critical_path.rs
+  # + assignments table); requires a BuildEvent extension.
   conditions:
     - type: Scheduled                          # also: InputsResolved, Building, Succeeded, Failed
       status: "True"
@@ -57,9 +58,12 @@ spec:
   fuseCacheSize: 100Gi                         # local SSD cache for rio-fuse
   features: [big-parallel, kvm]               # maps to requiredSystemFeatures
   systems: [x86_64-linux]
-  securityContext:
-    capabilities:
-      add: [SYS_ADMIN, SYS_CHROOT]            # NOT privileged: true
+  # securityContext: NOT a CRD field. The controller hardcodes
+  # capabilities (SYS_ADMIN + SYS_CHROOT) in build_pod_spec().
+  # Only `privileged: bool` is exposed (for VM-test/airgap escape
+  # hatches); production pods use granular caps, not privileged.
+  # Phase 3b deferral: exposing nodeSelector/tolerations via CRD
+  # (currently only in the kustomize overlay).
   nodeSelector:
     rio.build/worker: "true"
   tolerations:
@@ -202,18 +206,19 @@ The controller creates PDBs for each component:
 | Scheduler | gRPC health check | After leader election won + PostgreSQL connected | gRPC check, `failureThreshold × periodSeconds ≥ 60s` (state recovery) |
 | Store | gRPC health check | After PostgreSQL + S3 reachable | — |
 | Controller | HTTP `/healthz` | After CRD watches established | — |
-| Worker | gRPC health check to scheduler | After overlay mounted + registered with scheduler | gRPC check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
+| Worker | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
 
 ## Worker Lifecycle
 
 **Scale-down:** `terminationGracePeriodSeconds` is set to `7200` (2 hours) to allow in-flight builds to complete.
 
-**preStop hook sequence:**
+**SIGTERM drain (no preStop hook needed):** the worker's main loop has a `select!` arm on SIGTERM. On signal:
 
-1. Deregister from scheduler (stop accepting new builds).
-2. Wait for current build(s) to complete.
-3. Upload build outputs to rio-store.
-4. Exit cleanly.
+1. Send `AdminService.DrainWorker` to the scheduler (stop accepting new assignments — `has_capacity()` returns false for this worker).
+2. `acquire_many(max_builds)` on the build semaphore — succeeds when all in-flight build tasks have dropped their permits (completed + uploaded).
+3. Exit 0.
+
+A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The StatefulSet does NOT define a preStop.
 
 **Autoscaling:** The controller queries the scheduler's `AdminService.ClusterStatus` gRPC RPC to obtain current queue depth and worker utilization. It directly patches StatefulSet replicas based on this data. This is an internal mechanism, not HPA. The scaling logic requires stabilization windows and anti-flapping thresholds to avoid oscillation:
 
@@ -265,10 +270,11 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 
 ## WorkerPool Finalizer
 
-WorkerPool CRDs carry a `rio.build/workerpool-drain` finalizer. Before a WorkerPool is deleted, the controller:
+WorkerPool CRDs carry a `rio.build/workerpool-drain` finalizer. Before a WorkerPool is deleted, the controller's `cleanup()`:
 
-1. Sets `spec.replicas.min` and `spec.replicas.max` to 0 (prevents new pods).
-2. Sends drain requests to all running workers (deregister from scheduler, finish in-flight builds).
-3. Waits for all workers to complete and upload outputs.
-4. Deletes the StatefulSet and associated resources.
-5. Removes the finalizer, allowing the WorkerPool CRD to be garbage-collected.
+1. Lists pods by `rio.build/pool=<name>` label; sends `AdminService.DrainWorker` for each (scheduler stops assigning to them).
+2. Patches `StatefulSet.spec.replicas = 0`.
+3. Waits for all pods to terminate (each worker's SIGTERM handler completes in-flight builds before exit — see Worker Lifecycle above).
+4. Removes the finalizer, allowing K8s GC to delete the WorkerPool CRD and its owned children (StatefulSet, Service) via `ownerReference`.
+
+The reconciler's normal `apply()` path short-circuits when `deletionTimestamp` is set (finalizer wraps it) — no need to clamp `min`/`max` to zero as a separate step.
