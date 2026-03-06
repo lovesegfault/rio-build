@@ -616,12 +616,28 @@ pub async fn execute_build(
                     })
                     .collect();
 
+                // start/stop_time: nix-daemon's BuildResult already has
+                // these as Unix epoch seconds (rio-nix/build.rs:118-120).
+                // Scheduler guards update_build_history on BOTH being
+                // Some (completion.rs:182) — without them, EMA duration
+                // can't be computed and the WHOLE build_history write
+                // is skipped (peak_memory_bytes included). Never caught
+                // before: phase2c.nix pre-seeds via psql INSERT.
+                //
+                // 0 → None: nix-daemon sends 0 on some error paths.
+                // A real build at 1970-01-01 doesn't exist.
+                let to_proto_ts = |secs: u64| {
+                    (secs > 0).then_some(prost_types::Timestamp {
+                        seconds: secs as i64,
+                        nanos: 0,
+                    })
+                };
                 ProtoBuildResult {
                     status: BuildResultStatus::Built.into(),
                     error_msg: String::new(),
                     times_built: build_result.times_built,
-                    start_time: None,
-                    stop_time: None,
+                    start_time: to_proto_ts(build_result.start_time),
+                    stop_time: to_proto_ts(build_result.stop_time),
                     built_outputs,
                 }
             }
