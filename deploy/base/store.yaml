@@ -35,7 +35,7 @@ spec:
           env:
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:9002"
-            - name: RIO_PG_URL
+            - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: rio-postgres
