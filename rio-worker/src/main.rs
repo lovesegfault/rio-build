@@ -569,6 +569,14 @@ async fn main() -> anyhow::Result<()> {
                         spawn_build_task(assignment, permit, &build_ctx).await;
                     }
                     Some(scheduler_message::Msg::Cancel(cancel)) => {
+                        // TODO(phase3b): implement cancel. Write "1" to
+                        // the build's cgroup.kill (SIGKILLs the whole
+                        // tree), release the semaphore permit, send
+                        // CompletionReport{status: Cancelled}. Phase 3b's
+                        // K8s-aware retry needs this for pod preemption
+                        // handling (scheduler cancels builds on an
+                        // evicting node before the SIGTERM grace period
+                        // wastes 2h of terminationGracePeriodSeconds).
                         tracing::warn!(
                             drv_path = %cancel.drv_path,
                             reason = %cancel.reason,
