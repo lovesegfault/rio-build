@@ -67,11 +67,11 @@ spec:
               value: "0.0.0.0:9001"
             - name: RIO_STORE_ADDR
               value: "rio-store:9002"
-            # PG_URL: overlays inject the real connection string
+            # DATABASE_URL: overlays inject the real connection string
             # (CloudNativePG secret in dev, RDS in prod). Empty
             # here → scheduler fails fast at startup with a
             # clear error, not a silent hang.
-            - name: RIO_PG_URL
+            - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: rio-postgres
