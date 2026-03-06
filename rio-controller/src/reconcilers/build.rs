@@ -410,9 +410,12 @@ async fn drain_stream(
         match stream.message().await {
             Ok(Some(ev)) => {
                 // First event always carries the real build_id
-                // (scheduler assigns it on MergeDag). Overwrite
-                // the "submitted" sentinel from apply().
-                if status.build_id.is_empty() || status.build_id == "submitted" {
+                // (scheduler assigns it on MergeDag). `status` is
+                // TASK-LOCAL, initialized to empty above — not the
+                // CRD's persisted value (which has the "submitted"
+                // sentinel from apply()). So is_empty() is the only
+                // check needed; the sentinel never appears here.
+                if status.build_id.is_empty() {
                     status.build_id = ev.build_id.clone();
                 }
 
