@@ -254,7 +254,18 @@ fn node_common_fields(
     NodeCommonFields {
         output_names,
         expected_output_paths,
-        pname: env.get("pname").cloned().unwrap_or_default(),
+        // pname → name fallback: stdenv's mkDerivation sets both;
+        // raw derivation{} calls typically only set name. Without
+        // the fallback, raw derivations get pname="" → never match
+        // build_history (keyed on pname,system) → 30s default →
+        // wrong size-class routing. name includes version suffix so
+        // it's a LESS stable key (hello-2.12 vs hello-2.13 are
+        // different rows), but some history beats none.
+        pname: env
+            .get("pname")
+            .or_else(|| env.get("name"))
+            .cloned()
+            .unwrap_or_default(),
         system: platform.to_string(),
         required_features: env
             .get("requiredSystemFeatures")
@@ -518,6 +529,37 @@ mod tests {
         let nodes = single_node_from_basic("/nix/store/test.drv", &drv);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].required_features.is_empty());
+        Ok(())
+    }
+
+    /// pname falls back to name for raw derivation{} calls that only
+    /// set name. Without this, pname="" → no build_history match →
+    /// 30s default estimate → wrong size-class.
+    #[test]
+    fn test_pname_fallback_to_name() -> anyhow::Result<()> {
+        // pname wins when both set (stdenv mkDerivation case).
+        let mut env = BTreeMap::new();
+        env.insert("pname".into(), "hello".into());
+        env.insert("name".into(), "hello-2.12".into());
+        let drv = make_basic_drv(env)?;
+        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        assert_eq!(nodes[0].pname, "hello", "pname preferred over name");
+
+        // name fallback when pname absent (raw derivation{} case).
+        let mut env = BTreeMap::new();
+        env.insert("name".into(), "rawbuild-1.0".into());
+        let drv = make_basic_drv(env)?;
+        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        assert_eq!(
+            nodes[0].pname, "rawbuild-1.0",
+            "name fallback — less stable (includes version) but beats empty"
+        );
+
+        // neither → empty (no build_history key possible).
+        let drv = make_basic_drv(BTreeMap::new())?;
+        let nodes = single_node_from_basic("/nix/store/x.drv", &drv);
+        assert_eq!(nodes[0].pname, "");
+
         Ok(())
     }
 
