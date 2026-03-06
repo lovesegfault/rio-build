@@ -32,7 +32,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, ObjectMeta, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
-use kube::{Resource, ResourceExt};
+use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
 use crate::crds::workerpool::{WorkerPool, WorkerPoolStatus};
@@ -149,8 +149,19 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // write-only from the controller's perspective (operators
     // can't `kubectl edit` it into existence; only
     // PATCH /status works).
+    //
+    // apiVersion + kind are REQUIRED by server-side apply even
+    // for status patches — apiserver uses them to resolve the
+    // schema. Without them: 400 "apiVersion must be set in
+    // apply patch". (Same pattern as build.rs patch_status —
+    // that one learned this the hard way; this one forgot.)
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
-    let status_patch = serde_json::json!({ "status": status });
+    let ar = WorkerPool::api_resource();
+    let status_patch = serde_json::json!({
+        "apiVersion": ar.api_version,
+        "kind": ar.kind,
+        "status": status,
+    });
     wp_api
         .patch_status(
             &name,
@@ -372,8 +383,10 @@ pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action
         }
         _ => {
             // Transient (apiserver hiccup, scheduler restarting).
-            // Short backoff, retry.
-            debug!(error = %err, "reconcile failed; retrying");
+            // Short backoff, retry. warn! not debug! — a 30s
+            // silent retry loop is invisible at INFO and cost
+            // us ~10min of VM debugging once.
+            warn!(error = %err, "reconcile failed; retrying");
             Action::requeue(Duration::from_secs(30))
         }
     }
