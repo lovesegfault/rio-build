@@ -117,11 +117,47 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         .await?;
 
     // ---- StatefulSet ----
-    let sts = build_statefulset(&wp, oref, &ctx.scheduler_addr)?;
+    let sts_name = format!("{name}-workers");
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
+
+    // Check if STS already exists to decide whether to set
+    // spec.replicas. SSA semantics: sending a field claims
+    // ownership; omitting it releases ownership. The autoscaler
+    // (scaling.rs) owns replicas via fieldManager
+    // "rio-controller-autoscaler". If WE keep sending
+    // replicas=min with .force(), every reconcile reverts the
+    // autoscaler's patch. Instead: set it ONLY on first create
+    // (STS doesn't exist), then omit it — SSA releases our
+    // claim, autoscaler's value sticks.
+    //
+    // The extra GET is one round-trip per reconcile. Acceptable —
+    // reconciles are driven by CR/STS changes, not a hot loop.
+    let existing = sts_api.get_opt(&sts_name).await?;
+    let initial_replicas = if existing.is_none() {
+        Some(wp.spec.replicas.min)
+    } else {
+        None
+    };
+    // For status.desired_replicas: read what's ACTUALLY on the STS
+    // (autoscaler's last decision). Falls back to min on first
+    // create. Without this, kubectl's "Desired" column showed min
+    // forever regardless of autoscaler activity.
+    let current_replicas = existing
+        .as_ref()
+        .and_then(|s| s.spec.as_ref())
+        .and_then(|s| s.replicas)
+        .unwrap_or(wp.spec.replicas.min);
+
+    let sts = build_statefulset(
+        &wp,
+        oref,
+        &ctx.scheduler_addr,
+        &ctx.store_addr,
+        initial_replicas,
+    )?;
     let applied = sts_api
         .patch(
-            &sts.metadata.name.clone().expect("we set it"),
+            &sts_name,
             &PatchParams::apply(MANAGER).force(),
             &Patch::Apply(&sts),
         )
@@ -137,10 +173,10 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let status = WorkerPoolStatus {
         replicas: sts_status.replicas,
         ready_replicas: sts_status.ready_replicas.unwrap_or(0),
-        // desired_replicas is what the AUTOSCALER wants, not what
-        // we just patched. F4's autoscaler writes this. For now,
-        // mirror the spec min (the starting point).
-        desired_replicas: wp.spec.replicas.min,
+        // What the autoscaler set on STS.spec.replicas (or min on
+        // first create). Previously hardcoded to min — kubectl's
+        // "Desired" column was always wrong.
+        desired_replicas: current_replicas,
         last_scale_time: None,
         conditions: vec![],
     };
@@ -448,6 +484,10 @@ fn build_headless_service(wp: &WorkerPool, oref: OwnerReference) -> Service {
 /// The StatefulSet. All the worker pod spec details live here —
 /// security context, volumes, env, probes, termination grace.
 ///
+/// `replicas`: `Some(n)` to claim SSA ownership (first create),
+/// `None` to omit from the patch (subsequent reconciles — lets
+/// the autoscaler's field manager own it).
+///
 /// Returns `Err(InvalidSpec)` if `fuse_cache_size` doesn't parse
 /// as a K8s Quantity. That's the one operator-supplied string
 /// we need to validate.
@@ -455,6 +495,8 @@ fn build_statefulset(
     wp: &WorkerPool,
     oref: OwnerReference,
     scheduler_addr: &str,
+    store_addr: &str,
+    replicas: Option<i32>,
 ) -> Result<StatefulSet> {
     let name = format!("{}-workers", wp.name_any());
     let labels = labels(wp);
@@ -483,9 +525,10 @@ fn build_statefulset(
             // serviceName MUST match the headless Service above.
             // StatefulSet controller uses it for pod DNS.
             service_name: Some(name),
-            // Start at min. F4's autoscaler patches this based
-            // on queue depth.
-            replicas: Some(wp.spec.replicas.min),
+            // None on subsequent reconciles → field omitted from
+            // SSA patch → autoscaler's ownership preserved. See
+            // apply() for the existence check.
+            replicas,
             selector: LabelSelector {
                 match_labels: Some(labels.clone()),
                 ..Default::default()
@@ -495,7 +538,13 @@ fn build_statefulset(
                     labels: Some(labels),
                     ..Default::default()
                 }),
-                spec: Some(build_pod_spec(wp, scheduler_addr, cache_gb, cache_quantity)),
+                spec: Some(build_pod_spec(
+                    wp,
+                    scheduler_addr,
+                    store_addr,
+                    cache_gb,
+                    cache_quantity,
+                )),
             },
             ..Default::default()
         }),
@@ -508,6 +557,7 @@ fn build_statefulset(
 fn build_pod_spec(
     wp: &WorkerPool,
     scheduler_addr: &str,
+    store_addr: &str,
     cache_gb: u64,
     cache_quantity: Quantity,
 ) -> PodSpec {
@@ -529,7 +579,7 @@ fn build_pod_spec(
     // cgroup subtree). privileged → rw → writes succeed.
 
     PodSpec {
-        containers: vec![build_container(wp, scheduler_addr, cache_gb)],
+        containers: vec![build_container(wp, scheduler_addr, store_addr, cache_gb)],
         // hostNetwork from spec. None → K8s default (false).
         // Some(false) → explicit false (same effect). Some(true)
         // → pod shares node netns. `filter`: PodSpec field is
@@ -619,18 +669,12 @@ fn build_pod_spec(
 }
 
 /// The worker container.
-fn build_container(wp: &WorkerPool, scheduler_addr: &str, cache_gb: u64) -> Container {
-    // Store address derived from scheduler: they're co-deployed
-    // (both ClusterIP Services in the same namespace). Replace
-    // the port. If someone deploys them separately, they'd
-    // override via kustomize env patches anyway.
-    //
-    // This is a simplification — ideally a separate spec field.
-    // But 99% of deployments have scheduler + store co-located
-    // (the gateway → scheduler → store flow is the normal path).
-    // Adding a field = more CRD surface for the 1%.
-    let store_addr = scheduler_addr.replace(":9001", ":9002");
-
+fn build_container(
+    wp: &WorkerPool,
+    scheduler_addr: &str,
+    store_addr: &str,
+    cache_gb: u64,
+) -> Container {
     Container {
         name: "worker".into(),
         image: Some(wp.spec.image.clone()),
@@ -641,7 +685,11 @@ fn build_container(wp: &WorkerPool, scheduler_addr: &str, cache_gb: u64) -> Cont
         image_pull_policy: wp.spec.image_pull_policy.clone(),
         env: Some(vec![
             env("RIO_SCHEDULER_ADDR", scheduler_addr),
-            env("RIO_STORE_ADDR", &store_addr),
+            // From ctx.store_addr — NOT derived from scheduler_addr.
+            // The kustomize base uses different Service names
+            // (rio-scheduler vs rio-store); a port-replace would
+            // yield "rio-scheduler:9002" which doesn't exist.
+            env("RIO_STORE_ADDR", store_addr),
             env("RIO_MAX_BUILDS", &wp.spec.max_concurrent_builds.to_string()),
             env("RIO_FUSE_CACHE_SIZE_GB", &cache_gb.to_string()),
             env("RIO_FUSE_MOUNT_POINT", "/var/rio/fuse-store"),
@@ -861,11 +909,24 @@ mod tests {
         wp
     }
 
+    /// Shorthand for tests: builds with default scheduler/store
+    /// addrs and replicas=Some(min). Use `build_statefulset`
+    /// directly for tests that care about those params.
+    fn test_sts(wp: &WorkerPool) -> StatefulSet {
+        build_statefulset(
+            wp,
+            wp.controller_owner_ref(&()).unwrap(),
+            "sched:9001",
+            "store:9002",
+            Some(wp.spec.replicas.min),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn statefulset_has_owner_reference() {
         let wp = test_wp();
-        let oref = wp.controller_owner_ref(&()).unwrap();
-        let sts = build_statefulset(&wp, oref, "scheduler:9001").unwrap();
+        let sts = test_sts(&wp);
 
         let orefs = sts.metadata.owner_references.expect("ownerRef set");
         assert_eq!(orefs.len(), 1);
@@ -877,8 +938,7 @@ mod tests {
     #[test]
     fn statefulset_security_context() {
         let wp = test_wp();
-        let sts =
-            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let sts = test_sts(&wp);
 
         let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
         let caps = container
@@ -903,8 +963,7 @@ mod tests {
     #[test]
     fn statefulset_dev_fuse_volume() {
         let wp = test_wp();
-        let sts =
-            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let sts = test_sts(&wp);
 
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let fuse_vol = pod
@@ -930,8 +989,7 @@ mod tests {
         // Overlayfs-as-upperdir can't create trusted.* xattrs →
         // every overlay mount fails with EINVAL. Regression guard.
         let wp = test_wp();
-        let sts =
-            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let sts = test_sts(&wp);
         let pod = sts.spec.unwrap().template.spec.unwrap();
 
         let vol = pod
@@ -958,8 +1016,7 @@ mod tests {
     #[test]
     fn statefulset_termination_grace() {
         let wp = test_wp();
-        let sts =
-            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let sts = test_sts(&wp);
         let pod = sts.spec.unwrap().template.spec.unwrap();
         assert_eq!(
             pod.termination_grace_period_seconds,
@@ -976,8 +1033,7 @@ mod tests {
     #[test]
     fn statefulset_env_vars() {
         let wp = test_wp();
-        let sts =
-            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let sts = test_sts(&wp);
 
         let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
         let envs: BTreeMap<String, String> = container
@@ -991,8 +1047,9 @@ mod tests {
         assert_eq!(envs.get("RIO_SCHEDULER_ADDR"), Some(&"sched:9001".into()));
         assert_eq!(
             envs.get("RIO_STORE_ADDR"),
-            Some(&"sched:9002".into()),
-            "derived from scheduler addr (:9001 → :9002)"
+            Some(&"store:9002".into()),
+            "from ctx.store_addr (NOT derived from scheduler — \
+             different hostnames in kustomize base)"
         );
         assert_eq!(envs.get("RIO_MAX_BUILDS"), Some(&"4".into()));
         assert_eq!(envs.get("RIO_SIZE_CLASS"), Some(&"small".into()));
@@ -1028,12 +1085,49 @@ mod tests {
     #[test]
     fn statefulset_replicas_starts_at_min() {
         let wp = test_wp();
-        let sts =
-            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let sts = test_sts(&wp);
         assert_eq!(
             sts.spec.unwrap().replicas,
             Some(2),
-            "starts at spec.replicas.min; F4 autoscaler adjusts"
+            "initial create: set to spec.replicas.min"
+        );
+    }
+
+    /// replicas=None → field omitted from the SSA patch → the
+    /// autoscaler's field-manager ownership is preserved.
+    /// Without this, every reconcile would revert the autoscaler's
+    /// scaling decision to min (SSA .force() takes ownership of
+    /// every field in the patch).
+    ///
+    /// k8s-openapi's custom Serialize impl skips Option::None
+    /// fields, so None → field absent → SSA leaves it alone.
+    #[test]
+    fn statefulset_replicas_omitted_when_none() {
+        let wp = test_wp();
+        let sts = build_statefulset(
+            &wp,
+            wp.controller_owner_ref(&()).unwrap(),
+            "sched:9001",
+            "store:9002",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sts.spec.as_ref().unwrap().replicas,
+            None,
+            "subsequent reconciles: replicas=None → autoscaler owns it"
+        );
+
+        // And the crucial part: serialized JSON doesn't contain
+        // the field. SSA semantics: absent field = "I don't
+        // manage this." Verifies k8s-openapi's skip-None-on-
+        // serialize behavior hasn't regressed.
+        let json = serde_json::to_string(&sts).unwrap();
+        assert!(
+            !json.contains("\"replicas\""),
+            "replicas must be absent from serialized JSON for SSA to \
+             preserve autoscaler ownership. Found in: {json}"
         );
     }
 
@@ -1042,7 +1136,7 @@ mod tests {
         // None stays None — K8s applies its tag-based default
         // (IfNotPresent for non-:latest, Always for :latest).
         let wp = test_wp();
-        let sts = build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "s:9001").unwrap();
+        let sts = test_sts(&wp);
         let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
         assert_eq!(container.image_pull_policy, None);
 
@@ -1050,7 +1144,7 @@ mod tests {
         // IfNotPresent or Never to use ctr-imported images.
         let mut wp = test_wp();
         wp.spec.image_pull_policy = Some("IfNotPresent".into());
-        let sts = build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "s:9001").unwrap();
+        let sts = test_sts(&wp);
         let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
         assert_eq!(container.image_pull_policy.as_deref(), Some("IfNotPresent"));
     }
@@ -1124,7 +1218,13 @@ mod tests {
     fn quantity_invalidspec_from_statefulset() {
         let mut wp = test_wp();
         wp.spec.fuse_cache_size = "garbage".into();
-        let result = build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001");
+        let result = build_statefulset(
+            &wp,
+            wp.controller_owner_ref(&()).unwrap(),
+            "sched:9001",
+            "store:9002",
+            Some(1),
+        );
         match result {
             Err(Error::InvalidSpec(msg)) => {
                 assert!(msg.contains("fuseCacheSize"));
@@ -1166,7 +1266,9 @@ mod tests {
         let ctx = test_ctx(client);
         let wp = Arc::new(test_wp());
 
-        let task = verifier.run(apply_ok_scenarios("test-pool", "rio", 2));
+        // sts_exists=false: first-create path (STS GET → 404 →
+        // initial_replicas=Some(min)).
+        let task = verifier.run(apply_ok_scenarios("test-pool", "rio", 2, false));
 
         // Call apply() directly (not reconcile() — finalizer()
         // would do its own GET + PATCH of metadata.finalizers
@@ -1201,6 +1303,18 @@ mod tests {
                 "fieldManager=rio-controller",
                 serde_json::json!({"metadata":{"name":"test-pool-workers"}}).to_string(),
             ),
+            // GET before STS PATCH (replicas-ownership check).
+            // 404 → first-create → replicas set to min.
+            Scenario {
+                method: http::Method::GET,
+                path_contains: "/statefulsets/test-pool-workers",
+                status: 404,
+                body_json: serde_json::json!({
+                    "kind":"Status","apiVersion":"v1",
+                    "status":"Failure","reason":"NotFound","code":404,
+                })
+                .to_string(),
+            },
             Scenario::ok(
                 http::Method::PATCH,
                 "fieldManager=rio-controller",

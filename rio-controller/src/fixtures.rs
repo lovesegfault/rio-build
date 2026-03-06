@@ -138,7 +138,16 @@ impl ApiServerVerifier {
 /// The STATEFULSET response body matters: apply() reads
 /// `.status.replicas` from it to patch WorkerPool.status.
 /// Service + status responses are ignored.
-pub fn apply_ok_scenarios(pool_name: &str, ns: &str, sts_replicas: i32) -> Vec<Scenario> {
+///
+/// `sts_exists`: whether the STS GET (before PATCH) returns 200
+/// or 404. apply() uses this to decide whether to set
+/// spec.replicas (first-create) or omit it (autoscaler owns it).
+pub fn apply_ok_scenarios(
+    pool_name: &str,
+    ns: &str,
+    sts_replicas: i32,
+    sts_exists: bool,
+) -> Vec<Scenario> {
     let sts_name = format!("{pool_name}-workers");
     // Minimal Service: apply() doesn't read anything from the
     // response. Empty-ish JSON that parses as a Service.
@@ -156,6 +165,28 @@ pub fn apply_ok_scenarios(pool_name: &str, ns: &str, sts_replicas: i32) -> Vec<S
         "spec": { "replicas": sts_replicas },
         "status": { "replicas": sts_replicas, "readyReplicas": sts_replicas },
     });
+    // GET response: 404 "not found" or the same sts_body for 200.
+    // apply() uses get_opt which maps 404 → None → first-create.
+    let sts_get = if sts_exists {
+        Scenario::ok(
+            http::Method::GET,
+            Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
+            sts_body.to_string(),
+        )
+    } else {
+        Scenario {
+            method: http::Method::GET,
+            path_contains: Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
+            status: 404,
+            // kube's get_opt parses the 404 body as a Status, not a
+            // StatefulSet. Standard K8s NotFound shape.
+            body_json: serde_json::json!({
+                "kind": "Status", "apiVersion": "v1",
+                "status": "Failure", "reason": "NotFound", "code": 404,
+            })
+            .to_string(),
+        }
+    };
     // WorkerPool status patch response: also ignored by apply().
     // Needs at least valid metadata + spec for the serde
     // round-trip in kube's response decode.
@@ -183,6 +214,7 @@ pub fn apply_ok_scenarios(pool_name: &str, ns: &str, sts_replicas: i32) -> Vec<S
             Box::leak(format!("/services/{sts_name}").into_boxed_str()),
             svc_body.to_string(),
         ),
+        sts_get,
         Scenario::ok(
             http::Method::PATCH,
             Box::leak(format!("/statefulsets/{sts_name}").into_boxed_str()),
