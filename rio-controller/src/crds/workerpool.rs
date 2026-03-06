@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn crd_serializes() {
         let crd = WorkerPool::crd();
-        let yaml = serde_yaml::to_string(&crd).expect("serializes");
+        let yaml = serde_yml::to_string(&crd).expect("serializes");
         // Smoke check: the group/kind we configured are in there.
         assert!(yaml.contains("group: rio.build"));
         assert!(yaml.contains("kind: WorkerPool"));

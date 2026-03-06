@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn crd_serializes() {
         let crd = Build::crd();
-        let yaml = serde_yaml::to_string(&crd).expect("serializes");
+        let yaml = serde_yml::to_string(&crd).expect("serializes");
         assert!(yaml.contains("group: rio.build"));
         assert!(yaml.contains("kind: Build"));
         assert!(yaml.contains("rb"));

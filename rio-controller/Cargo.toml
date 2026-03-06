@@ -43,9 +43,8 @@ tokio = { workspace = true }
 # --- Serialization ---
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Write-only for crdgen. Deprecated but safe (no deserialization =
-# no attack surface). See deny.toml.
-serde_yaml = { workspace = true }
+# Write-only for crdgen. Maintained serde_yaml fork.
+serde_yml = { workspace = true }
 
 # --- Observability ---
 tracing = { workspace = true }

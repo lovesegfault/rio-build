@@ -158,11 +158,11 @@ schemars = "1"
 # both dispatch. Acceptable: dispatch is idempotent (drv_hash dedup in
 # DAG merge, workers ignore stale-generation assignments).
 kube-leader-election = "0.43"
-# Deprecated (2024-03) but write-only usage = no attack surface (the
-# advisory is about parsing untrusted YAML). crdgen binary only SERIALIZES
-# our own CRD structs. serde_norway is the maintained fork if we ever
-# need deserialization.
-serde_yaml = "0.9"
+# crdgen-only: serialize CustomResourceExt::crd() to YAML for kustomize.
+# serde_yml is the maintained fork of serde_yaml (which is RUSTSEC-
+# 2024-0320 unmaintained). Drop-in API. kube-client still transitively
+# pulls serde_yaml for kubeconfig parsing — see deny.toml.
+serde_yml = "0.0.12"
 
 # --- phase3a: health + streaming ---
 # grpc.health.v1.Health service. K8s readiness probes hit this.
