@@ -117,7 +117,16 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
             // Inherit stderr: daemon diagnostics go to worker's stderr (visible
             // in container logs). Piping without reading would deadlock if
             // nix-daemon writes >64KB to stderr (pipe buffer full, blocks on write).
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            // Safety net: the caller's explicit daemon.kill() covers the
+            // normal path, but any `?` between spawn and that kill (e.g.,
+            // the cgroup create/add_process in executor/mod.rs) would drop
+            // the Child without killing — leaking a daemon process that
+            // keeps the overlay mount busy. kill_on_drop makes the drop
+            // path safe. The explicit kill + wait is still the primary
+            // mechanism (graceful, bounded wait for reap); this is a
+            // seatbelt for early-return paths.
+            .kill_on_drop(true);
 
         // SAFETY: see function doc. Closure body is async-signal-safe.
         unsafe {

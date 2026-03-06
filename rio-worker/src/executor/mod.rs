@@ -499,7 +499,12 @@ pub async fn execute_build(
     });
 
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
-    // Previously, any `?` between spawn and kill leaked the daemon process.
+    // The cgroup setup above (create/add_process, added in phase3a)
+    // is NOT inside this helper — its `?` paths rely on the
+    // kill_on_drop set in spawn_daemon_in_namespace as a safety
+    // net. The explicit kill below remains the primary cleanup
+    // (graceful, bounded wait for reap); kill_on_drop covers early
+    // returns between spawn and here.
     let batcher = LogBatcher::new(drv_path.clone(), worker_id.to_string(), log_limits);
     let build_result =
         run_daemon_build(&mut daemon, drv_path, &basic_drv, timeout, batcher, log_tx).await;
