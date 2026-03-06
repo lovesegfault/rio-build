@@ -43,24 +43,47 @@ use rio_proto::AdminServiceClient;
 
 use crate::crds::workerpool::WorkerPool;
 
-/// Stabilization window for scale-up. Desired must be stable (same
-/// value) for this long before we patch. Short: queue depth is a
-/// high-confidence signal, react fast.
-const SCALE_UP_WINDOW: Duration = Duration::from_secs(30);
-
 /// Stabilization window for scale-down. Long: avoid killing
 /// workers right before the next burst. 10 min is the K8s HPA
 /// default `--horizontal-pod-autoscaler-downscale-stabilization`;
 /// we follow that convention.
+///
+/// NOT in ScalingTiming: the anti-flap property of a long down-
+/// window is a correctness guarantee, not a tuning knob. Tests
+/// that want fast iteration override the UP windows (scale-up
+/// is the thing that needs to happen fast in a VM test); a
+/// short scale-down would make them flaky under load spikes.
 const SCALE_DOWN_WINDOW: Duration = Duration::from_secs(600);
 
-/// Minimum interval between patches. Anti-flap.
-const MIN_SCALE_INTERVAL: Duration = Duration::from_secs(30);
+/// Tunable timing. Defaults match the previous consts (30s each).
+/// Configurable via `RIO_AUTOSCALER_*_SECS` env so VM tests can
+/// use 3s windows instead of waiting ~60s for a single scale-up.
+///
+/// The scale-DOWN window stays a 600s const — see its comment.
+#[derive(Debug, Clone, Copy)]
+pub struct ScalingTiming {
+    /// How often to poll ClusterStatus. Granularity for everything
+    /// else — polling faster than the up-window doesn't help.
+    pub poll_interval: Duration,
+    /// Stabilization window for scale-up. Desired must be stable
+    /// (same value) for this long before we patch. Queue depth
+    /// is high-confidence → react relatively fast.
+    pub scale_up_window: Duration,
+    /// Minimum interval between any two patches. Anti-flap: a
+    /// desired that wobbles around a boundary shouldn't cause
+    /// rapid patch churn.
+    pub min_scale_interval: Duration,
+}
 
-/// Poll ClusterStatus this often. Matches the stabilization
-/// granularity — polling faster wouldn't help (decisions need 30s
-/// windows anyway).
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+impl Default for ScalingTiming {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(30),
+            scale_up_window: Duration::from_secs(30),
+            min_scale_interval: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Configuration error returned by `scale_one` for the caller
 /// to surface via `WorkerPool.status.conditions`. Transient
@@ -87,7 +110,7 @@ struct ScaleState {
 }
 
 impl ScaleState {
-    fn new(initial: i32) -> Self {
+    fn new(initial: i32, min_interval: Duration) -> Self {
         let now = Instant::now();
         Self {
             last_desired: initial,
@@ -95,8 +118,11 @@ impl ScaleState {
             // Initialize to "long ago" so the first patch isn't
             // anti-flap-blocked. checked_sub → None on underflow;
             // unwrap_or(now) is a no-op on the FIRST iteration
-            // since stable_since hasn't elapsed anyway.
-            last_patch: now.checked_sub(MIN_SCALE_INTERVAL * 2).unwrap_or(now),
+            // since stable_since hasn't elapsed anyway. Uses the
+            // TUNABLE min_interval — with the 3s VM-test override,
+            // a 60s-ago init would work but 2× the actual config
+            // value is clearer (exactly "past the anti-flap gate").
+            last_patch: now.checked_sub(min_interval * 2).unwrap_or(now),
         }
     }
 }
@@ -108,14 +134,22 @@ pub struct Autoscaler {
     /// Per-pool state, keyed by `namespace/name`. Persists across
     /// iterations. Pruned when a pool disappears from the list.
     states: HashMap<String, ScaleState>,
+    /// Timing knobs. `Copy` — passed by value into
+    /// check_stabilization (3 Durations = 24 bytes).
+    timing: ScalingTiming,
 }
 
 impl Autoscaler {
-    pub fn new(client: Client, scheduler: AdminServiceClient<Channel>) -> Self {
+    pub fn new(
+        client: Client,
+        scheduler: AdminServiceClient<Channel>,
+        timing: ScalingTiming,
+    ) -> Self {
         Self {
             client,
             scheduler,
             states: HashMap::new(),
+            timing,
         }
     }
 
@@ -123,7 +157,7 @@ impl Autoscaler {
     /// this via `spawn_monitored` — if it dies, logged, controller
     /// keeps reconciling (just without autoscale).
     pub async fn run(mut self) {
-        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        let mut interval = tokio::time::interval(self.timing.poll_interval);
         // MissedTickBehavior::Skip: if one iteration takes >30s
         // (slow apiserver), don't fire twice immediately after.
         // Catch up on the NEXT normal tick.
@@ -265,12 +299,13 @@ impl Autoscaler {
         };
 
         // ---- Stabilization check ----
+        let timing = self.timing;
         let state = self
             .states
             .entry(key.clone())
-            .or_insert_with(|| ScaleState::new(current));
+            .or_insert_with(|| ScaleState::new(current, timing.min_scale_interval));
 
-        let decision = check_stabilization(state, current, desired);
+        let decision = check_stabilization(state, current, desired, timing);
 
         match decision {
             Decision::Patch(direction) => {
@@ -557,7 +592,12 @@ impl WaitReason {
 ///
 /// Separate fn for testability — all the timing logic is here,
 /// no K8s or scheduler interaction.
-fn check_stabilization(state: &mut ScaleState, current: i32, desired: i32) -> Decision {
+fn check_stabilization(
+    state: &mut ScaleState,
+    current: i32,
+    desired: i32,
+    timing: ScalingTiming,
+) -> Decision {
     let now = Instant::now();
 
     // Desired changed → reset window. Even if it changed BACK
@@ -576,9 +616,10 @@ fn check_stabilization(state: &mut ScaleState, current: i32, desired: i32) -> De
         return Decision::Wait(WaitReason::NoChange);
     }
 
-    // Direction + window.
+    // Direction + window. Up-window tunable (VM tests want 3s);
+    // down-window is the fixed 10-min const (correctness).
     let (direction, window) = if desired > current {
-        (Direction::Up, SCALE_UP_WINDOW)
+        (Direction::Up, timing.scale_up_window)
     } else {
         (Direction::Down, SCALE_DOWN_WINDOW)
     };
@@ -589,7 +630,7 @@ fn check_stabilization(state: &mut ScaleState, current: i32, desired: i32) -> De
 
     // Anti-flap. Prevents oscillation when desired wobbles
     // across a boundary (queue at exactly target*N).
-    if now.duration_since(state.last_patch) < MIN_SCALE_INTERVAL {
+    if now.duration_since(state.last_patch) < timing.min_scale_interval {
         return Decision::Wait(WaitReason::AntiFlap);
     }
 
@@ -767,15 +808,20 @@ mod tests {
 
     // ---- check_stabilization: timing logic ----
     //
-    // These use tokio::time::pause + advance so SCALE_UP_WINDOW
-    // (30s) doesn't make the test take 30s. Instant::now() in the
-    // prod code uses the real clock — but wait, that's std::time,
-    // not tokio::time. tokio::time::pause doesn't affect
-    // std::time::Instant.
-    //
-    // Actually: we can test the logic with MANUALLY constructed
-    // Instants. `Instant` has no public constructor but we can
-    // get one via `Instant::now()` and subtract/add durations.
+    // We manually construct Instants (subtract durations from
+    // now()) to avoid real sleeps. Tests use the DEFAULT timing
+    // (30s up-window, 30s min-interval); production may use
+    // different values via config but the LOGIC is the same.
+
+    const T: ScalingTiming = ScalingTiming {
+        poll_interval: Duration::from_secs(30),
+        scale_up_window: Duration::from_secs(30),
+        min_scale_interval: Duration::from_secs(30),
+    };
+
+    fn mk_state(initial: i32) -> ScaleState {
+        ScaleState::new(initial, T.min_scale_interval)
+    }
 
     /// Fresh state with a desired that differs from current →
     /// first call returns DesiredChanged (new desired seen, window
@@ -783,17 +829,17 @@ mod tests {
     /// elapsed → Patch.
     #[test]
     fn stabilization_window_before_patch() {
-        let mut state = ScaleState::new(2);
+        let mut state = mk_state(2);
         // Manually age stable_since past the window. We do this
         // instead of sleeping because real sleeps in tests are
         // flaky (CI noisy neighbors).
         state.stable_since = Instant::now()
-            .checked_sub(SCALE_UP_WINDOW + Duration::from_secs(1))
+            .checked_sub(T.scale_up_window + Duration::from_secs(1))
             .unwrap();
 
         // First call: desired=5 is new (state has last_desired=2
         // from init). Reset.
-        let d1 = check_stabilization(&mut state, 2, 5);
+        let d1 = check_stabilization(&mut state, 2, 5, T);
         assert!(
             matches!(d1, Decision::Wait(WaitReason::DesiredChanged)),
             "new desired → reset window"
@@ -801,7 +847,7 @@ mod tests {
         // stable_since was just reset to now.
 
         // Second call, same desired, but window hasn't elapsed.
-        let d2 = check_stabilization(&mut state, 2, 5);
+        let d2 = check_stabilization(&mut state, 2, 5, T);
         assert!(
             matches!(d2, Decision::Wait(WaitReason::Stabilizing)),
             "window not elapsed"
@@ -809,9 +855,9 @@ mod tests {
 
         // Age it.
         state.stable_since = Instant::now()
-            .checked_sub(SCALE_UP_WINDOW + Duration::from_secs(1))
+            .checked_sub(T.scale_up_window + Duration::from_secs(1))
             .unwrap();
-        let d3 = check_stabilization(&mut state, 2, 5);
+        let d3 = check_stabilization(&mut state, 2, 5, T);
         assert!(
             matches!(d3, Decision::Patch(Direction::Up)),
             "window elapsed, same desired → patch"
@@ -820,17 +866,17 @@ mod tests {
 
     #[test]
     fn stabilization_down_window_longer() {
-        let mut state = ScaleState::new(10);
+        let mut state = mk_state(10);
         state.last_desired = 3; // as if we've seen 3 before
 
-        // Age past SCALE_UP_WINDOW but NOT SCALE_DOWN_WINDOW.
+        // Age past T.scale_up_window but NOT SCALE_DOWN_WINDOW.
         state.stable_since = Instant::now()
-            .checked_sub(SCALE_UP_WINDOW + Duration::from_secs(60))
+            .checked_sub(T.scale_up_window + Duration::from_secs(60))
             .unwrap();
 
         // desired=3 < current=10 → scale DOWN. up-window elapsed
         // but down-window (10 min) hasn't.
-        let d = check_stabilization(&mut state, 10, 3);
+        let d = check_stabilization(&mut state, 10, 3, T);
         assert!(
             matches!(d, Decision::Wait(WaitReason::Stabilizing)),
             "scale-down needs the 10min window, not the 30s one"
@@ -840,30 +886,30 @@ mod tests {
         state.stable_since = Instant::now()
             .checked_sub(SCALE_DOWN_WINDOW + Duration::from_secs(1))
             .unwrap();
-        let d2 = check_stabilization(&mut state, 10, 3);
+        let d2 = check_stabilization(&mut state, 10, 3, T);
         assert!(matches!(d2, Decision::Patch(Direction::Down)));
     }
 
     #[test]
     fn stabilization_no_change() {
-        let mut state = ScaleState::new(5);
+        let mut state = mk_state(5);
         state.last_desired = 5;
-        let d = check_stabilization(&mut state, 5, 5);
+        let d = check_stabilization(&mut state, 5, 5, T);
         assert!(matches!(d, Decision::Wait(WaitReason::NoChange)));
     }
 
     #[test]
     fn stabilization_anti_flap() {
-        let mut state = ScaleState::new(2);
+        let mut state = mk_state(2);
         state.last_desired = 5;
         // Window elapsed.
         state.stable_since = Instant::now()
-            .checked_sub(SCALE_UP_WINDOW + Duration::from_secs(1))
+            .checked_sub(T.scale_up_window + Duration::from_secs(1))
             .unwrap();
         // But last_patch was just now.
         state.last_patch = Instant::now();
 
-        let d = check_stabilization(&mut state, 2, 5);
+        let d = check_stabilization(&mut state, 2, 5, T);
         assert!(
             matches!(d, Decision::Wait(WaitReason::AntiFlap)),
             "too soon since last patch, even though window elapsed"
@@ -875,19 +921,19 @@ mod tests {
         // desired changes 5 → 6 → 5. Each change resets. The
         // 5 → 6 → 5 round trip doesn't get to "5 was stable for
         // 30s" because the window reset when it hit 6.
-        let mut state = ScaleState::new(2);
+        let mut state = mk_state(2);
         state.last_desired = 5;
         state.stable_since = Instant::now()
-            .checked_sub(SCALE_UP_WINDOW + Duration::from_secs(1))
+            .checked_sub(T.scale_up_window + Duration::from_secs(1))
             .unwrap();
 
         // Wobble to 6.
-        let d = check_stabilization(&mut state, 2, 6);
+        let d = check_stabilization(&mut state, 2, 6, T);
         assert!(matches!(d, Decision::Wait(WaitReason::DesiredChanged)));
         assert_eq!(state.last_desired, 6);
 
         // Wobble back to 5. Resets AGAIN.
-        let d = check_stabilization(&mut state, 2, 5);
+        let d = check_stabilization(&mut state, 2, 5, T);
         assert!(
             matches!(d, Decision::Wait(WaitReason::DesiredChanged)),
             "5 → 6 → 5 resets twice; 'stable' means no changes in window"

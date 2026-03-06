@@ -40,6 +40,13 @@ struct Config {
     metrics_addr: std::net::SocketAddr,
     /// HTTP /healthz listen address. K8s livenessProbe hits this.
     health_addr: std::net::SocketAddr,
+    /// Autoscaler poll interval (seconds). Default 30s; VM tests
+    /// override to 3s so a scale decision happens within the test
+    /// timeout. Scale-DOWN window is NOT configurable (fixed
+    /// 600s) — see SCALE_DOWN_WINDOW comment in scaling.rs.
+    autoscaler_poll_secs: u64,
+    autoscaler_scale_up_window_secs: u64,
+    autoscaler_min_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -52,6 +59,12 @@ impl Default for Config {
             metrics_addr: "0.0.0.0:9094".parse().unwrap(),
             // Same +100 pattern as gateway/worker.
             health_addr: "0.0.0.0:9194".parse().unwrap(),
+            // Match ScalingTiming::default(). Duplicated rather
+            // than .as_secs()-ing from the Default impl to avoid
+            // a const-fn dance — keep them in sync when changing.
+            autoscaler_poll_secs: 30,
+            autoscaler_scale_up_window_secs: 30,
+            autoscaler_min_interval_secs: 30,
         }
     }
 }
@@ -183,7 +196,13 @@ async fn main() -> anyhow::Result<()> {
     // Separate task. spawn_monitored: if it panics, logged;
     // controller keeps reconciling (spec changes still apply),
     // just no autoscale. Better than the whole pod dying.
-    let autoscaler = Autoscaler::new(client.clone(), scheduler);
+    let timing = rio_controller::scaling::ScalingTiming {
+        poll_interval: std::time::Duration::from_secs(cfg.autoscaler_poll_secs),
+        scale_up_window: std::time::Duration::from_secs(cfg.autoscaler_scale_up_window_secs),
+        min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
+    };
+    info!(?timing, "autoscaler timing");
+    let autoscaler = Autoscaler::new(client.clone(), scheduler, timing);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run());
 
     // ---- Build controller ----
