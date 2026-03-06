@@ -9,7 +9,8 @@
 //! 6. Store NAR (inline or chunked) + flip status to 'complete'
 //!
 //! Trailer-only: metadata.nar_hash MUST be empty; hash arrives in the
-//! PutPathTrailer after all chunks. See F1 cleanup.
+//! PutPathTrailer after all chunks (stream-and-hash — the client doesn't
+//! know the hash until after transmitting all bytes).
 
 use super::*;
 

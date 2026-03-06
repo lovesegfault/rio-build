@@ -399,8 +399,8 @@ impl ChunkCache {
     /// `backend.put()` directly (no point caching freshly-written
     /// chunks nothing has asked for). With this accessor, main.rs can
     /// construct ONE ChunkCache and share it with StoreServiceImpl +
-    /// ChunkServiceImpl + CacheServerState — the main.rs TODO wanted
-    /// "a chunk warmed by GetPath is hot for GetChunk" which means
+    /// ChunkServiceImpl + CacheServerState — the goal was "a chunk
+    /// warmed by GetPath is hot for GetChunk" which means
     /// one cache. StoreServiceImpl needs the raw backend for writes;
     /// it gets it via this accessor instead of a separate Arc.
     pub fn backend(&self) -> Arc<dyn ChunkBackend> {
