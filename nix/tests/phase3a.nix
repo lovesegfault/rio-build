@@ -82,7 +82,7 @@ let
         metric = "queueDepth";
         targetValue = 2;
       };
-      image = "rio-worker:latest";
+      image = "rio-worker:dev";
       maxConcurrentBuilds = 1;
       fuseCacheSize = "5Gi";
       sizeClass = ""; # empty — scheduler not configured with size_classes
@@ -91,6 +91,11 @@ let
       # VM-test concessions (see file header):
       privileged = true;
       hostNetwork = true;
+      # Airgap: image is preloaded via services.k3s.images (below).
+      # :latest would default to Always (pull docker.io, fail — no
+      # internet). The CRD field + non-:latest tag both prevent it
+      # (defense in depth — if someone reverts the tag, still works).
+      imagePullPolicy = "IfNotPresent";
     };
   };
 in
@@ -270,12 +275,12 @@ pkgs.testers.runNixOSTest {
     k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
 
     # Airgap import: k3s ctr imports images on start, but it's
-    # async. Wait for OUR image to show up — "rio-worker:latest"
-    # is what the WorkerPool CR references (imagePullPolicy
-    # defaults to IfNotPresent for :latest, so if it's in the
-    # local store, no pull).
+    # async. Wait for OUR image to show up. Note: the pod may
+    # be scheduled BEFORE import completes (controller is fast,
+    # ctr import is slow). With imagePullPolicy=IfNotPresent,
+    # kubelet retries after backoff and eventually finds it.
     k8s.wait_until_succeeds(
-        "k3s ctr images ls -q | grep -q 'rio-worker:latest'",
+        "k3s ctr images ls -q | grep -q 'rio-worker:dev'",
         timeout=120
     )
 
