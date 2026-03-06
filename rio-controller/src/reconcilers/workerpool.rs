@@ -566,6 +566,21 @@ fn build_pod_spec(
                 }),
                 ..Default::default()
             },
+            // Overlay upperdir/workdir. MUST be a real filesystem
+            // (ext4/xfs via emptyDir on the node's disk), NOT the
+            // container's root — containerd's root is overlayfs,
+            // and overlayfs-as-upperdir can't create trusted.*
+            // xattrs → mount fails with EINVAL. emptyDir gives us
+            // the kubelet's local disk (/var/lib/kubelet/pods/...),
+            // which is ext4/xfs on every sane node. No sizeLimit:
+            // overlays are per-build, cleaned on Drop; unbounded
+            // growth = a leak bug that sizeLimit would mask with
+            // a pod eviction (worse debugging).
+            Volume {
+                name: "overlays".into(),
+                empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            },
         ]),
 
         // Security context. SYS_ADMIN for mount (FUSE, overlayfs,
@@ -655,6 +670,11 @@ fn build_container(wp: &WorkerPool, scheduler_addr: &str, cache_gb: u64) -> Cont
             VolumeMount {
                 name: "fuse-cache".into(),
                 mount_path: "/var/rio/cache".into(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "overlays".into(),
+                mount_path: "/var/rio/overlays".into(),
                 ..Default::default()
             },
         ]),
@@ -900,6 +920,39 @@ mod tests {
             Some("CharDevice".into()),
             "CharDevice type makes K8s verify it's a char device (catches no-FUSE nodes)"
         );
+    }
+
+    #[test]
+    fn statefulset_overlays_volume_mounted() {
+        // RIO_OVERLAY_BASE_DIR points to /var/rio/overlays. If
+        // there's no volume mount for it, it lands on the
+        // container's root filesystem — which is overlayfs.
+        // Overlayfs-as-upperdir can't create trusted.* xattrs →
+        // every overlay mount fails with EINVAL. Regression guard.
+        let wp = test_wp();
+        let sts =
+            build_statefulset(&wp, wp.controller_owner_ref(&()).unwrap(), "sched:9001").unwrap();
+        let pod = sts.spec.unwrap().template.spec.unwrap();
+
+        let vol = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "overlays")
+            .expect("overlays volume must exist");
+        assert!(
+            vol.empty_dir.is_some(),
+            "emptyDir → node's real disk (ext4/xfs with trusted.* xattr support)"
+        );
+
+        let mount = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "overlays")
+            .expect("overlays volumeMount");
+        assert_eq!(mount.mount_path, "/var/rio/overlays");
     }
 
     #[test]
