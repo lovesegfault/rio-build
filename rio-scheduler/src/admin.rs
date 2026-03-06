@@ -467,7 +467,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         _request: Request<ClearPoisonRequest>,
     ) -> Result<Response<ClearPoisonResponse>, Status> {
-        Err(Status::unimplemented("ClearPoison: phase3a controller"))
+        Err(Status::unimplemented("ClearPoison: phase4 dashboard"))
     }
 }
 
