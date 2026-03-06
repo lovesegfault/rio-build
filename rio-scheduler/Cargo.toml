@@ -30,6 +30,7 @@ tonic-health = { workspace = true }
 # stale-generation assignments via heartbeat compare).
 kube = { workspace = true }
 kube-leader-election = { workspace = true }
+rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
