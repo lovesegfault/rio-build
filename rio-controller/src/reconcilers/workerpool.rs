@@ -35,7 +35,7 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::{CustomResourceExt, Resource, ResourceExt};
 use tracing::{debug, info, warn};
 
-use crate::crds::workerpool::{WorkerPool, WorkerPoolStatus};
+use crate::crds::workerpool::WorkerPool;
 use crate::error::{Error, Result};
 use crate::reconcilers::Ctx;
 
@@ -170,16 +170,6 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // Controller setup watches StatefulSets; changes there
     // enqueue this reconcile.
     let sts_status = applied.status.unwrap_or_default();
-    let status = WorkerPoolStatus {
-        replicas: sts_status.replicas,
-        ready_replicas: sts_status.ready_replicas.unwrap_or(0),
-        // What the autoscaler set on STS.spec.replicas (or min on
-        // first create). Previously hardcoded to min — kubectl's
-        // "Desired" column was always wrong.
-        desired_replicas: current_replicas,
-        last_scale_time: None,
-        conditions: vec![],
-    };
 
     // Patch status subresource. Separate from spec — status is
     // write-only from the controller's perspective (operators
@@ -191,12 +181,28 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // schema. Without them: 400 "apiVersion must be set in
     // apply patch". (Same pattern as build.rs patch_status —
     // that one learned this the hard way; this one forgot.)
+    //
+    // Partial status: we patch ONLY replicas/ready/desired. The
+    // autoscaler owns lastScaleTime + conditions via a separate
+    // SSA field-manager ("rio-controller-autoscaler-status").
+    // SSA merges field ownership — our patch here doesn't touch
+    // lastScaleTime, so the autoscaler's value persists across
+    // our reconciles. Previously we set both to empty on EVERY
+    // reconcile, clobbering anything the autoscaler wrote.
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
     let ar = WorkerPool::api_resource();
     let status_patch = serde_json::json!({
         "apiVersion": ar.api_version,
         "kind": ar.kind,
-        "status": status,
+        "status": {
+            "replicas": sts_status.replicas,
+            "readyReplicas": sts_status.ready_replicas.unwrap_or(0),
+            // What the autoscaler set on STS.spec.replicas (or min
+            // on first create). Previously hardcoded to min —
+            // kubectl's "Desired" column was always wrong.
+            "desiredReplicas": current_replicas,
+            // lastScaleTime + conditions: NOT here. Autoscaler owns.
+        },
     });
     wp_api
         .patch_status(

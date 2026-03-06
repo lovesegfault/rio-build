@@ -62,6 +62,18 @@ const MIN_SCALE_INTERVAL: Duration = Duration::from_secs(30);
 /// windows anyway).
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Configuration error returned by `scale_one` for the caller
+/// to surface via `WorkerPool.status.conditions`. Transient
+/// errors (K8s API flake, STS not found) return `None` — they
+/// log + retry next tick, no condition update.
+#[derive(Debug, Clone)]
+pub(crate) enum ScaleError {
+    /// `spec.autoscaling.metric` is an unrecognized value.
+    /// Carried value = the operator's metric string (for the
+    /// condition message).
+    UnknownMetric(String),
+}
+
 /// Per-pool stabilization state. Lives across poll iterations.
 #[derive(Debug)]
 struct ScaleState {
@@ -156,8 +168,13 @@ impl Autoscaler {
         self.states.retain(|k, _| live_keys.contains(k));
 
         // ---- Compute + maybe patch each pool ----
+        // scale_one() returns Some(err) for config errors (unknown
+        // metric). Those surface via WorkerPool.status.conditions
+        // — best-effort (log + continue on patch failure).
         for pool in &pools {
-            self.scale_one(pool, &status).await;
+            if let Some(err) = self.scale_one(pool, &status).await {
+                self.patch_error_condition(pool, &err).await;
+            }
         }
 
         // Emit gauges AFTER scaling decisions. One `set` per pool.
@@ -184,14 +201,41 @@ impl Autoscaler {
 
     /// Scale one pool. Computes desired, checks stabilization,
     /// maybe patches the StatefulSet.
+    ///
+    /// Returns `None` on success / valid skip (STS not found,
+    /// read error, stabilizing); `Some(reason)` on configuration
+    /// error that should surface in `WorkerPool.status.conditions`.
+    /// The caller patches conditions — keeping the status patch
+    /// out of this fn lets tick() batch it with the gauge updates.
     async fn scale_one(
         &mut self,
         pool: &WorkerPool,
         status: &rio_proto::types::ClusterStatusResponse,
-    ) {
+    ) -> Option<ScaleError> {
         let key = pool_key(pool);
         let ns = pool.namespace().unwrap_or_default();
         let sts_name = format!("{}-workers", pool.name_any());
+
+        // ---- Validate metric ----
+        // Only "queueDepth" is supported. The CRD uses a free-form
+        // string (not enum) so future metrics don't need a CRD
+        // version bump — but an unrecognized value is an operator
+        // error, not a "fall through to default." Skip this pool;
+        // tick() surfaces the error via WorkerPool.status.conditions.
+        //
+        // Previously this field was never read. Operator setting
+        // `metric: "cpuUtilization"` expecting something would
+        // happen → silently scaled on queueDepth anyway.
+        if pool.spec.autoscaling.metric != "queueDepth" {
+            warn!(
+                pool = %key,
+                metric = %pool.spec.autoscaling.metric,
+                "unknown autoscaling metric (only queueDepth supported); skipping pool"
+            );
+            return Some(ScaleError::UnknownMetric(
+                pool.spec.autoscaling.metric.clone(),
+            ));
+        }
 
         // ---- Compute desired ----
         let desired = compute_desired(
@@ -212,11 +256,11 @@ impl Autoscaler {
                 // run, or was just deleted). Skip — reconciler
                 // creates it, next tick scales.
                 debug!(pool = %key, "StatefulSet not found; skipping scale");
-                return;
+                return None;
             }
             Err(e) => {
                 warn!(pool = %key, error = %e, "failed to read StatefulSet");
-                return;
+                return None;
             }
         };
 
@@ -258,6 +302,13 @@ impl Autoscaler {
                         metrics::counter!("rio_controller_scaling_decisions_total",
                             "direction" => direction.as_str())
                         .increment(1);
+
+                        // Best-effort: record the scale in
+                        // WorkerPool.status. Fire-and-forget
+                        // (log on fail) — the STS patch is the
+                        // source of truth; status is observability.
+                        self.patch_scaled_status(pool, current, desired, direction)
+                            .await;
                     }
                     Err(e) => {
                         warn!(pool = %key, error = %e, "scale patch failed");
@@ -274,7 +325,136 @@ impl Autoscaler {
                 );
             }
         }
+
+        None
     }
+
+    /// Patch `WorkerPool.status.{lastScaleTime,conditions}` after
+    /// a successful scale. Best-effort: log warn on failure, don't
+    /// propagate. The STS patch already landed — that's the source
+    /// of truth. This is observability.
+    ///
+    /// Uses a SEPARATE SSA field-manager from the reconciler
+    /// ("rio-controller-autoscaler-status" vs "rio-controller").
+    /// SSA splits field ownership: reconciler owns replicas/ready/
+    /// desired (patched every reconcile), we own lastScaleTime/
+    /// conditions (patched only on scale). Neither clobbers the
+    /// other.
+    async fn patch_scaled_status(
+        &self,
+        pool: &WorkerPool,
+        from: i32,
+        to: i32,
+        direction: Direction,
+    ) {
+        let reason = match direction {
+            Direction::Up => "ScaledUp",
+            Direction::Down => "ScaledDown",
+        };
+        let msg = format!("scaled from {from} to {to}");
+        let cond = scaling_condition("True", reason, &msg);
+        self.patch_status_partial(pool, Some(cond)).await;
+    }
+
+    /// Patch a config-error condition. The CRD doc at
+    /// crds/workerpool.rs:199 promises "unknown metric is a
+    /// RECONCILE error (surfaces in .status.conditions)" —
+    /// this delivers it.
+    async fn patch_error_condition(&self, pool: &WorkerPool, err: &ScaleError) {
+        let (reason, msg) = match err {
+            ScaleError::UnknownMetric(m) => (
+                "UnknownMetric",
+                format!("autoscaling.metric '{m}' is not supported (only 'queueDepth')"),
+            ),
+        };
+        let cond = scaling_condition("False", reason, &msg);
+        self.patch_status_partial(pool, Some(cond)).await;
+    }
+
+    /// Low-level: patch WorkerPool.status.{lastScaleTime,conditions}.
+    /// Partial status (replicas/ready/desired are the reconciler's
+    /// field-manager, not ours).
+    ///
+    /// `condition = None` → clear conditions (future use: when a
+    /// previously-errored pool becomes valid again). Currently both
+    /// callers pass Some.
+    async fn patch_status_partial(&self, pool: &WorkerPool, condition: Option<serde_json::Value>) {
+        let ns = pool.namespace().unwrap_or_default();
+        let name = pool.name_any();
+
+        // Conditions as a Vec (standard K8s Conditions pattern).
+        // Single condition type ("Scaling") — we overwrite on
+        // each call rather than appending (conditions are
+        // identified by type; duplicates are a bug).
+        let conditions: Vec<serde_json::Value> = condition.into_iter().collect();
+
+        let patch = wp_status_patch(&conditions);
+
+        let api: Api<WorkerPool> = Api::namespaced(self.client.clone(), &ns);
+        if let Err(e) = api
+            .patch_status(
+                &name,
+                &PatchParams::apply(STATUS_MANAGER).force(),
+                &Patch::Apply(&patch),
+            )
+            .await
+        {
+            // Warn not error: status patch is observability, not
+            // correctness. The STS replica patch already landed.
+            warn!(
+                pool = %pool_key(pool),
+                error = %e,
+                "failed to patch WorkerPool.status (scale itself succeeded)"
+            );
+        }
+    }
+}
+
+/// SSA field-manager for autoscaler's WorkerPool.status patches.
+/// DIFFERENT from the reconciler's "rio-controller" — SSA splits
+/// field ownership so the two don't clobber each other.
+const STATUS_MANAGER: &str = "rio-controller-autoscaler-status";
+
+/// Build a K8s Condition for the "Scaling" type. Uses json!
+/// instead of k8s_openapi's Condition struct because:
+/// (1) Condition requires all fields including observedGeneration
+/// which we don't track, (2) json! is easier to partial-patch.
+///
+/// `status`: "True" (scaled OK) / "False" (config error).
+/// `reason`: CamelCase machine-readable (ScaledUp/UnknownMetric).
+/// `message`: human-readable.
+fn scaling_condition(status: &str, reason: &str, message: &str) -> serde_json::Value {
+    // k8s_openapi re-exports jiff (kube 3.0's chrono replacement).
+    // Timestamp::now() → Display is RFC3339 with offset (UTC Z).
+    // K8s Condition.lastTransitionTime expects this format.
+    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+    serde_json::json!({
+        "type": "Scaling",
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "lastTransitionTime": now,
+    })
+}
+
+/// Build the SSA patch body for `WorkerPool.status.{lastScaleTime,
+/// conditions}`. Partial status — replicas/ready/desired are the
+/// reconciler's fields, not ours.
+///
+/// Same apiVersion+kind requirement as sts_replicas_patch (and
+/// the reconciler's status_patch).
+pub(crate) fn wp_status_patch(conditions: &[serde_json::Value]) -> serde_json::Value {
+    use kube::CustomResourceExt;
+    let ar = WorkerPool::api_resource();
+    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+    serde_json::json!({
+        "apiVersion": ar.api_version,
+        "kind": ar.kind,
+        "status": {
+            "lastScaleTime": now,
+            "conditions": conditions,
+        },
+    })
 }
 
 /// Build the SSA patch body for `StatefulSet.spec.replicas`.
@@ -436,6 +616,76 @@ mod tests {
     /// failed every scale (vm-phase3a used `kubectl scale` direct,
     /// bypassing this path). This test is a tripwire: if someone
     /// strips the GVK fields "for brevity," this breaks.
+    /// WorkerPool status patch needs apiVersion+kind (same SSA
+    /// requirement as the STS replicas patch). Also verify it's a
+    /// PARTIAL status: replicas/ready/desired absent (reconciler's
+    /// fields), lastScaleTime + conditions present (ours).
+    #[test]
+    fn wp_status_patch_has_gvk_and_partial_status() {
+        let cond = scaling_condition("True", "ScaledUp", "from 1 to 3");
+        let patch = wp_status_patch(std::slice::from_ref(&cond));
+
+        // GVK: SSA rejects without these.
+        assert!(
+            patch.get("apiVersion").and_then(|v| v.as_str()).is_some(),
+            "SSA body without apiVersion → 400"
+        );
+        assert_eq!(
+            patch.get("kind").and_then(|v| v.as_str()),
+            Some("WorkerPool")
+        );
+
+        let status = patch.get("status").expect("status key");
+        // Autoscaler's fields present.
+        assert!(
+            status.get("lastScaleTime").is_some(),
+            "autoscaler owns this"
+        );
+        assert_eq!(
+            status
+                .get("conditions")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "one Scaling condition"
+        );
+        // Reconciler's fields ABSENT — SSA field ownership split.
+        // If we included these, our patch would fight the
+        // reconciler's on every scale.
+        assert!(
+            status.get("replicas").is_none(),
+            "reconciler owns replicas; our patch must not touch it"
+        );
+        assert!(status.get("desiredReplicas").is_none());
+    }
+
+    /// Scaling condition has the standard K8s Condition shape
+    /// (type/status/reason/message/lastTransitionTime). kubectl
+    /// describe reads these fields by convention.
+    #[test]
+    fn scaling_condition_has_standard_fields() {
+        let c = scaling_condition("False", "UnknownMetric", "metric 'foo' unsupported");
+        assert_eq!(c.get("type").and_then(|v| v.as_str()), Some("Scaling"));
+        assert_eq!(c.get("status").and_then(|v| v.as_str()), Some("False"));
+        assert_eq!(
+            c.get("reason").and_then(|v| v.as_str()),
+            Some("UnknownMetric")
+        );
+        assert!(c.get("message").is_some());
+        // lastTransitionTime is an RFC3339 timestamp. Cheap check:
+        // contains T and ends with Z (UTC). Full parse in k8s
+        // apiserver; this just catches the obvious "we passed
+        // unix-epoch-secs as a number" class of mistakes.
+        let ts = c
+            .get("lastTransitionTime")
+            .and_then(|v| v.as_str())
+            .expect("timestamp string");
+        assert!(
+            ts.contains('T') && ts.ends_with('Z'),
+            "RFC3339 UTC format; got {ts}"
+        );
+    }
+
     #[test]
     fn sts_replicas_patch_has_gvk() {
         let patch = sts_replicas_patch(5);
