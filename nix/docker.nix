@@ -4,7 +4,7 @@
 #   nix build .#docker-gateway      # single image tarball at result
 #   nix build .#dockerImages        # all 4 at result/{gateway,scheduler,store,worker}.tar.gz
 #   docker load < result/gateway.tar.gz
-#   docker run rio-gateway:latest --help
+#   docker run rio-gateway:dev --help
 #
 # buildLayeredImage stratifies by popularity — the Nix store closure of each
 # binary is split into layers by reference count, so shared deps (glibc,
@@ -33,7 +33,12 @@ let
     }:
     dockerTools.buildLayeredImage {
       name = "rio-${name}";
-      tag = "latest";
+      # "dev" not "latest": :latest defaults to imagePullPolicy=Always
+      # in K8s (never checks local store), which breaks airgap k3s/kind.
+      # Non-latest tag → IfNotPresent default → locally-imported image
+      # works. Real release images are tagged by CI with git SHAs
+      # anyway; this tag is for local dev + VM tests.
+      tag = "dev";
 
       # Max layer count. Default is 100; Docker's hard limit is 127.
       # More layers = finer-grained caching but more tarball overhead.
