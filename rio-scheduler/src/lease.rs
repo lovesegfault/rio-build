@@ -247,6 +247,13 @@ pub async fn run_lease_loop(cfg: LeaseConfig, state: LeaderState) {
                         holder = %cfg.holder_id,
                         "acquired leadership"
                     );
+                    // Counter for VM test observability: vm-phase3a's
+                    // lease smoke test polls this to confirm the
+                    // lease loop actually acquired (vs silently
+                    // failing kube-client init and running standby
+                    // forever). The info! log has the same signal
+                    // but metrics are less brittle for VM grep.
+                    metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
                 } else if !now_leading && was_leading {
                     // ---- Lose transition ----
                     // Someone else acquired (we couldn't renew in
@@ -259,6 +266,7 @@ pub async fn run_lease_loop(cfg: LeaseConfig, state: LeaderState) {
                         holder = %cfg.holder_id,
                         "lost leadership (another replica acquired)"
                     );
+                    metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
                 }
                 // else: steady state (still leading, renewed; or
                 // still standby, someone else holds). No log —

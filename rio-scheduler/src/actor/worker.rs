@@ -298,6 +298,13 @@ impl DagActor {
                 let n = rows.len();
                 self.estimator.refresh(rows);
                 debug!(entries = n, "estimator refreshed from build_history");
+                // Counter for VM test observability: vm-phase2c
+                // previously sleep(15)'d waiting for this refresh
+                // to pick up a pre-seeded build_history row. Now
+                // it can poll this metric instead — ≥2 increments
+                // after the INSERT = refresh has seen the seed
+                // (first tick may have raced, second is certain).
+                metrics::counter!("rio_scheduler_estimator_refresh_total").increment(1);
             }
             Err(e) => {
                 warn!(error = %e, "estimator refresh failed; keeping previous snapshot");
