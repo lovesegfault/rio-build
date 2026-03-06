@@ -35,13 +35,6 @@ pub enum Error {
     /// with backoff — the scheduler may come back.
     #[error("scheduler unavailable: {0}")]
     SchedulerUnavailable(#[from] tonic::Status),
-
-    /// JSON serialization of a patch body failed. Indicates a
-    /// bug in our object construction (we built a struct that
-    /// serde can't handle). Shouldn't happen — our types are
-    /// all derive(Serialize) from k8s-openapi.
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
 }
 
 /// Result alias used throughout reconcilers.
