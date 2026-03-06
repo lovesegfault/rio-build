@@ -88,17 +88,26 @@ in
       pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
       pkgs.util-linux # mount, umount for overlay teardown
 
-      # nix-daemon drops privs to the nixbld user inside its sandbox.
-      # Without /etc/passwd, it can't look up the uid and fails with
-      # "getpwnam: user nixbld does not exist". writeTextDir gives us
-      # a minimal passwd/group file in the image layer.
-      (pkgs.writeTextDir "etc/passwd" ''
-        root:x:0:0:root:/root:/bin/sh
-        nixbld:x:30000:30000:Nix build user:/:/bin/false
-      '')
+      # nix-daemon drops privs to a nixbld{N} user inside its sandbox.
+      # It enumerates build users via getgrnam("nixbld")->gr_mem — the
+      # EXPLICIT member list in /etc/group. A user's primary group (gid
+      # field in passwd) does NOT appear in gr_mem; the member list must
+      # be populated or daemon fails: "nixbld group has no members".
+      #
+      # 8 users: one per concurrent build slot. maxConcurrentBuilds
+      # can go up to this without running out. UIDs 30001-30008 match
+      # the NixOS convention (nixbld1 at 30001, etc).
+      (pkgs.writeTextDir "etc/passwd" (
+        ''
+          root:x:0:0:root:/root:/bin/sh
+        ''
+        + lib.concatMapStrings (
+          n: "nixbld${toString n}:x:${toString (30000 + n)}:30000:Nix build user ${toString n}:/:/bin/false\n"
+        ) (lib.range 1 8)
+      ))
       (pkgs.writeTextDir "etc/group" ''
         root:x:0:
-        nixbld:x:30000:
+        nixbld:x:30000:${lib.concatMapStringsSep "," (n: "nixbld${toString n}") (lib.range 1 8)}
       '')
       # nix-daemon also reads /etc/nix/nix.conf. Give it a minimal one
       # with the settings the executor's per-build nix.conf overrides
