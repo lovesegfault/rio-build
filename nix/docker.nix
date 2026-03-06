@@ -30,9 +30,11 @@ let
       name,
       extraContents ? [ ],
       extraEnv ? [ ],
+      extraCommands ? "",
     }:
     dockerTools.buildLayeredImage {
       name = "rio-${name}";
+      inherit extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
       # in K8s (never checks local store), which breaks airgap k3s/kind.
       # Non-latest tag → IfNotPresent default → locally-imported image
@@ -119,5 +121,22 @@ in
         ]
       }"
     ];
+    # spawn_daemon_in_namespace bind-mounts the per-build synthetic DB
+    # at /nix/var/nix/db and the nix.conf at /etc/nix. Bind mount
+    # targets must exist. /etc/nix exists (writeTextDir above creates
+    # it); /nix/var doesn't — the closure only populates /nix/store.
+    # The NixOS VM worker module creates /nix/var/nix/db via tmpfiles;
+    # we do it here for the container case.
+    #
+    # /tmp: nix-daemon's sandbox needs a tmpdir. Containers don't have
+    # one by default. sticky-bit (1777) matches the standard /tmp.
+    #
+    # extraCommands runs in the customisation layer's root dir (unprivileged;
+    # nix's sandbox builder user) — paths are relative to image /.
+    extraCommands = ''
+      mkdir -p nix/var/nix/db
+      mkdir -p tmp
+      chmod 1777 tmp
+    '';
   };
 }
