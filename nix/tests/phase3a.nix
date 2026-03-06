@@ -496,6 +496,36 @@ pkgs.testers.runNixOSTest {
     # Output queryable via ssh-ng (round-trips through rio-store).
     client.succeed(f"nix path-info --store 'ssh-ng://control' {out}")
 
+    # ── Reconciler preserves autoscaler replicas (regression) ──────
+    # The reconciler was reverting STS.spec.replicas to min on every
+    # reconcile (SSA with .force() re-claimed the field). Simulate
+    # the autoscaler by scaling STS directly — the .owns() watch
+    # triggers a reconcile. If the bug is present, replicas reverts
+    # to 1 within ~5s. If fixed, it stays at 2.
+    #
+    # We don't wait for pod-1 to be Ready (4GB VM is tight) — just
+    # assert the reconciler didn't stomp on spec.replicas. The
+    # autoscaler's actual 30s+30s stabilization loop is unit-tested
+    # in scaling.rs; this proves the SSA field-ownership handoff.
+    k8s.succeed("k3s kubectl scale statefulset default-workers --replicas=2")
+    # Give the reconciler time to run (triggered by .owns() watch on
+    # STS change). The reconcile itself is fast (<100ms); 5s is plenty
+    # for the watch event to deliver. Without the fix, replicas would
+    # be back at 1 after this sleep.
+    import time; time.sleep(5)
+    k8s.succeed(
+        "test \"$(k3s kubectl get statefulset default-workers "
+        "-o jsonpath='{.spec.replicas}')\" = 2"
+    )
+    # And WorkerPool.status.desiredReplicas should reflect the
+    # scaled value (reconciler reads it from STS.spec.replicas
+    # before patching status). Previously hardcoded to min.
+    k8s.wait_until_succeeds(
+        "test \"$(k3s kubectl get workerpool default "
+        "-o jsonpath='{.status.desiredReplicas}')\" = 2",
+        timeout=15
+    )
+
     # ── Finalizer drain (F6) ───────────────────────────────────────
     # Delete the WorkerPool → finalizer runs → DrainWorker +
     # scale STS to 0 + wait → finalizer removed → GC. The pod
