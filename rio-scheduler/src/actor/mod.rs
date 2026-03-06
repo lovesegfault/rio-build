@@ -106,7 +106,12 @@ pub enum ActorCommand {
     /// Periodic heartbeat from a worker.
     Heartbeat {
         worker_id: WorkerId,
-        system: String,
+        /// Systems this worker can build for. Usually single-element
+        /// but multi-arch workers (e.g., qemu-user-static) declare
+        /// multiple. can_build() any-matches against the derivation's
+        /// target. Empty vec is rejected at the gRPC layer
+        /// (handle_heartbeat treats empty systems as "not registered").
+        systems: Vec<String>,
         supported_features: Vec<String>,
         max_builds: u32,
         /// drv_paths from worker proto (not hashes).
@@ -604,7 +609,7 @@ impl DagActor {
                 }
                 ActorCommand::Heartbeat {
                     worker_id,
-                    system,
+                    systems,
                     supported_features,
                     max_builds,
                     running_builds,
@@ -613,7 +618,7 @@ impl DagActor {
                 } => {
                     self.handle_heartbeat(
                         &worker_id,
-                        system,
+                        systems,
                         supported_features,
                         max_builds,
                         running_builds,
@@ -700,7 +705,7 @@ impl DagActor {
                         .map(|w| DebugWorkerInfo {
                             worker_id: w.worker_id.to_string(),
                             is_registered: w.is_registered(),
-                            system: w.system.clone(),
+                            systems: w.systems.clone(),
                             running_count: w.running_builds.len(),
                             running_builds: w
                                 .running_builds

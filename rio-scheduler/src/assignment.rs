@@ -310,7 +310,7 @@ mod tests {
     fn make_worker(id: &str, max: u32, running: u32) -> WorkerState {
         let mut w = WorkerState {
             worker_id: id.into(),
-            system: Some("x86_64-linux".into()),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: max,
             running_builds: (0..running).map(|i| format!("run-{i}").into()).collect(),

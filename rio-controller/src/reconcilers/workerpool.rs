@@ -702,6 +702,19 @@ fn build_container(
             // Actually — just always set it. Empty string is
             // the Config default anyway.
             env("RIO_SIZE_CLASS", &wp.spec.size_class),
+            // systems + features: comma-sep strings; worker's
+            // comma_vec deserialize helper splits them. systems
+            // is CEL-validated non-empty (crds/workerpool.rs:97),
+            // so join() always produces at least one element.
+            // features may be empty (empty string → comma_vec
+            // filters to empty vec, same as unset).
+            //
+            // Previously MISSING — the CRD's features field was
+            // silently dropped, and heartbeat hardcoded features
+            // to Vec::new(). Any derivation with
+            // requiredSystemFeatures never dispatched.
+            env("RIO_SYSTEMS", &wp.spec.systems.join(",")),
+            env("RIO_FEATURES", &wp.spec.features.join(",")),
             // RIO_WORKER_ID from pod name via downward API.
             // StatefulSet pods are `<sts-name>-<ordinal>`, e.g.,
             // `default-workers-0` — unique, stable. Two pools
@@ -1057,6 +1070,20 @@ mod tests {
             envs.get("RIO_FUSE_CACHE_SIZE_GB"),
             Some(&"50".into()),
             "50Gi parsed to 50 GB (binary → binary, integer)"
+        );
+        // systems + features: comma-sep strings. fixture wp has
+        // systems=["x86_64-linux"], features=["kvm"]. Previously
+        // these were SILENTLY DROPPED — CRD defined them, reconciler
+        // never passed them, worker hardcoded features=Vec::new().
+        assert_eq!(
+            envs.get("RIO_SYSTEMS"),
+            Some(&"x86_64-linux".into()),
+            "systems comma-joined → worker's comma_vec deserialize"
+        );
+        assert_eq!(
+            envs.get("RIO_FEATURES"),
+            Some(&"kvm".into()),
+            "features comma-joined (was silently dropped before)"
         );
 
         // RIO_WORKER_ID uses fieldRef, not value — check separately.

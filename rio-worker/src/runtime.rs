@@ -40,9 +40,15 @@ pub type BloomHandle = Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>;
 /// show up in our snapshots.
 ///
 /// Extracted for testability — the heartbeat loop in main.rs calls this.
+///
+/// `systems` + `features`: slice refs to the worker's static config.
+/// Both are `.to_vec()`'d into the proto — a heartbeat every 10s
+/// means ~100 allocs/min for typically 1-3 elements; not worth the
+/// lifetime-threading to avoid.
 pub async fn build_heartbeat_request(
     worker_id: &str,
-    system: &str,
+    systems: &[String],
+    features: &[String],
     max_builds: u32,
     size_class: &str,
     running: &RwLock<HashSet<String>>,
@@ -74,8 +80,8 @@ pub async fn build_heartbeat_request(
         running_builds: current,
         resources: Some(ResourceUsage::default()),
         local_paths,
-        system: system.to_string(),
-        supported_features: Vec::new(),
+        systems: systems.to_vec(),
+        supported_features: features.to_vec(),
         max_builds,
         // Empty string = unclassified (scheduler maps to None). We
         // pass through verbatim — the worker doesn't interpret it,
@@ -293,7 +299,16 @@ mod tests {
             .await
             .insert("/nix/store/bar.drv".to_string());
 
-        let req = build_heartbeat_request("worker-1", "x86_64-linux", 2, "", &running, None).await;
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            2,
+            "",
+            &running,
+            None,
+        )
+        .await;
         assert_eq!(req.running_builds.len(), 2);
         assert!(
             req.running_builds
@@ -304,7 +319,7 @@ mod tests {
                 .contains(&"/nix/store/bar.drv".to_string())
         );
         assert_eq!(req.worker_id, "worker-1");
-        assert_eq!(req.system, "x86_64-linux");
+        assert_eq!(req.systems, vec!["x86_64-linux"]);
         assert_eq!(req.max_builds, 2);
         // No cache → no bloom filter.
         assert!(req.local_paths.is_none());
@@ -313,7 +328,16 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_empty_running_builds() {
         let running = Arc::new(RwLock::new(HashSet::new()));
-        let req = build_heartbeat_request("worker-1", "x86_64-linux", 1, "", &running, None).await;
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            1,
+            "",
+            &running,
+            None,
+        )
+        .await;
         assert!(req.running_builds.is_empty());
     }
 
@@ -321,12 +345,50 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_includes_size_class() {
         let running = Arc::new(RwLock::new(HashSet::new()));
-        let req =
-            build_heartbeat_request("worker-1", "x86_64-linux", 1, "large", &running, None).await;
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            1,
+            "large",
+            &running,
+            None,
+        )
+        .await;
         assert_eq!(req.size_class, "large");
 
-        let req = build_heartbeat_request("worker-1", "x86_64-linux", 1, "", &running, None).await;
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            1,
+            "",
+            &running,
+            None,
+        )
+        .await;
         assert_eq!(req.size_class, "", "empty = unclassified");
+    }
+
+    /// systems + features are populated from static config slices.
+    /// Previously supported_features was hardcoded to Vec::new() —
+    /// the CRD's features field was silently ignored and any
+    /// derivation with requiredSystemFeatures would never dispatch.
+    #[tokio::test]
+    async fn test_heartbeat_includes_systems_and_features() {
+        let running = Arc::new(RwLock::new(HashSet::new()));
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into(), "aarch64-linux".into()],
+            &["kvm".into(), "big-parallel".into()],
+            1,
+            "",
+            &running,
+            None,
+        )
+        .await;
+        assert_eq!(req.systems, vec!["x86_64-linux", "aarch64-linux"]);
+        assert_eq!(req.supported_features, vec!["kvm", "big-parallel"]);
     }
 
     /// With a cache, the heartbeat includes a bloom filter that
@@ -360,9 +422,16 @@ mod tests {
         let bloom = cache.bloom_handle();
 
         let running = Arc::new(RwLock::new(HashSet::new()));
-        let req =
-            build_heartbeat_request("worker-1", "x86_64-linux", 1, "", &running, Some(&bloom))
-                .await;
+        let req = build_heartbeat_request(
+            "worker-1",
+            &["x86_64-linux".into()],
+            &[],
+            1,
+            "",
+            &running,
+            Some(&bloom),
+        )
+        .await;
 
         let bloom_proto = req.local_paths.expect("cache present → bloom present");
         assert_eq!(

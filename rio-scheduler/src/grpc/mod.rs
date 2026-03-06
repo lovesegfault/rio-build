@@ -764,7 +764,7 @@ impl WorkerService for SchedulerGrpc {
 
         let cmd = ActorCommand::Heartbeat {
             worker_id: req.worker_id.into(),
-            system: req.system,
+            systems: req.systems,
             supported_features: req.supported_features,
             max_builds: req.max_builds,
             running_builds: req.running_builds,

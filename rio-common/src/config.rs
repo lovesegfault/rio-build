@@ -82,6 +82,61 @@ where
         .map_err(|e| anyhow::anyhow!("config load for {component:?} failed: {e}"))
 }
 
+/// Deserialize `Vec<String>` from EITHER a comma-separated string
+/// (env var layer) OR a sequence (TOML layer). Figment's `Env`
+/// provider gives strings; `Toml` gives sequences. A bare
+/// `Vec<String>` field fails on the env layer ("invalid type:
+/// string, expected a sequence"). This visitor bridges both.
+///
+/// Usage on a Config field:
+///
+/// ```ignore
+/// #[serde(default, deserialize_with = "rio_common::config::comma_vec")]
+/// systems: Vec<String>,
+/// ```
+///
+/// Empty string → empty vec (not `[""]`). Leading/trailing
+/// whitespace in each element is trimmed. Empty elements (e.g.,
+/// `"a,,b"` → `["a","b"]`) are dropped — an accidental trailing
+/// comma shouldn't produce a spurious empty feature/system name.
+pub fn comma_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CommaVecVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CommaVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a comma-separated string or a sequence of strings")
+        }
+
+        // Env provider path: "x86_64-linux,aarch64-linux" → vec!
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            Ok(s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect())
+        }
+
+        // TOML provider path: ["x86_64-linux", "aarch64-linux"]
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+
+    d.deserialize_any(CommaVecVisitor)
+}
+
 /// Same as [`load`] but with an explicit TOML file path (for tests).
 /// Skips the `/etc/rio/` and cwd search paths entirely.
 #[cfg(test)]
@@ -365,6 +420,92 @@ mod tests {
             let cfg: TestConfig =
                 load("rio-test-nonexistent-component", TestCli::default()).unwrap();
             assert_eq!(cfg, TestConfig::default());
+            Ok(())
+        });
+    }
+
+    // ---- comma_vec: env-string OR toml-seq → Vec<String> ----
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
+    struct VecConfig {
+        #[serde(default, deserialize_with = "super::comma_vec")]
+        systems: Vec<String>,
+        #[serde(default, deserialize_with = "super::comma_vec")]
+        features: Vec<String>,
+    }
+
+    // Figment's Serialized::defaults needs a map-serializing overlay.
+    // `()` serializes as unit → "invalid type: found unit, expected
+    // map". Empty struct serializes as an empty map.
+    #[derive(Serialize, Default)]
+    struct NoCli {}
+
+    #[test]
+    fn comma_vec_from_env_string() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_SYSTEMS", "x86_64-linux,aarch64-linux");
+            let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
+            assert_eq!(
+                cfg.systems,
+                vec!["x86_64-linux", "aarch64-linux"],
+                "comma-sep env string → vec"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn comma_vec_from_toml_array() {
+        figment::Jail::expect_with(|_jail| {
+            let f = write_toml(r#"systems = ["x86_64-linux", "aarch64-linux"]"#);
+            let cfg: VecConfig = load_from_path(f.path(), NoCli::default()).unwrap();
+            assert_eq!(
+                cfg.systems,
+                vec!["x86_64-linux", "aarch64-linux"],
+                "TOML array → vec"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn comma_vec_empty_and_whitespace_filtered() {
+        figment::Jail::expect_with(|jail| {
+            // Trailing comma + internal empty + whitespace — should all
+            // be filtered/trimmed. Operator fat-fingering the env var
+            // is easy; spurious empty feature names would break
+            // requiredSystemFeatures matching silently.
+            jail.set_env("RIO_FEATURES", "kvm, big-parallel ,,");
+            let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
+            assert_eq!(
+                cfg.features,
+                vec!["kvm", "big-parallel"],
+                "empty segments dropped, whitespace trimmed"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn comma_vec_empty_string_is_empty_vec() {
+        // RIO_FEATURES="" → [], not [""]. Matches the "unset" case.
+        // An empty feature name would never match any required_features
+        // check but would pollute debug output.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_FEATURES", "");
+            let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
+            assert!(cfg.features.is_empty(), "empty env → empty vec");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn comma_vec_default_is_empty_when_unset() {
+        // Neither TOML nor env → serde's #[serde(default)] gives [].
+        figment::Jail::expect_with(|_jail| {
+            let cfg: VecConfig = load("rio-test-vec", NoCli::default()).unwrap();
+            assert!(cfg.systems.is_empty());
+            assert!(cfg.features.is_empty());
             Ok(())
         });
     }

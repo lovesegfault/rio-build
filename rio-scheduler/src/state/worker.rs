@@ -16,8 +16,11 @@ use super::{DrvHash, WorkerId};
 pub struct WorkerState {
     /// Unique worker ID (from pod UID).
     pub worker_id: WorkerId,
-    /// Target system (e.g. "x86_64-linux"). Set on first heartbeat.
-    pub system: Option<String>,
+    /// Target systems (e.g., ["x86_64-linux", "aarch64-linux"] for
+    /// a multi-arch worker). Populated on first heartbeat. Empty
+    /// vec = no heartbeat yet (not registered). can_build() does
+    /// any-match against the derivation's singular target system.
+    pub systems: Vec<String>,
     /// Features this worker supports.
     pub supported_features: Vec<String>,
     /// Maximum concurrent builds.
@@ -80,7 +83,7 @@ impl WorkerState {
     pub fn new(worker_id: WorkerId) -> Self {
         Self {
             worker_id,
-            system: None,
+            systems: Vec::new(),
             supported_features: Vec::new(),
             max_builds: 0,
             running_builds: HashSet::new(),
@@ -93,11 +96,16 @@ impl WorkerState {
         }
     }
 
-    /// Whether we have received both a stream connection and a heartbeat.
-    /// Derived from `stream_tx.is_some() && system.is_some()` — no manual
-    /// bookkeeping, so the two channels can't get out of sync.
+    /// Whether we have received both a stream connection and a
+    /// heartbeat. Derived from `stream_tx.is_some() &&
+    /// !systems.is_empty()` — no manual bookkeeping, so the two
+    /// channels can't get out of sync. A heartbeat with an empty
+    /// systems vec would mean a misconfigured worker (no system
+    /// to build for); treating it as unregistered surfaces the
+    /// misconfig via "worker never dispatches" rather than a
+    /// silent wildcard.
     pub fn is_registered(&self) -> bool {
-        self.stream_tx.is_some() && self.system.is_some()
+        self.stream_tx.is_some() && !self.systems.is_empty()
     }
 
     /// Whether this worker has available build capacity.
@@ -111,16 +119,23 @@ impl WorkerState {
             && (self.running_builds.len() as u32) < self.max_builds
     }
 
-    /// Whether this worker can build the given derivation based on system and features.
+    /// Whether this worker can build the given derivation based on
+    /// system and features. The derivation has a SINGLE target
+    /// system; the worker may support multiple (any-match). All
+    /// required features must be present (all-match).
     pub fn can_build(&self, system: &str, required_features: &[String]) -> bool {
         if !self.is_registered() {
             return false;
         }
-        // System must match
-        if self.system.as_deref() != Some(system) {
+        // Derivation's target system must be among the worker's
+        // supported systems. iter().any() — a multi-arch worker
+        // can build either arch.
+        if !self.systems.iter().any(|s| s == system) {
             return false;
         }
-        // All required features must be present on the worker
+        // All required features must be present on the worker.
+        // iter().all() — a derivation needing [kvm, big-parallel]
+        // needs BOTH; a worker with just [kvm] can't build it.
         required_features
             .iter()
             .all(|f| self.supported_features.contains(f))
@@ -175,6 +190,60 @@ impl RetryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registered_worker(systems: Vec<&str>, features: Vec<&str>) -> WorkerState {
+        let mut w = WorkerState::new("test".into());
+        w.systems = systems.into_iter().map(Into::into).collect();
+        w.supported_features = features.into_iter().map(Into::into).collect();
+        // is_registered() checks stream_tx.is_some() — fake it.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        w.stream_tx = Some(tx);
+        w
+    }
+
+    /// Multi-arch worker: any-match on system. A worker declaring
+    /// both archs can build derivations for either.
+    #[test]
+    fn can_build_multi_system_any_match() {
+        let w = registered_worker(vec!["x86_64-linux", "aarch64-linux"], vec![]);
+        assert!(w.can_build("x86_64-linux", &[]));
+        assert!(w.can_build("aarch64-linux", &[]));
+        assert!(
+            !w.can_build("riscv64-linux", &[]),
+            "not in worker's systems"
+        );
+    }
+
+    /// Features: all-match. Derivation needing [kvm, big-parallel]
+    /// dispatches only to workers with BOTH. Previously features
+    /// was hardcoded to Vec::new() in worker heartbeat — this test
+    /// proves the scheduler side correctly honors them now that
+    /// they flow through.
+    #[test]
+    fn can_build_features_all_match() {
+        let w = registered_worker(vec!["x86_64-linux"], vec!["kvm", "big-parallel"]);
+        assert!(w.can_build("x86_64-linux", &["kvm".into()]));
+        assert!(w.can_build("x86_64-linux", &["kvm".into(), "big-parallel".into()]));
+        assert!(
+            !w.can_build("x86_64-linux", &["kvm".into(), "nixos-test".into()]),
+            "worker missing one required feature → can't build"
+        );
+        // Worker with features can still build featureless derivs.
+        assert!(w.can_build("x86_64-linux", &[]));
+    }
+
+    /// Empty systems = not registered. Prevents a misconfigured
+    /// worker (no systems to build for) from being treated as a
+    /// wildcard.
+    #[test]
+    fn can_build_empty_systems_not_registered() {
+        let mut w = WorkerState::new("test".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        w.stream_tx = Some(tx);
+        // systems still empty
+        assert!(!w.is_registered(), "stream but no systems → not ready");
+        assert!(!w.can_build("x86_64-linux", &[]));
+    }
 
     #[test]
     fn test_retry_backoff() {

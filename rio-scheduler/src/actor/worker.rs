@@ -181,7 +181,7 @@ impl DagActor {
     pub(super) fn handle_heartbeat(
         &mut self,
         worker_id: &WorkerId,
-        system: String,
+        systems: Vec<String>,
         supported_features: Vec<String>,
         max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
@@ -247,7 +247,7 @@ impl DagActor {
 
         let was_registered = worker.is_registered();
 
-        worker.system = Some(system);
+        worker.systems = systems;
         worker.supported_features = supported_features;
         worker.max_builds = max_builds;
         worker.last_heartbeat = Instant::now();

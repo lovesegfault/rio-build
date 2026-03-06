@@ -28,8 +28,19 @@ struct Config {
     scheduler_addr: String,
     store_addr: String,
     max_builds: u32,
-    /// If empty after merge → auto-detect via std::env::consts.
-    system: String,
+    /// Systems this worker can build for. Empty after merge →
+    /// auto-detect single element via std::env::consts. Multi-
+    /// element for qemu-user-static or cross-arch workers.
+    /// Env: `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-sep)
+    /// or TOML `systems = ["x86_64-linux"]`.
+    #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    systems: Vec<String>,
+    /// requiredSystemFeatures this worker supports (e.g., "kvm",
+    /// "big-parallel"). Scheduler's can_build() all-matches the
+    /// derivation's required_features against this. Previously
+    /// hardcoded empty — CRD features field was silently dropped.
+    #[serde(deserialize_with = "rio_common::config::comma_vec")]
+    features: Vec<String>,
     fuse_mount_point: PathBuf,
     fuse_cache_dir: PathBuf,
     fuse_cache_size_gb: u64,
@@ -77,7 +88,8 @@ impl Default for Config {
             scheduler_addr: String::new(),
             store_addr: String::new(),
             max_builds: 1,
-            system: String::new(),
+            systems: Vec::new(),
+            features: Vec::new(),
             // Matches nix/modules/worker.nix. NEVER default to /nix/store:
             // mounting FUSE there shadows the host store, breaking every
             // process on the machine (including the worker itself).
@@ -128,10 +140,18 @@ struct CliArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_builds: Option<u32>,
 
-    /// System architecture (auto-detected if not set)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    /// Systems this worker builds for (repeatable: `--system
+    /// x86_64-linux --system aarch64-linux`). Auto-detected if
+    /// not set. Clap's `action = Append` collects repeated flags
+    /// into a Vec; serde name `systems` matches the Config field.
+    #[arg(long = "system", action = clap::ArgAction::Append)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    systems: Vec<String>,
+
+    /// requiredSystemFeatures this worker supports (repeatable).
+    #[arg(long = "feature", action = clap::ArgAction::Append)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    features: Vec<String>,
 
     /// FUSE mount point
     #[arg(long)]
@@ -250,11 +270,21 @@ async fn main() -> anyhow::Result<()> {
         cfg.worker_id
     };
 
-    let system = if cfg.system.is_empty() {
-        detect_system()
+    // systems: auto-detect single element when not configured.
+    // A worker with zero systems is useless (scheduler's can_build
+    // always false) — auto-detect is a sensible default, not a
+    // silent fallback for misconfiguration.
+    let systems = if cfg.systems.is_empty() {
+        vec![detect_system()]
     } else {
-        cfg.system
+        cfg.systems
     };
+    // features: no auto-detect. Empty is valid (worker supports no
+    // special features). Operator sets these explicitly in the CRD
+    // — auto-detecting "kvm" by checking /dev/kvm exists would be
+    // surprising (worker on a kvm-capable host but operator wants
+    // to reserve it for other work).
+    let features = cfg.features;
 
     let _root_guard =
         tracing::info_span!("worker", component = "worker", worker_id = %worker_id).entered();
@@ -305,7 +335,8 @@ async fn main() -> anyhow::Result<()> {
         scheduler_addr = %cfg.scheduler_addr,
         store_addr = %cfg.store_addr,
         max_builds = cfg.max_builds,
-        %system,
+        systems = ?systems,
+        features = ?features,
         "connected to gRPC services"
     );
 
@@ -394,7 +425,10 @@ async fn main() -> anyhow::Result<()> {
     // leading to duplicate builds. Wrap in spawn_monitored so panics are logged,
     // and check liveness in the main event loop.
     let heartbeat_worker_id = worker_id.clone();
-    let heartbeat_system = system.clone();
+    // move (not clone): these are owned Vecs, used only by the
+    // heartbeat loop. main() has no further use for them.
+    let heartbeat_systems = systems;
+    let heartbeat_features = features;
     let heartbeat_max_builds = cfg.max_builds;
     let heartbeat_size_class = cfg.size_class.clone();
     let heartbeat_running = running_builds.clone();
@@ -407,7 +441,8 @@ async fn main() -> anyhow::Result<()> {
 
             let request = build_heartbeat_request(
                 &heartbeat_worker_id,
-                &heartbeat_system,
+                &heartbeat_systems,
+                &heartbeat_features,
                 heartbeat_max_builds,
                 &heartbeat_size_class,
                 &heartbeat_running,
@@ -795,7 +830,8 @@ mod tests {
         assert!(d.scheduler_addr.is_empty(), "required, no default");
         assert!(d.store_addr.is_empty(), "required, no default");
         assert_eq!(d.max_builds, 1);
-        assert!(d.system.is_empty(), "system auto-detects");
+        assert!(d.systems.is_empty(), "systems auto-detect");
+        assert!(d.features.is_empty(), "features empty by default");
         assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
         assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
         assert_eq!(d.fuse_cache_size_gb, 50);

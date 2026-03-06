@@ -90,7 +90,7 @@ pub(crate) async fn connect_worker(
             bloom: None,
             size_class: None,
             worker_id: worker_id.into(),
-            system: system.into(),
+            systems: vec![system.into()],
             supported_features: vec![],
             max_builds,
             running_builds: vec![],

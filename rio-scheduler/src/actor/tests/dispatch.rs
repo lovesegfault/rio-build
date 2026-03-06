@@ -62,7 +62,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             bloom: None,
             size_class: Some("small".into()),
             worker_id: "w-small".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
             running_builds: vec![],
@@ -81,7 +81,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
             bloom: None,
             size_class: Some("large".into()),
             worker_id: "w-large".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
             running_builds: vec![],
@@ -509,7 +509,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             worker_id: "w1".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
             running_builds: vec![],
@@ -574,7 +574,7 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
     handle
         .send_unchecked(ActorCommand::Heartbeat {
             worker_id: "w1".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 4,
             running_builds: vec![],

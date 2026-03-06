@@ -57,7 +57,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
     worker_client
         .heartbeat(rio_proto::types::HeartbeatRequest {
             worker_id: "e2e-worker".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 1,
             running_builds: vec![],
@@ -205,7 +205,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
     worker_client
         .heartbeat(rio_proto::types::HeartbeatRequest {
             worker_id: "log-e2e-worker".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             max_builds: 1,
             ..Default::default()
         })
@@ -491,7 +491,7 @@ async fn test_heartbeat_rejects_too_many_running_builds() {
 
     let req = Request::new(rio_proto::types::HeartbeatRequest {
         worker_id: "test-worker".into(),
-        system: "x86_64-linux".into(),
+        systems: vec!["x86_64-linux".into()],
         supported_features: vec![],
         max_builds: 1,
         running_builds: too_many,

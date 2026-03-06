@@ -376,7 +376,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
             bloom: None,
             size_class: None,
             worker_id: "tight-worker".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 2, // room for 2, but stream has room for 1
             running_builds: vec![],
@@ -433,7 +433,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
             bloom: None,
             size_class: None,
             worker_id: "tight-worker".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 2,
             running_builds: vec![sent_hash.clone()],

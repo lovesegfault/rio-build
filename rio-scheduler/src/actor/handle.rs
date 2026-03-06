@@ -8,7 +8,7 @@ use super::*;
 pub struct DebugWorkerInfo {
     pub worker_id: String,
     pub is_registered: bool,
-    pub system: Option<String>,
+    pub systems: Vec<String>,
     pub running_count: usize,
     pub running_builds: Vec<String>,
 }

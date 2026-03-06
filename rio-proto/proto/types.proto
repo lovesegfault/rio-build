@@ -322,7 +322,11 @@ message HeartbeatRequest {
   repeated string running_builds = 2;     // Derivation paths currently building
   ResourceUsage resources = 3;
   BloomFilter local_paths = 4;            // Bloom filter of cached store paths
-  string system = 5;                      // e.g. "x86_64-linux"
+  // Systems this worker can build for (e.g., ["x86_64-linux",
+  // "aarch64-linux"] for a multi-arch worker). Replaces the old
+  // singular `system` field — same field number, wire-compatible
+  // for single-element encodings. Empty = unregistered.
+  repeated string systems = 5;
   repeated string supported_features = 6; // requiredSystemFeatures this worker supports
   uint32 max_builds = 7;                  // Concurrency limit
   // Size-class this worker is deployed as (e.g. "small", "large"). Static
@@ -640,7 +644,8 @@ message ListWorkersResponse {
 
 message WorkerInfo {
   string worker_id = 1;
-  string system = 2;
+  // Systems this worker supports. Mirrors HeartbeatRequest.systems.
+  repeated string systems = 2;
   repeated string supported_features = 3;
   uint32 max_builds = 4;
   uint32 running_builds = 5;

@@ -42,7 +42,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
             bloom: None,
             size_class: None,
             worker_id: "toctou-worker".into(),
-            system: "x86_64-linux".into(),
+            systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
             max_builds: 2,
             running_builds: vec![], // stale — does NOT include fresh assignment

@@ -1114,7 +1114,7 @@ mod tests {
         actor
             .send_unchecked(ActorCommand::Heartbeat {
                 worker_id: first_worker.into(),
-                system: "x86_64-linux".into(),
+                systems: vec!["x86_64-linux".into()],
                 supported_features: vec![],
                 max_builds: 2,
                 running_builds: vec![],
