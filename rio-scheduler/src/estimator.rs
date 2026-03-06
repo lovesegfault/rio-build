@@ -33,7 +33,9 @@ use std::collections::HashMap;
 pub struct HistoryEntry {
     /// EMA of build duration in seconds.
     pub ema_duration_secs: f64,
-    /// EMA of peak memory in bytes. `None` until F2 wires VmHWM reporting.
+    /// EMA of peak memory in bytes. `None` if no samples yet (e.g.,
+    /// pre-seeded via psql with only duration, or an old build
+    /// from before cgroup memory.peak was wired).
     pub ema_peak_memory_bytes: Option<f64>,
 }
 
@@ -312,7 +314,7 @@ mod tests {
         ]);
 
         assert_eq!(est.peak_memory(Some("firefox"), "x86_64-linux"), Some(8e9));
-        // No memory data for hello (VmHWM not wired / build was from before F2).
+        // No memory data for hello (seeded without ema_peak_memory_bytes).
         assert_eq!(est.peak_memory(Some("hello"), "x86_64-linux"), None);
         // Unknown → None.
         assert_eq!(est.peak_memory(Some("missing"), "x86_64-linux"), None);

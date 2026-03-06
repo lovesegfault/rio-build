@@ -20,8 +20,8 @@ use kube::Client;
 ///
 /// `scheduler_addr` not a live client: reconcilers connect lazily
 /// (per-reconcile) so a transient scheduler outage doesn't kill
-/// the controller at startup. The autoscaler (F4) holds a live
-/// client — it polls every 30s, the connection cost amortizes.
+/// the controller at startup. The autoscaler holds a live client
+/// — it polls every 30s, the connection cost amortizes.
 pub struct Ctx {
     /// K8s client. Shared (clone per `Api<T>` call — cheap, it's
     /// an Arc internally).

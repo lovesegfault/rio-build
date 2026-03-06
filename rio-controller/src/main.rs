@@ -138,8 +138,8 @@ async fn main() -> anyhow::Result<()> {
     // controller that can't read ClusterStatus can't autoscale.
     //
     // The reconciler DOESN'T use this client — it patches K8s
-    // objects only. F6's finalizer drain will connect lazily
-    // (per-cleanup DrainWorker call).
+    // objects only. The WorkerPool finalizer's cleanup() connects
+    // lazily per-call for DrainWorker.
     info!(addr = %cfg.scheduler_addr, "connecting to scheduler");
     let scheduler = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
 

@@ -12,9 +12,9 @@
 //! rio-controller`, K8s merges. Idempotent — same patch twice is
 //! a no-op. No GET-modify-PUT race.
 //!
-//! Finalizer wraps everything: delete → cleanup (F6 fills in the
-//! drain logic) → finalizer removed → K8s GC's the children via
-//! ownerReference.
+//! Finalizer wraps everything: delete → cleanup (DrainWorker +
+//! scale STS to 0 + wait for pods gone) → finalizer removed →
+//! K8s GC's the children via ownerReference.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -435,14 +435,14 @@ pub fn error_policy(_wp: Arc<WorkerPool>, err: &Error, _ctx: Arc<Ctx>) -> Action
 }
 
 // =============================================================================
-// Object builders (F3)
+// Object builders (pure: WorkerPool → K8s objects)
 // =============================================================================
 
 /// Labels applied to the StatefulSet, Service, and pods.
 ///
-/// `rio.build/pool`: the WorkerPool name. The finalizer (F6)
-/// lists pods by this label to DrainWorker each one. The
-/// autoscaler (F4) could use it too but patches the StatefulSet
+/// `rio.build/pool`: the WorkerPool name. The finalizer's
+/// cleanup() lists pods by this label to DrainWorker each one.
+/// The autoscaler could use it too but patches the StatefulSet
 /// directly instead.
 ///
 /// `app.kubernetes.io/*`: standard K8s recommended labels.
@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     // =========================================================
-    // Mock-apiserver integration tests (F8)
+    // Mock-apiserver integration tests
     //
     // These test the WIRING: apply() calls Service PATCH then
     // StatefulSet PATCH then WorkerPool/status PATCH, in that

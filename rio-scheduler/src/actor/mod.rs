@@ -176,8 +176,8 @@ pub enum ActorCommand {
 
     /// Mark a worker draining: stop sending new assignments.
     ///
-    /// Called by the worker itself (step 1 of SIGTERM preStop — D3) or
-    /// by the controller (WorkerPool finalizer — F6). Idempotent: an
+    /// Called by the worker itself (step 1 of SIGTERM drain) or by
+    /// the controller (WorkerPool finalizer cleanup). Idempotent: an
     /// already-draining worker replies `accepted=true` with the same
     /// running count. Unknown worker → `accepted=false, running=0`
     /// (not an error; the worker may have already disconnected).
