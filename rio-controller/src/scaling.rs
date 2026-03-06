@@ -322,8 +322,12 @@ pub(crate) fn compute_desired(queued: u32, _active: u32, target: i32, min: i32, 
     // (a + b - 1) / b idiom — same semantics, clearer intent.
     let raw = queued.div_ceil(target);
     // i32 clamp. min/max from the CRD are i32 (K8s replica counts
-    // are). raw as i32 can't overflow for realistic queue sizes.
-    (raw as i32).clamp(min, max)
+    // are). Bound raw within i32 range BEFORE casting — raw as i32
+    // would wrap negative when raw > 2^31 (queued near u32::MAX),
+    // and a negative value would then clamp to `min` → autoscaler
+    // scales DOWN under extreme load. Pathological but in u32 range.
+    let raw = raw.min(i32::MAX as u32) as i32;
+    raw.clamp(min, max)
 }
 
 /// Scaling decision.
@@ -483,6 +487,20 @@ mod tests {
         assert_eq!(compute_desired(5, 0, 0, 1, 10), 5);
         // Negative target (shouldn't happen via CRD, but be safe).
         assert_eq!(compute_desired(5, 0, -3, 1, 10), 5);
+    }
+
+    #[test]
+    fn compute_desired_no_wrap_at_high_queue() {
+        // queued > i32::MAX — pathological, but in u32 range.
+        // Previously: raw as i32 wrapped negative → .clamp(min,max)
+        // returned min → autoscaler scaled DOWN under extreme load.
+        // Now: bounded to i32::MAX first, clamps to max.
+        let queued = u32::MAX; // > 4 billion
+        let got = compute_desired(queued, 0, 1, 2, 100);
+        assert_eq!(
+            got, 100,
+            "high queue must clamp to max, not wrap negative → min"
+        );
     }
 
     #[test]
