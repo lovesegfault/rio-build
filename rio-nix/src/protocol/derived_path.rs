@@ -8,6 +8,7 @@
 //! - **Built (all outputs):** `/nix/store/abc...-foo.drv!*`
 //!
 //! See `gateway.md` for the full wire format specification.
+// r[impl gw.wire.derived-path]
 
 use crate::store_path::{StorePath, StorePathError};
 

@@ -210,6 +210,9 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     }
 }
 
+// r[impl gw.opcode.build-derivation]
+// r[impl gw.hook.single-node-dag]
+// r[impl gw.hook.ifd-detection]
 /// wopBuildDerivation (36): Build a derivation via scheduler.
 ///
 /// Receives an inline BasicDerivation (no inputDrvs). Recovers the full
@@ -317,6 +320,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     Ok(())
 }
 
+// r[impl gw.opcode.build-paths]
 /// wopBuildPaths (9): Build a set of derivations.
 #[instrument(skip_all)]
 pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -412,6 +416,8 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     Ok(())
 }
 
+// r[impl gw.opcode.build-paths-with-results]
+// r[impl gw.stderr.error-before-return]
 /// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
 #[instrument(skip_all)]
 pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(

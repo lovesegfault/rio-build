@@ -4,6 +4,7 @@ use super::*;
 // Opcode tests: IsValidPath (1)
 // ===========================================================================
 
+// r[verify gw.opcode.is-valid-path]
 #[tokio::test]
 async fn test_is_valid_path_exists() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -22,6 +23,7 @@ async fn test_is_valid_path_exists() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.is-valid-path]
 #[tokio::test]
 async fn test_is_valid_path_missing() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -43,6 +45,7 @@ async fn test_is_valid_path_missing() -> anyhow::Result<()> {
 // Opcode tests: EnsurePath (10)
 // ===========================================================================
 
+// r[verify gw.opcode.mandatory-set]
 #[tokio::test]
 async fn test_ensure_path_exists() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -85,6 +88,8 @@ async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
 // Opcode tests: QueryPathInfo (26)
 // ===========================================================================
 
+// r[verify gw.opcode.query-path-info]
+// r[verify gw.wire.narhash-hex]
 #[tokio::test]
 async fn test_query_path_info_exists() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -117,6 +122,7 @@ async fn test_query_path_info_exists() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.query-path-info]
 #[tokio::test]
 async fn test_query_path_info_missing_returns_invalid() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -140,6 +146,7 @@ async fn test_query_path_info_missing_returns_invalid() -> anyhow::Result<()> {
 // Opcode tests: QueryPathFromHashPart (29)
 // ===========================================================================
 
+// r[verify gw.opcode.mandatory-set]
 #[tokio::test]
 async fn test_query_path_from_hash_part_found() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -179,6 +186,7 @@ async fn test_query_path_from_hash_part_not_found() -> anyhow::Result<()> {
 // Opcode tests: AddTempRoot (11)
 // ===========================================================================
 
+// r[verify gw.opcode.mandatory-set]
 #[tokio::test]
 async fn test_add_temp_root() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -197,6 +205,8 @@ async fn test_add_temp_root() -> anyhow::Result<()> {
 // Opcode tests: NarFromPath (38)
 // ===========================================================================
 
+// r[verify gw.opcode.nar-from-path]
+// r[verify gw.opcode.nar-from-path.raw-bytes]
 #[tokio::test]
 async fn test_nar_from_path_streams_chunks() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -225,6 +235,7 @@ async fn test_nar_from_path_streams_chunks() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.stderr.error-before-return]
 #[tokio::test]
 async fn test_nar_from_path_missing_returns_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -241,6 +252,7 @@ async fn test_nar_from_path_missing_returns_error() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.stderr.error-before-return]
 #[tokio::test]
 async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -263,6 +275,7 @@ async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.mandatory-set]
 /// QueryRealisation: malformed id → empty set (soft-fail, same as the old
 /// stub). "abc" is 3 hex chars, not 64.
 #[tokio::test]
@@ -356,6 +369,7 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.query-missing]
 /// wopQueryMissing (40): reads strings(paths), writes willBuild + willSubstitute
 /// + unknown + downloadSize + narSize.
 #[tokio::test]
@@ -395,6 +409,8 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.query-derivation-output-map]
+// r[verify gw.stderr.error-before-return]
 /// wopQueryDerivationOutputMap (41): reads drv path, writes count +
 /// (name, path) pairs. Error path: missing .drv in store.
 #[tokio::test]
@@ -414,6 +430,7 @@ async fn test_query_derivation_output_map_missing_drv() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.query-derivation-output-map]
 /// wopQueryDerivationOutputMap (41) happy path: .drv is in store, returns
 /// output name -> path map.
 #[tokio::test]
@@ -470,6 +487,7 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
 //   - AddToStoreNar (39): invalid path, oversized nar_size -> error (tested below)
 //   - BuildDerivation (36): parse failure -> connection drop (wire read error)
 
+// r[verify gw.opcode.query-valid-paths]
 /// QueryValidPaths (31) happy path: returns paths present in the mock store.
 #[tokio::test]
 async fn test_query_valid_paths_filters_missing() -> anyhow::Result<()> {
@@ -514,6 +532,7 @@ async fn test_query_valid_paths_empty() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify gw.opcode.is-valid-path]
 /// IsValidPath with unparseable path returns false (not STDERR_ERROR).
 /// This documents the graceful-degradation behavior for Nix compatibility.
 #[tokio::test]

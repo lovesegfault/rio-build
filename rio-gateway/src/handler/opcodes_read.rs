@@ -2,6 +2,7 @@
 
 use super::*;
 
+// r[impl gw.opcode.is-valid-path]
 /// wopIsValidPath (1): Check if a store path exists.
 #[instrument(skip_all)]
 pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -28,6 +29,7 @@ pub(super) async fn handle_is_valid_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     Ok(())
 }
 
+// r[impl gw.opcode.mandatory-set]
 /// wopEnsurePath (10): Ensure a store path is valid/available.
 #[instrument(skip_all)]
 pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -62,6 +64,8 @@ pub(super) async fn handle_ensure_path<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     Ok(())
 }
 
+// r[impl gw.opcode.query-path-info]
+// r[impl gw.wire.narhash-hex]
 /// wopQueryPathInfo (26): Return full path metadata.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -115,6 +119,7 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
     Ok(())
 }
 
+// r[impl gw.opcode.query-valid-paths]
 /// wopQueryValidPaths (31): Batch validity check.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -153,6 +158,7 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
     Ok(())
 }
 
+// r[impl gw.opcode.mandatory-set]
 /// wopAddTempRoot (11): Register a temporary GC root.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -177,6 +183,8 @@ pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + U
     Ok(())
 }
 
+// r[impl gw.opcode.set-options.field-order]
+// r[impl gw.opcode.set-options.propagation]
 /// wopSetOptions (19): Accept client build configuration.
 #[instrument(skip_all)]
 pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -224,6 +232,8 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     Ok(())
 }
 
+// r[impl gw.opcode.nar-from-path]
+// r[impl gw.opcode.nar-from-path.raw-bytes]
 /// wopNarFromPath (38): Export path as raw NAR bytes AFTER STDERR_LAST.
 ///
 /// Nix client: `processStderr(ex)` (no sink) → `copyNAR(from, sink)`.
@@ -285,6 +295,7 @@ pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + U
     Ok(())
 }
 
+// r[impl gw.opcode.mandatory-set]
 /// wopQueryPathFromHashPart (29): Resolve a store path from its hash part.
 ///
 /// Nix sends just the 32-char nixbase32 hash (no /nix/store/ prefix, no
@@ -332,6 +343,7 @@ pub(super) async fn handle_query_path_from_hash_part<
     Ok(())
 }
 
+// r[impl gw.opcode.mandatory-set]
 /// wopAddSignatures (37): Add signatures to an existing store path.
 ///
 /// Wire: path string + strings list. Response: u64(1) on success.
@@ -402,6 +414,7 @@ fn parse_drv_output_id(id: &str) -> Option<([u8; 32], String)> {
 /// accepted everything; suddenly hard-failing would break clients that were
 /// already "working" (silently). A bad registration just means the cache-hit
 /// doesn't happen — degraded, not broken.
+// r[impl gw.opcode.mandatory-set]
 #[instrument(skip_all)]
 pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -496,6 +509,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
 /// (cache miss, normal) or 1 (found). Nix's wire format allows >1 but in
 /// practice the store returns at most one — the (drv_hash, output_name) PK
 /// is unique.
+// r[impl gw.opcode.mandatory-set]
 #[instrument(skip_all)]
 pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -573,6 +587,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     Ok(())
 }
 
+// r[impl gw.opcode.query-missing]
 /// wopQueryMissing (40): Report what needs building.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -650,6 +665,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     Ok(())
 }
 
+// r[impl gw.opcode.query-derivation-output-map]
 /// wopQueryDerivationOutputMap (41): Return output name -> path mappings.
 #[instrument(skip_all)]
 pub(super) async fn handle_query_derivation_output_map<

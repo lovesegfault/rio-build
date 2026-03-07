@@ -1,4 +1,7 @@
 //! Streaming framed reader for Nix framed byte streams.
+// r[impl gw.wire.framed-no-padding]
+// r[impl gw.opcode.add-to-store-nar.framing]
+// r[impl gw.opcode.add-multiple.unaligned-frames]
 
 use std::pin::Pin;
 use std::task::{Context, Poll};

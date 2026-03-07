@@ -1,3 +1,12 @@
+// r[verify gw.opcode.build-paths]
+// r[verify gw.opcode.build-paths-with-results]
+// r[verify gw.opcode.build-derivation]
+// r[verify gw.wire.derived-path]
+// r[verify gw.dag.reconstruct]
+// r[verify gw.hook.single-node-dag]
+// r[verify gw.hook.ifd-detection]
+// r[verify gw.stderr.activity]
+
 use super::*;
 
 // ===========================================================================

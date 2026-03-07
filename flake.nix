@@ -196,6 +196,10 @@
               ;
           };
 
+          # Spec-coverage CLI (CI: `tracey query validate`).
+          # Dashboard is stubbed — see nix/tracey.nix for why.
+          traceyPkg = import ./nix/tracey.nix { inherit craneLib pkgs; };
+
           # --------------------------------------------------------------
           # Golden conformance test fixtures
           # --------------------------------------------------------------
@@ -533,6 +537,9 @@
 
                 # Formatting (nix fmt also works, but direct treefmt is handy)
                 config.treefmt.build.wrapper
+
+                # Spec-coverage: `tracey query validate`, `tracey web`
+                traceyPkg
               ];
               shellEnv = {
                 RUST_BACKTRACE = "1";

@@ -236,6 +236,7 @@ impl Handler for ConnectionHandler {
         Ok(true)
     }
 
+    // r[impl gw.conn.exec-request]
     async fn exec_request(
         &mut self,
         channel_id: ChannelId,

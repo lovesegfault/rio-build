@@ -10,6 +10,8 @@
 //! 3. Run the gateway protocol session with gRPC clients connected to mocks
 //! 4. Perform: handshake -> wopSetOptions -> wopQueryValidPaths
 //! 5. Verify empty store returns all paths as missing (none valid)
+// r[verify gw.conn.exec-request]
+// r[verify gw.conn.lifecycle]
 
 mod common;
 

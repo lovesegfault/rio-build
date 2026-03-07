@@ -17,3 +17,6 @@ target/
 docs/book/
 
 .claude/settings.local.json
+
+# tracey daemon state (unix socket, cache)
+.tracey/

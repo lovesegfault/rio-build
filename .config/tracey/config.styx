@@ -1,0 +1,57 @@
+@schema {id crate:tracey-config@1, cli tracey}
+
+// Spec-coverage configuration for rio-build.
+//
+// Single spec "rio" with prefix `r` (inferred from markers). Requirement
+// IDs carry the domain: r[gw.*], r[sched.*], r[store.*], r[worker.*],
+// r[ctrl.*], r[obs.*], r[sec.*], r[proto.*].
+//
+// test_include semantics: matched files allow ONLY `verify` annotations —
+// using `impl` in a test file is a hard error. That's why inline
+// `#[cfg(test)]` modules in src/ are NOT listed here (they'd break);
+// those can carry r[verify ...] because src/ is in `include` and tracey
+// doesn't restrict verbs in non-test files.
+//
+// VM tests (nix/tests/*.nix) are NOT included — tracey doesn't parse .nix.
+// VM-verified requirements carry r[verify ...] in the embedded test scripts'
+// shell/python helpers (.sh extension is supported), or in a thin .rs shim.
+
+specs (
+  {
+    name rio
+    source_url https://github.com/lovesegfault/rio-build
+    include (
+      docs/src/components/gateway.md
+      docs/src/components/scheduler.md
+      docs/src/components/store.md
+      docs/src/components/worker.md
+      docs/src/components/controller.md
+      docs/src/components/proto.md
+      docs/src/observability.md
+      docs/src/security.md
+    )
+    impls (
+      {
+        name rust
+        include (
+          rio-gateway/src/**/*.rs
+          rio-scheduler/src/**/*.rs
+          rio-store/src/**/*.rs
+          rio-worker/src/**/*.rs
+          rio-controller/src/**/*.rs
+          rio-nix/src/**/*.rs
+          rio-proto/src/**/*.rs
+          rio-common/src/**/*.rs
+        )
+        exclude (
+          target/**
+          **/fuzz/**
+        )
+        test_include (
+          rio-gateway/tests/**/*.rs
+          rio-proto/tests/**/*.rs
+        )
+      }
+    )
+  }
+)

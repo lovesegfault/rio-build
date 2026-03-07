@@ -3,6 +3,8 @@
 //! All integers are 64-bit unsigned, little-endian — including handshake magic bytes.
 //! Strings are length-prefixed and padded to 8-byte boundaries.
 //! Collections are count-prefixed.
+// r[impl gw.wire.all-ints-u64]
+// r[impl gw.wire.string-encoding]
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -16,6 +18,7 @@ const PADDING: usize = 8;
 /// Maximum allowed string length (64 MiB) to prevent OOM on malicious input.
 pub const MAX_STRING_LEN: u64 = 64 * 1024 * 1024;
 
+// r[impl gw.wire.collection-max]
 /// Maximum allowed collection count (1M items) to prevent OOM on malicious input.
 pub const MAX_COLLECTION_COUNT: u64 = 1_048_576;
 

@@ -40,6 +40,9 @@ fn parse_reference_paths(refs: &[String], context: &str) -> anyhow::Result<Vec<S
         .collect()
 }
 
+// r[impl gw.opcode.add-to-store-nar]
+// r[impl gw.opcode.add-to-store-nar.framing]
+// r[impl gw.wire.narhash-hex]
 /// wopAddToStoreNar (39): Receive a store path with NAR content via framed stream.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin>(
@@ -207,6 +210,7 @@ async fn parse_add_multiple_entry(
     Ok(())
 }
 
+// r[impl gw.opcode.mandatory-set]
 /// wopAddToStore (7): Legacy content-addressed store path import.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -317,6 +321,7 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
     Ok(())
 }
 
+// r[impl gw.opcode.mandatory-set]
 /// wopAddTextToStore (8): Legacy text file import.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_text_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -423,6 +428,9 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError>
 /// framed). The bug was masked by a byte-level test written to match the
 /// buggy parser rather than the spec — caught by the VM test running real
 /// `nix copy --to ssh-ng://`.
+// r[impl gw.opcode.add-multiple.batch]
+// r[impl gw.opcode.add-multiple.unaligned-frames]
+// r[impl gw.opcode.add-multiple.dont-check-sigs-ignored]
 #[instrument(skip_all)]
 pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,

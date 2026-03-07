@@ -7,6 +7,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::wire::{self, WireError};
 
+// r[impl gw.handshake.magic]
+// r[impl gw.wire.all-ints-u64]
 /// Client-to-server magic. Represents "nixc" zero-extended to u64.
 ///
 /// Nix serializes all integers as u64 LE, including magic constants.
@@ -16,6 +18,7 @@ pub const WORKER_MAGIC_1: u64 = 0x6e697863;
 /// Server-to-client magic. Represents "dxio" zero-extended to u64.
 pub const WORKER_MAGIC_2: u64 = 0x6478696f;
 
+// r[impl gw.compat.version-range]
 /// Our protocol version: 1.38 encoded as `(1 << 8) | 38`.
 /// We advertise 1.38 to support the feature exchange added in that version.
 pub const PROTOCOL_VERSION: u64 = 0x126;
@@ -98,6 +101,12 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 /// Same as `server_handshake` but takes split read/write halves. This is
 /// needed when the reader and writer are independent streams (e.g., two
 /// ends of separate pipes bridging SSH channel I/O).
+// r[impl gw.handshake.phases]
+// r[impl gw.handshake.magic]
+// r[impl gw.handshake.version-negotiation]
+// r[impl gw.handshake.features]
+// r[impl gw.handshake.initial-stderr-last]
+// r[impl gw.handshake.flush-points]
 #[tracing::instrument(name = "handshake", skip_all)]
 pub async fn server_handshake_split<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,

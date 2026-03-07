@@ -1,3 +1,11 @@
+// r[verify gw.opcode.add-to-store-nar]
+// r[verify gw.opcode.add-to-store-nar.framing]
+// r[verify gw.opcode.add-multiple.batch]
+// r[verify gw.opcode.add-multiple.unaligned-frames]
+// r[verify gw.opcode.add-multiple.dont-check-sigs-ignored]
+// r[verify gw.wire.framed-no-padding]
+// r[verify gw.stderr.error-format]
+
 use super::*;
 
 // ===========================================================================

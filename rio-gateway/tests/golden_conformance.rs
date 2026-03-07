@@ -7,6 +7,23 @@
 //!
 //! Ported from rio-build/tests/golden_conformance.rs. Uses MockStore (gRPC)
 //! instead of the monolith's local MemoryStore.
+// r[verify gw.wire.all-ints-u64]
+// r[verify gw.wire.string-encoding]
+// r[verify gw.wire.collection-max]
+// r[verify gw.handshake.magic]
+// r[verify gw.handshake.phases]
+// r[verify gw.handshake.features]
+// r[verify gw.handshake.initial-stderr-last]
+// r[verify gw.handshake.flush-points]
+// r[verify gw.stderr.message-types]
+// r[verify gw.conn.per-channel-state]
+// r[verify gw.conn.lifecycle]
+// r[verify gw.opcode.is-valid-path]
+// r[verify gw.opcode.query-path-info]
+// r[verify gw.opcode.query-valid-paths]
+// r[verify gw.opcode.query-missing]
+// r[verify gw.opcode.nar-from-path]
+// r[verify gw.opcode.nar-from-path.raw-bytes]
 
 mod golden;
 

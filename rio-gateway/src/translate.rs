@@ -3,6 +3,7 @@
 //! Translates the per-session derivation cache into `SubmitBuildRequest`
 //! messages for the scheduler, walking `inputDrvs` recursively to build
 //! the full derivation graph.
+// r[impl gw.dag.reconstruct]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

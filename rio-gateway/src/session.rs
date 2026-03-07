@@ -15,6 +15,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::handler::{self, SessionContext};
 
+// r[impl gw.conn.per-channel-state]
+// r[impl gw.conn.sequential]
+// r[impl gw.conn.lifecycle]
+// r[impl gw.handshake.phases]
+// r[impl gw.compat.version-range]
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.

@@ -3,6 +3,7 @@
 //! Every opcode response is wrapped in an STDERR loop: the server sends log messages,
 //! progress updates, and errors via STDERR_* message types, and terminates with
 //! STDERR_LAST to signal that the operation result follows.
+// r[impl gw.stderr.message-types]
 
 use super::wire::{self, WireError};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -187,6 +188,8 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         Ok(())
     }
 
+    // r[impl gw.stderr.error-format]
+    // r[impl gw.stderr.error-before-return]
     /// Send STDERR_ERROR with the full structured error format.
     pub async fn error(&mut self, err: &StderrError) -> Result<(), WireError> {
         self.check_not_finished()?;
@@ -228,6 +231,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         Ok(())
     }
 
+    // r[impl gw.stderr.activity]
     /// Send STDERR_START_ACTIVITY. Returns the assigned activity ID.
     pub async fn start_activity(
         &mut self,

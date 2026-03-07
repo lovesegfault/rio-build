@@ -1,5 +1,6 @@
 //! CA data model end-to-end: register a realisation via the Nix wire
 //! protocol, query it back, and find the output by content hash.
+// r[verify gw.opcode.mandatory-set]
 //!
 //! This is the Phase 2c CA cache-hit path BEFORE Phase 5 early cutoff:
 //! a CA build completes → output uploaded to store → realisation

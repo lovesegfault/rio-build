@@ -1,3 +1,10 @@
+// r[verify gw.compat.unknown-opcode-close]
+// r[verify gw.compat.version-range]
+// r[verify gw.opcode.set-options.field-order]
+// r[verify gw.opcode.set-options.propagation]
+// r[verify gw.conn.sequential]
+// r[verify gw.handshake.version-negotiation]
+
 use super::*;
 
 // ===========================================================================

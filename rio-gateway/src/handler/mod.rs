@@ -115,6 +115,8 @@ impl SessionContext {
     }
 }
 
+// r[impl gw.opcode.mandatory-set]
+// r[impl gw.compat.unknown-opcode-close]
 /// Dispatch an opcode to the appropriate handler.
 ///
 /// Returns `Ok(())` on success. On errors, sends `STDERR_ERROR` to the
