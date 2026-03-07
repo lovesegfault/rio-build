@@ -205,7 +205,21 @@ impl Autoscaler {
         // scale_one() returns Some(err) for config errors (unknown
         // metric). Those surface via WorkerPool.status.conditions
         // — best-effort (log + continue on patch failure).
+        //
+        // Skip pools with deletionTimestamp: the finalizer's
+        // cleanup() scales STS to 0 as part of drain; the
+        // autoscaler rescaling to min would fight that (STS
+        // ping-pongs 0↔min every 3s poll → pods never terminate
+        // → finalizer never removes itself → kubectl delete hangs
+        // forever). Found via G3 VM test with 3s poll interval —
+        // with the default 30s this is a ~30s stall, not an
+        // infinite loop (finalizer usually wins the race between
+        // polls), but still wrong.
         for pool in &pools {
+            if pool.metadata.deletion_timestamp.is_some() {
+                debug!(pool = %pool_key(pool), "skipping: pool is being deleted");
+                continue;
+            }
             if let Some(err) = self.scale_one(pool, &status).await {
                 self.patch_error_condition(pool, &err).await;
             }
