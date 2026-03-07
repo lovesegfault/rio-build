@@ -203,24 +203,34 @@ pkgs.testers.runNixOSTest {
     #
     # The estimator refreshes every 6 ticks = 12s (tickInterval=2s).
     # Insert the seed, wait for refresh, then build.
+    #
+    # CAPTURE baseline refresh count first — by now the scheduler has
+    # been running for ~60s (bootstrap + worker registration + earlier
+    # builds) so the counter is already well above 0. We need to wait
+    # for it to INCREASE after the INSERT, not reach a fixed value.
+    # (The original sleep(15) was simpler but racy; this is race-free.)
+    baseline = int(control.succeed(
+        "curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_estimator_refresh_total ' | "
+        "awk '{print $2}' || echo 0"
+    ).strip() or "0")
+    print(f"estimator refresh baseline: {baseline}")
+
     control.succeed(
         "sudo -u postgres psql rio -c "
         "\"INSERT INTO build_history (pname, system, ema_duration_secs, sample_count, last_updated) "
         "VALUES ('rio-2c-bigthing', 'x86_64-linux', 120.0, 1, now())\""
     )
 
-    # Wait for estimator refresh to pick up the seed. The estimator
-    # refreshes every 6 ticks (12s at tickInterval=2s). Previously:
-    # sleep(15) and hope. Now: poll the refresh counter. ≥2 refreshes
-    # since test start = at least one after the INSERT above (the
-    # first may have raced). The counter starts at 0 on scheduler
-    # startup and increments only on SUCCESSFUL refresh (PG read +
-    # estimator.refresh() — not on error). Prometheus counters only
-    # appear after first .increment(), so `grep ...total [2-9]`
-    # implicitly asserts ≥2 (not just "registered").
+    # Wait for AT LEAST TWO more refreshes (proves seed was picked
+    # up). Two not one: a refresh could fire between baseline-capture
+    # and INSERT (12s cadence vs sub-second INSERT latency). The
+    # refresh AFTER that one is guaranteed to see the seed.
+    target = baseline + 2
     control.wait_until_succeeds(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep -E 'rio_scheduler_estimator_refresh_total [2-9]'",
+        "test \"$(curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_estimator_refresh_total ' | "
+        f"awk '{{print $2}}' || echo 0)\" -ge {target}",
         timeout=30
     )
 
