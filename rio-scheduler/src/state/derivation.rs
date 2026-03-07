@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::{DrvHash, TransitionError, WorkerId};
 
+// r[impl sched.state.machine]
 /// State of a single derivation in the global DAG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DerivationStatus {
@@ -37,6 +38,10 @@ impl DerivationStatus {
         )
     }
 
+    // r[impl sched.state.transitions]
+    // r[impl sched.state.terminal-idempotent]
+    // r[impl sched.state.poisoned-ttl]
+    // r[impl sched.completion.idempotent]
     /// Validate a state transition.
     ///
     /// Returns `Ok(())` if the transition is valid, `Err` with a description otherwise.

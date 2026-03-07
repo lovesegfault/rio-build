@@ -3,6 +3,7 @@
 //! Priority = `est_duration + max(children's priority)`. Bottom-up: a
 //! leaf's priority is just its own duration; a root's priority is the
 //! sum of durations along the longest path through its subtree.
+// r[impl sched.critical-path.incremental]
 //!
 //! Dispatching highest-priority-first means: work on the derivation
 //! whose completion unblocks the most remaining work. A short derivation

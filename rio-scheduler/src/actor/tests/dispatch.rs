@@ -1,4 +1,8 @@
 //! Dispatch: size-class routing, skip-ineligible, options propagation, interactive priority.
+// r[verify sched.classify.smallest-covering]
+// r[verify sched.classify.mem-bump]
+// r[verify sched.overflow.up-only]
+// r[verify sched.preempt.never-running]
 
 use super::*;
 

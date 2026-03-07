@@ -1,4 +1,6 @@
 //! DB fault-injection: pool.close() to exercise error-branch logging in completion paths.
+// r[verify sched.actor.single-owner]
+// r[verify sched.state.machine]
 
 use super::*;
 

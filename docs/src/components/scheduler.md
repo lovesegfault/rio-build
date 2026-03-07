@@ -19,6 +19,7 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 
 ## Concurrency Model
 
+r[sched.actor.single-owner]
 The scheduler uses a **single-owner actor model** for the in-memory global DAG. A single Tokio task owns the DAG and processes all mutations from an `mpsc` channel:
 
 - `SubmitBuild` → DAG merge command
@@ -77,21 +78,26 @@ The scheduling algorithm below is implemented as of Phase 2c: critical-path prio
 9. On failure: classify error (see errors.md), apply retry policy, reassign or mark as failed
 ```
 
+r[sched.merge.toctou-serial]
 > **TOCTOU note on cache checks (steps 2--4):** The DAG merge and subsequent cache check MUST be performed inside the DAG actor (serialized), not by the gRPC handler before sending the merge command. A cache check performed by the gRPC handler races with concurrent merges --- another build may complete a shared derivation between the handler's cache check and the actor's merge, leading to duplicate work. By performing cache verification after merge inside the actor, the check reflects the latest state.
 
+r[sched.completion.idempotent]
 > **Completion report idempotency:** A `CompletionReport` for an already-completed derivation is accepted and ignored (no-op). The actor's state machine treats `completed → completed` as an idempotent transition. This handles duplicate reports caused by worker retries during scheduler failover, network retransmissions, or race conditions with CA early cutoff.
 
 ## Multi-Build DAG Merging
 
+r[sched.merge.dedup]
 The scheduler maintains a single global DAG across all concurrent build requests. When a new derivation DAG arrives from the gateway, it is merged into the global graph:
 
 - **Input-addressed derivations**: deduplicated by store path
 - **Content-addressed derivations**: deduplicated by modular derivation hash (as computed by `hashDerivationModulo` --- excludes output paths, depends only on the derivation's fixed attributes)
 
+r[sched.merge.shared-priority-max]
 Each derivation node tracks a set of interested builds. Shared derivations are built once; all interested builds are notified on completion. **A shared derivation's priority is `max(priority of all interested builds)`, updated on merge.** When a new build raises a shared node's priority, the node's position in the priority queue is updated.
 
 ## Duration Estimation
 
+r[sched.estimate.fallback-chain]
 Build duration estimates feed into critical-path priority computation and scheduling decisions.
 
 | Priority | Method |
@@ -101,6 +107,7 @@ Build duration estimates feed into critical-path priority computation and schedu
 | Fallback 2 | Use closure size as a rough proxy |
 | Default | Configurable constant (default: 30 seconds) |
 
+r[sched.estimate.ema-alpha]
 After each build completes, the estimate is updated using an exponential moving average (alpha=0.3) of actual durations. Cold start: on a fresh deployment with no history, all derivations use Fallback 2 or Default. Critical-path scheduling quality improves as history accumulates (typically 5-10 builds per derivation for convergence).
 
 The `build_history` table also tracks peak resource usage (memory, CPU, output size) via EMA, reported by workers in `CompletionReport`. These feed into size-class routing decisions (see below).
@@ -111,18 +118,21 @@ When a `WorkerPoolSet` CRD is configured, the scheduler routes derivations to ri
 
 ### Classification
 
+r[sched.classify.smallest-covering]
 Each derivation is classified into a size class by comparing its estimated duration against the `WorkerPoolSet` cutoffs:
 
 ```
 class(drv) = smallest class i where estimated_duration(drv) <= cutoff_i
 ```
 
+r[sched.classify.mem-bump]
 If `ema_peak_memory_bytes` for a derivation exceeds the target class's memory limit, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping).
 
 If no `WorkerPoolSet` is configured, classification is skipped and all workers are candidates (backward compatible with single `WorkerPool` deployments).
 
 ### Misclassification Handling
 
+r[sched.classify.penalty-overwrite]
 Nix builds are non-preemptible --- a running build cannot be checkpointed or migrated. If a build classified as "small" exceeds 2x the class cutoff while still running, the scheduler:
 
 1. Marks the derivation as **misclassified** in the `build_history` table
@@ -155,10 +165,12 @@ SITA-E sets cutoffs such that load_1 ~= load_2 ~= ... ~= load_k
 
 ### Overflow Routing
 
+r[sched.overflow.up-only]
 When a size class's worker pool is fully occupied but another class has idle workers, the scheduler may route overflow derivations to the next larger class. This prevents queue starvation when the workload is temporarily skewed. Overflow routing is never applied downward (large builds are never routed to small workers).
 
 ## Preemption
 
+r[sched.preempt.never-running]
 Nix builds cannot be paused or resumed, so **running builds are never preempted or cancelled** --- including for CA early cutoff. When cutoff is detected for an already-running build, the build is allowed to complete and the result is simply discarded. This bounds wasted work to one build duration per affected worker.
 
 **Exception**: the only case where a running build is killed is worker pod termination (scale-down, node failure). The preStop hook gives the build time to complete; if it cannot finish within the grace period, it is reassigned.
@@ -170,6 +182,7 @@ Queue-level preemption is fully supported:
 
 ## Derivation State Machine
 
+r[sched.state.machine]
 Each derivation node in the global DAG follows a strict state machine. All transitions are performed inside the DAG actor to ensure serialized access.
 
 ```mermaid
@@ -201,6 +214,7 @@ stateDiagram-v2
 
 > **Note on the architecture diagram:** The mermaid flowchart in [architecture.md](../architecture.md) shows arrows FROM the scheduler TO workers for the `BuildExecution` stream. This reflects data flow direction (scheduler sends assignments). The gRPC connection direction is the reverse: workers are the gRPC client calling the scheduler's `WorkerService.BuildExecution` RPC.
 
+r[sched.state.transitions]
 **Transition guards:**
 
 | Transition | Guard / Condition |
@@ -219,14 +233,19 @@ stateDiagram-v2
 | `queued → dependency_failed` | A dependency reached `poisoned` while this node was waiting |
 | `ready → dependency_failed` | A dependency reached `poisoned` after this node became ready |
 
+r[sched.state.terminal-idempotent]
 **Idempotency rules:**
 - `completed → completed`: No-op (duplicate completion reports are accepted and ignored)
 - `poisoned → poisoned`: No-op
 - `dependency_failed → dependency_failed`: No-op
 - Any transition from a terminal state (`completed`, `poisoned`) to a non-terminal state is rejected, except `poisoned` auto-expiry after 24h which resets to `created`
 
+r[sched.state.poisoned-ttl]
+The `poisoned → created` transition is the only non-terminal escape from a terminal state, gated by a 24h TTL.
+
 ## Build State Machine
 
+r[sched.build.state]
 Each build request follows a separate state machine from individual derivations. Build status aggregates the status of its constituent derivations.
 
 ```mermaid
@@ -243,6 +262,7 @@ stateDiagram-v2
     failed --> [*]
 ```
 
+r[sched.build.keep-going]
 **Aggregation rules:**
 - `keepGoing=false` (default): the build fails as soon as any derivation reaches `PermanentFailure` or `poisoned`. Remaining derivations are cancelled.
 - `keepGoing=true`: the build continues executing independent derivations even after a failure. The build is `failed` only when all reachable derivations have completed or failed.
@@ -288,6 +308,7 @@ Workers buffer completion reports with retry logic: if `ReportCompletion` fails 
 
 ## Worker Registration Protocol
 
+r[sched.worker.dual-register]
 Worker registration is **two-step** --- there is no single registration RPC; instead, the scheduler infers registration from two separate interactions:
 
 1. Worker opens a `BuildExecution` bidirectional stream to the scheduler (calling `WorkerService.BuildExecution`).
@@ -300,6 +321,7 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
 3. When the scheduler receives the first `Heartbeat` from a `worker_id` that also has an open `BuildExecution` stream, it creates an in-memory worker entry with the reported capabilities and marks the worker as `alive`.
 4. Scheduler begins sending `WorkAssignment` messages on the stream.
 
+r[sched.worker.deregister-reassign]
 **Deregistration:** A worker is removed from the scheduler's state when:
 - The `BuildExecution` stream is closed (graceful shutdown or network failure)
 - Three consecutive heartbeats are missed (heartbeat interval: 10s, timeout: 30s)
@@ -312,6 +334,7 @@ The scheduler applies backpressure at multiple layers to prevent overload:
 
 **gRPC flow control:** The `BuildExecution` streams use the default HTTP/2 flow control window (64 KiB initial, dynamically adjusted). The scheduler does not send new `WorkAssignment` messages to a worker whose send window is exhausted, naturally rate-limiting dispatch to slow consumers.
 
+r[sched.backpressure.hysteresis]
 **Actor queue depth limit:** The DAG actor's `mpsc` channel has a bounded capacity (default: 10,000 messages). If the queue depth exceeds 80% of capacity:
 1. The scheduler stops reading from worker `BuildExecution` streams (applying TCP-level backpressure to workers).
 2. New `SubmitBuild` requests from the gateway receive gRPC `RESOURCE_EXHAUSTED` status.
@@ -407,10 +430,13 @@ CREATE TABLE build_history (
 
 ## Leader Election
 
+r[sched.lease.pg-advisory]
 The scheduler uses **PostgreSQL advisory locks** for leader election, while the controller uses Kubernetes Lease. This asymmetry is intentional:
 
 - **Why PG advisory locks for the scheduler:** The scheduler's state recovery depends on PostgreSQL --- on startup, the new leader reconstructs in-memory DAGs from the `builds`, `derivations`, `derivation_edges`, and `assignments` tables. Coupling leader election to PG availability ensures the leader always has access to its state backend. If PG is down, the scheduler cannot function regardless of who holds the leader lock.
 - **Why K8s Lease for the controller:** The controller only interacts with the Kubernetes API (CRDs, StatefulSets, Services). It has no PostgreSQL dependency, so a K8s-native leader election mechanism is simpler and more appropriate.
+
+r[sched.lease.generation-fence]
 - **Generation counter for write fencing:** Each leader election increments a generation counter stored in a PG row. All state-modifying SQL statements include `WHERE leader_generation = $current_generation`. A stale leader (whose PG connection was silently dropped) will have its writes rejected by the generation check, preventing split-brain corruption.
 
 **Operational caveats:**
@@ -421,6 +447,7 @@ The scheduler uses **PostgreSQL advisory locks** for leader election, while the 
 
 ## Incremental Critical-Path Maintenance
 
+r[sched.critical-path.incremental]
 Critical-path priorities are maintained **incrementally**, not via full O(V+E) recomputation on every event:
 
 - **On derivation completion:** Walk upward from the completed node to its ancestors, recalculating priorities only for nodes whose successor priorities changed. This is O(affected subgraph), which is typically much smaller than the full DAG.

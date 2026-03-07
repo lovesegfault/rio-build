@@ -1,4 +1,7 @@
 //! Worker management: heartbeat merge (no-clobber), Tick-driven timeout and poison expiry.
+// r[verify sched.worker.dual-register]
+// r[verify sched.worker.deregister-reassign]
+// r[verify sched.state.poisoned-ttl]
 
 use super::*;
 

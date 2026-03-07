@@ -3,6 +3,7 @@
 //! All gRPC handlers communicate with the actor via an mpsc command channel.
 //! The actor processes commands serially, ensuring deterministic ordering
 //! and eliminating lock contention.
+// r[impl sched.actor.single-owner]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

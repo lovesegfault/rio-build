@@ -1,4 +1,10 @@
 //! Completion handling: retry/poison thresholds, dep-chain release, duplicate idempotence.
+// r[verify sched.completion.idempotent]
+// r[verify sched.state.transitions]
+// r[verify sched.state.terminal-idempotent]
+// r[verify sched.critical-path.incremental]
+// r[verify sched.estimate.ema-alpha]
+// r[verify sched.classify.penalty-overwrite]
 
 use super::*;
 

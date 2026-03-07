@@ -1,4 +1,6 @@
 //! Build lifecycle: cancel, query status, watch events, completion transitions.
+// r[impl sched.build.state]
+// r[impl sched.build.keep-going]
 
 use super::*;
 

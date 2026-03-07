@@ -3,6 +3,8 @@
 //! Replaces `dispatch.rs`'s first-eligible-worker FIFO with a scored
 //! selection: pick the worker that will complete this derivation
 //! FASTEST, accounting for transfer cost (inputs not yet cached) and
+// r[impl sched.classify.smallest-covering]
+// r[impl sched.classify.mem-bump]
 //! current load.
 //!
 //! # Scoring (scheduler.md:53-59)

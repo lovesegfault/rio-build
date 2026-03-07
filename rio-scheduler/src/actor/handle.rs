@@ -1,4 +1,5 @@
 //! External-facing actor handle.
+// r[impl sched.backpressure.hysteresis]
 
 use super::*;
 

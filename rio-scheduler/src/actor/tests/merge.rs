@@ -1,4 +1,7 @@
 //! Merge error paths: DB-failure rollback, cache-check store errors, circuit breaker.
+// r[verify sched.merge.dedup]
+// r[verify sched.merge.toctou-serial]
+// r[verify sched.merge.shared-priority-max]
 
 use super::*;
 

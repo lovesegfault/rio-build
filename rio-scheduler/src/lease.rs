@@ -3,6 +3,8 @@
 //! When `RIO_LEASE_NAME` is set, a background task acquires and
 //! renews a `coordination.k8s.io/v1` Lease. On acquire, it
 //! increments the generation counter (workers see the new gen in
+// r[impl sched.lease.pg-advisory]
+// r[impl sched.lease.generation-fence]
 //! heartbeat, reject stale-gen assignments from the old leader)
 //! and sets `is_leader=true` (dispatch_ready checks this).
 //!
@@ -292,6 +294,8 @@ pub async fn run_lease_loop(cfg: LeaseConfig, state: LeaderState) {
     }
 }
 
+// r[verify sched.lease.pg-advisory]
+// r[verify sched.lease.generation-fence]
 #[cfg(test)]
 mod tests {
     use super::*;

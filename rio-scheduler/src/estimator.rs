@@ -3,6 +3,9 @@
 //! Feeds critical-path priority (D4) and size-class routing (D7).
 //! The estimate is a HINT — a wrong estimate means suboptimal scheduling
 //! (short job waits behind long job), not incorrectness. So we err on the
+// r[impl sched.estimate.fallback-chain]
+// r[impl sched.estimate.ema-alpha]
+// r[impl sched.classify.penalty-overwrite]
 //! side of "always return SOMETHING" rather than "fail if uncertain".
 //!
 //! # Fallback chain (scheduler.md:97-102)
@@ -208,6 +211,8 @@ impl Estimator {
     }
 }
 
+// r[verify sched.estimate.fallback-chain]
+// r[verify sched.estimate.ema-alpha]
 #[cfg(test)]
 mod tests {
     use super::*;

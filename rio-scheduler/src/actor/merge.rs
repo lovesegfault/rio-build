@@ -1,4 +1,7 @@
 //! DAG merge handling: SubmitBuild → merge client DAG into global DAG.
+// r[impl sched.merge.dedup]
+// r[impl sched.merge.shared-priority-max]
+// r[impl sched.merge.toctou-serial]
 
 use super::*;
 

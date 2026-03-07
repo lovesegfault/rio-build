@@ -1,4 +1,6 @@
 //! Completion handling: worker reports build done → update DAG, cascade, emit events.
+// r[impl sched.completion.idempotent]
+// r[impl sched.critical-path.incremental]
 
 use super::*;
 

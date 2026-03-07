@@ -1,4 +1,6 @@
 //! Ready-queue dispatch: assign ready derivations to available workers.
+// r[impl sched.overflow.up-only]
+// r[impl sched.preempt.never-running]
 
 use super::*;
 
