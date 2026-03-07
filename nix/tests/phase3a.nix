@@ -900,17 +900,30 @@ pkgs.testers.runNixOSTest {
         "grep -E 'rio_controller_scaling_decisions_total\\{direction=\"up\"\\} [1-9]'"
     )
 
-    # Wait for background builds to finish (so drain doesn't wait
-    # for them). 5 × 15s = 75s sequential; with 2 workers (scaled!)
-    # and 1 max_builds each, ~40s parallel. 120s timeout is safe.
+    # Wait for background builds to finish so the finalizer drain
+    # below doesn't block on them (acquire_many waits for permits).
     #
-    # `client.succeed("wait")` waits for the backgrounded
-    # nix-build. The builds MAY fail (pod-1 not Ready yet — we
-    # didn't wait for it) but that's OK: the autoscaler scaled on
-    # QUEUE DEPTH, which is what we're testing. `|| true` swallows
-    # build failures (they'd be infrastructure failures from the
-    # not-ready pod, not our bug).
-    client.succeed("wait || true")
+    # CAN'T use `client.succeed("wait")`: each .succeed()/.execute()
+    # call is a NEW shell session. The `&`-backgrounded nix-build
+    # from earlier is a job in a DIFFERENT shell — `wait` here has
+    # no children. Instead: poll the queue-depth gauge back to 0
+    # AND running gauge to 0 (queued=0 + running=0 = all terminal).
+    #
+    # 5 × 15s builds: ~75s sequential on pod-0 alone (pod-1 may
+    # never become Ready on the 4GB VM). 120s gives headroom.
+    # The builds MAY fail (infrastructure: pod-1 not ready) — we
+    # don't care about their success, only that the queue drains
+    # so the finalizer can complete.
+    control.wait_until_succeeds(
+        "q=$(curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_derivations_queued ' | "
+        "awk '{print $2}' || echo 0); "
+        "r=$(curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_derivations_running ' | "
+        "awk '{print $2}' || echo 0); "
+        "test \"$q\" = 0 -a \"$r\" = 0",
+        timeout=120
+    )
 
     # ── Finalizer drain ────────────────────────────────────────────
     # Delete the WorkerPool → finalizer runs → DrainWorker +
