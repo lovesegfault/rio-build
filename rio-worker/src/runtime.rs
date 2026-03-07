@@ -10,16 +10,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tonic::transport::Channel;
 
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
-    CompletionReport, HeartbeatRequest, ResourceUsage, WorkAssignment, WorkAssignmentAck,
-    WorkerMessage, worker_message,
+    CompletionReport, HeartbeatRequest, PrefetchHint, ResourceUsage, WorkAssignment,
+    WorkAssignmentAck, WorkerMessage, worker_message,
 };
 
-use crate::{executor, log_stream};
+use crate::{executor, fuse, log_stream};
 
 /// Handle to the FUSE cache's bloom filter. Extracted via
 /// `Cache::bloom_handle()` before the Cache is moved into the FUSE
@@ -280,6 +280,98 @@ pub async fn spawn_build_task(
             }
         }
     });
+}
+
+/// Handle a PrefetchHint from the scheduler: spawn one fire-and-forget
+/// task per path to warm the FUSE cache.
+///
+/// Extracted from main.rs's event loop — previously a 6-level-nested
+/// inline match arm. Does NOT block the caller: each path is spawned
+/// as an independent tokio task that acquires a permit from `sem`
+/// before entering the blocking pool.
+///
+/// No JoinHandle tracking: prefetch is fire-and-forget. If the worker
+/// SIGTERMs mid-prefetch, the tasks abort with the runtime — the
+/// partial fetch is in a .tmp-XXXX sibling dir (see fetch_extract_insert)
+/// which cache init cleans up on next start.
+pub fn handle_prefetch_hint(
+    prefetch: PrefetchHint,
+    cache: Arc<fuse::cache::Cache>,
+    store_client: StoreServiceClient<Channel>,
+    rt: tokio::runtime::Handle,
+    sem: Arc<Semaphore>,
+) {
+    // Spawn one task per path. Don't await — the
+    // whole point is to NOT block the stream loop
+    // on prefetch. The semaphore bounds concurrent
+    // in-flight; excess queue in tokio's task
+    // scheduler (cheap — no blocking-pool thread
+    // is held until the permit is acquired).
+    for store_path in prefetch.store_paths {
+        // Scheduler sends full paths; we need
+        // basename. Malformed (no /nix/store/
+        // prefix) → skip with debug log. Don't
+        // fail the loop — one bad path in a
+        // batch shouldn't poison the rest.
+        let Some(basename) = store_path.strip_prefix("/nix/store/") else {
+            tracing::debug!(
+                path = %store_path,
+                "prefetch: malformed path (no /nix/store/ prefix), skipping"
+            );
+            metrics::counter!("rio_worker_prefetch_total", "result" => "malformed").increment(1);
+            continue;
+        };
+        let basename = basename.to_string();
+
+        // Clone handles into the task. All cheap:
+        // Arc clone, tonic Channel is Arc-internal,
+        // tokio Handle is a lightweight token.
+        let cache = Arc::clone(&cache);
+        let client = store_client.clone();
+        let rt = rt.clone();
+        let sem = Arc::clone(&sem);
+
+        tokio::spawn(async move {
+            // Permit BEFORE spawn_blocking: if the
+            // semaphore is saturated, this task
+            // waits here (cheap async wait) not
+            // in the blocking pool. Tasks queue
+            // in tokio's scheduler; blocking
+            // threads only taken when a permit
+            // is available.
+            //
+            // On Err(Closed): semaphore closed →
+            // worker shutting down. Drop the
+            // prefetch silently — it was a hint.
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return;
+            };
+
+            // spawn_blocking: Cache methods use
+            // block_on internally (nested-runtime
+            // panic from async). The permit moves
+            // into the blocking closure and drops
+            // when it returns — next queued task
+            // wakes.
+            let result = tokio::task::spawn_blocking(move || {
+                use crate::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
+                let _permit = _permit; // hold through blocking work
+                match prefetch_path_blocking(&cache, &client, &rt, &basename) {
+                    Ok(None) => "fetched",
+                    Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
+                    Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",
+                    Err(_) => "error",
+                }
+            })
+            .await;
+
+            // JoinError (panic in blocking) →
+            // record as "panic". Don't re-panic
+            // — we're fire-and-forget.
+            let label = result.unwrap_or("panic");
+            metrics::counter!("rio_worker_prefetch_total", "result" => label).increment(1);
+        });
+    }
 }
 
 #[cfg(test)]

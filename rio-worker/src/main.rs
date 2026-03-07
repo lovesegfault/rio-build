@@ -3,240 +3,26 @@
 //! Wires up FUSE daemon, gRPC clients (WorkerService + StoreService),
 //! executor, and heartbeat loop.
 
+mod config;
+
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tracing::info;
 
 use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
+use rio_worker::runtime::handle_prefetch_hint;
 use rio_worker::{BuildSpawnContext, build_heartbeat_request, fuse, spawn_build_task};
 
-// ---------------------------------------------------------------------------
-// Configuration (two-struct split per rio-common/src/config.rs)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
-struct Config {
-    /// If empty after merge → auto-detect via hostname.
-    worker_id: String,
-    scheduler_addr: String,
-    store_addr: String,
-    max_builds: u32,
-    /// Systems this worker can build for. Empty after merge →
-    /// auto-detect single element via std::env::consts. Multi-
-    /// element for qemu-user-static or cross-arch workers.
-    /// Env: `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-sep)
-    /// or TOML `systems = ["x86_64-linux"]`.
-    #[serde(deserialize_with = "rio_common::config::comma_vec")]
-    systems: Vec<String>,
-    /// requiredSystemFeatures this worker supports (e.g., "kvm",
-    /// "big-parallel"). Scheduler's can_build() all-matches the
-    /// derivation's required_features against this. Previously
-    /// hardcoded empty — CRD features field was silently dropped.
-    #[serde(deserialize_with = "rio_common::config::comma_vec")]
-    features: Vec<String>,
-    fuse_mount_point: PathBuf,
-    fuse_cache_dir: PathBuf,
-    fuse_cache_size_gb: u64,
-    fuse_threads: u32,
-    /// Defaults to `true`. NOT the serde bool default — see `default_true`.
-    /// A drift here (`false`) would silently disable kernel passthrough,
-    /// adding a userspace copy per FUSE read and ~2× per-build latency.
-    fuse_passthrough: bool,
-    overlay_base_dir: PathBuf,
-    metrics_addr: std::net::SocketAddr,
-    /// HTTP /healthz + /readyz listen address. Worker has no gRPC
-    /// server so tonic-health doesn't fit — plain HTTP via axum.
-    /// K8s readinessProbe hits /readyz (200 after first accepted
-    /// heartbeat), livenessProbe hits /healthz (always 200).
-    health_addr: std::net::SocketAddr,
-    /// Log limits (configuration.md:68-69). 0 = unlimited.
-    /// Wired into LogLimits → LogBatcher in main().
-    log_rate_limit: u64,
-    log_size_limit: u64,
-    /// Size-class this worker is deployed as. Empty = unclassified.
-    /// If the scheduler has size_classes configured, unclassified
-    /// workers are REJECTED (misconfiguration — set this). Operator
-    /// sets it to match the scheduler's size_classes config — e.g.
-    /// "small" workers on cheap spot instances, "large" on
-    /// memory-optimized. The scheduler routes by estimated duration;
-    /// this just declares which bucket this worker serves.
-    size_class: String,
-    /// Threshold for leaked overlay mounts before refusing new builds.
-    /// After N umount2 failures (stuck-busy mounts), the worker is
-    /// degraded; execute_build short-circuits with InfrastructureFailure
-    /// so the scheduler reassigns and the supervisor can restart.
-    max_leaked_mounts: usize,
-    /// Timeout (seconds) for the local nix-daemon subprocess build when
-    /// the client didn't specify BuildOptions.build_timeout. Intentionally
-    /// long (2h default) — some builds genuinely take that long; this is
-    /// a bound on blast radius of a truly stuck daemon, not an expected
-    /// build time.
-    daemon_timeout_secs: u64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            worker_id: String::new(),
-            scheduler_addr: String::new(),
-            store_addr: String::new(),
-            max_builds: 1,
-            systems: Vec::new(),
-            features: Vec::new(),
-            // Matches nix/modules/worker.nix. NEVER default to /nix/store:
-            // mounting FUSE there shadows the host store, breaking every
-            // process on the machine (including the worker itself).
-            fuse_mount_point: "/var/rio/fuse-store".into(),
-            fuse_cache_dir: "/var/rio/cache".into(),
-            fuse_cache_size_gb: 50,
-            fuse_threads: 4,
-            fuse_passthrough: true,
-            overlay_base_dir: "/var/rio/overlays".into(),
-            metrics_addr: "0.0.0.0:9093".parse().unwrap(),
-            // 9193 = metrics (9093) + 100. Same +100 pattern as
-            // gateway (9090→9190). Scheduler/store piggyback health
-            // on their gRPC ports; worker+gateway have no gRPC server.
-            health_addr: "0.0.0.0:9193".parse().unwrap(),
-            // configuration.md:68-69 specs these defaults.
-            log_rate_limit: 10_000,
-            log_size_limit: 100 * 1024 * 1024, // 100 MiB
-            size_class: String::new(),
-            max_leaked_mounts: 3,
-            daemon_timeout_secs: rio_worker::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
-        }
-    }
-}
-
-#[derive(Parser, Serialize, Default)]
-#[command(
-    name = "rio-worker",
-    about = "Build executor with FUSE store for rio-build"
-)]
-struct CliArgs {
-    /// Worker ID (defaults to hostname)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    worker_id: Option<String>,
-
-    /// rio-scheduler gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scheduler_addr: Option<String>,
-
-    /// rio-store gRPC address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store_addr: Option<String>,
-
-    /// Maximum concurrent builds
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_builds: Option<u32>,
-
-    /// Systems this worker builds for (repeatable: `--system
-    /// x86_64-linux --system aarch64-linux`). Auto-detected if
-    /// not set. Clap's `action = Append` collects repeated flags
-    /// into a Vec; serde name `systems` matches the Config field.
-    #[arg(long = "system", action = clap::ArgAction::Append)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    systems: Vec<String>,
-
-    /// requiredSystemFeatures this worker supports (repeatable).
-    #[arg(long = "feature", action = clap::ArgAction::Append)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    features: Vec<String>,
-
-    /// FUSE mount point
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_mount_point: Option<PathBuf>,
-
-    /// FUSE cache directory
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_cache_dir: Option<PathBuf>,
-
-    /// FUSE cache size limit in GB
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_cache_size_gb: Option<u64>,
-
-    /// Number of FUSE threads
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_threads: Option<u32>,
-
-    /// Enable FUSE passthrough mode. Use --fuse-passthrough=false to disable.
-    //
-    // clap's `bool` is a flag (presence=true, absence=false), which would
-    // make it impossible to NOT set from CLI (defeating layering).
-    // `Option<bool>` with an explicit value parser makes clap accept
-    // `--fuse-passthrough=true|false` and leaves it None when absent.
-    #[arg(long, value_parser = clap::value_parser!(bool))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fuse_passthrough: Option<bool>,
-
-    /// Overlay base directory
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    overlay_base_dir: Option<PathBuf>,
-
-    /// Prometheus metrics listen address
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics_addr: Option<std::net::SocketAddr>,
-
-    /// Max log lines/sec per build (0 = unlimited)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    log_rate_limit: Option<u64>,
-
-    /// Max total log bytes per build (0 = unlimited)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    log_size_limit: Option<u64>,
-
-    /// Size-class (matches scheduler config; e.g. "small", "large")
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size_class: Option<String>,
-
-    /// Max leaked overlay mounts before refusing builds (default: 3)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_leaked_mounts: Option<usize>,
-
-    /// Daemon build timeout seconds (default: 7200)
-    #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    daemon_timeout_secs: Option<u64>,
-}
+use config::{CliArgs, Config, detect_system};
 
 /// Heartbeat interval. Shared source of truth with the scheduler's timeout
 /// check (rio_common::limits::HEARTBEAT_TIMEOUT_SECS derives from this).
 const HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(rio_common::limits::HEARTBEAT_INTERVAL_SECS);
-
-/// Detect the system architecture (e.g. "x86_64-linux").
-fn detect_system() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    // Map Rust arch names to Nix system names
-    let nix_arch = match arch {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        "x86" => "i686",
-        other => other,
-    };
-    format!("{nix_arch}-{os}")
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -588,86 +374,13 @@ async fn main() -> anyhow::Result<()> {
                             paths = prefetch.store_paths.len(),
                             "received prefetch hint"
                         );
-                        // Spawn one task per path. Don't await — the
-                        // whole point is to NOT block the stream loop
-                        // on prefetch. The semaphore bounds concurrent
-                        // in-flight; excess queue in tokio's task
-                        // scheduler (cheap — no blocking-pool thread
-                        // is held until the permit is acquired).
-                        //
-                        // No JoinHandle tracking: prefetch is fire-and-
-                        // forget. If the worker SIGTERMs mid-prefetch,
-                        // the tasks abort with the runtime — the
-                        // partial fetch is in a .tmp-XXXX sibling dir
-                        // (see fetch_extract_insert) which cache init
-                        // cleans up on next start.
-                        for store_path in prefetch.store_paths {
-                            // Scheduler sends full paths; we need
-                            // basename. Malformed (no /nix/store/
-                            // prefix) → skip with debug log. Don't
-                            // fail the loop — one bad path in a
-                            // batch shouldn't poison the rest.
-                            let Some(basename) = store_path.strip_prefix("/nix/store/") else {
-                                tracing::debug!(
-                                    path = %store_path,
-                                    "prefetch: malformed path (no /nix/store/ prefix), skipping"
-                                );
-                                metrics::counter!("rio_worker_prefetch_total", "result" => "malformed")
-                                    .increment(1);
-                                continue;
-                            };
-                            let basename = basename.to_string();
-
-                            // Clone handles into the task. All cheap:
-                            // Arc clone, tonic Channel is Arc-internal,
-                            // tokio Handle is a lightweight token.
-                            let cache = Arc::clone(&prefetch_cache);
-                            let client = prefetch_store.clone();
-                            let rt = prefetch_runtime.clone();
-                            let sem = Arc::clone(&prefetch_sem);
-
-                            tokio::spawn(async move {
-                                // Permit BEFORE spawn_blocking: if the
-                                // semaphore is saturated, this task
-                                // waits here (cheap async wait) not
-                                // in the blocking pool. Tasks queue
-                                // in tokio's scheduler; blocking
-                                // threads only taken when a permit
-                                // is available.
-                                //
-                                // On Err(Closed): semaphore closed →
-                                // worker shutting down. Drop the
-                                // prefetch silently — it was a hint.
-                                let Ok(_permit) = sem.acquire_owned().await else {
-                                    return;
-                                };
-
-                                // spawn_blocking: Cache methods use
-                                // block_on internally (nested-runtime
-                                // panic from async). The permit moves
-                                // into the blocking closure and drops
-                                // when it returns — next queued task
-                                // wakes.
-                                let result = tokio::task::spawn_blocking(move || {
-                                    use rio_worker::fuse::fetch::{PrefetchSkip, prefetch_path_blocking};
-                                    let _permit = _permit; // hold through blocking work
-                                    match prefetch_path_blocking(&cache, &client, &rt, &basename) {
-                                        Ok(None) => "fetched",
-                                        Ok(Some(PrefetchSkip::AlreadyCached)) => "already_cached",
-                                        Ok(Some(PrefetchSkip::AlreadyInFlight)) => "already_in_flight",
-                                        Err(_) => "error",
-                                    }
-                                })
-                                .await;
-
-                                // JoinError (panic in blocking) →
-                                // record as "panic". Don't re-panic
-                                // — we're fire-and-forget.
-                                let label = result.unwrap_or("panic");
-                                metrics::counter!("rio_worker_prefetch_total", "result" => label)
-                                    .increment(1);
-                            });
-                        }
+                        handle_prefetch_hint(
+                            prefetch,
+                            Arc::clone(&prefetch_cache),
+                            prefetch_store.clone(),
+                            prefetch_runtime.clone(),
+                            Arc::clone(&prefetch_sem),
+                        );
                     }
                     None => {
                         tracing::warn!("received empty scheduler message");
@@ -677,25 +390,44 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // ---- Drain sequence -------------------------------------------------
-    //
-    // K8s preStop (controller.md:211-216):
-    //   1. DrainWorker: scheduler stops sending assignments
-    //   2. Wait for in-flight builds
-    //   3. (Outputs already uploaded by each build task — no step here)
-    //   4. Exit 0
-    //
-    // terminationGracePeriodSeconds=7200 (2h). If we exceed that,
-    // SIGKILL — builds lost. 2h is enough for ~any single build; the
-    // ones that take longer (LLVM+ccache-cold) are rare.
-    //
-    // Only DrainReason::Sigterm does the full sequence. Stream close/
-    // error means the scheduler is gone — DrainWorker would fail, and
-    // WorkerDisconnected already reassigned our builds. Just exit.
-    match drain_reason {
+    run_drain(
+        drain_reason,
+        &build_semaphore,
+        cfg.max_builds,
+        &cfg.scheduler_addr,
+        &build_ctx.worker_id,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Execute the drain sequence after the event loop exits.
+///
+/// K8s preStop (controller.md:211-216):
+///   1. DrainWorker: scheduler stops sending assignments
+///   2. Wait for in-flight builds
+///   3. (Outputs already uploaded by each build task — no step here)
+///   4. Exit 0
+///
+/// terminationGracePeriodSeconds=7200 (2h). If we exceed that,
+/// SIGKILL — builds lost. 2h is enough for ~any single build; the
+/// ones that take longer (LLVM+ccache-cold) are rare.
+///
+/// Only DrainReason::Sigterm does the full sequence. Stream close/
+/// error means the scheduler is gone — DrainWorker would fail, and
+/// WorkerDisconnected already reassigned our builds. Just exit.
+async fn run_drain(
+    reason: DrainReason,
+    semaphore: &Semaphore,
+    max_builds: u32,
+    scheduler_addr: &str,
+    worker_id: &str,
+) {
+    match reason {
         DrainReason::Sigterm => {
             info!(
-                in_flight = cfg.max_builds as usize - build_semaphore.available_permits(),
+                in_flight = max_builds as usize - semaphore.available_permits(),
                 "SIGTERM received, draining"
             );
 
@@ -711,11 +443,11 @@ async fn main() -> anyhow::Result<()> {
             // connect is cheap (happy path: one TCP handshake, ~1ms
             // on localhost, ~RTT over network). This is a one-shot
             // call at shutdown, not a hot path.
-            match rio_proto::client::connect_admin(&cfg.scheduler_addr).await {
+            match rio_proto::client::connect_admin(scheduler_addr).await {
                 Ok(mut admin) => {
                     match admin
                         .drain_worker(rio_proto::types::DrainWorkerRequest {
-                            worker_id: build_ctx.worker_id.clone(),
+                            worker_id: worker_id.to_string(),
                             force: false,
                         })
                         .await
@@ -777,7 +509,7 @@ async fn main() -> anyhow::Result<()> {
             // loop — no new acquires can happen. Skip close() entirely
             // and acquire_many works as the synchronization primitive
             // it's meant to be.
-            match build_semaphore.acquire_many(cfg.max_builds).await {
+            match semaphore.acquire_many(max_builds).await {
                 Ok(_all_permits) => {
                     info!("all in-flight builds complete");
                 }
@@ -803,8 +535,6 @@ async fn main() -> anyhow::Result<()> {
             info!("build execution stream error, shutting down");
         }
     }
-
-    Ok(())
 }
 
 /// Why the event loop exited. Determines whether to run the full
@@ -822,59 +552,6 @@ enum DrainReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Regression guard against silent default drift. CRITICAL case:
-    /// `fuse_passthrough` defaults to `true` — NOT the serde bool default.
-    /// A drift to `false` adds a userspace copy per FUSE read (~2× per-build
-    /// latency) and would only show up as a vm-phase2a timing regression,
-    /// not a hard failure.
-    #[test]
-    fn config_defaults_are_stable() {
-        let d = Config::default();
-        assert!(
-            d.worker_id.is_empty(),
-            "worker_id auto-detects via hostname"
-        );
-        assert!(d.scheduler_addr.is_empty(), "required, no default");
-        assert!(d.store_addr.is_empty(), "required, no default");
-        assert_eq!(d.max_builds, 1);
-        assert!(d.systems.is_empty(), "systems auto-detect");
-        assert!(d.features.is_empty(), "features empty by default");
-        assert_eq!(d.fuse_mount_point, PathBuf::from("/var/rio/fuse-store"));
-        assert_eq!(d.fuse_cache_dir, PathBuf::from("/var/rio/cache"));
-        assert_eq!(d.fuse_cache_size_gb, 50);
-        assert_eq!(d.fuse_threads, 4);
-        assert!(
-            d.fuse_passthrough,
-            "fuse_passthrough MUST default to true (phase2a behavior); \
-             serde's bool default is false so this needs explicit handling"
-        );
-        assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
-        assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9093");
-        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9193");
-        // Phase2b additions — spec values from configuration.md:68-69.
-        assert_eq!(d.log_rate_limit, 10_000);
-        assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
-        assert_eq!(d.max_leaked_mounts, 3);
-    }
-
-    #[test]
-    fn cli_args_parse_help() {
-        use clap::CommandFactory;
-        CliArgs::command().debug_assert();
-    }
-
-    /// `--fuse-passthrough` must accept explicit true/false (not a flag).
-    #[test]
-    fn cli_fuse_passthrough_explicit_bool() {
-        let args = CliArgs::try_parse_from(["rio-worker", "--fuse-passthrough", "false"]).unwrap();
-        assert_eq!(args.fuse_passthrough, Some(false));
-        let args = CliArgs::try_parse_from(["rio-worker", "--fuse-passthrough", "true"]).unwrap();
-        assert_eq!(args.fuse_passthrough, Some(true));
-        // Absent → None (layering: don't overlay).
-        let args = CliArgs::try_parse_from(["rio-worker"]).unwrap();
-        assert_eq!(args.fuse_passthrough, None);
-    }
 
     /// The drain-wait synchronization: `acquire_many(max)` succeeds
     /// exactly when all in-flight build tasks have dropped their
