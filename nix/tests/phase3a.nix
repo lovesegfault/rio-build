@@ -402,7 +402,12 @@ pkgs.testers.runNixOSTest {
     kubeconfig = k8s.succeed("cat /etc/rancher/k3s/k3s.yaml")
     kubeconfig = kubeconfig.replace("127.0.0.1", "k8s")
     control.succeed("mkdir -p /etc/kube")
-    control.succeed(f"cat > /etc/kube/config << 'EOF'\n{kubeconfig}\nEOF")
+    # NOT an f-string: kubeconfig YAML may contain {} (empty maps)
+    # which Python's f-string would mangle. str concat + heredoc-
+    # with-quoted-delimiter ('EOF' = no shell expansion inside).
+    control.succeed(
+        "cat > /etc/kube/config << 'EOF'\n" + kubeconfig + "\nEOF"
+    )
     control.succeed("chmod 600 /etc/kube/config")
 
     # Restart scheduler to pick up the now-existing kubeconfig.
@@ -411,10 +416,11 @@ pkgs.testers.runNixOSTest {
     control.succeed("systemctl restart rio-scheduler")
     control.wait_for_unit("rio-scheduler.service")
 
-    # Poll the lease object. holderIdentity should be the
-    # scheduler's hostname (systemd %H = "control"). The lease
-    # object is CREATED on first acquire — if it's absent, the
-    # lease loop hasn't succeeded yet.
+    # Poll the lease object. holderIdentity should be "control"
+    # (HOSTNAME env set by scheduler.nix from networking.hostName).
+    # The lease object is CREATED on first acquire — if absent,
+    # the lease loop hasn't succeeded yet (kube client init failed
+    # or still waiting for first 5s tick).
     #
     # 30s timeout: lease loop ticks every 5s (RENEW_INTERVAL);
     # first tick after restart creates the lease. ~5-10s normally.

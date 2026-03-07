@@ -159,11 +159,19 @@ in
         {
           RIO_LEASE_NAME = cfg.lease.name;
           RIO_LEASE_NAMESPACE = cfg.lease.namespace;
-          # Holder ID: %H = hostname (systemd specifier). Each
-          # replica gets a unique holder ID so the Lease can tell
-          # them apart. In a StatefulSet this would be the pod
-          # name (ordinal-suffixed = unique).
-          RIO_LEASE_HOLDER_ID = "%H";
+          # The scheduler's lease.rs:105 reads HOSTNAME (not a
+          # custom RIO_* var) — matches what K8s injects into
+          # pods. systemd doesn't set HOSTNAME by default for
+          # services (only login shells via pam_env), so set it
+          # explicitly from networking.hostName. In a StatefulSet
+          # this would be the pod name (ordinal-suffixed = unique
+          # per replica).
+          #
+          # NOT %H: systemd %-specifiers are only expanded in
+          # ExecStart/ExecStop/etc, not in Environment= entries.
+          # config.networking.hostName is evaluated at nix-build
+          # time, which is correct (static per-VM, not dynamic).
+          HOSTNAME = config.networking.hostName;
         }
         // lib.optionalAttrs (cfg.lease.kubeconfigPath != null) {
           KUBECONFIG = cfg.lease.kubeconfigPath;
