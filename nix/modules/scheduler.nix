@@ -79,6 +79,45 @@ in
             ${"''"};
       '';
     };
+
+    lease = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.submodule {
+          options = {
+            name = lib.mkOption {
+              type = lib.types.str;
+              description = "Kubernetes Lease name for leader election (`RIO_LEASE_NAME`).";
+            };
+            namespace = lib.mkOption {
+              type = lib.types.str;
+              default = "default";
+              description = "Namespace for the Lease object (`RIO_LEASE_NAMESPACE`).";
+            };
+            kubeconfigPath = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = ''
+                Path to kubeconfig for out-of-cluster lease API access (`KUBECONFIG`).
+                Leave null for in-cluster config (ServiceAccount token mount).
+                The scheduler's `kube::Client::try_default()` tries in-cluster
+                first, then `KUBECONFIG`. If both fail, the lease loop exits
+                gracefully and the scheduler runs as standby (never dispatches).
+              '';
+            };
+          };
+        }
+      );
+      default = null;
+      description = ''
+        Kubernetes Lease leader election. When set, the scheduler
+        uses a K8s Lease object to coordinate multiple replicas —
+        only the lease holder dispatches builds. `null` (default)
+        disables leader election: single-replica mode, always the
+        leader.
+
+        The holder ID is the hostname (systemd `%H`).
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -115,7 +154,21 @@ in
       }
       // lib.optionalAttrs (cfg.logS3Bucket != null) {
         RIO_LOG_S3_BUCKET = cfg.logS3Bucket;
-      };
+      }
+      // lib.optionalAttrs (cfg.lease != null) (
+        {
+          RIO_LEASE_NAME = cfg.lease.name;
+          RIO_LEASE_NAMESPACE = cfg.lease.namespace;
+          # Holder ID: %H = hostname (systemd specifier). Each
+          # replica gets a unique holder ID so the Lease can tell
+          # them apart. In a StatefulSet this would be the pod
+          # name (ordinal-suffixed = unique).
+          RIO_LEASE_HOLDER_ID = "%H";
+        }
+        // lib.optionalAttrs (cfg.lease.kubeconfigPath != null) {
+          KUBECONFIG = cfg.lease.kubeconfigPath;
+        }
+      );
 
       serviceConfig = {
         ExecStart = "${config.services.rio.package}/bin/rio-scheduler";

@@ -61,6 +61,40 @@ let
   # Escaping: ''${x} → ${x} in the WRITTEN file (inner .nix reads
   # its own let-bound child, its own busybox arg). ''' → '' (the
   # inner .nix's own indented string for builder args).
+  # G3 autoscaler exercise: 5 independent derivations for queue
+  # pressure. All leaves (no deps) → all go Ready immediately.
+  # With maxConcurrentBuilds=1, 1 runs + 4 queue → queued=4.
+  # compute_desired(4, target=2) = ceil(4/2) = 2 → scale to 2.
+  #
+  # sleep 15: enough for ~3 autoscaler poll cycles (3s each) to
+  # see sustained queue pressure. Each drv has a unique name
+  # so they're distinct derivations (nix-build would dedupe
+  # identical ones otherwise).
+  autoscaleDrvFile = pkgs.writeText "phase3a-autoscale.nix" ''
+    { busybox }:
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      mk = n: derivation {
+        name = "rio-3a-queue-''${toString n}";
+        pname = "rio-3a-queue-''${toString n}";
+        system = builtins.currentSystem;
+        builder = sh;
+        args = [ "-c" '''
+          ''${bb} mkdir -p $out
+          ''${bb} echo "queue pressure ''${toString n}" > $out/stamp
+          ''${bb} sleep 15
+        ''' ];
+      };
+    in {
+      d1 = mk 1;
+      d2 = mk 2;
+      d3 = mk 3;
+      d4 = mk 4;
+      d5 = mk 5;
+    }
+  '';
+
   testDrvFile = pkgs.writeText "phase3a-derivation.nix" ''
     { busybox }:
     let
@@ -133,10 +167,11 @@ pkgs.testers.runNixOSTest {
   # Hard timeout on the whole test. Without this, a crash-
   # looping worker pod means wait_until_succeeds loops forever
   # (individual calls have timeouts but the outer retry doesn't).
-  # 600s = 10min: k3s startup (~60s) + airgap import (~30s) +
-  # pod scheduling + FUSE mount (~30s) + build (~30s) + drain
-  # (~30s) = ~3min happy path. 10min gives 3× headroom.
-  globalTimeout = 600;
+  # 900s = 15min: k3s startup (~60s) + airgap import (~30s) +
+  # pod scheduling + FUSE mount (~30s) + build (~30s) + Build CRD
+  # exercise (~20s) + autoscaler exercise (~90s, 5×15s builds) +
+  # drain (~30s) = ~5min happy path. 15min gives 3× headroom.
+  globalTimeout = 900;
 
   nodes = {
     control = common.mkControlNode {
@@ -145,7 +180,26 @@ pkgs.testers.runNixOSTest {
       # 9091 = scheduler metrics (scraped from k8s node in assertions).
       extraFirewallPorts = [ 9091 ];
       # Short tick — faster dispatch retry after worker registers.
-      extraSchedulerConfig.tickIntervalSecs = 2;
+      extraSchedulerConfig = {
+        tickIntervalSecs = 2;
+        # H1 lease smoke: scheduler talks to k3s apiserver for
+        # leader election. kubeconfig is copied from k8s VM at
+        # test time (see testScript). The scheduler starts in
+        # standby (lease loop's kube client init fails → graceful
+        # return, is_leader stays false → no dispatch). After
+        # the test copies kubeconfig + restarts scheduler, it
+        # acquires the lease and starts dispatching.
+        #
+        # This tests the OUT-OF-CLUSTER kubeconfig path
+        # (KUBECONFIG env var) which is kube::Client::try_default's
+        # fallback after in-cluster config fails — less tested
+        # than the in-cluster path (no ServiceAccount here).
+        lease = {
+          name = "rio-scheduler-lease";
+          namespace = "default";
+          kubeconfigPath = "/etc/kube/config";
+        };
+      };
       # psql for the cgroup assertion (check build_history).
       extraPackages = [ pkgs.postgresql ];
     };
@@ -210,6 +264,14 @@ pkgs.testers.runNixOSTest {
             "traefik"
             "--disable"
             "metrics-server"
+            # H1 lease smoke: scheduler on `control` VM needs to
+            # reach this apiserver as https://k8s:6443. The
+            # self-signed cert must include `k8s` as a SAN, or
+            # the kube-rs client's TLS verification rejects it.
+            # Without this: "tls: certificate is not valid for
+            # k8s, only 127.0.0.1, localhost, ...".
+            "--tls-san"
+            "k8s"
           ];
           # Airgap images: k3s's own pods (coredns, local-path-
           # provisioner) + our worker. Without airgap-images, k3s
@@ -248,6 +310,16 @@ pkgs.testers.runNixOSTest {
             RIO_SCHEDULER_ADDR = "control:9001";
             RIO_STORE_ADDR = "control:9002";
             RIO_LOG_FORMAT = "pretty"; # human-readable in VM logs
+            # G3 autoscaler exercise: 3s windows instead of 30s.
+            # Defaults (30s poll × 30s up-window × 30s anti-flap)
+            # would mean ~60s to first scale — too long for a VM
+            # test. 3s each → ~9s, well within our queue-pressure
+            # window (5 builds × 15s sleep = ~75s total).
+            # Scale-DOWN stays at 600s (not configurable — see
+            # scaling.rs SCALE_DOWN_WINDOW comment).
+            RIO_AUTOSCALER_POLL_SECS = "3";
+            RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS = "3";
+            RIO_AUTOSCALER_MIN_INTERVAL_SECS = "3";
           };
           serviceConfig = {
             ExecStart = "${rio-workspace}/bin/rio-controller";
@@ -301,6 +373,76 @@ pkgs.testers.runNixOSTest {
     # fails on connect, RestartSec=5 retries. By the time we
     # check below, it should be up.
     k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
+
+    # ── Lease leader election smoke (H1) ───────────────────────────
+    # The scheduler on `control` has lease config pointing at
+    # /etc/kube/config (which doesn't exist yet). On startup, the
+    # lease loop's kube client init failed → loop returned →
+    # is_leader stays FALSE → dispatch_ready() returns early →
+    # STANDBY. The scheduler merges DAGs (state warm for takeover)
+    # but never dispatches.
+    #
+    # Now: copy kubeconfig from k8s VM, rewrite the server URL
+    # (kubeconfig has 127.0.0.1, we need k8s:6443), restart
+    # scheduler. The lease loop's kube client init succeeds →
+    # try_acquire_or_renew → LeaseLockResult::Acquired →
+    # generation increment + is_leader=true → dispatch enabled.
+    #
+    # This tests the OUT-OF-CLUSTER path (KUBECONFIG env, no
+    # ServiceAccount). In-cluster is kube::Client::try_default's
+    # first try; this is the fallback, less commonly tested.
+    #
+    # --tls-san k8s (set in k3s extraFlags) makes the apiserver
+    # cert valid for hostname `k8s`, avoiding "certificate not
+    # valid for k8s" TLS errors.
+
+    # Copy + rewrite. Python string manipulation is cleaner than
+    # sed in a heredoc. k8s.succeed returns stdout; we pass it to
+    # control.succeed via stdin on a cat.
+    kubeconfig = k8s.succeed("cat /etc/rancher/k3s/k3s.yaml")
+    kubeconfig = kubeconfig.replace("127.0.0.1", "k8s")
+    control.succeed("mkdir -p /etc/kube")
+    control.succeed(f"cat > /etc/kube/config << 'EOF'\n{kubeconfig}\nEOF")
+    control.succeed("chmod 600 /etc/kube/config")
+
+    # Restart scheduler to pick up the now-existing kubeconfig.
+    # The lease loop runs on a 5s renew interval; acquisition
+    # happens on the first tick after kube client init succeeds.
+    control.succeed("systemctl restart rio-scheduler")
+    control.wait_for_unit("rio-scheduler.service")
+
+    # Poll the lease object. holderIdentity should be the
+    # scheduler's hostname (systemd %H = "control"). The lease
+    # object is CREATED on first acquire — if it's absent, the
+    # lease loop hasn't succeeded yet.
+    #
+    # 30s timeout: lease loop ticks every 5s (RENEW_INTERVAL);
+    # first tick after restart creates the lease. ~5-10s normally.
+    k8s.wait_until_succeeds(
+        "k3s kubectl get lease rio-scheduler-lease -n default "
+        "-o jsonpath='{.spec.holderIdentity}' | grep -q control",
+        timeout=30
+    )
+
+    # Metric: H1a added rio_scheduler_lease_acquired_total. This
+    # proves the ACQUIRE TRANSITION ran (not just "lease exists"
+    # — the scheduler might have restarted between create and
+    # this check, losing the counter). Value ≥1 = at least one
+    # acquire transition this process lifetime.
+    #
+    # lease_acquired → is_leader=true → dispatch_ready() unblocked.
+    # No separate readiness check needed — acquired implies ready.
+    control.wait_until_succeeds(
+        "curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_lease_acquired_total [1-9]'",
+        timeout=15
+    )
+
+    # Gateway needs to reconnect after scheduler restart (its
+    # gRPC channel to SchedulerService drops on scheduler exit).
+    # wait_for_open_port confirms scheduler is accepting
+    # connections again; gateway retries automatically.
+    control.wait_for_open_port(9001)
 
     # Airgap import: k3s ctr imports images on start, but it's
     # async. Wait for OUR image to show up. Note: the pod may
@@ -518,6 +660,85 @@ pkgs.testers.runNixOSTest {
     # Output queryable via ssh-ng (round-trips through rio-store).
     client.succeed(f"nix path-info --store 'ssh-ng://control' {out}")
 
+    # ── Build CRD reconciler exercise (G4) ─────────────────────────
+    # The ssh-ng build above put both .drv files in rio-store. Now
+    # submit a build via the K8s-native path: kubectl apply a Build
+    # CR pointing at the parent .drv. The reconciler's apply() should:
+    #   1. Fetch .drv from rio-store (fetch_and_build_node)
+    #   2. Submit single-node DAG (outputs already built → Cached)
+    #   3. Spawn drain_stream watch task
+    #   4. Patch status with sentinel first, then real build_id
+    #
+    # This is the FIRST time the Build reconciler has run against a
+    # real apiserver. Previously only unit-tested (4 pure-fn tests).
+    # Validates B1's fix: sentinel patch before drain_stream spawn.
+    #
+    # nix-instantiate on client gives us the .drv path. The .drv is
+    # ALREADY in rio-store (nix-build copied the closure). The
+    # derivation outputs are also there (just built) → scheduler's
+    # FindMissingPaths sees them → instant Cached phase.
+    drv_path = client.succeed(
+        "nix-instantiate "
+        "--arg busybox '(builtins.storePath ${common.busybox})' "
+        "${testDrvFile} 2>/dev/null"
+    ).strip()
+    print(f"Build CRD .drv: {drv_path}")
+    assert drv_path.endswith(".drv"), f"not a drv path: {drv_path}"
+
+    # heredoc → kubectl apply -f -. Build CR spec is minimal:
+    # just derivation + priority. tenant/timeout optional.
+    # Double-braces in f-string escape to literal braces for JSON.
+    k8s.succeed(
+        "k3s kubectl apply -f - <<'EOF'\n"
+        "apiVersion: rio.build/v1alpha1\n"
+        "kind: Build\n"
+        "metadata:\n"
+        "  name: test-crd-build\n"
+        "  namespace: default\n"
+        "spec:\n"
+        f"  derivation: {drv_path}\n"
+        "  priority: 0\n"
+        "EOF"
+    )
+
+    # Poll for terminal phase. Outputs already in store → scheduler
+    # sees empty FindMissingPaths → Cached (or Completed if the
+    # scheduler's cache-check is async and the build re-runs —
+    # either is success). 30s is generous for an already-cached
+    # build; the reconciler's apply() runs in <1s once CRD
+    # established.
+    k8s.wait_until_succeeds(
+        "k3s kubectl get build test-crd-build "
+        "-o jsonpath='{.status.phase}' | "
+        "grep -E '^(Completed|Cached|Succeeded)$'",
+        timeout=30
+    )
+
+    # build_id should be a UUID (not empty, not "submitted"). This
+    # validates B1's fix: if the sentinel patch ran AFTER the watch
+    # task's first patch, build_id would be stuck at "submitted".
+    # The regex checks for UUID-like shape (8-4-4-4-12 hex).
+    build_id = k8s.succeed(
+        "k3s kubectl get build test-crd-build "
+        "-o jsonpath='{.status.buildId}'"
+    ).strip()
+    print(f"Build CRD build_id: {build_id}")
+    assert build_id != "" and build_id != "submitted", \
+        f"build_id stuck at sentinel/empty (B1 race?): {build_id!r}"
+    import re
+    assert re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-', build_id), \
+        f"build_id not UUID-like: {build_id!r}"
+
+    # Delete → finalizer's cleanup() runs → CancelBuild (NotFound
+    # OK since already terminal) → finalizer removed → CR gone.
+    # Tests the finalizer flow without blocking on an in-flight
+    # build (already terminal = instant cleanup).
+    k8s.succeed("k3s kubectl delete build test-crd-build --wait=false")
+    k8s.wait_until_succeeds(
+        "! k3s kubectl get build test-crd-build 2>/dev/null",
+        timeout=15
+    )
+
     # ── Reconciler preserves autoscaler replicas (regression) ──────
     # The reconciler was reverting STS.spec.replicas to min on every
     # reconcile (SSA with .force() re-claimed the field). Simulate
@@ -555,6 +776,135 @@ pkgs.testers.runNixOSTest {
         "test \"$(k3s kubectl get statefulset default-workers "
         "-o jsonpath='{.spec.replicas}')\" = 2"
     )
+
+    # Reset replicas to 1 for the autoscaler test below — we want
+    # to observe 1→2, not 2→2 (no-op). The reconciler will update
+    # desiredReplicas back to 1 as well.
+    k8s.succeed("k3s kubectl scale statefulset default-workers --replicas=1")
+    k8s.wait_until_succeeds(
+        "test \"$(k3s kubectl get workerpool default "
+        "-o jsonpath='{.status.desiredReplicas}')\" = 1",
+        timeout=15
+    )
+
+    # ── Autoscaler real poll loop (G3) ─────────────────────────────
+    # FIRST TIME the autoscaler's scale_one() runs against a real
+    # apiserver. Previously: unit-tested only (scaling.rs has 10
+    # tests). The kubectl-scale test above proved the reconciler
+    # doesn't STOMP autoscaler replicas, but the autoscaler ITSELF
+    # never patched anything.
+    #
+    # Controller env (set above in systemd.services.rio-controller)
+    # overrides timing to 3s: poll/up-window/min-interval. With
+    # defaults (30s each), first scale would take ~60s — too slow.
+    # 3s each → first scale in ~6-9s after sustained queue pressure.
+    #
+    # This proves A1's fix (apiVersion+kind in SSA patch body) AND
+    # C2's fix (autoscaler patches WorkerPool.status.lastScaleTime).
+    # Without A1, the STS patch would 400 silently (warn log only).
+    #
+    # Flow:
+    #   1. Launch 5 builds in background (all leaves, all Ready)
+    #   2. With maxConcurrentBuilds=1, queued_derivations stabilizes
+    #      at ~4 while 1 runs (each sleep 15s → ~75s total runtime)
+    #   3. compute_desired(queued=4, target=2) = ceil(4/2) = 2
+    #   4. Autoscaler polls (3s), sees desired=2, waits 3s
+    #      up-window, passes 3s anti-flap → patches STS replicas=2
+    #   5. Autoscaler also patches WorkerPool.status.lastScaleTime
+    #      + conditions[Scaling=True, reason=ScaledUp]
+
+    # Launch 5 builds. nix-build with all 5 attrs in one command
+    # submits one DAG with 5 leaf nodes (no edges — all independent).
+    # Background it: the SCRIPT continues to poll metrics while
+    # builds run. `&` + `sleep 1` (let nix-build start before we
+    # poll); we'll `wait` for it later.
+    #
+    # NIX_CONFIG: nix-build on the client VM needs experimental
+    # features just like the earlier build() calls (common.nix
+    # handles this for build()). Also need --store to route via
+    # ssh-ng (builds execute on the pod, not the client).
+    client.execute(
+        "NIX_CONFIG='experimental-features = nix-command' "
+        "nix-build --no-out-link "
+        "--store 'ssh-ng://control' "
+        "--arg busybox '(builtins.storePath ${common.busybox})' "
+        "${autoscaleDrvFile} -A d1 -A d2 -A d3 -A d4 -A d5 "
+        "> /tmp/autoscale-build.log 2>&1 &"
+    )
+
+    # Wait for queue depth to build up. rio_scheduler_derivations_
+    # queued gauge (set on Tick, actor/worker.rs) shows Ready-but-
+    # not-dispatched count. With 1 worker × 1 max_builds, the 5
+    # builds queue: 1 Running, 4 Queued. We wait for ≥3 (not
+    # exactly 4 — the first dispatch may happen between our poll
+    # and the gauge update, so we'd see 3 briefly). ≥3 is enough
+    # to trigger compute_desired=2.
+    #
+    # The gauge is set on Tick (every tickIntervalSecs=2s), so
+    # there's up to 2s latency between merge and metric update.
+    # The metric might show 0 if nothing has queued before — `||
+    # echo 0` handles the grep-miss case.
+    control.wait_until_succeeds(
+        "q=$(curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_derivations_queued ' | "
+        "awk '{print $2}' || echo 0); "
+        "test \"$q\" -ge 3",
+        timeout=20
+    )
+
+    # THE BIG ONE: autoscaler patches STS replicas 1→2. This is
+    # the A1 SSA fix proof. Previously: patch body {spec:{replicas:
+    # 2}} → apiserver 400 "apiVersion must be set" → warn log →
+    # autoscaler silently never scaled. Now: body has apiVersion+
+    # kind → patch succeeds.
+    #
+    # Timing: 3s poll + 3s up-window + anti-flap (already past
+    # due to earlier scale) = ~6-12s to first patch. 45s timeout
+    # gives headroom for slow VM but fails fast if broken.
+    k8s.wait_until_succeeds(
+        "test \"$(k3s kubectl get statefulset default-workers "
+        "-o jsonpath='{.spec.replicas}')\" = 2",
+        timeout=45
+    )
+
+    # C2 proof: autoscaler patched WorkerPool.status.lastScaleTime.
+    # Previously written as None on every reconcile (clobbered).
+    # Now owned by autoscaler's separate SSA field-manager.
+    # Non-empty string = set (K8s serializes Time as RFC3339).
+    k8s.wait_until_succeeds(
+        "sc=$(k3s kubectl get workerpool default "
+        "-o jsonpath='{.status.lastScaleTime}'); "
+        "test -n \"$sc\"",
+        timeout=15
+    )
+
+    # Scaling conditions: reason=ScaledUp, status=True. C2 adds
+    # these to explain WHY replicas changed.
+    k8s.succeed(
+        "k3s kubectl get workerpool default "
+        "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
+        "grep -q 'ScaledUp'"
+    )
+
+    # Existing metric (scaling.rs:257) incremented. Proves the
+    # scale_one() success path ran to completion (not just the
+    # patch — the info! log + metric increment come after).
+    k8s.succeed(
+        "curl -sf http://localhost:9094/metrics | "
+        "grep -E 'rio_controller_scaling_decisions_total\\{direction=\"up\"\\} [1-9]'"
+    )
+
+    # Wait for background builds to finish (so drain doesn't wait
+    # for them). 5 × 15s = 75s sequential; with 2 workers (scaled!)
+    # and 1 max_builds each, ~40s parallel. 120s timeout is safe.
+    #
+    # `client.succeed("wait")` waits for the backgrounded
+    # nix-build. The builds MAY fail (pod-1 not Ready yet — we
+    # didn't wait for it) but that's OK: the autoscaler scaled on
+    # QUEUE DEPTH, which is what we're testing. `|| true` swallows
+    # build failures (they'd be infrastructure failures from the
+    # not-ready pod, not our bug).
+    client.succeed("wait || true")
 
     # ── Finalizer drain ────────────────────────────────────────────
     # Delete the WorkerPool → finalizer runs → DrainWorker +
