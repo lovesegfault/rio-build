@@ -42,7 +42,6 @@ service StoreService {
 > **PutPath stream shape:** `metadata` (1) → `nar_chunk` (0+) → `trailer` (1, mandatory). The `nar_hash` / `nar_size` go in the **trailer**, NOT the metadata — `metadata.info.nar_hash` MUST be empty (store rejects non-empty as a protocol violation). This enables single-pass streaming: the worker's `HashingChannelWriter` tee reads the file once, hashing + uploading simultaneously (~256 KiB peak memory, down from 8 GiB pre-phase2b).
 
 ```protobuf
-
 service ChunkService {
   rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);  // UNIMPLEMENTED — server-side chunking only
   rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
