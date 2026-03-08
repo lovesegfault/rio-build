@@ -56,7 +56,7 @@ The fields are sent in order, all as `u64` unless noted. `wopSetOptions` is **ma
 10. `obsolete_printBuildTrace` (u64: 0)
 11. `buildCores` (u64)
 12. `useSubstitutes` (u64 bool)
-13. *(version >= 1.12)* `overrides_count` (u64) followed by `overrides_count` pairs of `(key: string, value: string)`
+13. `overrides_count` (u64) followed by `overrides_count` pairs of `(key: string, value: string)` --- always present since the minimum accepted client version is 1.37
 
 r[gw.opcode.set-options.propagation]
 **Override propagation:** The `overrides` key-value pairs contain client build settings (e.g., `max-silent-time`, `build-timeout`). The gateway extracts relevant overrides and propagates them through the build pipeline: gateway -> scheduler (via gRPC) -> workers. This ensures client-specified timeouts are honored by the actual build execution.
@@ -92,7 +92,7 @@ For protocol >= 1.25 (always present since we target 1.37+):
 | `sigs` | string collection | Signatures |
 | `ca` | string | Content address (empty for input-addressed) |
 | `repair` | u64 bool | Whether to repair/overwrite existing path |
-| `dontCheckSigs` | u64 bool | Skip signature verification (always treated as false by rio-gateway) |
+| `dontCheckSigs` | u64 bool | Skip signature verification (read and discarded by rio-gateway; signature enforcement, if any, is delegated to rio-store) |
 
 r[gw.opcode.add-to-store-nar.framing]
 After sending the metadata fields, the NAR data is transferred as a **framed byte stream** (protocol >= 1.23, always true for 1.37+):
@@ -129,7 +129,7 @@ Each entry in the byte stream contains:
 The outer framed stream terminates with a `u64(0)` sentinel.
 
 r[gw.opcode.add-multiple.dont-check-sigs-ignored]
-**`dontCheckSigs` handling:** The gateway always treats `dontCheckSigs` as `false` regardless of the value sent by the client. This is a security requirement --- remote clients must never bypass signature verification. The field is read and discarded to maintain wire compatibility.
+**`dontCheckSigs` handling:** The gateway reads and discards `dontCheckSigs`. The gateway does not perform signature verification itself; signature enforcement (if any) is delegated to rio-store. The field is consumed to maintain wire compatibility.
 
 **Response:** The server sends `STDERR_LAST` with no result value (matching the `wopAddMultipleToStore` handler's `logger->stopWork()` sequence in `daemon.cc`).
 
@@ -374,7 +374,7 @@ The feature sets are intersected to determine the negotiated features. rio-build
 |------|-----------|------|------|
 | 7 | C -> S | Obsolete CPU affinity (always 0; if non-zero, followed by a second u64 mask) | u64 |
 | 8 | C -> S | `reserveSpace` (always 0) | u64 |
-| 9 | S -> C | Nix version string (e.g. `"rio-build 0.1.0"`) | string |
+| 9 | S -> C | Nix version string (e.g. `"rio-gateway 0.1.0"`) | string |
 | 10 | S -> C | Trusted status: 0 = unknown, 1 = trusted, 2 = not-trusted | u64 |
 
 r[gw.handshake.initial-stderr-last]
@@ -450,6 +450,8 @@ This is a complex nested structure. The gateway must construct it correctly for 
 
 r[gw.stderr.error-before-return]
 **Every handler error path that returns `Err(...)` MUST send `STDERR_ERROR` to the client first.** Never use bare `?` to propagate errors from store operations, NAR extraction, or ATerm parsing --- always wrap in a match that sends `STDERR_ERROR` before returning. For batch opcodes like `wopBuildPathsWithResults`, per-entry errors should push `BuildResult::failure` and `continue`, not abort the entire batch.
+
+> **Exception — `wopQueryRealisation`:** The handler sends `STDERR_LAST` before invoking the store (to avoid buffering the response). A store error after that point is too late for `STDERR_ERROR`; instead the handler returns empty-set (`u64(0)`) and logs a warning. This is a degraded path (one missed CA cache hit), not a correctness violation; the next opcode on the session will hit the same store and fail through its own error path.
 
 | Field | Type | Description |
 |-------|------|-------------|
