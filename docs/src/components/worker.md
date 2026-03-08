@@ -5,8 +5,8 @@ Long-running process in a StatefulSet pod that executes individual derivations.
 ## Responsibilities
 
 - Receive build assignments from scheduler via gRPC
-- Run the FUSE store daemon (`rio-fuse`) that mounts `/nix/store` with lazy on-demand fetching from rio-store
-- Manage per-build overlay filesystem: FUSE mount as lower layer, local SSD as upper layer
+- Run the FUSE store daemon (`rio-fuse`) that mounts at `/var/rio/fuse-store` (configurable) with lazy on-demand fetching from rio-store
+- Manage per-build overlay filesystem: FUSE mount as lower layer, local SSD as upper layer; the overlay's merged dir is bind-mounted at `/nix/store` inside the build's mount namespace
 - Execute build: invoke `nix-daemon --stdio` locally for sandboxed build execution
 - Stream build logs back to scheduler via gRPC bidirectional streaming
 - After build: upload output NAR to rio-store (chunked), report completion
@@ -15,14 +15,14 @@ Long-running process in a StatefulSet pod that executes individual derivations.
 
 ## FUSE Store (`rio-fuse`)
 
-Each worker runs a FUSE filesystem that presents `/nix/store` to the build environment. The FUSE daemon communicates with rio-store via gRPC to lazily fetch store path content on demand.
+Each worker runs a FUSE filesystem that presents store paths to the build environment. The FUSE daemon mounts at `/var/rio/fuse-store` (configurable --- **never** directly at `/nix/store`, which would shadow the host store and break every process on the machine including the worker itself). The per-build overlay's merged directory is what gets bind-mounted at `/nix/store`, and only inside the build's mount namespace. The FUSE daemon communicates with rio-store via gRPC to lazily fetch store path content on demand.
 
 ```
                          Worker Pod
 ┌──────────────────────────────────────────────────────────┐
 │                                                          │
 │  rio-fuse (FUSE daemon)                                  │
-│  ├── Mounts /nix/store                                   │
+│  ├── Mounts /var/rio/fuse-store                          │
 │  ├── On file access: fetches from rio-store via gRPC     │
 │  ├── Local SSD cache (LRU eviction)                      │
 │  ├── Immutable content → no cache invalidation needed    │
@@ -88,14 +88,14 @@ The `fuser` 0.17 crate includes breaking API changes from 0.14/0.15 that affect 
 ```mermaid
 graph TB
     subgraph "Worker Pod"
-        FUSE["rio-fuse daemon<br/>(FUSE mount at /nix/store)"]
+        FUSE["rio-fuse daemon<br/>(FUSE mount at /var/rio/fuse-store)"]
         Cache["SSD Cache<br/>(LRU, Arc&lt;Cache&gt;)"]
-        subgraph "Build A"
-            OA["overlayfs<br/>upper: /var/rio/overlays/build-a<br/>lower: /nix/store (FUSE)"]
+        subgraph "Build A (child mount ns)"
+            OA["overlayfs merged<br/>upper: /var/rio/overlays/build-a<br/>lower: host /nix/store : FUSE<br/>bind-mounted at /nix/store"]
             SA["nix sandbox<br/>(user/mount/PID/net ns)"]
         end
-        subgraph "Build B"
-            OB["overlayfs<br/>upper: /var/rio/overlays/build-b<br/>lower: /nix/store (FUSE)"]
+        subgraph "Build B (child mount ns)"
+            OB["overlayfs merged<br/>upper: /var/rio/overlays/build-b<br/>lower: host /nix/store : FUSE<br/>bind-mounted at /nix/store"]
             SB["nix sandbox"]
         end
     end
@@ -160,7 +160,7 @@ r[worker.overlay.stacked-lower]
 The overlay lower-dir stack is `lowerdir=/nix/store:{fuse_mount}` --- host store **first** so `nix-daemon` and its deps are reachable after bind-mount at `/nix/store`. FUSE second for rio-store paths. With `writableStore=false` on the worker VM, `/nix/store` is a plain mount; otherwise the VM's store would itself be an overlay and overlay-as-lower may break.
 
 r[worker.overlay.upper-not-overlayfs]
-> **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the worker's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/nix/store`. The upper also MUST NOT itself be on an overlayfs (containerd root overlay) — overlayfs-as-upperdir cannot create `trusted.*` xattrs and `mount()` returns `EINVAL`.
+> **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the worker's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/var/rio/fuse-store`. The upper also MUST NOT itself be on an overlayfs (containerd root overlay) — overlayfs-as-upperdir cannot create `trusted.*` xattrs and `mount()` returns `EINVAL`.
 
 After build completes:
 
@@ -246,10 +246,10 @@ Fixed-output derivations (FODs) have a known output hash declared in `outputHash
 r[worker.ns.order]
 Both overlayfs and the Nix sandbox use mount namespaces. The correct ordering is:
 
-1. Worker sets up the FUSE mount at `/nix/store` (in the worker's mount namespace)
-2. Worker creates per-build overlayfs mount (FUSE as lower, SSD as upper)
-3. Worker forks `nix-daemon --stdio` --- the overlay is inherited by the child
-4. Nix sandbox does `unshare(CLONE_NEWNS)` to create a new mount namespace
+1. Worker sets up the FUSE mount at `/var/rio/fuse-store` and creates the per-build overlayfs (stacked lower: host `/nix/store` then FUSE; upper: SSD) --- both in the worker's mount namespace
+2. Worker forks `nix-daemon --stdio` in a fresh child mount namespace (`unshare(CLONE_NEWNS)`)
+3. Inside the child's mount namespace only, the overlay's merged dir is bind-mounted at `/nix/store` --- the worker's own view of `/nix/store` is untouched
+4. Nix sandbox does another `unshare(CLONE_NEWNS)` for the build itself
 5. Inside the sandbox, Nix bind-mounts specific paths from the overlay into the build chroot
 6. Nix calls `pivot_root` to enter the chroot
 

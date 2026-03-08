@@ -1,8 +1,10 @@
 //! FUSE store daemon for rio-worker.
 //!
-//! Mounts `/nix/store` via `fuser` 0.17 and serves store paths from a local
-//! SSD cache backed by remote `StoreService` gRPC. The FUSE mount is shared
-//! across all concurrent builds as the lower layer of per-build overlayfs mounts.
+//! Mounts at `/var/rio/fuse-store` (configurable; NEVER `/nix/store`) via
+//! `fuser` 0.17 and serves store paths from a local SSD cache backed by remote
+//! `StoreService` gRPC. The FUSE mount is shared across all concurrent builds
+//! as a lower layer of per-build overlayfs mounts; the overlay's merged dir is
+//! bind-mounted at `/nix/store` only inside each build's child mount namespace.
 // r[impl worker.fuse.passthrough]
 //!
 //! Key design points:
