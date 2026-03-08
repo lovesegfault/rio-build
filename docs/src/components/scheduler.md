@@ -13,8 +13,8 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 - Closure-locality affinity: score workers by normalized transfer cost, using bloom filter approximation from worker heartbeats
 - Priority queue with inter-build priority (CI > interactive > scheduled) and intra-build priority (critical path)
 - IFD prioritization: builds that block evaluation get maximum priority (detected by protocol sequencing --- `wopBuildDerivation` arriving before `wopBuildPathsWithResults` on the same session)
-- CA early cutoff: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved
-- Work reassignment: when a worker fails or is slow (actual\_time > estimated\_time * 3), reassign to another worker (only if idle workers are available)
+- CA early cutoff _(Phase 5+, not yet implemented)_: per-edge tracking --- when a CA derivation output matches cached content, mark that edge as cutoff and skip downstream only when ALL input edges are resolved
+- Work reassignment: when a worker fails (stream closed, heartbeat timeout), reassign its in-flight derivations to another worker. _Slow-worker speculative reassignment (actual\_time > estimated\_time × 3) is deferred — see Phase 4._
 - Poison derivation tracking: mark derivations that fail on 3+ different workers; auto-expire after 24h. See [Error Taxonomy](../errors.md) for details.
 
 ## Concurrency Model
@@ -45,8 +45,8 @@ The scheduling algorithm below is implemented as of Phase 2c: critical-path prio
 6. Compute critical path priorities (bottom-up traversal)
 7. For each ready node (all deps satisfied):
    a. Estimate duration (existing EMA / fallback chain, see Duration Estimation)
-   b. Classify into size class based on estimated duration vs WorkerPoolSet cutoffs
-      (see Size-Class Routing below). If no WorkerPoolSet is configured, skip this step.
+   b. Classify into size class based on estimated duration vs configured cutoffs
+      (see Size-Class Routing below). If no size classes are configured, skip this step.
       If ema_peak_memory_bytes exceeds the target class's memory limit, bump to the next class.
    c. Score each worker (filtered to the target size class if applicable):
       - Resource fit (hard filter): does worker have required features, enough CPU/memory?
@@ -118,12 +118,14 @@ The `build_history` table also tracks peak resource usage (memory, CPU, output s
 
 ## Size-Class Routing
 
-When a `WorkerPoolSet` CRD is configured, the scheduler routes derivations to right-sized worker pools based on estimated duration and resource needs. This is inspired by [SITA-E (Size Interval Task Assignment with Equal load)](https://dl.acm.org/doi/10.1145/506147.506154), adapted for non-preemptible Nix builds.
+> **Current configuration source:** size classes are configured via static TOML (`[[size_classes]]` tables in `scheduler.toml`). Workers declare their class in the heartbeat. `WorkerPoolSet` CRD integration is deferred to Phase 4 — for now, cutoffs are operator-maintained static values.
+
+When size classes are configured, the scheduler routes derivations to right-sized worker pools based on estimated duration and resource needs. This is inspired by [SITA-E (Size Interval Task Assignment with Equal load)](https://dl.acm.org/doi/10.1145/506147.506154), adapted for non-preemptible Nix builds.
 
 ### Classification
 
 r[sched.classify.smallest-covering]
-Each derivation is classified into a size class by comparing its estimated duration against the `WorkerPoolSet` cutoffs:
+Each derivation is classified into a size class by comparing its estimated duration against the configured cutoffs:
 
 ```
 class(drv) = smallest class i where estimated_duration(drv) <= cutoff_i
@@ -132,7 +134,7 @@ class(drv) = smallest class i where estimated_duration(drv) <= cutoff_i
 r[sched.classify.mem-bump]
 If `ema_peak_memory_bytes` for a derivation exceeds the target class's memory limit, the derivation is bumped to the next larger class regardless of duration (resource-aware class bumping).
 
-If no `WorkerPoolSet` is configured, classification is skipped and all workers are candidates (backward compatible with single `WorkerPool` deployments).
+If no size classes are configured (empty `[[size_classes]]`), classification is skipped and all workers are candidates (backward compatible with single `WorkerPool` deployments).
 
 ### Misclassification Handling
 
@@ -181,8 +183,8 @@ Nix builds cannot be paused or resumed, so **running builds are never preempted 
 **Exception**: the only case where a running build is killed is worker pod termination (scale-down, node failure). The preStop hook gives the build time to complete; if it cannot finish within the grace period, it is reassigned.
 
 Queue-level preemption is fully supported:
-- High-priority derivations jump ahead of lower-priority queued (not yet running) work
-- Priority lanes: a configurable fraction of workers (default: 25%) is reserved for high-priority builds, preventing starvation
+- High-priority derivations jump ahead of lower-priority queued (not yet running) work. Interactive builds receive an `INTERACTIVE_BOOST` of +1e9 to their priority score, which dominates any realistic critical-path sum while still preserving relative ordering **within** the interactive set.
+- _Worker-slot reservation (priority lanes holding a fraction of workers for high-priority work) is not implemented. The boost heuristic plus autoscaling is the current mitigation for starvation._
 - Autoscaling is the primary mitigation for all-workers-busy scenarios
 
 ## Derivation State Machine
@@ -344,13 +346,14 @@ The scheduler applies backpressure at multiple layers to prevent overload:
 
 r[sched.backpressure.hysteresis]
 **Actor queue depth limit:** The DAG actor's `mpsc` channel has a bounded capacity (default: 10,000 messages). If the queue depth exceeds 80% of capacity:
-1. The scheduler stops reading from worker `BuildExecution` streams (applying TCP-level backpressure to workers).
-2. New `SubmitBuild` requests from the gateway receive gRPC `RESOURCE_EXHAUSTED` status.
-3. The scheduler emits a `scheduler.queue.backpressure` metric for alerting.
+1. `CompletionReport` messages from worker `BuildExecution` streams block the stream-reader task on the actor channel send (completions must not be dropped — a lost completion would leave the derivation stuck `Running`).
+2. `LogBatch` and `ProgressUpdate` messages are dropped (non-blocking `try_send`) — the ring buffer already holds log lines and live-forward is a nice-to-have; progress is dashboard-only.
+3. New `SubmitBuild` requests from the gateway receive gRPC `RESOURCE_EXHAUSTED` status.
+4. The scheduler increments the `rio_scheduler_queue_backpressure` counter for alerting.
 
 Normal processing resumes when the queue depth drops below 60% (hysteresis to prevent oscillation).
 
-**Gateway timeout:** If a `SubmitBuild` request takes longer than 30 seconds to receive an initial acknowledgement from the DAG actor, the gateway handler returns gRPC `DEADLINE_EXCEEDED`. The gateway may retry with exponential backoff. This prevents unbounded request queueing at the gateway layer.
+**Gateway timeout:** If a `SubmitBuild` request takes longer than 30 seconds to receive an initial acknowledgement from the DAG actor, the gateway handler returns gRPC `DEADLINE_EXCEEDED`. This timeout is enforced client-side in rio-gateway, not in the scheduler. The gateway may retry with exponential backoff. This prevents unbounded request queueing at the gateway layer.
 
 ## State Storage (PostgreSQL)
 
@@ -362,6 +365,8 @@ Normal processing resumes when the queue depth drops below 60% (hysteresis to pr
 | `assignments` | Derivation -> worker mapping, status, assignment generation counter |
 | `build_derivations` | Many-to-many mapping: which builds are interested in which derivations |
 | `build_history` | Running EMA per (pname, system) for duration estimation (not per-build rows) |
+| `build_logs` | S3 blob metadata per (build_id, drv_hash) — `s3_key`, `line_count`, `is_complete` for log-flush UPSERTs |
+| `build_event_log` | Prost-encoded `BuildEvent` per (build_id, sequence) for gateway `since_sequence` replay across failover |
 
 ### Schema (pseudo-DDL)
 
@@ -397,7 +402,7 @@ CREATE TABLE derivations (
     CONSTRAINT derivations_drv_hash_uq UNIQUE (drv_hash)
 );
 CREATE INDEX derivations_status_idx ON derivations (status) WHERE status NOT IN ('completed', 'poisoned', 'dependency_failed');
-CREATE INDEX derivations_tenant_idx ON derivations (tenant_id);
+-- TODO(phase4): CREATE INDEX derivations_tenant_idx ON derivations (tenant_id);  -- deferred with multi-tenancy
 
 CREATE TABLE derivation_edges (
     parent_id   UUID NOT NULL REFERENCES derivations (derivation_id),
@@ -427,11 +432,16 @@ CREATE UNIQUE INDEX assignments_active_uq ON assignments (derivation_id) WHERE s
 CREATE INDEX assignments_worker_idx ON assignments (worker_id, status);
 
 CREATE TABLE build_history (
-    pname               TEXT NOT NULL,
-    system              TEXT NOT NULL,
-    ema_duration_secs   DOUBLE PRECISION NOT NULL,
-    sample_count        INT NOT NULL DEFAULT 0,
-    last_updated        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    pname                   TEXT NOT NULL,
+    system                  TEXT NOT NULL,
+    ema_duration_secs       DOUBLE PRECISION NOT NULL,
+    sample_count            INT NOT NULL DEFAULT 0,
+    last_updated            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ema_peak_memory_bytes   DOUBLE PRECISION,       -- nullable: worker may not report cgroup memory.peak
+    ema_peak_cpu_cores      DOUBLE PRECISION,       -- nullable: polled worker-side from cgroup cpu.stat
+    ema_output_size_bytes   DOUBLE PRECISION,       -- nullable: NAR size of built outputs
+    size_class              TEXT,                   -- informational: last class routed to (dashboards, not classify())
+    misclassification_count INTEGER NOT NULL DEFAULT 0,  -- Phase 4 CutoffRebalancer input; currently write-only
     PRIMARY KEY (pname, system)
 );
 ```
@@ -457,7 +467,7 @@ Critical-path priorities are maintained **incrementally**, not via full O(V+E) r
 
 - **On derivation completion:** Walk upward from the completed node to its ancestors, recalculating priorities only for nodes whose successor priorities changed. This is O(affected subgraph), which is typically much smaller than the full DAG.
 - **On DAG merge:** New nodes are inserted with initial priorities computed bottom-up from the merge point. Existing nodes' priorities are updated only if the new subgraph connects to them with a higher-priority path.
-- **Periodic full recomputation:** Every 60 seconds, a background Tokio task snapshots the DAG and performs a full bottom-up priority sweep. The result is sent to the DAG actor as a single `UpdatePriorities` message, ensuring consistency even if incremental updates accumulate rounding errors or miss edge cases.
+- **Periodic full recomputation:** Every ~60 seconds (on the estimator-refresh cadence), the DAG actor performs a full bottom-up priority sweep **inline** inside `handle_tick`, ensuring consistency even if incremental updates accumulate rounding errors or miss edge cases. No separate background task or message is involved --- the actor owns the DAG and mutates it directly.
 
 This approach keeps per-event processing well under the 1ms budget needed for 1000+ ops/sec throughput.
 
@@ -469,12 +479,12 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/queue.rs` — Priority BinaryHeap ReadyQueue (OrderedFloat + lazy invalidation)
 - `rio-scheduler/src/critical_path.rs` — Bottom-up priority: `est_duration + max(children's priority)`; incremental ancestor-walk on completion
 - `rio-scheduler/src/assignment.rs` — Worker scoring (bloom locality + load fraction) + size-class classify()
-- `rio-scheduler/src/estimator.rs` — Duration + peak-memory from build_history; fallback chain (exact → pname-cross-system → 30s default)
+- `rio-scheduler/src/estimator.rs` — Duration + peak-memory from build_history; fallback chain (exact → pname-cross-system → closure-size proxy → 30s default)
 - `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
 - `rio-scheduler/src/db.rs` — PostgreSQL persistence (derivations, assignments, build_history EMA)
 - `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
 
-## Planned Files (Phase 3a/5+)
+## Planned Files (Phase 4/5)
 
 - `rio-scheduler/src/early_cutoff.rs` — CA early cutoff detection (per-edge DAG tracking)
 - `rio-scheduler/src/poison.rs` — Cross-build poison derivation tracking
