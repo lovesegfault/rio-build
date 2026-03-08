@@ -113,11 +113,12 @@ pub struct BuildSpawnContext {
     pub max_leaked_mounts: usize,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     pub daemon_timeout: std::time::Duration,
-    /// Parent cgroup (`cgroup::own_cgroup()`), validated at startup.
-    /// Each build creates a sub-cgroup under here. Set ONCE in main.rs
-    /// after `enable_subtree_controllers` succeeds — if that fails,
-    /// main.rs bails with `?` and we never get here. So this is
-    /// always a valid, delegated cgroup2 path.
+    /// Parent cgroup (`cgroup::delegated_root()` — PARENT of the
+    /// worker's own cgroup), validated at startup. Each build creates
+    /// a sub-cgroup under here as a SIBLING of the worker. Set ONCE
+    /// in main.rs after `enable_subtree_controllers` succeeds — if
+    /// that fails, main.rs bails with `?` and we never get here. So
+    /// this is always a valid, delegated cgroup2 path.
     pub cgroup_parent: PathBuf,
 }
 

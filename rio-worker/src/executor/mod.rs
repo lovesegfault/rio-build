@@ -77,11 +77,14 @@ pub struct ExecutorEnv {
     /// purpose is to bound blast radius of a truly stuck daemon.
     pub daemon_timeout: Duration,
     /// Parent cgroup for per-build sub-cgroups. This is
-    /// `cgroup::own_cgroup()` — the worker's own cgroup. main.rs
-    /// computes it ONCE at startup (and calls
-    /// `enable_subtree_controllers` on it, which fail-fasts on
-    /// delegation misconfig). Each build gets a sub-cgroup named
-    /// by drv hash. cgroup v2 is a hard requirement — no Option.
+    /// `cgroup::delegated_root()` — the PARENT of the worker's own
+    /// cgroup (with `DelegateSubgroup=builds`, worker lives in
+    /// `.../service/builds/`; delegated_root is `.../service/`).
+    /// Per-build cgroups go here as SIBLINGS. main.rs computes it
+    /// ONCE at startup (and calls `enable_subtree_controllers` on
+    /// it, which fail-fasts on delegation misconfig). Each build
+    /// gets a sub-cgroup named by drv hash. cgroup v2 is a hard
+    /// requirement — no Option.
     pub cgroup_parent: std::path::PathBuf,
 }
 
