@@ -22,7 +22,7 @@ service WorkerService {
 }
 ```
 
-> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, system, supported_features, max_builds, bloom_filter). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update the bloom filter and resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
+> **Worker registration:** Worker registration is implicit and two-step: (1) the worker opens a `BuildExecution` bidirectional stream, (2) the worker calls the separate `Heartbeat` unary RPC with its initial capabilities (worker_id, systems, supported_features, max_builds, size_class, bloom_filter). The scheduler creates the worker entry when it receives a heartbeat from a worker_id that also has an open `BuildExecution` stream. Periodic heartbeats update the bloom filter and resource usage. See [rio-scheduler](./scheduler.md#worker-registration-protocol) for deregistration rules.
 
 ```protobuf
 // store.proto --- inspired by tvix castore/store protos (MIT)
@@ -32,6 +32,10 @@ service StoreService {
   rpc QueryPathInfo(QueryPathInfoRequest) returns (PathInfo);
   rpc FindMissingPaths(FindMissingPathsRequest) returns (FindMissingPathsResponse);
   rpc ContentLookup(ContentLookupRequest) returns (ContentLookupResponse);
+  rpc QueryPathFromHashPart(QueryPathFromHashPartRequest) returns (PathInfo);  // wopQueryPathFromHashPart (29)
+  rpc AddSignatures(AddSignaturesRequest) returns (AddSignaturesResponse);     // wopAddSignatures (37)
+  rpc RegisterRealisation(RegisterRealisationRequest) returns (RegisterRealisationResponse);  // wopRegisterDrvOutput (42)
+  rpc QueryRealisation(QueryRealisationRequest) returns (Realisation);         // wopQueryRealisation (43)
 }
 
 service ChunkService {
@@ -110,7 +114,7 @@ message HeartbeatRequest {
   repeated string running_builds = 2;
   ResourceUsage resources = 3;
   BloomFilter local_paths = 4;     // Bloom filter of cached store paths
-  string system = 5;               // Worker's system (e.g. "x86_64-linux")
+  repeated string systems = 5;     // Systems this worker builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
   uint32 max_builds = 7;           // Maximum concurrent builds this worker accepts
 }
@@ -119,12 +123,13 @@ message BloomFilter {
   bytes data = 1;
   uint32 hash_count = 2;
   uint32 num_bits = 3;
-  BloomHashAlgorithm hash_algorithm = 4;  // enum: MURMUR3_128, XXHASH64
+  BloomHashAlgorithm hash_algorithm = 4;  // enum: BLAKE3_256 (Kirsch-Mitzenmacher double-hash).
+                                          // MURMUR3_128/XXHASH64 were never implemented; reserved.
   uint32 version = 5;                     // filter format version
 }
 ```
 
-The `BloomFilter` message is self-describing: it includes the hash algorithm and bit count so the scheduler can validate the filter without implicit coupling to worker code.
+The `BloomFilter` message is self-describing: it includes the hash algorithm and bit count so the scheduler can validate the filter without implicit coupling to worker code. Only `BLAKE3_256` is supported — blake3 is portable and deterministic across architectures (a requirement since the bloom filter crosses the wire between worker and scheduler; AES-NI-dependent hashes would produce different output on heterogeneous clusters).
 
 ### BuildEvent
 
