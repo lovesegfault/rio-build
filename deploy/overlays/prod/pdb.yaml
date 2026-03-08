@@ -5,10 +5,9 @@
 # but possible without anti-affinity). PDBs make the drain
 # WAIT until at least N pods are healthy elsewhere.
 #
-# Workers don't get a PDB here — the WorkerPool controller
-# could manage per-pool PDBs (WorkerPool.spec.replicas.min
-# maps naturally to minAvailable). TODO(phase4): add PDB
-# management to the WorkerPool reconciler.
+# Workers don't get a PDB HERE — the WorkerPool reconciler
+# creates per-pool PDBs (maxUnavailable=1) with ownerRef →
+# GC on delete. See build_pdb in builders.rs.
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

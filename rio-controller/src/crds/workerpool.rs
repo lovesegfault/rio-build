@@ -177,6 +177,36 @@ pub struct WorkerPoolSpec {
     /// defaults to empty → load_client_tls returns None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_secret_name: Option<String>,
+
+    /// Spread worker pods across nodes. `None`/`Some(true)` (the
+    /// default) sets `topologySpreadConstraints` with `maxSkew: 1`
+    /// on `kubernetes.io/hostname` (soft — `whenUnsatisfiable:
+    /// ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =
+    /// no spread (all pods can land on one node; useful for
+    /// single-node dev clusters where spread would just be noise).
+    ///
+    /// Soft (not hard) because a node drain evicting all but one
+    /// would temporarily make hard-spread unsatisfiable → pods
+    /// stuck Pending. Soft lets them schedule then re-spread on
+    /// the next autoscaler action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology_spread: Option<bool>,
+
+    /// Forward proxy URL for fixed-output derivation (FOD) fetches.
+    /// When set, the worker injects `http_proxy`/`https_proxy` env
+    /// vars into the nix-daemon spawn IF the build is an FOD.
+    /// Non-FOD builds never get proxy env (they don't need network).
+    ///
+    /// Typical: `http://rio-fod-proxy:3128` (the Squid deployment
+    /// from deploy/base/fod-proxy.yaml). The proxy allowlists
+    /// known source hosts (nixos.org, github, crates.io etc) and
+    /// denies everything else — defense against FODs fetching from
+    /// arbitrary attacker-controlled URLs.
+    ///
+    /// Unset = FODs have direct internet (if NetworkPolicy allows
+    /// it, which it doesn't by default in prod overlay). Dev mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fod_proxy_url: Option<String>,
 }
 
 /// Replica bounds with cross-field CEL.

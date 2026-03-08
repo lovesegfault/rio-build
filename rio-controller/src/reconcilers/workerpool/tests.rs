@@ -32,6 +32,8 @@ fn test_wp() -> WorkerPool {
         privileged: None,
         host_network: None,
         tls_secret_name: None,
+        topology_spread: None,
+        fod_proxy_url: None,
     };
     let mut wp = WorkerPool::new("test-pool", spec);
     // UID + namespace: controller_owner_ref needs these. In
@@ -479,6 +481,13 @@ fn quantity_invalidspec_from_statefulset() {
 // =========================================================
 
 fn test_ctx(client: kube::Client) -> Arc<Ctx> {
+    let recorder = kube::runtime::events::Recorder::new(
+        client.clone(),
+        kube::runtime::events::Reporter {
+            controller: "rio-controller-test".into(),
+            instance: None,
+        },
+    );
     Arc::new(Ctx {
         client,
         // Unreachable — apply() doesn't touch the scheduler,
@@ -487,6 +496,7 @@ fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         // never listened on) vs one that times out.
         scheduler_addr: "http://127.0.0.1:1".into(),
         store_addr: "http://127.0.0.1:1".into(),
+        recorder,
     })
 }
 
@@ -535,6 +545,12 @@ async fn apply_uses_server_side_apply() {
             http::Method::PATCH,
             "fieldManager=rio-controller",
             serde_json::json!({"metadata":{"name":"test-pool-workers"}}).to_string(),
+        ),
+        // PDB PATCH — same fieldManager assertion.
+        Scenario::ok(
+            http::Method::PATCH,
+            "fieldManager=rio-controller",
+            serde_json::json!({"metadata":{"name":"test-pool-pdb"}}).to_string(),
         ),
         // GET before STS PATCH (replicas-ownership check).
         // 404 → first-create → replicas set to min.

@@ -92,14 +92,39 @@ pub struct ExecutorEnv {
 pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// Worker nix.conf content for sandbox builds.
+///
+/// The ConfigMap `rio-nix-conf` in deploy/base/configmaps.yaml can
+/// override this at `/etc/rio/nix.conf` — operators customize without
+/// image rebuild. `setup_nix_conf` checks for the override first;
+/// this is the fallback when the mount is absent (VM tests, local dev).
+///
+/// `ca-derivations`: required for content-addressed outputs (Phase 2c
+/// CA support). The ConfigMap also lists `nix-command` for pod
+/// diagnostics (`nix store info` etc), but it's NOT needed for builds
+/// — the daemon receives pre-evaluated .drv files via worker-protocol
+/// opcodes, no `nix` CLI involvement. Dropped here to reduce attack
+/// surface in the sandbox-spawned daemon.
+///
+/// Drift history: this was previously `experimental-features =`
+/// (empty) while the ConfigMap had `ca-derivations` — but the
+/// ConfigMap was never mounted, so CA builds used THIS empty value
+/// and failed with "ca-derivations is an experimental feature."
+/// Phase 2c worked because VM tests use native NixOS modules (not
+/// this code path); the drift only bit K8s deployments.
 const WORKER_NIX_CONF: &str = "\
 builders =
 substitute = false
 sandbox = true
 sandbox-fallback = false
 restrict-eval = true
-experimental-features =
+experimental-features = ca-derivations
 ";
+
+/// Path where operators can mount a nix.conf override (via the
+/// `rio-nix-conf` ConfigMap). If present, `setup_nix_conf` copies
+/// THIS instead of using `WORKER_NIX_CONF`. Lets operators customize
+/// experimental-features, sandbox paths, etc without image rebuild.
+const NIX_CONF_OVERRIDE_PATH: &str = "/etc/rio/nix.conf";
 
 /// Error type for executor operations.
 ///
@@ -720,10 +745,40 @@ pub async fn execute_build(
 }
 
 /// Write nix.conf to the overlay upper layer.
+///
+/// Checks for an operator override at [`NIX_CONF_OVERRIDE_PATH`]
+/// first (mounted from the `rio-nix-conf` ConfigMap in K8s). If
+/// present, copies it verbatim; else uses [`WORKER_NIX_CONF`].
+///
+/// Override use case: operator wants to add e.g. `extra-sandbox-
+/// paths = /some/secret` or tweak `sandbox-build-dir`. ConfigMap
+/// edit + pod restart, no image rebuild.
 fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
     let conf_dir = upper_dir.join("etc/nix");
     std::fs::create_dir_all(&conf_dir).map_err(ExecutorError::NixConf)?;
-    std::fs::write(conf_dir.join("nix.conf"), WORKER_NIX_CONF).map_err(ExecutorError::NixConf)?;
+
+    // Try the override first. `read` (not `read_to_string`) —
+    // nix.conf is ASCII but we're just copying bytes, no reason
+    // to UTF-8-validate. ENOENT = override not mounted → fallback.
+    // Any OTHER error (permission denied, I/O) → bubble up
+    // (something's wrong with the mount).
+    let content = match std::fs::read(NIX_CONF_OVERRIDE_PATH) {
+        Ok(bytes) => {
+            tracing::debug!(
+                path = NIX_CONF_OVERRIDE_PATH,
+                "using nix.conf override from ConfigMap mount"
+            );
+            bytes
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Common case (VM tests, local dev, K8s without the
+            // ConfigMap mount). Compiled-in fallback.
+            WORKER_NIX_CONF.as_bytes().to_vec()
+        }
+        Err(e) => return Err(ExecutorError::NixConf(e)),
+    };
+
+    std::fs::write(conf_dir.join("nix.conf"), content).map_err(ExecutorError::NixConf)?;
     Ok(())
 }
 

@@ -24,6 +24,7 @@ spec:
         app.kubernetes.io/name: rio-store
         app.kubernetes.io/component: store
     spec:
+      serviceAccountName: rio-store
       containers:
         - name: store
           image: rio-store:latest

@@ -14,6 +14,31 @@ kind: ServiceAccount
 metadata:
   name: rio-controller
 ---
+# ServiceAccounts for gateway/store/worker. They don't need K8s
+# API access (automountServiceAccountToken: false on the pods),
+# but a dedicated SA lets us attach IRSA annotations (prod) and
+# scope network policy by SA if needed later.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-gateway
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-store
+  # EKS IRSA: eks overlay patches eks.amazonaws.com/role-arn here.
+  # The store needs S3 access; IRSA attaches the IAM role to the
+  # pod via a projected token. No static AWS keys.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-worker
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -52,6 +77,11 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # PodDisruptionBudgets: per-WorkerPool PDB managed by the
+  # reconciler (maxUnavailable=1). Same lifecycle as STS/Svc.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

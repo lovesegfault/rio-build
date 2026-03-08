@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
@@ -140,6 +141,21 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
             &svc.metadata.name.clone().expect("we set it"),
             &PatchParams::apply(MANAGER).force(),
             &Patch::Apply(&svc),
+        )
+        .await?;
+
+    // ---- PodDisruptionBudget ----
+    // maxUnavailable=1: at most one worker evicted at a time
+    // during node drain. The evicting pod's builds get reassigned
+    // (via DrainWorker force — E2 preemption hook); the rest of
+    // the pool keeps working. ownerRef → GC on WorkerPool delete.
+    let pdb = build_pdb(&wp, oref.clone());
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
+    pdb_api
+        .patch(
+            &pdb.metadata.name.clone().expect("we set it"),
+            &PatchParams::apply(MANAGER).force(),
+            &Patch::Apply(&pdb),
         )
         .await?;
 

@@ -111,3 +111,84 @@ spec:
             cidr: 172.16.0.0/12
         - ipBlock:
             cidr: 192.168.0.0/16
+---
+# Scheduler ingress: only rio components can connect to :9001.
+# Blocks random pods in the cluster from calling SubmitBuild /
+# WorkerService directly. The Service still exists (for DNS) but
+# NetworkPolicy blocks connections from non-allowlisted pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-scheduler-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-scheduler
+  policyTypes:
+    - Ingress
+  ingress:
+    # gRPC from gateway (SubmitBuild), workers (Heartbeat/
+    # BuildExecution), controller (ClusterStatus/DrainWorker).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-controller
+      ports:
+        - protocol: TCP
+          port: 9001
+    # Plaintext health from kubelet. kubelet isn't a pod →
+    # needs ipBlock. Node CIDR varies per cluster; the prod
+    # overlay's private-range allowance covers it (nodes are
+    # RFC1918). Alternatively: omit this (the base yaml's
+    # grpc probe is on 9001 which the above rules open; the
+    # plaintext 9101 is only used when mTLS is on, and THAT
+    # overlay can add a kubelet-specific rule).
+    #
+    # For now: allow from any pod in this namespace on 9101.
+    # The plaintext port serves ONLY health; exposure is
+    # harmless (no data, just SERVING/NOT_SERVING).
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9101
+---
+# Store ingress: gateway (PutPath from nix copy), workers
+# (GetPath inputs, PutPath outputs), scheduler (FindMissingPaths
+# cache-check).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-store-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-store
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-scheduler
+      ports:
+        - protocol: TCP
+          port: 9002
+    # Plaintext health (same rationale as scheduler).
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9102

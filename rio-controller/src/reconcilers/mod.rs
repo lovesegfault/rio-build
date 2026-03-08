@@ -35,4 +35,28 @@ pub struct Ctx {
     /// reconciler fetches .drv content from here to construct the
     /// DerivationNode. Same lazy-connect rationale as scheduler.
     pub store_addr: String,
+    /// Recorder for K8s Events. Reconcilers call `ctx.publish_
+    /// event(obj, ev)` to emit; events show in `kubectl describe`
+    /// and `kubectl get events`. Operator visibility for "what
+    /// did the controller just do" without scraping logs.
+    ///
+    /// kube 3.0 API: Recorder is constructed ONCE with (client,
+    /// reporter); `publish` takes the object_ref per-call. So we
+    /// hold one Recorder and pass the ref at publish time.
+    pub recorder: kube::runtime::events::Recorder,
+}
+
+impl Ctx {
+    /// Publish an event scoped to a K8s object. Best-effort —
+    /// event-publish failure is logged, not propagated (events
+    /// are observability, not correctness; a reconcile that
+    /// succeeds but couldn't emit an event still succeeded).
+    pub async fn publish_event<K>(&self, obj: &K, ev: &kube::runtime::events::Event)
+    where
+        K: kube::Resource<DynamicType = ()>,
+    {
+        if let Err(e) = self.recorder.publish(ev, &obj.object_ref(&())).await {
+            tracing::warn!(error = %e, "failed to publish K8s event");
+        }
+    }
 }

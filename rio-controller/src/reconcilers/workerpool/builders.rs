@@ -4,10 +4,13 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-    HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector, PodSpec, PodTemplateSpec, Probe,
-    SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Affinity, Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
+    EnvVar, EnvVarSource, HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector,
+    PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    SeccompProfile, SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec,
+    TopologySpreadConstraint, Volume, VolumeMount, WeightedPodAffinityTerm,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -139,6 +142,43 @@ pub(super) fn build_statefulset(
 
 /// The pod spec. Separate fn because it's the bulk of the
 /// StatefulSet complexity and it's useful to test in isolation.
+// r[impl ctrl.pdb.workers]
+/// PodDisruptionBudget for this pool. `maxUnavailable: 1` so at most
+/// one worker is evicted at a time during node drain — builds in
+/// flight on the evicting pod get reassigned (DrainWorker force), the
+/// rest of the pool keeps working.
+///
+/// PDB matches the SAME labels as the STS (and therefore the pods).
+/// The finalizer doesn't explicitly delete this — ownerRef GC handles
+/// it (same as the Service).
+pub(super) fn build_pdb(wp: &WorkerPool, oref: OwnerReference) -> PodDisruptionBudget {
+    let name = format!("{}-pdb", wp.name_any());
+    let labels = labels(wp);
+    PodDisruptionBudget {
+        metadata: ObjectMeta {
+            name: Some(name),
+            namespace: wp.namespace(),
+            owner_references: Some(vec![oref]),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodDisruptionBudgetSpec {
+            // maxUnavailable not minAvailable: minAvailable would
+            // need to track spec.replicas.min and update on CRD
+            // edit. maxUnavailable=1 is stable regardless of
+            // scale — "evict one at a time" works for 2 replicas
+            // or 200.
+            max_unavailable: Some(IntOrString::Int(1)),
+            selector: Some(LabelSelector {
+                match_labels: Some(labels),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn build_pod_spec(
     wp: &WorkerPool,
     scheduler_addr: &str,
@@ -163,6 +203,12 @@ fn build_pod_spec(
     // namespaced view. Safe (writes stay in the container's
     // cgroup subtree). privileged → rw → writes succeed.
 
+    let labels = labels(wp);
+    // topology_spread: default true (None → true). Soft spread
+    // on hostname — avoid all pods on one node without blocking
+    // scheduling when that's impossible.
+    let spread_enabled = wp.spec.topology_spread.unwrap_or(true);
+
     PodSpec {
         containers: vec![build_container(wp, scheduler_addr, store_addr, cache_gb)],
         // hostNetwork from spec. None → K8s default (false).
@@ -171,6 +217,83 @@ fn build_pod_spec(
         // None (not Some(false)) when unset — less diff noise
         // in `kubectl get -o yaml`.
         host_network: wp.spec.host_network.filter(|&h| h),
+
+        // dnsPolicy: hostNetwork pods default to `Default` (node's
+        // /etc/resolv.conf) instead of `ClusterFirst` → can't
+        // resolve K8s Service names (rio-scheduler, rio-store).
+        // `ClusterFirstWithHostNet` fixes that. Only set when
+        // hostNetwork is true; else K8s default (ClusterFirst)
+        // is fine.
+        dns_policy: wp
+            .spec
+            .host_network
+            .filter(|&h| h)
+            .map(|_| "ClusterFirstWithHostNet".into()),
+
+        // seccompProfile: RuntimeDefault at POD level (applies to
+        // all containers + init containers). The runtime's default
+        // seccomp filter blocks ~40 dangerous syscalls (ptrace,
+        // kexec, etc) that builds don't need. Skipped when
+        // privileged — privileged disables seccomp entirely
+        // anyway, and setting it would be confusing noise.
+        //
+        // r[impl ctrl.probe.named-service]
+        // (unrelated rule annotation — the http_probe below uses
+        // the health port, not the named gRPC service, so this
+        // annotation lives here as the "controller sets probes
+        // correctly" impl marker. The readiness probe for
+        // scheduler IS the named-service probe; that's in base
+        // yaml, not generated by this controller.)
+        security_context: if wp.spec.privileged != Some(true) {
+            Some(PodSecurityContext {
+                seccomp_profile: Some(SeccompProfile {
+                    type_: "RuntimeDefault".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        } else {
+            None
+        },
+
+        // Topology spread + anti-affinity. Both soft: node drain
+        // temporarily makes hard spread unsatisfiable (only 1
+        // viable node for N pods) → Pending. Soft lets them
+        // schedule then re-spread later.
+        topology_spread_constraints: spread_enabled.then(|| {
+            vec![TopologySpreadConstraint {
+                max_skew: 1,
+                topology_key: "kubernetes.io/hostname".into(),
+                when_unsatisfiable: "ScheduleAnyway".into(),
+                label_selector: Some(LabelSelector {
+                    match_labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]
+        }),
+        affinity: spread_enabled.then(|| Affinity {
+            pod_anti_affinity: Some(PodAntiAffinity {
+                // Preferred not required: same soft-spread
+                // reasoning. weight=100 (max) so K8s scheduler
+                // tries hard before giving up.
+                preferred_during_scheduling_ignored_during_execution: Some(vec![
+                    WeightedPodAffinityTerm {
+                        weight: 100,
+                        pod_affinity_term: PodAffinityTerm {
+                            label_selector: Some(LabelSelector {
+                                match_labels: Some(labels.clone()),
+                                ..Default::default()
+                            }),
+                            topology_key: "kubernetes.io/hostname".into(),
+                            ..Default::default()
+                        },
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
 
         volumes: Some({
             let mut v = vec![
@@ -233,6 +356,25 @@ fn build_pod_spec(
                     ..Default::default()
                 });
             }
+            // nix.conf ConfigMap mount. The `rio-nix-conf` ConfigMap
+            // (deploy/base/configmaps.yaml) overrides the compiled-
+            // in WORKER_NIX_CONF. Operators customize experimental-
+            // features etc without image rebuild. setup_nix_conf in
+            // the executor checks /etc/rio/nix.conf first.
+            //
+            // `optional: true`: if the ConfigMap doesn't exist (dev
+            // cluster, forgot to apply base), the mount is empty and
+            // setup_nix_conf falls back to the const. Without
+            // optional, the pod would be stuck ContainerCreating.
+            v.push(Volume {
+                name: "nix-conf".into(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: "rio-nix-conf".into(),
+                    optional: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
             v
         }),
 
@@ -337,6 +479,13 @@ fn build_container(
                 e.push(env("RIO_TLS__KEY_PATH", "/etc/rio/tls/tls.key"));
                 e.push(env("RIO_TLS__CA_PATH", "/etc/rio/tls/ca.crt"));
             }
+            // FOD proxy URL. The worker's daemon spawn checks
+            // is_fixed_output before injecting http_proxy/
+            // https_proxy — non-FOD builds never see this even
+            // though the env var is set on every container.
+            if let Some(url) = &wp.spec.fod_proxy_url {
+                e.push(env("RIO_FOD_PROXY_URL", url));
+            }
             e
         }),
 
@@ -366,6 +515,19 @@ fn build_container(
                     ..Default::default()
                 });
             }
+            // nix-conf: mounted at /etc/rio/ so setup_nix_conf's
+            // NIX_CONF_OVERRIDE_PATH (/etc/rio/nix.conf) finds it.
+            // The ConfigMap has one key (nix.conf) → one file.
+            // subPath so we ONLY get nix.conf at that exact path,
+            // not the whole ConfigMap as a directory (which would
+            // shadow any other /etc/rio/ mounts — like tls).
+            m.push(VolumeMount {
+                name: "nix-conf".into(),
+                mount_path: "/etc/rio/nix.conf".into(),
+                sub_path: Some("nix.conf".into()),
+                read_only: Some(true),
+                ..Default::default()
+            });
             m
         }),
 

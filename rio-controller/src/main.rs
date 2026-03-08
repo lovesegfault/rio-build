@@ -173,11 +173,25 @@ async fn main() -> anyhow::Result<()> {
     // single replica per controller.md design).
     spawn_health_server(cfg.health_addr);
 
+    // ---- Events Recorder ----
+    // Reporter identifies US (the controller) in emitted events.
+    // `kubectl get events` shows `rio-controller` in the SOURCE
+    // column. instance=None → K8s uses pod name (from metadata.
+    // name downward API if set, else hostname).
+    let recorder = kube::runtime::events::Recorder::new(
+        client.clone(),
+        kube::runtime::events::Reporter {
+            controller: "rio-controller".into(),
+            instance: None,
+        },
+    );
+
     // ---- Context ----
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
         store_addr: cfg.store_addr.clone(),
+        recorder,
     });
 
     // ---- WorkerPool controller ----

@@ -26,6 +26,7 @@ spec:
         app.kubernetes.io/name: rio-gateway
         app.kubernetes.io/component: gateway
     spec:
+      serviceAccountName: rio-gateway
       containers:
         - name: gateway
           image: rio-gateway:latest

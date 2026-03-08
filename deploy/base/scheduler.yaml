@@ -30,6 +30,19 @@ spec:
         app.kubernetes.io/component: scheduler
     spec:
       serviceAccountName: rio-scheduler
+      # Anti-affinity: with replicas=2, REQUIRE they land on
+      # different nodes. Both on one node = that node draining
+      # kills both (PDB blocks it, but that just stalls the drain
+      # — still bad). requiredDuringScheduling is safe for 2
+      # replicas on any multi-node cluster; a single-node dev
+      # cluster uses replicas=1 anyway (dev overlay patches).
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: rio-scheduler
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: scheduler
           image: rio-scheduler:latest

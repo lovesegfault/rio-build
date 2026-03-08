@@ -205,6 +205,13 @@ pub fn apply_ok_scenarios(
             "image": "x",
         },
     });
+    // PDB response: ignored like Service. Minimal shape that
+    // parses. Phase 3b adds per-pool PDB management (E2).
+    let pdb_body = serde_json::json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": { "name": format!("{pool_name}-pdb"), "namespace": ns },
+    });
     vec![
         Scenario::ok(
             http::Method::PATCH,
@@ -213,6 +220,12 @@ pub fn apply_ok_scenarios(
             // process ends before the heap is reclaimed anyway.
             Box::leak(format!("/services/{sts_name}").into_boxed_str()),
             svc_body.to_string(),
+        ),
+        // PDB PATCH — after Service, before STS (apply() order).
+        Scenario::ok(
+            http::Method::PATCH,
+            Box::leak(format!("/poddisruptionbudgets/{pool_name}-pdb").into_boxed_str()),
+            pdb_body.to_string(),
         ),
         sts_get,
         Scenario::ok(
