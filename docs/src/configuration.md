@@ -57,16 +57,27 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `scheduler_addr` | string | `rio-scheduler:50051` | Scheduler gRPC endpoint |
-| `store_addr` | string | `rio-store:50052` | Store gRPC endpoint |
-| `fuse_cache_path` | string | `/var/rio/cache` | Local SSD cache directory for rio-fuse |
-| `fuse_cache_max_size` | u64 | 107374182400 (100GB) | Maximum FUSE cache size |
-| `overlay_upper_path` | string | `/var/rio/overlays` | Base directory for per-build overlay upper layers |
-| `heartbeat_interval` | Duration | 10s | Heartbeat frequency to scheduler |
-| `bloom_filter_fpr` | f64 | 0.01 | Target false positive rate for path bloom filter |
-| `max_nar_upload_size` | u64 | 10737418240 (10GB) | Maximum NAR size for upload |
-| `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build |
-| `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build |
+| `worker_id` | string | (auto: hostname) | Worker identity. Empty → auto-detect via hostname. |
+| `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
+| `store_addr` | string | (required) | Store gRPC endpoint |
+| `max_builds` | u32 | 1 | Maximum concurrent builds on this worker |
+| `systems` | list\<string\> | (auto: `{arch}-{os}`) | Nix systems this worker can build for (any-match). Env `RIO_SYSTEMS` is comma-separated; TOML is an array. |
+| `features` | list\<string\> | `[]` | `requiredSystemFeatures` this worker supports (all-match). Same env/TOML format as `systems`. |
+| `fuse_mount_point` | path | `/var/rio/fuse-store` | FUSE mount point. **Never** `/nix/store` --- that would shadow the host store. |
+| `fuse_cache_dir` | path | `/var/rio/cache` | Local SSD cache directory for rio-fuse |
+| `fuse_cache_size_gb` | u64 | 50 | Maximum FUSE cache size in GB (LRU eviction above this) |
+| `fuse_threads` | u32 | 4 | Number of FUSE daemon threads |
+| `fuse_passthrough` | bool | true | Enable kernel passthrough (Linux 6.9+). Disable only for debugging. |
+| `overlay_base_dir` | path | `/var/rio/overlays` | Base directory for per-build overlay upper/work layers |
+| `metrics_addr` | socket addr | `0.0.0.0:9093` | Prometheus metrics listen address |
+| `health_addr` | socket addr | `0.0.0.0:9193` | HTTP `/healthz` + `/readyz` listen address (worker has no gRPC server) |
+| `log_rate_limit` | u64 | 10000 | Maximum log lines per second per build (0 = unlimited) |
+| `log_size_limit` | u64 | 104857600 (100MB) | Maximum total log bytes per build (0 = unlimited) |
+| `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, workers with an empty `size_class` are **rejected**. |
+| `max_leaked_mounts` | usize | 3 | After this many overlay-teardown (`umount2`) failures, the worker refuses new builds with `InfrastructureFailure`. |
+| `daemon_timeout_secs` | u64 | 7200 (2h) | Timeout for the local `nix-daemon --stdio` subprocess when the client didn't set `build_timeout`. |
+
+> **Heartbeat interval** is a compile-time constant (`HEARTBEAT_INTERVAL_SECS = 10` in `rio-common::limits`), not a configurable parameter. Changing it would require the scheduler's heartbeat-timeout to be adjusted in lockstep.
 
 ## Controller
 
