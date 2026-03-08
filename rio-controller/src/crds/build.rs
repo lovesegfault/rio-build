@@ -114,6 +114,22 @@ pub struct BuildStatus {
     #[serde(default)]
     #[schemars(schema_with = "crate::crds::any_object_array")]
     pub conditions: Vec<Condition>,
+
+    /// Last BuildEvent sequence number seen by drain_stream.
+    ///
+    /// Used for WatchBuild reconnect: on controller restart, the
+    /// idempotence gate in apply() sees build_id non-empty AND
+    /// phase non-terminal, then calls WatchBuild with this as
+    /// since_sequence. Scheduler replays from build_event_log
+    /// (persisted) for events past this seq. Without it, a
+    /// controller restart means status frozen until build
+    /// terminates.
+    ///
+    /// i64 because sequence is u64 in proto but K8s JSON schema
+    /// doesn't do uint64 natively. Cast at use; seq=0 means
+    /// "replay all" which is the safe default.
+    #[serde(default)]
+    pub last_sequence: i64,
 }
 
 #[cfg(test)]

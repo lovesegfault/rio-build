@@ -97,19 +97,51 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     let name = b.name_any();
 
     // Idempotence gate. build_id non-empty → already submitted.
-    // The watch task is patching status independently. Don't
-    // resubmit — that'd create a duplicate scheduler build
-    // (different UUID) for the same CRD.
+    // Phase 3b: if phase is non-terminal, reconnect the watch via
+    // WatchBuild(build_id, since_sequence=status.last_sequence).
+    // Scheduler replays from build_event_log for events > that
+    // sequence. The watch task died (controller restart, panic);
+    // reconnecting resumes status updates.
     //
-    // If the watch task DIED (controller restart, panic), status
-    // goes stale. Operator sees Progress frozen. We COULD reconnect
-    // via WatchBuild(build_id, since_sequence) — deferred to
-    // phase3b (needs since_sequence bookkeeping in status).
-    // TODO(phase3b): reconnect watch on controller restart. Store
-    // last-seen sequence in .status, call WatchBuild with it.
+    // If phase IS terminal: no reconnect needed, the last status
+    // was patched before the watch task exited. await_change.
     if let Some(status) = &b.status
         && !status.build_id.is_empty()
     {
+        // Check for REAL build_id (not the "submitted" sentinel —
+        // that means apply() set it but SubmitBuild hasn't
+        // responded yet, no build_id to WatchBuild with). We don't
+        // bother validating UUID format — if the scheduler gave
+        // us a non-UUID, WatchBuild will just return NotFound.
+        let is_real_uuid = status.build_id != "submitted";
+        let is_terminal = matches!(status.phase.as_str(), "Succeeded" | "Failed" | "Cancelled");
+
+        if is_real_uuid && !is_terminal {
+            // Reconnect: WatchBuild + spawn fresh drain_stream.
+            // since_sequence from status.last_sequence (0 for
+            // pre-Phase-3b rows = replay all, safe default).
+            info!(
+                build = %name,
+                build_id = %status.build_id,
+                since_seq = status.last_sequence,
+                "reconnecting WatchBuild (controller restart or watch died)"
+            );
+            let sched = rio_proto::client::connect_scheduler(&ctx.scheduler_addr)
+                .await
+                .map_err(|e| {
+                    Error::SchedulerUnavailable(tonic::Status::unavailable(e.to_string()))
+                })?;
+            spawn_reconnect_watch(
+                name.clone(),
+                Api::namespaced(ctx.client.clone(), &ns),
+                sched,
+                status.build_id.clone(),
+                status.last_sequence as u64,
+                ctx.scheduler_addr.clone(),
+            );
+            return Ok(Action::await_change());
+        }
+
         debug!(build = %name, build_id = %status.build_id, "already submitted");
         return Ok(Action::await_change());
     }
@@ -198,9 +230,64 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // The task owns the stream. We DON'T await it here —
     // returning from apply() lets the controller move on to the
     // next reconcile. The stream drains in the background.
-    rio_common::task::spawn_monitored("build-watch", drain_stream(name.clone(), api, stream));
+    //
+    // scheduler_addr cloned in for reconnect on stream error.
+    rio_common::task::spawn_monitored(
+        "build-watch",
+        drain_stream(
+            name.clone(),
+            api,
+            stream,
+            ctx.scheduler_addr.clone(),
+            // since_seq=0 for initial connect — this IS the
+            // SubmitBuild stream, it starts from the beginning.
+            0,
+        ),
+    );
 
     Ok(Action::await_change())
+}
+
+/// Reconnect: call WatchBuild with since_sequence, spawn
+/// drain_stream on the resulting stream. Used by apply()'s
+/// idempotence gate when build_id is real + phase non-terminal
+/// (controller restarted mid-build).
+///
+/// Fire-and-forget like the initial drain_stream spawn. If
+/// WatchBuild fails (scheduler down, unknown build_id after
+/// recovery didn't find it), logs and exits — status stays stale.
+/// Next controller restart retries.
+fn spawn_reconnect_watch(
+    name: String,
+    api: Api<Build>,
+    mut sched: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
+    build_id: String,
+    since_seq: u64,
+    scheduler_addr: String,
+) {
+    rio_common::task::spawn_monitored("build-watch-reconnect", async move {
+        match sched
+            .watch_build(types::WatchBuildRequest {
+                build_id: build_id.clone(),
+                since_sequence: since_seq,
+            })
+            .await
+        {
+            Ok(resp) => {
+                info!(build = %name, %build_id, since_seq, "WatchBuild reconnect ok");
+                drain_stream(name, api, resp.into_inner(), scheduler_addr, since_seq).await;
+            }
+            Err(e) => {
+                // Scheduler down, or build not found (recovery
+                // didn't reconstruct it — PG was cleared, or
+                // it's from a very old pre-recovery scheduler).
+                // Log and exit; status stays stale. Next restart
+                // retries.
+                warn!(build = %name, %build_id, error = %e,
+                      "WatchBuild reconnect failed; status will stop updating");
+            }
+        }
+    });
 }
 
 async fn cleanup(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
@@ -416,22 +503,39 @@ fn priority_to_class(p: i32) -> &'static str {
 /// PATCHing status on each is apiserver abuse. Progress events
 /// are emitted on derivation state transitions (1/sec worst
 /// case), and that's what the printer column shows anyway.
+///
+/// `scheduler_addr` + `start_seq`: for reconnect on stream error
+/// (scheduler failover). Backoff-retry up to 5 attempts; WatchBuild
+/// with the LAST seq we saw (or start_seq on first reconnect).
+/// After max retries: log warn, exit — status stale.
 async fn drain_stream(
     name: String,
     api: Api<Build>,
     mut stream: tonic::Streaming<types::BuildEvent>,
+    scheduler_addr: String,
+    start_seq: u64,
 ) {
     // Accumulate status across events. We PATCH the FULL status
     // object each time (server-side apply merges), so this tracks
-    // the "last known good" state.
+    // the "last known good" state. last_sequence initialized from
+    // start_seq (0 for initial SubmitBuild stream, persisted seq
+    // for reconnects).
     let mut status = BuildStatus {
         phase: "Pending".into(),
+        last_sequence: start_seq as i64,
         ..Default::default()
     };
+
+    // Reconnect retry state. Reset on successful event.
+    let mut reconnect_attempts = 0u32;
+    const MAX_RECONNECT: u32 = 5;
 
     loop {
         match stream.message().await {
             Ok(Some(ev)) => {
+                // Reset reconnect counter: stream is healthy.
+                reconnect_attempts = 0;
+
                 // First event always carries the real build_id
                 // (scheduler assigns it on MergeDag). `status` is
                 // TASK-LOCAL, initialized to empty above — not the
@@ -441,6 +545,13 @@ async fn drain_stream(
                 if status.build_id.is_empty() {
                     status.build_id = ev.build_id.clone();
                 }
+
+                // Track sequence BEFORE apply_event: even if this
+                // event doesn't trigger a patch (e.g., Log), the
+                // NEXT patch will persist the correct last_sequence.
+                // ev.sequence is u64; cast to i64 for K8s schema
+                // compat (overflow at ~9e18, not a concern).
+                status.last_sequence = ev.sequence as i64;
 
                 let Some(inner) = ev.event else { continue };
                 let should_patch = apply_event(&mut status, inner);
@@ -465,16 +576,91 @@ async fn drain_stream(
                 return;
             }
             Err(e) => {
-                // Scheduler dropped the connection (restart,
-                // failover). TODO(phase3b): reconnect via
-                // WatchBuild with the last sequence we saw.
-                // For now: status goes stale at this point.
+                // Scheduler dropped (restart, failover, network).
+                // Reconnect via WatchBuild with last seq. Backoff
+                // 1s/2s/4s/8s/16s; after MAX_RECONNECT fails, give
+                // up — status stale until next controller restart.
+                reconnect_attempts += 1;
+                if reconnect_attempts > MAX_RECONNECT {
+                    warn!(
+                        build = %name,
+                        error = %e,
+                        attempts = reconnect_attempts,
+                        "BuildEvent stream error: max reconnects exhausted; status will stop updating"
+                    );
+                    // Patch phase=Unknown so operator sees "watch
+                    // lost" not just "stuck at last state". Terminal-
+                    // ish (not Succeeded/Failed/Cancelled) so the
+                    // idempotence gate WOULD reconnect on controller
+                    // restart. Best-effort; ignore PATCH error.
+                    status.phase = "Unknown".into();
+                    let _ = patch_status(&api, &name, status).await;
+                    return;
+                }
+
+                let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
                 warn!(
                     build = %name,
                     error = %e,
-                    "BuildEvent stream error; status will stop updating"
+                    attempt = reconnect_attempts,
+                    backoff_secs = backoff.as_secs(),
+                    "BuildEvent stream error; reconnecting"
                 );
-                return;
+                tokio::time::sleep(backoff).await;
+
+                // Reconnect: fresh scheduler client + WatchBuild.
+                // Need build_id — if we never got the first event
+                // (status.build_id empty), we can't reconnect.
+                // That's the "SubmitBuild stream dropped before
+                // first event" case — rare (scheduler crashed
+                // between MergeDag and first BuildStarted). Just
+                // exit; apply()'s idempotence gate will retry on
+                // next reconcile (build_id is still "submitted"
+                // sentinel → resubmit).
+                if status.build_id.is_empty() {
+                    warn!(build = %name, "no build_id yet; cannot reconnect, exiting watch");
+                    return;
+                }
+
+                match rio_proto::client::connect_scheduler(&scheduler_addr).await {
+                    Ok(mut sched) => {
+                        match sched
+                            .watch_build(types::WatchBuildRequest {
+                                build_id: status.build_id.clone(),
+                                since_sequence: status.last_sequence as u64,
+                            })
+                            .await
+                        {
+                            Ok(resp) => {
+                                info!(build = %name, "reconnected WatchBuild");
+                                stream = resp.into_inner();
+                                // Loop continues: next iteration
+                                // reads from the new stream.
+                            }
+                            Err(wb_err) => {
+                                // WatchBuild itself failed (build
+                                // not found — recovery didn't
+                                // reconstruct it). Don't retry
+                                // THIS error — it's not transient.
+                                warn!(build = %name, error = %wb_err,
+                                      "WatchBuild failed (build unknown?); exiting watch");
+                                return;
+                            }
+                        }
+                    }
+                    Err(conn_err) => {
+                        // Connect failed. Count as reconnect
+                        // attempt; next iteration of the outer
+                        // loop will Error again (stream is still
+                        // the dead one) → another backoff. After
+                        // MAX, give up.
+                        warn!(build = %name, error = %conn_err,
+                              "scheduler connect failed during reconnect");
+                        // Don't continue — the dead stream will
+                        // just error again immediately. Sleep was
+                        // already done above.
+                    }
+                }
             }
         }
     }
