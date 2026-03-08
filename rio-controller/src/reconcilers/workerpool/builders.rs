@@ -6,7 +6,7 @@ use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
     HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector, PodSpec, PodTemplateSpec, Probe,
-    SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
@@ -172,51 +172,69 @@ fn build_pod_spec(
         // in `kubectl get -o yaml`.
         host_network: wp.spec.host_network.filter(|&h| h),
 
-        volumes: Some(vec![
-            // /dev/fuse character device. hostPath not because
-            // we need a file from the host, but because it's a
-            // DEVICE node that must be the same major/minor as
-            // the host's. CharDevice type makes K8s verify it's
-            // actually a char device (catches a node without
-            // FUSE compiled in).
-            Volume {
-                name: "dev-fuse".into(),
-                host_path: Some(HostPathVolumeSource {
-                    path: "/dev/fuse".into(),
-                    type_: Some("CharDevice".into()),
-                }),
-                ..Default::default()
-            },
-            // FUSE cache. emptyDir = local ephemeral storage,
-            // wiped on pod restart. sizeLimit enforced by the
-            // kubelet (evicts pod if exceeded). For persistent
-            // cache across restarts, operators can override
-            // with a PVC via kustomize — we don't model that
-            // in the CRD (too many backend-specific knobs).
-            Volume {
-                name: "fuse-cache".into(),
-                empty_dir: Some(EmptyDirVolumeSource {
-                    size_limit: Some(cache_quantity),
+        volumes: Some({
+            let mut v = vec![
+                // /dev/fuse character device. hostPath not because
+                // we need a file from the host, but because it's a
+                // DEVICE node that must be the same major/minor as
+                // the host's. CharDevice type makes K8s verify it's
+                // actually a char device (catches a node without
+                // FUSE compiled in).
+                Volume {
+                    name: "dev-fuse".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/dev/fuse".into(),
+                        type_: Some("CharDevice".into()),
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            // Overlay upperdir/workdir. MUST be a real filesystem
-            // (ext4/xfs via emptyDir on the node's disk), NOT the
-            // container's root — containerd's root is overlayfs,
-            // and overlayfs-as-upperdir can't create trusted.*
-            // xattrs → mount fails with EINVAL. emptyDir gives us
-            // the kubelet's local disk (/var/lib/kubelet/pods/...),
-            // which is ext4/xfs on every sane node. No sizeLimit:
-            // overlays are per-build, cleaned on Drop; unbounded
-            // growth = a leak bug that sizeLimit would mask with
-            // a pod eviction (worse debugging).
-            Volume {
-                name: "overlays".into(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-            },
-        ]),
+                },
+                // FUSE cache. emptyDir = local ephemeral storage,
+                // wiped on pod restart. sizeLimit enforced by the
+                // kubelet (evicts pod if exceeded). For persistent
+                // cache across restarts, operators can override
+                // with a PVC via kustomize — we don't model that
+                // in the CRD (too many backend-specific knobs).
+                Volume {
+                    name: "fuse-cache".into(),
+                    empty_dir: Some(EmptyDirVolumeSource {
+                        size_limit: Some(cache_quantity),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                // Overlay upperdir/workdir. MUST be a real filesystem
+                // (ext4/xfs via emptyDir on the node's disk), NOT the
+                // container's root — containerd's root is overlayfs,
+                // and overlayfs-as-upperdir can't create trusted.*
+                // xattrs → mount fails with EINVAL. emptyDir gives us
+                // the kubelet's local disk (/var/lib/kubelet/pods/...),
+                // which is ext4/xfs on every sane node. No sizeLimit:
+                // overlays are per-build, cleaned on Drop; unbounded
+                // growth = a leak bug that sizeLimit would mask with
+                // a pod eviction (worse debugging).
+                Volume {
+                    name: "overlays".into(),
+                    empty_dir: Some(EmptyDirVolumeSource::default()),
+                    ..Default::default()
+                },
+            ];
+            // mTLS Secret mount. Only when spec.tlsSecretName is set.
+            // The Secret's tls.crt/tls.key/ca.crt are cert-manager's
+            // standard output keys (see deploy/overlays/prod/
+            // cert-manager.yaml). Mounted at /etc/rio/tls/; env vars
+            // below point the worker's TlsConfig there.
+            if let Some(secret) = &wp.spec.tls_secret_name {
+                v.push(Volume {
+                    name: "tls".into(),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some(secret.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+            v
+        }),
 
         // Security context. SYS_ADMIN for mount (FUSE, overlayfs,
         // CLONE_NEWNS in the executor's pre_exec). SYS_CHROOT
@@ -305,25 +323,51 @@ fn build_container(
             // `default-workers-0` — unique, stable. Two pools
             // can't collide (different sts names).
             env_from_field("RIO_WORKER_ID", "metadata.name"),
-        ]),
+        ])
+        .map(|mut e| {
+            // Conditionally append TLS env vars. Using map-over-
+            // Some keeps the builder linear (vs an if-push dance
+            // with a mutable Vec, which would need `let mut env_vec
+            // = vec![...]; if tls { env_vec.push(...) }; Some(
+            // env_vec)`). The Option::map pattern reads cleaner.
+            if wp.spec.tls_secret_name.is_some() {
+                // Paths match the volume mount below and cert-
+                // manager's standard Secret key names.
+                e.push(env("RIO_TLS__CERT_PATH", "/etc/rio/tls/tls.crt"));
+                e.push(env("RIO_TLS__KEY_PATH", "/etc/rio/tls/tls.key"));
+                e.push(env("RIO_TLS__CA_PATH", "/etc/rio/tls/ca.crt"));
+            }
+            e
+        }),
 
-        volume_mounts: Some(vec![
-            VolumeMount {
-                name: "dev-fuse".into(),
-                mount_path: "/dev/fuse".into(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "fuse-cache".into(),
-                mount_path: "/var/rio/cache".into(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "overlays".into(),
-                mount_path: "/var/rio/overlays".into(),
-                ..Default::default()
-            },
-        ]),
+        volume_mounts: Some({
+            let mut m = vec![
+                VolumeMount {
+                    name: "dev-fuse".into(),
+                    mount_path: "/dev/fuse".into(),
+                    ..Default::default()
+                },
+                VolumeMount {
+                    name: "fuse-cache".into(),
+                    mount_path: "/var/rio/cache".into(),
+                    ..Default::default()
+                },
+                VolumeMount {
+                    name: "overlays".into(),
+                    mount_path: "/var/rio/overlays".into(),
+                    ..Default::default()
+                },
+            ];
+            if wp.spec.tls_secret_name.is_some() {
+                m.push(VolumeMount {
+                    name: "tls".into(),
+                    mount_path: "/etc/rio/tls".into(),
+                    read_only: Some(true),
+                    ..Default::default()
+                });
+            }
+            m
+        }),
 
         security_context: Some(SecurityContext {
             // Granular caps are the default. privileged=true

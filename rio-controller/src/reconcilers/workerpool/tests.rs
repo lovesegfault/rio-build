@@ -31,6 +31,7 @@ fn test_wp() -> WorkerPool {
         tolerations: None,
         privileged: None,
         host_network: None,
+        tls_secret_name: None,
     };
     let mut wp = WorkerPool::new("test-pool", spec);
     // UID + namespace: controller_owner_ref needs these. In
@@ -142,6 +143,95 @@ fn statefulset_overlays_volume_mounted() {
         .find(|m| m.name == "overlays")
         .expect("overlays volumeMount");
     assert_eq!(mount.mount_path, "/var/rio/overlays");
+}
+
+#[test]
+fn statefulset_tls_secret_mounted_when_set() {
+    // spec.tlsSecretName set → volume + mount + 3 RIO_TLS__* env
+    // vars. Unset → none of these (plaintext mode). Both paths
+    // tested: the base test_wp has it unset; this test sets it.
+    let mut wp = test_wp();
+    wp.spec.tls_secret_name = Some("rio-worker-tls".into());
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    // Volume: Secret source with the configured name.
+    let tls_vol = pod
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|v| v.name == "tls")
+        .expect("tls volume should exist when tlsSecretName set");
+    assert_eq!(
+        tls_vol.secret.as_ref().unwrap().secret_name,
+        Some("rio-worker-tls".into())
+    );
+
+    // Mount: /etc/rio/tls, read-only. cert-manager's Secret keys
+    // (tls.crt, tls.key, ca.crt) appear as files here.
+    let container = &pod.containers[0];
+    let mount = container
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|m| m.name == "tls")
+        .expect("tls mount");
+    assert_eq!(mount.mount_path, "/etc/rio/tls");
+    assert_eq!(mount.read_only, Some(true));
+
+    // Env vars: the three RIO_TLS__* pointing at the mount.
+    // Double-underscore is figment nesting (tls.cert_path).
+    let envs: std::collections::HashMap<_, _> = container
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.value.as_ref().map(|v| (e.name.as_str(), v.as_str())))
+        .collect();
+    assert_eq!(
+        envs.get("RIO_TLS__CERT_PATH"),
+        Some(&"/etc/rio/tls/tls.crt")
+    );
+    assert_eq!(envs.get("RIO_TLS__KEY_PATH"), Some(&"/etc/rio/tls/tls.key"));
+    assert_eq!(envs.get("RIO_TLS__CA_PATH"), Some(&"/etc/rio/tls/ca.crt"));
+}
+
+#[test]
+fn statefulset_no_tls_when_unset() {
+    // The default test_wp has tls_secret_name=None. No tls
+    // volume, no mount, no RIO_TLS__* env — clean plaintext.
+    let wp = test_wp();
+    let sts = test_sts(&wp);
+    let pod = sts.spec.unwrap().template.spec.unwrap();
+
+    assert!(
+        !pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v.name == "tls"),
+        "no tls volume when tlsSecretName unset"
+    );
+    let container = &pod.containers[0];
+    assert!(
+        !container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "tls"),
+    );
+    assert!(
+        !container
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.name.starts_with("RIO_TLS__")),
+        "no RIO_TLS__* env when tlsSecretName unset"
+    );
 }
 
 #[test]

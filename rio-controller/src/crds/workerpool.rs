@@ -163,6 +163,20 @@ pub struct WorkerPoolSpec {
     /// doesn't break it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
+
+    /// mTLS client cert Secret name. When set, the controller
+    /// mounts this Secret at `/etc/rio/tls/` and sets the
+    /// `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars.
+    ///
+    /// The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
+    /// (cert-manager's standard output for a Certificate with a
+    /// CA issuer). In the prod overlay, this is `rio-worker-tls`
+    /// (see cert-manager.yaml).
+    ///
+    /// Unset = plaintext gRPC (dev mode). The worker's TlsConfig
+    /// defaults to empty → load_client_tls returns None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_secret_name: Option<String>,
 }
 
 /// Replica bounds with cross-field CEL.

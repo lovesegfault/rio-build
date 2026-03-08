@@ -15,16 +15,16 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.readyReplicas
+    - jsonPath: '.status.readyReplicas'
       name: Ready
       type: integer
-    - jsonPath: .status.desiredReplicas
+    - jsonPath: '.status.desiredReplicas'
       name: Desired
       type: integer
-    - jsonPath: .spec.sizeClass
+    - jsonPath: '.spec.sizeClass'
       name: Class
       type: string
-    - jsonPath: .metadata.creationTimestamp
+    - jsonPath: '.metadata.creationTimestamp'
       name: Age
       type: date
     name: v1alpha1
@@ -85,7 +85,7 @@ spec:
                   type: string
                 type: array
               fuseCacheSize:
-                default: 50Gi
+                default: '50Gi'
                 description: |-
                   FUSE cache size as a K8s Quantity string (e.g., "100Gi").
                   Maps to an emptyDir sizeLimit + parsed to bytes for
@@ -226,6 +226,21 @@ spec:
                 type: array
                 x-kubernetes-validations:
                 - rule: size(self) > 0
+              tlsSecretName:
+                description: |-
+                  mTLS client cert Secret name. When set, the controller
+                  mounts this Secret at `/etc/rio/tls/` and sets the
+                  `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars.
+
+                  The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
+                  (cert-manager's standard output for a Certificate with a
+                  CA issuer). In the prod overlay, this is `rio-worker-tls`
+                  (see cert-manager.yaml).
+
+                  Unset = plaintext gRPC (dev mode). The worker's TlsConfig
+                  defaults to empty → load_client_tls returns None.
+                nullable: true
+                type: string
               tolerations:
                 description: |-
                   Tolerations for the StatefulSet pod spec. Pairs with
@@ -255,9 +270,11 @@ spec:
               conditions:
                 default: []
                 description: |-
-                  Standard K8s Conditions. ScalingActive / AtMinCapacity /
-                  AtMaxCapacity. Helps operators see WHY replicas is what
-                  it is ("at max, queue still deep" → raise spec.replicas.max).
+                  Standard K8s Conditions. Single `Scaling` type with reason
+                  ScaledUp / ScaledDown / UnknownMetric (status=False for
+                  errors). Helps operators see WHY replicas is what it is
+                  ("ScaledUp" with a message showing from/to; "UnknownMetric"
+                  when spec.autoscaling.metric is unsupported).
                 items:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -318,13 +335,13 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.phase
+    - jsonPath: '.status.phase'
       name: Phase
       type: string
-    - jsonPath: .status.progress
+    - jsonPath: '.status.progress'
       name: Progress
       type: string
-    - jsonPath: .metadata.creationTimestamp
+    - jsonPath: '.metadata.creationTimestamp'
       name: Age
       type: date
     name: v1alpha1

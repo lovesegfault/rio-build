@@ -17,6 +17,18 @@ resources:
   - namespace.yaml
   - pdb.yaml
   - networkpolicy.yaml
+  # cert-manager: self-signed CA + per-component Certificates.
+  # Requires cert-manager to be installed in the cluster (it's a
+  # prerequisite, not managed by this kustomization). The
+  # ClusterIssuer in here is cluster-scoped; everything else
+  # lands in rio-system.
+  - cert-manager.yaml
+
+# Strategic merge patches: TLS Secret mounts + RIO_TLS__* env +
+# probe retarget to plaintext health port. One patch file with
+# multiple YAML docs (one per Deployment).
+patchesStrategicMerge:
+  - tls-mounts.yaml
 
 patches:
   # S3 chunk backend. AWS creds via IRSA (the ServiceAccount
