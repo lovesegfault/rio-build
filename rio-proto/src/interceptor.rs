@@ -48,6 +48,7 @@ use opentelemetry::propagation::{Extractor, Injector};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+// r[impl obs.trace.w3c-traceparent]
 /// Inject the current span's trace context as W3C `traceparent` header
 /// into outgoing gRPC metadata.
 ///

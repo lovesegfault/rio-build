@@ -102,7 +102,13 @@ r[obs.metric.scheduler]
 | `rio_scheduler_cutoff_seconds` | Gauge | Duration cutoff per class (labeled by class; set once at config load, static) |
 | `rio_scheduler_class_queue_depth` | Gauge | Deferred derivations per target class (snapshot per dispatch pass) |
 | `rio_scheduler_cache_check_circuit_open_total` | Counter | Circuit-breaker open transitions (store unreachable for 5 consecutive cache checks). Alert if rate > 0: scheduler falling back to rejecting SubmitBuild. |
-| `rio_scheduler_class_load_fraction` *(Phase 3a+)* | Gauge | Load fraction per size class (adaptive rebalancer input) |
+| `rio_scheduler_prefetch_hints_sent_total` | Counter | PrefetchHint messages sent (one per assignment with paths to warm). Missing from a dispatch = leaf drv or bloom filter says worker already has everything. |
+| `rio_scheduler_prefetch_paths_sent_total` | Counter | Total paths in sent PrefetchHints. Divide by `hints_sent` for avg paths-per-hint. High avg = workers cold (poor locality) or bloom stale. |
+| `rio_scheduler_event_persist_dropped_total` | Counter | BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained. |
+| `rio_scheduler_lease_acquired_total` | Counter | Kubernetes Lease acquire transitions (standby → leader). *Internal — primary use is VM test observability.* |
+| `rio_scheduler_lease_lost_total` | Counter | Kubernetes Lease loss transitions (leader → standby). *Internal — non-zero on a single-replica deployment is a bug.* |
+| `rio_scheduler_estimator_refresh_total` | Counter | Build-history estimator refresh ticks (60s cadence). *Internal — VM test sync signal.* |
+| `rio_scheduler_class_load_fraction` *(Phase 4+)* | Gauge | Load fraction per size class (adaptive rebalancer input) |
 
 ### Store Metrics
 
@@ -132,8 +138,9 @@ r[obs.metric.worker]
 | `rio_worker_fuse_cache_misses_total` | Counter | FUSE cache misses |
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
 | `rio_worker_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
+| `rio_worker_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`error`/`malformed`/`panic`). Sustained high `already_cached` = scheduler bloom filter stale. |
 
-> **Note on ratio metrics:** For aggregatable cache metrics, use counter pairs (e.g., `rio_store_chunk_cache_hits_total` + `rio_store_chunk_cache_misses_total`) and compute ratios at query time with PromQL's `rate()`. Pre-computed gauge ratios lose meaning when averaged across instances, so rio-build does not emit any.
+> **Note on ratio metrics:** For aggregatable cache metrics, use counter pairs (e.g., `rio_store_chunk_cache_hits_total` + `rio_store_chunk_cache_misses_total`) and compute ratios at query time with PromQL's `rate()`. Pre-computed gauge ratios lose meaning when averaged across instances. Exception: `rio_store_chunk_dedup_ratio` is a per-upload event gauge (last-written-wins, not averaged) — useful for eyeballing recent PutPath dedup effectiveness but NOT for cross-instance aggregation.
 
 ### Controller Metrics
 
@@ -144,7 +151,7 @@ r[obs.metric.controller]
 | `rio_controller_reconcile_errors_total` | Counter | Reconcile errors (labeled by reconciler) |
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
-| `rio_controller_gc_runs_total` | Counter | GC runs (labeled by result: success/failure) |
+| `rio_controller_gc_runs_total` *(Phase 4+)* | Counter | GC runs (labeled by result: success/failure) — not yet emitted |
 
 ## Distributed Tracing
 
@@ -173,16 +180,20 @@ Build (gateway)
 
 ### Configuration
 
-| Parameter | Description |
-|-----------|-------------|
-| `otel_endpoint` | OTLP collector endpoint (e.g., `http://otel-collector:4317`) |
-| `otel_service_name` | Component name (auto-set per component) |
-| `otel_sample_rate` | Trace sampling rate (default: 1.0 in dev, 0.1 in prod) |
+OTel config is read from environment variables (NOT figment) because `init_tracing()` runs before config parsing and must not depend on any crate's config layout.
+
+| Env var | Description |
+|---------|-------------|
+| `RIO_OTEL_ENDPOINT` | OTLP gRPC collector endpoint (e.g., `http://otel-collector:4317`). Unset = OTel disabled entirely (zero overhead). |
+| `RIO_OTEL_SAMPLE_RATE` | Trace sampling rate 0.0–1.0 (default: 1.0). Clamped. |
+| `RIO_LOG_FORMAT` | `json` or `pretty` (default: `json`). |
+
+The OTel `service.name` resource attribute is set automatically per component (gateway, scheduler, store, worker, controller) by `init_tracing()`.
 
 ### Trace Propagation
 
 r[obs.trace.w3c-traceparent]
-Trace context is propagated via gRPC metadata using the W3C `traceparent` header format. The `tracing-opentelemetry` crate handles context injection and extraction automatically for tonic interceptors.
+Trace context is propagated via gRPC metadata using the W3C `traceparent` header format. Injection and extraction are **manual**, not tonic interceptors: `rio_proto::interceptor::inject_current()` copies the current span's context into outgoing request metadata (client side), and `rio_proto::interceptor::link_parent()` stitches the `#[instrument]` span into the incoming parent (server side, first line of each handler). Manual is deliberate: tonic's `Interceptor` trait changes `connect_*` return types (62-callsite type churn), doesn't compose with server-side `#[instrument]`, and the explicit call makes propagation points greppable. The W3C `TraceContextPropagator` is registered globally in `init_tracing()` regardless of whether `RIO_OTEL_ENDPOINT` is set — propagation works even when spans aren't exported.
 
 ## SLOs, SLIs, and Alerting
 
@@ -219,13 +230,18 @@ All components emit structured JSON logs via `tracing-subscriber` with the follo
 | `timestamp` | RFC 3339 | Event time |
 | `level` | string | Log level (TRACE, DEBUG, INFO, WARN, ERROR) |
 | `component` | string | Emitting component (gateway, scheduler, store, worker, controller) |
-| `trace_id` | string | OpenTelemetry trace ID (if within a traced span) |
-| `span_id` | string | OpenTelemetry span ID |
 | `build_id` | string | Build request ID (if applicable) |
 | `derivation_hash` | string | Derivation hash (if applicable) |
-| `tenant_id` | string | Tenant identifier |
 | `worker_id` | string | Worker instance ID (worker component only) |
 | `message` | string | Human-readable log message |
+
+Conditionally present:
+
+| Field | Type | When present |
+|-------|------|--------------|
+| `trace_id` | string | Only when `RIO_OTEL_ENDPOINT` is set AND the log is emitted within an active span. The default JSON fmt layer does NOT include trace/span IDs — they come from the OTel layer's span context. |
+| `span_id` | string | Same condition as `trace_id`. |
+| `tenant_id` *(Phase 4+)* | string | Tenant identifier — currently plumbed through `SubmitBuild` and persisted to `builds` table, but NOT yet recorded as a span field on any log line. |
 
 Optional fields may be added per component as `tracing` span fields. All fields use snake_case. Missing context fields (e.g., `build_id` outside a build context) are omitted rather than set to empty strings.
 
