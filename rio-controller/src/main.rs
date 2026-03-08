@@ -232,8 +232,20 @@ async fn main() -> anyhow::Result<()> {
 
 // r[impl obs.metric.controller]
 fn describe_metrics() {
-    use metrics::{describe_counter, describe_gauge};
+    use metrics::{describe_counter, describe_gauge, describe_histogram};
 
+    describe_histogram!(
+        "rio_controller_reconcile_duration_seconds",
+        "Reconcile loop latency. reconciler=build|workerpool. \
+         Recorded on both success and error paths — long durations + errors \
+         = slow/timing-out apiserver."
+    );
+    describe_counter!(
+        "rio_controller_reconcile_errors_total",
+        "Reconcile errors. reconciler=build|workerpool, error_kind=kube|finalizer|invalid_spec|scheduler_unavailable. \
+         error_kind is the variant discriminator (stable, low cardinality). \
+         Sustained rate > 0 = check controller logs."
+    );
     describe_counter!(
         "rio_controller_scaling_decisions_total",
         "Autoscale patches executed. direction=up|down. \
