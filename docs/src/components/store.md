@@ -201,19 +201,21 @@ Pseudo-DDL for all store tables. `narinfo` and `manifests` are split to avoid TO
 
 ```sql
 CREATE TABLE narinfo (
-    store_path_hash  BYTEA PRIMARY KEY,
-    store_path       TEXT NOT NULL,
-    deriver          TEXT,
-    nar_hash         BYTEA NOT NULL,          -- SHA-256
-    nar_size         BIGINT NOT NULL,
-    references       TEXT[] NOT NULL DEFAULT '{}',
-    signatures       TEXT[] NOT NULL DEFAULT '{}',
-    ca               TEXT,                        -- content address (empty string for input-addressed)
-    tenant_id        UUID NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    store_path_hash    BYTEA PRIMARY KEY,
+    store_path         TEXT NOT NULL,
+    deriver            TEXT,
+    nar_hash           BYTEA NOT NULL,          -- SHA-256
+    nar_size           BIGINT NOT NULL,
+    references         TEXT[] NOT NULL DEFAULT '{}',
+    signatures         TEXT[] NOT NULL DEFAULT '{}',
+    ca                 TEXT,                    -- content address (empty string for input-addressed)
+    tenant_id          UUID,                    -- nullable: multi-tenancy deferred to Phase 4
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    registration_time  BIGINT NOT NULL DEFAULT 0,
+    ultimate           BOOLEAN NOT NULL DEFAULT FALSE
 );
 
-> The `manifests` + `manifest_data` + `chunks` tables are the active schema as of Phase 2c (migration `006_phase2c.sql` dropped the Phase 2a `nar_blobs` table). Small NARs (< 256 KiB) store inline in `manifests.inline_blob`; larger NARs are FastCDC-chunked with BLAKE3 dedup. **ChunkBackend wiring in `main.rs` is deferred to Phase 3a** — the chunking library (C1-C6) is complete and tested, but the binary runs inline-only until the backend is constructed from config.
+> The `manifests` + `manifest_data` + `chunks` tables are the active schema as of Phase 2c (migration `002_store.sql` dropped the Phase 2a `nar_blobs` table). Small NARs (< 256 KiB) store inline in `manifests.inline_blob`; larger NARs are FastCDC-chunked with BLAKE3 dedup. ChunkBackend is constructed from config (`ChunkBackendKind` enum: `Inline` / `Filesystem` / `S3`, default `Inline` for back-compat).
 
 CREATE TABLE manifests (
     store_path_hash  BYTEA PRIMARY KEY
@@ -269,7 +271,11 @@ CREATE TABLE realisations (
     PRIMARY KEY (drv_hash, output_name)
 );
 CREATE INDEX realisations_output_idx ON realisations (output_path);
+```
 
+> **Phase deferral (GC):** The `pending_s3_deletes` table is part of the unimplemented GC subsystem. This DDL is the target design.
+
+```sql
 CREATE TABLE pending_s3_deletes (
     id               BIGSERIAL PRIMARY KEY,
     s3_key           TEXT NOT NULL,
