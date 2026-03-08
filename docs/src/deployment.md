@@ -14,9 +14,9 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 | Component | K8s Resource | Replicas | Notes |
 |-----------|-------------|----------|-------|
 | rio-gateway | Deployment | 2+ | Stateless (per-connection ephemeral state only). Behind NLB. |
-| rio-scheduler | Deployment | 1 (leader-elected) | Leader election via Kubernetes Lease. Standby replicas for failover. |
-| rio-store | Deployment | 2+ | Stateless. Handles gRPC + binary cache HTTP. |
-| rio-controller | Deployment | 1 (leader-elected) | K8s operator. Leader election via Kubernetes Lease. |
+| rio-scheduler | Deployment | 2 (leader-elected) | Leader election via Kubernetes Lease. One leader, one hot standby. ~15s failover. |
+| rio-store | Deployment | 1 | Stateless at runtime (PG + S3 hold everything), but concurrent startup migrations from multiple replicas would race. Scale horizontally later after adding a migration-lock mechanism. |
+| rio-controller | Deployment | 1 | K8s operator. **Single replica, not leader-elected** --- two controllers would fight over SSA patches (conflicting fieldManager). Add leader election later if the ~30s pod-reschedule gap during restart becomes a problem. |
 | rio-worker | StatefulSet | 2+ (autoscaled) | Managed by rio-controller via WorkerPool CRD. Requires dedicated node pool. |
 
 ## Deployment Order
@@ -63,11 +63,13 @@ See [Configuration Reference](./configuration.md) for all parameters. The minimu
 
 | Component | Required Config |
 |-----------|----------------|
-| Gateway | `host_key_path`, `authorized_keys_path` |
+| Gateway | `host_key`, `authorized_keys`, `scheduler_addr`, `store_addr` |
 | Scheduler | `database_url` |
-| Store | `database_url`, `s3_bucket`, `signing_key_path` |
+| Store | `database_url`, `chunk_backend` (tagged enum: `inline` / `filesystem` / `s3`), `signing_key_path` |
 | Controller | `scheduler_addr` |
 | Workers | `scheduler_addr`, `store_addr` |
+
+> **Store chunk backend config** uses a serde internally-tagged enum (`kind`). TOML example for S3: `[chunk_backend]` / `kind = "s3"` / `bucket = "..."` / `prefix = "..."`. Default is `inline` (NARs stored in PostgreSQL --- fine for dev, does not scale). There is no flat `s3_bucket` field.
 
 ## Secrets
 
@@ -77,7 +79,9 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Authorized SSH keys (gateway)
 - NAR signing key (store)
 - Database credentials (scheduler, store)
-- HMAC signing key for assignment tokens (scheduler, store)
+- HMAC signing key for assignment tokens (scheduler, store) --- **not yet implemented**; the current assignment token is an unsigned `format!("{worker_id}-{drv_hash}-{generation}")` string and the store does not validate it. Signed tokens are planned for Phase 3b.
+
+> **SSH key mounting:** The base manifests and shipped overlays (`deploy/overlays/dev`, `deploy/overlays/prod`) do **not** mount the SSH host key or authorized_keys Secret into the gateway container --- without a mount, the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production deployments must add a `volumeMount` patch to the gateway Deployment for the SSH key Secret.
 
 ## Verification
 
@@ -85,13 +89,14 @@ After deployment:
 
 ```bash
 # 1. Verify gateway is reachable
-ssh -i ~/.ssh/rio_key -p 2222 rio-gateway.example.com
+# (Service maps external port 22 → container port 2222; use the default SSH port externally)
+ssh -i ~/.ssh/rio_key rio-gateway.example.com
 
 # 2. Query a known store path
-nix path-info --store ssh-ng://rio-gateway.example.com:2222 /nix/store/...-hello
+nix path-info --store ssh-ng://rio-gateway.example.com /nix/store/...-hello
 
 # 3. Build a simple package
-nix build --store ssh-ng://rio-gateway.example.com:2222 nixpkgs#hello
+nix build --store ssh-ng://rio-gateway.example.com nixpkgs#hello
 
 # 4. Verify binary cache
 curl -s https://rio-cache.example.com/nix-cache-info
@@ -107,7 +112,7 @@ curl -s https://rio-cache.example.com/nix-cache-info
 ## Upgrades
 
 - **Schema migrations:** Run via `sqlx migrate` with advisory locks. All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables).
-- **Rolling updates:** Workers drain gracefully via `terminationGracePeriodSeconds` (7200s for workers, 600s for gateways). In-flight builds complete before the pod exits. Use `maxUnavailable: 1` in the StatefulSet update strategy.
+- **Rolling updates:** Worker StatefulSets (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the worker's SIGTERM handler blocks on its build semaphore until in-flight builds complete, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Use `maxUnavailable: 1` in the StatefulSet update strategy.
 - **Blue/green deployments:** Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
 - **Version skew policy:** Gateway and worker binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.
 
@@ -115,7 +120,9 @@ curl -s https://rio-cache.example.com/nix-cache-info
 
 - **PostgreSQL:** Standard backup/restore via `pg_dump`, WAL archiving, or managed service snapshots (e.g., RDS automated backups). PostgreSQL is the authoritative source for all metadata (narinfo, chunk manifests, scheduling state, build history). **PG metadata cannot be reconstructed from S3 alone.**
 - **S3:** Durable by default (11 nines). Chunk data in S3 is the source of truth for build artifacts. Enable S3 versioning as defense against accidental deletes.
-- **Recovery procedure:** Restore PostgreSQL from backup, verify S3 bucket accessibility, restart all components. The scheduler reconstructs its in-memory DAG from PostgreSQL on startup. Workers reconnect and re-register.
+- **Recovery procedure:** Restore PostgreSQL from backup, verify S3 bucket accessibility, restart all components. Workers reconnect and re-register.
+
+    > **Phase 3b deferral:** Scheduler in-memory DAG reconstruction from PostgreSQL on startup is **not yet implemented**. A scheduler restart currently starts with an empty DAG --- in-flight builds are lost and must be resubmitted by clients. Crash recovery for scheduler state is planned for Phase 3b.
 - **RPO:** Determined by PostgreSQL backup frequency. With WAL archiving, RPO can be near-zero. S3 data has effectively zero RPO.
 - **RTO:** Determined by PostgreSQL restore time + component restart time. Typically 5-15 minutes for managed databases.
 
