@@ -8,22 +8,31 @@ Referenced by: [Phase 3](phases/phase3.md) (basic retry), [Phase 4](phases/phase
 
 | Classification | Retryable | Example | Client Sees | Phase |
 |---------------|-----------|---------|-------------|-------|
-| **PermanentFailure** | No | Build script exits non-zero, sandbox violation, derivation resolution failed | `BuildResult::PermanentFailure` | 2a |
-| **TransientFailure** | Yes (with backoff) | Worker OOM-killed, worker pod preempted, network timeout during input fetch, MiscFailure | `BuildResult::TransientFailure` | 3 |
+| **PermanentFailure** | No | Build script exits non-zero, sandbox violation, output rejected, timeout | `BuildResult::PermanentFailure` | 2a |
+| **TransientFailure** | Yes (with backoff) | Worker OOM-killed, worker pod preempted, network timeout during input fetch | `BuildResult::TransientFailure` | 3 |
 | **InfrastructureFailure** | Yes (different worker) | S3 unavailable, PostgreSQL connection timeout, FUSE cache I/O error, overlay mount failure | `BuildResult::TransientFailure` + reassignment | 3 |
-| **TimedOut** | Configurable | Build exceeded `maxSilentTime` or overall timeout | `BuildResult::TimedOut` | 3 |
 | **DependencyFailed** | No (dep must succeed first) | An input derivation failed | `BuildResult::DependencyFailed` | 2a |
 | **CachedFailure** | No (until TTL expires) | Derivation marked as poisoned | `BuildResult::CachedFailure` | 4 |
 
+> **Note:** There is no `TimedOut` variant in the `BuildResultStatus` proto enum. Nix's `BuildStatus::TimedOut` (wire value 8) currently maps to `PermanentFailure` via the worker's fallthrough mapping.
+
 ### Additional Nix BuildResult Mappings
 
-| Nix Status | rio-build Classification | Rationale |
-|------------|------------------------|-----------|
-| `MiscFailure` | TransientFailure | Catch-all for unclassified Nix errors; retry is safe |
-| `LogLimitExceeded` | PermanentFailure | Build produces excessive output; retry would repeat |
-| `NotDeterministic` | PermanentFailure | Build detected as non-deterministic by Nix's `--check` |
-| `ResolveFailed` | PermanentFailure | Derivation references unresolvable store path |
-| `NoSubstituters` | PermanentFailure | rio-build does not use external substituters; if the store doesn't have it, it can't be substituted |
+The worker maps `rio_nix::BuildStatus` (the real Nix wire enum) to the proto `BuildResultStatus`. Only `PermanentFailure` and `TransientFailure` are mapped explicitly; **all other Nix statuses fall through to `PermanentFailure`**:
+
+| Nix Status | rio-build Classification | Notes |
+|------------|------------------------|-------|
+| `PermanentFailure` (3) | PermanentFailure | Explicit mapping |
+| `TransientFailure` (6) | TransientFailure | Explicit mapping |
+| `MiscFailure` (9) | PermanentFailure | Fallthrough. TODO(phase3b): consider mapping to TransientFailure if field experience shows these are often retryable. |
+| `TimedOut` (8) | PermanentFailure | Fallthrough. No distinct proto variant. |
+| `LogLimitExceeded` (11) | PermanentFailure | Fallthrough. Retry would repeat. |
+| `NotDeterministic` (12) | PermanentFailure | Fallthrough. Detected by Nix's `--check`. |
+| `InputRejected` (4) | PermanentFailure | Fallthrough. Derivation references an invalid/unresolvable input. |
+| `OutputRejected` (5) | PermanentFailure | Fallthrough. Output hash mismatch (FOD) or path collision. |
+| `NoSubstituters` (14) | PermanentFailure | Fallthrough. rio-build does not use external substituters. |
+
+See `rio-worker/src/executor/mod.rs` for the mapping implementation.
 
 ### FUSE/Overlay Failures
 
@@ -31,22 +40,27 @@ Referenced by: [Phase 3](phases/phase3.md) (basic retry), [Phase 4](phases/phase
 |---------|---------------|--------|
 | FUSE cache I/O error | InfrastructureFailure | Retry on different worker (local disk may be failing) |
 | Overlay mount failure | InfrastructureFailure | Retry on different worker (kernel/capability issue) |
-| FUSE daemon crash | InfrastructureFailure | Restart FUSE daemon; retry build on same worker if restart succeeds |
+| FUSE daemon crash | InfrastructureFailure | The FUSE filesystem is mounted in-process; a crash terminates the worker. External supervisor (systemd / Kubernetes) restarts the pod. Builds in flight are reported as `InfrastructureFailure` and retried on a different worker. |
 
 ## Retry Policy
 
+The scheduler's `RetryPolicy` struct (see `rio-scheduler/src/state/worker.rs`):
+
 | Parameter | Default | Description | Phase |
 |-----------|---------|-------------|-------|
-| `maxRetries` | 2 | Maximum retry attempts per derivation after the initial attempt (total attempts = maxRetries + 1, across all workers) | 3 |
-| `retryBackoffBase` | 5s | Initial backoff delay | 3 |
-| `retryBackoffMultiplier` | 2.0 | Exponential multiplier | 3 |
-| `retryBackoffMax` | 300s | Maximum backoff delay | 3 |
-| `retryBackoffJitter` | 0.2 | Jitter factor (0.0-1.0) | 3 |
-| `retryOnDifferentWorker` | true | Whether to prefer a different worker on retry | 3 |
+| `max_retries` | 2 | Maximum retry attempts per derivation after the initial attempt (total attempts = max_retries + 1) | 2a |
+| `backoff_base_secs` | 5.0 | Initial backoff delay in seconds | 2a |
+| `backoff_multiplier` | 2.0 | Exponential multiplier | 2a |
+| `backoff_max_secs` | 300.0 | Maximum backoff delay in seconds | 2a |
+| `jitter_fraction` | 0.2 | Jitter factor (0.0-1.0) applied to computed backoff | 2a |
 
-Only `TransientFailure` and `InfrastructureFailure` errors trigger retries. `PermanentFailure` and `DependencyFailed` are terminal. `TimedOut` is configurable (retryable if the timeout was `maxSilentTime`, terminal if overall build timeout).
+Only `TransientFailure` and `InfrastructureFailure` errors trigger retries. `PermanentFailure` and `DependencyFailed` are terminal.
 
-> **Interaction with poison tracking:** The poison threshold (default: 3 different workers) spans across all builds, not just one build's retry budget. A derivation that fails with `maxRetries=2` in Build A (3 total attempts) may be attempted again in Build B. After failing on 3 distinct workers across any number of builds, it is marked poisoned. Within a single build, `maxRetries` bounds the retry count.
+> **Phase 3b deferral:** The backoff duration is computed and logged but **not yet applied** --- the derivation is re-queued immediately after a transient failure. A delayed re-queue using `tokio::time::sleep` on the computed duration is planned for Phase 3b (see `TODO(phase3b)` at `rio-scheduler/src/actor/completion.rs`).
+
+**Worker avoidance on retry:** There is no explicit config flag for "retry on a different worker." Instead, the scheduler maintains a `failed_workers: HashSet<WorkerId>` on each derivation (see `DerivationState`). This set is currently used only for poison-threshold detection (the derivation is poisoned once `failed_workers.len() >= POISON_THRESHOLD`). Dispatch does not yet exclude workers in `failed_workers` from re-assignment --- a retry may land on the same worker.
+
+> **Interaction with poison tracking:** The poison threshold (`POISON_THRESHOLD = 3` distinct workers) spans across all builds, not just one build's retry budget. A derivation that fails with `max_retries=2` in Build A (3 total attempts) may be attempted again in Build B. After failing on 3 distinct workers across any number of builds, it is marked poisoned. Within a single build, `max_retries` bounds the retry count.
 
 ## Poison Derivation Tracking
 
@@ -68,12 +82,14 @@ Poisoned derivations:
 
 ## Timeout Enforcement
 
-| Level | Enforced By | Mechanism |
-|-------|------------|-----------|
-| Per-derivation silence timeout | Worker | Monitors build process stdout/stderr; kills if no output for `maxSilentTime` |
-| Per-derivation wall-clock timeout | Worker | Kills build process if exceeds `2 * estimatedDuration` (configurable factor) |
-| Per-build overall timeout | Scheduler | Cancels remaining derivations if `Build.spec.timeout` exceeded |
-| Scheduler backstop | Scheduler | If worker doesn't report completion within `max(3 * estimatedDuration, heartbeat_interval * 30)`, assumes worker is lost and reassigns. The `heartbeat_interval * 30` floor ensures long builds with poor estimates aren't killed prematurely. |
+| Level | Enforced By | Mechanism | Status |
+|-------|------------|-----------|--------|
+| Per-derivation wall-clock timeout | Worker | `tokio::time::timeout` wrapping the nix-daemon build. Duration is `WorkAssignment.build_options.build_timeout` if nonzero, else `DEFAULT_DAEMON_TIMEOUT` (7200s / 2h). Configurable via `RIO_DAEMON_TIMEOUT_SECS`, `--daemon-timeout-secs`, or `worker.toml`. | **Implemented** |
+| Per-derivation silence timeout | --- | `maxSilentTime` (kill if no output for N seconds) is **not** enforced by the worker. The nix-daemon subprocess may enforce it internally via `nix.conf`, but the worker does not monitor output cadence. | Not implemented |
+| Per-build overall timeout | --- | Scheduler-side cancellation when `Build.spec.timeout` is exceeded is **not** implemented. | Not implemented |
+| Scheduler backstop timeout | --- | Scheduler-side "worker is lost, reassign" based on missing completion within a multiple of estimated duration is **not** implemented. Worker loss is detected via heartbeat disconnect, not via per-derivation timeout. | Not implemented |
+
+> **Phase 3b deferral:** Per-build overall timeout and scheduler backstop timeout are planned for Phase 3b as part of K8s-aware retry hardening.
 
 ## Error Propagation: What the Client Sees
 
