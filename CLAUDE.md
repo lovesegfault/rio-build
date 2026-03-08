@@ -59,6 +59,8 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 30s fuzz smoke, VM tests) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
 | `nix build .#fuzz-nightly-<target>` | 10-minute nightly-tier fuzz run for a single target |
+| `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
+| `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
 
 ### CI aggregate targets
@@ -93,6 +95,7 @@ Pre-commit hooks run treefmt automatically on commit.
 - PostgreSQL integration tests bootstrap their own ephemeral postgres server (via `rio-test-support`) using `initdb`/`postgres` binaries from the dev shell. **No manual setup needed.** Tests panic (not skip) if postgres binaries are unavailable. Set `DATABASE_URL` to override with an external PG for debugging.
 - Use semantic commit messages scoped by crate (e.g., `feat(rio-nix): add ATerm derivation parser`).
 - Keep phase plan docs (`docs/src/phases/`) in sync: mark tasks `[x]` as they're completed.
+- **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
 
 ## Fuzzing
 
@@ -128,6 +131,25 @@ This project has a comprehensive design book in `docs/src/`. When implementing a
 ### Keeping docs and code in sync
 
 When implementation reveals that a design doc is wrong (e.g., the spec says u32 but the real protocol uses u64), update the design doc in the same commit that fixes the code. Don't let them drift.
+
+### Spec traceability (tracey)
+
+Normative requirements in `docs/src/` are marked with `r[domain.area.detail]` standalone paragraphs. Code that implements a requirement carries `// r[impl domain.area.detail]`; tests carry `// r[verify …]`. The CI check `tracey-validate` fails on broken references.
+
+| Command | Use |
+|---|---|
+| `tracey query uncovered` | Spec rules with no `impl` annotation — unimplemented features |
+| `tracey query untested` | Spec rules with `impl` but no `verify` — missing test coverage |
+| `tracey query rule <id>` | See spec text + all impl/verify sites for one rule |
+| `tracey query validate` | CI check — broken refs, duplicate IDs (exits 0 currently, CI greps for `0 total error(s)`) |
+| `tracey query status` | Overall coverage summary |
+| `tracey bump` | Bump version of staged requirements whose text changed (marks existing annotations stale) |
+
+**When adding spec text that describes a new behavior or constraint:** add an `r[...]` marker (standalone paragraph, blank line before, col 0), then annotate the implementing code with `// r[impl ...]` and the test with `// r[verify ...]`. The marker-first discipline means `tracey query uncovered` surfaces unimplemented spec requirements immediately.
+
+**When spec text changes meaningfully:** run `tracey bump` before committing. This version-bumps the marker (e.g., `r[gw.opcode.foo]` → `r[gw.opcode.foo+2]`), making existing `r[impl gw.opcode.foo]` annotations stale until someone reviews and bumps them.
+
+**tracey ≠ `TODO(phaseXY)`.** tracey answers "what does the spec say, what's covered, what's tested." `TODO(phaseXY)` answers "when do we build this." A feature with a spec marker but no `r[impl]` shows up in `tracey query uncovered` — pair that with a `TODO(phaseXY)` in the spec itself or a phase doc to answer "when."
 
 ### Deferred work and TODOs
 
@@ -188,7 +210,8 @@ Include:
 - Fuzz targets for wire parsing (`cargo-fuzz` in `rio-nix/fuzz/`)
 
 **Before marking an opcode as complete, verify:**
-- [ ] Byte-level test in `direct_protocol.rs` (constructs raw wire bytes, no SSH)
+- [ ] `tracey query rule gw.opcode.<name>` shows both `impl` (in `opcodes_*.rs`) and `verify` (in `wire_opcodes/` + `golden/`)
+- [ ] Byte-level test in `wire_opcodes/` (constructs raw wire bytes, no SSH)
 - [ ] At least one error-path test (e.g., missing path, hash mismatch) verifying STDERR_ERROR is sent
 - [ ] Proptest roundtrip for any new wire types introduced by the opcode
 - [ ] Fuzz target for any new parser (ATerm, NAR, DerivedPath, etc.)
