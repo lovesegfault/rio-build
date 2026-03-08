@@ -397,7 +397,6 @@ impl Handler for ConnectionHandler {
 }
 
 // r[verify sec.boundary.ssh-auth]
-// r[verify obs.metric.gateway]
 #[cfg(test)]
 mod tests {
     use super::*;

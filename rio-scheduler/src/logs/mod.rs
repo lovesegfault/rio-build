@@ -195,8 +195,6 @@ impl Default for LogBuffers {
     }
 }
 
-// r[verify obs.log.batch-64-100ms]
-// r[verify obs.metric.scheduler]
 #[cfg(test)]
 mod tests {
     use super::*;

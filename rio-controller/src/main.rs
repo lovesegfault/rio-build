@@ -321,7 +321,6 @@ fn spawn_health_server(addr: std::net::SocketAddr) {
     });
 }
 
-// r[verify obs.metric.controller]
 #[cfg(test)]
 mod tests {
     use super::*;

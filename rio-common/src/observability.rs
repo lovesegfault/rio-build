@@ -296,8 +296,6 @@ fn log_format_from_env() -> LogFormat {
     }
 }
 
-// r[verify obs.log.required-fields]
-// r[verify obs.trace.w3c-traceparent]
 #[cfg(test)]
 // See config.rs test module for the same allow — figment::Jail closure's
 // Result<(), figment::Error> is 208 bytes, API-fixed, can't box it.
