@@ -308,7 +308,6 @@ pub fn prepare_nix_state_dirs(upper: &Path) -> Result<PathBuf, OverlayError> {
 }
 
 // r[verify worker.overlay.per-build]
-// r[verify worker.overlay.stacked-lower]
 // r[verify worker.overlay.upper-not-overlayfs]
 #[cfg(test)]
 mod tests {

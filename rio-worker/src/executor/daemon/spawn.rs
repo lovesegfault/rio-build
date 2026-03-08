@@ -169,7 +169,6 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
 
 // r[verify worker.daemon.no-unwrap-stdio]
 // r[verify worker.daemon.kill-both-paths]
-// r[verify worker.ns.order]
 #[cfg(test)]
 mod tests {
     use super::*;

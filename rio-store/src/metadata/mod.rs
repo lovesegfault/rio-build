@@ -280,10 +280,6 @@ pub(super) async fn update_narinfo_complete(
     .map(|r| r.rows_affected())
 }
 
-// r[verify store.put.wal-manifest]
-// r[verify store.put.idempotent]
-// r[verify store.inline.threshold]
-// r[verify store.chunk.refcount-txn]
 #[cfg(test)]
 mod tests {
     use super::*;

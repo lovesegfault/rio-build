@@ -597,7 +597,6 @@ async fn patch_status(api: &Api<Build>, name: &str, status: BuildStatus) -> Resu
 }
 
 // r[verify ctrl.crd.build]
-// r[verify ctrl.build.sentinel]
 #[cfg(test)]
 mod tests {
     use super::*;

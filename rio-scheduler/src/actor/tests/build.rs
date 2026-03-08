@@ -1,7 +1,5 @@
 //! Build lifecycle: CancelBuild, WatchBuild, terminal cleanup.
 // r[verify sched.build.state]
-// r[verify sched.build.keep-going]
-// r[verify sched.backpressure.hysteresis]
 
 use super::*;
 

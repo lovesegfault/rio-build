@@ -132,7 +132,7 @@ impl DagActor {
     ///
     /// Overflow direction: small → large only. A slow build on a small
     /// worker would dominate that worker's single slot; a fast build on
-    /// a large worker is just slightly wasteful. scheduler.md:158.
+    /// a large worker is just slightly wasteful. scheduler.md:178.
     fn find_worker_with_overflow(
         &self,
         drv_hash: &DrvHash,

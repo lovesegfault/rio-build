@@ -7,7 +7,7 @@
 // r[impl sched.classify.mem-bump]
 //! current load.
 //!
-//! # Scoring (scheduler.md:53-59)
+//! # Scoring (scheduler.md:54-61)
 //!
 //! `score = transfer_cost * W_locality + load_fraction * W_load`
 //!

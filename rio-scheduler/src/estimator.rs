@@ -7,7 +7,7 @@
 // r[impl sched.estimate.ema-alpha]
 //! side of "always return SOMETHING" rather than "fail if uncertain".
 //!
-//! # Fallback chain (scheduler.md:97-102)
+//! # Fallback chain (scheduler.md:105-110)
 //!
 //! 1. Exact `(pname, system)` match → EMA from `build_history`
 //! 2. `pname` match on ANY system → cross-system EMA (ARM and x86 builds
@@ -57,7 +57,7 @@ pub struct Estimator {
 }
 
 /// Default duration estimate when we have no history. 30 seconds is the
-/// spec value (scheduler.md:102). Too short and critical-path priorities
+/// spec value (scheduler.md:110). Too short and critical-path priorities
 /// are dominated by unknown derivations (everything looks equally urgent);
 /// too long and unknown derivations hog the front of the queue.
 ///
@@ -211,7 +211,6 @@ impl Estimator {
 }
 
 // r[verify sched.estimate.fallback-chain]
-// r[verify sched.estimate.ema-alpha]
 #[cfg(test)]
 mod tests {
     use super::*;

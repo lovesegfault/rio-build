@@ -664,7 +664,6 @@ fn pool_key(pool: &WorkerPool) -> String {
 
 // r[verify ctrl.autoscale.direct-patch]
 // r[verify ctrl.autoscale.separate-field-manager]
-// r[verify ctrl.autoscale.skip-deleting]
 #[cfg(test)]
 mod tests {
     use super::*;

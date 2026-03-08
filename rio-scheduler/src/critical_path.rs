@@ -39,7 +39,7 @@ use crate::state::DrvHash;
 /// (from the Estimator) and `priority` (bottom-up from children).
 ///
 /// Existing nodes are NOT recomputed unless a new subgraph connects to
-/// them with a higher-priority path (scheduler.md:428). This means:
+/// them with a higher-priority path (scheduler.md:473). This means:
 /// - A new build that shares an existing derivation doesn't disturb
 ///   the existing derivation's priority UNLESS the new build's subgraph
 ///   makes that derivation more critical (on a longer path).
