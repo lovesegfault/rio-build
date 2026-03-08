@@ -66,14 +66,14 @@ r[worker.fuse.cache-lru]
 r[worker.fuse.lookup-caches]
 The FUSE daemon is implemented using the `fuser` crate and runs as part of the worker process (not a sidecar). It handles:
 
-- `lookup`: Check if a store path exists by querying rio-store's `QueryPathInfo`. **MUST call `ensure_cached()`** --- the kernel caches lookup attr with 1h TTL, never calls `getattr`, so child lookups hit empty cache → ENOENT otherwise.
+- `lookup`: **Top-level lookups** (direct children of the FUSE root, i.e., store basenames like `abc...-hello`) **MUST call `ensure_cached()`** to materialize the whole store-path tree on disk before returning. The kernel caches the lookup attr with 1h TTL and never calls `getattr`, so child lookups (`lookup(busybox_ino, "bin")`) would hit an empty cache → ENOENT otherwise. **Child lookups** (inside an already-materialized tree) hit local disk directly with `symlink_metadata` --- no gRPC.
 - `getattr`: Return file metadata from cached path info
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
-- `open`: Trigger background prefetch of the entire store path on first access
+- `open`: Open the already-materialized local file (fast path, since `lookup` fetched the tree). Falls back to `ensure_cached()` on ENOENT. With passthrough enabled, hands the kernel a backing fd via `open_backing()` so subsequent `read()` calls bypass userspace. **Prefetch is separate** --- it's scheduler-driven via `PrefetchHint` messages on the assignment stream, not triggered by `open()`.
 
 ### FUSE Design Notes
 
-The target architecture splits the FUSE daemon into submodules: `fuse/mod.rs` (daemon lifecycle, mount management), `fuse/lookup.rs` (path existence and metadata queries), `fuse/read.rs` (file content serving), and `fuse/cache.rs` (LRU cache management). The FUSE daemon handles concurrent access from multiple overlays via `Arc<Cache>` with a read-mostly access pattern --- store paths are immutable, so concurrent reads require no synchronization beyond the cache index.
+The FUSE daemon is split across submodules: `fuse/mod.rs` (daemon lifecycle, mount management, `NixStoreFs` struct), `fuse/ops.rs` (the `Filesystem` trait impl --- all kernel callbacks: `lookup`, `getattr`, `open`, `read`, `readlink`, `readdir`, `forget`), `fuse/inode.rs` (bidirectional inode↔path map with kernel `nlookup` refcounting), `fuse/lookup.rs` (attribute helpers: `stat_to_attr`, `ATTR_TTL`), `fuse/read.rs` (file-range read helper + errno translation), `fuse/cache.rs` (LRU cache management, SQLite-backed), and `fuse/fetch.rs` (`ensure_cached`: NAR fetch + extract from rio-store). The FUSE daemon handles concurrent access from multiple overlays via `Arc<Cache>` with a read-mostly access pattern --- store paths are immutable, so concurrent reads require no synchronization beyond the cache index.
 
 **`fuser` 0.17 API (validated in Phase 1a spike):**
 
@@ -132,6 +132,13 @@ experimental-features =
 
 This configuration ensures workers only build derivations locally and never attempt to delegate or substitute externally.
 
+### Worker Capabilities
+
+Each worker advertises two capability lists in its heartbeat so the scheduler can route derivations:
+
+- **`systems`** (`Vec<String>`): Nix system identifiers this worker can build for (e.g., `x86_64-linux`, `aarch64-linux`). The scheduler's `can_build()` does an **any-match** against the derivation's `system` field. If unset, the worker auto-detects a single element as `{arch}-{os}` via `std::env::consts`. Multi-element configurations are for qemu-user-static or cross-arch workers. Configure via `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-separated env), `systems = ["x86_64-linux"]` (TOML array), or repeated `--system` CLI flags.
+- **`features`** (`Vec<String>`): `requiredSystemFeatures` this worker supports (e.g., `kvm`, `big-parallel`). The scheduler's `can_build()` does an **all-match** --- every feature the derivation requires must be present here. Empty by default. Configure via `RIO_FEATURES`, `features` in TOML, or repeated `--feature` flags.
+
 > **Recursive Nix is not supported.** Derivations that invoke Nix internally (`__recursive` / `recursive-nix` experimental feature) will fail because `substitute = false`, `builders =`, and `experimental-features =` prevent the inner Nix from fetching dependencies or delegating builds. This is an explicit non-goal for the initial release. Supporting recursive Nix would require the worker to act as both a builder and a store client for the inner Nix instance, significantly complicating the worker architecture.
 
 ## rio-nix Client Protocol
@@ -168,6 +175,8 @@ After build completes:
 2. Chunk and upload to rio-store (CAS), presenting the scheduler-issued assignment token for authorization (see [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc))
 3. Register path metadata (narinfo, references)
 4. Discard upper layer
+
+**Teardown failure handling:** Overlay teardown (`umount2`) can fail if the mount is stuck busy (open file handles, zombie `nix-daemon`, FUSE hang). The worker tracks these leaks with a worker-lifetime counter. After `max_leaked_mounts` failures (default 3, configurable), `execute_build` short-circuits at entry with `InfrastructureFailure` so the scheduler reassigns to a healthy worker and the supervisor can restart this one. The check is at build **entry**, not exit --- a build that completes successfully isn't penalized if its own teardown later fails; the *next* build is what gets refused.
 
 ### Multi-Output Derivation Upload
 
@@ -350,16 +359,22 @@ A future improvement would split the worker into two processes:
 
 **Status:** Deferred. Will be investigated when the basic worker architecture is stable (post Phase 3).
 
+## Deferred: Build Cancellation (Phase 3b)
+
+The worker currently logs and ignores `Cancel` messages from the scheduler. Phase 3b will implement cancellation by writing `1` to the build's `cgroup.kill` (SIGKILLs the whole tree), releasing the semaphore permit, and sending `CompletionReport{status: Cancelled}`. This is needed for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
+
 ## Key Files
 
+- `rio-worker/src/config.rs` --- `Config` + `CliArgs` (two-struct figment split) and `detect_system()`
 - `rio-worker/src/executor/` --- Build execution (spawns nix-daemon in mount namespace, drives protocol)
 - `rio-worker/src/overlay.rs` --- overlayfs setup and teardown
-- `rio-worker/src/fuse/mod.rs` --- FUSE daemon lifecycle and mount management
-- `rio-worker/src/fuse/ops.rs` --- `Filesystem` trait impl: lookup, getattr, open (passthrough), read, readdir
-- `rio-worker/src/fuse/lookup.rs` --- `stat_to_attr` + TTL constants (helpers for ops.rs)
-- `rio-worker/src/fuse/read.rs` --- File content serving and prefetch
-- `rio-worker/src/fuse/cache.rs` --- LRU cache management (SSD-backed)
-- `rio-worker/src/fuse/fetch.rs` --- Fetch + extract NAR from rio-store (prefetch + on-demand)
+- `rio-worker/src/fuse/mod.rs` --- FUSE daemon lifecycle, mount management, `NixStoreFs` struct
+- `rio-worker/src/fuse/ops.rs` --- `Filesystem` trait implementation (all kernel callbacks: `lookup`, `getattr`, `open`, `read`, `readlink`, `readdir`, `forget`, `init`, `destroy`)
+- `rio-worker/src/fuse/inode.rs` --- Bidirectional inode↔path map with kernel `nlookup` refcounting
+- `rio-worker/src/fuse/lookup.rs` --- Attribute helpers: `stat_to_attr`, `ATTR_TTL`, `BLOCK_SIZE`
+- `rio-worker/src/fuse/read.rs` --- File-range read helper (`pread`) + `io::Error` → `Errno` translation
+- `rio-worker/src/fuse/cache.rs` --- LRU cache management (SQLite-indexed, SSD-backed)
+- `rio-worker/src/fuse/fetch.rs` --- `ensure_cached`: NAR fetch + extract from rio-store (prefetch + on-demand)
 - `rio-worker/src/synth_db.rs` --- Synthetic SQLite DB generation for nix-daemon
 - `rio-worker/src/upload.rs` --- Chunk and upload build outputs (streaming NAR → rio-store PutPath)
 - `rio-worker/src/log_stream.rs` --- Build log batching (64-line/100ms) and streaming via gRPC
