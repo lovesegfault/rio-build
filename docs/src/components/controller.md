@@ -91,6 +91,8 @@ status:
 
 ### WorkerPoolSet
 
+> **Phase 4 deferral:** The `WorkerPoolSet` CRD is not yet implemented. Size-class routing currently works via multiple independent `WorkerPool` CRs, each setting `spec.sizeClass`; cutoffs are configured statically via `rio-scheduler` config (no learned cutoff propagation). The reconciler below (WorkerPoolSet reconciler) and `CutoffRebalancer` integration do not exist yet.
+
 For deployments with heavy-tailed build workloads, `WorkerPoolSet` defines multiple size-class worker pools with different resource allocations. The scheduler routes derivations to the appropriate pool based on estimated duration. See [ADR-015](../decisions/015-size-class-routing.md) for the design rationale.
 
 ```yaml
@@ -160,25 +162,28 @@ r[ctrl.reconcile.owner-refs]
 - **Build reconciler**: create Build CRDs from API/webhook triggers, track status, update conditions.
 - **GC reconciler**: trigger store garbage collection on schedule, clean up completed Build resources.
 
+> **Phase deferral:** The WorkerPoolSet reconciler (Phase 4) and GC reconciler (blocked on `store.gc.*` implementation) do not exist yet. Only the WorkerPool and Build reconcilers are implemented.
+
 ## RBAC
 
-The controller requires a dedicated ServiceAccount with a ClusterRole granting:
+The controller requires a dedicated ServiceAccount with a ClusterRole granting (see `deploy/base/rbac.yaml`):
 
 | API Group | Resources | Verbs |
 |---|---|---|
-| `rio.build` | Build, WorkerPool | get, list, watch, create, update, patch, delete |
-| `rio.build` | Build/status, WorkerPool/status | get, patch |
-| `apps/v1` | StatefulSets | get, list, watch, create, update, patch, delete |
-| `core/v1` | Pods | get, list, watch |
-| `core/v1` | Services, ConfigMaps | get, list, watch, create, update, patch, delete |
-| `core/v1` | Events | create, patch |
-| `policy/v1` | PodDisruptionBudgets | get, list, watch, create, update, patch, delete |
-| `networking.k8s.io/v1` | NetworkPolicies | get, list, watch, create, update, patch, delete |
-| `coordination.k8s.io/v1` | Leases | get, list, watch, create, update |
+| `rio.build` | workerpools, builds | get, list, watch, create, update, patch, delete |
+| `rio.build` | workerpools/status, builds/status | get, patch |
+| `apps` | statefulsets | get, list, watch, create, update, patch, delete |
+| `""` (core) | pods | get, list, watch |
+| `""` (core) | services | get, list, watch, create, update, patch, delete |
+| `""` (core) | events | create, patch |
+
+Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
+
+> **Note:** The controller does NOT currently hold permissions for `PodDisruptionBudgets`, `NetworkPolicies`, `ConfigMaps`, or `Leases`. PDBs and NetworkPolicies are deployed as static kustomize manifests (see below), not controller-managed. These permissions would be added in Phase 4 when/if the controller takes over PDB management.
 
 ## NetworkPolicy
 
-The controller provisions NetworkPolicy resources for each component:
+NetworkPolicy resources are deployed via the prod kustomize overlay (`deploy/overlays/prod/networkpolicy.yaml`), not controller-managed. The controller has no `networking.k8s.io` RBAC permissions. Intended policies:
 
 - **Workers**: egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`169.254.169.254`). DNS egress to kube-system (CoreDNS) required for service resolution.
 - **Gateway**: ingress from external (Service type LoadBalancer/NodePort for SSH). Egress to rio-scheduler and rio-store. DNS egress to kube-system.
