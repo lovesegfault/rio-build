@@ -18,6 +18,12 @@ Metadata (byte offsets, timestamps, line counts) is stored in PostgreSQL for eff
 
 ### Log Lifecycle
 
+r[obs.log.batch-64-100ms]
+Log lines are batched (up to 64 lines or 100ms, whichever first) in `BuildLogBatch` messages.
+
+r[obs.log.periodic-flush]
+The scheduler flushes buffers to S3 periodically (every 30s) during active builds, not only on completion --- bounds log loss to at most 30s on failover.
+
 ```mermaid
 sequenceDiagram
     participant Worker
@@ -54,6 +60,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 ### Gateway Metrics
 
+r[obs.metric.gateway]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_gateway_connections_total` | Counter | Total SSH connections |
@@ -68,6 +75,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 ### Scheduler Metrics
 
+r[obs.metric.scheduler]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_scheduler_builds_total` | Counter | Total builds at terminal state (labeled by `outcome`: `success`/`failure`/`cancelled`) |
@@ -98,6 +106,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 ### Store Metrics
 
+r[obs.metric.store]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_store_put_path_total` | Counter | Total PutPath operations |
@@ -111,6 +120,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 ### Worker Metrics
 
+r[obs.metric.worker]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_worker_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`) |
@@ -127,6 +137,7 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via `metrics-
 
 ### Controller Metrics
 
+r[obs.metric.controller]
 | Metric | Type | Description |
 |--------|------|-------------|
 | `rio_controller_reconcile_duration_seconds` | Histogram | Reconcile loop latency (labeled by reconciler) |
@@ -170,6 +181,7 @@ Build (gateway)
 
 ### Trace Propagation
 
+r[obs.trace.w3c-traceparent]
 Trace context is propagated via gRPC metadata using the W3C `traceparent` header format. The `tracing-opentelemetry` crate handles context injection and extraction automatically for tonic interceptors.
 
 ## SLOs, SLIs, and Alerting
@@ -199,6 +211,7 @@ Trace context is propagated via gRPC metadata using the W3C `traceparent` header
 
 ## Structured Logging
 
+r[obs.log.required-fields]
 All components emit structured JSON logs via `tracing-subscriber` with the following required fields per log line:
 
 | Field | Type | Description |

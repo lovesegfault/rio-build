@@ -3,6 +3,8 @@
 //!
 //! `upgrade_manifest_to_chunked` takes an EXISTING placeholder (from
 //! `insert_manifest_uploading`) and adds manifest_data + increments chunk
+// r[impl store.chunk.refcount-txn]
+// r[impl store.put.wal-manifest]
 //! refcounts — the placeholder is the idempotency lock, created BEFORE the
 //! NAR stream is consumed, before we know the size. Refcounts go up here
 //! (not at complete) so GC between upload and complete sees count > 0.

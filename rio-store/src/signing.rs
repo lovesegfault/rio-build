@@ -3,6 +3,7 @@
 //! Signatures are computed at PutPath time and stored in
 //! `narinfo.signatures`. The binary-cache HTTP server (B3) serves them
 //! as `Sig:` lines — it never touches the private key. This means:
+// r[impl store.signing.fingerprint]
 //! - Key rotation doesn't require re-serving anything (paths signed
 //!   under the old key stay valid; new paths get the new key)
 //! - The HTTP server can be a separate, less-privileged process
@@ -138,6 +139,7 @@ impl Signer {
     }
 }
 
+// r[verify store.signing.fingerprint]
 #[cfg(test)]
 mod tests {
     use super::*;

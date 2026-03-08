@@ -3,6 +3,9 @@
 //! Write-ahead flow:
 //! 1. Receive first message: PutPathMetadata with PathInfo
 //! 2. Check idempotency: if path already complete, return success
+// r[impl store.put.wal-manifest]
+// r[impl store.put.idempotent]
+// r[impl store.integrity.verify-on-put]
 //! 3. Insert manifest placeholder with status='uploading'
 //! 4. Accumulate NAR chunks (bounded by MAX_NAR_SIZE)
 //! 5. Verify SHA-256 matches trailer's declared nar_hash

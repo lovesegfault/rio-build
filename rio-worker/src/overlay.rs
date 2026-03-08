@@ -3,6 +3,9 @@
 //! Each build gets its own overlayfs mount with:
 //! - Lower layer: FUSE mount (presents store paths at its root)
 //! - Upper layer: `{upper}/nix/store/` on local SSD (separate FS from FUSE)
+// r[impl worker.overlay.per-build]
+// r[impl worker.overlay.stacked-lower]
+// r[impl worker.overlay.upper-not-overlayfs]
 //! - Work directory: required by overlayfs (same filesystem as upper)
 //! - Merged: bind-mounted to `/nix/store` in the per-build daemon's mount
 //!   namespace (see executor.rs `pre_exec`). Outputs written by nix-daemon
@@ -304,6 +307,9 @@ pub fn prepare_nix_state_dirs(upper: &Path) -> Result<PathBuf, OverlayError> {
     Ok(db_dir)
 }
 
+// r[verify worker.overlay.per-build]
+// r[verify worker.overlay.stacked-lower]
+// r[verify worker.overlay.upper-not-overlayfs]
 #[cfg(test)]
 mod tests {
     use super::*;

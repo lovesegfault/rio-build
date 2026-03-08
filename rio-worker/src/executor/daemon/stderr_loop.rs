@@ -1,4 +1,5 @@
 //! Daemon I/O after spawn: handshake, wopBuildDerivation, STDERR loop, log batching.
+// r[impl worker.daemon.stderr-result-logs]
 
 use std::time::Duration;
 
@@ -348,6 +349,8 @@ where
     }
 }
 
+// r[verify worker.daemon.stderr-result-logs]
+// r[verify worker.daemon.stdio-client]
 #[cfg(test)]
 mod tests {
     use super::*;

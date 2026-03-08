@@ -3,6 +3,7 @@
 //! A manifest is the ordered list of (BLAKE3 hash, size) pairs that
 //! describes how to reassemble a chunked NAR. It's stored in PG
 //! (`manifest_data.chunk_list` BYTEA) and read on every GetPath.
+// r[impl store.manifest.format]
 //!
 //! # Format
 //!
@@ -151,6 +152,7 @@ impl Manifest {
     }
 }
 
+// r[verify store.manifest.format]
 #[cfg(test)]
 mod tests {
     use super::*;

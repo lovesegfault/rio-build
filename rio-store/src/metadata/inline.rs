@@ -3,6 +3,7 @@
 //! Step 1 (`insert_manifest_uploading`) writes a placeholder with
 //! `nar_size = 0` + `status = 'uploading'`. Step 3 (`complete_manifest_inline`)
 //! fills real narinfo and stores the NAR blob atomically. On failure,
+// r[impl store.inline.threshold]
 //! `delete_manifest_uploading` reclaims the placeholder (guarded by
 //! `nar_size = 0` so a concurrent successful upload is never touched).
 

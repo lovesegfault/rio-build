@@ -58,6 +58,7 @@ service AdminService {
 
 ### BuildExecution Bidirectional Stream
 
+r[proto.stream.bidi]
 The `BuildExecution` RPC replaces the previous `PullWork` + `ReportCompletion` design with a single bidirectional stream per worker, enabling:
 
 - Scheduler-to-worker signals (assignment, cancellation, prefetch hints) without out-of-band RPCs

@@ -44,6 +44,7 @@ pub use runtime::{BloomHandle, BuildSpawnContext, build_heartbeat_request, spawn
 /// Call from `main()` immediately after `init_metrics()`. Descriptions
 /// sourced from docs/src/observability.md (the Worker Metrics table).
 /// See rio_gateway::describe_metrics for rationale.
+// r[impl obs.metric.worker]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 

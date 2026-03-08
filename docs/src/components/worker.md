@@ -54,6 +54,7 @@ Each worker runs a FUSE filesystem that presents `/nix/store` to the build envir
 
 ### FUSE Cache
 
+r[worker.fuse.cache-lru]
 - **Backend**: Local SSD (`emptyDir` or a dedicated PVC)
 - **Eviction**: LRU by last-access time when cache exceeds configured size limit
 - **Granularity**: Whole store paths (not individual chunks). The FUSE daemon reassembles NARs from chunks via rio-store and materializes them as directory trees on disk.
@@ -62,9 +63,10 @@ Each worker runs a FUSE filesystem that presents `/nix/store` to the build envir
 
 ### FUSE Implementation
 
+r[worker.fuse.lookup-caches]
 The FUSE daemon is implemented using the `fuser` crate and runs as part of the worker process (not a sidecar). It handles:
 
-- `lookup`: Check if a store path exists by querying rio-store's `QueryPathInfo`
+- `lookup`: Check if a store path exists by querying rio-store's `QueryPathInfo`. **MUST call `ensure_cached()`** --- the kernel caches lookup attr with 1h TTL, never calls `getattr`, so child lookups hit empty cache → ENOENT otherwise.
 - `getattr`: Return file metadata from cached path info
 - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching from rio-store on cache miss
 - `open`: Trigger background prefetch of the entire store path on first access
@@ -134,13 +136,31 @@ This configuration ensures workers only build derivations locally and never atte
 
 ## rio-nix Client Protocol
 
+r[worker.daemon.stdio-client]
 Workers invoke `nix-daemon --stdio` and must speak the Nix worker protocol as a *client*. The `rio-nix` crate implements both server-side (gateway: responds to opcodes from Nix clients) and client-side (worker: sends `wopBuildDerivation` to the local daemon and receives `BuildResult`) protocol handling.
+
+r[worker.daemon.no-unwrap-stdio]
+When spawning `nix-daemon --stdio`, never `.unwrap()` on `daemon.stdin.take()` / `daemon.stdout.take()` --- use `.ok_or_else()`.
+
+r[worker.daemon.timeout-wrap]
+Wrap all daemon communication in `tokio::time::timeout` (default: 2h, configurable via `RIO_DAEMON_TIMEOUT_SECS` / `--daemon-timeout-secs` / `worker.toml`).
+
+r[worker.daemon.kill-both-paths]
+Always `daemon.kill().await` in both success and error paths, and set `kill_on_drop` on the Command to guard against early-exit leaks.
+
+r[worker.daemon.stderr-result-logs]
+Modern `nix-daemon` sends build output via `STDERR_RESULT` with `BuildLogLine`, NOT raw `STDERR_NEXT`. The worker's stderr loop MUST handle `STDERR_RESULT` --- otherwise all build logs are silently dropped.
 
 ## Overlay Store Architecture
 
+r[worker.overlay.per-build]
 Each active build gets its own overlayfs mount with a separate upper directory and work directory. A synthetic Nix store SQLite database is placed in each overlay's upper layer so that Nix recognizes the input paths.
 
-> **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the worker's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/nix/store`.
+r[worker.overlay.stacked-lower]
+The overlay lower-dir stack is `lowerdir=/nix/store:{fuse_mount}` --- host store **first** so `nix-daemon` and its deps are reachable after bind-mount at `/nix/store`. FUSE second for rio-store paths. With `writableStore=false` on the worker VM, `/nix/store` is a plain mount; otherwise the VM's store would itself be an overlay and overlay-as-lower may break.
+
+r[worker.overlay.upper-not-overlayfs]
+> **Filesystem constraint (validated in Phase 1a spike):** The overlayfs upper and work directories must reside on a different filesystem than the FUSE lower layer. The kernel rejects overlay mounts where upper and lower are on the same filesystem when the lower is a FUSE mount. In practice, the upper/work directories should be on the worker's local SSD (`emptyDir` or PVC), while the lower is the FUSE mount at `/nix/store`. The upper also MUST NOT itself be on an overlayfs (containerd root overlay) — overlayfs-as-upperdir cannot create `trusted.*` xattrs and `mount()` returns `EINVAL`.
 
 After build completes:
 
@@ -151,6 +171,7 @@ After build completes:
 
 ### Multi-Output Derivation Upload
 
+r[worker.upload.multi-output]
 Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a build completes:
 
 1. **Detect outputs**: Scan the overlay upper layer for all new store paths. A multi-output derivation produces one path per output (e.g., `/nix/store/abc...-hello`, `/nix/store/def...-hello-dev`).
@@ -163,6 +184,7 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 
 ## Store Database Management
 
+r[worker.synth-db.per-build]
 Nix requires a functional store database (SQLite at `/nix/var/nix/db/db.sqlite`) to operate. It refuses to build derivations whose inputs are not registered in the local database, even if the paths physically exist on disk.
 
 For each build, the worker synthesizes a minimal SQLite database in the overlay upper layer:
@@ -173,6 +195,10 @@ For each build, the worker synthesizes a minimal SQLite database in the overlay 
 4. The database contains only path registrations for that specific build's input closure --- not the entire store.
 5. After the build completes, the synthetic database is discarded along with the rest of the overlay upper layer.
 
+r[worker.synth-db.derivation-outputs]
+The `DerivationOutputs` table MUST be populated --- `nix-daemon`'s `queryPartialDerivationOutputMap()` reads it. Empty → `scratchPath = makeFallbackPath(drvPath)` → `OutputRejected`.
+
+r[worker.synth-db.refs-table]
 > **Critical (validated in Phase 1a spike):** The `Refs` table must accurately reflect each path's references. When `sandbox = true`, Nix resolves the derivation's input closure by walking the `Refs` table to determine which store paths to bind-mount into the sandbox chroot. If references are missing, the sandbox will not bind-mount transitive dependencies (e.g., `glibc` needed by `bash`), causing builds to fail with "No such file or directory" errors when the builder's dynamic linker cannot be found.
 
 Performance: direct SQLite writes handle 1000+ paths in <50ms. The bottleneck is the PostgreSQL metadata query, not the SQLite generation.
@@ -187,6 +213,12 @@ Performance: direct SQLite writes handle 1000+ paths in <50ms. The bottleneck is
 
 ## Concurrent Build Isolation
 
+r[worker.cgroup.sibling-layout]
+Per-build cgroups are **siblings** of the worker's own cgroup under the delegated root. With systemd `DelegateSubgroup=builds`, the worker lives at `.../service/builds/`; per-build cgroups go in `.../service/` as siblings. When running in a cgroup-namespace root (containerd in pods: `/proc/self/cgroup` shows `0::/`), the worker MUST move itself into a `/leaf/` subgroup first so the namespace root becomes the delegated_root --- otherwise writing to `/sys/fs/cgroup/` would hit the HOST root.
+
+r[worker.cgroup.memory-peak]
+cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accounting for each build. This fixes the Phase 2c bug where `VmHWM` (daemon PID only) measured ~10MB regardless of what the builder consumed.
+
 The overlay is per-build, not per-worker. Each active build on a worker gets its own independent overlayfs mount with separate upper and work directories. This means:
 
 - Multiple builds run concurrently on the same worker without filesystem interference.
@@ -197,6 +229,7 @@ The overlay is per-build, not per-worker. Each active build on a worker gets its
 
 ## Fixed-Output Derivation (FOD) Handling
 
+r[worker.fod.verify-hash]
 Fixed-output derivations (FODs) have a known output hash declared in `outputHash`. They require special handling:
 
 1. **Detection**: A derivation is a FOD if its `outputHash` attribute is non-empty.
@@ -206,6 +239,7 @@ Fixed-output derivations (FODs) have a known output hash declared in `outputHash
 
 ## Namespace Ordering
 
+r[worker.ns.order]
 Both overlayfs and the Nix sandbox use mount namespaces. The correct ordering is:
 
 1. Worker sets up the FUSE mount at `/nix/store` (in the worker's mount namespace)
@@ -258,6 +292,7 @@ Without `/dev/fuse`, the FUSE daemon cannot create the store mount and the worke
 
 ## FUSE Passthrough Mode (Linux 6.9+)
 
+r[worker.fuse.passthrough]
 Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which allows the FUSE daemon to hand off file descriptors to backing files. For cached store paths on local SSD, passthrough mode bypasses the kernel-userspace context switch entirely, providing near-native I/O performance.
 
 This is relevant to rio-fuse because the warm-cache path (store paths already fetched to local SSD) is the most performance-critical. With passthrough:
@@ -288,6 +323,7 @@ The Phase 1a spike validated passthrough on EKS AL2023 (kernel 6.12). Key findin
 
 ## Nix Version Pinning
 
+r[worker.nix.pinned-schema]
 The synthetic SQLite store database generated per-build in the overlay upper layer is coupled to Nix's internal DB schema (version 10). This schema (`ValidPaths`, `Refs`, `DerivationOutputs` tables) is an internal API with no stability guarantees from the Nix project.
 
 **Requirements:**

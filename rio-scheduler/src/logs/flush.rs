@@ -3,6 +3,7 @@
 //! The flusher runs on its own task, driven by two triggers:
 //!   1. **Completion** — actor `try_send`s a [`FlushRequest`] when a
 //!      derivation hits a terminal state (success OR permanent failure).
+// r[impl obs.log.periodic-flush]
 //!      This drains the buffer (`LogBuffers::drain`) and uploads the final
 //!      blob with `is_complete=true`.
 //!   2. **Periodic (30s)** — tick scans all active buffers and uploads
@@ -372,6 +373,7 @@ async fn insert_log_rows(
     Ok(())
 }
 
+// r[verify obs.log.periodic-flush]
 #[cfg(test)]
 mod tests {
     use super::*;

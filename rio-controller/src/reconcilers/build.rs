@@ -2,6 +2,8 @@
 //!
 //! Apply → SubmitBuild → spawn a watch task that drains the event
 //! stream and patches `.status`. Cleanup → CancelBuild.
+// r[impl ctrl.crd.build]
+// r[impl ctrl.build.sentinel]
 //!
 //! # Single-node DAG (phase3a scope)
 //!
@@ -594,6 +596,8 @@ async fn patch_status(api: &Api<Build>, name: &str, status: BuildStatus) -> Resu
     Ok(())
 }
 
+// r[verify ctrl.crd.build]
+// r[verify ctrl.build.sentinel]
 #[cfg(test)]
 mod tests {
     use super::*;

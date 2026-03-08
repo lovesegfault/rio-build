@@ -3,6 +3,7 @@
 //! FastCDC picks chunk boundaries based on content, not position. A small
 //! edit to one file in a big NAR only perturbs the chunk containing that
 //! file — everything before and after still hashes the same. That's the
+// r[impl store.cas.fastcdc]
 //! whole point of chunked dedup: two NARs that are 70% identical should
 //! share 70% of their chunks.
 //!
@@ -86,6 +87,7 @@ pub fn chunk_nar(nar: &[u8]) -> Vec<Chunk<'_>> {
         .collect()
 }
 
+// r[verify store.cas.fastcdc]
 #[cfg(test)]
 mod tests {
     use super::*;

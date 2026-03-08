@@ -4,6 +4,7 @@ The global artifact store. Two-layer design inspired by tvix's castore/store spl
 
 ## Layer 1: Chunk Store (content-addressed blobs)
 
+r[store.cas.fastcdc]
 - NAR archives are split into chunks using FastCDC (content-defined chunking)
 - Each chunk is stored by its BLAKE3 hash
 - Identical chunks across different store paths are stored once (deduplication)
@@ -12,6 +13,7 @@ The global artifact store. Two-layer design inspired by tvix's castore/store spl
 
 ## Inline Storage Fast-Path
 
+r[store.inline.threshold]
 NARs below 256KB (configurable, `inline_threshold`) are stored as a single blob bypassing FastCDC chunking and manifest indirection entirely. This eliminates per-item overhead for the thousands of tiny `.drv` files found in nixpkgs closures.
 
 **S3 key schema for inline blobs:** `inline/{sha256-hex}` --- distinct from `chunks/{blake3-hex}` to prevent hash domain confusion.
@@ -26,6 +28,7 @@ NARs below 256KB (configurable, `inline_threshold`) are stored as a single blob 
 
 ## Hash Domain Separation
 
+r[store.hash.domain-sep]
 Two hash algorithms are used, in strictly separated domains:
 
 | Context | Hash Algorithm | Example |
@@ -41,12 +44,16 @@ Two hash algorithms are used, in strictly separated domains:
 
 ## Content Integrity Verification
 
+r[store.integrity.verify-on-put]
 - **On PutPath:** The store independently computes SHA-256 over the uploaded NAR stream and verifies it matches the declared `NarHash`. Rejects the upload on mismatch. This prevents corrupted or tampered uploads from being signed and served.
+
+r[store.integrity.verify-on-get]
 - **On chunk read (S3 or cache):** Every chunk fetched from S3 or the in-process LRU cache is BLAKE3-verified against its manifest-declared digest. Corrupt chunks are re-fetched (from S3 on cache corruption) or flagged as an error.
 - **On inline blob read:** SHA-256-verified against the blob key on read.
 
 ## Chunk Manifest Format
 
+r[store.manifest.format]
 Each manifest is stored as a single PostgreSQL row with a `bytea` column containing serialized `(BLAKE3_digest, chunk_size)` pairs --- not one row per chunk. This reduces the INSERT count per `PutPath` from N to 1. Manifests are keyed by store path hash. The serialization format includes a version byte prefix for future evolution.
 
 ## Chunk Storage
@@ -69,6 +76,7 @@ Chunk refcounts track how many manifests reference each chunk. The `chunks` tabl
 | `created_at` | `TIMESTAMPTZ` | Insertion timestamp |
 | `deleted` | `BOOLEAN NOT NULL DEFAULT FALSE` | Soft-delete flag (set by GC sweep) |
 
+r[store.chunk.refcount-txn]
 **Refcount increment:** In the same PostgreSQL transaction that creates the manifest with `status='uploading'` (step 1 of PutPath) or commits it to `'complete'` (step 5). Use `SELECT ... FOR UPDATE` on chunk rows to prevent concurrent modification.
 
 **Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Use `SELECT ... FOR UPDATE` on affected chunk rows.
@@ -87,6 +95,7 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 
 ### Write-Ahead Manifest Pattern (PutPath flow)
 
+r[store.put.wal-manifest]
 **Authorization:** Worker `PutPath` calls must include a valid assignment token (HMAC-SHA256, issued by the scheduler). The store verifies the token signature and checks that the output path matches `expected_output_paths`. See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 
 > **Phase 2a deferral:** Assignment token HMAC signing and verification are deferred to Phase 3 (with leader election). In Phase 2a, tokens are opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. This matches the `types.proto` comment on `WorkAssignment.assignment_token`.
@@ -99,10 +108,12 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 
 On failure at any step, the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 2 hours). The chunk list in the stale manifest is used to decrement refcounts for referenced chunks. Only chunks whose refcount drops to 0 become eligible for S3 deletion via the `pending_s3_deletes` table. No full S3 enumeration needed.
 
+r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
 
 ## NAR Reassembly
 
+r[store.nar.reassembly]
 - Load the full manifest into memory (list of chunk digests --- even a 10GB NAR is only ~5MB of manifest)
 - Parallel chunk prefetch with a sliding window (K=8--16 concurrent S3 GETs, adaptive based on consumer throughput)
 - In-process LRU chunk cache (configurable, default 2GB) to avoid repeated S3 round-trips for hot chunks
@@ -111,6 +122,7 @@ On failure at any step, the orphan scanner reclaims stale `'uploading'` records 
 
 ## Request Coalescing (Singleflight)
 
+r[store.singleflight]
 When multiple concurrent requests need the same chunk from S3 (common during cold starts or thundering herd scenarios), rio-store coalesces them into a single in-flight fetch using a singleflight pattern:
 
 - A `DashMap<ChunkHash, Shared<JoinHandle<Bytes>>>` tracks in-flight S3 GETs
@@ -123,6 +135,7 @@ This is critical for cold start thundering herd: when many builds start simultan
 
 ## Binary Cache HTTP Server
 
+r[store.http.narinfo]
 rio-store serves the standard Nix binary cache protocol so Nix clients can use it as a substituter directly (e.g., `substituters = https://rio-cache.example.com`).
 
 | Endpoint | Description |
@@ -142,6 +155,7 @@ rio-store serves the standard Nix binary cache protocol so Nix clients can use i
 
 ## Signing Key Management
 
+r[store.signing.fingerprint]
 - Per-instance signing key stored in a Kubernetes Secret (recommend KMS/Vault for production)
 - Signatures are computed at `PutPath` time --- the binary cache server does not need private key access at serve time
 - Narinfo `Sig:` field format: `<key-name>:<base64-ed25519-signature>` (compatible with `nix.settings.trusted-public-keys`)
@@ -162,6 +176,7 @@ CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv
 
 ## Two-Phase Garbage Collection
 
+r[store.gc.two-phase]
 - **Phase 1 (Mark):** Identify paths unreachable from GC roots. GC roots include: active builds, queued builds, pinned paths, paths with active binary cache serving sessions, paths in `'uploading'` manifests, `wopAddTempRoot` temp roots from gateways.
 - **Grace period:** Wait T hours (configurable, default 24h). Configurable per-invocation via `GCRequest`.
 - **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Use `UPDATE chunks SET deleted=true WHERE blake3_hash=$1 AND refcount=0` atomically in PostgreSQL before issuing S3 DELETEs. This statement MUST execute under `SERIALIZABLE` isolation level or use explicit row-level locking (`SELECT ... FOR UPDATE` on the chunk row, then conditional `UPDATE`) to prevent a TOCTOU race where a concurrent `PutPath` increments the refcount between the read and the update. Delete path metadata from PostgreSQL first (making paths invisible), then enqueue S3 deletions via `pending_s3_deletes` (async/batched). Also clean up content index entries for swept paths.
@@ -172,6 +187,7 @@ Configurable retention policies per tenant/project. Supports dry-run mode via `G
 
 ## Crash-Safe S3 Deletion (`pending_s3_deletes`)
 
+r[store.gc.pending-deletes]
 S3 deletes are not transactional with PostgreSQL. To prevent data leaks (chunks removed from PG but never deleted from S3) or premature deletes on crash, rio-store uses a transactional outbox pattern:
 
 1. In the same PostgreSQL transaction that marks chunks as `deleted=true` (GC sweep) or decrements refcounts to 0 (orphan cleanup), write the corresponding S3 keys to the `pending_s3_deletes` table.

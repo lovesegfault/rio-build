@@ -3,6 +3,7 @@
 //! Lives **outside** the DAG actor so that a chatty build (10k lines/sec)
 //! can't fill the actor's bounded mpsc(10_000) channel with log traffic and
 //! trip the 80%/60% backpressure hysteresis. The BuildExecution recv task
+// r[impl obs.log.batch-64-100ms]
 //! writes directly here; the actor only touches this indirectly (via the
 //! `ForwardLogBatch` command for gateway-forward, and via the completion
 //! flush trigger added in a later commit).
@@ -194,6 +195,8 @@ impl Default for LogBuffers {
     }
 }
 
+// r[verify obs.log.batch-64-100ms]
+// r[verify obs.metric.scheduler]
 #[cfg(test)]
 mod tests {
     use super::*;

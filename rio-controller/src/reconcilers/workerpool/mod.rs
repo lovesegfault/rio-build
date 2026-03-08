@@ -3,6 +3,10 @@
 //! Reconcile flow:
 //! 1. Ensure headless Service exists (StatefulSet needs one for
 //!    stable pod DNS; workers don't actually serve anything, but
+// r[impl ctrl.crd.workerpool]
+// r[impl ctrl.reconcile.owner-refs]
+// r[impl ctrl.drain.all-then-scale]
+// r[impl ctrl.drain.sigterm]
 //!    the StatefulSet controller requires `serviceName` to point
 //!    to a real Service).
 //! 2. Ensure StatefulSet exists with spec derived from the CRD.

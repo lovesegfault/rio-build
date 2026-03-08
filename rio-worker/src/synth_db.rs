@@ -3,6 +3,10 @@
 //! For each build, the worker synthesizes a minimal SQLite database in the
 //! overlay upper layer so that Nix recognizes the input paths. The data
 //! source is `StoreServiceClient.QueryPathInfo` for each path in the input
+// r[impl worker.synth-db.per-build]
+// r[impl worker.synth-db.derivation-outputs]
+// r[impl worker.synth-db.refs-table]
+// r[impl worker.nix.pinned-schema]
 //! closure.
 //!
 //! Schema version 10 (Nix 2.20+). Tables: Config, ValidPaths, Refs,
@@ -294,6 +298,10 @@ async fn insert_drv_outputs(
     Ok(())
 }
 
+// r[verify worker.synth-db.per-build]
+// r[verify worker.synth-db.derivation-outputs]
+// r[verify worker.synth-db.refs-table]
+// r[verify worker.nix.pinned-schema]
 #[cfg(test)]
 mod tests {
     use super::*;

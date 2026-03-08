@@ -724,6 +724,7 @@ fn sanitize_build_id(drv_path: &str) -> String {
         .replace('.', "_")
 }
 
+// r[verify worker.daemon.timeout-wrap]
 #[cfg(test)]
 mod tests {
     use super::*;

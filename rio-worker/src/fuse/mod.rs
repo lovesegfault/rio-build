@@ -3,6 +3,7 @@
 //! Mounts `/nix/store` via `fuser` 0.17 and serves store paths from a local
 //! SSD cache backed by remote `StoreService` gRPC. The FUSE mount is shared
 //! across all concurrent builds as the lower layer of per-build overlayfs mounts.
+// r[impl worker.fuse.passthrough]
 //!
 //! Key design points:
 //! - `fuser` 0.17 data-path methods are `&self` (interior mutability via `RwLock`)

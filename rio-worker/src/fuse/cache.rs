@@ -3,6 +3,7 @@
 //! Cached store paths are materialized as directory trees on disk (not stored
 //! as NAR blobs). On cache miss the worker fetches the NAR via `GetPath`,
 //! parses it, and extracts it to disk via [`rio_nix::nar::extract_to_path`].
+// r[impl worker.fuse.cache-lru]
 //!
 //! A lightweight SQLite index tracks cached paths, sizes, and access
 //! timestamps for LRU eviction decisions.
@@ -546,6 +547,8 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+// r[verify worker.fuse.cache-lru]
+// r[verify worker.fuse.passthrough]
 #[cfg(test)]
 mod tests {
     use super::*;

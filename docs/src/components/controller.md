@@ -6,6 +6,7 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
 
 ### Build
 
+r[ctrl.crd.build]
 ```yaml
 apiVersion: rio.build/v1alpha1
 kind: Build
@@ -39,6 +40,7 @@ Condition types: `Scheduled`, `InputsResolved`, `Building`, `Succeeded`, `Failed
 
 ### WorkerPool
 
+r[ctrl.crd.workerpool]
 ```yaml
 apiVersion: rio.build/v1alpha1
 kind: WorkerPool
@@ -148,6 +150,7 @@ The existing `WorkerPool` CRD remains valid for single-pool deployments without 
 
 ## Reconciliation Loops
 
+r[ctrl.reconcile.owner-refs]
 - **WorkerPool reconciler**: scale worker StatefulSet based on scheduler queue depth. Create/delete pods. Manage per-worker ephemeral storage for the FUSE cache. All resources created by this reconciler carry `ownerReferences` to the WorkerPool CRD with `controller: true`, ensuring garbage collection on WorkerPool deletion.
 - **WorkerPoolSet reconciler**: manages multiple `WorkerPool` sub-resources (one per size class). Queries the scheduler's `CutoffRebalancer` for learned cutoffs and updates the `WorkerPoolSet` status. Autoscales each class independently based on per-class queue depth from the scheduler.
 - **Build reconciler**: create Build CRDs from API/webhook triggers, track status, update conditions.
@@ -181,6 +184,7 @@ The controller provisions NetworkPolicy resources for each component:
 
 ## PodDisruptionBudget
 
+r[ctrl.pdb.workers]
 The controller creates PDBs for each component:
 
 | Component | Policy | Rationale |
@@ -200,6 +204,9 @@ The controller creates PDBs for each component:
 
 ## Health Probes
 
+r[ctrl.probe.named-service]
+K8s readiness probes on gRPC components MUST target a named health check service (e.g., `grpc.health.v1.Health/Check` with `service: rio-scheduler`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- readiness would stay green during drain otherwise.
+
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
@@ -210,6 +217,7 @@ The controller creates PDBs for each component:
 
 ## Worker Lifecycle
 
+r[ctrl.drain.sigterm]
 **Scale-down:** `terminationGracePeriodSeconds` is set to `7200` (2 hours) to allow in-flight builds to complete.
 
 **SIGTERM drain (no preStop hook needed):** the worker's main loop has a `select!` arm on SIGTERM. On signal:
@@ -220,7 +228,14 @@ The controller creates PDBs for each component:
 
 A preStop hook doing the same is redundant: K8s sends SIGTERM on pod termination regardless of preStop, and the worker's signal handler implements the drain. The StatefulSet does NOT define a preStop.
 
+r[ctrl.autoscale.direct-patch]
 **Autoscaling:** The controller queries the scheduler's `AdminService.ClusterStatus` gRPC RPC to obtain current queue depth and worker utilization. It directly patches StatefulSet replicas based on this data. This is an internal mechanism, not HPA. The scaling logic requires stabilization windows and anti-flapping thresholds to avoid oscillation:
+
+r[ctrl.autoscale.separate-field-manager]
+The autoscaler uses a **separate SSA field manager** (`rio-autoscaler`) from the reconciler (`rio-controller`). The reconciler owns `status.replicas`/`readyReplicas`/`desiredReplicas`; the autoscaler owns `status.lastScaleTime` + scaling conditions. Using the same field manager would cause 400 "conflict" on concurrent patches.
+
+r[ctrl.autoscale.skip-deleting]
+The autoscaler MUST check `metadata.deletionTimestamp` and skip pools being deleted --- otherwise it rescales the StatefulSet while the finalizer is scaling to 0, causing ping-pong.
 
 - Scale-up: react quickly (e.g., 30s window) when queue depth exceeds target.
 - Scale-down: react slowly (e.g., 10m window) to avoid killing workers that may be needed again soon.
@@ -233,6 +248,9 @@ Build CRDs are created by:
 2. **External systems** via `kubectl` or the Kubernetes API --- for K8s-native workflows that want to submit builds programmatically.
 
 SSH-initiated builds do NOT require Build CRDs; Build CRDs are an alternative submission path for Kubernetes-native workflows.
+
+r[ctrl.build.sentinel]
+**Double-submit guard:** The reconciler MUST set `status.build_id` (a UUID sentinel or the real scheduler-returned ID) **immediately** on first reconcile, before the finalizer-add re-reconcile fires. Otherwise the second reconcile re-submits to the scheduler.
 
 **Finalizer:** All Build CRDs carry a `rio.build/build-cleanup` finalizer. Before a Build CRD is deleted, the controller sends `CancelBuild` to the scheduler to ensure in-flight work is properly handled.
 
@@ -270,9 +288,10 @@ CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constr
 
 ## WorkerPool Finalizer
 
+r[ctrl.drain.all-then-scale]
 WorkerPool CRDs carry a `rio.build/workerpool-drain` finalizer. Before a WorkerPool is deleted, the controller's `cleanup()`:
 
-1. Lists pods by `rio.build/pool=<name>` label; sends `AdminService.DrainWorker` for each (scheduler stops assigning to them).
+1. Lists pods by `rio.build/pool=<name>` label; sends `AdminService.DrainWorker` for each (scheduler stops assigning to them). **ALL workers must be drained BEFORE scaling to 0** --- StatefulSet `OrderedReady` terminates pods one-by-one in reverse ordinal, so if you scale before draining, pod-N gets SIGTERM while pod-0 is still receiving assignments.
 2. Patches `StatefulSet.spec.replicas = 0`.
 3. Waits for all pods to terminate (each worker's SIGTERM handler completes in-flight builds before exit — see Worker Lifecycle above).
 4. Removes the finalizer, allowing K8s GC to delete the WorkerPool CRD and its owned children (StatefulSet, Service) via `ownerReference`.

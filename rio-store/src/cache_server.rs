@@ -2,6 +2,7 @@
 //!
 //! Serves the standard Nix binary cache protocol so clients can use us
 //! as a substituter: `nix.settings.substituters = ["http://rio-store:PORT"]`.
+// r[impl store.http.narinfo]
 //!
 //! Three routes:
 //! - `/nix-cache-info` — static metadata (store dir, priority)
@@ -409,6 +410,9 @@ fn nar_chunk_stream(
     }
 }
 
+// r[verify store.http.narinfo]
+// r[verify store.nar.reassembly]
+// r[verify store.integrity.verify-on-get]
 #[cfg(test)]
 mod tests {
     use super::*;

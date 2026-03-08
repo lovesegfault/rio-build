@@ -1,4 +1,6 @@
 //! Object builders (pure: WorkerPool → K8s objects)
+// r[impl ctrl.pdb.workers]
+// r[impl ctrl.probe.named-service]
 
 use std::collections::BTreeMap;
 

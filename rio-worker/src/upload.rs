@@ -3,6 +3,7 @@
 //! Scans the overlay upper layer for new store paths, serializes each as
 //! a NAR, computes SHA-256, and uploads via `StoreService.PutPath` gRPC
 //! with retry on failure.
+// r[impl worker.upload.multi-output]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -422,6 +423,7 @@ pub async fn upload_all_outputs(
     results.into_iter().collect()
 }
 
+// r[verify worker.upload.multi-output]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -45,6 +45,7 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// Call from `main()` immediately after `init_metrics()`. Descriptions
 /// sourced from docs/src/observability.md (the Scheduler Metrics table).
 /// See rio_gateway::describe_metrics for rationale.
+// r[impl obs.metric.scheduler]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 

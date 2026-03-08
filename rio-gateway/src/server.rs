@@ -51,6 +51,7 @@ pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
     }
 }
 
+// r[impl sec.boundary.ssh-auth]
 /// Load authorized public keys from a file in standard `authorized_keys` format.
 pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<PublicKey>> {
     let content = std::fs::read_to_string(path)
@@ -395,6 +396,8 @@ impl Handler for ConnectionHandler {
     }
 }
 
+// r[verify sec.boundary.ssh-auth]
+// r[verify obs.metric.gateway]
 #[cfg(test)]
 mod tests {
     use super::*;

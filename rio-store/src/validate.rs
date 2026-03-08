@@ -3,6 +3,7 @@
 //! For callers that already have buffered data (the common case: PutPath
 //! accumulates the full NAR before validation), use
 //! `validate_nar_digest(&NarDigest::from_bytes(data), ...)`.
+// r[impl sec.drv.validate]
 //!
 //! The streaming `HashingReader` path is test-only — grpc.rs now buffers
 //! the full NAR and uses `from_bytes` (see grpc.rs:~517 comment re: avoiding
@@ -177,6 +178,7 @@ pub fn validate_nar_digest(
     Ok(())
 }
 
+// r[verify sec.drv.validate]
 #[cfg(test)]
 mod tests {
     use super::*;

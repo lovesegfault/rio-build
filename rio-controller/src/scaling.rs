@@ -3,6 +3,9 @@
 //! Runs separately from the reconciler (spawned in main.rs as its
 //! own task). The reconciler ensures the StatefulSet EXISTS with
 //! the right shape; the autoscaler adjusts `spec.replicas` within
+// r[impl ctrl.autoscale.direct-patch]
+// r[impl ctrl.autoscale.separate-field-manager]
+// r[impl ctrl.autoscale.skip-deleting]
 //! `[min, max]` based on queue depth.
 //!
 //! # Stabilization windows
@@ -659,6 +662,9 @@ fn pool_key(pool: &WorkerPool) -> String {
     )
 }
 
+// r[verify ctrl.autoscale.direct-patch]
+// r[verify ctrl.autoscale.separate-field-manager]
+// r[verify ctrl.autoscale.skip-deleting]
 #[cfg(test)]
 mod tests {
     use super::*;

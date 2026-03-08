@@ -230,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[impl obs.metric.controller]
 fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge};
 
@@ -308,6 +309,7 @@ fn spawn_health_server(addr: std::net::SocketAddr) {
     });
 }
 
+// r[verify obs.metric.controller]
 #[cfg(test)]
 mod tests {
     use super::*;

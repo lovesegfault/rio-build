@@ -16,6 +16,7 @@ flowchart LR
 
 ### Boundary 1: Nix Client → Gateway (SSH)
 
+r[sec.boundary.ssh-auth]
 - **Auth**: SSH public key authentication. Keys map to tenants.
 - **Threat**: Malicious `.drv` files, crafted protocol messages, resource exhaustion
 - **Mitigations**: Protocol parser fuzzing, per-tenant rate limiting, connection limits, NAR size limits
@@ -23,6 +24,7 @@ flowchart LR
 
 ### Boundary 2: Gateway/Worker → Internal Services (gRPC)
 
+r[sec.boundary.grpc-hmac]
 - **Auth**: mTLS (service mesh or cert-manager). Each component has a distinct identity.
 - **Threat**: Compromised pod impersonating another component
 - **Mitigations**: mTLS with per-service certificates, NetworkPolicy restricting pod-to-pod communication
@@ -66,6 +68,7 @@ flowchart LR
 
 ## Derivation Validation
 
+r[sec.drv.validate]
 Before a derivation is executed, the gateway and worker enforce several validation checks:
 
 | Check | Where | Description |

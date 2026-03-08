@@ -3,6 +3,8 @@
 //! Fixes the phase2c VmHWM bug: `read_vmhwm_bytes(daemon.id())`
 //! measured nix-daemon's RSS (~10MB) because nix-daemon FORKS the
 //! builder and waitpid()s — the builder's memory never appeared in
+// r[impl worker.cgroup.sibling-layout]
+// r[impl worker.cgroup.memory-peak]
 //! daemon's `/proc`. cgroup `memory.peak` captures the WHOLE TREE
 //! (daemon + builder + every compiler sub-process), which is what
 //! size-class memory-bump actually needs.
@@ -473,6 +475,8 @@ fn read_single_u64(path: &Path) -> Option<u64> {
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.
 use nix::libc;
 
+// r[verify worker.cgroup.sibling-layout]
+// r[verify worker.cgroup.memory-peak]
 #[cfg(test)]
 mod tests {
     use super::*;

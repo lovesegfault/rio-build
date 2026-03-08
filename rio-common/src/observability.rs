@@ -10,6 +10,8 @@
 //!      `RIO_OTEL_ENDPOINT` is set. Unset = no OTel overhead at all (not even
 //!      a no-op layer; the `Option<Layer>` is `None` and the registry
 //!      composes it out at compile-time-ish via `Layer for Option<L>`).
+// r[impl obs.log.required-fields]
+// r[impl obs.trace.w3c-traceparent]
 //!
 //! `RIO_LOG_FORMAT` and `RIO_OTEL_ENDPOINT` are read as direct env vars, NOT
 //! via figment — logging must initialize before figment could fail, and a
@@ -232,6 +234,8 @@ fn log_format_from_env() -> LogFormat {
     }
 }
 
+// r[verify obs.log.required-fields]
+// r[verify obs.trace.w3c-traceparent]
 #[cfg(test)]
 // See config.rs test module for the same allow — figment::Jail closure's
 // Result<(), figment::Error> is 208 bytes, API-fixed, can't box it.

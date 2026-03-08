@@ -22,6 +22,7 @@ pub use server::{GatewayServer, load_authorized_keys, load_or_generate_host_key}
 /// whatever recorder is installed. Safe to call before or after the metric
 /// is first emitted; the exporter merges description with value at scrape
 /// time. Calling twice is a no-op (first description wins).
+// r[impl obs.metric.gateway]
 pub fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram};
 

@@ -2,6 +2,7 @@
 //!
 //! Handles `lookup` and `getattr` operations by checking the local SSD cache
 //! first, then falling back to `StoreService.QueryPathInfo` via gRPC.
+// r[impl worker.fuse.lookup-caches]
 
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -59,6 +60,7 @@ pub fn stat_to_attr(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     }
 }
 
+// r[verify worker.fuse.lookup-caches]
 #[cfg(test)]
 mod tests {
     use super::*;

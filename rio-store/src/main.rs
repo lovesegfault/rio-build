@@ -279,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify obs.metric.store]
 #[cfg(test)]
 mod tests {
     use super::*;

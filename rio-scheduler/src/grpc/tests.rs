@@ -1,3 +1,6 @@
+// r[verify proto.stream.bidi]
+// r[verify sec.boundary.grpc-hmac]
+
 use super::*;
 use crate::actor::tests::{make_test_node, setup_actor};
 use rio_proto::SchedulerServiceServer;

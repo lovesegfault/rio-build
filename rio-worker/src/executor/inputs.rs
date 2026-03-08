@@ -1,4 +1,5 @@
 //! Input fetching: .drv from store, metadata, input closure, FOD hash verification.
+// r[impl worker.fod.verify-hash]
 
 use std::path::Path;
 
@@ -245,6 +246,7 @@ pub(super) async fn compute_input_closure(
     Ok(closure.into_iter().collect())
 }
 
+// r[verify worker.fod.verify-hash]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -201,6 +201,8 @@ impl LogBatcher {
     }
 }
 
+// r[verify obs.log.batch-64-100ms]
+// r[verify obs.metric.worker]
 #[cfg(test)]
 mod tests {
     use super::*;

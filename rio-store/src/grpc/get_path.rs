@@ -3,6 +3,8 @@
 //! Flow:
 //! 1. Look up narinfo + manifest from PostgreSQL
 //! 2. First response: PathInfo metadata
+// r[impl store.nar.reassembly]
+// r[impl store.integrity.verify-on-get]
 //! 3. Stream NAR bytes — branch on inline vs chunked
 //! 4. Verify whole-NAR SHA-256 (belt-and-suspenders over per-chunk BLAKE3)
 //!

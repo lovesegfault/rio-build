@@ -3,6 +3,7 @@
 //! Answers "have we ever seen content with this SHA-256?" — the
 //! fundamental CA cache-hit question. If yes, the caller can skip a
 //! build by copying the existing path (CA derivations don't care which
+// r[impl store.hash.domain-sep]
 //! store path holds the content, only that the content is right).
 //!
 //! # Why this is separate from narinfo
@@ -94,6 +95,7 @@ pub async fn lookup(
     crate::metadata::validate_row(row)
 }
 
+// r[verify store.hash.domain-sep]
 #[cfg(test)]
 mod tests {
     use super::*;

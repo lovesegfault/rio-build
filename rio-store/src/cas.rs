@@ -2,6 +2,8 @@
 //!
 //! Write path: `put_chunked()` — FastCDC + write-ahead + parallel upload.
 //! Read path: `ChunkCache` — moka LRU + singleflight + BLAKE3 verify.
+// r[impl store.singleflight]
+// r[impl store.integrity.verify-on-get]
 //!
 //! The gRPC layer owns request parsing and the inline/chunked branch;
 //! this module owns everything below that.
@@ -586,6 +588,9 @@ impl ChunkCache {
     }
 }
 
+// r[verify store.singleflight]
+// r[verify store.integrity.verify-on-get]
+// r[verify store.integrity.verify-on-put]
 #[cfg(test)]
 mod cache_tests {
     use super::*;
