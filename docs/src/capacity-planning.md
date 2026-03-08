@@ -56,10 +56,12 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 - With 5min average (including large packages): ~480 derivations/hour = ~125 hours total
 - Reality is bimodal: most builds are seconds, a few are hours. Expect 15-25 hours for a full nixpkgs rebuild on 10 workers.
 
-**With size-class routing (WorkerPoolSet):**
+**With size-class routing:**
 - Small pool (10 workers, 8 concurrent each): handles 90% of builds (short-lived)
 - Large pool (2 workers, 2 concurrent each): handles 10% of builds (GCC, LLVM, Firefox)
 - Better utilization: small workers aren't blocked by multi-hour builds
+
+> **Phase 4 deferral — `WorkerPoolSet` CRD:** currently size-class routing is configured per `WorkerPool` via the scheduler's size-class cutoff table (duration + memory thresholds). A `WorkerPoolSet` CRD that groups pools and lets the controller manage cutoffs declaratively is deferred to Phase 4. Until then, deploy multiple independent `WorkerPool` CRs and configure cutoffs in `scheduler.toml`.
 
 ## Gateway and Scheduler
 
@@ -67,7 +69,7 @@ This page provides resource sizing guidance for rio-build deployments. All estim
 |-----------|----------|-----|--------|-------|
 | Gateway | 2-3 | 1 vCPU | 1 GB | Scales with concurrent SSH connections (~1 KB per connection) |
 | Scheduler | 1 active + 1 standby | 2 vCPU | 4 GB | In-memory DAG: ~8 bytes/node + ~16 bytes/edge. 60K-node DAG ≈ 50-100 MB |
-| Store | 2-3 | 2 vCPU | 4 GB | LRU chunk cache: configured via `cache_size` (default 2 GB) |
+| Store | 2-3 | 2 vCPU | 4 GB | LRU chunk cache: configured via `chunk_cache_capacity_bytes` (default 2 GB) |
 | Controller | 1 | 0.5 vCPU | 256 MB | Lightweight; mostly waiting for reconcile intervals |
 
 ## Monitoring Thresholds

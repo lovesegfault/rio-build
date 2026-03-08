@@ -11,10 +11,12 @@ rio-build is a build execution backend, not a CI/CD system. This page describes 
    ssh-keygen -t ed25519 -f ~/.ssh/rio_key -N ""
    ```
 
-2. Add the public key to the gateway's `authorized_keys` with a tenant annotation:
+2. Add the public key to the gateway's `authorized_keys`:
    ```
    ssh-ed25519 AAAA... team-infra
    ```
+
+   > **Phase 5 deferral — tenant annotation:** the comment field (`team-infra` above) is currently discarded by the gateway; all connections are treated as a single anonymous tenant. Mapping the authorized\_keys comment to a `tenant_id` is Phase 5 work (see [Multi-Tenancy](./multi-tenancy.md)).
 
 3. Configure the Nix client to use the key:
    ```bash
@@ -91,7 +93,7 @@ metadata:
 spec:
   derivation: /nix/store/abc...-hello.drv   # must be a store path
   priority: 50
-  timeout: 7200s
+  timeoutSeconds: 7200
   tenant: ci-team
 ```
 
@@ -116,7 +118,7 @@ This is useful for bootstrapping a new rio-build deployment with commonly-used p
 
 ## Multi-Architecture Builds
 
-rio-build supports multiple architectures via separate worker pools. Each `WorkerPool` CRD targets a specific `system` (e.g., `x86_64-linux`, `aarch64-linux`). The scheduler matches derivation `system` to workers with compatible capabilities.
+rio-build supports multiple architectures via separate worker pools. Each `WorkerPool` CRD declares a `systems` list (e.g., `["x86_64-linux"]`, or `["aarch64-linux", "aarch64-darwin"]` for a macOS host with Linux builder). The scheduler matches derivation `system` to workers whose `systems` list contains it, and also requires all derivation `requiredSystemFeatures` to be present in the worker's `features` list.
 
 ```bash
 # Build for a specific architecture (requires workers with matching system)

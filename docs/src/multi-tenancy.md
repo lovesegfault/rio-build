@@ -16,6 +16,8 @@ Each SSH connection is associated with exactly one tenant.
 
 ### Signed Tenant Tokens
 
+> **Phase 5 deferral:** the JWT token flow below is completely unimplemented. Currently `tenant_id` is an empty string in all gRPC metadata; no issuance, signing, propagation, or verification exists. The design below is the Phase 5 target.
+
 Tenant identity is cryptographically bound using signed JWT tokens rather than plain gRPC metadata:
 
 1. **Token issuance**: When a client authenticates via SSH, the gateway issues a short-lived JWT containing:
@@ -34,12 +36,16 @@ All persistent data carries a `tenant_id` foreign key:
 
 | Table | Tenant Column | Isolation Level |
 |-------|--------------|-----------------|
-| `builds` | `tenant_id` | Query-level filtering |
-| `derivations` | `tenant_id` | Query-level filtering |
-| `narinfo` | `tenant_id` | Query-level filtering |
-| `assignments` | Inherited from derivation | Implicit |
+| `builds` | `tenant_id` (nullable) | Query-level filtering |
+| `derivations` | `tenant_id` (nullable) | Query-level filtering |
+| `narinfo` | `tenant_id` (nullable) | Query-level filtering |
+| `content_index` | `tenant_id` (nullable) | Query-level filtering |
+| `realisations` | `tenant_id` (nullable) | Query-level filtering |
+| `assignments` | *(none)* | Implicit via `derivation_id` FK --- no direct `tenant_id` column; tenant scope is derived by joining to `derivations` |
 
 Query-level filtering ensures tenants can only see their own builds and metadata through the `AdminService` and `SchedulerService` RPCs. The gateway injects `tenant_id` from the SSH session into all requests.
+
+> **Current state (Phase 3a):** all `tenant_id` columns are nullable and never written (always NULL). Query-level filtering is not implemented; `AdminService` returns all rows regardless of tenant.
 
 ## Shared Resources
 
@@ -55,9 +61,13 @@ Store paths can be shared across tenants. Since store paths are content-addresse
 
 ### Signing Keys
 
+> **Phase 5 deferral:** per-tenant signing keys are unimplemented. A single cluster-wide ed25519 key signs all narinfo.
+
 Each tenant can have their own ed25519 signing key for narinfo signatures. This allows tenants to maintain independent trust chains for their binary caches.
 
 ### GC Policies
+
+> **Phase 4 deferral:** GC itself is unimplemented (see `tracey query uncovered` → `store.gc.*`). Per-tenant GC policy parameters are stubbed.
 
 Garbage collection retention policies are configurable per tenant:
 
@@ -68,6 +78,8 @@ Garbage collection retention policies are configurable per tenant:
 | `gc_max_store_size` | Maximum total store size for the tenant |
 
 ### Resource Quotas
+
+> **Phase 5 deferral:** per-tenant quotas are unimplemented. Current limits are global compile-time constants (e.g., `MAX_COLLECTION_COUNT` in wire parsers, `MAX_NAR_SIZE`). The scheduler has no per-tenant accounting.
 
 | Parameter | Description |
 |-----------|-------------|
@@ -85,7 +97,7 @@ The `FindMissingChunks` RPC can reveal whether another tenant has built a specif
 1. **Global scope** (default): All tenants share the chunk namespace. Maximum dedup savings, but tenants can infer each other's build activity.
 2. **Per-tenant scope**: Each tenant has a separate chunk namespace. No cross-tenant information leakage, but reduced dedup (identical chunks stored per-tenant).
 
-The choice is a deployment-time configuration. Most deployments should use global scope and accept the minor information leakage risk.
+> **Current state:** scoping is not configurable. `FindMissingChunks` always uses global scope. Per-tenant scoping requires the chunk table to carry `tenant_id` (it doesn't) and is deferred to Phase 5 if a use case emerges.
 
 ### Build Activity Leakage
 
@@ -95,8 +107,10 @@ Beyond `FindMissingChunks`, a tenant can observe shared derivation scheduling (e
 
 | Phase | Multi-Tenancy Work |
 |-------|-------------------|
-| Phase 2a | `tenant_id` columns added to PostgreSQL schema (nullable, unused) |
-| Phase 3 | `tenant_id` propagated via gRPC metadata; query filtering implemented |
-| Phase 5 | Full enforcement: resource quotas, per-tenant signing keys, GC policies |
+| Phase 2a | `tenant_id` columns added to PostgreSQL schema (nullable, unused) --- **done** |
+| Phase 4 | `tenant_id` propagated via gRPC metadata; query filtering implemented in `AdminService` |
+| Phase 5 | Full enforcement: JWT issuance/verification, resource quotas, per-tenant signing keys, GC policies |
+
+> **Correction:** earlier docs claimed Phase 3 would wire `tenant_id` propagation. Phase 3a landed with `tenant_id` still the empty string everywhere; no propagation or filtering exists. This work has been re-scoped to Phase 4.
 
 > **Warning: Multi-tenant deployments are unsafe before Phase 5.** Prior to Phase 5, resource quotas are not enforced, per-tenant signing keys are not available, and data isolation relies on incomplete query-level filtering. Phases 2a--4 should only be deployed as single-tenant or in environments where all tenants are trusted. Do not expose a pre-Phase-5 deployment to untrusted tenants.
