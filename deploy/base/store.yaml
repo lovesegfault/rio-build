@@ -32,9 +32,16 @@ spec:
               containerPort: 9002
             - name: metrics
               containerPort: 9092
+            # Plaintext health for K8s probes when mTLS is on.
+            # Same pattern as scheduler; see scheduler.yaml
+            # comment for shared-HealthReporter rationale.
+            - name: health
+              containerPort: 9102
           env:
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:9002"
+            - name: RIO_HEALTH_ADDR
+              value: "0.0.0.0:9102"
             - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:

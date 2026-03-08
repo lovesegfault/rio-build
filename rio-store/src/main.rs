@@ -278,7 +278,6 @@ async fn main() -> anyhow::Result<()> {
     let max_msg_size = rio_proto::max_message_size();
 
     let addr = cfg.listen_addr.parse()?;
-    info!(addr = %addr, max_msg_size, "starting gRPC server");
 
     // PG is connected, migrations applied, services constructed.
     // Everything that can fail-fast has. SERVING.
@@ -292,7 +291,38 @@ async fn main() -> anyhow::Result<()> {
         .set_serving::<StoreServiceServer<StoreServiceImpl>>()
         .await;
 
-    Server::builder()
+    // Server TLS + plaintext health split. Same pattern as scheduler:
+    // K8s gRPC probes can't do mTLS, so when TLS is on, spawn a
+    // second plaintext listener with ONLY health, sharing the SAME
+    // HealthReporter so set_serving above propagates. Store has no
+    // leader-toggle (always SERVING once booted) so the shared-
+    // reporter requirement is less sharp than scheduler's, but it's
+    // the same architectural pattern — no reason to diverge.
+    let server_tls = rio_common::tls::load_server_tls(&cfg.tls)
+        .map_err(|e| anyhow::anyhow!("server TLS config: {e}"))?;
+    let health_service_plain = health_service.clone();
+    if server_tls.is_some() {
+        let health_addr = cfg.health_addr;
+        info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
+        rio_common::task::spawn_monitored("health-plaintext", async move {
+            if let Err(e) = Server::builder()
+                .add_service(health_service_plain)
+                .serve(health_addr)
+                .await
+            {
+                tracing::error!(error = %e, "plaintext health server failed");
+            }
+        });
+        info!("server mTLS enabled — clients must present CA-signed certs");
+    }
+
+    info!(addr = %addr, max_msg_size, tls = server_tls.is_some(), "starting gRPC server");
+
+    let mut builder = Server::builder();
+    if let Some(tls) = server_tls {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
         .add_service(health_service)
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
         .add_service(ChunkServiceServer::new(chunk_service))
@@ -319,6 +349,9 @@ mod tests {
         assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
         assert!(d.signing_key_path.is_none());
         assert!(d.cache_http_addr.is_none());
+        // Phase3b: plaintext health for K8s probes when mTLS on.
+        assert_eq!(d.health_addr.to_string(), "0.0.0.0:9102");
+        assert!(!d.tls.is_configured());
     }
 
     /// TOML parsing for the tagged enum via figment (what main.rs

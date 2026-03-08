@@ -40,6 +40,16 @@ spec:
               containerPort: 9001
             - name: metrics
               containerPort: 9091
+            # Plaintext health for K8s probes. Only listens when
+            # server mTLS is configured (RIO_TLS__* set) — K8s
+            # gRPC probes can't present client certs. Shares the
+            # SAME HealthReporter as the main port: the leader-
+            # toggle loop's set_not_serving propagates → standby
+            # still correctly fails readiness. Without shared
+            # reporter: standby always SERVING → K8s routes to
+            # non-leader → cluster split.
+            - name: health
+              containerPort: 9101
           env:
             # Lease name: all replicas contend for the SAME
             # lease. First to acquire wins. Presence of this
@@ -65,6 +75,8 @@ spec:
                   fieldPath: metadata.name
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:9001"
+            - name: RIO_HEALTH_ADDR
+              value: "0.0.0.0:9101"
             - name: RIO_STORE_ADDR
               value: "rio-store:9002"
             # DATABASE_URL: overlays inject the real connection string
