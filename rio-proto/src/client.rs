@@ -1,16 +1,17 @@
 //! gRPC client connection and streaming helpers.
 //!
-//! - Connection: `connect_*` build `"http://{addr}"` from a `host:port`
-//!   string, connect, and apply [`max_message_size`](crate::max_message_size).
+//! - Connection: `connect_*` build `"http(s)://{addr}"` from a `host:port`
+//!   string, apply global TLS config if [`init_client_tls`] was called,
+//!   connect, and apply [`max_message_size`](crate::max_message_size).
 //! - NAR streaming: [`collect_nar_stream`] drains `GetPath` responses;
 //!   [`chunk_nar_for_put`] builds a lazy `PutPath` request stream.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio_stream::{Stream, StreamExt};
 use tonic::Streaming;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::StoreServiceClient;
 use crate::types::{
@@ -25,13 +26,62 @@ use crate::validated::ValidatedPathInfo;
 /// 256 KiB reduces per-chunk overhead with negligible latency impact.
 pub const NAR_CHUNK_SIZE: usize = 256 * 1024;
 
+/// Process-global client TLS config. Set once via [`init_client_tls`] in
+/// each binary's `main()` AFTER config load but BEFORE any `connect_*`.
+///
+/// Why a global instead of threading `ClientTlsConfig` through every
+/// connect call: the controller's reconcilers connect lazily per-reconcile
+/// (`Ctx` holds only `String` addrs — see `rio-controller/src/reconcilers/
+/// mod.rs`). Threading TLS config through ~11 call sites + 4 wrapper fns
+/// is invasive. A OnceLock initialized once in main() is the minimal
+/// change — and TLS config IS process-global (same cert for all outgoing
+/// connections; we don't vary it per target).
+///
+/// `None` in the OnceLock = plaintext (init_client_tls called with None,
+/// or never called at all). Both mean "TLS not configured."
+static CLIENT_TLS: OnceLock<Option<ClientTlsConfig>> = OnceLock::new();
+
+/// Set the process-wide client TLS config. Call ONCE in each binary's
+/// main(), after loading TlsConfig but before any `connect_*`.
+///
+/// `None` → plaintext (http://). `Some` → TLS (https:// + the given
+/// config). Calling twice is a silent no-op (OnceLock semantics) — the
+/// first call wins. Tests that need to re-init should use a fresh
+/// process (nextest's default) or accept the first-wins behavior.
+pub fn init_client_tls(cfg: Option<ClientTlsConfig>) {
+    // `let _`: set() returns Err if already set. Not an error —
+    // just means another call raced us (main-only → shouldn't
+    // happen) or tests re-init (first wins, fine).
+    let _ = CLIENT_TLS.set(cfg);
+}
+
 /// Connect to a gRPC endpoint at `host:port` and return a raw [`Channel`].
+///
+/// Scheme and TLS wiring depend on the process-global [`CLIENT_TLS`]:
+/// set → `https://` + `.tls_config()`; unset → `http://` (plaintext).
+/// The global is initialized by [`init_client_tls`] in each binary's
+/// main; if main doesn't call it (or calls it with `None`), plaintext.
 async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
-    let endpoint = format!("http://{addr}");
-    Channel::from_shared(endpoint)?
-        .connect()
-        .await
-        .map_err(Into::into)
+    // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
+    // initialized" and "initialized with None" to plaintext. Tests
+    // that never call init_client_tls stay plaintext.
+    match CLIENT_TLS.get().and_then(|o| o.as_ref()) {
+        Some(tls) => {
+            let endpoint = format!("https://{addr}");
+            Channel::from_shared(endpoint)?
+                .tls_config(tls.clone())?
+                .connect()
+                .await
+                .map_err(Into::into)
+        }
+        None => {
+            let endpoint = format!("http://{addr}");
+            Channel::from_shared(endpoint)?
+                .connect()
+                .await
+                .map_err(Into::into)
+        }
+    }
 }
 
 /// Connect to the store service.
