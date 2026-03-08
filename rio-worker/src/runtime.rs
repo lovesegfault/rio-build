@@ -27,6 +27,17 @@ use crate::{executor, fuse, log_stream};
 /// writes to.
 pub type BloomHandle = Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>;
 
+/// Per-build cancel registration: cgroup path (for cgroup.kill) +
+/// cancelled flag (for spawn_build_task to distinguish Cancelled
+/// from InfrastructureFailure when execute_build returns Err).
+///
+/// Type alias appeases clippy::type_complexity for the nested
+/// `Arc<RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>>` on
+/// BuildSpawnContext.cancel_registry. The inner types ARE the
+/// right shape — extracting a struct for (PathBuf, Arc<AtomicBool>)
+/// would be more indirection for two fields read once each.
+pub type CancelRegistry = std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>;
+
 /// Build a heartbeat request, populating `running_builds` from the shared
 /// tracker and `local_paths` from the FUSE cache bloom filter.
 ///
@@ -137,7 +148,7 @@ pub struct BuildSpawnContext {
     /// (once per build start/end, once per cancel), reads are
     /// cancel-only. std::sync is simpler and the critical sections
     /// are short (HashMap insert/remove/get — no await inside).
-    pub cancel_registry: Arc<std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>>,
+    pub cancel_registry: Arc<CancelRegistry>,
 }
 
 /// Attempt to cancel a build by drv_path. Looks up the cgroup
@@ -152,10 +163,7 @@ pub struct BuildSpawnContext {
 /// the scheduler doesn't wait for confirmation (it's already
 /// transitioned the derivation to Cancelled on its side — this
 /// is just cleanup).
-pub fn try_cancel_build(
-    registry: &std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>,
-    drv_path: &str,
-) -> bool {
+pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
     // Read lock: we only need to look up. The cgroup.kill write
     // doesn't mutate our data structure. The AtomicBool store
     // doesn't need a write lock either.
