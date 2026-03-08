@@ -40,7 +40,10 @@ ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 async-trait = "0.1"
 
 # gRPC
-tonic = { version = "0.14", features = ["transport"] }
+# tls-aws-lc: matches the rustls CryptoProvider choice (aws-lc-rs, not
+# ring). tonic's tls feature family wraps rustls; without tls-*, there's
+# no ClientTlsConfig/ServerTlsConfig at all. Phase 3b mTLS needs both.
+tonic = { version = "0.14", features = ["transport", "tls-aws-lc"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
@@ -186,6 +189,14 @@ http = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
+# HMAC-SHA256 for assignment tokens (Phase 3b). Constant-time verify
+# via Mac::verify_slice — never compare raw tag bytes with ==.
+hmac = "0.12"
+
+# Test-only cert generation for mTLS integration tests. Not a prod dep
+# — real deployments use cert-manager. rcgen's in-memory API lets
+# tests build a CA + client/server certs without touching disk.
+rcgen = "0.14"
 
 # Encoding
 hex = "0.4"
