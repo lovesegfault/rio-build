@@ -72,6 +72,11 @@ pub struct DerivationRow {
     pub system: String,
     pub status: DerivationStatus,
     pub required_features: Vec<String>,
+    // Phase 3b recovery columns. These are written at merge time
+    // so recover_from_pg() can fully reconstruct DerivationState.
+    pub expected_output_paths: Vec<String>,
+    pub output_names: Vec<String>,
+    pub is_fixed_output: bool,
 }
 
 impl SchedulerDb {
@@ -90,21 +95,34 @@ impl SchedulerDb {
     // -----------------------------------------------------------------------
 
     /// Insert a new build record.
+    ///
+    /// `keep_going` + `options` are for Phase 3b state recovery —
+    /// `recover_from_pg()` reads them back to rebuild BuildInfo.
+    /// `options` is serialized to JSONB (`sqlx::types::Json`
+    /// wrapper handles the serde round-trip).
     pub async fn insert_build(
         &self,
         build_id: Uuid,
         tenant_id: Option<&str>,
         priority_class: crate::state::PriorityClass,
+        keep_going: bool,
+        options: &crate::state::BuildOptions,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO builds (build_id, tenant_id, requestor, status, priority_class)
-            VALUES ($1, $2::uuid, '', 'pending', $3)
+            INSERT INTO builds
+                (build_id, tenant_id, requestor, status, priority_class,
+                 keep_going, options_json)
+            VALUES ($1, $2::uuid, '', 'pending', $3, $4, $5)
             "#,
         )
         .bind(build_id)
         .bind(tenant_id)
         .bind(priority_class.as_str())
+        .bind(keep_going)
+        // Json<&T>: sqlx serializes via serde_json and binds as
+        // JSONB. BuildOptions derives Serialize (add if missing).
+        .bind(sqlx::types::Json(options))
         .execute(&self.pool)
         .await?;
 
@@ -200,6 +218,34 @@ impl SchedulerDb {
 
         Ok(())
     }
+
+    /// Append a worker ID to a derivation's `failed_workers` array.
+    ///
+    /// Called from `handle_transient_failure` and `reassign_derivations`
+    /// (worker disconnect mid-build) so recovery can rebuild the
+    /// HashSet that feeds best_worker exclusion + poison detection.
+    ///
+    /// `array_append` is idempotent for our purposes: PG arrays CAN
+    /// have duplicates (not a set), but recovery builds a HashSet
+    /// from the array so dupes collapse. We COULD de-dup in SQL with
+    /// `WHERE NOT ($2 = ANY(failed_workers))` — not worth the extra
+    /// clause for a rare path (transient failures).
+    pub async fn append_failed_worker(
+        &self,
+        drv_hash: &DrvHash,
+        worker_id: &WorkerId,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations \
+             SET failed_workers = array_append(failed_workers, $2), updated_at = now() \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .bind(worker_id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
     // -----------------------------------------------------------------------
     // Build-derivation mapping
     // -----------------------------------------------------------------------
@@ -242,7 +288,9 @@ impl SchedulerDb {
         }
 
         let mut qb = QueryBuilder::new(
-            "INSERT INTO derivations (drv_hash, drv_path, pname, system, status, required_features) ",
+            "INSERT INTO derivations \
+             (drv_hash, drv_path, pname, system, status, required_features, \
+              expected_output_paths, output_names, is_fixed_output) ",
         );
         qb.push_values(rows, |mut b, row| {
             b.push_bind(&row.drv_hash)
@@ -250,10 +298,23 @@ impl SchedulerDb {
                 .push_bind(&row.pname)
                 .push_bind(&row.system)
                 .push_bind(row.status.as_str())
-                .push_bind(&row.required_features);
+                .push_bind(&row.required_features)
+                .push_bind(&row.expected_output_paths)
+                .push_bind(&row.output_names)
+                .push_bind(row.is_fixed_output);
         });
+        // ON CONFLICT: update the recovery columns too. A second
+        // build requesting the same derivation may have fresher
+        // expected_output_paths (same drv_hash → same outputs, so
+        // this is idempotent in practice, but keeps the row in sync
+        // with in-mem). status/retry etc stay as-is — those reflect
+        // LIVE state, not merge-time snapshot.
         qb.push(
-            " ON CONFLICT (drv_hash) DO UPDATE SET updated_at = now() \
+            " ON CONFLICT (drv_hash) DO UPDATE SET \
+                updated_at = now(), \
+                expected_output_paths = EXCLUDED.expected_output_paths, \
+                output_names = EXCLUDED.output_names, \
+                is_fixed_output = EXCLUDED.is_fixed_output \
              RETURNING drv_hash, derivation_id",
         );
 
@@ -623,6 +684,9 @@ mod tests {
             system: "x86_64-linux".into(),
             status: DerivationStatus::Created,
             required_features: vec![],
+            expected_output_paths: vec![],
+            output_names: vec!["out".into()],
+            is_fixed_output: false,
         };
         let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
         tx.commit().await?;
@@ -635,8 +699,14 @@ mod tests {
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let build_id = Uuid::new_v4();
-        db.insert_build(build_id, None, crate::state::PriorityClass::Scheduled)
-            .await?;
+        db.insert_build(
+            build_id,
+            None,
+            crate::state::PriorityClass::Scheduled,
+            true,
+            &Default::default(),
+        )
+        .await?;
         let drv_id = insert_test_derivation(&db, "aaa").await?;
 
         // Call twice — ON CONFLICT DO NOTHING should make the second call a no-op.
@@ -659,8 +729,14 @@ mod tests {
         let db = SchedulerDb::new(test_db.pool.clone());
 
         let build_id = Uuid::new_v4();
-        db.insert_build(build_id, None, crate::state::PriorityClass::Scheduled)
-            .await?;
+        db.insert_build(
+            build_id,
+            None,
+            crate::state::PriorityClass::Scheduled,
+            true,
+            &Default::default(),
+        )
+        .await?;
 
         // Insert starts at 'pending'. Transition to Active then back to Pending
         // (unusual but valid at the DB layer — the state machine rejects it,

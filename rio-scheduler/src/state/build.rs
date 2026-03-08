@@ -158,7 +158,12 @@ impl BuildInfo {
 }
 
 /// Build configuration options.
-#[derive(Debug, Clone, Default)]
+///
+/// Serialize/Deserialize for JSONB persistence (Phase 3b state
+/// recovery): `insert_build` writes this as `options_json`,
+/// `load_nonterminal_builds` reads it back. Default for NULL rows
+/// (written before migration 004) = all zeroes = unlimited.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BuildOptions {
     pub max_silent_time: u64,
     pub build_timeout: u64,

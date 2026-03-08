@@ -361,6 +361,16 @@ impl DagActor {
         drv_hash: &DrvHash,
         worker_id: &WorkerId,
     ) {
+        // Persist the failed worker BEFORE in-mem mutation — same
+        // write order as status updates. best-effort: if PG is down,
+        // the in-mem state is still authoritative; recovery would
+        // lose this one failure's worker-tracking (degrades to
+        // "might retry on same worker once post-recovery").
+        if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
+            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e,
+                   "failed to persist failed_worker");
+        }
+
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
             state.failed_workers.insert(worker_id.clone());
 

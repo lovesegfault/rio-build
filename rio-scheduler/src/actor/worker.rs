@@ -126,6 +126,13 @@ impl DagActor {
                 // as a distinct-worker failure.
                 if let Some(worker_id) = lost_worker {
                     state.failed_workers.insert(worker_id.clone());
+                    // Persist for recovery. best-effort — in-mem is
+                    // authoritative, PG failure just means recovery
+                    // misses this one worker-tracking entry.
+                    if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
+                        error!(drv_hash = %drv_hash, error = %e,
+                               "failed to persist failed_worker");
+                    }
                 }
                 if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");

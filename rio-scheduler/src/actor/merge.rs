@@ -31,7 +31,13 @@ impl DagActor {
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
         self.db
-            .insert_build(build_id, tenant_id.as_deref(), priority_class)
+            .insert_build(
+                build_id,
+                tenant_id.as_deref(),
+                priority_class,
+                keep_going,
+                &options,
+            )
             .await?;
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========
@@ -329,6 +335,12 @@ impl DagActor {
                     system: node.system.clone(),
                     status,
                     required_features: node.required_features.clone(),
+                    // Phase 3b recovery columns: persist what we
+                    // need to fully reconstruct DerivationState on
+                    // leader failover. The proto node has all this.
+                    expected_output_paths: node.expected_output_paths.clone(),
+                    output_names: node.output_names.clone(),
+                    is_fixed_output: node.is_fixed_output,
                 }
             })
             .collect();
