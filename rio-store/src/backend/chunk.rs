@@ -86,7 +86,7 @@ pub trait ChunkBackend: Send + Sync {
     /// drain task which stores keys (not hashes) in pending_s3_deletes.
     ///
     /// Separate from `delete(hash)` because the drain reads string keys
-    /// from PG; re-parsing them back to [u8;32] would be pointless
+    /// from PG; re-parsing them back to `[u8; 32]` would be pointless
     /// indirection.
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()>;
 }

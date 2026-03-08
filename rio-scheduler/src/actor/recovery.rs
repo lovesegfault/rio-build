@@ -35,7 +35,7 @@
 //!
 //! Seed from `MAX(generation) FROM assignments` + 1 via `fetch_max`
 //! (not `store`) — the lease loop already did `fetch_add(1)` on the
-//! SAME Arc<AtomicU64>. `store` would clobber that. `fetch_max`
+//! SAME `Arc<AtomicU64>`. `store` would clobber that. `fetch_max`
 //! takes the larger of (lease's post-increment value, PG high-water
 //! mark + 1). Defensive against Lease reset (`kubectl delete lease`
 //! resets the annotation; PG's high-water mark persists).

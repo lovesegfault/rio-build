@@ -31,10 +31,10 @@ pub type BloomHandle = Arc<std::sync::RwLock<rio_common::bloom::BloomFilter>>;
 /// cancelled flag (for spawn_build_task to distinguish Cancelled
 /// from InfrastructureFailure when execute_build returns Err).
 ///
-/// Type alias appeases clippy::type_complexity for the nested
+/// Type alias appeases `clippy::type_complexity` for the nested
 /// `Arc<RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>>` on
-/// BuildSpawnContext.cancel_registry. The inner types ARE the
-/// right shape — extracting a struct for (PathBuf, Arc<AtomicBool>)
+/// `BuildSpawnContext.cancel_registry`. The inner types ARE the
+/// right shape — extracting a struct for `(PathBuf, Arc<AtomicBool>)`
 /// would be more indirection for two fields read once each.
 pub type CancelRegistry = std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>;
 
