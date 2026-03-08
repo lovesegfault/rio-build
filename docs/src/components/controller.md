@@ -202,6 +202,8 @@ The controller creates PDBs for each component:
 | Scheduler | `maxUnavailable: 1` | Leader election handles failover; at most one pod unavailable |
 | Gateway | `minAvailable: 1` | At least one pod must remain for SSH connectivity |
 
+> **Phase 4 deferral:** Worker PDBs are not controller-managed. Only the scheduler and gateway PDBs exist, deployed as static manifests in the prod kustomize overlay (`deploy/overlays/prod/pdb.yaml`). Per-pool worker PDBs (deriving `minAvailable` from `WorkerPool.spec.replicas.min`) require the reconciler to create/update `PodDisruptionBudget` children alongside the StatefulSet.
+
 ## Service Definitions
 
 | Service | Type | Purpose |
@@ -215,6 +217,8 @@ The controller creates PDBs for each component:
 
 r[ctrl.probe.named-service]
 K8s readiness probes on gRPC components MUST target a named health check service (e.g., `grpc.health.v1.Health/Check` with `service: rio-scheduler`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- readiness would stay green during drain otherwise.
+
+> **Note:** This requirement is satisfied by the static kustomize base manifests (`deploy/base/scheduler.yaml` and `deploy/base/store.yaml`), which set `readinessProbe.grpc.service` to `rio.scheduler.SchedulerService` and `rio.store.StoreService` respectively. It is not controller-managed (the controller does not deploy scheduler/store). Worker probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
 
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|

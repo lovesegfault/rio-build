@@ -2,8 +2,6 @@
 // r[verify ctrl.reconcile.owner-refs]
 // r[verify ctrl.drain.all-then-scale]
 // r[verify ctrl.drain.sigterm]
-// r[verify ctrl.pdb.workers]
-// r[verify ctrl.probe.named-service]
 
 use std::collections::BTreeMap;
 
