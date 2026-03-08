@@ -154,7 +154,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
   - The proxy enforces a domain allowlist (configurable per deployment; default: `cache.nixos.org`, `github.com`, `gitlab.com`, common source forges).
   - All proxied requests are logged for audit. Requests to non-allowlisted domains are rejected.
   - Non-FOD builds retain the full egress deny NetworkPolicy --- no proxy access.
-- **Phase**: Implemented in Phase 3. See [Phase 3 tasks](phases/phase3.md).
+- **Phase**: Phase 3b (not yet implemented). See [Phase 3b tasks](phases/phase3b.md).
 
 ### Log Injection
 

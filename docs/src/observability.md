@@ -231,7 +231,7 @@ Trace context is propagated via gRPC metadata using the W3C `traceparent` header
 
 - **Error budget burn rate:** Alert when the error budget consumption rate exceeds 14.4x the allowed rate over 1h (fast burn) or 6x over 6h (slow burn), following the multi-window multi-burn-rate approach.
 - **Saturation alerts:** PostgreSQL connection pool utilization > 80%, S3 rate limiting (429 responses), worker queue depth exceeding 2x worker count.
-- **Absence alerts:** No worker heartbeat received for > 3x `heartbeat_interval` (default 30s). Indicates a worker has silently died or lost network connectivity.
+- **Absence alerts:** No worker heartbeat received for > ~50-60s (the scheduler's effective deregistration threshold: 30s staleness + 3-tick confirmation). Indicates a worker has silently died or lost network connectivity.
 
 ## Structured Logging
 

@@ -223,7 +223,7 @@ K8s readiness probes on gRPC components MUST target a named health check service
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
-| Scheduler | gRPC health check | After leader election won + PostgreSQL connected | gRPC check, `failureThreshold × periodSeconds ≥ 60s` (state recovery) |
+| Scheduler | gRPC health check | After leader election won + PostgreSQL connected | gRPC check. Startup budget will need to grow once Phase 3b state recovery lands. |
 | Store | gRPC health check | After PostgreSQL + S3 reachable | — |
 | Controller | HTTP `/healthz` | After CRD watches established | — |
 | Worker | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |

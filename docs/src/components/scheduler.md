@@ -235,7 +235,7 @@ r[sched.state.transitions]
 | `running → failed` | Worker reports a retriable error; retry count < max_retries (default 2) |
 | `running → poisoned` | Derivation has failed on `poisonThreshold` distinct workers (default: 3); note that poison tracking spans across builds, not just one build's retry attempts |
 | `assigned → ready` | Assigned worker is lost (heartbeat timeout, pod termination) |
-| `failed → ready` | Retry delay elapsed; derivation re-enters the ready queue |
+| `failed → ready` | Derivation re-enters the ready queue. **Phase 3b:** retry backoff is computed but not yet applied --- re-queue is currently immediate. |
 | `created → dependency_failed` | A dependency reached `poisoned` before this node was queued |
 | `queued → dependency_failed` | A dependency reached `poisoned` while this node was waiting |
 | `ready → dependency_failed` | A dependency reached `poisoned` after this node became ready |

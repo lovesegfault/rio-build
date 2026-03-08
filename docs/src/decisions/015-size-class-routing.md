@@ -55,4 +55,4 @@ The following are **deferred to Phase 4**:
 
 - **`WorkerPoolSet` CRD:** Multiple pools are currently managed as independent `WorkerPool` CRs. The aggregating CRD with shared scaling policy is not yet implemented.
 - **SITA-E adaptive cutoffs:** Cutoffs are static, read from `scheduler.toml` (`size_classes` table). There is no `CutoffRebalancer` task adjusting boundaries from historical data. Operators set cutoffs manually.
-- **CPU and output-size class bumping:** `ema_peak_cpu_cores` and `ema_output_size_bytes` are tracked in `build_history`, but only memory is consulted when bumping a derivation's size class. CPU bumping is blocked on cgroup CPU polling (Phase 3a deferral); output-size bumping has no classifier wiring.
+- **CPU and output-size class bumping:** `ema_peak_cpu_cores` and `ema_output_size_bytes` are tracked in `build_history`, but only memory is consulted when bumping a derivation's size class. cgroup CPU polling was completed in Phase 3a; CPU and output-size bumping simply have no classifier wiring yet.

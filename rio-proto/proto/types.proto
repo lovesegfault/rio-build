@@ -280,8 +280,8 @@ message WorkAssignment {
   reserved "input_paths";
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
-  string assignment_token = 6;            // Opaque token (NOT cryptographically signed in Phase 2a;
-                                          //  HMAC-SHA256 signing deferred to Phase 3 with leader election)
+  string assignment_token = 6;            // Opaque token (NOT cryptographically signed;
+                                          //  HMAC-SHA256 signing deferred to Phase 3b)
   uint64 generation = 7;                  // Leader election generation counter
   bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
 }

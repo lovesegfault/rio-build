@@ -97,7 +97,7 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 r[store.put.wal-manifest]
 **Authorization:** Worker `PutPath` calls must include a valid assignment token (HMAC-SHA256, issued by the scheduler). The store verifies the token signature and checks that the output path matches `expected_output_paths`. See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 
-> **Phase 2a deferral:** Assignment token HMAC signing and verification are deferred to Phase 3 (with leader election). In Phase 2a, tokens are opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. This matches the `types.proto` comment on `WorkAssignment.assignment_token`.
+> **Phase 3b deferral:** Assignment token HMAC signing and verification are not yet implemented. Tokens are currently opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. Leader election (Phase 3a) landed without HMAC.
 
 1. **Buffer + verify:** Buffer the uploaded NAR stream fully in memory, then compute SHA-256 over the buffered bytes and verify against the declared `NarHash`. Reject on mismatch before touching PostgreSQL or S3.
 2. **Write-ahead manifest (PG):** Chunk the buffered NAR with FastCDC, then in a single PostgreSQL transaction: write `manifest_data` (serialized chunk list) and UPSERT chunk refcounts. This protects chunks from GC sweep immediately — even if the upload crashes after this point, orphan cleanup will find the stale `'uploading'` row and decrement refcounts correctly.

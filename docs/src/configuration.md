@@ -35,21 +35,30 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `listen_addr` | string | `0.0.0.0:50052` | gRPC listen address |
-| `http_listen_addr` | string | `0.0.0.0:8080` | Binary cache HTTP listen address |
+| `listen_addr` | string | `0.0.0.0:9002` | gRPC listen address |
+| `cache_http_addr` | socket addr | (unset) | Binary cache HTTP listen address. None = don't spawn the HTTP server. |
 | `database_url` | string | (required) | PostgreSQL connection string |
-| `s3_bucket` | string | (required) | S3 bucket for chunk storage |
-| `s3_prefix` | string | `chunks/` | S3 key prefix |
-| `inline_threshold` | u64 | 262144 (256KB) | NARs below this size bypass chunking |
-| `chunk_target` | u64 | 65536 (64KB) | FastCDC target chunk size |
-| `chunk_min` | u64 | 16384 (16KB) | FastCDC minimum chunk size |
-| `chunk_max` | u64 | 262144 (256KB) | FastCDC maximum chunk size |
-| `cache_size` | u64 | 2147483648 (2GB) | In-process LRU chunk cache size |
-| `gc_grace_period` | Duration | 24h | Grace period between GC mark and sweep |
-| `orphan_scanner_interval` | Duration | 7d | Frequency of orphan chunk scanner |
-| `signing_key_path` | string | `/etc/rio/signing-key` | ed25519 signing key for narinfo |
-| `verify_on_read` | bool | true | BLAKE3-verify chunks on read from S3 |
-| `verify_nar_on_put` | bool | true | SHA-256-verify NAR on PutPath |
+| `metrics_addr` | socket addr | `0.0.0.0:9092` | Prometheus metrics listen address |
+| `chunk_backend` | tagged enum | `{ kind = "inline" }` | Where chunks live. See `ChunkBackendKind` below. |
+| `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
+| `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
+
+`chunk_backend` TOML syntax (tagged enum):
+
+```toml
+# Default — all NARs inline in PG, no chunk backend
+chunk_backend = { kind = "inline" }
+
+# Local filesystem (256-subdir fanout by hash prefix)
+chunk_backend = { kind = "filesystem", base_dir = "/var/rio/chunks" }
+
+# S3 (credentials from aws-sdk default chain — env vars, IRSA, instance profile)
+chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
+```
+
+> **Compile-time constants (not configurable):** `INLINE_THRESHOLD` = 256 KiB, `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).
+
+> **GC is unimplemented** --- `gc_grace_period` and `orphan_scanner_interval` do not exist yet. See [store: GC](./components/store.md#two-phase-garbage-collection).
 
 ## Worker
 
@@ -85,22 +94,14 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `scheduler_addr` | string | `rio-scheduler:50051` | Scheduler gRPC endpoint (for queue depth queries) |
 | `worker_pool_sync_interval` | Duration | 30s | How often to reconcile WorkerPool state |
 | `gc_schedule` | string | `0 3 * * *` | Cron schedule for automated GC triggers (Phase 4) |
-| `leader_election_lease_name` | string | `rio-controller-leader` | Kubernetes Lease name for leader election |
+
+> **The controller is NOT leader-elected** (single replica by design). Only the scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` / `RIO_LEASE_NAMESPACE` env vars documented in [scheduler: Leader Election](./components/scheduler.md#leader-election)).
 
 ## TLS / mTLS
 
-mTLS between internal components is typically provided by the service mesh (Istio/Linkerd). If no service mesh is deployed, application-level TLS can be configured:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `tls_enabled` | bool | false | Enable application-level TLS |
-| `tls_cert_path` | string | `/etc/rio/tls/tls.crt` | TLS certificate file |
-| `tls_key_path` | string | `/etc/rio/tls/tls.key` | TLS private key file |
-| `tls_ca_path` | string | `/etc/rio/tls/ca.crt` | CA certificate for mTLS client verification |
-
-These parameters apply to all gRPC-serving components (gateway, scheduler, store). When a service mesh provides mTLS, set `tls_enabled = false` (the default) and rely on the mesh for encryption and authentication.
-
-> **Security warning:** The default `tls_enabled = false` means all internal gRPC traffic is plaintext. This is only appropriate when a service mesh (Istio, Linkerd) provides transparent mTLS. Deployments without a service mesh MUST set `tls_enabled = true` and provide valid certificates. See [Security & Threat Model](./security.md) for details.
+> **Phase 3b deferral:** Application-level TLS is **not implemented**. There is no `tls_enabled` / `tls_cert_path` / `tls_key_path` / `tls_ca_path` configuration surface. All internal gRPC currently uses plaintext HTTP/2.
+>
+> For production deployments today, deploy a service mesh (Istio/Linkerd) to provide transparent mTLS. See [Security & Threat Model](./security.md) for the target design.
 
 ## Observability
 

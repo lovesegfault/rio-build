@@ -106,12 +106,12 @@ curl -s https://rio-cache.example.com/nix-cache-info
 
 - **PostgreSQL HA:** Use RDS Multi-AZ, Cloud SQL HA, or Patroni. See [Configuration: PostgreSQL Operations](./configuration.md#postgresql-operations).
 - **Monitoring:** Configure Prometheus scraping and Grafana dashboards. See [Integration: Monitoring](./integration.md#monitoring-integration).
-- **TLS:** Deploy a service mesh (Istio/Linkerd) for transparent mTLS between components, or configure application-level TLS. See [Configuration: TLS](./configuration.md#tls--mtls).
+- **TLS:** Deploy a service mesh (Istio/Linkerd) for transparent mTLS between components. **Phase 3b:** application-level TLS is not yet implemented --- there is no `tls_enabled` config surface. See [Security](./security.md).
 - **Backups:** PostgreSQL backups are critical. S3 data is durable by default. No additional backup needed for chunk storage.
 
 ## Upgrades
 
-- **Schema migrations:** Run via `sqlx migrate` with advisory locks. All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables).
+- **Schema migrations:** Run via `sqlx::migrate!` (uses sqlx's built-in PG advisory lock internally). All migrations are forward-compatible; rollback is supported by deploying the previous binary version (it ignores unknown columns/tables). Note: sqlx's lock covers single-service migrations; multi-replica store deployment needs a migration-lock mechanism (hence `replicas: 1` today).
 - **Rolling updates:** Worker StatefulSets (created by rio-controller) set `terminationGracePeriodSeconds: 7200` --- the worker's SIGTERM handler blocks on its build semaphore until in-flight builds complete, then exits 0. Gateway pods use the Kubernetes default (30s); no extended grace period is configured in the base manifests. Use `maxUnavailable: 1` in the StatefulSet update strategy.
 - **Blue/green deployments:** Supported if separate PostgreSQL schemas and S3 key prefixes are used per deployment. The gateway can be switched atomically via NLB target group changes.
 - **Version skew policy:** Gateway and worker binaries can be at most 1 minor version behind the scheduler and store. The scheduler and store must be upgraded first.
