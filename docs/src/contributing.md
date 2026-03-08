@@ -23,7 +23,7 @@ cargo build
 cargo nextest run
 ```
 
-The dev shell provides: Rust toolchain, `protoc`, `libclang`, formatters (`rustfmt`, `nixfmt`, `taplo`), `treefmt`, and pre-commit hooks.
+The dev shell provides: Rust toolchain (nightly by default so `cargo fuzz` works; use `nix develop .#stable` for CI parity), `protoc`, `libclang`, PostgreSQL binaries (`initdb`/`postgres` for ephemeral test databases), `tracey` (spec-coverage tooling), formatters (`rustfmt`, `nixfmt`, `taplo`), `treefmt`, and pre-commit hooks.
 
 ## Building and Testing
 
@@ -54,6 +54,18 @@ nix build .#ci-local-fast
 - **Formatting** --- always run `nix fmt` before committing (pre-commit hooks run treefmt automatically)
 - **Dependencies** --- dual-licensed under MIT OR Apache-2.0. Do not introduce GPL-3.0 dependencies into any crate (see [Architecture Decision #8](./decisions.md))
 
+## Commit Messages
+
+Commits use [Conventional Commits](https://www.conventionalcommits.org/) enforced by the `convco` pre-commit hook. Scope by crate or area:
+
+```
+feat(rio-nix): add ATerm derivation parser
+fix(rio-worker): propagate BuildResult start_time/stop_time
+docs(challenges): update FUSE timeout description
+```
+
+The scope regex only allows alphanumerics and `-`/`_`/`/` --- **no commas** in the scope (use the broader scope or split into multiple commits).
+
 ## Pull Request Conventions
 
 1. **Branch from `main`**, name branches descriptively (e.g., `feat/nar-streaming`, `fix/handshake-padding`)
@@ -64,15 +76,15 @@ nix build .#ci-local-fast
 
 ## Project Structure
 
-See [Crate Structure](./crate-structure.md) for the workspace layout. During early development, most code lives in the `rio-build` and `rio-nix` crates. Crates are split as module boundaries stabilize.
+The workspace is split into 9 crates (`rio-common`, `rio-nix`, `rio-proto`, `rio-gateway`, `rio-scheduler`, `rio-store`, `rio-worker`, `rio-controller`, `rio-test-support`). See [Crate Structure](./crate-structure.md) for the responsibilities and module layout of each.
 
 ## Where to Start
 
 Good first contributions:
 
-- **Phase 1a tasks** in [phases/phase1a.md](./phases/phase1a.md) --- wire format primitives, store path parsing, hash types
+- **Current phase tasks** in [phases/phase3b.md](./phases/phase3b.md), or grep the codebase for `TODO(phase3b)` / `TODO(phase4)` markers
 - **Fuzzing targets** described in [verification.md](./verification.md) --- wire format parsers are security-critical
-- **Golden tests** --- add live-daemon conformance scenarios for new opcodes (see `tests/golden/`)
+- **Golden tests** --- add live-daemon conformance scenarios for new opcodes (see `rio-gateway/tests/golden/`)
 - **Documentation** --- improvements to this design book (typos, clarifications, missing details)
 
 ## Architecture Overview
