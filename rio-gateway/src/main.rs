@@ -146,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     // "rio-scheduler" as a reasonable default (gateway→scheduler is
     // the most-used link).
     rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls, "rio-scheduler")
+        rio_common::tls::load_client_tls(&cfg.tls)
             .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
     );
     if cfg.tls.is_configured() {

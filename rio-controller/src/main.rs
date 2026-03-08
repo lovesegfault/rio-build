@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     // connect calls go through rio_proto::client::connect_* which
     // reads this OnceLock.
     rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls, "rio-scheduler")
+        rio_common::tls::load_client_tls(&cfg.tls)
             .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
     );
     if cfg.tls.is_configured() {

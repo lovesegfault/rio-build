@@ -38,6 +38,6 @@
 
 **PASS (Rust unit/integration coverage):** mTLS handshake (4 tests), HMAC sign/verify/tamper (10 tests), cancel registry (3 tests), failed_workers exclusion + retry backoff (updated poison tests), state recovery (2 tests), GC mark (5 tests), `__noChroot` validation (2 tests). 961 total tests, 126/126 tracey rules covered.
 
-**vm-phase3b:** iteration 1 covers G1 (`__noChroot` rejection) end-to-end. Iteration 2 (T/B/A/S/C/F/E/D VM sections) pending NixOS module TLS env-var extension + k8s worker pod TLS mount — Rust paths fully unit-tested.
+**vm-phase3b:** iteration 2 — 7 test sections (T1-T3 mTLS, B1 HMAC, S1 state recovery, C1 GC TriggerGC, G1 `__noChroot`) via native NixOS worker VM + Nix-time PKI generation. k3s-dependent sections (E PDB/Events/NetPol, F controller WatchBuild, D FOD proxy) and timing-sensitive A (cancel) deferred to iteration 3. Iteration 2 additionally caught and fixed a **latent TLS SNI bug**: `load_client_tls` set `domain_name` globally via OnceLock, but gateway/worker connect to BOTH scheduler AND store — fixed domain_name would mismatch one of the two server certs. Fix: remove `domain_name` override; tonic derives SNI from URL host per-connection.
 
 **EKS smoke:** manual trigger (`infra/eks/smoke-test.sh`). Deploys, builds hello, kills worker, verifies reassign via metrics delta.

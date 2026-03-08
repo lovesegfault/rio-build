@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
     // means :authority from the URL ("rio-store") is the actual SAN
     // match, so this just needs to be A valid SAN of SOME target.
     rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls, "rio-store")
+        rio_common::tls::load_client_tls(&cfg.tls)
             .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
     );
     if cfg.tls.is_configured() {

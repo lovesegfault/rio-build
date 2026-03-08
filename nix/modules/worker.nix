@@ -189,6 +189,11 @@ in
         # Retry on failure with backoff.
         Restart = "on-failure";
         RestartSec = "5s";
+        # Default StartLimitBurst (5 in 10s) is too tight for startup
+        # races: worker starts before cross-VM scheduler → connect
+        # refused → exit → restart. A few of these in quick succession
+        # hits the limit and systemd gives up. 0 = unlimited restarts.
+        StartLimitIntervalSec = "0";
         # Unmount FUSE on shutdown (best-effort; the fuser background session
         # holds it, but the kernel detaches on process exit anyway).
         ExecStopPost = "-${pkgs.util-linux}/bin/umount -l ${cfg.fuseMountPoint}";

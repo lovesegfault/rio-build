@@ -36,7 +36,7 @@ impl TestPki {
     /// client's `domain_name` must match this (or :authority must
     /// match it). Tests use "localhost" since we connect to
     /// `127.0.0.1` and set `domain_name("localhost")`.
-    fn generate(server_san: &str) -> Self {
+    fn generate(server_sans: &[&str]) -> Self {
         // CA: self-signed, isCA: true. `CertifiedIssuer::self_signed`
         // builds both the CA Certificate and an `Issuer` wrapper that
         // can sign leaf certs. The wrapper derefs to `Issuer` (what
@@ -52,10 +52,22 @@ impl TestPki {
             .push(rcgen::DnType::CommonName, "test-ca");
         let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
-        // Server leaf: CA-signed, one SAN. `signed_by` takes
-        // `&Issuer` (what CertifiedIssuer derefs to).
+        // Server leaf: CA-signed. SANs match how the test connects
+        // (both DNS names and IP — `CertificateParams::new` takes
+        // strings and infers DNS vs IP). We don't set
+        // `ClientTlsConfig::domain_name` anymore (removed — it
+        // breaks multi-target clients); tonic derives SNI from the
+        // URL host. So tests binding 127.0.0.1 need 127.0.0.1 as a
+        // SAN; if we connected via `localhost:port` we'd need
+        // `localhost`. Include both for test flexibility.
         let server_key = rcgen::KeyPair::generate().unwrap();
-        let server_params = rcgen::CertificateParams::new(vec![server_san.to_string()]).unwrap();
+        let server_params = rcgen::CertificateParams::new(
+            server_sans
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
 
         // Client leaf: same CA, SAN "rio-test-client" (client
@@ -157,14 +169,14 @@ fn ensure_crypto_provider() {
 #[tokio::test]
 async fn mtls_valid_client_cert_succeeds() {
     ensure_crypto_provider();
-    let pki = TestPki::generate("localhost");
+    let pki = TestPki::generate(&["localhost", "127.0.0.1"]);
 
     let (server_cfg, _server_files) = pki.server_config();
     let server_tls = load_server_tls(&server_cfg).unwrap().unwrap();
     let addr = spawn_server(server_tls).await;
 
     let (client_cfg, _client_files) = pki.client_config();
-    let client_tls = load_client_tls(&client_cfg, "localhost").unwrap().unwrap();
+    let client_tls = load_client_tls(&client_cfg).unwrap().unwrap();
 
     let channel = tonic::transport::Channel::from_shared(format!("https://{addr}"))
         .unwrap()
@@ -195,7 +207,7 @@ async fn mtls_valid_client_cert_succeeds() {
 #[tokio::test]
 async fn mtls_no_client_cert_rejected() {
     ensure_crypto_provider();
-    let pki = TestPki::generate("localhost");
+    let pki = TestPki::generate(&["localhost", "127.0.0.1"]);
 
     let (server_cfg, _server_files) = pki.server_config();
     let server_tls = load_server_tls(&server_cfg).unwrap().unwrap();
@@ -254,10 +266,10 @@ async fn mtls_no_client_cert_rejected() {
 #[tokio::test]
 async fn mtls_wrong_ca_client_cert_rejected() {
     ensure_crypto_provider();
-    let pki = TestPki::generate("localhost");
+    let pki = TestPki::generate(&["localhost", "127.0.0.1"]);
     // A SECOND CA + client cert. Same SAN, valid cert — but the
     // server trusts pki.ca_pem, not this one.
-    let rogue_pki = TestPki::generate("localhost");
+    let rogue_pki = TestPki::generate(&["localhost", "127.0.0.1"]);
 
     let (server_cfg, _server_files) = pki.server_config();
     let server_tls = load_server_tls(&server_cfg).unwrap().unwrap();
@@ -274,7 +286,7 @@ async fn mtls_wrong_ca_client_cert_rejected() {
         key_path: Some(rogue_key.path().to_path_buf()),
         ca_path: Some(real_ca.path().to_path_buf()),
     };
-    let client_tls = load_client_tls(&client_cfg, "localhost").unwrap().unwrap();
+    let client_tls = load_client_tls(&client_cfg).unwrap().unwrap();
 
     let result = tonic::transport::Channel::from_shared(format!("https://{addr}"))
         .unwrap()
@@ -301,25 +313,31 @@ async fn mtls_wrong_ca_client_cert_rejected() {
     }
 }
 
-/// Client with WRONG domain_name → CLIENT rejects the server's
-/// cert (SAN mismatch). Tests the other direction of mTLS: the
-/// client verifies the server too.
+/// Server cert WITHOUT the client's connect address in SANs →
+/// CLIENT rejects. Tests the other direction of mTLS: the client
+/// verifies the server too.
+///
+/// We no longer set `ClientTlsConfig::domain_name` (it breaks
+/// multi-target clients). tonic derives SNI from the URL host.
+/// So to trigger a SAN mismatch: generate a cert with SAN=localhost
+/// only, then connect to 127.0.0.1 — SNI=127.0.0.1, cert has only
+/// localhost → rustls rejects.
 #[tokio::test]
 async fn mtls_san_mismatch_rejected_by_client() {
     ensure_crypto_provider();
-    let pki = TestPki::generate("localhost");
+    // SAN=localhost ONLY, NOT 127.0.0.1. spawn_server binds to
+    // 127.0.0.1 so the connect URL will have host=127.0.0.1.
+    let pki = TestPki::generate(&["localhost"]);
 
     let (server_cfg, _server_files) = pki.server_config();
     let server_tls = load_server_tls(&server_cfg).unwrap().unwrap();
     let addr = spawn_server(server_tls).await;
 
     let (client_cfg, _client_files) = pki.client_config();
-    // Domain name WRONG — server cert has SAN "localhost", we
-    // ask for "rio-wrong-name". rustls should reject.
-    let client_tls = load_client_tls(&client_cfg, "rio-wrong-name")
-        .unwrap()
-        .unwrap();
+    let client_tls = load_client_tls(&client_cfg).unwrap().unwrap();
 
+    // addr = 127.0.0.1:PORT → SNI = "127.0.0.1". Server cert's
+    // only SAN is "localhost". Mismatch → client rejects.
     let result = tonic::transport::Channel::from_shared(format!("https://{addr}"))
         .unwrap()
         .tls_config(client_tls)

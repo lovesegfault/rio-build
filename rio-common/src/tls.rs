@@ -12,12 +12,20 @@
 //! CA Issuer. The `ca.crt` in each Secret is the same (the CA); `tls.crt`
 //! + `tls.key` are per-component. Mounted at `/etc/rio/tls/`.
 //!
-//! [`load_client_tls`]'s `server_name` MUST match a SAN in the server's
-//! certificate (tonic's `ClientTlsConfig::domain_name` sets the SNI and
-//! rustls verifies the cert against it). cert-manager's `dnsNames` field
-//! populates SANs — include BOTH the short name (e.g., `rio-scheduler`)
-//! and the FQDN (e.g., `rio-scheduler.rio-system.svc.cluster.local`) so
-//! clients can use either addressing style.
+//! SNI / SAN verification: [`load_client_tls`] does NOT set
+//! `ClientTlsConfig::domain_name` — tonic derives the SNI hostname
+//! from the connect URL's authority. So connecting to
+//! `rio-scheduler:9001` sends SNI=`rio-scheduler`; connecting to
+//! `rio-store:9002` sends SNI=`rio-store`. rustls verifies the
+//! server cert has a SAN matching the SNI. cert-manager's `dnsNames`
+//! populates SANs — include the SHORT name (how clients address)
+//! and the FQDN (for fully-qualified addressing).
+//!
+//! Previously set `domain_name` globally via OnceLock — BUG: gateway
+//! connects to BOTH scheduler and store with a SINGLE config; fixed
+//! `domain_name="rio-scheduler"` fails store handshake (store cert
+//! has SAN `rio-store` not `rio-scheduler`). Letting tonic derive
+//! from the URL is correct per-connection.
 //!
 //! # Health probes
 //!
@@ -131,27 +139,22 @@ pub fn load_server_tls(cfg: &TlsConfig) -> Result<Option<ServerTlsConfig>, TlsEr
 
 /// Build a client-side TLS config.
 ///
-/// `server_name` is the expected SNI/SAN — must match a `dnsNames`
-/// entry in the server's certificate. Use the SHORT K8s Service name
-/// (e.g., `"rio-scheduler"`) since that's how `scheduler_addr` is
-/// typically configured and cert-manager includes it in SANs.
+/// Does NOT set `domain_name` — tonic derives SNI from the connect
+/// URL's host. Each connection verifies against THAT host's SAN,
+/// which is correct when one client connects to multiple servers
+/// (gateway → scheduler AND store). Server certs must have SANs
+/// matching how clients address them (cert-manager `dnsNames`).
 ///
 /// Like [`load_server_tls`], returns `Ok(None)` for unconfigured,
 /// `Err` for partial, `Ok(Some)` for valid.
-pub fn load_client_tls(
-    cfg: &TlsConfig,
-    server_name: &str,
-) -> Result<Option<ClientTlsConfig>, TlsError> {
+pub fn load_client_tls(cfg: &TlsConfig) -> Result<Option<ClientTlsConfig>, TlsError> {
     match (&cfg.cert_path, &cfg.key_path, &cfg.ca_path) {
         (None, None, None) => Ok(None),
         (Some(cert), Some(key), Some(ca)) => {
             let identity = Identity::from_pem(read_pem(cert)?, read_pem(key)?);
             let ca = Certificate::from_pem(read_pem(ca)?);
             Ok(Some(
-                ClientTlsConfig::new()
-                    .identity(identity)
-                    .ca_certificate(ca)
-                    .domain_name(server_name),
+                ClientTlsConfig::new().identity(identity).ca_certificate(ca),
             ))
         }
         (c, k, a) => Err(TlsError::Incomplete {
@@ -192,7 +195,7 @@ mod tests {
         let cfg = TlsConfig::default();
         assert!(!cfg.is_configured());
         assert!(load_server_tls(&cfg).unwrap().is_none());
-        assert!(load_client_tls(&cfg, "rio-scheduler").unwrap().is_none());
+        assert!(load_client_tls(&cfg).unwrap().is_none());
     }
 
     #[test]
@@ -218,7 +221,7 @@ mod tests {
             }
         ));
         // Same for client.
-        let err = load_client_tls(&cfg, "x").unwrap_err();
+        let err = load_client_tls(&cfg).unwrap_err();
         assert!(matches!(err, TlsError::Incomplete { .. }));
     }
 
@@ -278,7 +281,7 @@ mod tests {
         assert!(cfg.is_configured());
         let server = load_server_tls(&cfg).unwrap();
         assert!(server.is_some(), "full config → Some(ServerTlsConfig)");
-        let client = load_client_tls(&cfg, "rio-store").unwrap();
+        let client = load_client_tls(&cfg).unwrap();
         assert!(client.is_some(), "full config → Some(ClientTlsConfig)");
     }
 

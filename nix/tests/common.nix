@@ -115,6 +115,13 @@ rec {
       # scrapes metrics via curl on the control node. phase1a doesn't
       # need curl but getting it is harmless.
       extraPackages ? [ ],
+      # Merged into systemd.services.rio-{store,scheduler,gateway}.environment.
+      # phase3b uses this to set RIO_TLS__* + RIO_HMAC_KEY_PATH without
+      # extending the NixOS modules. NixOS attrsOf merge composes this
+      # with each module's own `environment = {...}` block — figment reads
+      # the union. Same env applied to all three services (TLS is the
+      # same cert for the shared control VM; unknown vars are ignored).
+      extraServiceEnv ? { },
     }:
     {
       imports = [
@@ -124,6 +131,16 @@ rec {
         postgresqlConfig
       ];
       networking.hostName = hostName;
+
+      # phase3b TLS/HMAC env injection. Empty attrset = no-op (NixOS
+      # module merge with {} is identity). When set, the module system
+      # merges these keys with each module's own `environment = {...}`
+      # — no risk of clobbering RIO_LISTEN_ADDR etc.
+      systemd.services = {
+        rio-store.environment = extraServiceEnv;
+        rio-scheduler.environment = extraServiceEnv;
+        rio-gateway.environment = extraServiceEnv;
+      };
 
       services.rio = {
         package = rio-workspace;
@@ -188,6 +205,10 @@ rec {
       maxBuilds,
       sizeClass ? null,
       otelEndpoint ? null,
+      # Merged into systemd.services.rio-worker.environment. phase3b
+      # uses this to set RIO_TLS__* (client cert for mTLS to scheduler/
+      # store). Composed with the optional RIO_OTEL_ENDPOINT below via //.
+      extraServiceEnv ? { },
     }:
     {
       imports = [ rioModules.worker ];
@@ -209,9 +230,11 @@ rec {
       # strictly needed for the milestone (gateway→scheduler is the
       # critical trace hop), but having them in Tempo makes the trace
       # tree match the observability.md spec diagram.
-      systemd.services.rio-worker.environment = lib.optionalAttrs (otelEndpoint != null) {
-        RIO_OTEL_ENDPOINT = otelEndpoint;
-      };
+      systemd.services.rio-worker.environment =
+        lib.optionalAttrs (otelEndpoint != null) {
+          RIO_OTEL_ENDPOINT = otelEndpoint;
+        }
+        // extraServiceEnv;
 
       # curl for metric scraping.
       environment.systemPackages = [ pkgs.curl ];

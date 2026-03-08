@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     // actual SAN verification uses the :authority header from
     // the endpoint URL (K8s DNS: "rio-scheduler", "rio-store").
     rio_proto::client::init_client_tls(
-        rio_common::tls::load_client_tls(&cfg.tls, "rio-scheduler")
+        rio_common::tls::load_client_tls(&cfg.tls)
             .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
     );
     if cfg.tls.is_configured() {
