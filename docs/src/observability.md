@@ -153,6 +153,19 @@ r[obs.metric.controller]
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
 | `rio_controller_gc_runs_total` *(Phase 4+)* | Counter | GC runs (labeled by result: success/failure) — not yet emitted |
 
+### Histogram Buckets
+
+`metrics-exporter-prometheus` defaults to `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` — tuned for HTTP request latencies. Build durations span seconds to hours, so `rio-common::observability::init_metrics` installs per-metric overrides via `PrometheusBuilder::set_buckets_for_metric`:
+
+| Metric(s) | Buckets (seconds unless noted) |
+|---|---|
+| `rio_scheduler_build_duration_seconds`, `rio_worker_build_duration_seconds` | `[1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200]` |
+| `rio_scheduler_critical_path_accuracy` | `[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0]` (ratio: actual/estimated; 1.0 = perfect) |
+| `rio_controller_reconcile_duration_seconds` | `[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]` |
+| `rio_scheduler_assignment_latency_seconds` | `[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]` |
+
+Histograms not listed here (e.g., `rio_gateway_opcode_duration_seconds`, `rio_store_put_path_duration_seconds`, `rio_worker_fuse_fetch_duration_seconds`) use the default buckets — those are genuinely sub-second request latencies.
+
 ## Distributed Tracing
 
 rio-build uses OpenTelemetry for distributed tracing with trace context propagation via gRPC metadata.

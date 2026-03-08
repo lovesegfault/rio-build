@@ -204,12 +204,74 @@ where
     Ok((Some(layer), OtelGuard(Some(provider))))
 }
 
+/// Histogram bucket boundaries for build-duration metrics (seconds).
+///
+/// Default Prometheus buckets top out at 10s — useless for Nix builds that
+/// routinely run 1–60 minutes. These span 1s..2h with denser coverage in the
+/// 1–10min range where most builds land.
+const BUILD_DURATION_BUCKETS: &[f64] = &[
+    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0,
+];
+
+/// Histogram bucket boundaries for `rio_scheduler_critical_path_accuracy`.
+///
+/// Ratio of actual/estimated build duration. `1.0` = perfect prediction,
+/// values above `1.0` = underestimate (build took longer than predicted).
+/// Bucket edges are chosen to give resolution around `1.0` and capture
+/// long tails on both sides.
+const CRITICAL_PATH_ACCURACY_BUCKETS: &[f64] = &[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0];
+
+/// Histogram bucket boundaries for controller reconcile latency (seconds).
+///
+/// Reconciles are mostly K8s API round-trips — expect 10–500ms normally,
+/// seconds only under API-server stress. Default Prometheus buckets
+/// actually work here but the low end (5ms) is wasted; this set trades
+/// that for a 10s top bucket.
+const RECONCILE_DURATION_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+/// Histogram bucket boundaries for scheduler assignment latency (seconds).
+///
+/// Time from a derivation becoming Ready to being assigned to a worker.
+/// Healthy system: sub-millisecond to low-tens-of-ms. Seconds = backlog.
+const ASSIGNMENT_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+
 /// Initialize Prometheus metrics exporter.
 ///
 /// This starts an HTTP server on the given address that serves `/metrics`.
+///
+/// Installs custom histogram bucket boundaries for known duration/ratio
+/// metrics — the `metrics-exporter-prometheus` default buckets
+/// (`[0.005..10.0]`) are tuned for HTTP request latencies and are useless
+/// for build durations that span seconds to hours. See `observability.md`
+/// for the full bucket table.
 pub fn init_metrics(addr: std::net::SocketAddr) -> anyhow::Result<()> {
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-    builder
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+    // set_buckets_for_metric returns Result<Self, BuildError> — the only
+    // error variant is EmptyBucketsOrQuantiles, which cannot fire for the
+    // non-empty const slices above. Unwrap with `.expect()` is safe here,
+    // but we propagate anyway to keep the error surface uniform.
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full("rio_scheduler_build_duration_seconds".to_string()),
+            BUILD_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("rio_worker_build_duration_seconds".to_string()),
+            BUILD_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("rio_scheduler_critical_path_accuracy".to_string()),
+            CRITICAL_PATH_ACCURACY_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("rio_controller_reconcile_duration_seconds".to_string()),
+            RECONCILE_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("rio_scheduler_assignment_latency_seconds".to_string()),
+            ASSIGNMENT_LATENCY_BUCKETS,
+        )?
         .with_http_listener(addr)
         .install()
         .map_err(|e| anyhow::anyhow!("failed to install Prometheus exporter: {e}"))?;
