@@ -151,6 +151,8 @@ Future instances of the same `(pname, system)` are routed to a larger class by v
 
 ### Adaptive Cutoff Learning (SITA-E)
 
+> **Phase 4 deferral:** The `CutoffRebalancer` and adaptive learning are not yet implemented. Cutoffs are static TOML config. The algorithm below is the target design.
+
 A background task (`CutoffRebalancer`) periodically recomputes class cutoffs to equalize load across pools:
 
 ```
@@ -202,7 +204,7 @@ stateDiagram-v2
     assigned --> running : worker acknowledges
     running --> completed : build succeeded
     running --> failed : build error (retriable)
-    running --> poisoned : failed on 3+ workers
+    running --> poisoned : poison threshold / max retries / permanent failure
     assigned --> ready : worker lost / heartbeat timeout
     failed --> ready : retry scheduled
     completed --> [*]
@@ -231,11 +233,11 @@ r[sched.state.transitions]
 | `queued → ready` | All dependency derivations are in `completed` state |
 | `ready → assigned` | A worker passes resource-fit check and is selected by the scoring algorithm |
 | `assigned → running` | Worker sends acknowledgement on the `BuildExecution` stream |
-| `running → completed` | Worker reports success and output is verified in rio-store |
-| `running → failed` | Worker reports a retriable error; retry count < max_retries (default 2) |
-| `running → poisoned` | Derivation has failed on `poisonThreshold` distinct workers (default: 3); note that poison tracking spans across builds, not just one build's retry attempts |
+| `running → completed` | Worker reports success (output uploaded by worker before reporting; scheduler does not re-verify against rio-store) |
+| `running → failed` | Worker reports a retriable error (`TransientFailure` / `InfrastructureFailure`); retry count < max_retries (default 2) **and** failed_workers count < poisonThreshold. `failed` is a non-terminal intermediate state --- it always transitions to `ready` after retry backoff (**Phase 3b:** backoff is computed but not yet applied; re-queue is currently immediate). |
+| `running → poisoned` | Any of: **(a)** derivation has failed on `poisonThreshold` distinct workers (default: 3; poison tracking spans across builds, not just one build's retry attempts), **(b)** retry_count >= max_retries with failed_workers below threshold, **(c)** worker reports a permanent-class failure (`PermanentFailure`, `OutputRejected`, `CachedFailure`, `LogLimitExceeded`, `DependencyFailed`) --- poisoned immediately on first attempt, no retry |
 | `assigned → ready` | Assigned worker is lost (heartbeat timeout, pod termination) |
-| `failed → ready` | Derivation re-enters the ready queue. **Phase 3b:** retry backoff is computed but not yet applied --- re-queue is currently immediate. |
+| `failed → ready` | Derivation re-enters the ready queue. See `running → failed` above. |
 | `created → dependency_failed` | A dependency reached `poisoned` before this node was queued |
 | `queued → dependency_failed` | A dependency reached `poisoned` while this node was waiting |
 | `ready → dependency_failed` | A dependency reached `poisoned` after this node became ready |
@@ -327,14 +329,14 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
    - `systems` (list, e.g., `[x86_64-linux]`; a worker may support multiple target systems via emulation)
    - `supported_features` (list of `requiredSystemFeatures` the worker supports)
    - `max_builds` (concurrency limit)
-   - `bloom_filter` (initial store path bloom filter for closure-locality scoring)
+   - `local_paths` (initial store path bloom filter for closure-locality scoring)
 3. When the scheduler receives the first `Heartbeat` from a `worker_id` that also has an open `BuildExecution` stream, it creates an in-memory worker entry with the reported capabilities and marks the worker as `alive`.
 4. Scheduler begins sending `WorkAssignment` messages on the stream.
 
 r[sched.worker.deregister-reassign]
 **Deregistration:** A worker is removed from the scheduler's state when:
 - The `BuildExecution` stream is closed (graceful shutdown or network failure)
-- Heartbeat timeout: the actor's 10s tick finds `last_heartbeat` older than 30s **and** this has been observed on 3 consecutive ticks (effective wall-clock timeout: ~50–60s depending on tick phase alignment)
+- Heartbeat timeout: the actor's tick (configurable, default 10s) finds `last_heartbeat` older than 30s **and** this has been observed on 3 consecutive ticks (effective wall-clock timeout: ~50–60s depending on tick phase alignment)
 
 On deregistration, all derivations in `assigned` state for that worker are transitioned back to `ready` for reassignment.
 
@@ -345,7 +347,7 @@ The scheduler applies backpressure at multiple layers to prevent overload:
 **gRPC flow control:** The `BuildExecution` streams use the default HTTP/2 flow control window (64 KiB initial, dynamically adjusted). The scheduler does not send new `WorkAssignment` messages to a worker whose send window is exhausted, naturally rate-limiting dispatch to slow consumers.
 
 r[sched.backpressure.hysteresis]
-**Actor queue depth limit:** The DAG actor's `mpsc` channel has a bounded capacity (default: 10,000 messages). If the queue depth exceeds 80% of capacity:
+**Actor queue depth limit:** The DAG actor's `mpsc` channel has a fixed capacity (`ACTOR_CHANNEL_CAPACITY` = 10,000 messages; compile-time constant). If the queue depth exceeds 80% of capacity:
 1. `CompletionReport` messages from worker `BuildExecution` streams block the stream-reader task on the actor channel send (completions must not be dropped — a lost completion would leave the derivation stuck `Running`).
 2. `LogBatch` and `ProgressUpdate` messages are dropped (non-blocking `try_send`) — the ring buffer already holds log lines and live-forward is a nice-to-have; progress is dashboard-only.
 3. New `SubmitBuild` requests from the gateway receive gRPC `RESOURCE_EXHAUSTED` status.
@@ -440,11 +442,13 @@ CREATE TABLE build_history (
     ema_peak_memory_bytes   DOUBLE PRECISION,       -- nullable: worker may not report cgroup memory.peak
     ema_peak_cpu_cores      DOUBLE PRECISION,       -- nullable: polled worker-side from cgroup cpu.stat
     ema_output_size_bytes   DOUBLE PRECISION,       -- nullable: NAR size of built outputs
-    size_class              TEXT,                   -- informational: last class routed to (dashboards, not classify())
+    size_class              TEXT,                   -- currently unused (DerivationState.assigned_size_class populated in-memory but not persisted)
     misclassification_count INTEGER NOT NULL DEFAULT 0,  -- Phase 4 CutoffRebalancer input; currently write-only
     PRIMARY KEY (pname, system)
 );
 ```
+
+> **Auxiliary tables omitted from pseudo-DDL above:** `build_logs` (S3 blob metadata per derivation) and `build_event_log` (Prost-encoded BuildEvent per sequence for gateway replay). See `rio-scheduler/migrations/` for full schema.
 
 ## Leader Election
 
@@ -483,11 +487,14 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
 - `rio-scheduler/src/db.rs` — PostgreSQL persistence (derivations, assignments, build_history EMA)
 - `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
+- `rio-scheduler/src/lease.rs` — Kubernetes Lease leader-election loop (generation counter, is_leader flag)
+- `rio-scheduler/src/event_log.rs` — PostgreSQL-backed build_event_log writes for gateway `since_sequence` replay
+- `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs)
 
 ## Planned Files (Phase 4/5)
 
 - `rio-scheduler/src/early_cutoff.rs` — CA early cutoff detection (per-edge DAG tracking)
-- `rio-scheduler/src/poison.rs` — Cross-build poison derivation tracking
+- `rio-scheduler/src/poison.rs` — Persistent (PG-backed) poison derivation tracking. Current `failed_workers` HashSet is in-memory and lost on scheduler restart.
 - CutoffRebalancer — adaptive size-class cutoff adjustment from misclassification_count
 
 ```mermaid
