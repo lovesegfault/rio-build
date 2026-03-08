@@ -52,16 +52,18 @@ The scheduling algorithm below is implemented as of Phase 2c: critical-path prio
       - Resource fit (hard filter): does worker have required features, enough CPU/memory?
         Workers that fail this check are excluded entirely.
       - Transfer cost (normalized):
-          raw_cost(drv, worker) = sum(nar_size(p) for p in closure(drv) - worker_cached_paths)
+          raw_cost(drv, worker) = |closure(drv) - worker_cached_paths|  (path count, not nar_size sum)
           normalized_cost = raw_cost / max(raw_cost across all candidate workers)
         Closure membership approximated via bloom filters in worker heartbeats (target FPR: 1%).
+        Path count is used as a proxy for transfer size; nar_size-weighted scoring is a possible future refinement.
       - Load fraction: running_builds / max_builds (dimensionless, in [0, 1])
       - Combined score: normalized_cost * W_locality + load_fraction * W_load
         Lowest score wins. Both terms are in [0, 1], making weights directly comparable.
    d. Assign to the best-scoring worker via the bidirectional BuildExecution stream.
-      The scheduler signs an HMAC-SHA256 assignment token containing (worker_id,
-      derivation_hash, expected_output_paths, expiry) and includes it in the
-      WorkAssignment. See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
+      The WorkAssignment carries an assignment token — currently a plain format-string
+      `{worker_id}-{drv_hash}-{generation}`. HMAC-SHA256 signing with expected_output_paths
+      and expiry is deferred to Phase 3b.
+      See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 8. As builds complete (reported via BuildExecution stream):
    a. Upload output to rio-store (worker does this before reporting)
    b. For CA derivations: check if output content matches any existing CAS entry
@@ -317,7 +319,7 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
 1. Worker opens a `BuildExecution` bidirectional stream to the scheduler (calling `WorkerService.BuildExecution`).
 2. Worker calls the separate `Heartbeat` unary RPC with its initial capabilities:
    - `worker_id` (unique, derived from pod UID)
-   - `system` (e.g., `x86_64-linux`)
+   - `systems` (list, e.g., `[x86_64-linux]`; a worker may support multiple target systems via emulation)
    - `supported_features` (list of `requiredSystemFeatures` the worker supports)
    - `max_builds` (concurrency limit)
    - `bloom_filter` (initial store path bloom filter for closure-locality scoring)
