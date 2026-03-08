@@ -37,9 +37,14 @@ service StoreService {
   rpc RegisterRealisation(RegisterRealisationRequest) returns (RegisterRealisationResponse);  // wopRegisterDrvOutput (42)
   rpc QueryRealisation(QueryRealisationRequest) returns (Realisation);         // wopQueryRealisation (43)
 }
+```
+
+> **PutPath stream shape:** `metadata` (1) → `nar_chunk` (0+) → `trailer` (1, mandatory). The `nar_hash` / `nar_size` go in the **trailer**, NOT the metadata — `metadata.info.nar_hash` MUST be empty (store rejects non-empty as a protocol violation). This enables single-pass streaming: the worker's `HashingChannelWriter` tee reads the file once, hashing + uploading simultaneously (~256 KiB peak memory, down from 8 GiB pre-phase2b).
+
+```protobuf
 
 service ChunkService {
-  rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);
+  rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);  // UNIMPLEMENTED — server-side chunking only
   rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
   rpc FindMissingChunks(FindMissingChunksRequest) returns (FindMissingChunksResponse);
 }
@@ -104,6 +109,23 @@ message BuildLogBatch {
 }
 ```
 
+### CompletionReport
+
+Worker → scheduler message on the `BuildExecution` stream reporting the result of a single derivation build, including cgroup-v2-derived resource metrics:
+
+```protobuf
+message CompletionReport {
+  string drv_path = 1;           // Derivation that completed
+  BuildResult result = 2;        // Build result details (status, outputs, timing)
+  string assignment_token = 3;   // Echoed from WorkAssignment
+  uint64 peak_memory_bytes = 4;  // memory.peak from per-build cgroup (tree-wide, single read at end)
+  uint64 output_size_bytes = 5;  // Sum of NAR sizes uploaded across all outputs
+  double peak_cpu_cores = 6;     // Max of 1Hz-sampled cpu.stat delta (cores-equivalent; double for fractional cores)
+}
+```
+
+`peak_memory_bytes` / `peak_cpu_cores` feed the `build_history` EMA columns for size-class memory-bump routing. Zero is the no-signal sentinel (cgroup setup failed or build failed before the cgroup was populated) — the scheduler keeps the prior EMA instead of dragging toward zero. cgroup v2 is a **hard requirement**; the worker fails startup if the delegated subtree is unavailable.
+
 ### HeartbeatRequest
 
 Workers include inventory data in heartbeats so the scheduler can make informed placement decisions:
@@ -117,6 +139,7 @@ message HeartbeatRequest {
   repeated string systems = 5;     // Systems this worker builds for (e.g. ["x86_64-linux", "aarch64-linux"])
   repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
   uint32 max_builds = 7;           // Maximum concurrent builds this worker accepts
+  string size_class = 8;           // Static size-class from worker.toml ("small"/"large"/"" = wildcard)
 }
 
 message BloomFilter {
@@ -193,6 +216,12 @@ message DerivationNode {
                                               // (for scheduler-side cache check: closes
                                               //  TOCTOU between gateway FindMissingPaths
                                               //  and DAG merge)
+  bytes drv_content = 9;           // Inline ATerm-serialized .drv. Empty = worker fetches from store.
+                                   // Populated by gateway's filter_and_inline_drv ONLY for nodes with
+                                   // missing outputs (≤64KB per node, 16MB total DAG budget).
+  uint64 input_srcs_nar_size = 10; // Sum of nar_size of this node's input_srcs (direct static sources,
+                                   // NOT transitive). Estimator fallback for fresh (pname,system) with
+                                   // no build_history. 0 = no-signal (skip fallback, use 30s default).
 }
 
 message DerivationEdge {
