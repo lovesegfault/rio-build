@@ -12,7 +12,7 @@
 #     approach needs NixOS-test-specific wiring)
 #
 # The Rust implementation IS fully tested at the unit/integration
-# level (961 tests as of this commit). The VM test is the end-to-end
+# level (965 tests as of this commit). The VM test is the end-to-end
 # WIRING proof; iteration 2 extends coverage here.
 #
 # Tests: mTLS handshake, HMAC token accept/reject, cancel via
@@ -77,7 +77,6 @@ pkgs.testers.runNixOSTest {
 
     client = common.mkClientNode {
       gatewayHost = "control";
-      extraPackages = [ noChrootDrvFile ];
     };
   };
 
@@ -87,7 +86,10 @@ pkgs.testers.runNixOSTest {
     # Control plane boot.
     ${common.waitForControlPlane "control"}
 
-    # SSH + busybox seed for builds.
+    # SSH key + gateway restart (authorized_keys).
+    ${common.sshKeySetup "control"}
+
+    # Busybox closure seed (client needs it resolvable for the drv arg).
     ${common.seedBusybox "control"}
 
     # === Section G: Gateway validation ===
@@ -99,7 +101,7 @@ pkgs.testers.runNixOSTest {
         # fail(): the build SHOULD fail. Capture stderr.
         result = client.fail("""
           nix-build ${noChrootDrvFile} --arg busybox \
-            "(import <nixpkgs> {}).busybox" \
+            '(builtins.storePath ${common.busybox})' \
             --store ssh-ng://control 2>&1
         """)
         # Gateway's error message contains "sandbox escape" (from
@@ -133,7 +135,7 @@ pkgs.testers.runNixOSTest {
     print("Phase 3b VM test iteration 1: G1 (__noChroot) PASS")
     print("Iteration 2 (TLS/HMAC/cancel/recovery/GC): pending")
     print("  NixOS module env-var extensions + k8s worker pod.")
-    print("  All paths unit-tested (961 tests total).")
+    print("  All paths unit-tested (965 tests total).")
     print("=" * 60)
   '';
 }

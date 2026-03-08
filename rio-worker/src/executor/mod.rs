@@ -99,9 +99,10 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 /// Worker nix.conf content for sandbox builds.
 ///
 /// The ConfigMap `rio-nix-conf` in deploy/base/configmaps.yaml can
-/// override this at `/etc/rio/nix.conf` — operators customize without
-/// image rebuild. `setup_nix_conf` checks for the override first;
-/// this is the fallback when the mount is absent (VM tests, local dev).
+/// override this at `/etc/rio/nix-conf/nix.conf` — operators customize
+/// without image rebuild. `setup_nix_conf` checks for the override
+/// first; this is the fallback when the mount is absent (VM tests,
+/// local dev).
 ///
 /// `ca-derivations`: required for content-addressed outputs (Phase 2c
 /// CA support). The ConfigMap also lists `nix-command` for pod
@@ -129,7 +130,7 @@ experimental-features = ca-derivations
 /// `rio-nix-conf` ConfigMap). If present, `setup_nix_conf` copies
 /// THIS instead of using `WORKER_NIX_CONF`. Lets operators customize
 /// experimental-features, sandbox paths, etc without image rebuild.
-const NIX_CONF_OVERRIDE_PATH: &str = "/etc/rio/nix.conf";
+const NIX_CONF_OVERRIDE_PATH: &str = "/etc/rio/nix-conf/nix.conf";
 
 /// Error type for executor operations.
 ///
@@ -775,22 +776,29 @@ fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
 
     // Try the override first. `read` (not `read_to_string`) —
     // nix.conf is ASCII but we're just copying bytes, no reason
-    // to UTF-8-validate. ENOENT = override not mounted → fallback.
+    // to UTF-8-validate. ENOENT OR empty = not mounted → fallback.
     // Any OTHER error (permission denied, I/O) → bubble up
     // (something's wrong with the mount).
+    //
+    // The mount is a DIRECTORY (no subPath): `optional: true`
+    // ConfigMap + missing ConfigMap → K8s mounts an empty dir →
+    // read("dir/nix.conf") → clean ENOENT → fallback. Previously
+    // used subPath which creates empty-file-or-dir weirdness when
+    // the ConfigMap is missing — vm-phase3a caught a 600s+ hang
+    // (empty nix.conf → Nix defaults → substitute=true → tries
+    // cache.nixos.org → airgap DNS timeout).
     let content = match std::fs::read(NIX_CONF_OVERRIDE_PATH) {
-        Ok(bytes) => {
+        Ok(bytes) if !bytes.is_empty() => {
             tracing::debug!(
                 path = NIX_CONF_OVERRIDE_PATH,
                 "using nix.conf override from ConfigMap mount"
             );
             bytes
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Common case (VM tests, local dev, K8s without the
-            // ConfigMap mount). Compiled-in fallback.
-            WORKER_NIX_CONF.as_bytes().to_vec()
-        }
+        // Empty OR NotFound: ConfigMap not applied, or key missing.
+        // Either way, compiled-in fallback.
+        Ok(_) => WORKER_NIX_CONF.as_bytes().to_vec(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => WORKER_NIX_CONF.as_bytes().to_vec(),
         Err(e) => return Err(ExecutorError::NixConf(e)),
     };
 

@@ -555,6 +555,12 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let mut seen: HashSet<String> = HashSet::new();
     all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
+    // Validate BEFORE inlining: __noChroot check + early MAX_DAG_NODES.
+    if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
+        warn!(reason = %reason, "rejecting build: DAG validation failed");
+        stderr_err!(stderr, "build rejected: {reason}");
+    }
+
     // Inline .drv content for will-dispatch nodes (after dedup so we
     // don't serialize the same derivation twice).
     translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
@@ -688,12 +694,25 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         let mut seen: HashSet<String> = HashSet::new();
         all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
-        // Inline .drv content for will-dispatch nodes.
-        translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
+        // Validate BEFORE inlining: __noChroot check + early
+        // MAX_DAG_NODES. On reject: STDERR_ERROR + per-path failure,
+        // no SubmitBuild.
+        let build_result = if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
+            warn!(reason = %reason, "rejecting build: DAG validation failed");
+            stderr
+                .error(&rio_nix::protocol::stderr::StderrError::simple(
+                    "DAGValidationFailed",
+                    format!("build rejected: {reason}"),
+                ))
+                .await?;
+            BuildResult::failure(BuildStatus::MiscFailure, reason)
+        } else {
+            // Inline .drv content for will-dispatch nodes.
+            translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
-        let request = translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
+            let request =
+                translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
 
-        let build_result =
             submit_and_process_build(stderr, scheduler_client, request, active_build_ids)
                 .await
                 .unwrap_or_else(|e| {
@@ -701,7 +720,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                         .increment(1);
                     BuildResult::failure(BuildStatus::MiscFailure, format!("scheduler error: {e}"))
-                });
+                })
+        };
 
         // Apply the build result to all derivation paths, enriching each with
         // its builtOutputs (drvHashModulo!outputName → Realisation JSON).

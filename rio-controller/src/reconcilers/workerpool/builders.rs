@@ -515,16 +515,23 @@ fn build_container(
                     ..Default::default()
                 });
             }
-            // nix-conf: mounted at /etc/rio/ so setup_nix_conf's
-            // NIX_CONF_OVERRIDE_PATH (/etc/rio/nix.conf) finds it.
-            // The ConfigMap has one key (nix.conf) → one file.
-            // subPath so we ONLY get nix.conf at that exact path,
-            // not the whole ConfigMap as a directory (which would
-            // shadow any other /etc/rio/ mounts — like tls).
+            // nix-conf: mount the ConfigMap as a DIRECTORY (no
+            // subPath). setup_nix_conf reads /etc/rio/nix-conf/
+            // nix.conf. With optional=true + missing ConfigMap,
+            // K8s mounts an empty dir → read("dir/nix.conf")
+            // gets clean ENOENT → fallback to WORKER_NIX_CONF.
+            //
+            // Previously used subPath="nix.conf" + mount_path=
+            // "/etc/rio/nix.conf" — that creates an empty dir (or
+            // file, depends on k8s version) at the mount point when
+            // the ConfigMap is missing. read() then returns
+            // IsADirectory or Ok(vec![]) instead of NotFound →
+            // setup_nix_conf either errored or wrote empty
+            // nix.conf → Nix defaults → substitute=true → airgap
+            // VM DNS hang. Caught by vm-phase3a timeout.
             m.push(VolumeMount {
                 name: "nix-conf".into(),
-                mount_path: "/etc/rio/nix.conf".into(),
-                sub_path: Some("nix.conf".into()),
+                mount_path: "/etc/rio/nix-conf".into(),
                 read_only: Some(true),
                 ..Default::default()
             });
