@@ -288,6 +288,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Cancel registry: drv_path → (cgroup path, cancelled flag).
+    // Populated by spawn_build_task after cgroup creation; the
+    // Cancel handler below looks up and writes cgroup.kill.
+    let cancel_registry = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::<
+        String,
+        (std::path::PathBuf, Arc<std::sync::atomic::AtomicBool>),
+    >::new()));
+
     // Shared context for spawning build tasks (clones done once per assignment
     // inside spawn_build_task, not here).
     let build_ctx = BuildSpawnContext {
@@ -305,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         max_leaked_mounts: cfg.max_leaked_mounts,
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
         cgroup_parent,
+        cancel_registry: cancel_registry.clone(),
     };
 
     // Process incoming scheduler messages + SIGTERM for graceful drain.
@@ -374,18 +383,26 @@ async fn main() -> anyhow::Result<()> {
                         spawn_build_task(assignment, permit, &build_ctx).await;
                     }
                     Some(scheduler_message::Msg::Cancel(cancel)) => {
-                        // TODO(phase3b): implement cancel. Write "1" to
-                        // the build's cgroup.kill (SIGKILLs the whole
-                        // tree), release the semaphore permit, send
-                        // CompletionReport{status: Cancelled}. Phase 3b's
-                        // K8s-aware retry needs this for pod preemption
-                        // handling (scheduler cancels builds on an
-                        // evicting node before the SIGTERM grace period
-                        // wastes 2h of terminationGracePeriodSeconds).
-                        tracing::warn!(
+                        info!(
                             drv_path = %cancel.drv_path,
                             reason = %cancel.reason,
-                            "received cancel signal (cancel not yet implemented)"
+                            "received cancel signal"
+                        );
+                        // Look up cgroup → write cgroup.kill → daemon
+                        // + builder + children SIGKILLed → run_daemon_
+                        // build sees stdout EOF → Err → execute_build
+                        // returns Err → spawn_build_task checks the
+                        // cancelled flag → reports Cancelled (not
+                        // InfrastructureFailure). The semaphore permit
+                        // drops when the spawned task exits (scopeguard).
+                        //
+                        // Fire-and-forget: scheduler doesn't wait for
+                        // confirmation. If the build already finished
+                        // (race), try_cancel_build returns false and
+                        // we log at debug.
+                        rio_worker::runtime::try_cancel_build(
+                            &cancel_registry,
+                            &cancel.drv_path,
                         );
                     }
                     Some(scheduler_message::Msg::Prefetch(prefetch)) => {

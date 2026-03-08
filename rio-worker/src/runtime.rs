@@ -5,10 +5,10 @@
 //! snapshots the FUSE cache bloom filter; `spawn_build_task` wraps
 //! `executor::execute_build` with ACK + CompletionReport + panic-catcher.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use tokio::sync::{RwLock, Semaphore, mpsc};
 use tonic::transport::Channel;
@@ -120,6 +120,80 @@ pub struct BuildSpawnContext {
     /// that fails, main.rs bails with `?` and we never get here. So
     /// this is always a valid, delegated cgroup2 path.
     pub cgroup_parent: PathBuf,
+    /// drv_path → (cgroup path, cancel flag). Populated by
+    /// execute_build after the BuildCgroup is created; removed by
+    /// the scopeguard at the end of spawn_build_task (same lifetime
+    /// as running_builds). The Cancel handler in main.rs looks up
+    /// by drv_path, writes the cgroup.kill pseudo-file, AND sets
+    /// the flag so spawn_build_task knows to report Cancelled (not
+    /// InfrastructureFailure) when execute_build returns Err.
+    ///
+    /// The AtomicBool is the handshake: cgroup.kill SIGKILLs the
+    /// daemon → run_daemon_build sees stdout EOF → returns Err →
+    /// execute_build returns Err → WITHOUT the flag, spawn_build_
+    /// task would report InfrastructureFailure. With it: Cancelled.
+    ///
+    /// std::sync::RwLock not tokio::sync::RwLock: writes are rare
+    /// (once per build start/end, once per cancel), reads are
+    /// cancel-only. std::sync is simpler and the critical sections
+    /// are short (HashMap insert/remove/get — no await inside).
+    pub cancel_registry: Arc<std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>>,
+}
+
+/// Attempt to cancel a build by drv_path. Looks up the cgroup
+/// in the registry, writes cgroup.kill, sets the cancel flag.
+///
+/// Returns `true` if the build was found and kill was attempted
+/// (kill may still fail if the cgroup was already removed — we
+/// log and consider it "cancelled anyway"). `false` if not found
+/// (build already finished, or never started).
+///
+/// Called from main.rs's `Msg::Cancel` handler. Fire-and-forget:
+/// the scheduler doesn't wait for confirmation (it's already
+/// transitioned the derivation to Cancelled on its side — this
+/// is just cleanup).
+pub fn try_cancel_build(
+    registry: &std::sync::RwLock<HashMap<String, (PathBuf, Arc<AtomicBool>)>>,
+    drv_path: &str,
+) -> bool {
+    // Read lock: we only need to look up. The cgroup.kill write
+    // doesn't mutate our data structure. The AtomicBool store
+    // doesn't need a write lock either.
+    let guard = registry.read().unwrap_or_else(|e| e.into_inner());
+    let Some((cgroup_path, cancelled)) = guard.get(drv_path) else {
+        // Not found: build finished between the scheduler sending
+        // CancelSignal and us receiving it, OR it never started
+        // (assignment dropped due to permit-acquire failure). Either
+        // way: nothing to cancel.
+        tracing::debug!(
+            drv_path,
+            "cancel: build not in registry (finished or never started)"
+        );
+        return false;
+    };
+
+    // Set flag BEFORE kill: if there's a race where execute_build
+    // is reading the flag right now, we want "cancelled=true" to
+    // be visible by the time it sees the Err from run_daemon_build.
+    // The kill → stdout EOF → Err path has some latency (kernel
+    // delivers SIGKILL, process dies, pipe closes, tokio wakes);
+    // setting the flag first gives us a wider window.
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
+
+    match crate::cgroup::kill_cgroup(cgroup_path) {
+        Ok(()) => {
+            tracing::info!(drv_path, cgroup = %cgroup_path.display(), "build cancelled via cgroup.kill");
+            true
+        }
+        Err(e) => {
+            // cgroup gone (race with Drop) or kernel too old for
+            // cgroup.kill. Log but still return true — the flag is
+            // set, so if the build IS still running it'll report
+            // Cancelled; if it finished, no harm.
+            tracing::warn!(drv_path, error = %e, "cgroup.kill failed (build may have finished)");
+            true
+        }
+    }
 }
 
 /// Handle a WorkAssignment: ACK the scheduler, spawn the build task, set up
@@ -151,12 +225,35 @@ pub async fn spawn_build_task(
     // Track as running (for heartbeat).
     ctx.running_builds.write().await.insert(drv_path.clone());
 
+    // Register in the cancel registry. We know the cgroup path
+    // deterministically: cgroup_parent/sanitize_build_id(drv_path).
+    // execute_build creates this AFTER spawning the daemon (needs
+    // PID); we register PREDICTIVELY here so a Cancel arriving
+    // early still finds the entry. If Cancel arrives BEFORE the
+    // cgroup exists, cgroup.kill → ENOENT → try_cancel_build logs
+    // warn, build proceeds (tiny race, scheduler's backstop timeout
+    // catches it).
+    //
+    // The cancelled flag: set by try_cancel_build BEFORE killing.
+    // Read below in the Err arm to distinguish "cancelled" (user
+    // intent, Cancelled status) from "executor failed" (infra issue,
+    // InfrastructureFailure status).
+    let build_id = executor::sanitize_build_id(&drv_path);
+    let cgroup_path = ctx.cgroup_parent.join(&build_id);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    ctx.cancel_registry
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(drv_path.clone(), (cgroup_path, cancelled.clone()));
+
     // Clone state needed by spawned tasks ('static lifetime).
     let mut build_store_client = ctx.store_client.clone();
     let build_tx = ctx.stream_tx.clone();
     let build_running = ctx.running_builds.clone();
     let build_leaked_mounts = ctx.leaked_mounts.clone();
     let build_drv_path = drv_path.clone();
+    let build_cancel_registry = ctx.cancel_registry.clone();
+    let build_cancelled = cancelled;
     let build_env = executor::ExecutorEnv {
         fuse_mount_point: ctx.fuse_mount_point.clone(),
         overlay_base_dir: ctx.overlay_base_dir.clone(),
@@ -175,10 +272,18 @@ pub async fn spawn_build_task(
     let handle = rio_common::task::spawn_monitored("build-executor", async move {
         let _permit = permit; // Hold permit until build completes
 
-        // Remove from running_builds on task exit (success, failure, or panic)
+        // Remove from running_builds + cancel_registry on task exit
+        // (success, failure, panic, or cancellation). Same lifetime
+        // for both — they track "this build is in-flight."
+        let cleanup_drv_path = build_drv_path.clone();
         let _running_guard = scopeguard::guard((), move |()| {
             let rb = build_running.clone();
-            let drv = build_drv_path;
+            let reg = build_cancel_registry.clone();
+            let drv = cleanup_drv_path;
+            // Cancel registry: synchronous (std::sync::RwLock), no
+            // await needed. Remove here directly; the running_builds
+            // remove still needs a spawned task (tokio RwLock).
+            reg.write().unwrap_or_else(|e| e.into_inner()).remove(&drv);
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     rb.write().await.remove(&drv);
@@ -207,16 +312,50 @@ pub async fn spawn_build_task(
                 peak_cpu_cores: exec_result.peak_cpu_cores,
             },
             Err(e) => {
-                tracing::error!(
-                    drv_path = %drv_path,
-                    error = %e,
-                    "build execution failed"
-                );
+                // Check the cancel flag BEFORE deciding the status.
+                // try_cancel_build sets this BEFORE writing cgroup.kill;
+                // the kill → SIGKILL → stdout-EOF → Err path has some
+                // latency, so by the time we're here the flag is set.
+                // Acquire pairs with try_cancel_build's Release — not
+                // strictly needed (no other state to synchronize) but
+                // cheap and documents the pairing.
+                let was_cancelled = build_cancelled.load(std::sync::atomic::Ordering::Acquire);
+                let (status, log_level) = if was_cancelled {
+                    // Expected outcome of CancelBuild / DrainWorker(force).
+                    // Not an error — info, not error. Scheduler's
+                    // completion handler treats Cancelled as a no-op
+                    // (already transitioned the derivation when it sent
+                    // the CancelSignal).
+                    (rio_proto::types::BuildResultStatus::Cancelled, false)
+                } else {
+                    // Genuine executor failure (overlay mount fail,
+                    // daemon spawn fail, etc). Error-log.
+                    (
+                        rio_proto::types::BuildResultStatus::InfrastructureFailure,
+                        true,
+                    )
+                };
+                if log_level {
+                    tracing::error!(
+                        drv_path = %drv_path,
+                        error = %e,
+                        "build execution failed"
+                    );
+                } else {
+                    tracing::info!(
+                        drv_path = %drv_path,
+                        "build cancelled (cgroup.kill)"
+                    );
+                }
                 CompletionReport {
                     drv_path,
                     result: Some(rio_proto::types::BuildResult {
-                        status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
-                        error_msg: e.to_string(),
+                        status: status.into(),
+                        error_msg: if was_cancelled {
+                            "cancelled by scheduler".into()
+                        } else {
+                            e.to_string()
+                        },
                         ..Default::default()
                     }),
                     assignment_token,
@@ -230,9 +369,14 @@ pub async fn spawn_build_task(
         };
 
         // Record outcome for SLI dashboards. Ok(exec) doesn't mean success —
-        // check the proto status. Err(ExecutorError) is always infra failure.
+        // check the proto status. Err(ExecutorError) is infra failure OR
+        // cancelled; the "cancelled" bucket is a distinct label so SLIs
+        // don't count user-initiated cancels as failures.
         let outcome = match &completion.result {
             Some(r) if r.status == rio_proto::types::BuildResultStatus::Built as i32 => "success",
+            Some(r) if r.status == rio_proto::types::BuildResultStatus::Cancelled as i32 => {
+                "cancelled"
+            }
             _ => "failure",
         };
         metrics::counter!("rio_worker_builds_total", "outcome" => outcome).increment(1);
@@ -379,6 +523,70 @@ pub fn handle_prefetch_hint(
 mod tests {
     use super::*;
     use crate::fuse;
+
+    // ---- try_cancel_build ----
+
+    /// Entry in registry + cgroup.kill file exists → kill written,
+    /// flag set, returns true.
+    #[test]
+    fn cancel_build_found_in_registry() {
+        // Use a tmpdir as a fake cgroup. cgroup.kill is a write-
+        // once pseudo-file in a real cgroup2fs; in tmpfs it's just
+        // a regular file that gets the "1" written. Good enough
+        // for testing the plumbing (real cgroup behavior is
+        // VM-tested in vm-phase3b).
+        let tmpdir = tempfile::tempdir().unwrap();
+        let cgroup_path = tmpdir.path().to_path_buf();
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let registry = std::sync::RwLock::new(HashMap::from([(
+            "/nix/store/test.drv".to_string(),
+            (cgroup_path.clone(), cancelled.clone()),
+        )]));
+
+        let found = try_cancel_build(&registry, "/nix/store/test.drv");
+        assert!(found, "entry in registry → true");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "flag set — spawn_build_task reads this to report Cancelled"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cgroup_path.join("cgroup.kill")).unwrap(),
+            "1",
+            "cgroup.kill written with '1' (kernel trigger in real cgroup2fs)"
+        );
+    }
+
+    /// Not in registry → returns false, nothing written.
+    #[test]
+    fn cancel_build_not_found() {
+        let registry = std::sync::RwLock::new(HashMap::new());
+        let found = try_cancel_build(&registry, "/nix/store/absent.drv");
+        assert!(
+            !found,
+            "not in registry → false (build finished or never started)"
+        );
+    }
+
+    /// Entry exists but cgroup path doesn't → still sets flag,
+    /// returns true. Kill-write fails (ENOENT), logged as warn.
+    /// This is the "Cancel arrived before cgroup created" race.
+    #[test]
+    fn cancel_build_cgroup_missing_still_sets_flag() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let registry = std::sync::RwLock::new(HashMap::from([(
+            "/nix/store/test.drv".to_string(),
+            (PathBuf::from("/nonexistent/cgroup/path"), cancelled.clone()),
+        )]));
+
+        let found = try_cancel_build(&registry, "/nix/store/test.drv");
+        assert!(found, "entry found → true even if kill fails");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::Acquire),
+            "flag set FIRST — if the build proceeds and later Errs, \
+             spawn_build_task still sees cancelled=true and reports correctly"
+        );
+    }
 
     #[tokio::test]
     async fn test_heartbeat_reports_running_builds() {

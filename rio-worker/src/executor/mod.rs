@@ -718,7 +718,21 @@ fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
 }
 
 /// Convert a derivation path to a safe build ID for directory names.
-fn sanitize_build_id(drv_path: &str) -> String {
+///
+/// Public so `spawn_build_task` can predict the cgroup path for the
+/// cancel registry (cgroup_parent/sanitize_build_id(drv_path)) without
+/// execute_build having to report it back. The cgroup is created
+/// DURING execute_build (after daemon spawn, needs PID), so spawn_
+/// build_task registers the path PREDICTIVELY before spawning and
+/// removes it after. If a cancel arrives before the cgroup exists,
+/// cgroup.kill returns ENOENT — try_cancel_build logs and moves on
+/// (the build will fail anyway since the daemon dies when the cgroup
+/// IS created with a stale kill file — no, cgroup.kill isn't a
+/// persistent file, it's a write-once trigger. ENOENT just means no
+/// kill happened, the build proceeds. Harmless race — a cancel
+/// arriving THAT early is extremely rare and the scheduler will
+/// re-send on the next dispatch cycle if the build keeps running).
+pub fn sanitize_build_id(drv_path: &str) -> String {
     // /nix/store/abc...-foo.drv -> abc...-foo.drv
     drv_path
         .rsplit('/')

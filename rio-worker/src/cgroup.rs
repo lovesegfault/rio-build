@@ -165,6 +165,46 @@ impl BuildCgroup {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// SIGKILL every process in this cgroup tree (including
+    /// descendants in sub-cgroups). The kernel's `cgroup.kill`
+    /// pseudo-file: write "1" → kernel sends SIGKILL to every PID
+    /// in `cgroup.procs` recursively.
+    ///
+    /// This is the Cancel mechanism. The daemon + builder + every
+    /// child dies immediately (SIGKILL can't be caught). nix-daemon
+    /// has no chance to do its normal cleanup (which is FINE — we're
+    /// abandoning this build entirely, the overlayfs Drop handles
+    /// mount cleanup, and a crashed daemon's sandbox doesn't need
+    /// orderly teardown).
+    ///
+    /// After this, `run_daemon_build` sees stdout EOF → returns
+    /// Err(DaemonDied or similar). The executor's error path sends
+    /// CompletionReport; the caller (spawn_build_task) checks the
+    /// cancel flag to decide between InfrastructureFailure and
+    /// Cancelled status.
+    ///
+    /// `io::Result`: can fail if the cgroup was already removed
+    /// (race with Drop) or the kernel is too old for cgroup.kill
+    /// (Linux 5.14+). The caller logs and the build lingers —
+    /// worst case is the 2h daemon_timeout still applies.
+    pub fn kill(&self) -> io::Result<()> {
+        fs::write(self.path.join("cgroup.kill"), "1")
+    }
+}
+
+/// Cancel a build by cgroup path (lookup via the cancel registry).
+///
+/// Static free function instead of a `BuildCgroup` method because the
+/// cancel registry stores PathBufs (not BuildCgroup — those are owned
+/// by the executor and dropped at the end of execute_build; the cancel
+/// handler runs in the main event loop concurrently).
+///
+/// Same semantics as [`BuildCgroup::kill`]: SIGKILLs the whole tree.
+/// `io::Result` — cgroup may have been removed (build finished between
+/// the registry lookup and this call). Caller logs and continues.
+pub fn kill_cgroup(path: &Path) -> io::Result<()> {
+    fs::write(path.join("cgroup.kill"), "1")
 }
 
 impl Drop for BuildCgroup {

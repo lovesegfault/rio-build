@@ -37,7 +37,9 @@ pub mod upload;
 
 // Re-exports for main.rs — keeps `use rio_worker::{...}` imports stable
 // after the lib.rs → runtime.rs extraction.
-pub use runtime::{BloomHandle, BuildSpawnContext, build_heartbeat_request, spawn_build_task};
+pub use runtime::{
+    BloomHandle, BuildSpawnContext, build_heartbeat_request, spawn_build_task, try_cancel_build,
+};
 
 /// Register `# HELP` descriptions for all worker metrics.
 ///
