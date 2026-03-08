@@ -27,6 +27,13 @@ pub enum DerivationStatus {
     /// never complete in the current build. Terminal (like Poisoned).
     /// Maps to Nix BuildStatus::DependencyFailed=10.
     DependencyFailed,
+    /// Explicitly cancelled via CancelBuild (all interested builds cancelled)
+    /// or DrainWorker(force). Terminal but distinct from Poisoned: no
+    /// implication of build defect, just scheduler/operator decision.
+    /// No TTL reset — a cancelled build stays cancelled; retry means
+    /// re-submitting. Worker's cgroup.kill SIGKILLs the daemon tree,
+    /// cleanup is immediate (no 2h terminationGracePeriodSeconds wait).
+    Cancelled,
 }
 
 impl DerivationStatus {
@@ -34,7 +41,7 @@ impl DerivationStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Poisoned | Self::DependencyFailed
+            Self::Completed | Self::Poisoned | Self::DependencyFailed | Self::Cancelled
         )
     }
 
@@ -50,7 +57,7 @@ impl DerivationStatus {
         if self == to {
             match self {
                 Self::Completed | Self::Poisoned => return Ok(()),
-                Self::DependencyFailed => return Ok(()),
+                Self::DependencyFailed | Self::Cancelled => return Ok(()),
                 _ => {
                     return Err(TransitionError::Invalid {
                         from: self,
@@ -85,6 +92,15 @@ impl DerivationStatus {
             (Self::Running, Self::Failed) => true,          // retriable failure
             (Self::Running, Self::Poisoned) => true,        // failed on 3+ workers
             (Self::Failed, Self::Ready) => true,            // retry scheduled
+            // Cancel: from any in-flight state. CancelBuild sends
+            // CancelSignal to workers running sole-interest derivations;
+            // DrainWorker(force) cancels all a worker's in-flight.
+            // Both require the derivation to be Assigned or Running —
+            // if it's still Queued/Ready (not dispatched yet), just
+            // remove build interest instead (handle_cancel_build's
+            // existing orphan-removal path).
+            (Self::Assigned, Self::Cancelled) => true, // cancel before worker ACK
+            (Self::Running, Self::Cancelled) => true,  // cancel mid-build
             _ => false,
         };
 
@@ -111,6 +127,7 @@ impl DerivationStatus {
             Self::Failed => "failed",
             Self::Poisoned => "poisoned",
             Self::DependencyFailed => "dependency_failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -134,6 +151,7 @@ impl std::str::FromStr for DerivationStatus {
             "failed" => Ok(Self::Failed),
             "poisoned" => Ok(Self::Poisoned),
             "dependency_failed" => Ok(Self::DependencyFailed),
+            "cancelled" => Ok(Self::Cancelled),
             other => Err(TransitionError::UnknownStatus(other.to_string())),
         }
     }
@@ -376,6 +394,11 @@ mod tests {
             (Queued, DependencyFailed),  // dep poisoned cascade
             (Ready, DependencyFailed),   // dep poisoned cascade
             (Created, DependencyFailed), // dep poisoned before queue
+            // Cancel: only from in-flight states. Queued/Ready
+            // derivations are handled by orphan-removal instead
+            // (handle_cancel_build's existing path).
+            (Assigned, Cancelled), // CancelSignal before worker ACK
+            (Running, Cancelled),  // CancelSignal mid-build (cgroup.kill)
         ];
 
         for (from, to) in valid_transitions {
@@ -400,6 +423,24 @@ mod tests {
                 .validate_transition(DependencyFailed)
                 .is_ok()
         );
+        // cancelled -> cancelled is no-op (duplicate CancelSignal or
+        // late completion report after cgroup.kill)
+        assert!(Cancelled.validate_transition(Cancelled).is_ok());
+    }
+
+    #[test]
+    fn test_cancelled_is_terminal_no_resurrect() {
+        use DerivationStatus::*;
+        // Cancelled is terminal: no TTL reset like Poisoned. A
+        // cancelled build stays cancelled; retry = re-submit.
+        assert!(Cancelled.is_terminal());
+        assert!(Cancelled.validate_transition(Created).is_err());
+        assert!(Cancelled.validate_transition(Ready).is_err());
+        // Cancel from NON-in-flight states: invalid. Queued/Ready
+        // orphans are just removed from ready_queue, not transitioned.
+        assert!(Queued.validate_transition(Cancelled).is_err());
+        assert!(Ready.validate_transition(Cancelled).is_err());
+        assert!(Created.validate_transition(Cancelled).is_err());
     }
 
     #[test]

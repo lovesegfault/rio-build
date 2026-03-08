@@ -98,6 +98,19 @@ impl DagActor {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, worker_id)
                     .await;
             }
+            rio_proto::types::BuildResultStatus::Cancelled => {
+                // Worker reports Cancelled after cgroup.kill. The
+                // scheduler already transitioned the DerivationState
+                // when it SENT the CancelSignal (see handle_cancel_
+                // build / handle_drain_worker), so this report is
+                // expected but needs no further action on the
+                // derivation itself. Just the worker-capacity cleanup
+                // below. Log at debug: every CancelBuild generates
+                // one of these per running drv, and it's the happy
+                // path for cancel.
+                debug!(drv_hash = %drv_hash, worker_id = %worker_id,
+                       "cancelled completion report (expected after CancelSignal)");
+            }
             rio_proto::types::BuildResultStatus::Unspecified => {
                 warn!(
                     drv_hash = %drv_hash,

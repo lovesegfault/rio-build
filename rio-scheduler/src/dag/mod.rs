@@ -548,7 +548,13 @@ impl DerivationDag {
                 DerivationStatus::Running | DerivationStatus::Assigned => summary.running += 1,
                 DerivationStatus::Failed
                 | DerivationStatus::Poisoned
-                | DerivationStatus::DependencyFailed => summary.failed += 1,
+                | DerivationStatus::DependencyFailed
+                // Cancelled counts as failed from the build-summary
+                // perspective: the build didn't produce its output.
+                // Distinct terminal reason but same "not done" bucket
+                // for the total/completed/failed accounting the gateway
+                // shows.
+                | DerivationStatus::Cancelled => summary.failed += 1,
                 DerivationStatus::Ready | DerivationStatus::Queued | DerivationStatus::Created => {
                     summary.queued += 1;
                 }

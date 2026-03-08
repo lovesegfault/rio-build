@@ -266,6 +266,7 @@ enum BuildResultStatus {
   BUILD_RESULT_STATUS_LOG_LIMIT_EXCEEDED = 8;
   BUILD_RESULT_STATUS_OUTPUT_REJECTED = 9;
   BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Worker infra issue (not build)
+  BUILD_RESULT_STATUS_CANCELLED = 11;        // Explicit cancel (CancelBuild RPC or DrainWorker force)
 }
 
 // Work assignment from scheduler to worker.
