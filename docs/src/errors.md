@@ -24,7 +24,7 @@ The worker maps `rio_nix::BuildStatus` (the real Nix wire enum) to the proto `Bu
 |------------|------------------------|-------|
 | `PermanentFailure` (3) | PermanentFailure | Explicit mapping |
 | `TransientFailure` (6) | TransientFailure | Explicit mapping |
-| `MiscFailure` (9) | PermanentFailure | Fallthrough. TODO(phase3b): consider mapping to TransientFailure if field experience shows these are often retryable. |
+| `MiscFailure` (9) | PermanentFailure | Fallthrough for uncategorized failures. Kept as permanent: field experience (Phase 3a VM tests) shows these are usually deterministic (malformed .drv, missing env var) rather than transient. |
 | `TimedOut` (8) | PermanentFailure | Fallthrough. No distinct proto variant. |
 | `LogLimitExceeded` (11) | PermanentFailure | Fallthrough. Retry would repeat. |
 | `NotDeterministic` (12) | PermanentFailure | Fallthrough. Detected by Nix's `--check`. |
@@ -56,9 +56,9 @@ The scheduler's `RetryPolicy` struct (see `rio-scheduler/src/state/worker.rs`):
 
 Only `TransientFailure` and `InfrastructureFailure` errors trigger retries. `PermanentFailure` and `DependencyFailed` are terminal.
 
-> **Phase 3b deferral:** The backoff duration is computed and logged but **not yet applied** --- the derivation is re-queued immediately after a transient failure. A delayed re-queue using `tokio::time::sleep` on the computed duration is planned for Phase 3b (see `TODO(phase3b)` at `rio-scheduler/src/actor/completion.rs`).
+**Delayed re-queue (Phase 3b):** The computed backoff is stored in `DerivationState.backoff_until`. `dispatch_ready` defers the derivation until `Instant::now() >= backoff_until` using the same defer-and-requeue pattern as size-class mismatch. Cleared on successful dispatch. Stateless — no timer tasks to clean up on cancel.
 
-**Worker avoidance on retry:** There is no explicit config flag for "retry on a different worker." Instead, the scheduler maintains a `failed_workers: HashSet<WorkerId>` on each derivation (see `DerivationState`). This set is currently used only for poison-threshold detection (the derivation is poisoned once `failed_workers.len() >= POISON_THRESHOLD`). Dispatch does not yet exclude workers in `failed_workers` from re-assignment --- a retry may land on the same worker.
+**Worker avoidance (Phase 3b):** Dispatch's `best_worker()` filter excludes workers in `DerivationState.failed_workers`. Combined with the backoff above: a transient fail → Ready + backoff_until set + failed_workers.insert(worker) → next dispatch goes to a DIFFERENT worker after the backoff. `reassign_derivations` (worker disconnect) also feeds failed_workers, so a worker crashing mid-build counts as a distinct-worker failure for poison detection.
 
 > **Interaction with poison tracking:** The poison threshold (`POISON_THRESHOLD = 3` distinct workers) spans across all builds, not just one build's retry budget. A derivation that fails with `max_retries=2` in Build A (3 total attempts) may be attempted again in Build B. After failing on 3 distinct workers across any number of builds, it is marked poisoned. Within a single build, `max_retries` bounds the retry count.
 

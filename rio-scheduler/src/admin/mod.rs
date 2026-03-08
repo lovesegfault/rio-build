@@ -342,7 +342,7 @@ impl AdminService for AdminServiceImpl {
     /// size; that would be a store-service RPC and this endpoint is
     /// on the autoscaler's hot path (30s poll). If the dashboard
     /// wants store size, it can query the store's /metrics directly.
-    /// `TODO(phase3b)`: add a best-effort store-size field populated
+    /// `TODO(phase4)`: add a best-effort store-size field populated
     /// via a separate slow-refresh background task, NOT inline here.
     #[instrument(skip(self, _request), fields(rpc = "ClusterStatus"))]
     async fn cluster_status(

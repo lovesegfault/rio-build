@@ -48,7 +48,7 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 - **Threat**: Malicious derivation escaping sandbox and accessing worker resources
 - **Mitigations**: `CAP_SYS_ADMIN` + custom seccomp profile (NOT `privileged: true`), dedicated node pool, NetworkPolicy, `automountServiceAccountToken: false`, IMDSv2 hop limit=1
 
-> **Phase deferral (seccomp):** The custom seccomp profile is not yet shipped. Worker pods currently run with the runtime-default seccomp profile only. A rio-specific profile blocking `ptrace`, `bpf`, `kexec_load`, and other unnecessary syscalls under `CAP_SYS_ADMIN` is tracked as TODO(phase3b). See [Known Limitations](#known-limitations) item 2.
+> **seccomp (Phase 3b):** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A CUSTOM profile (blocking `ptrace`, `bpf` etc under `CAP_SYS_ADMIN`) is tracked for Phase 4 — RuntimeDefault is sufficient for Phase 3b's threat model (it's what production containers use by default; we just make it explicit). See [Known Limitations](#known-limitations) item 2.
 
 ### Boundary 4: Binary Cache HTTP → External Clients
 
@@ -88,10 +88,10 @@ Additional validation checks (below) are enforced at other points in the pipelin
 | NAR SHA-256 verification | Store | `r[sec.drv.validate]` | On `PutPath`, the store recomputes SHA-256 over the NAR bytes and rejects on mismatch. |
 | `restrict-eval` | Worker | Implemented | The worker's `nix.conf` sets `restrict-eval = true`, preventing derivations from accessing paths outside the Nix store during evaluation. |
 | Sandbox enforcement | Worker | Implemented | `sandbox = true` in `nix.conf` ensures all builds run inside the Nix sandbox (user/mount/PID/network namespaces). |
-| DAG size limit | Scheduler | Partial | The scheduler enforces `max_dag_size` on `SubmitBuild`. **Not yet enforced at the gateway** as an early rejection. |
-| `__noChroot` rejection | Gateway | **Not implemented** | Derivations with `__noChroot = true` must be rejected before dispatch. TODO(phase3b). |
+| DAG size limit | Gateway + Scheduler | Implemented | Gateway's `translate::validate_dag` checks `nodes.len() > MAX_DAG_NODES` before SubmitBuild (early reject); scheduler also enforces. |
+| `__noChroot` rejection | Gateway | Implemented | `translate::validate_dag` checks derivation env for `__noChroot=1` via drv_cache lookup. Rejected with "sandbox escape" error. |
 | Per-tenant NAR size limit | Gateway | **Not implemented** | Only the global `MAX_NAR_SIZE` limit exists. Per-tenant `max_nar_upload_size` is Phase 5. |
-| Output path match | Store | **Not implemented** | Blocked on HMAC assignment tokens (Phase 3b). Until then, any worker can `PutPath` any output. |
+| Output path match | Store | Implemented | HMAC assignment tokens: store verifies `x-rio-assignment-token` metadata on PutPath, checks `store_path ∈ claims.expected_outputs`. mTLS bypass for gateway. |
 
 ## Secrets Management
 
@@ -138,7 +138,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 
 - **Threat**: A malicious or buggy client submits a derivation DAG with millions of nodes, exhausting scheduler memory and CPU.
 - **Mitigation**: Per-tenant limits on maximum DAG size (`max_dag_size`) and maximum concurrent builds (`max_concurrent_builds`). See [Multi-Tenancy](multi-tenancy.md) for quota configuration.
-- **Implementation note**: `max_dag_size` is currently enforced **only at the scheduler** on `SubmitBuild`. Gateway-side early rejection (before gRPC transmission) is planned but not yet implemented — TODO(phase3b): add a simple node-count check in `rio-gateway/src/handler/build.rs` before calling `SubmitBuild`.
+- **Implementation (Phase 3b):** `max_dag_size` is enforced at BOTH gateway (`translate::validate_dag`) and scheduler. Gateway-side check is early rejection — saves the gRPC round-trip for obvious over-size submissions.
 
 ### Build-Time Secrets
 

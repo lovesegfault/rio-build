@@ -405,6 +405,25 @@
                   }
                 )
               );
+              # vm-phase3b: production hardening (mTLS, HMAC, cancel,
+              # recovery, GC, gateway validation). 4 VMs: pki (cert
+              # gen), control (with TLS+HMAC), k8s (worker with TLS),
+              # client. Same extended args as 3a (dockerImages + crds).
+              #
+              # Iteration 1: control-plane sections (T/G) only — k8s
+              # node is stubbed pending iteration 2 (TLS-mounted
+              # worker pod). The test script `pass`es through
+              # TODO(vm-phase3b-iteration) sections; those paths
+              # ARE covered by unit tests.
+              vm-phase3b = withMinCpu 4 (
+                import ./nix/tests/phase3b.nix (
+                  vmTestArgs
+                  // {
+                    inherit dockerImages;
+                    inherit (inputs.self.packages.${system}) crds;
+                  }
+                )
+              );
             }
           );
 

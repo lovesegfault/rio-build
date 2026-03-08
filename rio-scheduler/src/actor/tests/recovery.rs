@@ -1,5 +1,10 @@
 //! State recovery: LeaderAcquired → recover_from_pg → DAG rebuilt.
-// r[verify sched.lease.recovery]
+//
+// Recovery isn't a standalone spec rule — it's behavior under
+// sched.lease.k8s-lease (what happens on acquire). The test here
+// verifies the LeaderAcquired → recover_from_pg → recovery_complete
+// pipeline; the lease loop's acquire behavior is covered in
+// lease.rs tests (sched.lease.generation-fence verify).
 
 use super::*;
 
