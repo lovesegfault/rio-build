@@ -273,11 +273,12 @@ r[sched.build.keep-going]
 
 The scheduler uses a leader-elected model for the in-memory global DAG. On leadership transitions:
 
-1. **Assignment generation counter**: Incremented on each leader election. Each `WorkAssignment` carries this generation number.
+> **Phase 3b deferral:** Only step 1 is implemented. Steps 2-4 depend on State Recovery (see below), which is not yet implemented. Currently, a new leader starts with an empty in-memory DAG and workers reconnect organically via the standard registration protocol; in-flight builds from the previous leader are lost.
+
+1. **Assignment generation counter**: Incremented on each leader election (by the lease loop's acquire transition). Each `WorkAssignment` carries this generation number. Workers compare it against the generation seen in `HeartbeatResponse` and reject stale-generation assignments.
 2. **State reconstruction**: New leader reconstructs state from PostgreSQL (see State Recovery below), then increments the generation counter.
 3. **Worker reconnection**: Workers reconnect their `BuildExecution` streams to the new leader. Stale completion reports (carrying an old generation number) are verified against rio-store for output existence before acceptance.
 4. **In-flight assignments**: Assignments from the old leader are verified via heartbeat. If a worker reports it is still running the assigned derivation, the new leader reuses the assignment with the new generation number.
-5. **PostgreSQL write fencing**: On election, the new leader acquires a PostgreSQL advisory lock (`pg_advisory_lock(scheduler_lock_id)`) and increments `leader_generation` in the `scheduler_meta` row. All synchronous writes include `AND leader_generation = $current_gen` in the `WHERE` clause. If a stale leader's write affects zero rows, it detects it has been fenced and must stop processing. This guarantees at-most-one-writer semantics without relying solely on the distributed lock's availability.
 
 ## Synchronous vs. Async Writes
 
@@ -291,6 +292,8 @@ Not all state changes require synchronous PostgreSQL writes:
 On crash, async writes may be lost but are non-critical: EMA re-converges after a few builds, and status is rebuilt from ground truth (derivation/assignment tables) during state recovery.
 
 ## State Recovery
+
+> **Phase 3b deferral:** State recovery is not yet implemented. After scheduler restart, in-flight builds are lost (clients hang waiting on `SubmitBuild` streams that the new scheduler knows nothing about). The protocol below is the target design.
 
 On startup, the scheduler reconstructs its in-memory state:
 
@@ -430,20 +433,17 @@ CREATE TABLE build_history (
 
 ## Leader Election
 
-r[sched.lease.pg-advisory]
-The scheduler uses **PostgreSQL advisory locks** for leader election, while the controller uses Kubernetes Lease. This asymmetry is intentional:
+r[sched.lease.k8s-lease]
+The scheduler uses a **Kubernetes Lease** (`coordination.k8s.io/v1`) for leader election, via the `kube-leader-election` crate. A background task polls `try_acquire_or_renew` every 5 seconds against a 15-second lease TTL (3:1 renew ratio, per Kubernetes convention). On the acquire transition (standby → leader), the task increments the in-memory generation counter and sets `is_leader=true`; on the lose transition, it clears `is_leader`. The dispatch loop checks `is_leader` and no-ops while standby (DAGs are still merged so state is warm for takeover).
 
-- **Why PG advisory locks for the scheduler:** The scheduler's state recovery depends on PostgreSQL --- on startup, the new leader reconstructs in-memory DAGs from the `builds`, `derivations`, `derivation_edges`, and `assignments` tables. Coupling leader election to PG availability ensures the leader always has access to its state backend. If PG is down, the scheduler cannot function regardless of who holds the leader lock.
-- **Why K8s Lease for the controller:** The controller only interacts with the Kubernetes API (CRDs, StatefulSets, Services). It has no PostgreSQL dependency, so a K8s-native leader election mechanism is simpler and more appropriate.
+- **Configuration:** Enabled by setting `RIO_LEASE_NAME`. When unset (VM tests, single-scheduler deployments), the scheduler runs in non-K8s mode: `is_leader` defaults to `true` immediately and generation stays at 1. Namespace is read from `RIO_LEASE_NAMESPACE` or the in-cluster service-account mount; holder identity defaults to the pod's `HOSTNAME`.
+- **Transient API errors:** On apiserver errors, the loop logs a warning and retries on the next tick without flipping `is_leader`. If errors persist past the lease TTL, the lease expires naturally and another replica acquires --- correct behavior for a replica with broken K8s connectivity.
+- **Split-brain window:** `kube-leader-election` is a polling loop, not a watch-based fence. During a network partition, both replicas may believe they are leader for up to `lease_ttl` (15s). This is **acceptable** because dispatch is idempotent: DAG merge dedups by `drv_hash`, and workers reject stale-generation assignments after seeing the new generation in `HeartbeatResponse`. Worst case: a derivation is dispatched twice, builds twice, produces the same deterministic output. Wasteful but correct.
 
 r[sched.lease.generation-fence]
-- **Generation counter for write fencing:** Each leader election increments a generation counter stored in a PG row. All state-modifying SQL statements include `WHERE leader_generation = $current_generation`. A stale leader (whose PG connection was silently dropped) will have its writes rejected by the generation check, preventing split-brain corruption.
+**Generation-based staleness detection is worker-side only.** On each lease acquisition, the new leader increments an in-memory `Arc<AtomicU64>` generation counter. Workers see the new generation in `HeartbeatResponse` and reject any `WorkAssignment` carrying an older generation. **No PostgreSQL-level write fencing exists.** A deposed leader's in-flight PG writes will succeed; the split-brain window is bounded by the Lease renew deadline (default 15s). Because the writes in question are idempotent upserts keyed by `drv_hash` and status transitions are monotone, brief dual-writer windows do not corrupt state.
 
-**Operational caveats:**
-
-- **PgBouncer compatibility:** Transaction-mode connection pooling is **incompatible** with PG advisory locks (which are session-scoped). The leader election connection must use session-mode pooling or a direct connection to PostgreSQL. Other scheduler connections can use transaction-mode PgBouncer.
-- **TCP keepalive tuning:** The PG connection used for the advisory lock should have aggressive TCP keepalive settings (e.g., `keepalives_idle=30, keepalives_interval=10, keepalives_count=3`) to detect connection loss within ~60 seconds.
-- **Lock release on connection drop:** When the leader's PG connection drops (pod crash, network partition), the advisory lock is released automatically by PostgreSQL, allowing a standby to acquire it.
+> **Phase 3b deferral (optional hardening):** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
 
 ## Incremental Critical-Path Maintenance
 
