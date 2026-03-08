@@ -28,7 +28,7 @@ service StoreService {
   // ValidPaths table by prefix. We need the same: WHERE store_path LIKE
   // '/nix/store/' || hash_part || '-%'. Without this RPC, the gateway was
   // calling QueryPathInfo with a constructed path that has no name — always
-  // a miss (see the TODO this resolves at opcodes_read.rs:292).
+  // a miss.
   //
   // Also reused by cache_server.rs for /{hash}.narinfo HTTP requests.
   rpc QueryPathFromHashPart(rio.types.QueryPathFromHashPartRequest) returns (rio.types.PathInfo);
@@ -36,9 +36,8 @@ service StoreService {
   // Append signatures to an existing store path's narinfo.
   //
   // wopAddSignatures (37): Nix clients send this after `nix store sign`.
-  // Previously stubbed (read wire data, discard — see TODO at
-  // opcodes_read.rs:337). Now we actually persist: UPDATE narinfo
-  // SET signatures = signatures || $2.
+  // Previously stubbed (read wire data, discard). Now we actually persist:
+  // UPDATE narinfo SET signatures = signatures || $2.
   rpc AddSignatures(rio.types.AddSignaturesRequest) returns (rio.types.AddSignaturesResponse);
 
   // Register a CA derivation realisation (wopRegisterDrvOutput, 42).
