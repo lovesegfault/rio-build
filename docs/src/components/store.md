@@ -9,14 +9,14 @@ r[store.cas.fastcdc]
 - Each chunk is stored by its BLAKE3 hash
 - Identical chunks across different store paths are stored once (deduplication)
 - Chunks stored in S3-compatible backend (production) or filesystem (dev/test)
-- Chunk size target: 64KB (configurable), with min 16KB and max 256KB
+- Chunk size target: 64KB average, with min 16KB and max 256KB (compile-time constants in `chunker.rs`)
 
 ## Inline Storage Fast-Path
 
 r[store.inline.threshold]
-NARs below 256KB (configurable, `inline_threshold`) are stored as a single blob bypassing FastCDC chunking and manifest indirection entirely. This eliminates per-item overhead for the thousands of tiny `.drv` files found in nixpkgs closures.
+NARs below 256KB (`INLINE_THRESHOLD`, a compile-time constant) are stored directly in the `manifests.inline_blob` PostgreSQL `BYTEA` column, bypassing FastCDC chunking, S3, and manifest indirection entirely. This eliminates per-item overhead for the thousands of tiny `.drv` files found in nixpkgs closures.
 
-**S3 key schema for inline blobs:** `inline/{sha256-hex}` --- distinct from `chunks/{blake3-hex}` to prevent hash domain confusion.
+Inline blobs never touch S3 — they live entirely in PostgreSQL. The inline/chunked decision is made at `PutPath` time based on NAR size; see the "Inline vs. chunked invariant" in the schema section below.
 
 ## Layer 2: Nix Metadata Store
 
@@ -38,9 +38,8 @@ Two hash algorithms are used, in strictly separated domains:
 | narinfo signature | SHA-256 | signed over fingerprint |
 | CA output hash | SHA-256 | `ContentLookup` key |
 | Chunk storage key | BLAKE3 | `chunks/a3/a3f7...` |
-| Inline blob key | SHA-256 | `inline/7b2e...` |
 
-`ContentLookupRequest` takes a SHA-256 NAR hash, never BLAKE3. These domains must never be confused.
+`ContentLookupRequest` takes a SHA-256 NAR hash, never BLAKE3. These domains must never be confused. Inline blobs are not separately keyed — they are stored by `store_path_hash` in the `manifests` table alongside their narinfo.
 
 ## Content Integrity Verification
 
@@ -49,7 +48,7 @@ r[store.integrity.verify-on-put]
 
 r[store.integrity.verify-on-get]
 - **On chunk read (S3 or cache):** Every chunk fetched from S3 or the in-process LRU cache is BLAKE3-verified against its manifest-declared digest. Corrupt chunks are re-fetched (from S3 on cache corruption) or flagged as an error.
-- **On inline blob read:** SHA-256-verified against the blob key on read.
+- **On inline blob read:** The inline NAR is served directly from PostgreSQL. On `GetPath`, the client can verify the SHA-256 against `narinfo.nar_hash` (the store does not re-hash on every read; integrity is guaranteed by verify-on-put and PostgreSQL's own storage guarantees).
 
 ## Chunk Manifest Format
 
@@ -77,9 +76,9 @@ Chunk refcounts track how many manifests reference each chunk. The `chunks` tabl
 | `deleted` | `BOOLEAN NOT NULL DEFAULT FALSE` | Soft-delete flag (set by GC sweep) |
 
 r[store.chunk.refcount-txn]
-**Refcount increment:** In the same PostgreSQL transaction that creates the manifest with `status='uploading'` (step 1 of PutPath) or commits it to `'complete'` (step 5). Use `SELECT ... FOR UPDATE` on chunk rows to prevent concurrent modification.
+**Refcount increment:** In the same PostgreSQL transaction that writes `manifest_data` (step 2 of PutPath). Uses `INSERT ... ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1` — a single UPSERT over the full chunk list via `UNNEST`. PostgreSQL's conflict resolution serializes INSERT vs UPDATE per-row, so concurrent `PutPath` calls with overlapping chunk lists both increment correctly without explicit locking.
 
-**Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Use `SELECT ... FOR UPDATE` on affected chunk rows.
+**Refcount decrement:** In the same PostgreSQL transaction that deletes a manifest (orphan cleanup of stale `'uploading'` manifests, or GC sweep of unreachable `'complete'` manifests). Uses `UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)` — atomic batch decrement.
 
 Chunks with `refcount = 0` are not immediately deleted from S3; they become eligible for GC sweep, which soft-deletes them and enqueues S3 key deletion via the `pending_s3_deletes` table.
 
@@ -115,7 +114,7 @@ r[store.put.idempotent]
 
 r[store.nar.reassembly]
 - Load the full manifest into memory (list of chunk digests --- even a 10GB NAR is only ~5MB of manifest)
-- Parallel chunk prefetch with a sliding window (K=8--16 concurrent S3 GETs, adaptive based on consumer throughput)
+- Parallel chunk prefetch with a sliding window (K=8 concurrent fetches via `futures::stream::buffered()`, which preserves chunk ordering)
 - In-process LRU chunk cache (configurable, default 2GB) to avoid repeated S3 round-trips for hot chunks
 - BLAKE3-verify every chunk on read (see Content Integrity Verification above)
 - Stream the reassembled NAR to the client without materializing the full NAR in memory
@@ -125,11 +124,11 @@ r[store.nar.reassembly]
 r[store.singleflight]
 When multiple concurrent requests need the same chunk from S3 (common during cold starts or thundering herd scenarios), rio-store coalesces them into a single in-flight fetch using a singleflight pattern:
 
-- A `DashMap<ChunkHash, Shared<JoinHandle<Bytes>>>` tracks in-flight S3 GETs
-- First request for chunk X spawns a tokio task and inserts the shared handle
-- Subsequent requests for chunk X `.await` the existing handle instead of issuing duplicate S3 GETs
+- A `DashMap<[u8; 32], Shared<BoxFuture<'static, Option<Bytes>>>>` tracks in-flight S3 GETs (the fetch is spawned as a tokio task and its `JoinHandle` is mapped to `Option<Bytes>` before `.shared()`, since `JoinError` is not `Clone`)
+- First request for chunk X spawns the fetch task and inserts the shared future
+- Subsequent requests for chunk X `.await` the existing shared future instead of issuing duplicate S3 GETs
 - On completion (success or failure), the entry is removed from the map
-- Failed fetches remove the entry so the next request retries cleanly
+- Failed fetches (including task panics) resolve to `None`, and removal from the map means the next request retries cleanly
 
 This is critical for cold start thundering herd: when many builds start simultaneously and request overlapping closures, without coalescing S3 would see O(N*M) GET requests instead of O(M) where N is concurrent builds and M is unique chunks.
 
