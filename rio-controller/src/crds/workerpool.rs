@@ -235,9 +235,11 @@ pub struct WorkerPoolStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub last_scale_time: Option<Time>,
-    /// Standard K8s Conditions. ScalingActive / AtMinCapacity /
-    /// AtMaxCapacity. Helps operators see WHY replicas is what
-    /// it is ("at max, queue still deep" → raise spec.replicas.max).
+    /// Standard K8s Conditions. Single `Scaling` type with reason
+    /// ScaledUp / ScaledDown / UnknownMetric (status=False for
+    /// errors). Helps operators see WHY replicas is what it is
+    /// ("ScaledUp" with a message showing from/to; "UnknownMetric"
+    /// when spec.autoscaling.metric is unsupported).
     #[serde(default)]
     #[schemars(schema_with = "crate::crds::any_object_array")]
     pub conditions: Vec<Condition>,

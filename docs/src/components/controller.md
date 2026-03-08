@@ -15,7 +15,7 @@ metadata:
 spec:
   derivation: /nix/store/abc...-hello.drv   # must be a store path (evaluation is external)
   priority: 100                               # inter-build priority
-  timeout: 3600s
+  timeoutSeconds: 3600                        # 0 = no timeout
   tenant: team-infra
 status:
   phase: Building                             # Pending/Building/Succeeded/Failed
@@ -37,6 +37,8 @@ status:
 ```
 
 Condition types: `Scheduled`, `InputsResolved`, `Building`, `Succeeded`, `Failed`. Each carries `lastTransitionTime`, `reason`, and `message`. `Succeeded` and `Failed` are terminal and mutually exclusive.
+
+> **Phase 3b deferral:** Currently only `Failed` and `Cancelled` conditions are set by the Build reconciler; `phase` is the coarse signal for progress (`Pending` → `Building` → `Succeeded`/`Failed`/`Cancelled`). The finer-grained `Scheduled`/`InputsResolved`/`Building` conditions require per-event condition updates from the watch task.
 
 ### WorkerPool
 
@@ -60,12 +62,13 @@ spec:
   fuseCacheSize: 100Gi                         # local SSD cache for rio-fuse
   features: [big-parallel, kvm]               # maps to requiredSystemFeatures
   systems: [x86_64-linux]
+  image: rio-worker:dev                        # required — container image ref
+  imagePullPolicy: IfNotPresent                # optional — K8s default if omitted
+  sizeClass: small                             # maps to RIO_SIZE_CLASS env
   # securityContext: NOT a CRD field. The controller hardcodes
   # capabilities (SYS_ADMIN + SYS_CHROOT) in build_pod_spec().
   # Only `privileged: bool` is exposed (for VM-test/airgap escape
   # hatches); production pods use granular caps, not privileged.
-  # Phase 3b deferral: exposing nodeSelector/tolerations via CRD
-  # (currently only in the kustomize overlay).
   nodeSelector:
     rio.build/worker: "true"
   tolerations:
@@ -79,10 +82,11 @@ status:
   desiredReplicas: 8
   lastScaleTime: 2026-02-13T06:00:00Z
   conditions:
-    - type: ScalingActive                      # also: AtMaxCapacity, AtMinCapacity
+    - type: Scaling                            # single condition type; reason distinguishes state
       status: "True"
       lastTransitionTime: 2026-02-13T05:55:00Z
-      reason: QueueDepthAboveTarget
+      reason: ScaledUp                         # also: ScaledDown, UnknownMetric (status=False)
+      message: "scaled from 5 to 8"
 ```
 
 ### WorkerPoolSet
@@ -232,7 +236,7 @@ r[ctrl.autoscale.direct-patch]
 **Autoscaling:** The controller queries the scheduler's `AdminService.ClusterStatus` gRPC RPC to obtain current queue depth and worker utilization. It directly patches StatefulSet replicas based on this data. This is an internal mechanism, not HPA. The scaling logic requires stabilization windows and anti-flapping thresholds to avoid oscillation:
 
 r[ctrl.autoscale.separate-field-manager]
-The autoscaler uses a **separate SSA field manager** (`rio-autoscaler`) from the reconciler (`rio-controller`). The reconciler owns `status.replicas`/`readyReplicas`/`desiredReplicas`; the autoscaler owns `status.lastScaleTime` + scaling conditions. Using the same field manager would cause 400 "conflict" on concurrent patches.
+The autoscaler uses **separate SSA field managers** from the reconciler (`rio-controller`): `rio-controller-autoscaler` for `StatefulSet.spec.replicas` patches, and `rio-controller-autoscaler-status` for `WorkerPool.status.{lastScaleTime,conditions}` patches. The reconciler owns `status.replicas`/`readyReplicas`/`desiredReplicas`; the autoscaler owns `status.lastScaleTime` + scaling conditions. Using the same field manager would cause 400 "conflict" on concurrent patches.
 
 r[ctrl.autoscale.skip-deleting]
 The autoscaler MUST check `metadata.deletionTimestamp` and skip pools being deleted --- otherwise it rescales the StatefulSet while the finalizer is scaling to 0, causing ping-pong.
@@ -250,7 +254,7 @@ Build CRDs are created by:
 SSH-initiated builds do NOT require Build CRDs; Build CRDs are an alternative submission path for Kubernetes-native workflows.
 
 r[ctrl.build.sentinel]
-**Double-submit guard:** The reconciler MUST set `status.build_id` (a UUID sentinel or the real scheduler-returned ID) **immediately** on first reconcile, before the finalizer-add re-reconcile fires. Otherwise the second reconcile re-submits to the scheduler.
+**Double-submit guard:** The reconciler MUST set `status.build_id` to the literal sentinel string `"submitted"` **immediately** on first reconcile, before the finalizer-add re-reconcile fires. Otherwise the second reconcile sees an empty `build_id` and re-submits to the scheduler. The watch task later overwrites the sentinel with the real scheduler-assigned UUID.
 
 **Finalizer:** All Build CRDs carry a `rio.build/build-cleanup` finalizer. Before a Build CRD is deleted, the controller sends `CancelBuild` to the scheduler to ensure in-flight work is properly handled.
 
@@ -281,10 +285,11 @@ CRDs follow a `v1alpha1` → `v1beta1` → `v1` progression. The initial impleme
 CRDs use CEL validation rules (`x-kubernetes-validations`) for structural constraints:
 
 - `spec.replicas.min <= spec.replicas.max`
-- `spec.timeout > 0`
+- `spec.timeoutSeconds >= 0` (Build CRD; 0 means unbounded)
 - `spec.maxConcurrentBuilds >= 1`
-- `spec.fuseCacheSize` must parse as a valid Kubernetes quantity
 - `spec.systems` must be non-empty
+
+`spec.fuseCacheSize` is NOT a CEL rule — it is validated at reconcile time (`parse_quantity_to_gb` in `builders.rs` returns `InvalidSpec` on unparseable input, which fails the reconcile and emits an event).
 
 ## WorkerPool Finalizer
 
