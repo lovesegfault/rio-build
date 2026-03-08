@@ -1,7 +1,7 @@
 //! Store path metadata persistence in PostgreSQL.
 //!
 //! CRUD operations for the `narinfo` and `manifests` tables defined in
-//! `migrations/006_phase2c.sql`.
+//! `migrations/002_store.sql`.
 //!
 //! # Storage model (phase 2c)
 //!

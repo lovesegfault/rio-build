@@ -148,7 +148,7 @@ pub async fn find_missing_paths(pool: &PgPool, store_paths: &[String]) -> Result
 /// the narinfo we serve has `URL: nar/{nixbase32(nar_hash)}.nar.zst`, so
 /// when the client fetches that URL, we need to find the path by nar_hash.
 ///
-/// Uses `idx_narinfo_nar_hash` (migration 006). Without it, every NAR
+/// Uses `idx_narinfo_nar_hash` (migration 002_store.sql). Without it, every NAR
 /// fetch would seq-scan narinfo.
 #[instrument(skip(pool), fields(nar_hash = hex::encode(nar_hash)))]
 pub async fn path_by_nar_hash(pool: &PgPool, nar_hash: &[u8; 32]) -> Result<Option<String>> {

@@ -266,7 +266,7 @@ async fn nar(State(state): State<Arc<CacheServerState>>, Path(filename): Path<St
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    // Look up the store path. Uses idx_narinfo_nar_hash (migration 006).
+    // Look up the store path. Uses idx_narinfo_nar_hash (migration 002_store.sql).
     let store_path = match metadata::path_by_nar_hash(&state.pool, &nar_hash).await {
         Ok(Some(p)) => p,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
