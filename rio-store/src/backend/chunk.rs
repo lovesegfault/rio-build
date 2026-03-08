@@ -62,6 +62,33 @@ pub trait ChunkBackend: Send + Sync {
     /// lookup loop; for S3 it's a batch of HeadObject calls (C3 might
     /// switch to checking the `chunks` PG table instead — faster than S3).
     async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>>;
+
+    /// Delete a chunk. Used by the GC drain task (pending_s3_deletes).
+    ///
+    /// `Err` on I/O failure (S3 down, permission denied). "Already gone"
+    /// is `Ok` — idempotent, the drain might retry a partially-processed
+    /// batch. The drain task increments `attempts` on Err and retries
+    /// with backoff; after max attempts it stops (alert-worthy but not
+    /// a process crash — S3 objects leak, PG state is correct).
+    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()>;
+
+    /// Compute the storage key for a hash without doing I/O. Used by
+    /// GC sweep to enqueue the key to `pending_s3_deletes` in the SAME
+    /// PG transaction as the refcount decrement (two-phase commit for
+    /// S3 cleanup — enqueue atomically, delete later).
+    ///
+    /// Returns the backend-specific key: for S3 it's `prefix/aa/hex`
+    /// (bucket-relative); for filesystem it's the relative path. The
+    /// drain task passes this back to `delete_by_key`.
+    fn key_for(&self, hash: &[u8; 32]) -> String;
+
+    /// Delete by storage key (as returned by `key_for`). Used by the
+    /// drain task which stores keys (not hashes) in pending_s3_deletes.
+    ///
+    /// Separate from `delete(hash)` because the drain reads string keys
+    /// from PG; re-parsing them back to [u8;32] would be pointless
+    /// indirection.
+    async fn delete_by_key(&self, key: &str) -> anyhow::Result<()>;
 }
 
 /// Encode a chunk hash into its storage key (`{aa}/{hex}`).
@@ -138,6 +165,33 @@ impl ChunkBackend for MemoryChunkBackend {
     async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>> {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         Ok(hashes.iter().map(|h| inner.contains_key(h)).collect())
+    }
+
+    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash);
+        Ok(())
+    }
+
+    fn key_for(&self, hash: &[u8; 32]) -> String {
+        // Memory backend doesn't have real keys; use hex for the
+        // pending_s3_deletes table (drain task just needs A key,
+        // delete_by_key parses it back). Consistent with chunk_key
+        // but no directory structure.
+        hex::encode(hash)
+    }
+
+    async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
+        // Parse hex back to [u8; 32]. If it's not 64 hex chars,
+        // this was never a valid key_for output — drain is
+        // retrying a bad row. Error (attempts++, operator looks).
+        let bytes = hex::decode(key).map_err(|e| anyhow::anyhow!("invalid key {key:?}: {e}"))?;
+        let hash: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("key {key:?} is not 32 bytes"))?;
+        self.delete(&hash).await
     }
 }
 
@@ -231,6 +285,34 @@ impl ChunkBackend for FilesystemChunkBackend {
             result.push(tokio::fs::try_exists(&path).await?);
         }
         Ok(result)
+    }
+
+    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()> {
+        let path = self.chunk_path(hash);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            // ENOENT = already gone. Idempotent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn key_for(&self, hash: &[u8; 32]) -> String {
+        // Relative path (no base_dir) so pending_s3_deletes entries
+        // survive a base_dir relocation. delete_by_key rejoins.
+        chunk_key(hash)
+    }
+
+    async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
+        // key is the relative path from key_for. Rejoin to base_dir.
+        // No path-traversal concern: chunk_key output is always
+        // `{aa}/{hex}` from a [u8;32], no `..`.
+        let path = self.base_dir.join(key);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -387,6 +469,33 @@ impl ChunkBackend for S3ChunkBackend {
         }
 
         Ok(results)
+    }
+
+    async fn delete(&self, hash: &[u8; 32]) -> anyhow::Result<()> {
+        self.delete_by_key(&self.s3_key(hash)).await
+    }
+
+    fn key_for(&self, hash: &[u8; 32]) -> String {
+        // Full S3 key (bucket-relative, includes prefix). The
+        // pending_s3_deletes row stores this; drain task passes
+        // it to delete_by_key verbatim.
+        self.s3_key(hash)
+    }
+
+    async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
+        metrics::counter!("rio_store_s3_requests_total", "operation" => "delete_object")
+            .increment(1);
+        // DeleteObject is idempotent: deleting a non-existent key
+        // returns success (no NotFound error). So no special-case
+        // for "already gone" — just send and return.
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("S3 DeleteObject failed for {key}: {e}"))?;
+        Ok(())
     }
 }
 

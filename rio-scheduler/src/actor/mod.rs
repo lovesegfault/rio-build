@@ -436,6 +436,26 @@ impl DagActor {
                             .increment(lines);
                     }
                 }
+                ActorCommand::GcRoots { reply } => {
+                    // Collect expected_output_paths ∪ output_paths
+                    // from all non-terminal derivations. These are
+                    // the live-build roots that GC must NOT delete —
+                    // either the worker is about to upload them
+                    // (expected) or just did (output). Both cases:
+                    // don't race the upload.
+                    let roots: Vec<String> = self
+                        .dag
+                        .iter_nodes()
+                        .filter(|(_, s)| !s.status().is_terminal())
+                        .flat_map(|(_, s)| {
+                            s.expected_output_paths
+                                .iter()
+                                .chain(s.output_paths.iter())
+                                .cloned()
+                        })
+                        .collect();
+                    let _ = reply.send(roots);
+                }
                 ActorCommand::LeaderAcquired => {
                     self.handle_leader_acquired().await;
                     // Schedule reconciliation ~45s out via WeakSender.

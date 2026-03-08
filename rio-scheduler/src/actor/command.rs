@@ -189,6 +189,12 @@ pub enum ActorCommand {
         reply: oneshot::Sender<ClusterSnapshot>,
     },
 
+    /// Return expected output paths for all non-terminal
+    /// derivations. Used by TriggerGC to pass as extra_roots to
+    /// the store's mark phase — protects in-flight build outputs
+    /// that may not be in narinfo yet (worker hasn't uploaded).
+    GcRoots { reply: oneshot::Sender<Vec<String>> },
+
     /// Lease acquired: trigger state recovery from PG. Fire-and-
     /// forget (no reply) — the lease loop keeps renewing while
     /// recovery runs in the actor task. handle_leader_acquired
