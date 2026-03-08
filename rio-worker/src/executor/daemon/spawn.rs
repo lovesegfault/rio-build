@@ -74,6 +74,19 @@ fn bind_mount(src: &Path, target: &str) -> std::io::Result<()> {
 #[instrument(skip_all)]
 pub(in crate::executor) async fn spawn_daemon_in_namespace(
     overlay_mount: &overlay::OverlayMount,
+    // FOD proxy: inject http_proxy/https_proxy env ONLY when
+    // is_fixed_output is true. Nix's FOD sandbox passes these
+    // through to the builder (FODs need network for fetchurl).
+    // Non-FOD builds have no network anyway (sandbox blocks it),
+    // so proxy env would be unused but we still don't set it —
+    // reduces any confusion about what environment the daemon
+    // sees, and prevents a non-FOD builder from accidentally
+    // picking it up if someone misconfigures sandbox settings.
+    //
+    // `fod_proxy`: None = FOD proxy disabled OR this isn't an
+    // FOD. Some(url) = set proxy env vars. Caller computes this
+    // from `is_fixed_output && env.fod_proxy_url.is_some()`.
+    fod_proxy: Option<&str>,
 ) -> Result<tokio::process::Child, ExecutorError> {
     // Clone paths BEFORE the closure — the clones happen in the parent
     // pre-fork, so they're safe. The closure captures owned PathBufs.
@@ -112,6 +125,10 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
     // includes the host store as its FIRST lower layer (see overlay.rs), so
     // nix-daemon + glibc + etc. stay visible through the overlay alongside
     // FUSE-served rio-store paths.
+    // Owned String for move into spawn_blocking (can't borrow
+    // across thread boundary). None stays None (not Some("")).
+    let fod_proxy = fod_proxy.map(|s| s.to_string());
+
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("nix-daemon");
         cmd.arg("--stdio")
@@ -130,6 +147,19 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
             // mechanism (graceful, bounded wait for reap); this is a
             // seatbelt for early-return paths.
             .kill_on_drop(true);
+
+        // FOD proxy env. Both lowercase and uppercase for compat
+        // (curl honors lowercase; some tools want uppercase; Nix's
+        // sandbox passes both through to the FOD builder). ONLY
+        // set for FODs — non-FOD sandbox has no network so these
+        // would be useless there, and setting them could mislead
+        // someone reading /proc/PID/environ during debugging.
+        if let Some(proxy) = &fod_proxy {
+            cmd.env("http_proxy", proxy)
+                .env("https_proxy", proxy)
+                .env("HTTP_PROXY", proxy)
+                .env("HTTPS_PROXY", proxy);
+        }
 
         // SAFETY: see function doc. Closure body is async-signal-safe.
         unsafe {

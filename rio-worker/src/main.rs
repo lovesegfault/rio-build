@@ -314,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
         cgroup_parent,
         cancel_registry: cancel_registry.clone(),
+        fod_proxy_url: cfg.fod_proxy_url,
     };
 
     // Process incoming scheduler messages + SIGTERM for graceful drain.

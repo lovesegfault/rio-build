@@ -23,6 +23,12 @@ resources:
   # ClusterIssuer in here is cluster-scoped; everything else
   # lands in rio-system.
   - cert-manager.yaml
+  # FOD forward proxy (Squid). Workers route FOD fetches through
+  # this; the allowlist restricts to known source hosts. Only in
+  # prod overlay — dev doesn't need it (NetworkPolicy isn't
+  # enforced there anyway). Set WorkerPool.spec.fodProxyUrl to
+  # http://rio-fod-proxy:3128 to enable.
+  - ../../base/fod-proxy.yaml
 
 # Strategic merge patches: TLS Secret mounts + RIO_TLS__* env +
 # probe retarget to plaintext health port. One patch file with

@@ -50,17 +50,27 @@ spec:
       ports:
         - protocol: TCP
           port: 9002
+    # FOD forward proxy. Workers route FOD fetches through
+    # Squid (rio-fod-proxy). Squid's allowlist restricts to
+    # known source hosts; this egress rule lets workers reach
+    # Squid's cluster IP.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rio-fod-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
   # No rule for 169.254.169.254 (cloud metadata) or 0.0.0.0/0
   # (internet) → DENIED. NetworkPolicy is default-deny for
   # policyTypes listed: anything not matched by an `egress`
   # rule is blocked. The metadata endpoint block is implicit.
   #
-  # What about FODs (fetchurl etc)? They need internet. Two
-  # options: (a) fetch on the GATEWAY (which has egress) and
-  # upload to the store before submitting — that's the "upload
-  # via nix copy first" model the Build CRD assumes; (b) a
-  # separate `rio-worker-fod` pool with a relaxed policy. (a)
-  # is the design; (b) is an escape hatch if needed.
+  # FODs (fetchurl etc): route through rio-fod-proxy (above).
+  # The daemon spawn injects http_proxy/https_proxy env vars
+  # pointing at the proxy; Nix's FOD sandbox passes these
+  # through to the builder. Squid's allowlist does domain
+  # filtering; this NetworkPolicy just opens worker→proxy.
 ---
 # Controller egress: K8s API + scheduler + store.
 #
@@ -192,3 +202,54 @@ spec:
       ports:
         - protocol: TCP
           port: 9102
+---
+# FOD proxy egress: DNS + internet (HTTP/HTTPS). Squid forwards
+# worker FOD fetches to the real source hosts. Allowlisting
+# happens INSIDE Squid (squid.conf dstdomain); this policy just
+# opens egress to the internet — Squid is the enforcement point.
+#
+# Block RFC1918 + link-local: a malicious FOD trying
+# http_proxy=Squid → http://169.254.169.254/ would bypass the
+# worker's NetworkPolicy (traffic from Squid, not worker). The
+# `except` clause makes Squid reject connections to internal IPs.
+# Domain allowlist is the primary defense (evil.example.com
+# won't be in it); this is defense-in-depth for the IP-literal
+# case.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-fod-proxy-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-fod-proxy
+  policyTypes:
+    - Egress
+  egress:
+    # DNS. Squid resolves dstdomain names.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Internet (HTTP + HTTPS). ipBlock 0.0.0.0/0 except private
+    # + link-local. Squid's allowlist does the domain filtering;
+    # this blocks IP-literal bypasses.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              # Link-local (cloud metadata).
+              - 169.254.0.0/16
+              # Loopback (Squid shouldn't proxy to itself).
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443

@@ -292,6 +292,26 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let priority_class = if is_ifd_hint { "interactive" } else { "ci" };
 
+    // Validate BEFORE inlining (no point doing FindMissingPaths +
+    // inline for a DAG we're about to reject). __noChroot check +
+    // early MAX_DAG_NODES.
+    if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
+        warn!(reason = %reason, "rejecting build: DAG validation failed");
+        stderr
+            .error(&rio_nix::protocol::stderr::StderrError::simple(
+                "DAGValidationFailed",
+                format!("build rejected: {reason}"),
+            ))
+            .await?;
+        // BuildResult::failure so the wire protocol gets a clean
+        // STDERR_LAST + result sequence (caller expects one even
+        // on rejection).
+        let failure = BuildResult::failure(BuildStatus::MiscFailure, reason);
+        stderr.finish().await?;
+        write_build_result(stderr.inner_mut(), &failure).await?;
+        return Ok(());
+    }
+
     // Inline .drv content for will-dispatch nodes. Mutable because
     // this fills node.drv_content in-place. On store error: skips
     // silently (safe degrade; worker fetches).

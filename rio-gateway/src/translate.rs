@@ -275,6 +275,73 @@ fn node_common_fields(
     }
 }
 
+/// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
+/// DAG should be rejected — caller sends STDERR_ERROR with the
+/// reason. Returns `Ok(())` if valid.
+///
+/// Checks:
+/// - `__noChroot=1` in any node's env → reject (sandbox escape)
+/// - `nodes.len() > MAX_DAG_NODES` → reject (early, before gRPC)
+///
+/// The scheduler ALSO enforces MAX_DAG_NODES (grpc/mod.rs:298);
+/// this is an early reject to save the gRPC round-trip for obvious
+/// over-size submissions. The __noChroot check is ONLY here — the
+/// scheduler doesn't have the env (DerivationNode doesn't carry it).
+pub fn validate_dag(
+    nodes: &[types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+) -> Result<(), String> {
+    // MAX_DAG_NODES: early reject. Scheduler enforces too but
+    // this saves a 100MB+ gRPC message for obvious over-size.
+    if nodes.len() > rio_common::limits::MAX_DAG_NODES {
+        return Err(format!(
+            "DAG too large: {} nodes > {} max",
+            nodes.len(),
+            rio_common::limits::MAX_DAG_NODES
+        ));
+    }
+
+    // __noChroot check: iterate nodes, look up each drv in the
+    // cache (it was populated during BFS), check env. Nodes
+    // without a cached drv (BasicDerivation fallback) are
+    // skipped — we don't have the env. A __noChroot drv
+    // arriving via BasicDerivation is a corner case (client
+    // sent a pre-parsed BasicDerivation without inputDrvs);
+    // the build would fail at the worker's sandbox anyway
+    // (sandbox=true, sandbox-fallback=false), so the check
+    // here is best-effort early rejection.
+    //
+    // Why reject: __noChroot=1 tells nix-daemon to skip the
+    // sandbox. That's a sandbox escape — the build sees /etc,
+    // $HOME, the host network, everything. Allowed in single-
+    // user Nix for bootstrap derivations; NEVER allowed in a
+    // multi-tenant build farm. A malicious .drv could use this
+    // to exfiltrate secrets from the worker.
+    for node in nodes {
+        // drv_path is the StorePath key in drv_cache (we built
+        // nodes from the cache during BFS).
+        let Ok(sp) = StorePath::parse(&node.drv_path) else {
+            continue; // malformed path — let scheduler reject
+        };
+        let Some(drv) = drv_cache.get(&sp) else {
+            continue; // BasicDerivation fallback, no env
+        };
+        if drv
+            .env()
+            .get("__noChroot")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "derivation {} requests __noChroot (sandbox escape) — not permitted",
+                node.drv_path
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Create a single-node DAG from a BasicDerivation (no inputDrvs).
 /// Used as fallback when the full Derivation is not available.
 pub fn single_node_from_basic(
@@ -522,6 +589,55 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn validate_dag_rejects_oversized() {
+        // MAX_DAG_NODES is 100k; build 100k+1 nodes to trigger.
+        // No drv_cache needed — the size check fires first.
+        let oversized: Vec<types::DerivationNode> = (0..=rio_common::limits::MAX_DAG_NODES)
+            .map(|i| types::DerivationNode {
+                drv_path: format!("/nix/store/node{i}.drv"),
+                drv_hash: format!("node{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let empty_cache = HashMap::new();
+        let result = validate_dag(&oversized, &empty_cache);
+        assert!(
+            result.is_err(),
+            "{} nodes > {} max should reject",
+            oversized.len(),
+            rio_common::limits::MAX_DAG_NODES
+        );
+        assert!(result.unwrap_err().contains("DAG too large"));
+    }
+
+    #[test]
+    fn validate_dag_accepts_normal_size_no_nochroot() {
+        // A few nodes, empty cache (BasicDerivation fallback path),
+        // no __noChroot → Ok.
+        let nodes = vec![
+            types::DerivationNode {
+                drv_path: "/nix/store/aaa-test.drv".into(),
+                drv_hash: "aaa".into(),
+                ..Default::default()
+            },
+            types::DerivationNode {
+                drv_path: "/nix/store/bbb-test.drv".into(),
+                drv_hash: "bbb".into(),
+                ..Default::default()
+            },
+        ];
+        let empty_cache = HashMap::new();
+        assert!(validate_dag(&nodes, &empty_cache).is_ok());
+    }
+
+    // __noChroot rejection is hard to unit-test here because it
+    // needs a Derivation in drv_cache with __noChroot=1 in env,
+    // and constructing a full Derivation (not BasicDerivation)
+    // requires ATerm parsing or a complex builder. Coverage comes
+    // from vm-phase3b's G1 section (submit a real .drv with
+    // __noChroot, assert STDERR_ERROR "sandbox escape").
 
     #[test]
     fn test_single_node_no_features() -> anyhow::Result<()> {

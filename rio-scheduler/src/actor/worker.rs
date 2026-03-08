@@ -569,6 +569,41 @@ impl DagActor {
             }
         }
 
+        // build_event_log time-based sweep. Every 360 ticks (~1h at
+        // 10s interval). Safety net for terminal-cleanup delete —
+        // if that failed (PG blip), rows would leak. Also catches
+        // rows from builds that never hit terminal-cleanup (actor
+        // restart mid-build, PG restored before recovery).
+        //
+        // Fire-and-forget spawn: a slow PG doesn't stall handle_tick.
+        // 24h retention is plenty for WatchBuild replay (gateway
+        // reconnects are within minutes of disconnect).
+        const EVENT_LOG_SWEEP_EVERY: u64 = 360;
+        if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.event_persist_tx.is_some()
+        {
+            let pool = self.db.pool().clone();
+            tokio::spawn(async move {
+                match sqlx::query(
+                    "DELETE FROM build_event_log WHERE created_at < now() - interval '24 hours'",
+                )
+                .execute(&pool)
+                .await
+                {
+                    Ok(r) => {
+                        if r.rows_affected() > 0 {
+                            debug!(
+                                rows = r.rows_affected(),
+                                "event-log sweep: deleted rows older than 24h"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "event-log sweep failed (will retry next hour)");
+                    }
+                }
+            });
+        }
+
         // Update metrics. All gauges are set from ground-truth state on each
         // Tick — this is self-healing against any counting bugs elsewhere.
         metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);

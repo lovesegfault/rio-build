@@ -131,6 +131,8 @@ pub struct BuildSpawnContext {
     /// that fails, main.rs bails with `?` and we never get here. So
     /// this is always a valid, delegated cgroup2 path.
     pub cgroup_parent: PathBuf,
+    /// FOD proxy URL. Passed to ExecutorEnv → daemon spawn.
+    pub fod_proxy_url: Option<String>,
     /// drv_path → (cgroup path, cancel flag). Populated by
     /// execute_build after the BuildCgroup is created; removed by
     /// the scopeguard at the end of spawn_build_task (same lifetime
@@ -270,6 +272,7 @@ pub async fn spawn_build_task(
         max_leaked_mounts: ctx.max_leaked_mounts,
         daemon_timeout: ctx.daemon_timeout,
         cgroup_parent: ctx.cgroup_parent.clone(),
+        fod_proxy_url: ctx.fod_proxy_url.clone(),
     };
 
     // Clone for the panic handler before moving into the task.

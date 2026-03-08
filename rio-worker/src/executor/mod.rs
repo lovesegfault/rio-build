@@ -86,6 +86,11 @@ pub struct ExecutorEnv {
     /// gets a sub-cgroup named by drv hash. cgroup v2 is a hard
     /// requirement — no Option.
     pub cgroup_parent: std::path::PathBuf,
+    /// Forward proxy URL for FOD builds (fetchurl etc). Injected
+    /// as http_proxy/https_proxy env into the daemon spawn ONLY
+    /// when the assignment's is_fixed_output is true. None =
+    /// FODs have direct internet (if NetworkPolicy allows).
+    pub fod_proxy_url: Option<String>,
 }
 
 /// Default daemon build timeout: 2 hours. See `ExecutorEnv.daemon_timeout`.
@@ -430,8 +435,19 @@ pub async fn execute_build(
         })
         .unwrap_or(env.daemon_timeout);
 
+    // FOD proxy: compute once here (is_fixed_output × config).
+    // Passed to spawn which sets http_proxy/https_proxy env on
+    // the daemon. Nix's FOD sandbox passes these through to the
+    // builder; the Squid proxy (deploy/base/fod-proxy.yaml)
+    // allowlists known source hosts.
+    let fod_proxy = if assignment.is_fixed_output {
+        env.fod_proxy_url.as_deref()
+    } else {
+        None
+    };
+
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");
-    let mut daemon = spawn_daemon_in_namespace(&overlay_mount).await?;
+    let mut daemon = spawn_daemon_in_namespace(&overlay_mount, fod_proxy).await?;
     tracing::info!(drv_path = %drv_path, pid = ?daemon.id(), "nix-daemon spawned; starting handshake");
 
     // Per-build cgroup. Created AFTER spawn (we need the PID) but
@@ -875,6 +891,7 @@ mod tests {
             // Short-circuit path never reaches cgroup setup (bails at
             // the leak-threshold check). Tempdir is fine.
             cgroup_parent: dir.path().to_path_buf(),
+            fod_proxy_url: None,
         };
         let result =
             execute_build(&assignment, &env, &mut store_client, &log_tx, &leak_counter).await;

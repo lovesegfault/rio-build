@@ -75,6 +75,11 @@ pub(crate) struct Config {
     /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
     /// Unset = plaintext.
     pub(crate) tls: rio_common::tls::TlsConfig,
+    /// Forward proxy URL for FOD builds. Injected as http_proxy/
+    /// https_proxy env into the daemon spawn ONLY when is_fixed_
+    /// output is true. Env: `RIO_FOD_PROXY_URL`. Unset = FODs
+    /// have direct internet.
+    pub(crate) fod_proxy_url: Option<String>,
 }
 
 impl Default for Config {
@@ -107,6 +112,7 @@ impl Default for Config {
             max_leaked_mounts: 3,
             daemon_timeout_secs: rio_worker::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
             tls: rio_common::tls::TlsConfig::default(),
+            fod_proxy_url: None,
         }
     }
 }

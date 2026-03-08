@@ -475,7 +475,7 @@ impl DagActor {
         // GC the persisted event log. Fire-and-forget: this is
         // cleanup of replay state for a build that's already
         // terminal — if PG is down the rows just age out via
-        // created_at (TODO(phase3b) time-based sweep on Tick).
+        // created_at (handle_tick runs a 24h sweep every 360 ticks).
         // Spawned (not awaited in the actor loop): a slow PG
         // doesn't stall the next command. Unlike emit_build_event's
         // persister (which needs FIFO ordering), DELETE ordering
