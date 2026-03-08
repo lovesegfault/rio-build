@@ -355,7 +355,8 @@ A future improvement would split the worker into two processes:
 - `rio-worker/src/executor/` --- Build execution (spawns nix-daemon in mount namespace, drives protocol)
 - `rio-worker/src/overlay.rs` --- overlayfs setup and teardown
 - `rio-worker/src/fuse/mod.rs` --- FUSE daemon lifecycle and mount management
-- `rio-worker/src/fuse/lookup.rs` --- Path existence and metadata queries
+- `rio-worker/src/fuse/ops.rs` --- `Filesystem` trait impl: lookup, getattr, open (passthrough), read, readdir
+- `rio-worker/src/fuse/lookup.rs` --- `stat_to_attr` + TTL constants (helpers for ops.rs)
 - `rio-worker/src/fuse/read.rs` --- File content serving and prefetch
 - `rio-worker/src/fuse/cache.rs` --- LRU cache management (SSD-backed)
 - `rio-worker/src/fuse/fetch.rs` --- Fetch + extract NAR from rio-store (prefetch + on-demand)

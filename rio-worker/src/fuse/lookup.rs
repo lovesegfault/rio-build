@@ -1,8 +1,7 @@
-//! Path existence and metadata queries for the FUSE store.
+//! FUSE attribute helpers.
 //!
-//! Handles `lookup` and `getattr` operations by checking the local SSD cache
-//! first, then falling back to `StoreService.QueryPathInfo` via gRPC.
-// r[impl worker.fuse.lookup-caches]
+//! `stat_to_attr` + TTL constants shared by `ops.rs`. The actual `lookup`/
+//! `getattr` FUSE handlers live in `ops.rs` (the `Filesystem` trait impl).
 
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -60,7 +59,6 @@ pub fn stat_to_attr(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     }
 }
 
-// r[verify worker.fuse.lookup-caches]
 #[cfg(test)]
 mod tests {
     use super::*;

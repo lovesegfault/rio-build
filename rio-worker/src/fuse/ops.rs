@@ -49,6 +49,7 @@ impl Filesystem for NixStoreFs {
         }
     }
 
+    // r[impl worker.fuse.lookup-caches]
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(parent_path) = self.real_path(parent.0) else {
             reply.error(Errno::ENOENT);

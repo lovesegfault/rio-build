@@ -548,7 +548,6 @@ fn unix_now() -> i64 {
 }
 
 // r[verify worker.fuse.cache-lru]
-// r[verify worker.fuse.passthrough]
 #[cfg(test)]
 mod tests {
     use super::*;
