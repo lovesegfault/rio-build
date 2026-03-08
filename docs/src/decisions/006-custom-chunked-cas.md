@@ -9,10 +9,10 @@ Nix store paths are serialized as NAR archives for transport and storage. A cont
 ## Decision
 NAR archives are chunked using content-defined chunking (FastCDC). Identical chunks across store paths are stored once. The system has two tiers:
 
-- **Inline fast-path**: NARs below 256KB are stored as a single blob with no chunking overhead. Most small derivations (scripts, config files, small libraries) fall into this category.
-- **Chunked path**: Larger NARs are split by FastCDC. A chunk manifest in PostgreSQL maps each NAR to its ordered list of chunk references.
+- **Inline fast-path**: NARs below 256KB are stored as a single blob in PostgreSQL (`manifests.inline_blob BYTEA`) with no chunking overhead and no S3 round-trip. Most small derivations (scripts, config files, small libraries) fall into this category.
+- **Chunked path**: Larger NARs are split by FastCDC. A chunk manifest in PostgreSQL (`manifest_data.chunk_list`) maps each NAR to its ordered list of chunk references; the chunk bodies themselves are stored in S3.
 
-Blob storage is in S3. Metadata (narinfo, references, chunk manifests) is in PostgreSQL.
+Blob storage is split: inline NARs in PostgreSQL, FastCDC chunks in S3. Metadata (narinfo, references, chunk manifests, refcounts) is entirely in PostgreSQL.
 
 Hash domains are strictly separated:
 - **SHA-256** for all Nix-facing hashes (store path hashes, NAR hashes, output hashes).

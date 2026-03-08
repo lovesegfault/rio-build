@@ -46,3 +46,12 @@ The Phase 1a spike discovered two constraints:
 - **Negative**: Requires cluster-level configuration (node pools, taints, seccomp profiles) that complicates initial setup.
 - **Negative**: `CAP_SYS_ADMIN` is a broad capability. The seccomp profile is the real security boundary.
 - **Negative**: Not compatible with restrictive PodSecurityStandard `restricted` profile; requires `privileged` or `baseline` with custom exceptions.
+
+## Implementation Note (Phase 3a)
+
+The controller-generated pod spec (`rio-controller/src/reconcilers/workerpool/builders.rs`) diverges from the recommended configuration above in two ways:
+
+- **`/dev/fuse` via hostPath, not device plugin.** The controller emits a `hostPath` volume of type `CharDevice` for `/dev/fuse`. The FUSE device plugin recommended in the Phase 1a spike finding is not yet wired. On clusters where the containerd device cgroup does not include `/dev/fuse` by default, this requires the `privileged` escape hatch (see below).
+- **`hostUsers: false` not set.** The pod spec does not request user-namespace isolation. Adding it requires the device-plugin migration first (hostPath + idmap mounts on device nodes are incompatible, per the spike finding).
+
+Additionally, the `WorkerPool` CRD exposes an optional `privileged: bool` field (`rio-controller/src/crds/workerpool.rs`). When unset or `false`, the container gets the granular `SYS_ADMIN` + `SYS_CHROOT` capabilities (this ADR's recommended default). When `true`, the container runs fully privileged — an escape hatch for k3s/kind clusters whose default seccomp profiles block `mount(2)` even with `SYS_ADMIN`. Production deployments on EKS/GKE with proper runtime configuration should not need this.

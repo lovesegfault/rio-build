@@ -17,7 +17,9 @@ Workers connect to the scheduler via a bidirectional `BuildExecution` streaming 
 **Worker to scheduler:**
 - Build log batches (streamed incrementally).
 - Build completion reports (success/failure, output paths, timing).
-- Acknowledgments and heartbeats.
+- Acknowledgments.
+
+> **Implementation note:** Heartbeats are a **separate unary RPC** (`Worker.Heartbeat`, see `rio-proto/proto/worker.proto`), not carried on the `BuildExecution` stream. The heartbeat loop runs independently of stream lifecycle so liveness reporting survives stream reconnection.
 
 The stream provides natural backpressure: if a worker is overwhelmed, gRPC flow control slows the scheduler's assignment rate. Connection drops are detected via gRPC keepalives, enabling fast failure detection and rescheduling.
 

@@ -7,18 +7,19 @@ Accepted
 Nix builds require a populated `/nix/store` with all build inputs present, plus a valid SQLite store database. In a distributed system, workers must access potentially hundreds of gigabytes of store paths without pre-materializing everything. The store model must support concurrent builds with isolation, be Kubernetes-native, and avoid shared mutable state.
 
 ## Decision
-Each worker runs a custom FUSE filesystem (`rio-fuse`) mounted at `/nix/store`. The FUSE daemon:
+Each worker runs a custom FUSE filesystem (the `fuse` module in `rio-worker`) mounted at a configurable path (default `/var/rio/fuse-store` — see `rio-worker/src/config.rs`). The FUSE daemon:
 
 - Lazily fetches store path content from rio-store via gRPC on demand.
 - Caches fetched content on local SSD with LRU eviction.
 - Exploits store path immutability: cached data never needs invalidation.
 
-Each build gets a per-build overlayfs:
-- Lower layer: the FUSE mount (shared, read-only).
-- Upper layer: a tmpdir for build outputs.
-- A synthetic SQLite store DB is generated in the upper layer from rio-store's PostgreSQL metadata, containing only the paths relevant to that build.
+Each build gets a per-build overlayfs (see `rio-worker/src/overlay.rs`, r[worker.overlay.stacked-lower]):
+- **Lower layer (stacked):** `/nix/store:{fuse_mount}` — the host's real `/nix/store` first, then the FUSE mount. Host-store-first ensures `nix-daemon` and its runtime dependencies remain reachable after the overlay is bind-mounted at `/nix/store` in the child's mount namespace. FUSE second provides rio-store-served paths.
+- **Upper layer:** `{overlay_base_dir}/{build_id}/upper/nix/store/` on a local-disk emptyDir volume (controller-managed). Must be a real filesystem (ext4/xfs), not the container's overlayfs root — overlayfs-as-upperdir cannot create `trusted.*` xattrs and fails with `EINVAL`.
+- **Merged:** bind-mounted to `/nix/store` inside a per-build mount namespace. Outputs written by `nix-daemon` land in `{upper}/nix/store/{hash}-{name}`.
+- A synthetic SQLite store DB is generated per-build from rio-store's PostgreSQL metadata, containing only the paths relevant to that build.
 
-On completion, built outputs are uploaded from the upper layer to rio-store.
+On completion, built outputs are scanned from the upper layer and uploaded to rio-store.
 
 ## Alternatives Considered
 - **Shared NFS/EFS ReadWriteMany PersistentVolume**: Shared mutable state across workers. NFS performance under concurrent builds is poor. overlayfs-over-NFS is not a supported kernel configuration. Lock contention on the SQLite DB makes this impractical for concurrent builds.
