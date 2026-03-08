@@ -4542,9 +4542,11 @@ name = "rio-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "blake3",
  "figment",
  "futures-util",
+ "hmac",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4553,6 +4555,8 @@ dependencies = [
  "rcgen",
  "rustls 0.23.37",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -55,7 +55,15 @@ impl ActorHandle {
     ) -> Self {
         // Non-K8s default: always leader, generation stays at 1.
         // For K8s deployments main.rs calls spawn_with_lease().
-        Self::spawn_with_leader(db, store_client, log_flush_tx, size_classes, None, None)
+        Self::spawn_with_leader(
+            db,
+            store_client,
+            log_flush_tx,
+            size_classes,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Spawn with an external leader state. main.rs uses this
@@ -78,6 +86,7 @@ impl ActorHandle {
         size_classes: Vec<crate::assignment::SizeClassConfig>,
         leader: Option<crate::lease::LeaderState>,
         event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
+        hmac_signer: Option<rio_common::hmac::HmacSigner>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
         let mut actor = DagActor::new(db, store_client).with_size_classes(size_classes);
@@ -86,6 +95,9 @@ impl ActorHandle {
         }
         if let Some(persist_tx) = event_persist_tx {
             actor = actor.with_event_persister(persist_tx);
+        }
+        if let Some(signer) = hmac_signer {
+            actor = actor.with_hmac_signer(signer);
         }
 
         // Wire leader state. With None: the actor's default

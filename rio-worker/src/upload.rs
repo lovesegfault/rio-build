@@ -124,6 +124,7 @@ async fn upload_output(
     store_client: &mut StoreServiceClient<Channel>,
     upper_dir: &Path,
     output_basename: &str,
+    assignment_token: &str,
 ) -> Result<UploadResult, UploadError> {
     let output_path = upper_dir.join("nix/store").join(output_basename);
     let store_path = format!("/nix/store/{output_basename}");
@@ -156,7 +157,14 @@ async fn upload_output(
             tokio::time::sleep(delay).await;
         }
 
-        match do_upload_streaming(store_client, &store_path, output_path.clone()).await {
+        match do_upload_streaming(
+            store_client,
+            &store_path,
+            output_path.clone(),
+            assignment_token,
+        )
+        .await
+        {
             Ok((nar_hash, nar_size)) => {
                 metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
                 tracing::info!(
@@ -192,11 +200,16 @@ async fn upload_output(
 
 /// One upload attempt: spawn_blocking(dump_streaming → HashingChannelWriter)
 /// → mpsc → tonic gRPC. Returns (hash, size) on success.
+///
+/// `assignment_token`: passed as `x-rio-assignment-token` gRPC
+/// metadata. The store verifies if HMAC is configured. Empty string
+/// = no header (dev mode).
 #[instrument(skip_all)]
 async fn do_upload_streaming(
     store_client: &mut StoreServiceClient<Channel>,
     store_path: &str,
     output_path: PathBuf,
+    assignment_token: &str,
 ) -> Result<([u8; 32], u64), tonic::Status> {
     // Channel bridges sync `dump_path_streaming` (spawn_blocking) to async
     // gRPC. Backpressure: when full, `blocking_send` inside the writer
@@ -248,11 +261,26 @@ async fn do_upload_streaming(
     // blocking task produces them. `with_timeout_status` bounds the whole
     // thing (initial call + stream drain) so a stuck disk read can't hang
     // the worker forever.
+    //
+    // Attach the assignment token as gRPC metadata. Store with
+    // hmac_verifier set will check it; store without = ignore
+    // (the header is just extra metadata). Empty token = no header
+    // (scheduler without hmac_signer, dev mode).
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut req = tonic::Request::new(outbound);
+    if !assignment_token.is_empty() {
+        // parse() for AsciiMetadataValue — assignment tokens are
+        // base64url.base64url, always ASCII. unwrap_or default
+        // for the impossible case (defensive, no crash on a bad
+        // token format that came from US anyway).
+        if let Ok(v) = assignment_token.parse() {
+            req.metadata_mut().insert("x-rio-assignment-token", v);
+        }
+    }
     let put_result = rio_common::grpc::with_timeout_status(
         "PutPath",
         rio_common::grpc::GRPC_STREAM_TIMEOUT,
-        store_client.put_path(outbound),
+        store_client.put_path(req),
     )
     .await;
 
@@ -400,6 +428,7 @@ impl Write for HashingChannelWriter {
 pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
     upper_dir: &Path,
+    assignment_token: &str,
 ) -> Result<Vec<UploadResult>, UploadError> {
     let outputs = scan_new_outputs(upper_dir)?;
 
@@ -410,11 +439,15 @@ pub async fn upload_all_outputs(
     );
 
     let upper_dir = upper_dir.to_path_buf();
+    // Clone the token into each task (it's a String in each async
+    // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
+    let token = assignment_token.to_string();
     let results: Vec<Result<UploadResult, UploadError>> = stream::iter(outputs)
         .map(|output| {
             let mut client = store_client.clone();
             let upper_dir = upper_dir.clone();
-            async move { upload_output(&mut client, &upper_dir, &output).await }
+            let token = token.clone();
+            async move { upload_output(&mut client, &upper_dir, &output, &token).await }
         })
         .buffer_unordered(MAX_PARALLEL_UPLOADS)
         .collect()
@@ -484,7 +517,7 @@ mod tests {
         let basename = test_store_basename("hello");
         let tmp = make_output_file(&basename, b"hello world")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename)
+        let result = upload_output(&mut client, tmp.path(), &basename, "")
             .await
             .expect("upload should succeed");
 
@@ -512,7 +545,7 @@ mod tests {
         let basename = test_store_basename("retry");
         let tmp = make_output_file(&basename, b"retry me")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename)
+        let result = upload_output(&mut client, tmp.path(), &basename, "")
             .await
             .expect("upload should succeed on 3rd attempt");
 
@@ -534,7 +567,7 @@ mod tests {
         let basename = test_store_basename("exhaust");
         let tmp = make_output_file(&basename, b"never uploads")?;
 
-        let err = upload_output(&mut client, tmp.path(), &basename)
+        let err = upload_output(&mut client, tmp.path(), &basename, "")
             .await
             .expect_err("upload should exhaust retries");
 
@@ -563,7 +596,7 @@ mod tests {
         fs::write(store_dir.join(&b2), b"two")?;
         fs::write(store_dir.join(&b3), b"three")?;
 
-        let results = upload_all_outputs(&client, tmp.path())
+        let results = upload_all_outputs(&client, tmp.path(), "")
             .await
             .expect("all uploads succeed");
 
@@ -593,7 +626,7 @@ mod tests {
         // Use a VALID basename (32-char hash) so we get past the path
         // validation and into the dump that actually ENOENTs.
         let basename = test_store_basename("nonexistent");
-        let err = upload_output(&mut client, tmp.path(), &basename)
+        let err = upload_output(&mut client, tmp.path(), &basename, "")
             .await
             .expect_err("should fail NAR serialization");
 
@@ -654,7 +687,7 @@ mod tests {
         let basename = test_store_basename("tee-hash");
         let tmp = make_output_file(&basename, b"tee upload test data")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename).await?;
+        let result = upload_output(&mut client, tmp.path(), &basename, "").await?;
 
         // The hash returned by upload_output == the hash MockStore recorded
         // == SHA-256 of dump_path(). Three-way consistency.

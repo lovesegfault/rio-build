@@ -79,6 +79,10 @@ struct Config {
     /// currently — store doesn't dial out via rio-proto, only
     /// S3 which has its own auth). Set via `RIO_TLS__*`.
     tls: rio_common::tls::TlsConfig,
+    /// HMAC key file for verifying assignment tokens on PutPath.
+    /// SAME file as scheduler's `hmac_key_path`. Unset = accept
+    /// all PutPath callers (dev mode).
+    hmac_key_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -98,6 +102,7 @@ impl Default for Config {
             // gateway (9090→9190). Only used when TLS is on.
             health_addr: "0.0.0.0:9102".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
+            hmac_key_path: None,
         }
     }
 }
@@ -232,14 +237,26 @@ async fn main() -> anyhow::Result<()> {
         info!(path = ?cfg.signing_key_path, "narinfo signing enabled");
     }
 
+    // HMAC verifier for assignment tokens. Same key file as the
+    // scheduler's signer. None → accept all PutPath (dev mode).
+    let hmac_verifier = rio_common::hmac::HmacVerifier::load(cfg.hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("HMAC key load: {e}"))?;
+    if hmac_verifier.is_some() {
+        info!("HMAC assignment token verification enabled on PutPath");
+    }
+
     // StoreServiceImpl: inline-only vs chunked based on cache. The
-    // signer chains after either constructor (builder-style).
+    // signer + hmac_verifier chain after either constructor.
     let store_service = match &chunk_cache {
         None => StoreServiceImpl::new(pool.clone()),
         Some(cache) => StoreServiceImpl::with_chunk_cache(pool.clone(), Arc::clone(cache)),
     };
     let store_service = match signer {
         Some(s) => store_service.with_signer(s),
+        None => store_service,
+    };
+    let store_service = match hmac_verifier {
+        Some(v) => store_service.with_hmac_verifier(v),
         None => store_service,
     };
 

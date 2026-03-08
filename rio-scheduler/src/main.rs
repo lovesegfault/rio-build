@@ -45,6 +45,10 @@ struct Config {
     /// mTLS for BOTH server (workers, gateway, controller incoming)
     /// AND client (store outgoing). Set via `RIO_TLS__*`.
     tls: rio_common::tls::TlsConfig,
+    /// HMAC key file for signing assignment tokens. The store
+    /// verifies on PutPath with the SAME key. Unset = unsigned
+    /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
+    hmac_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -62,6 +66,7 @@ impl Default for Config {
             // gateway. Only used when server TLS is configured.
             health_addr: "0.0.0.0:9101".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
+            hmac_key_path: None,
         }
     }
 }
@@ -291,6 +296,16 @@ async fn main() -> anyhow::Result<()> {
     // mid-backlog gateway reconnect loses it.
     let event_persist_tx = rio_scheduler::event_log::spawn(pool.clone());
 
+    // Load HMAC signer for assignment tokens. None path = disabled
+    // (unsigned tokens, dev mode). Bad path / empty file = startup
+    // error (operator configured it, failing silently = workers can
+    // upload arbitrary paths = security surprise).
+    let hmac_signer = rio_common::hmac::HmacSigner::load(cfg.hmac_key_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("HMAC key load: {e}"))?;
+    if hmac_signer.is_some() {
+        info!("HMAC assignment token signing enabled");
+    }
+
     // Spawn the DAG actor — now with the shared leader state.
     let actor = ActorHandle::spawn_with_leader(
         db,
@@ -299,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.size_classes,
         Some(leader),
         Some(event_persist_tx),
+        hmac_signer,
     );
     info!("DAG actor spawned");
 

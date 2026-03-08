@@ -561,7 +561,17 @@ pub async fn execute_build(
         tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
 
         // Upload outputs
-        match upload::upload_all_outputs(store_client, overlay_mount.upper_dir()).await {
+        match upload::upload_all_outputs(
+            store_client,
+            overlay_mount.upper_dir(),
+            // Pass the assignment token as gRPC metadata on each
+            // PutPath. Store with hmac_verifier checks it. Empty
+            // token (scheduler without hmac_signer, dev mode) →
+            // no header → store with verifier=None accepts.
+            &assignment.assignment_token,
+        )
+        .await
+        {
             Ok(upload_results) => {
                 // FOD defense-in-depth: verify output hashes match declared outputHash.
                 // nix-daemon already verifies, but we re-check before accepting.

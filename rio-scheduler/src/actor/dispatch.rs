@@ -316,6 +316,44 @@ impl DagActor {
 
         // Send WorkAssignment to worker via stream
         if let Some(state) = self.dag.node(drv_hash) {
+            let build_opts = self.build_options_for_derivation(drv_hash);
+
+            // Assignment token: HMAC-signed if configured, else
+            // legacy format-string. The store verifies signed
+            // tokens on PutPath (prevents arbitrary-path upload
+            // from a compromised worker). Unsigned tokens are
+            // accepted by a store with hmac_verifier=None (dev).
+            //
+            // Expiry: 2× build_timeout (or 2× daemon_timeout
+            // default if timeout=0). A worker legitimately
+            // uploading after completion is well within that
+            // window. Prevents replay from a leaked token later.
+            let assignment_token = if let Some(signer) = &self.hmac_signer {
+                let timeout_secs = if build_opts.build_timeout > 0 {
+                    build_opts.build_timeout
+                } else {
+                    // Match rio-worker's DEFAULT_DAEMON_TIMEOUT.
+                    // Can't reference the const cross-crate, so
+                    // duplicate the value. 7200s = 2h.
+                    7200
+                };
+                let expiry_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    .saturating_add(timeout_secs.saturating_mul(2));
+                signer.sign(&rio_common::hmac::Claims {
+                    worker_id: worker_id.to_string(),
+                    drv_hash: drv_hash.to_string(),
+                    expected_outputs: state.expected_output_paths.clone(),
+                    expiry_unix,
+                })
+            } else {
+                // Legacy unsigned: format-string. Store with
+                // hmac_verifier=None accepts this.
+                format!("{worker_id}-{drv_hash}-{generation}")
+            };
+
             let assignment = rio_proto::types::WorkAssignment {
                 drv_path: state.drv_path().to_string(),
                 // Forward what the gateway inlined (or empty → worker
@@ -325,8 +363,8 @@ impl DagActor {
                 // paths (executor/mod.rs:241 branches on is_empty).
                 drv_content: state.drv_content.clone(),
                 output_names: state.output_names.clone(),
-                build_options: Some(self.build_options_for_derivation(drv_hash)),
-                assignment_token: format!("{worker_id}-{drv_hash}-{generation}"),
+                build_options: Some(build_opts),
+                assignment_token,
                 generation,
                 is_fixed_output: state.is_fixed_output,
             };

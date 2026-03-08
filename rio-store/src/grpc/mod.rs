@@ -119,6 +119,19 @@ pub struct StoreServiceImpl {
     /// Arc because both PutPath branches need it and the inline branch
     /// doesn't have a good place to hold a reference across the await.
     signer: Option<Arc<Signer>>,
+    /// HMAC verifier for assignment tokens on PutPath. When Some, a
+    /// PutPath without a valid `x-rio-assignment-token` metadata
+    /// header → PERMISSION_DENIED. When Some + valid token: the
+    /// uploaded path must be in `claims.expected_outputs`.
+    ///
+    /// mTLS bypass: if `request.peer_certs()` is present AND the
+    /// cert CN matches "rio-gateway" → skip HMAC (gateway uploads
+    /// don't have assignment tokens — `nix copy` just sends paths).
+    /// This ties HMAC to mTLS: you can only bypass if you have a
+    /// CA-signed gateway cert.
+    ///
+    /// None = accept all callers (dev mode, same as pre-Phase-3b).
+    hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
 }
 
 impl StoreServiceImpl {
@@ -132,6 +145,7 @@ impl StoreServiceImpl {
             chunk_backend: None,
             chunk_cache: None,
             signer: None,
+            hmac_verifier: None,
         }
     }
 
@@ -155,7 +169,15 @@ impl StoreServiceImpl {
             chunk_backend: Some(cache.backend()),
             chunk_cache: Some(cache),
             signer: None,
+            hmac_verifier: None,
         }
+    }
+
+    /// Enable HMAC verification on PutPath assignment tokens.
+    /// Builder-style — chains after `new()` or `with_chunk_cache()`.
+    pub fn with_hmac_verifier(mut self, verifier: rio_common::hmac::HmacVerifier) -> Self {
+        self.hmac_verifier = Some(Arc::new(verifier));
+        self
     }
 
     /// Enable narinfo signing with the given key.

@@ -183,6 +183,17 @@ pub struct DagActor {
     /// flood PG (~20/sec chatty rustc) and S3 already durables
     /// them via log_flush_tx. None in tests without PG.
     event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
+    /// HMAC signer for assignment tokens. When Some, dispatch
+    /// signs a Claims { worker_id, drv_hash, expected_output_paths,
+    /// expiry } into WorkAssignment.assignment_token. The store
+    /// verifies on PutPath — a worker can only upload outputs
+    /// matching a valid assignment.
+    ///
+    /// None = tokens are the legacy format-string (unsigned).
+    /// Store with hmac_verifier=None accepts both (dev mode).
+    /// Arc because assign_to_worker is hot path and cloning the
+    /// underlying key Vec on every dispatch would allocate.
+    hmac_signer: Option<Arc<rio_common::hmac::HmacSigner>>,
 }
 
 impl DagActor {
@@ -222,7 +233,15 @@ impl DagActor {
             // deployments gate on recovery.
             recovery_complete: Arc::new(AtomicBool::new(true)),
             event_persist_tx: None,
+            hmac_signer: None,
         }
+    }
+
+    /// Enable HMAC signing for assignment tokens. Builder-style.
+    /// Key loaded by main.rs from `hmac_key_path` config.
+    pub fn with_hmac_signer(mut self, signer: rio_common::hmac::HmacSigner) -> Self {
+        self.hmac_signer = Some(Arc::new(signer));
+        self
     }
 
     /// Inject the event-log persister channel. Call before
