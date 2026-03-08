@@ -149,19 +149,28 @@ Added in protocol 1.32 (always present for 1.37+). This is the primary upload pa
 | `dontCheckSigs` | u64 bool | Skip signature verification (see note below) |
 
 r[gw.opcode.add-multiple.unaligned-frames]
-Followed by a **framed byte stream** containing all entries concatenated. The framed stream is a byte transport --- **entry boundaries do not align with frame boundaries**. A single frame may contain the end of one entry and the beginning of the next, or an entry may span multiple frames. The receiver must:
+Followed by a **framed byte stream** containing a count prefix and all entries concatenated. The framed stream is a byte transport --- **entry boundaries do not align with frame boundaries**. A single frame may contain the end of one entry and the beginning of the next, or an entry may span multiple frames. The receiver must:
 
 1. Reassemble frames into a contiguous byte stream
-2. Parse entries sequentially from the reassembled stream
+2. Read `num_paths: u64` from the start of the reassembled stream
+3. Parse `num_paths` entries sequentially
 
-Each entry in the byte stream contains:
+The reassembled stream begins with:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `pathInfo` | (same fields as wopAddToStoreNar metadata, minus the trailing `repair` and `dontCheckSigs` flags) | Path metadata |
-| NAR data | embedded framed stream | The NAR content (this inner framed stream IS frame-aligned) |
+| `num_paths` | u64 | Number of entries that follow (MUST be bounds-checked against `MAX_COLLECTION_COUNT`) |
+
+Each entry in the reassembled stream contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pathInfo` | (same 9 fields as wopAddToStoreNar metadata, minus the trailing `repair` and `dontCheckSigs` flags) | Path metadata |
+| NAR data | `narSize` plain bytes | The NAR content — **NOT nested-framed**; read `narSize` bytes directly from the reassembled outer stream |
 
 The outer framed stream terminates with a `u64(0)` sentinel.
+
+> **Correction (discovered via VM test):** Earlier versions of this spec described the per-entry NAR as an inner framed stream and omitted the `num_paths` prefix. Both were wrong. Nix's `Store::addMultipleToStore(Source &)` reads `num_paths` first (`readNum<uint64_t>(source)`) and then for each entry calls `addToStore(info, source)` which reads `narSize` plain bytes directly. The bug was masked by a byte-level test written to match the buggy parser rather than the spec.
 
 r[gw.opcode.add-multiple.dont-check-sigs-ignored]
 **`dontCheckSigs` handling:** The gateway reads and discards `dontCheckSigs`. The gateway does not perform signature verification itself; signature enforcement (if any) is delegated to rio-store. The field is consumed to maintain wire compatibility.
@@ -447,11 +456,20 @@ Multiple clients require multiple SSH channels or connections. The gateway multi
 r[gw.dag.reconstruct]
 When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it must reconstruct the full derivation DAG to send to the scheduler via `SubmitBuild`. The algorithm:
 
-1. **During store uploads:** The gateway intercepts each uploaded path. If the path ends in `.drv`, the gateway extracts the `.drv` file from the NAR, parses the ATerm-format derivation, and caches the parsed result in per-session memory (keyed by store path). This applies to all upload opcodes: `wopAddToStore` (7), `wopAddTextToStore` (8), `wopAddToStoreNar` (39), and `wopAddMultipleToStore` (44). For opcodes 7, 8, and 44 the NAR data is already buffered in the handler, so the `.drv` is extracted directly from the buffer. For opcode 39 the NAR is streamed into the store without handler-level buffering, so the gateway reads it back from the store after the write completes.
+1. **During store uploads:** The gateway intercepts each uploaded path. If the path ends in `.drv`, the gateway extracts the `.drv` file from the NAR, parses the ATerm-format derivation, and caches the parsed result in per-session memory (keyed by store path). This applies to all upload opcodes: `wopAddToStore` (7), `wopAddTextToStore` (8), `wopAddToStoreNar` (39), and `wopAddMultipleToStore` (44). In all four cases the NAR data is buffered in the handler before being sent to the store, so the `.drv` is extracted directly from the buffer via `try_cache_drv`.
 2. **On `wopBuildDerivation`/`wopBuildPathsWithResults`:** The gateway identifies all requested derivation paths. For each, it looks up the parsed derivation from the session cache (step 1). If a `.drv` was not uploaded in the current session (e.g., it was uploaded in a previous session and already exists in the store), the gateway fetches it from rio-store via `GetPath`, unpacks the NAR, and parses the ATerm.
-3. **DAG construction:** Starting from the requested derivation(s), the gateway walks `inputDrvs` references recursively to build the full DAG. Derivations whose outputs are already known to be in the store (via `FindMissingPaths`) are included as completed nodes.
+3. **DAG construction:** Starting from the requested derivation(s), the gateway walks `inputDrvs` references recursively (BFS) to build the full DAG. **DAG reconstruction is capped at 10,000 transitive input derivations** (`MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation graphs. The gateway sends the **full DAG** to the scheduler; cache-hit determination (which nodes have outputs already in the store) happens in the scheduler, not here.
 4. **Validation:** Malformed `.drv` files cause `STDERR_ERROR` with type `"Error"` and a descriptive message. Missing `.drv` files (referenced by `inputDrvs` but not in the store) cause `STDERR_ERROR` with type `"Error"`.
 5. **The reconstructed DAG is sent to the scheduler via `SubmitBuild`.** The gateway holds the SSH connection open and converts the `BuildEvent` response stream into STDERR messages for the Nix client.
+
+### Inline .drv Optimization
+
+After DAG construction, the gateway optionally inlines the ATerm content of `.drv` files into the `drv_content` field of each `DerivationNode`. This saves one worker -> store round-trip per dispatched derivation (the `GetPath` fetch). The optimization:
+
+- Is **gated by a single batched `FindMissingPaths` call** over all expected output paths. Only nodes with at least one missing output (i.e., nodes that will actually dispatch) are inlined. Cache-hit nodes stay empty — the scheduler short-circuits them to `Completed` and they never dispatch.
+- Applies a **per-node cap of 64 KB** (`MAX_INLINE_DRV_BYTES`). Larger `.drv` files (e.g., flake inputs serialized into `env`) fall back to worker-fetch.
+- Applies a **total budget of 16 MB** (`INLINE_BUDGET_BYTES`) across all inlined nodes. Once the budget is exhausted, remaining nodes fall back to worker-fetch.
+- Is **best-effort**: on any error (`FindMissingPaths` timeout, store unreachable), inlining is skipped entirely and all nodes fall back to worker-fetch. This is an optimization, not a correctness requirement.
 
 > **Session state:** Although the gateway is described as "stateless beyond the lifetime of a single SSH connection," each SSH channel does accumulate per-session state: the parsed `.drv` cache, the `wopSetOptions` configuration, and the `wopAddTempRoot` set. This state is connection-scoped and discarded when the SSH channel closes.
 
