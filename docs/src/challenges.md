@@ -35,7 +35,7 @@ Workers need a functional `/nix/store`. The FUSE + overlay approach introduces c
 - The FUSE SSD cache requires LRU eviction and disk pressure monitoring
 - The namespace ordering (FUSE mount → overlayfs → nix sandbox) must be correct; see [worker.md](components/worker.md)
 
-**Decided approach:** Each worker runs a FUSE filesystem (`rio-fuse`) that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with the FUSE mount as the lower layer and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [worker.md](components/worker.md) for full details.
+**Decided approach:** Each worker runs a FUSE filesystem (`rio-fuse`) that lazily fetches store paths from rio-store. Each build gets a per-build overlayfs with **stacked lowers** (host `/nix/store` first so nix-daemon and its dependencies are reachable, FUSE mount second for lazily-fetched paths) and a per-build synthetic SQLite database in the upper layer. This avoids shared mutable state, eliminates shared PV infrastructure, and provides local-disk performance via SSD caching. See [worker.md](components/worker.md) for full details.
 
 ## 6. Failure Semantics
 
@@ -67,9 +67,10 @@ The content-addressable store has two failure modes during writes:
 When many workers start simultaneously (scale-up event), all FUSE caches are cold. Every worker needs to fetch the same common dependencies (glibc, coreutils, etc.) from rio-store, creating a thundering herd on the store's S3 backend.
 
 **Mitigations:**
-- Staggered scheduling: the scheduler delays dispatching work to newly-started workers until their FUSE caches are partially warm (via prefetch hints)
-- Cache warming jobs: on worker startup, prefetch the top-N most commonly used store paths before accepting work
-- In-process LRU chunk cache on rio-store reduces S3 round-trips for hot chunks
+- **Implemented:** In-process LRU chunk cache on rio-store (`ChunkCache`, moka-based, default 2 GiB) reduces S3 round-trips for hot chunks
+- **Implemented:** Per-derivation prefetch hints --- scheduler sends input-path prefetch to the assigned worker before dispatch, so the FUSE cache warms during the scheduling window rather than on first `read()`
+
+> **Phase 4 deferral:** Staggered scheduling (delay dispatch to newly-registered workers until prefetch-warm) and startup top-N cache warming jobs are not yet implemented. New workers currently accept work immediately on registration; the in-process chunk cache and per-derivation prefetch absorb most of the thundering herd, but a mass cold-start (all pools scaling from 0) may still spike S3.
 
 ## 10. PostgreSQL as Bottleneck
 
@@ -91,9 +92,12 @@ When rio-store is overloaded or degraded, FUSE cache misses on workers become sl
 4. All workers stall -> scheduler queue depth grows -> controller scales up workers -> more rio-store load
 
 **Mitigations:**
-- FUSE read timeout: the FUSE daemon should timeout individual store fetches (configurable, default: 60s) and return `EIO`, allowing the build to fail with `InfrastructureFailure` rather than hanging indefinitely
-- Scheduler load-shedding: when store health checks fail, the scheduler pauses dispatching new work (backpressure) rather than accumulating stalled builds
-- Circuit breaker on rio-store: workers track consecutive fetch failures and enter a "degraded" state, reported via heartbeat, causing the scheduler to avoid assigning them new work
+- **FUSE fetch timeout:** `fetch_extract_insert` wraps the entire gRPC-fetch-plus-stream-drain in `GRPC_STREAM_TIMEOUT` (300s). A stalled store returns `EIO` to the build rather than blocking a FUSE thread forever. Concurrent-fetch waiters (threads that hit the same path while a fetch is already in flight) time out after 30s and return `EAGAIN` (retryable) --- the wait is defensive, since the fetcher's Drop-guard fires even on panic.
+- **Scheduler cache-check circuit breaker:** the scheduler's `FindMissingPaths` cache-check trips open after 5 consecutive failures (`CacheCheckBreaker`). While open, SubmitBuild is rejected with `StoreUnavailable` instead of queueing every derivation as a cache miss. Half-open probe closes the breaker on the first success; auto-closes after 30s even without a probe.
+- **Scheduler backpressure:** actor-queue-depth hysteresis (80% activate, 60% deactivate) refuses new submissions when the actor is overloaded. Not store-health-aware --- it responds to actor congestion regardless of cause.
+- **Worker leaked-mount refusal:** the worker tracks overlay mounts that failed teardown (`max_leaked_mounts`, default 3) and refuses new builds above the threshold. This bounds FUSE-failure blast radius but does not directly signal store unavailability.
+
+> **Phase 4 deferral:** The worker does not yet track consecutive store-fetch failures or report a "store-degraded" state via heartbeat. The scheduler does not health-check rio-store independently of the cache-check breaker. If the store becomes unreachable mid-build (after SubmitBuild succeeded), workers see `EIO` on FUSE reads and builds fail with `InfrastructureFailure`, but the scheduler will continue dispatching to those workers.
 
 ## 12. Scheduler In-Memory DAG Scalability
 
@@ -107,7 +111,7 @@ The scheduler maintains the entire global DAG in memory via a single-owner actor
 **Mitigations:**
 - Profile memory and throughput during Phase 2c benchmarks (target: 60K-node DAG in < 500MB, actor processes > 1000 ops/sec)
 - Consider offloading compute-heavy operations (critical-path recomputation) to a background task with dirty-flag coalescing
-- Set a per-tenant `max_dag_size` limit (default: 10,000) to bound individual submissions
+- Bound individual submissions: `MAX_DAG_NODES = 100,000` / `MAX_DAG_EDGES = 500,000` --- global compile-time constants (`rio-common/src/limits.rs`), not per-tenant. SubmitBuild rejects DAGs exceeding either limit before merge.
 
 ## 13. FUSE Local I/O Performance
 
@@ -131,11 +135,13 @@ Standard FUSE overhead was 10-50x vs direct reads (p50, varying concurrency 1-16
 
 ## 14. Size-Class Cold Start and Misclassification
 
-When using `WorkerPoolSet` with size-class routing, two related challenges arise:
+> **Phase 4 deferral:** The `WorkerPoolSet` CRD is not yet implemented (see [controller.md](components/controller.md#workerpoolset)). Size-class routing currently works via multiple independent `WorkerPool` CRs with operator-configured cutoffs in `scheduler.toml`.
+
+With size-class routing, two related challenges arise:
 
 **Cold start:** On a fresh deployment with no `build_history` data, all derivations use the operator-configured cutoffs or the default fallback (30s estimate). These initial cutoffs may be wildly wrong for the actual workload, leading to poor classification until sufficient data accumulates. Mitigation: allow operators to seed `build_history` from external sources (e.g., Hydra build logs, previous rio-build deployments), and use conservative initial cutoffs that over-classify into larger classes (wastes resources but avoids OOM kills).
 
-**Misclassification cascades:** A derivation that is consistently misclassified (e.g., a build whose duration depends on network speed for FODs, or on source code changes) creates oscillation: it gets routed to a small class, exceeds the cutoff, gets bumped to large, then gets routed back to small after the EMA decays. Mitigation: track `misclassification_count` per `(pname, system)` and permanently bump after 3 consecutive misclassifications until a successful build on the larger class resets the counter.
+**Misclassification cascades:** A derivation that is consistently misclassified (e.g., a build whose duration depends on network speed for FODs, or on source code changes) creates oscillation: it gets routed to a small class, exceeds the cutoff, gets bumped to large, then gets routed back to small after the EMA decays. **Implemented mitigation: penalty-overwrite** (`r[sched.classify.penalty-overwrite]`) --- when actual duration exceeds 2× the assigned class's cutoff, the scheduler overwrites `ema_duration_secs` with the observed value directly (no alpha-blend). The next `classify()` call sees the real duration and picks the right class. A fluke self-corrects via normal EMA blending on the next successful completion; no consecutive-failure counter is tracked.
 
 **Queue imbalance:** If all ready derivations happen to be "medium" but only "small" workers are idle, derivations queue unnecessarily. Mitigation: overflow routing allows small-class derivations to spill to medium workers when the small queue is empty, but never routes large derivations downward.
 
