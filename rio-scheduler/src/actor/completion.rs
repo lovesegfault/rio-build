@@ -438,10 +438,15 @@ impl DagActor {
                 "scheduling retry after transient failure"
             );
 
-            // TODO(phase3b): delayed re-queue using the computed backoff duration
-            // (K8s-aware retry extends Phase 2a basic retry; see phase3b.md task 12).
-            // Phase 2a re-queues immediately (see docs/src/phases/phase2a.md).
+            // Delayed re-queue: set backoff_until on the state, then
+            // Failed → Ready + push. dispatch_ready checks
+            // backoff_until and defers if not yet elapsed. Stateless
+            // — no timer tasks, no cleanup if the derivation is
+            // cancelled meanwhile (backoff_until is just an Option
+            // on the state, ignored for non-Ready). Cleared on
+            // successful dispatch in assign_to_worker.
             if let Some(state) = self.dag.node_mut(&drv_hash_owned) {
+                state.backoff_until = Some(Instant::now() + backoff);
                 if let Err(e) = state.transition(DerivationStatus::Ready) {
                     warn!(drv_hash = %drv_hash, error = %e, "Failed->Ready transition failed");
                 } else {

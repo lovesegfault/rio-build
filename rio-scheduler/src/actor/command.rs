@@ -201,6 +201,23 @@ pub enum ActorCommand {
         drv_hash: String,
         reply: oneshot::Sender<Option<DebugDerivationInfo>>,
     },
+
+    /// Test-only: force a derivation to Assigned state with the
+    /// given worker, bypassing dispatch + backoff. Used by retry/
+    /// poison tests that need to drive multiple completion cycles
+    /// without waiting for real backoff durations.
+    ///
+    /// Previously those tests relied on immediate re-dispatch after
+    /// failure (the Phase 2a "retry immediately" behavior). With
+    /// Phase 3b backoff + failed_workers exclusion, dispatch won't
+    /// re-assign immediately. This helper lets tests control the
+    /// state machine directly.
+    #[cfg(test)]
+    DebugForceAssign {
+        drv_hash: String,
+        worker_id: WorkerId,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Reply for `ActorCommand::DrainWorker`.

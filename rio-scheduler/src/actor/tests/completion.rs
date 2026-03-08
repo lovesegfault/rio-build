@@ -37,7 +37,10 @@ async fn test_transient_retry_different_worker() -> TestResult {
     )
     .await?;
 
-    // Should be retried: retry_count=1, possibly on a different worker
+    // Should be retried: retry_count=1. Phase 3b: backoff_until
+    // is set so the derivation stays Ready (not immediately re-
+    // dispatched). failed_workers contains first_worker so when
+    // backoff elapses, retry goes to the OTHER worker.
     let info2 = handle
         .debug_query_derivation("retry-hash")
         .await?
@@ -46,21 +49,47 @@ async fn test_transient_retry_different_worker() -> TestResult {
         info2.retry_count, 1,
         "transient failure should increment retry_count"
     );
-    // Note: the retry MAY go to the same worker (no affinity avoidance yet),
-    // but retry_count proves it was processed.
-    assert!(matches!(
-        info2.status,
-        DerivationStatus::Assigned | DerivationStatus::Ready
-    ));
+    // Status: Ready with backoff_until set. NOT Assigned — backoff
+    // blocks immediate re-dispatch (that was the Phase 2a bug where
+    // a 5s backoff was computed but never used). If it IS Assigned,
+    // dispatch raced us between complete_failure and query — still
+    // fine for the test, the worker must be different (failed_
+    // workers exclusion).
+    match info2.status {
+        DerivationStatus::Ready => {
+            // Backoff active: assigned_worker cleared.
+            assert!(
+                info2.assigned_worker.is_none(),
+                "Ready after failure → assigned_worker cleared"
+            );
+        }
+        DerivationStatus::Assigned => {
+            // Raced: dispatch happened. Worker MUST be different
+            // (failed_workers exclusion).
+            let retry_worker = info2.assigned_worker.expect("Assigned → worker set");
+            assert_ne!(
+                retry_worker, first_worker,
+                "failed_workers exclusion: retry must go to a DIFFERENT worker"
+            );
+        }
+        other => panic!("expected Ready or Assigned, got {other:?}"),
+    }
     Ok(())
 }
 
-/// max_retries (default 2) exhausted with the SAME worker should poison.
-/// This branch (retry_count >= max_retries) is distinct from
-/// POISON_THRESHOLD (3 distinct workers) — same worker failing
-/// repeatedly hits max_retries first.
+/// max_retries (default 2) exhausted → poison (the `retry_count >=
+/// max_retries` branch, distinct from POISON_THRESHOLD 3-distinct-
+/// workers).
+///
+/// Phase 3b update: uses `debug_force_assign` between failures.
+/// Previously relied on immediate re-dispatch, but backoff_until
+/// + failed_workers exclusion now prevent the same worker from
+/// getting the derivation back immediately (which is the CORRECT
+/// behavior — same-worker-retry was a bug). The test drives the
+/// state machine directly to test the completion handler's
+/// max_retries logic, not dispatch.
 #[tokio::test]
-async fn test_transient_failure_max_retries_same_worker_poisons() -> TestResult {
+async fn test_transient_failure_max_retries_poisons() -> TestResult {
     let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await?;
 
     let build_id = Uuid::new_v4();
@@ -68,9 +97,21 @@ async fn test_transient_failure_max_retries_same_worker_poisons() -> TestResult 
     let _event_rx =
         merge_single_node(&handle, build_id, "maxretry-hash", PriorityClass::Scheduled).await?;
 
-    // Default RetryPolicy::max_retries = 2. Fail 3 times on same worker:
+    // Default RetryPolicy::max_retries = 2. Fail 3 times:
     // retry_count 0 -> 1 (retry), 1 -> 2 (retry), 2 >= 2 -> Poisoned.
+    //
+    // debug_force_assign before each failure (except the first —
+    // initial dispatch happened) bypasses backoff so the completion
+    // handler sees Assigned state and processes the failure.
     for attempt in 0..3 {
+        if attempt > 0 {
+            // Force back to Assigned: backoff would block real
+            // dispatch, and failed_workers now excludes flaky-worker.
+            let ok = handle
+                .debug_force_assign("maxretry-hash", "flaky-worker")
+                .await?;
+            assert!(ok, "force-assign should succeed for Ready derivation");
+        }
         complete_failure(
             &handle,
             "flaky-worker",
@@ -88,7 +129,7 @@ async fn test_transient_failure_max_retries_same_worker_poisons() -> TestResult 
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
-        "3 transient failures on same worker (retry_count >= max_retries=2) should poison"
+        "3 transient failures (retry_count >= max_retries=2) should poison"
     );
     Ok(())
 }
@@ -111,7 +152,21 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
+    //
+    // debug_force_assign between failures: Phase 3b's backoff_until
+    // prevents immediate re-dispatch after each failure. The test
+    // drives the assignment directly — we're testing the poison-
+    // threshold logic (3 distinct failed_workers → poisoned), not
+    // dispatch timing.
     for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
+        if i > 0 {
+            // After the first failure, dispatch won't re-assign
+            // until backoff elapses. Force it. The worker is
+            // distinct each time so failed_workers exclusion
+            // wouldn't block (if backoff weren't in play).
+            let ok = handle.debug_force_assign(drv_hash, worker).await?;
+            assert!(ok, "force-assign should succeed");
+        }
         complete_failure(
             &handle,
             worker,

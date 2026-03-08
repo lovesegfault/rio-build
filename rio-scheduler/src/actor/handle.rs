@@ -192,4 +192,25 @@ impl ActorHandle {
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
+
+    /// Test-only: force a derivation to Assigned for a given
+    /// worker, bypassing dispatch's backoff + failed_workers
+    /// exclusion. For retry/poison tests that drive multiple
+    /// completion cycles. Returns `false` if the derivation
+    /// couldn't be forced (terminal state, not found).
+    #[cfg(test)]
+    pub async fn debug_force_assign(
+        &self,
+        drv_hash: &str,
+        worker_id: &str,
+    ) -> Result<bool, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugForceAssign {
+            drv_hash: drv_hash.to_string(),
+            worker_id: worker_id.into(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
 }

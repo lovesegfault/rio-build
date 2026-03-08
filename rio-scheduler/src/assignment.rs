@@ -174,6 +174,16 @@ pub fn best_worker(
         .filter(|w| {
             w.has_capacity()
                 && w.can_build(&drv.system, &drv.required_features)
+                // Exclude workers that previously failed this
+                // derivation. failed_workers is populated by
+                // handle_transient_failure (explicit report) AND
+                // reassign_derivations (worker disconnected mid-
+                // build — that's also a failed attempt on THAT
+                // worker's infrastructure). Without this, a
+                // transient fail would re-dispatch to the SAME
+                // broken worker (2-worker cluster with one bad
+                // worker → oscillate forever until poison threshold).
+                && !drv.failed_workers.contains(&w.worker_id)
                 // Size-class filter. If the scheduler is classifying
                 // (target is Some), workers MUST declare a class.
                 // An unclassified worker when the scheduler has
@@ -342,6 +352,40 @@ mod tests {
         let workers = workers_map(vec![make_worker("full", 2, 2)]); // at capacity
         let dag = DerivationDag::new();
         assert_eq!(best_worker(&workers, &make_drv(), &dag, None), None);
+    }
+
+    #[test]
+    fn failed_worker_excluded() {
+        // Two workers, both idle + capable. drv has worker-a in
+        // failed_workers → best_worker MUST pick worker-b. Without
+        // the exclusion, a 2-worker cluster with one broken worker
+        // would oscillate: fail → reassign to same worker → fail
+        // → ... until poison threshold. With exclusion: second
+        // attempt goes to worker-b, succeeds.
+        let workers = workers_map(vec![
+            make_worker("worker-a", 4, 0),
+            make_worker("worker-b", 4, 0),
+        ]);
+        let dag = DerivationDag::new();
+        let mut drv = make_drv();
+        drv.failed_workers.insert("worker-a".into());
+
+        let chosen = best_worker(&workers, &drv, &dag, None);
+        assert_eq!(
+            chosen,
+            Some("worker-b".into()),
+            "worker-a excluded via failed_workers → worker-b is the only candidate"
+        );
+
+        // ALL workers failed → None (caller defers). This is where
+        // poison detection kicks in (failed_workers.len() >= 3 →
+        // handle_transient_failure poisons).
+        drv.failed_workers.insert("worker-b".into());
+        assert_eq!(
+            best_worker(&workers, &drv, &dag, None),
+            None,
+            "all workers in failed_workers → nobody eligible"
+        );
     }
 
     #[test]

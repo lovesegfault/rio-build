@@ -24,6 +24,96 @@ impl DagActor {
             return Ok(false);
         }
 
+        // Before removing interest, find derivations that are Running/
+        // Assigned AND have THIS build as their ONLY interested build.
+        // These need an active cancel — the worker is burning CPU on
+        // them right now. Other derivations (sole-interest but not
+        // yet dispatched, or shared with another build) are handled
+        // by the existing orphan-removal / keep-running paths.
+        //
+        // Collect (drv_path, worker_id) for each such derivation.
+        // drv_path (not drv_hash) because that's what CancelSignal
+        // and the worker's cancel registry are keyed on.
+        let to_cancel: Vec<(DrvHash, String, WorkerId)> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Assigned | DerivationStatus::Running
+                ) && s.interested_builds.len() == 1
+                    && s.interested_builds.contains(&build_id)
+            })
+            .filter_map(|(h, s)| {
+                // assigned_worker should always be Some for Assigned/
+                // Running, but be defensive. h is &str (iter_nodes
+                // returns HashMap's &str keys) — .into() to DrvHash.
+                s.assigned_worker
+                    .as_ref()
+                    .map(|w| (h.into(), s.drv_path().to_string(), w.clone()))
+            })
+            .collect();
+
+        // Send CancelSignal + transition Cancelled. The worker's
+        // cgroup.kill SIGKILLs the daemon tree → run_daemon_build
+        // Errs → worker reports BuildResultStatus::Cancelled →
+        // completion handler is a no-op (we already transitioned).
+        //
+        // try_send (not send): fire-and-forget. If the worker's
+        // stream is full/closed, it's about to disconnect anyway
+        // and reassign_derivations will handle it. The transition
+        // to Cancelled still happens — scheduler-authoritative.
+        for (drv_hash, drv_path, worker_id) in &to_cancel {
+            // Transition FIRST. If it fails (state changed under
+            // us — completion arrived between the collect above and
+            // here), skip the signal — the build finished naturally.
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                if let Err(e) = state.transition(DerivationStatus::Cancelled) {
+                    debug!(drv_hash = %drv_hash, error = %e,
+                           "cancel transition failed (completion raced us), skipping signal");
+                    continue;
+                }
+                state.assigned_worker = None;
+            }
+            if let Some(worker) = self.workers.get(worker_id)
+                && let Some(tx) = &worker.stream_tx
+            {
+                let _ = tx.try_send(rio_proto::types::SchedulerMessage {
+                    msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
+                        rio_proto::types::CancelSignal {
+                            drv_path: drv_path.clone(),
+                            reason: format!("build {build_id} cancelled: {reason}"),
+                        },
+                    )),
+                });
+            }
+            // Remove from worker's running set — it's no longer
+            // counted against their capacity. They'll re-report it
+            // on next heartbeat but our reconcile logic keeps
+            // scheduler-authoritative.
+            if let Some(worker) = self.workers.get_mut(worker_id) {
+                worker.running_builds.remove(drv_hash);
+            }
+            // Persist. fire-and-forget via db; completion handler's
+            // no-op for Cancelled means no double-write.
+            if let Err(e) = self
+                .db
+                .update_derivation_status(drv_hash, DerivationStatus::Cancelled, None)
+                .await
+            {
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist Cancelled status");
+            }
+        }
+        if !to_cancel.is_empty() {
+            info!(
+                build_id = %build_id,
+                count = to_cancel.len(),
+                "sent CancelSignal to workers for sole-interest in-flight derivations"
+            );
+            metrics::counter!("rio_scheduler_cancel_signals_sent_total")
+                .increment(to_cancel.len() as u64);
+        }
+
         // Remove build interest from derivations
         let orphaned = self.dag.remove_build_interest(build_id);
 

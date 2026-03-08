@@ -233,6 +233,27 @@ pub struct DerivationState {
     pub db_id: Option<Uuid>,
     /// When the derivation entered Ready state (for assignment latency metric).
     pub(crate) ready_at: Option<Instant>,
+    /// Earliest time this derivation may be dispatched. Set by
+    /// handle_transient_failure to implement the retry backoff —
+    /// the derivation is Ready and in the queue, but dispatch_ready
+    /// defers it if `Instant::now() < backoff_until`.
+    ///
+    /// Why not a timer-based requeue: timers need a scheduled task
+    /// per deferred derivation + cleanup if the derivation
+    /// transitions meanwhile (cancelled, DAG reload). Putting the
+    /// deadline ON the state and checking in dispatch_ready is
+    /// stateless — the existing defer-and-requeue pattern handles
+    /// it. Cost: one Instant::now() comparison per Ready-pop for
+    /// derivations that have backoff set (only transient-failures).
+    ///
+    /// Cleared on successful dispatch (assign_to_worker).
+    pub backoff_until: Option<Instant>,
+    /// When the derivation entered Running state. For the backstop
+    /// timeout: handle_tick checks this + est_duration × 3 (clamped
+    /// to daemon_timeout + slack). A build that's been Running far
+    /// longer than expected is likely stuck (worker heartbeating
+    /// but daemon wedged, or the worker's clock jumped).
+    pub(crate) running_since: Option<Instant>,
 }
 
 impl DerivationState {
@@ -272,6 +293,8 @@ impl DerivationState {
             priority: 0.0,
             db_id: None,
             ready_at: None,
+            backoff_until: None,
+            running_since: None,
         })
     }
 
@@ -305,6 +328,13 @@ impl DerivationState {
         // Track ready_at for assignment latency metric
         if to == DerivationStatus::Ready {
             self.ready_at = Some(Instant::now());
+        }
+        // Track running_since for backstop timeout. Running → any
+        // transition clears it (next Assigned → Running sets fresh).
+        if to == DerivationStatus::Running {
+            self.running_since = Some(Instant::now());
+        } else if from == DerivationStatus::Running {
+            self.running_since = None;
         }
 
         Ok(from)

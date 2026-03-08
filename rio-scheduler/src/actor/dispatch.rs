@@ -44,6 +44,19 @@ impl DagActor {
                 if state.status() != DerivationStatus::Ready {
                     continue;
                 }
+                // Retry backoff: if set and not yet elapsed, defer.
+                // The derivation stays Ready + in queue (re-pushed
+                // at the end of the pass with the other deferred).
+                // Next dispatch pass re-checks — convergent without
+                // timers. Cheap: one Instant::now() only for
+                // derivations that failed transiently (backoff_until
+                // is None for fresh ones).
+                if let Some(deadline) = state.backoff_until
+                    && Instant::now() < deadline
+                {
+                    deferred.push(drv_hash);
+                    continue;
+                }
 
                 // Classify by estimated duration + memory. None if
                 // size_classes unconfigured (optional feature off —
@@ -219,6 +232,12 @@ impl DagActor {
                 metrics::histogram!("rio_scheduler_assignment_latency_seconds")
                     .record(latency.as_secs_f64());
             }
+            // Clear retry-backoff deadline: we're dispatching, the
+            // backoff has been honored (dispatch_ready wouldn't
+            // have let us here otherwise). Next failure gets a
+            // fresh computed backoff from the (incremented)
+            // retry_count.
+            state.backoff_until = None;
             state.assigned_worker = Some(worker_id.clone());
         }
 

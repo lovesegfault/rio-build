@@ -406,6 +406,48 @@ impl DagActor {
                     });
                     let _ = reply.send(info);
                 }
+                #[cfg(test)]
+                ActorCommand::DebugForceAssign {
+                    drv_hash,
+                    worker_id,
+                    reply,
+                } => {
+                    // Force Ready→Assigned (or Failed→Ready→Assigned)
+                    // bypassing backoff + failed_workers exclusion.
+                    // For retry/poison tests that need to drive
+                    // multiple completion cycles without waiting
+                    // for real backoff. Clears backoff_until.
+                    let ok = if let Some(state) = self.dag.node_mut(&drv_hash) {
+                        // If not already Ready, try to get there.
+                        // Assigned/Running → reset_to_ready, Failed →
+                        // transition Ready, Ready → no-op.
+                        let prepped = match state.status() {
+                            DerivationStatus::Ready => true,
+                            DerivationStatus::Assigned | DerivationStatus::Running => {
+                                state.reset_to_ready().is_ok()
+                            }
+                            DerivationStatus::Failed => {
+                                state.transition(DerivationStatus::Ready).is_ok()
+                            }
+                            _ => false, // terminal or pre-Ready: can't force
+                        };
+                        if prepped {
+                            state.backoff_until = None;
+                            state.assigned_worker = Some(worker_id.clone());
+                            // Add to worker's running set so subsequent
+                            // complete_failure finds a consistent state.
+                            if let Some(w) = self.workers.get_mut(&worker_id) {
+                                w.running_builds.insert((&*drv_hash).into());
+                            }
+                            state.transition(DerivationStatus::Assigned).is_ok()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let _ = reply.send(ok);
+                }
             }
         }
 

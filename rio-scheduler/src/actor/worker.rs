@@ -4,6 +4,29 @@
 
 use super::*;
 
+/// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
+/// timeout). A build can't legitimately run longer than this — the
+/// worker would have killed the daemon already. The scheduler-side
+/// check at this floor is belt-and-suspenders for "worker heartbeating
+/// but not enforcing its own timeout" (worker bug or clock skew).
+///
+/// Same cfg(test) shadow pattern as POISON_TTL: 7200s in prod (matches
+/// worker's daemon_timeout default), short in tests so backstop can be
+/// observed without waiting 2h.
+#[cfg(not(test))]
+const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 7200;
+#[cfg(test)]
+const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 0; // tests control via est_duration
+
+/// Slack on top of BACKSTOP_DAEMON_TIMEOUT_SECS. The worker's timeout
+/// fires → daemon killed → CompletionReport sent → scheduler receives
+/// → completion handler runs. 10 minutes covers that round-trip plus
+/// gRPC retry/reconnect slack.
+#[cfg(not(test))]
+const BACKSTOP_SLACK_SECS: u64 = 600;
+#[cfg(test)]
+const BACKSTOP_SLACK_SECS: u64 = 0;
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Worker management
@@ -45,11 +68,13 @@ impl DagActor {
         // gone; whether it was draining or not doesn't matter now.
         // Clone the set so we can call reassign (which borrows self mut).
         let to_reassign: Vec<DrvHash> = worker.running_builds.iter().cloned().collect();
-        self.reassign_derivations(&to_reassign).await;
+        self.reassign_derivations(&to_reassign, Some(worker_id))
+            .await;
 
         if was_registered {
             metrics::gauge!("rio_scheduler_workers_active").decrement(1.0);
         }
+        metrics::counter!("rio_scheduler_worker_disconnects_total").increment(1);
     }
 
     /// Reset a set of derivations to Ready and re-enqueue.
@@ -64,7 +89,24 @@ impl DagActor {
     /// derivation in any other state (Completed, Poisoned, DepFailed) is
     /// skipped with a warn — it shouldn't be in `running_builds` but
     /// split-brain or delayed heartbeat reconcile can produce it.
-    async fn reassign_derivations(&mut self, drv_hashes: &[DrvHash]) {
+    ///
+    /// `lost_worker`: if Some, record it in each derivation's
+    /// `failed_workers` set. This feeds:
+    /// - `best_worker()` exclusion (don't retry on the SAME broken
+    ///   worker — it just disconnected, clearly something is wrong
+    ///   there)
+    /// - Poison detection (3 distinct failed workers → poisoned).
+    ///   Previously worker disconnect DIDN'T feed poison detection,
+    ///   so a derivation that crashed 3 workers in a row would
+    ///   loop forever (each crash = reassign = fresh attempt).
+    ///
+    /// `None` for callers that don't have a specific lost worker
+    /// (none currently, but keeps the signature extensible).
+    async fn reassign_derivations(
+        &mut self,
+        drv_hashes: &[DrvHash],
+        lost_worker: Option<&WorkerId>,
+    ) {
         for drv_hash in drv_hashes {
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.reset_to_ready() {
@@ -77,6 +119,14 @@ impl DagActor {
                 // Worker-loss mid-build is a failed attempt: count it.
                 // retry_count → poison threshold (3 different workers).
                 state.retry_count += 1;
+                // Track the lost worker. Feeds best_worker exclusion
+                // AND poison detection (failed_workers.len() >=
+                // POISON_THRESHOLD → poisoned in handle_transient_
+                // failure). A worker that crashes mid-build counts
+                // as a distinct-worker failure.
+                if let Some(worker_id) = lost_worker {
+                    state.failed_workers.insert(worker_id.clone());
+                }
                 if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
                 }
@@ -150,23 +200,68 @@ impl DagActor {
         }
 
         if force {
-            // Reassign in-flight. The worker's nix-daemon is still
-            // running these builds (we can't reach into its process
-            // tree), but we stop caring about the result and redispatch.
-            // Wasteful but unblocks forward progress when a worker is
-            // wedged-but-heartbeating.
-            //
-            // Clone the set out before calling reassign (borrows self
-            // mut through dag.node_mut). Then clear the worker's set —
-            // it's not running anything WE care about anymore. If the
-            // worker later sends CompletionReports for these, the
-            // completion handler's "unknown drv_hash" path drops them
-            // (the DAG node has a different assigned_worker by then).
+            // Clone the set + capture stream_tx before reassign
+            // (borrows self mut). We'll send CancelSignal for each
+            // AFTER we know the drv_paths (which needs DAG lookup).
             let to_reassign: Vec<DrvHash> = worker.running_builds.drain().collect();
-            // NOTE: worker borrow drops here (before the await). No
-            // await-holding-lock concern — workers is a plain HashMap,
-            // not a Mutex.
-            self.reassign_derivations(&to_reassign).await;
+            let stream_tx = worker.stream_tx.clone();
+
+            // Send CancelSignal for each in-flight build BEFORE
+            // reassigning. This is the preemption hook: when the
+            // controller sees DisruptionTarget condition on a pod,
+            // it calls DrainWorker(force=true). The CancelSignal
+            // makes the worker SIGKILL its builds immediately (via
+            // cgroup.kill) instead of letting them run for the
+            // full terminationGracePeriodSeconds (2h — wasted if
+            // the pod is evicting anyway).
+            //
+            // try_send: best-effort. If the stream is full/closed,
+            // the worker is about to disconnect anyway. reassign_
+            // derivations below still redispatches regardless.
+            //
+            // Look up drv_paths from the DAG (CancelSignal is keyed
+            // on drv_path, not drv_hash). Skip derivations that
+            // aren't in the DAG (shouldn't happen but be defensive).
+            if let Some(tx) = &stream_tx {
+                for drv_hash in &to_reassign {
+                    let Some(drv_path) = self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
+                    else {
+                        continue;
+                    };
+                    let _ = tx.try_send(rio_proto::types::SchedulerMessage {
+                        msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
+                            rio_proto::types::CancelSignal {
+                                drv_path,
+                                reason: "worker draining (forced)".into(),
+                            },
+                        )),
+                    });
+                }
+                if !to_reassign.is_empty() {
+                    info!(
+                        worker_id = %worker_id,
+                        count = to_reassign.len(),
+                        "sent CancelSignal for force-drain (preemption)"
+                    );
+                    metrics::counter!("rio_scheduler_cancel_signals_sent_total")
+                        .increment(to_reassign.len() as u64);
+                }
+            }
+
+            // Reassign. Worker later sends CompletionReport{Cancelled};
+            // completion handler's Cancelled arm is a no-op (status
+            // already Ready after reassign, not Assigned/Running — the
+            // "not in assigned/running state, ignoring" warn fires.
+            // That's fine — the warn documents the expected behavior).
+            //
+            // Pass the drained worker's ID so reassigned derivations
+            // track it in failed_workers. A force-drained worker is
+            // "failed" for these builds in the sense that it didn't
+            // finish them — exclude it from retry consideration
+            // (moot since it's draining anyway, but consistent with
+            // the disconnect path and feeds poison detection).
+            self.reassign_derivations(&to_reassign, Some(worker_id))
+                .await;
 
             return DrainResult {
                 accepted: true,
@@ -348,13 +443,105 @@ impl DagActor {
         }
 
         // Check for poisoned derivations that should expire (24h TTL)
+        // + backstop timeout for stuck-Running derivations.
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
+        // (drv_hash, drv_path, worker_id) for backstop-timed-out builds
+        let mut backstop_timeouts: Vec<(DrvHash, String, WorkerId)> = Vec::new();
+
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
                 && let Some(poisoned_at) = state.poisoned_at
                 && now.duration_since(poisoned_at) > POISON_TTL
             {
                 expired_poisons.push(drv_hash.into());
+            }
+
+            // Backstop timeout: a build that's been Running far
+            // longer than expected is likely stuck (worker still
+            // heartbeating but daemon wedged, or the worker's
+            // clock jumped). Send CancelSignal + reset to Ready.
+            //
+            // Threshold: max(est_duration × 3, 7200s + 600s). The
+            // first term catches builds that exceed their estimate
+            // by 3×; the second is a floor at daemon_timeout + 10
+            // minutes slack (even with no estimate, a build can't
+            // legitimately run longer than the daemon timeout
+            // plus some grace for reporting). 7200 = DEFAULT_
+            // DAEMON_TIMEOUT; 600 = arbitrary slack.
+            if state.status() == DerivationStatus::Running
+                && let Some(running_since) = state.running_since
+            {
+                let elapsed = now.duration_since(running_since);
+                // est_duration is in seconds (f64). 0.0 = no
+                // estimate (fresh derivation, estimator had no
+                // history) → floor applies.
+                let est_3x_secs = (state.est_duration * 3.0).max(0.0);
+                let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
+                let backstop_secs = est_3x_secs.max(floor_secs);
+
+                if elapsed.as_secs_f64() > backstop_secs
+                    && let Some(worker_id) = &state.assigned_worker
+                {
+                    backstop_timeouts.push((
+                        drv_hash.into(),
+                        state.drv_path().to_string(),
+                        worker_id.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Process backstop timeouts: send CancelSignal, reset to
+        // Ready for retry. This is a TRANSIENT failure (the build
+        // may work fine on another worker or even the same worker
+        // after a restart) so we go through retry not poison.
+        for (drv_hash, drv_path, worker_id) in &backstop_timeouts {
+            warn!(
+                drv_hash = %drv_hash,
+                worker_id = %worker_id,
+                "backstop timeout: build running far longer than expected, cancelling + retrying"
+            );
+            metrics::counter!("rio_scheduler_backstop_timeouts_total").increment(1);
+
+            // CancelSignal: worker's cgroup.kill. Best-effort
+            // try_send — if the worker is truly wedged its stream
+            // may be full; reset_to_ready below still progresses.
+            if let Some(worker) = self.workers.get(worker_id)
+                && let Some(tx) = &worker.stream_tx
+            {
+                let _ = tx.try_send(rio_proto::types::SchedulerMessage {
+                    msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
+                        rio_proto::types::CancelSignal {
+                            drv_path: drv_path.clone(),
+                            reason: "backstop timeout (stuck build)".into(),
+                        },
+                    )),
+                });
+            }
+            // Remove from worker's running set (we're taking it back).
+            if let Some(worker) = self.workers.get_mut(worker_id) {
+                worker.running_builds.remove(drv_hash);
+            }
+            // Reset + track failed worker + requeue. Same pattern
+            // as reassign_derivations (worker disconnect).
+            if let Some(state) = self.dag.node_mut(drv_hash) {
+                if let Err(e) = state.reset_to_ready() {
+                    warn!(drv_hash = %drv_hash, error = %e, "backstop reset failed");
+                    continue;
+                }
+                state.retry_count += 1;
+                state.failed_workers.insert(worker_id.clone());
+                self.push_ready(drv_hash.clone());
+            }
+            if let Err(e) = self.db.increment_retry_count(drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
+            }
+            if let Err(e) = self
+                .db
+                .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
+                .await
+            {
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready after backstop");
             }
         }
 
