@@ -26,31 +26,36 @@
    -> forwards to rio-scheduler via gRPC SubmitBuild
 10. rio-scheduler:
     a. Queries rio-store for cache hits (already-built outputs)
-    b. For CA derivations: content-indexed lookup for early cutoff
-    c. Computes remaining build graph
-    d. Computes critical-path priorities
-    e. Dispatches ready derivations to workers
+    b. Computes remaining build graph
+    c. Computes critical-path priorities
+    d. Dispatches ready derivations to workers
 11. For each dispatched derivation:
-    a. Worker's FUSE daemon checks local SSD cache for input paths (fast path)
-    b. Cache miss: FUSE daemon fetches from rio-store via gRPC, caches on SSD
-    c. Worker executes build in nix sandbox (overlay-merged /nix/store)
-    d. Worker streams build logs to scheduler via bidirectional
+    a. Scheduler sends PrefetchHint (anticipated input paths) on the
+       BuildExecution stream so the worker can pre-warm its FUSE cache
+    b. Worker's FUSE daemon checks local SSD cache for input paths (fast path)
+    c. Cache miss: FUSE daemon fetches from rio-store via gRPC, caches on SSD
+    d. Worker executes build in nix sandbox (overlay-merged /nix/store)
+    e. Worker streams build logs to scheduler via bidirectional
        BuildExecution stream (log lines batched for efficiency)
        Scheduler relays logs to gateway via BuildEvent stream (from SubmitBuild)
        Gateway converts to STDERR_NEXT messages for the Nix client
-    e. Worker chunks output NAR via FastCDC, uploads to rio-store
-    f. Worker reports completion to scheduler
-    g. Scheduler checks CA early cutoff: does output match existing content?
-       - If yes: skip downstream rebuilds, return cached outputs
-       - If no: store new content, release downstream nodes
+    f. Worker streams output NAR via PutPath; rio-store chunks via
+       FastCDC on the server side (workers never chunk locally)
+    g. Worker reports completion to scheduler
+    h. Scheduler stores completion, releases downstream nodes
 12. When top-level derivation completes:
     a. Scheduler notifies gateway
     b. Gateway sends STDERR_LAST + BuildResult to Nix client
     c. Client requests wopNarFromPath for outputs
-       -> NAR data is streamed via STDERR_WRITE messages inside the
-          STDERR loop, not as a direct payload after STDERR_LAST.
+       -> Gateway sends STDERR_LAST first, then writes the NAR as raw
+          bytes directly (no STDERR framing). The Nix client's
+          processStderr(ex) has no sink argument for this opcode, so
+          STDERR_WRITE would fail with 'error: no sink'. See
+          rio-gateway/src/handler/opcodes_read.rs.
     d. Gateway streams NAR (reassembled from chunks) back to client
 ```
+
+> **Phase 5 deferral:** CA early cutoff (content-indexed lookup to skip downstream rebuilds when a CA derivation produces an output matching an existing realisation) is not implemented. The scheduler currently treats all completions uniformly and releases downstream nodes unconditionally. See [Phase 5](phases/phase5.md).
 
 See [rio-gateway](./components/gateway.md) for protocol opcode details, [rio-scheduler](./components/scheduler.md) for the scheduling algorithm, and [rio-store](./components/store.md) for the chunked CAS.
 
@@ -65,14 +70,14 @@ sequenceDiagram
     Client->>GW: SSH connect + handshake
     Client->>GW: wopSetOptions
     Client->>GW: wopQueryValidPaths
-    GW->>Store: QueryPathInfo
-    Store-->>GW: PathInfo results
-    GW-->>Client: valid paths
+    GW->>Store: FindMissingPaths
+    Store-->>GW: missing paths
+    GW-->>Client: valid paths (inverted)
     Client->>GW: wopAddToStoreNar (.drv files)
     GW->>Store: PutPath
     Client->>GW: wopQueryDerivationOutputMap
-    GW->>Store: QueryPathInfo
-    Store-->>GW: output map
+    GW->>Store: GetPath (.drv NAR)
+    GW->>GW: parse ATerm -> output map
     GW-->>Client: derivation output map
     Client->>GW: wopBuildDerivation
     GW->>Sched: SubmitBuild (DAG)
@@ -144,13 +149,18 @@ sequenceDiagram
 3. Gateway sends CancelBuild to scheduler with reason="client_disconnect"
 4. Scheduler policy:
    a. For derivations shared with other active builds: continue building
-   b. For derivations unique to this build: mark as orphaned
-   c. Orphaned derivations timeout after configurable period (default: 5 minutes)
-   d. If client reconnects and re-submits before timeout, work is reattached
-5. Workers building orphaned derivations: allowed to complete current build
-   (wasted work is bounded by one derivation per worker)
-6. Completed outputs remain in rio-store regardless of client state
+      (the DAG merge logic keeps shared derivation nodes live as long as
+      at least one interested build remains)
+   b. For derivations unique to this build: removed from the queue
+      immediately. If already Running, the worker is allowed to complete
+      (wasted work is bounded by one derivation per worker)
+5. Completed outputs remain in rio-store regardless of client state
+6. If the client reconnects and re-submits, the scheduler's DAG merge
+   re-inserts the derivations. Any outputs already stored in step 5 are
+   cache hits (instant completion via FindMissingPaths)
 ```
+
+> **Phase deferral:** There is no orphan timeout window or explicit "reattach" mechanism. Reconnection safety comes entirely from (a) shared-derivation DAG merge and (b) cache hits on already-stored outputs. A timed orphan grace period is not currently planned.
 
 ```mermaid
 sequenceDiagram
@@ -164,12 +174,12 @@ sequenceDiagram
     alt Shared derivation
         Sched->>Sched: continue (other builds need it)
     else Unique derivation
-        Sched->>Sched: mark orphaned (5m timeout)
+        Sched->>Sched: remove from queue immediately
     end
-    Worker->>Sched: CompletionReport (if still running)
+    Worker->>Sched: CompletionReport (if already Running)
     Note over Sched: Outputs kept in store regardless
     Client->>GW: Reconnect + re-submit
-    Sched->>Sched: reattach if within timeout
+    Sched->>Sched: DAG merge + cache hits on stored outputs
 ```
 
 ## Scheduler Failover
@@ -181,15 +191,15 @@ sequenceDiagram
 4. Workers detect stream break, reconnect BuildExecution streams to new leader
 5. For gateway connections with active SubmitBuild streams:
    a. The SubmitBuild response stream (BuildEvent) breaks with a gRPC error
-   b. Gateway must call WatchBuild(build_id, since_sequence) on the new leader
-      to resume the BuildEvent stream from where it left off
-   c. The gateway maintains a per-session mapping of (SSH channel -> build_id)
-      so it can re-subscribe after failover
-   d. If the gateway itself also restarted, see Client Disconnection above
-      (client reconnects and re-submits; scheduler reattaches)
-6. Log events between the old leader's crash and the WatchBuild reconnection
-   may be lost unless log persistence is configured (see observability.md)
+   b. The gateway currently returns a MiscFailure BuildResult to the Nix
+      client. The client must re-run nix build; the scheduler's DAG merge
+      and cache hits on already-stored outputs make the retry cheap
+   c. If the gateway itself also restarted, see Client Disconnection above
+6. Log events between the old leader's crash and the client retry may be
+   lost unless log persistence is configured (see observability.md)
 ```
+
+> **Phase 3b deferral:** Gateway-side `WatchBuild(build_id, since_sequence)` re-subscription after scheduler failover is not yet implemented. The gateway does not maintain a per-session `(SSH channel -> build_id)` mapping for transparent failover. Until Phase 3b, scheduler restarts are surfaced to the Nix client as a transient build failure. See [Phase 3b](phases/phase3b.md).
 
 ## Import-From-Derivation (IFD)
 
@@ -213,4 +223,4 @@ IFD occurs when Nix evaluation depends on a build result. The flow is:
    primary channel --- the IFD derivation is already cached (instant hit)
 ```
 
-> **Detection heuristic:** The scheduler detects IFD builds because they arrive as individual `wopBuildDerivation` calls on a separate SSH channel, typically before the full DAG is submitted on another channel. The gateway can annotate the `SubmitBuildRequest` with `is_ifd_hint = true` based on the session context (single derivation, no prior `wopQueryValidPaths` on this channel).
+> **Detection heuristic:** IFD builds arrive as individual `wopBuildDerivation` calls, typically before the full DAG is submitted via `wopBuildPathsWithResults`. The gateway annotates the `SubmitBuildRequest` with `priority_class = "interactive"` when the session has not yet seen a `wopBuildPathsWithResults` call (see `rio-gateway/src/handler/build.rs`). There is no dedicated `is_ifd_hint` field; priority classification is conveyed entirely through `priority_class`.
