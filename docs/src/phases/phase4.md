@@ -6,13 +6,11 @@
 
 ## Tasks
 
-- [ ] OpenTelemetry distributed tracing across all components
-  - Trace spans: build submission -> scheduling -> worker assignment -> build execution -> output upload
-  - Propagate trace context through gRPC and worker protocol
-- [ ] Prometheus metrics
-  - Build times (p50, p95, p99), queue depth, cache hit rates
-  - Chunk deduplication ratio, transfer volumes, worker utilization
-  - Scheduler: critical path accuracy, assignment latency
+- [ ] OpenTelemetry distributed tracing — **completion pass**
+  - W3C traceparent propagation across gRPC hops is implemented (Phase 2b: `rio-proto/src/interceptor.rs` + `rio-common/src/observability.rs`). Remaining work: audit span coverage (every user-visible latency path should have an `#[instrument]` span), add `link_parent()` calls to any handlers missing them, and verify end-to-end traces in Tempo for a real multi-worker build.
+  - Propagate trace context through the **Nix worker protocol** (SSH channel, not gRPC — needs a side-band or STDERR metadata frame).
+- [ ] Prometheus metrics — **completion pass**
+  - Most metrics are already emitted (build times, queue depth, cache hits, dedup ratio, assignment latency, critical path accuracy — see [observability.md](../observability.md)). Remaining work: transfer volume metrics (bytes sent/received per component), worker utilization (cpu/mem fraction gauges), and Grafana dashboard JSON for the existing metrics.
 - [ ] Enhanced structured logging (extend Phase 2b correlation IDs with full distributed tracing pipeline)
 - [ ] Store garbage collection
   - Path-level GC: mark-and-sweep from GC roots (automated scheduling)
