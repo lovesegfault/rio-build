@@ -46,3 +46,15 @@ workspace = true
 tempfile = { workspace = true }
 # figment::Jail (test-only env/cwd manipulation under a global mutex)
 figment = { workspace = true, features = ["test"] }
+# In-memory cert generation for mTLS integration test. Generates
+# a CA + client/server leaf certs without touching disk — proves
+# the load_server_tls/load_client_tls output actually works in a
+# real tonic handshake.
+rcgen = { workspace = true }
+# TcpListenerStream for test server.
+tokio-stream = { workspace = true, features = ["net"] }
+# Health service used as a trivial gRPC service to hit in the
+# integration test. Already in workspace deps.
+tonic-health = { workspace = true }
+# Direct rustls access for CryptoProvider install in tests.
+rustls = { workspace = true }
