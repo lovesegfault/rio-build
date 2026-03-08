@@ -38,6 +38,13 @@ struct Config {
     /// No CLI override — this is structural deploy config, not a knob
     /// you tweak per-invocation. Change it in scheduler.toml.
     size_classes: Vec<rio_scheduler::SizeClassConfig>,
+    /// Plaintext health listen address for K8s probes when mTLS is on.
+    /// Shares the same HealthReporter as the main server → leadership
+    /// toggles propagate. Only listens if server TLS is configured.
+    health_addr: std::net::SocketAddr,
+    /// mTLS for BOTH server (workers, gateway, controller incoming)
+    /// AND client (store outgoing). Set via `RIO_TLS__*`.
+    tls: rio_common::tls::TlsConfig,
 }
 
 impl Default for Config {
@@ -51,6 +58,10 @@ impl Default for Config {
             log_s3_bucket: None,
             log_s3_prefix: "logs".into(),
             size_classes: Vec::new(),
+            // 9101 = gRPC (9001) + 100. Same +100 pattern as
+            // gateway. Only used when server TLS is configured.
+            health_addr: "0.0.0.0:9101".parse().unwrap(),
+            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -109,6 +120,18 @@ async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("scheduler", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("scheduler")?;
+
+    // Client TLS init BEFORE connect_store. One config, all outgoing
+    // connections. server_name is a fallback; K8s DNS addressing
+    // means :authority from the URL ("rio-store") is the actual SAN
+    // match, so this just needs to be A valid SAN of SOME target.
+    rio_proto::client::init_client_tls(
+        rio_common::tls::load_client_tls(&cfg.tls, "rio-store")
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
+    );
+    if cfg.tls.is_configured() {
+        info!("client mTLS enabled for outgoing gRPC");
+    }
 
     anyhow::ensure!(
         !cfg.store_addr.is_empty(),

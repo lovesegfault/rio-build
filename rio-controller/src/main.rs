@@ -47,6 +47,11 @@ struct Config {
     autoscaler_poll_secs: u64,
     autoscaler_scale_up_window_secs: u64,
     autoscaler_min_interval_secs: u64,
+    /// mTLS client config for outgoing gRPC (scheduler + store).
+    /// Set via `RIO_TLS__*`. The controller's K8s API connection
+    /// has its own TLS (kube client, in-cluster service account
+    /// CA) — this is only for rio-internal gRPC.
+    tls: rio_common::tls::TlsConfig,
 }
 
 impl Default for Config {
@@ -65,6 +70,7 @@ impl Default for Config {
             autoscaler_poll_secs: 30,
             autoscaler_scale_up_window_secs: 30,
             autoscaler_min_interval_secs: 30,
+            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -107,6 +113,18 @@ async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("controller", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("controller")?;
+
+    // Client TLS init BEFORE connect_admin. The controller connects
+    // lazily per-reconcile (Ctx holds String addrs) — all those
+    // connect calls go through rio_proto::client::connect_* which
+    // reads this OnceLock.
+    rio_proto::client::init_client_tls(
+        rio_common::tls::load_client_tls(&cfg.tls, "rio-scheduler")
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
+    );
+    if cfg.tls.is_configured() {
+        info!("client mTLS enabled for outgoing gRPC");
+    }
 
     anyhow::ensure!(
         !cfg.scheduler_addr.is_empty(),

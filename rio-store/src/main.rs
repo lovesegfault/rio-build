@@ -67,6 +67,18 @@ struct Config {
     /// None = don't spawn. Separate from listen_addr (that's gRPC);
     /// Nix clients hit this with plain HTTP GETs.
     cache_http_addr: Option<std::net::SocketAddr>,
+    /// Plaintext gRPC health listen address. K8s gRPC probes can't
+    /// do mTLS, so when server TLS is enabled, the main port's
+    /// health check is unreachable to K8s. This spawns a second
+    /// tonic server with ONLY `grpc.health.v1.Health`, plaintext,
+    /// sharing the SAME HealthReporter so status toggles propagate.
+    /// Only listens if server TLS is configured — plaintext main
+    /// port already serves health, no second listener needed.
+    health_addr: std::net::SocketAddr,
+    /// mTLS for both server (incoming gRPC) and client (none
+    /// currently — store doesn't dial out via rio-proto, only
+    /// S3 which has its own auth). Set via `RIO_TLS__*`.
+    tls: rio_common::tls::TlsConfig,
 }
 
 impl Default for Config {
@@ -82,6 +94,10 @@ impl Default for Config {
             chunk_cache_capacity_bytes: 2 * 1024 * 1024 * 1024,
             signing_key_path: None,
             cache_http_addr: None,
+            // 9102 = gRPC (9002) + 100. Same +100 pattern as
+            // gateway (9090→9190). Only used when TLS is on.
+            health_addr: "0.0.0.0:9102".parse().unwrap(),
+            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -110,6 +126,13 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls CryptoProvider install. Phase 3b enables tonic
+    // tls-aws-lc; without this, first TLS handshake panics.
+    // Store is a gRPC SERVER (incoming TLS) — the S3 client has
+    // its own TLS stack (aws-sdk's rustls) but it's the same
+    // aws-lc-rs feature, so one install covers both.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("store", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("store")?;

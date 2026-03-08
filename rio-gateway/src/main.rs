@@ -36,6 +36,11 @@ struct Config {
     /// health is gRPC. Could multiplex with tonic's accept_http1 +
     /// a route, but that's more complexity than a second listener.
     health_addr: std::net::SocketAddr,
+    /// mTLS: client cert + key + CA for outgoing gRPC connections
+    /// (scheduler + store). Set via `RIO_TLS__CERT_PATH` etc. Unset
+    /// = plaintext (dev mode). The gateway's INCOMING connections
+    /// are SSH — TLS doesn't apply there.
+    tls: rio_common::tls::TlsConfig,
 }
 
 impl Default for Config {
@@ -57,6 +62,7 @@ impl Default for Config {
             // Gateway has no gRPC port so needs its own. The +100
             // pattern keeps it discoverable without a doc lookup.
             health_addr: "0.0.0.0:9190".parse().unwrap(),
+            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }
@@ -105,9 +111,47 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls CryptoProvider MUST be installed before any TLS use.
+    // tonic's tls-aws-lc feature (Phase 3b) enables aws-lc-rs; without
+    // this install_default, rustls can't auto-select and panics on
+    // first handshake. Gateway's outgoing gRPC (scheduler + store)
+    // is the TLS user here — incoming is SSH.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("gateway", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("gateway")?;
+
+    // Initialize the process-global client TLS config BEFORE any
+    // connect_* call. None (TLS unconfigured) → plaintext. Some →
+    // https + client cert. One config serves all outgoing
+    // connections: server_name is scoped to the target DNS name,
+    // not the client identity. cert-manager's per-component
+    // Certificates all chain to the same CA, so the gateway's
+    // client cert verifies against scheduler's and store's
+    // client_ca_root identically.
+    //
+    // server_name here is a DEFAULT for the most common target. For
+    // a gateway connecting to scheduler + store, the domain_name
+    // in ClientTlsConfig needs to match EACH target's cert SAN.
+    // We can't set per-target in a single ClientTlsConfig — but
+    // tonic's domain_name is overridden by the `:authority` header
+    // (which is the hostname from the endpoint URL). So as long as
+    // we connect to `rio-scheduler:9001` (hostname), rustls verifies
+    // against THAT SAN. The domain_name in ClientTlsConfig is a
+    // fallback when `:authority` is absent (IP-literal endpoints).
+    //
+    // With K8s DNS addressing (`rio-scheduler`, `rio-store`), the
+    // authority matches the SAN, so any domain_name works. We pick
+    // "rio-scheduler" as a reasonable default (gateway→scheduler is
+    // the most-used link).
+    rio_proto::client::init_client_tls(
+        rio_common::tls::load_client_tls(&cfg.tls, "rio-scheduler")
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
+    );
+    if cfg.tls.is_configured() {
+        info!("client mTLS enabled for outgoing gRPC");
+    }
 
     // Required-field checks that `#[serde(default)]` can't express
     // (figment's "missing field" error for `String` defaulting to `""`

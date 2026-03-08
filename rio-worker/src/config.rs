@@ -72,6 +72,9 @@ pub(crate) struct Config {
     /// a bound on blast radius of a truly stuck daemon, not an expected
     /// build time.
     pub(crate) daemon_timeout_secs: u64,
+    /// mTLS for outgoing gRPC (scheduler + store). Env: `RIO_TLS__*`.
+    /// Unset = plaintext.
+    pub(crate) tls: rio_common::tls::TlsConfig,
 }
 
 impl Default for Config {
@@ -103,6 +106,7 @@ impl Default for Config {
             size_class: String::new(),
             max_leaked_mounts: 3,
             daemon_timeout_secs: rio_worker::executor::DEFAULT_DAEMON_TIMEOUT.as_secs(),
+            tls: rio_common::tls::TlsConfig::default(),
         }
     }
 }

@@ -26,9 +26,28 @@ const HEARTBEAT_INTERVAL: Duration =
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls CryptoProvider install BEFORE any TLS use. Phase 3b
+    // enables tonic tls-aws-lc; without this, rustls panics on
+    // first handshake (aws-lc-rs feature active but no provider
+    // installed means auto-select fails).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("worker", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("worker")?;
+
+    // Client TLS init BEFORE connect_store/connect_worker. Same
+    // pattern as gateway: one config, all outgoing connections.
+    // server_name matches the most common target (scheduler);
+    // actual SAN verification uses the :authority header from
+    // the endpoint URL (K8s DNS: "rio-scheduler", "rio-store").
+    rio_proto::client::init_client_tls(
+        rio_common::tls::load_client_tls(&cfg.tls, "rio-scheduler")
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?,
+    );
+    if cfg.tls.is_configured() {
+        info!("client mTLS enabled for outgoing gRPC");
+    }
 
     anyhow::ensure!(
         !cfg.scheduler_addr.is_empty(),

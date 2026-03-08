@@ -19,6 +19,10 @@ rio-proto = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
+# Direct rustls for CryptoProvider::install_default(). Needed now that
+# tonic tls-aws-lc is enabled (Phase 3b mTLS). Without the install call,
+# dual ring+aws-lc-rs feature activation → rustls panic on first TLS use.
+rustls = { workspace = true }
 # grpc.health.v1.Health for K8s readiness probes. Gateway's main
 # protocol is SSH (russh, no tonic server), so we spawn a separate
 # tonic server on health_addr with ONLY the health service. The K8s

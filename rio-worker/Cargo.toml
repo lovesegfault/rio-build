@@ -19,6 +19,8 @@ rio-proto = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
+# Direct rustls for CryptoProvider::install_default(). Phase 3b mTLS.
+rustls = { workspace = true }
 # google.protobuf.Timestamp in BuildResult.start_time/stop_time.
 # Scheduler guards update_build_history on these being Some.
 prost-types = { workspace = true }
