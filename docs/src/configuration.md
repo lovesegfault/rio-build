@@ -23,12 +23,10 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 |-----------|------|---------|-------------|
 | `listen_addr` | string | `0.0.0.0:50051` | gRPC listen address |
 | `database_url` | string | (required) | PostgreSQL connection string |
-| `w_locality` | f64 | 1.0 | Weight for transfer-cost locality scoring (normalized) |
-| `w_load` | f64 | 0.5 | Weight for worker load scoring |
+| `w_locality` | const | 0.7 | Weight for transfer-cost locality scoring (compile-time const, not configurable) |
+| `w_load` | const | 0.3 | Weight for worker load scoring (compile-time const, not configurable) |
 | `default_duration_estimate` | Duration | 30s | Fallback build duration estimate |
 | `ema_alpha` | f64 | 0.3 | EMA smoothing factor for duration estimates |
-| `orphan_timeout` | Duration | 5m | Timeout before orphaned derivations are cancelled |
-| `preemption_reserve_fraction` | f64 | 0.25 | Fraction of workers reserved for high-priority builds |
 | `poison_threshold` | u32 | 3 | Failures across different workers before poisoning |
 | `poison_ttl` | Duration | 24h | Time before poison state expires |
 | `max_retries` | u32 | 2 | Maximum retry attempts per derivation |
@@ -106,13 +104,15 @@ These parameters apply to all gRPC-serving components (gateway, scheduler, store
 
 ## Observability
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `otel_endpoint` | string | `http://otel-collector:4317` | OTLP collector endpoint for traces and metrics |
-| `otel_service_name` | string | (auto-set per component) | OpenTelemetry service name |
-| `otel_sample_rate` | f64 | 1.0 (dev) / 0.1 (prod) | Trace sampling rate |
+Observability is configured via **environment variables only** (not figment/TOML) because `init_tracing()` runs before config parsing:
 
-These parameters apply to all components. See [observability.md](./observability.md) for trace structure and metric details.
+| Env Var | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `RIO_OTEL_ENDPOINT` | string | (unset → no OTel) | OTLP collector endpoint. If unset, only local Prometheus metrics + JSON logs are emitted. |
+| `RIO_OTEL_SAMPLE_RATE` | f64 | 1.0 | Trace sampling rate |
+| `RIO_LOG_FORMAT` | enum | `json` | `json` or `pretty` |
+
+The OTel service name is auto-set per component (not user-configurable). See [observability.md](./observability.md) for trace structure and metric details.
 
 ## Retry Policy
 
@@ -153,7 +153,7 @@ All components use connection pooling via `sqlx`'s built-in pool. Key settings:
 
 For production deployments with many worker pods, deploy PgBouncer between components and PostgreSQL to multiplex connections. Use transaction-mode pooling (not session-mode) since rio-build does not use prepared statements across transaction boundaries.
 
-> **Warning:** The scheduler's leader election uses PostgreSQL advisory locks, which are **session-scoped**. The leader election connection MUST bypass PgBouncer transaction-mode pooling and use either session-mode pooling or a direct connection to PostgreSQL. See [scheduler: Leader Election](./components/scheduler.md#leader-election) for details.
+> **Note:** The scheduler's leader election uses a **Kubernetes Lease** (`coordination.k8s.io/v1`), not PostgreSQL. PgBouncer mode has no effect on leader election. See [scheduler: Leader Election](./components/scheduler.md#leader-election) for details.
 
 ## gRPC
 

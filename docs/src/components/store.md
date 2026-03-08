@@ -217,9 +217,11 @@ CREATE TABLE narinfo (
     registration_time  BIGINT NOT NULL DEFAULT 0,
     ultimate           BOOLEAN NOT NULL DEFAULT FALSE
 );
+```
 
 > The `manifests` + `manifest_data` + `chunks` tables are the active schema as of Phase 2c (migration `002_store.sql` dropped the Phase 2a `nar_blobs` table). Small NARs (< 256 KiB) store inline in `manifests.inline_blob`; larger NARs are FastCDC-chunked with BLAKE3 dedup. ChunkBackend is constructed from config (`ChunkBackendKind` enum: `Inline` / `Filesystem` / `S3`, default `Inline` for back-compat).
 
+```sql
 CREATE TABLE manifests (
     store_path_hash  BYTEA PRIMARY KEY
                      REFERENCES narinfo(store_path_hash),

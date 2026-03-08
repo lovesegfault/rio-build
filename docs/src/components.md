@@ -16,6 +16,6 @@ Supporting crates (see [Crate Structure](./crate-structure.md) for details):
 
 | Crate | Role |
 |-------|------|
-| [`rio-nix`](./crate-structure.md#phase-1-starting-point-3-crates) | Nix wire protocol, derivation parsing, NAR, store paths (from scratch, MIT/Apache-2.0) |
-| [`rio-cli`](./crate-structure.md#phase-2-split-as-boundaries-stabilize) | Command-line interface for operators (Phase 4) |
-| [`rio-common`](./crate-structure.md#target-architecture-9-crates--dashboard) | Shared utilities: config, observability, error types |
+| [`rio-nix`](./crate-structure.md#rio-nix--nix-protocol-and-data-types) | Nix wire protocol, derivation parsing, NAR, store paths (from scratch, MIT/Apache-2.0) |
+| `rio-cli` | Command-line interface for operators (Phase 4, not yet built) |
+| [`rio-common`](./crate-structure.md#rio-common--shared-utilities) | Shared utilities: config, observability, error types |
