@@ -42,10 +42,12 @@ use crate::realisations;
 use crate::signing::Signer;
 use crate::validate::validate_nar_digest;
 
+mod admin;
 mod chunk;
 mod get_path;
 mod put_path;
 
+pub use admin::StoreAdminServiceImpl;
 pub use chunk::ChunkServiceImpl;
 
 /// Maximum number of paths in a FindMissingPaths request.

@@ -29,7 +29,16 @@ async fn setup_svc(
 ) {
     let db = TestDb::new(&crate::MIGRATOR).await;
     let (actor, task) = setup_actor(db.pool.clone());
-    let svc = AdminServiceImpl::new(buffers, s3, db.pool.clone(), actor.clone());
+    let svc = AdminServiceImpl::new(
+        buffers,
+        s3,
+        db.pool.clone(),
+        actor.clone(),
+        // store_addr: unreachable in tests. TriggerGC would fail
+        // the proxy connect with a clear error. Use :1 (fails
+        // fast, never listened on) not a timeout-prone addr.
+        "127.0.0.1:1".into(),
+    );
     (svc, actor, task, db)
 }
 
@@ -160,6 +169,7 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         Some((s3, "test-bucket".into())),
         db.pool.clone(),
         actor,
+        "127.0.0.1:1".into(),
     );
 
     let resp = svc
@@ -223,7 +233,9 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
 async fn stubs_return_unimplemented() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
 
-    // ClusterStatus (E1) and DrainWorker (E2) are no longer stubs.
+    // ClusterStatus (E1), DrainWorker (E2), TriggerGC (Phase 3b)
+    // are no longer stubs. TriggerGC is tested separately (proxy
+    // to store); here we just confirm the remaining stubs.
     assert_eq!(
         svc.list_workers(Request::new(ListWorkersRequest::default()))
             .await
@@ -238,12 +250,17 @@ async fn stubs_return_unimplemented() -> anyhow::Result<()> {
             .code(),
         tonic::Code::Unimplemented
     );
+    // TriggerGC: now implemented (proxy to store). Test separately.
+    // With the test store_addr (127.0.0.1:1), proxy connect fails
+    // with Unavailable (not Unimplemented) — proves it's wired.
+    let gc_err = svc
+        .trigger_gc(Request::new(GcRequest::default()))
+        .await
+        .unwrap_err();
     assert_eq!(
-        svc.trigger_gc(Request::new(GcRequest::default()))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
+        gc_err.code(),
+        tonic::Code::Unavailable,
+        "TriggerGC implemented but store unreachable in tests"
     );
     assert_eq!(
         svc.clear_poison(Request::new(ClearPoisonRequest::default()))

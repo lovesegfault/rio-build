@@ -8,11 +8,12 @@ use tonic::transport::Server;
 use tracing::{error, info};
 
 use rio_proto::ChunkServiceServer;
+use rio_proto::StoreAdminServiceServer;
 use rio_proto::StoreServiceServer;
 use rio_store::backend::chunk::{ChunkBackend, FilesystemChunkBackend, S3ChunkBackend};
 use rio_store::cache_server::{self, CacheServerState};
 use rio_store::cas::ChunkCache;
-use rio_store::grpc::{ChunkServiceImpl, StoreServiceImpl};
+use rio_store::grpc::{ChunkServiceImpl, StoreAdminServiceImpl, StoreServiceImpl};
 use rio_store::signing::Signer;
 
 // Two-struct config split — see rio-common/src/config.rs for rationale.
@@ -265,6 +266,22 @@ async fn main() -> anyhow::Result<()> {
     // ARE no chunks to get).
     let chunk_service = ChunkServiceImpl::new(pool.clone(), chunk_cache.clone());
 
+    // StoreAdminServiceImpl: TriggerGC + PinPath/UnpinPath. Gets
+    // the chunk backend directly (for key_for in sweep's pending_
+    // s3_deletes enqueue). None for inline-only stores — sweep
+    // does CASCADE delete only, no chunk refcounting.
+    //
+    // Also spawn GC background tasks (orphan scanner + drain).
+    // Both are periodic (15min / 30s). spawn_monitored: if one
+    // panics, logged; store keeps serving (degraded GC, not down).
+    let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
+        chunk_cache.as_ref().map(|c| c.backend());
+    let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone());
+    rio_store::gc::orphan::spawn_scanner(pool.clone(), chunk_backend_for_gc.clone());
+    if let Some(backend) = chunk_backend_for_gc {
+        rio_store::gc::drain::spawn_drain_task(pool.clone(), backend);
+    }
+
     // Binary-cache HTTP server (narinfo + nar.zst routes). Spawned
     // concurrently with the gRPC server (which blocks on serve()
     // below). Only if configured — this is optional; the gRPC
@@ -343,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(health_service)
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
         .add_service(ChunkServiceServer::new(chunk_service))
+        .add_service(StoreAdminServiceServer::new(admin_service))
         .serve(addr)
         .await?;
 

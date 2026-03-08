@@ -419,7 +419,13 @@ async fn main() -> anyhow::Result<()> {
     // use it and silently break the pipeline.
     let grpc_service =
         SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers.clone(), pool.clone());
-    let admin_service = AdminServiceImpl::new(log_buffers, admin_s3, pool, actor.clone());
+    let admin_service = AdminServiceImpl::new(
+        log_buffers,
+        admin_s3,
+        pool,
+        actor.clone(),
+        cfg.store_addr.clone(),
+    );
 
     // Start periodic tick task
     let tick_actor = actor.clone();

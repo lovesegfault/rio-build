@@ -68,6 +68,8 @@ pub use scheduler::scheduler_service_client::SchedulerServiceClient;
 pub use scheduler::scheduler_service_server::{SchedulerService, SchedulerServiceServer};
 pub use store::chunk_service_client::ChunkServiceClient;
 pub use store::chunk_service_server::{ChunkService, ChunkServiceServer};
+pub use store::store_admin_service_client::StoreAdminServiceClient;
+pub use store::store_admin_service_server::{StoreAdminService, StoreAdminServiceServer};
 pub use store::store_service_client::StoreServiceClient;
 pub use store::store_service_server::{StoreService, StoreServiceServer};
 pub use worker::worker_service_client::WorkerServiceClient;

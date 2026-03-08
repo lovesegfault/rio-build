@@ -142,3 +142,94 @@ pub fn spawn_drain_task(
         }
     })
 }
+
+// r[verify store.gc.pending-deletes]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::chunk::MemoryChunkBackend;
+    use rio_test_support::TestDb;
+
+    #[tokio::test]
+    async fn drain_deletes_and_removes_row() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed a chunk + pending row. MemoryBackend's key_for is
+        // hex; insert the row with that key.
+        let hash = [0x42u8; 32];
+        backend
+            .put(&hash, bytes::Bytes::from_static(b"test-chunk-data"))
+            .await
+            .unwrap();
+        let key = backend.key_for(&hash);
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Drain: should delete the chunk from backend + remove
+        // the pending row.
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        assert_eq!(deleted, 1, "one row drained");
+        assert_eq!(failed, 0);
+
+        // Backend: chunk gone.
+        assert!(
+            backend.get(&hash).await.unwrap().is_none(),
+            "backend delete_by_key removed the chunk"
+        );
+        // PG: row gone.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "pending row deleted");
+    }
+
+    #[tokio::test]
+    async fn drain_increments_attempts_on_failure() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed a row with a key that CAN'T be deleted (not valid
+        // hex → delete_by_key Errs).
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ('not-valid-hex!')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(failed, 1, "invalid key → delete fails");
+
+        // Row still there, attempts=1, last_error set.
+        let (attempts, last_error): (i32, Option<String>) =
+            sqlx::query_as("SELECT attempts, last_error FROM pending_s3_deletes LIMIT 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1, "attempts incremented");
+        assert!(last_error.is_some(), "last_error recorded");
+    }
+
+    #[tokio::test]
+    async fn drain_respects_max_attempts() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed a row at max attempts — drain should SKIP it.
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key, attempts) VALUES ('stuck-key', $1)")
+            .bind(MAX_ATTEMPTS)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        // Both 0: the row is excluded by WHERE attempts < MAX.
+        // Operator investigates; this row is effectively "parked."
+        assert_eq!(deleted, 0);
+        assert_eq!(failed, 0, "max-attempts row excluded from drain");
+    }
+}

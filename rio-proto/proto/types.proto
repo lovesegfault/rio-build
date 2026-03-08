@@ -698,6 +698,11 @@ message BuildLogChunk {
 message GCRequest {
   bool dry_run = 1;                      // If true, only report what would be collected
   uint32 grace_period_hours = 2;         // Override default grace period (default: 24)
+  // Scheduler-populated: expected output paths for all non-terminal
+  // derivations (live builds). Protects in-flight build outputs that
+  // may not be in narinfo yet (worker hasn't uploaded). The store's
+  // mark phase includes these as root seeds.
+  repeated string extra_roots = 3;
 }
 
 message GCProgress {
@@ -706,6 +711,16 @@ message GCProgress {
   uint64 bytes_freed = 3;
   bool is_complete = 4;
   string current_path = 5;              // Path currently being processed
+}
+
+message PinPathRequest {
+  string store_path = 1;                 // Full store path to pin/unpin
+  string source = 2;                     // Free-form: who/what pinned this (audit)
+}
+
+message PinPathResponse {
+  bool success = 1;
+  string message = 2;                    // Error detail on failure (path not found etc)
 }
 
 message DrainWorkerRequest {

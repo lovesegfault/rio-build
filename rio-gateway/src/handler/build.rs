@@ -2,21 +2,64 @@
 
 use super::*;
 
+/// Error from `process_build_events`. Distinguishes transport
+/// errors (scheduler connection dropped — reconnect-worthy) from
+/// stream EOF without terminal (scheduler closed gracefully but
+/// incompletely — NOT reconnect-worthy, the build state is lost).
+#[derive(Debug)]
+enum StreamProcessError {
+    /// gRPC-level error (connection reset, timeout). Scheduler
+    /// may have failed over — reconnecting via WatchBuild has
+    /// a good chance of resuming.
+    Transport(tonic::Status),
+    /// Stream returned `Ok(None)` (EOF) without a Completed/
+    /// Failed/Cancelled event. Scheduler closed the stream
+    /// gracefully but the build didn't finish from our view.
+    /// Reconnecting is unlikely to help (if it were a failover,
+    /// we'd see a transport error, not a clean close).
+    EofWithoutTerminal,
+    /// Error writing STDERR to the client (WireError). The Nix
+    /// client disconnected or the SSH channel closed. NOT
+    /// reconnect-worthy — scheduler is fine, client is gone.
+    Wire(rio_nix::protocol::wire::WireError),
+}
+
+impl From<rio_nix::protocol::wire::WireError> for StreamProcessError {
+    fn from(e: rio_nix::protocol::wire::WireError) -> Self {
+        Self::Wire(e)
+    }
+}
+
+impl std::fmt::Display for StreamProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(s) => write!(f, "build event stream error: {s}"),
+            Self::EofWithoutTerminal => {
+                write!(
+                    f,
+                    "build event stream ended unexpectedly (scheduler disconnected?)"
+                )
+            }
+            Self::Wire(e) => write!(f, "client disconnected: {e}"),
+        }
+    }
+}
+
 /// Process a BuildEvent stream from the scheduler and translate events
 /// into STDERR protocol messages for the Nix client.
 ///
-/// Returns the final BuildResult on success, or an error message on failure.
+/// Returns the final BuildResult on success, or a typed error.
 async fn process_build_events<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
     active_build_ids: &mut HashMap<String, u64>,
-) -> anyhow::Result<BuildEventOutcome> {
+) -> Result<BuildEventOutcome, StreamProcessError> {
     let mut drv_activity_ids: HashMap<String, u64> = HashMap::new();
 
     while let Some(event) = event_stream
         .message()
         .await
-        .map_err(|e| anyhow::anyhow!("build event stream error: {e}"))?
+        .map_err(StreamProcessError::Transport)?
     {
         // Update active_build_ids with latest sequence
         if let Some(seq) = active_build_ids.get_mut(&event.build_id) {
@@ -108,9 +151,14 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
     // Err and converts it to Ok(BuildResult::failure), which callers then
     // send via STDERR_LAST + BuildResult. Sending STDERR_ERROR here first
     // would produce an invalid STDERR_ERROR -> STDERR_LAST frame sequence.
-    Err(anyhow::anyhow!(
-        "build event stream ended unexpectedly (scheduler disconnected?)"
-    ))
+    //
+    // EofWithoutTerminal (not Transport): this is a clean stream close
+    // (Ok(None)), not a connection drop. Reconnecting via WatchBuild
+    // is unlikely to help — if it were a scheduler crash/failover,
+    // we'd see a transport error. Clean close + incomplete build
+    // suggests the scheduler intentionally dropped us (bug or
+    // resource exhaustion). Don't retry; surface the failure.
+    Err(StreamProcessError::EofWithoutTerminal)
 }
 
 /// Outcome of processing a build event stream.
@@ -187,8 +235,100 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         }
     }
 
-    // Process remaining events
-    let outcome = process_build_events(stderr, &mut event_stream, active_build_ids).await;
+    // Process remaining events, with reconnect on stream error.
+    // Scheduler failover/restart drops the stream; we reconnect
+    // via WatchBuild(build_id, since_sequence=last_seen) with
+    // backoff (1s/2s/4s/8s/16s, max 5). The scheduler replays
+    // events from build_event_log past that sequence.
+    //
+    // Without reconnect: scheduler restart mid-build → client's
+    // `nix build` fails with MiscFailure even though the build
+    // itself completes fine on a worker. With reconnect: client
+    // doesn't notice the scheduler blip (~15s failover).
+    const MAX_RECONNECT: u32 = 5;
+    let mut reconnect_attempts = 0u32;
+
+    let outcome = loop {
+        match process_build_events(stderr, &mut event_stream, active_build_ids).await {
+            Ok(outcome) => break Ok(outcome),
+            // EOF or wire error: NOT reconnect-worthy. EOF =
+            // scheduler closed gracefully but incompletely (not a
+            // crash — crash would be Transport). Wire = client
+            // gone (SSH closed). Surface immediately.
+            Err(e @ (StreamProcessError::EofWithoutTerminal | StreamProcessError::Wire(_))) => {
+                break Err(e);
+            }
+            Err(e @ StreamProcessError::Transport(_)) => {
+                reconnect_attempts += 1;
+                if reconnect_attempts > MAX_RECONNECT {
+                    // Max retries exhausted. Give up — surface
+                    // MiscFailure to the client.
+                    break Err(e);
+                }
+
+                // active_build_ids tracks last seq (updated on
+                // every event above). 0 if no events arrived yet —
+                // WatchBuild with since=0 replays from the start.
+                let since_seq = active_build_ids.get(&build_id).copied().unwrap_or(0);
+
+                let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
+                tracing::warn!(
+                    %build_id,
+                    error = %e,
+                    attempt = reconnect_attempts,
+                    since_seq,
+                    backoff_secs = backoff.as_secs(),
+                    "BuildEvent stream error; reconnecting via WatchBuild"
+                );
+                // Also surface to the client via STDERR — they see
+                // "reconnecting..." instead of a hang.
+                let _ = stderr
+                    .log(&format!(
+                        "scheduler connection lost (attempt {}/{}); reconnecting...",
+                        reconnect_attempts, MAX_RECONNECT
+                    ))
+                    .await;
+                tokio::time::sleep(backoff).await;
+
+                // Reconnect: need a fresh scheduler client. The
+                // original was moved into this function; we can't
+                // easily get the address here. Clone the existing
+                // client — tonic clients ARE cheap to clone (Arc
+                // internally), and the underlying channel may have
+                // auto-reconnected. If that fails (channel dead),
+                // WatchBuild will Err and we retry.
+                match scheduler_client
+                    .watch_build(types::WatchBuildRequest {
+                        build_id: build_id.clone(),
+                        since_sequence: since_seq,
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        tracing::info!(%build_id, since_seq, "reconnected via WatchBuild");
+                        event_stream = resp.into_inner();
+                        // Loop continues: next process_build_events
+                        // reads from the new stream.
+                    }
+                    Err(wb_err) => {
+                        // WatchBuild failed. Could be: scheduler
+                        // still down (transient — next loop iter
+                        // retries), OR build not found (recovery
+                        // didn't reconstruct it — terminal). We
+                        // can't distinguish without the error code
+                        // check; for simplicity, treat both as
+                        // retryable and let MAX_RECONNECT cap it.
+                        tracing::warn!(%build_id, error = %wb_err,
+                                      "WatchBuild reconnect attempt failed");
+                        // Don't break yet — next iteration of the
+                        // loop will try process_build_events on the
+                        // DEAD stream, which immediately Errs →
+                        // another backoff+retry. After MAX we exit.
+                    }
+                }
+            }
+        }
+    };
 
     // Remove from active builds
     active_build_ids.remove(&build_id);
@@ -205,7 +345,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         )),
         Err(e) => Ok(BuildResult::failure(
             BuildStatus::MiscFailure,
-            format!("build stream error: {e}"),
+            format!("build stream error (reconnect exhausted): {e}"),
         )),
     }
 }

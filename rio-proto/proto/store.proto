@@ -73,3 +73,25 @@ service ChunkService {
   // Batch check which chunks are missing from the store.
   rpc FindMissingChunks(rio.types.FindMissingChunksRequest) returns (rio.types.FindMissingChunksResponse);
 }
+
+// Store-side administrative operations. The scheduler's AdminService.
+// TriggerGC proxies to this after populating extra_roots from live
+// builds. Separate service from StoreService so it can have separate
+// RBAC/TLS (admin ops are more privileged than PutPath/GetPath).
+service StoreAdminService {
+  // Run garbage collection: mark reachable paths (from gc_roots +
+  // uploading manifests + grace period + extra_roots), sweep
+  // unreachable complete manifests (DELETE CASCADE + chunk decrement
+  // + pending_s3_deletes enqueue). Streams GCProgress updates.
+  //
+  // dry_run=true: compute stats but ROLLBACK the sweep tx.
+  rpc TriggerGC(rio.types.GCRequest) returns (stream rio.types.GCProgress);
+
+  // Pin a store path (add to gc_roots). Protects it from GC
+  // regardless of reachability. Explicit unpin via UnpinPath.
+  rpc PinPath(rio.types.PinPathRequest) returns (rio.types.PinPathResponse);
+
+  // Remove a GC root. The path becomes eligible for collection
+  // on the next GC run (if unreachable).
+  rpc UnpinPath(rio.types.PinPathRequest) returns (rio.types.PinPathResponse);
+}

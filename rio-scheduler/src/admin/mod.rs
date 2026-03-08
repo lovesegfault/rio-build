@@ -68,6 +68,12 @@ pub struct AdminServiceImpl {
     /// That's the correct "when did we start, in CURRENT wall-clock
     /// terms" answer even across NTP adjustments.
     started_at: Instant,
+    /// Store gRPC address for TriggerGC proxy. The scheduler's
+    /// `AdminService.TriggerGC` collects extra_roots via
+    /// `ActorCommand::GcRoots`, then proxies to the store's
+    /// `StoreAdminService.TriggerGC`. GC runs IN the store (it
+    /// owns the chunk backend); scheduler contributes roots.
+    store_addr: String,
 }
 
 impl AdminServiceImpl {
@@ -76,6 +82,7 @@ impl AdminServiceImpl {
         s3: Option<(S3Client, String)>,
         pool: PgPool,
         actor: ActorHandle,
+        store_addr: String,
     ) -> Self {
         Self {
             log_buffers,
@@ -83,6 +90,7 @@ impl AdminServiceImpl {
             pool,
             actor,
             started_at: Instant::now(),
+            store_addr,
         }
     }
 
@@ -405,11 +413,100 @@ impl AdminService for AdminServiceImpl {
         Err(Status::unimplemented("ListBuilds: phase4 dashboard"))
     }
 
+    /// Proxy to store's `StoreAdminService.TriggerGC` after
+    /// populating `extra_roots` from the scheduler's live builds.
+    ///
+    /// Flow:
+    /// 1. `ActorCommand::GcRoots` → collect expected_output_paths
+    ///    from all non-terminal derivations. These may not be in
+    ///    narinfo yet (worker hasn't uploaded); the store's mark
+    ///    phase includes them as root seeds so in-flight outputs
+    ///    aren't collected.
+    /// 2. Connect to store, call TriggerGC with the populated
+    ///    extra_roots + client's dry_run/grace_period.
+    /// 3. Proxy the store's GCProgress stream back to the client.
+    ///
+    /// If store is unreachable: UNAVAILABLE (not UNIMPLEMENTED —
+    /// the RPC IS implemented, store is just down). Client retries.
+    #[instrument(skip(self, request), fields(rpc = "TriggerGC"))]
     async fn trigger_gc(
         &self,
-        _request: Request<GcRequest>,
+        request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
-        Err(Status::unimplemented("TriggerGC: phase4 controller"))
+        self.check_actor_alive()?;
+        let mut req = request.into_inner();
+
+        // Step 1: collect extra_roots from the actor. send_unchecked
+        // bypasses backpressure — GC is operator-initiated, rare,
+        // and should work even when the scheduler is saturated.
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send_unchecked(ActorCommand::GcRoots { reply: tx })
+            .await
+            .map_err(|e| Status::internal(format!("actor send failed: {e}")))?;
+        let mut extra_roots = rx
+            .await
+            .map_err(|_| Status::internal("actor GcRoots reply dropped"))?;
+
+        // Merge with any client-provided extra_roots (unusual but
+        // allowed — maybe the client has additional pins).
+        req.extra_roots.append(&mut extra_roots);
+        let extra_count = req.extra_roots.len();
+
+        debug!(
+            dry_run = req.dry_run,
+            grace_hours = req.grace_period_hours,
+            extra_roots = extra_count,
+            "proxying TriggerGC to store with live-build roots"
+        );
+
+        // Step 2: connect to store admin service. Same TLS config
+        // as connect_store (OnceLock CLIENT_TLS).
+        let mut store_admin = rio_proto::client::connect_store_admin(&self.store_addr)
+            .await
+            .map_err(|e| Status::unavailable(format!("store admin connect failed: {e}")))?;
+
+        // Step 3: proxy the call. The store's stream becomes OUR
+        // stream — we wrap it in a forwarding task.
+        let store_stream = store_admin
+            .trigger_gc(req)
+            .await
+            .map_err(|e| Status::internal(format!("store TriggerGC failed: {e}")))?
+            .into_inner();
+
+        // Forward store's progress stream to the client. A small
+        // channel + forwarding task: the store stream isn't
+        // directly compatible with our TriggerGCStream type (we
+        // declare it as ReceiverStream).
+        let (tx, rx) = mpsc::channel::<Result<GcProgress, Status>>(8);
+        tokio::spawn(async move {
+            let mut store_stream = store_stream;
+            loop {
+                match store_stream.message().await {
+                    Ok(Some(progress)) => {
+                        if tx.send(Ok(progress)).await.is_err() {
+                            // Client disconnected. Let the store-
+                            // side GC finish (it's already running);
+                            // just stop forwarding.
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // Store stream EOF (GC complete). Drop tx
+                        // → client sees stream end.
+                        break;
+                    }
+                    Err(e) => {
+                        // Store error mid-stream. Forward the error;
+                        // client decides whether to retry.
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     /// Mark a worker draining: `has_capacity()` returns false, dispatch

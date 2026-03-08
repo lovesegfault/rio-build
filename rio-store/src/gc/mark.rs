@@ -108,6 +108,9 @@ pub async fn compute_unreachable(
     Ok(rows.into_iter().map(|(h,)| h).collect())
 }
 
+// r[verify store.gc.two-phase]
+// (mark is phase 1 of two-phase; sweep tests + these mark tests
+// together verify the mark-then-sweep pattern)
 #[cfg(test)]
 mod tests {
     use super::*;

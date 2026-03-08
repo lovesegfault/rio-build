@@ -147,6 +147,54 @@ fn statefulset_overlays_volume_mounted() {
     assert_eq!(mount.mount_path, "/var/rio/overlays");
 }
 
+// r[verify ctrl.pdb.workers]
+#[test]
+fn pdb_has_correct_selector_and_max_unavailable() {
+    // build_pdb produces maxUnavailable=1 with the SAME selector
+    // as the STS → matches worker pods. ownerRef set so GC on
+    // WorkerPool delete takes the PDB too.
+    let wp = test_wp();
+    let oref = wp.controller_owner_ref(&()).unwrap();
+    let pdb = build_pdb(&wp, oref.clone());
+
+    // Name: <pool>-pdb
+    assert_eq!(pdb.metadata.name, Some("test-pool-pdb".into()));
+    // ownerRef: controller=true for GC.
+    let orefs = pdb.metadata.owner_references.expect("ownerRef set");
+    assert_eq!(orefs.len(), 1);
+    assert_eq!(orefs[0].kind, "WorkerPool");
+    assert_eq!(orefs[0].controller, Some(true));
+
+    let spec = pdb.spec.expect("spec");
+    // maxUnavailable=1: at most one worker evicted at a time
+    // during node drain. Builds on the evicting pod get
+    // reassigned (DrainWorker force); rest keep working.
+    assert_eq!(
+        spec.max_unavailable,
+        Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(1))
+    );
+    // minAvailable NOT set: maxUnavailable is stable regardless
+    // of scale (works for 2 replicas or 200); minAvailable
+    // would need to track spec.replicas.min.
+    assert!(spec.min_available.is_none());
+
+    // Selector matches pod labels (same as STS). If these
+    // diverge, PDB protects nothing.
+    let selector = spec
+        .selector
+        .expect("selector")
+        .match_labels
+        .expect("labels");
+    assert_eq!(
+        selector.get("rio.build/pool"),
+        Some(&"test-pool".to_string())
+    );
+    assert_eq!(
+        selector.get("app.kubernetes.io/name"),
+        Some(&"rio-worker".to_string())
+    );
+}
+
 #[test]
 fn statefulset_tls_secret_mounted_when_set() {
     // spec.tlsSecretName set → volume + mount + 3 RIO_TLS__* env

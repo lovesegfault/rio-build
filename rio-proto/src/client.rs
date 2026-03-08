@@ -123,6 +123,21 @@ pub async fn connect_admin(addr: &str) -> anyhow::Result<crate::AdminServiceClie
         .max_encoding_message_size(crate::max_message_size()))
 }
 
+/// Connect to the store admin service (scheduler's TriggerGC proxy).
+///
+/// Same address as `connect_store` — StoreAdminService is hosted on
+/// the store's gRPC port alongside StoreService/ChunkService. The
+/// scheduler's `AdminService.TriggerGC` populates extra_roots from
+/// GcRoots and proxies here.
+pub async fn connect_store_admin(
+    addr: &str,
+) -> anyhow::Result<crate::StoreAdminServiceClient<Channel>> {
+    let ch = connect_channel(addr).await?;
+    Ok(crate::StoreAdminServiceClient::new(ch)
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size()))
+}
+
 // ===========================================================================
 // NAR stream helpers
 // ===========================================================================
