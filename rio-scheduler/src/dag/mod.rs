@@ -61,6 +61,36 @@ impl DerivationDag {
         Self::default()
     }
 
+    /// Insert a pre-built node (Phase 3b state recovery). No cycle
+    /// check — recovered edges come from PG which was validated at
+    /// merge time. No interested_builds population — that's done
+    /// separately from the build_derivations join.
+    ///
+    /// If the node already exists (shouldn't — recover_from_pg
+    /// clears the DAG first), the existing one is kept (first-wins,
+    /// no overwrite). warn! since it indicates a double-insert bug.
+    pub fn insert_recovered_node(&mut self, state: DerivationState) {
+        let hash = state.drv_hash.clone();
+        if self.nodes.contains_key(&hash) {
+            tracing::warn!(drv_hash = %hash, "duplicate recovered node (skipping)");
+            return;
+        }
+        self.path_to_hash
+            .insert(state.drv_path().to_string(), hash.clone());
+        self.nodes.insert(hash, state);
+    }
+
+    /// Insert a recovered edge. No cycle check (PG was validated
+    /// at merge time). Idempotent — HashSet::insert is a no-op for
+    /// existing entries.
+    pub fn insert_recovered_edge(&mut self, parent: DrvHash, child: DrvHash) {
+        self.children
+            .entry(parent.clone())
+            .or_default()
+            .insert(child.clone());
+        self.parents.entry(child).or_default().insert(parent);
+    }
+
     /// Look up a derivation state by hash.
     pub fn node(&self, drv_hash: &str) -> Option<&DerivationState> {
         self.nodes.get(drv_hash)

@@ -102,12 +102,16 @@ impl ActorHandle {
         // generation reader and dispatch.rs then see the shared
         // Arc. No chicken-and-egg.
         if let Some(leader) = leader {
-            // This replaces the actor's default Arc(AtomicU64(1))
-            // with the caller's. Caller initializes it to 1 too
-            // (LeaderState constructors do). Same init, shared ref.
+            // This replaces the actor's default Arcs with the
+            // caller's. Same init values, shared references. All
+            // three flow from LeaderState: the lease task writes
+            // is_leader + generation + clears recovery_complete;
+            // the actor reads all three (dispatch) and writes
+            // recovery_complete (handle_leader_acquired).
             actor = actor
                 .with_leader_flag(leader.is_leader)
-                .with_generation(leader.generation);
+                .with_generation(leader.generation)
+                .with_recovery_flag(leader.recovery_complete);
         }
 
         let backpressure = actor.backpressure_flag();

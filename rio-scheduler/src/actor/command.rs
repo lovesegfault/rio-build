@@ -189,6 +189,24 @@ pub enum ActorCommand {
         reply: oneshot::Sender<ClusterSnapshot>,
     },
 
+    /// Lease acquired: trigger state recovery from PG. Fire-and-
+    /// forget (no reply) — the lease loop keeps renewing while
+    /// recovery runs in the actor task. handle_leader_acquired
+    /// sets recovery_complete=true when done (or on failure —
+    /// degrade to empty DAG, don't block).
+    ///
+    /// In non-K8s mode (always_leader): sent once at spawn.
+    /// recovery_complete is already true there (no recovery needed
+    /// for single-instance) but the command is still processed
+    /// (no-op: empty PG → empty DAG → recovery_complete already true).
+    LeaderAcquired,
+
+    /// Post-recovery worker reconciliation (spec step 6). Scheduled
+    /// ~45s after recovery via WeakSender. For each Assigned/Running
+    /// derivation: if assigned_worker NOT in self.workers →
+    /// query store → Completed (orphan) or reset to Ready.
+    ReconcileAssignments,
+
     /// Test-only: query worker states.
     #[cfg(test)]
     DebugQueryWorkers {

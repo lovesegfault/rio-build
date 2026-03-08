@@ -63,6 +63,42 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 const EMA_ALPHA: f64 = 0.3;
 
+/// Row from `load_nonterminal_builds`. FromRow for named-column
+/// mapping (tuples at this arity are error-prone).
+///
+/// `options_json`: `Option<Json<BuildOptions>>` because the column
+/// is NULLable (rows from before migration 004). Caller unwraps
+/// with `.map(|j| j.0).unwrap_or_default()`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct RecoveryBuildRow {
+    pub build_id: Uuid,
+    pub tenant_id: Option<String>,
+    pub status: String,
+    pub priority_class: String,
+    pub keep_going: bool,
+    pub options_json: Option<sqlx::types::Json<crate::state::BuildOptions>>,
+}
+
+/// Row from `load_nonterminal_derivations`. Mirrors the INSERT
+/// columns from `batch_upsert_derivations` plus live-state fields
+/// (retry_count, assigned_worker_id, failed_workers).
+#[derive(Debug, sqlx::FromRow)]
+pub struct RecoveryDerivationRow {
+    pub derivation_id: Uuid,
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub pname: Option<String>,
+    pub system: String,
+    pub status: String,
+    pub required_features: Vec<String>,
+    pub assigned_worker_id: Option<String>,
+    pub retry_count: i32,
+    pub expected_output_paths: Vec<String>,
+    pub output_names: Vec<String>,
+    pub is_fixed_output: bool,
+    pub failed_workers: Vec<String>,
+}
+
 /// Row for [`SchedulerDb::batch_upsert_derivations`].
 #[derive(Debug)]
 pub struct DerivationRow {
@@ -451,6 +487,151 @@ impl SchedulerDb {
             FROM build_history
             "#,
         )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3b: state recovery read queries
+    //
+    // Called by recover_from_pg() on LeaderAcquired transition. Loads
+    // all non-terminal builds + derivations + edges + build_derivations +
+    // assignments, from which the actor rebuilds its in-mem DAG.
+    //
+    // FromRow structs (not tuples): recovery needs ~10 fields per
+    // derivation, tuples at that arity are error-prone (wrong-field
+    // assignment). #[derive(FromRow)] + named columns is safer.
+    // -----------------------------------------------------------------------
+
+    /// Load all non-terminal builds. Terminal builds (succeeded/
+    /// failed/cancelled) don't need recovery — they're done, any
+    /// WatchBuild subscriber has already received the terminal event
+    /// (or will time out waiting, which is the same as "scheduler
+    /// restarted and forgot").
+    pub async fn load_nonterminal_builds(&self) -> Result<Vec<RecoveryBuildRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT build_id, tenant_id::text, status, priority_class,
+                   keep_going, options_json
+            FROM builds
+            WHERE status IN ('pending', 'active')
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load all non-terminal derivations. Same terminal-exclusion
+    /// rationale as builds; the partial index (status_idx) makes
+    /// this efficient for large tables.
+    pub async fn load_nonterminal_derivations(
+        &self,
+    ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT derivation_id, drv_hash, drv_path, pname, system, status,
+                   required_features, assigned_worker_id, retry_count,
+                   expected_output_paths, output_names, is_fixed_output,
+                   failed_workers
+            FROM derivations
+            WHERE status NOT IN ('completed', 'poisoned', 'dependency_failed', 'cancelled')
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load edges for a set of derivation IDs. Only loads edges
+    /// where BOTH endpoints are in the set — an edge to a completed
+    /// derivation (not in `derivation_ids`) is dropped; the in-mem
+    /// DAG treats "no edge" = "no incomplete dependency" = "ready"
+    /// (compute_initial_states). This is correct: a completed
+    /// dependency IS satisfied.
+    ///
+    /// ANY($1): PG unnest-style array comparison. Scales to ~100k
+    /// IDs before the planner starts preferring a temp table; recovery
+    /// DAGs are typically <10k nodes.
+    pub async fn load_edges_for_derivations(
+        &self,
+        derivation_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT parent_id, child_id FROM derivation_edges
+            WHERE parent_id = ANY($1) AND child_id = ANY($1)
+            "#,
+        )
+        .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load (build_id, derivation_id) links for a set of builds.
+    /// `recover_from_pg` uses this to rebuild `interested_builds`
+    /// on each DerivationState and `derivation_hashes` on BuildInfo.
+    pub async fn load_build_derivations(
+        &self,
+        build_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+        if build_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT build_id, derivation_id FROM build_derivations
+            WHERE build_id = ANY($1)
+            "#,
+        )
+        .bind(build_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Max assignment generation ever written. recover_from_pg()
+    /// seeds its generation counter from this + 1 — defensive
+    /// monotonicity guard in case the Lease's generation (in its
+    /// annotation) was lost/reset (e.g., someone `kubectl delete
+    /// lease`). Workers with a stale generation reject assignments;
+    /// if we accidentally reused a gen, workers that received old
+    /// assignments would ALSO accept new ones from that gen —
+    /// dual-processing. Seeding from PG's high-water mark prevents
+    /// that regardless of Lease state.
+    ///
+    /// BIGINT → i64 → u64 cast at the caller. `None` = no
+    /// assignments ever (fresh cluster).
+    pub async fn max_assignment_generation(&self) -> Result<Option<i64>, sqlx::Error> {
+        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(generation) FROM assignments")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// Max sequence number per build_id from build_event_log.
+    /// recover_from_pg() seeds `build_sequences` from this so new
+    /// events continue from where the old leader left off — a
+    /// reconnecting WatchBuild client with `since_sequence=N` would
+    /// miss events if we reset to 0 and emitted new events with
+    /// seq=1 (<N → filtered by the client).
+    ///
+    /// Only for builds that are still active (caller filters by
+    /// build_ids from load_nonterminal_builds).
+    pub async fn max_sequence_per_build(
+        &self,
+        build_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, i64)>, sqlx::Error> {
+        if build_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT build_id, MAX(sequence) FROM build_event_log
+            WHERE build_id = ANY($1) GROUP BY build_id
+            "#,
+        )
+        .bind(build_ids)
         .fetch_all(&self.pool)
         .await
     }

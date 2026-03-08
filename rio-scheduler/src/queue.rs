@@ -171,6 +171,19 @@ impl ReadyQueue {
     /// Number of valid (not-removed) entries.
     // `is_empty` pair was dead code — `pub(crate) mod queue` revealed it.
     #[allow(clippy::len_without_is_empty)]
+    /// Remove all entries. Used by recover_from_pg() to start
+    /// fresh before reloading Ready derivations from PG.
+    pub fn clear(&mut self) {
+        self.heap.clear();
+        self.members.clear();
+        self.removed.clear();
+        // seq_counter: DON'T reset. Monotonic-forever is fine
+        // (it's just a FIFO tiebreak, wraps at u64::MAX after
+        // ~500 billion years) and resetting would be a subtle
+        // ordering bug if clear() were ever called mid-session
+        // with entries re-pushed.
+    }
+
     pub fn len(&self) -> usize {
         self.members.len()
     }

@@ -140,25 +140,45 @@ pub struct LeaderState {
     /// returns if false (standby schedulers merge DAGs but don't
     /// dispatch — state warm for fast takeover).
     pub is_leader: Arc<AtomicBool>,
+    /// Whether recovery has completed. dispatch_ready gates on
+    /// BOTH is_leader AND this. Set by handle_leader_acquired
+    /// AFTER recover_from_pg finishes. Cleared by the lease loop
+    /// on LOSE transition so re-acquire re-triggers recovery.
+    ///
+    /// Separate from is_leader because the lease loop sets
+    /// is_leader IMMEDIATELY (non-blocking — must keep renewing),
+    /// then fire-and-forgets LeaderAcquired. Recovery may take
+    /// seconds; dispatch waits.
+    pub recovery_complete: Arc<AtomicBool>,
 }
 
 impl LeaderState {
     /// Non-K8s mode: leader immediately, generation stays at 1.
     /// This is what VM tests and single-scheduler deployments see.
+    ///
+    /// recovery_complete=true: no lease acquisition → no recovery
+    /// trigger. Empty DAG at startup (same as Phase 3a). Single-
+    /// instance deployments don't failover so PG recovery isn't
+    /// meaningful.
     pub fn always_leader(generation: Arc<AtomicU64>) -> Self {
         Self {
             generation,
             is_leader: Arc::new(AtomicBool::new(true)),
+            recovery_complete: Arc::new(AtomicBool::new(true)),
         }
     }
 
     /// K8s mode: NOT leader until the lease loop acquires. If the
     /// loop never acquires (another replica holds it), we stay
     /// standby forever — correct.
+    ///
+    /// recovery_complete=false: acquisition triggers recovery.
+    /// dispatch_ready gates on this AND is_leader.
     pub fn pending(generation: Arc<AtomicU64>) -> Self {
         Self {
             generation,
             is_leader: Arc::new(AtomicBool::new(false)),
+            recovery_complete: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -170,8 +190,15 @@ impl LeaderState {
 ///   exist, or updates `renewTime` if we hold it, or returns
 ///   "not leading" if someone else holds it.
 /// - On acquire transition (was standby, now leading): increment
-///   generation, flip `is_leader`.
-/// - On lose transition (was leading, now not): flip `is_leader`.
+///   generation, flip `is_leader`, fire-and-forget
+///   `LeaderAcquired` to the actor. The actor's
+///   `handle_leader_acquired` runs recovery then sets
+///   `recovery_complete=true`. CRITICAL: this loop does NOT
+///   block on recovery — it keeps renewing the lease every 5s
+///   regardless. A slow recovery (>15s) would otherwise let the
+///   lease expire → another replica acquires → dual-leader.
+/// - On lose transition (was leading, now not): flip `is_leader`,
+///   clear `recovery_complete` (re-acquire re-triggers recovery).
 ///   DON'T increment generation — the NEW leader does that on
 ///   THEIR acquire. We don't know the new gen.
 ///
@@ -181,7 +208,15 @@ impl LeaderState {
 /// `lease_ttl`, our lease expires and another replica takes over,
 /// which is exactly the desired behavior for "this replica's K8s
 /// connectivity is broken."
-pub async fn run_lease_loop(cfg: LeaseConfig, state: LeaderState) {
+///
+/// `actor`: handle to fire-and-forget `LeaderAcquired`. Cloned
+/// into the task. No reply channel — recovery is the actor's
+/// concern, the lease loop only signals the transition.
+pub async fn run_lease_loop(
+    cfg: LeaseConfig,
+    state: LeaderState,
+    actor: crate::actor::ActorHandle,
+) {
     // kube client from in-cluster config. If this fails (not in
     // a pod, or service account not mounted), log and exit the
     // loop — spawn_monitored logs the task death. The scheduler
@@ -256,6 +291,35 @@ pub async fn run_lease_loop(cfg: LeaseConfig, state: LeaderState) {
                     // forever). The info! log has the same signal
                     // but metrics are less brittle for VM grep.
                     metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
+
+                    // Fire-and-forget LeaderAcquired. The actor
+                    // runs recovery then sets recovery_complete.
+                    // send_unchecked bypasses backpressure — this
+                    // is a control message, not work submission.
+                    // Spawn the send so we don't block the lease
+                    // loop on actor backpressure (shouldn't happen
+                    // — channel capacity is 10k — but defensive).
+                    //
+                    // NON-BLOCKING IS LOAD-BEARING: if we awaited
+                    // a reply from recovery, a slow recovery (>15s
+                    // for a large DAG) would stall the renewal
+                    // tick → lease expires → another replica
+                    // acquires → dual-leader. fire-and-forget +
+                    // separate recovery_complete flag lets the
+                    // loop keep renewing regardless.
+                    let actor_clone = actor.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = actor_clone
+                            .send_unchecked(crate::actor::ActorCommand::LeaderAcquired)
+                            .await
+                        {
+                            // Actor dead. We're holding the lease
+                            // but can't dispatch. Not much to do —
+                            // the process is probably crashing.
+                            tracing::error!(error = %e,
+                                "failed to send LeaderAcquired (actor dead?)");
+                        }
+                    });
                 } else if !now_leading && was_leading {
                     // ---- Lose transition ----
                     // Someone else acquired (we couldn't renew in
@@ -264,6 +328,10 @@ pub async fn run_lease_loop(cfg: LeaseConfig, state: LeaderState) {
                     // might). Stop dispatching. Generation is the
                     // NEW leader's job to increment.
                     state.is_leader.store(false, Ordering::Relaxed);
+                    // Clear recovery_complete: if we re-acquire,
+                    // recovery runs again. The other replica's
+                    // actions may have changed PG state.
+                    state.recovery_complete.store(false, Ordering::Relaxed);
                     warn!(
                         holder = %cfg.holder_id,
                         "lost leadership (another replica acquired)"

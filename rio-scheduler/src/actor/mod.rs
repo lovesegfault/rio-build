@@ -36,6 +36,8 @@ use crate::state::{
 mod command;
 pub use command::*;
 
+mod recovery;
+
 /// Channel capacity for the actor command channel.
 pub const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
 
@@ -52,6 +54,19 @@ const BUILD_EVENT_BUFFER_SIZE: usize = 1024;
 /// subscribers to receive the terminal event before the broadcast sender
 /// is dropped.
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Delay before post-recovery worker reconciliation. Workers have
+/// this long to reconnect after scheduler restart; after that, any
+/// Assigned/Running derivation with an unknown worker is reconciled
+/// (Completed if outputs in store, else reset to Ready).
+///
+/// 45s = 3× HEARTBEAT_INTERVAL (10s) + 15s slack. A worker that's
+/// alive should reconnect within one heartbeat; 3× covers network
+/// blips. Same cfg(test) shadow pattern as POISON_TTL.
+#[cfg(not(test))]
+const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(test)]
+const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The DAG actor state.
 pub struct DagActor {
@@ -140,6 +155,28 @@ pub struct DagActor {
     /// dispatch (idempotent — workers reject stale-gen assignments
     /// after the new leader increments).
     is_leader: Arc<AtomicBool>,
+    /// Set by handle_leader_acquired AFTER recover_from_pg
+    /// completes (success or failure — see recovery.rs module
+    /// doc). dispatch_ready gates on BOTH is_leader AND this.
+    ///
+    /// Why two flags: the lease loop sets is_leader=true
+    /// IMMEDIATELY on acquire (non-blocking), then fire-and-
+    /// forgets LeaderAcquired. Recovery may take seconds for a
+    /// large DAG. If dispatch gated ONLY on is_leader, it would
+    /// try to dispatch from an incomplete DAG mid-recovery.
+    ///
+    /// Non-K8s mode (always_leader): initialized `true` since
+    /// there's no lease acquisition to trigger recovery. The DAG
+    /// starts empty (as before); no recovery from PG because
+    /// there's no failover.
+    ///
+    /// Relaxed/Release/Acquire: Release on store (handle_leader_
+    /// acquired), Acquire on load (dispatch_ready) so dispatch
+    /// sees all writes from recovery before proceeding. Not
+    /// STRICTLY needed (actor is single-threaded → single-thread
+    /// sequential consistency) but documents the pairing and
+    /// doesn't cost anything.
+    recovery_complete: Arc<AtomicBool>,
     /// Channel to the event-log persister task. emit_build_event
     /// try_sends (build_id, seq, prost-encoded BuildEvent) here
     /// AFTER the broadcast. Event::Log is filtered out — those
@@ -178,6 +215,12 @@ impl DagActor {
             // Default true: non-K8s mode, always leader.
             // with_leader_flag() overrides for K8s deployments.
             is_leader: Arc::new(AtomicBool::new(true)),
+            // Default true: non-K8s mode has no lease acquire →
+            // no recovery trigger. DAG starts empty (as before).
+            // with_leader_flag() sets this to the shared Arc from
+            // LeaderState (initialized false there) so K8s
+            // deployments gate on recovery.
+            recovery_complete: Arc::new(AtomicBool::new(true)),
             event_persist_tx: None,
         }
     }
@@ -374,6 +417,29 @@ impl DagActor {
                             .increment(lines);
                     }
                 }
+                ActorCommand::LeaderAcquired => {
+                    self.handle_leader_acquired().await;
+                    // Schedule reconciliation ~45s out via WeakSender.
+                    // Same pattern as schedule_terminal_cleanup.
+                    // Workers have ~45s (3× heartbeat + slack) to
+                    // reconnect after scheduler restart. Any
+                    // Assigned/Running derivation whose worker
+                    // DIDN'T reconnect by then gets reconciled
+                    // (Completed if outputs in store, else reset).
+                    if let Some(weak_tx) = self.self_tx.clone() {
+                        rio_common::task::spawn_monitored("reconcile-timer", async move {
+                            tokio::time::sleep(RECONCILE_DELAY).await;
+                            if let Some(tx) = weak_tx.upgrade()
+                                && tx.try_send(ActorCommand::ReconcileAssignments).is_err()
+                            {
+                                tracing::warn!("reconcile command dropped (channel full)");
+                            }
+                        });
+                    }
+                }
+                ActorCommand::ReconcileAssignments => {
+                    self.handle_reconcile_assignments().await;
+                }
                 #[cfg(test)]
                 ActorCommand::DebugQueryWorkers { reply } => {
                     let workers: Vec<_> = self
@@ -514,6 +580,18 @@ impl DagActor {
     /// `LeaderState`. spawn_with_leader calls both.
     pub fn with_generation(mut self, generation: Arc<AtomicU64>) -> Self {
         self.generation = generation;
+        self
+    }
+
+    /// Inject the shared recovery_complete flag. The actor's
+    /// `handle_leader_acquired` sets it; the lease loop clears it
+    /// on lose. dispatch_ready gates on it. REPLACES the default
+    /// `Arc::new(true)` (non-K8s mode: no recovery needed).
+    ///
+    /// Triad with `with_leader_flag` + `with_generation` — all
+    /// three come from the same `LeaderState`.
+    pub fn with_recovery_flag(mut self, recovery_complete: Arc<AtomicBool>) -> Self {
+        self.recovery_complete = recovery_complete;
         self
     }
 

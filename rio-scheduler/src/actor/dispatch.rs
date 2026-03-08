@@ -18,6 +18,18 @@ impl DagActor {
         if !self.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        // Also gate on recovery: don't dispatch until recover_from_
+        // pg has rebuilt the DAG. Otherwise we'd dispatch from a
+        // partial/empty DAG mid-recovery. Acquire pairs with
+        // handle_leader_acquired's Release — sees all recovery
+        // writes before proceeding (though actor is single-threaded
+        // so this is belt-and-suspenders).
+        if !self
+            .recovery_complete
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
 
         // Drain the queue, dispatching eligible derivations and deferring
         // ineligible ones. Previously, `None => break` on the first ineligible

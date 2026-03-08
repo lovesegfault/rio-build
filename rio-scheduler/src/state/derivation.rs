@@ -303,6 +303,70 @@ impl DerivationState {
         self.status
     }
 
+    /// Reconstruct from a PG recovery row. Used by recover_from_pg().
+    ///
+    /// Lossy fields (can't persist Instant): `ready_at`, `running_since`,
+    /// `poisoned_at`, `backoff_until` all reset to conservative
+    /// defaults. `ready_at=Some(now)` for Ready (metric skew
+    /// acceptable). `poisoned_at=None` — poisoned rows aren't
+    /// loaded (load_nonterminal_derivations filters them). If one
+    /// DOES slip through (race with status update), the None means
+    /// the poison-TTL check never fires — the derivation stays
+    /// poisoned forever until a new build re-merges it.
+    ///
+    /// `drv_content` is empty — worker fetches from store via
+    /// GetPath (the pre-D8 path, still supported in executor).
+    ///
+    /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
+    /// happen (it was validated at merge time before persist) but
+    /// be defensive against PG corruption / manual edits.
+    pub fn from_recovery_row(
+        row: &crate::db::RecoveryDerivationRow,
+        status: DerivationStatus,
+    ) -> Result<Self, rio_nix::store_path::StorePathError> {
+        let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)?;
+        let now = Instant::now();
+        Ok(Self {
+            drv_hash: row.drv_hash.as_str().into(),
+            drv_path,
+            pname: row.pname.clone(),
+            system: row.system.clone(),
+            required_features: row.required_features.clone(),
+            output_names: row.output_names.clone(),
+            is_fixed_output: row.is_fixed_output,
+            status,
+            interested_builds: HashSet::new(), // populated by build_derivations join
+            assigned_worker: row.assigned_worker_id.as_deref().map(Into::into),
+            assigned_size_class: None, // lossy; misclassification detector skips None
+            drv_content: Vec::new(),   // worker fetches from store
+            retry_count: row.retry_count.max(0) as u32,
+            failed_workers: row
+                .failed_workers
+                .iter()
+                .map(|s| s.as_str().into())
+                .collect(),
+            poisoned_at: None, // poisoned rows not loaded; if one slips through, stays poisoned
+            output_paths: Vec::new(), // completed rows not loaded
+            expected_output_paths: row.expected_output_paths.clone(),
+            est_duration: 0.0,      // recomputed by full_sweep
+            input_srcs_nar_size: 0, // lossy; only used as estimator input (proxy)
+            priority: 0.0,          // recomputed by full_sweep
+            db_id: Some(row.derivation_id),
+            // Instant fields: conservative defaults.
+            // ready_at: Some(now) if Ready → assignment_latency
+            // metric skews (looks like instant dispatch) but
+            // doesn't break anything.
+            ready_at: (status == DerivationStatus::Ready).then_some(now),
+            // running_since: Some(now) if Running → backstop
+            // timeout resets. A build that was 1h into a 2h
+            // estimate gets another full 6h backstop. Conservative
+            // (won't spuriously cancel) at the cost of a possibly
+            // stale build running longer.
+            running_since: (status == DerivationStatus::Running).then_some(now),
+            backoff_until: None, // any in-flight backoff is forgiven
+        })
+    }
+
     /// Store path of the .drv file (read-only; DAG owns the reverse index).
     ///
     /// Callers using `&str` auto-deref via `StorePath::Deref<Target=str>`.

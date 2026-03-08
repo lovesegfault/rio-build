@@ -278,8 +278,11 @@ async fn main() -> anyhow::Result<()> {
             rio_scheduler::lease::LeaderState::always_leader(generation.clone())
         }
     };
-    // Clone for the health toggle loop (C3) BEFORE moving into spawn.
+    // Clone for the health toggle loop (C3) + lease loop BEFORE
+    // moving into spawn. Both need the same shared Arcs the actor
+    // gets; spawn_with_leader consumes the LeaderState.
     let is_leader_for_health = leader.is_leader.clone();
+    let recovery_complete_for_lease = leader.recovery_complete.clone();
 
     // Spawn the event-log persister. Bounded mpsc + single drain
     // task → FIFO write ordering (fire-and-forget spawns would
@@ -310,10 +313,14 @@ async fn main() -> anyhow::Result<()> {
         let lease_state = rio_scheduler::lease::LeaderState {
             generation,
             is_leader: is_leader_for_health.clone(),
+            recovery_complete: recovery_complete_for_lease,
         };
+        // Pass actor.clone() for fire-and-forget LeaderAcquired.
+        // The lease loop does NOT block on recovery — it keeps
+        // renewing while the actor handles LeaderAcquired.
         rio_common::task::spawn_monitored(
             "lease-loop",
-            rio_scheduler::lease::run_lease_loop(lease_cfg, lease_state),
+            rio_scheduler::lease::run_lease_loop(lease_cfg, lease_state, actor.clone()),
         );
     }
 
