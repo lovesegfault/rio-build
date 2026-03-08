@@ -75,6 +75,41 @@ r[gw.opcode.nar-from-path.raw-bytes]
 
 **Historical note (bug #11):** Earlier phases sent the NAR inside the stderr loop via `STDERR_WRITE` chunks, described in this document as an "intentional divergence". That was wrong — the Nix client's `processStderr()` for this opcode passes no sink, so `STDERR_WRITE` frames caused `error: no sink`. Fixed to `STDERR_LAST` + raw bytes. See `handle_nar_from_path` in `rio-gateway/src/handler/opcodes_read.rs`.
 
+### wopAddToStore (7) Wire Format
+
+Legacy content-addressed store path import. The client sends a name, a content-address method string, references, and the raw file contents (or NAR) as a framed stream. The server computes the store path, wraps non-recursive data in a NAR, and returns the full `ValidPathInfo`.
+
+| Direction | Field | Type | Description |
+|-----------|-------|------|-------------|
+| C -> S | `name` | string | Store path name component |
+| C -> S | `camStr` | string | Content-address method (see CAM formats below) |
+| C -> S | `references` | string collection | Referenced store paths |
+| C -> S | `repair` | u64 bool | Whether to repair/overwrite (read and discarded) |
+| C -> S | `dump` | framed byte stream | Raw file contents (flat) or NAR bytes (recursive) |
+
+**Content-address method (`camStr`) formats:**
+
+| Format | Meaning |
+|--------|---------|
+| `text:sha256` | Text import (builtins.toFile-style); hash is over raw bytes; store path via `makeTextPath` |
+| `fixed:sha256` | Flat fixed-output; hash is over raw bytes; gateway wraps in a single-file NAR |
+| `fixed:r:sha256` | Recursive fixed-output; dump IS a NAR; hash is over the NAR bytes |
+| `fixed:git:sha1` | Git tree import; treated as recursive |
+
+Response (after `STDERR_LAST`) is a full `ValidPathInfo`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | string | Computed store path |
+| `deriver` | string | Always empty |
+| `narHash` | string | SHA-256 hash of the NAR (hex-encoded digest, no prefix) |
+| `references` | string collection | Echoed references |
+| `registrationTime` | u64 | Always 0 |
+| `narSize` | u64 | NAR size in bytes |
+| `ultimate` | u64 bool | Always 1 (trusted source) |
+| `sigs` | string collection | Always empty |
+| `ca` | string | Content address: `text:sha256:<nixbase32>` or `fixed:[r:]<algo>:<nixbase32>` |
+
 ### wopAddToStoreNar (39) Wire Format
 
 r[gw.opcode.add-to-store-nar]
@@ -271,10 +306,20 @@ Response (after STDERR loop):
 | `downloadSize` | u64 | Estimated download size in bytes |
 | `narSize` | u64 | Estimated total NAR size in bytes |
 
-### BuildResult Wire Format (returned by wopBuildPathsWithResults)
+### wopBuildPathsWithResults (46) Response Wire Format
 
 r[gw.opcode.build-paths-with-results]
-`wopBuildPathsWithResults` (opcode 46) returns one `BuildResult` per requested path. For protocol 1.37+, all fields are present:
+`wopBuildPathsWithResults` (opcode 46) returns one `KeyedBuildResult` per requested path --- the key echoes the `DerivedPath` string the client sent. Response structure (after the STDERR loop):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `count` | u64 | Number of result entries |
+| (per entry) `derivedPath` | string | The `DerivedPath` string exactly as the client sent it |
+| (per entry) `buildResult` | BuildResult | See `BuildResult` format below |
+
+#### BuildResult Wire Format
+
+For protocol 1.37+, all fields are present:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -429,6 +474,8 @@ stateDiagram-v2
 r[gw.conn.exec-request]
 **SSH transport:** Nix connects via `ssh ... nix-daemon --stdio`. The gateway must handle `exec_request` for this command and start the protocol on the SSH channel data stream. The `channel_open_session` alone does not start the protocol.
 
+The gateway matches the **suffix** of the second-to-last whitespace-separated argument (`ends_with("nix-daemon")`) and requires the last argument to be exactly `--stdio`. This allows clients that send a full store path (e.g., `/nix/store/...-nix-2.20.0/bin/nix-daemon --stdio`) to connect successfully.
+
 ## STDERR Message Types
 
 r[gw.stderr.message-types]
@@ -557,7 +604,12 @@ r[gw.hook.ifd-detection]
 
 ## Key Files
 
-- `rio-gateway/src/server.rs` --- SSH server setup (russh), per-channel task spawning
-- `rio-gateway/src/handler.rs` --- Nix worker protocol opcode dispatch (`handle_opcode`), gRPC delegation
+- `rio-gateway/src/server.rs` --- SSH server setup (russh), per-channel task spawning, `exec_request` matching
 - `rio-gateway/src/session.rs` --- Per-SSH-channel protocol session loop (`run_protocol`), CancelBuild on disconnect
-- `rio-gateway/src/translate.rs` --- DAG reconstruction from .drv references, proto <-> wire translation
+- `rio-gateway/src/handler/` --- Nix worker protocol opcode handlers:
+    - `mod.rs` --- opcode dispatch (`handle_opcode`), `SessionContext`, `.drv` cache
+    - `opcodes_read.rs` --- read-only opcodes (`wopIsValidPath`, `wopQueryPathInfo`, `wopNarFromPath`, ...)
+    - `opcodes_write.rs` --- write opcodes (`wopAddToStore`, `wopAddToStoreNar`, `wopAddMultipleToStore`, ...)
+    - `build.rs` --- build opcodes (`wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`)
+    - `grpc.rs` --- gRPC helpers for store put/get
+- `rio-gateway/src/translate.rs` --- DAG reconstruction from `.drv` references, inline-`.drv` optimization, proto <-> wire translation

@@ -48,6 +48,11 @@ where
                 "handshake complete"
             );
         }
+        // r[impl gw.handshake.version-negotiation]
+        // handshake.rs returns VersionTooOld for client < 1.37; the session
+        // layer is responsible for converting that into STDERR_ERROR on the
+        // wire before closing. The annotation in handshake.rs covers the
+        // version check; this one covers the STDERR_ERROR send.
         Err(handshake::HandshakeError::VersionTooOld {
             client_major,
             client_minor,
