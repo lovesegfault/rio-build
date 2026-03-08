@@ -17,14 +17,18 @@ flowchart LR
 ### Boundary 1: Nix Client → Gateway (SSH)
 
 r[sec.boundary.ssh-auth]
-- **Auth**: SSH public key authentication. Keys map to tenants.
+The gateway authenticates SSH connections via public key authentication. Authorized keys are loaded from an `authorized_keys`-format file at startup; only connections presenting a listed key are accepted. Password authentication is disabled.
+
 - **Threat**: Malicious `.drv` files, crafted protocol messages, resource exhaustion
-- **Mitigations**: Protocol parser fuzzing, per-tenant rate limiting, connection limits, NAR size limits
-- **SSH hardening**: Configure `russh` to accept only ed25519 keys, disable password auth, set connection timeouts, limit concurrent channels per connection
+- **Mitigations**: Protocol parser fuzzing (see `rio-nix/fuzz/`), global NAR size limits (`MAX_NAR_SIZE`)
+
+> **Phase deferral (hardening):** The following hardening measures are planned but not yet enforced: (a) ed25519-only key algorithm filter (currently any key type in `authorized_keys` is accepted), (b) per-tenant rate limiting, (c) per-tenant connection / concurrent-channel limits, (d) SSH key → tenant mapping (see [Multi-Tenancy](multi-tenancy.md)). See [Phase 5](phases/phase5.md).
 
 ### Boundary 2: Gateway/Worker → Internal Services (gRPC)
 
 r[sec.boundary.grpc-hmac]
+Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs, authorized via HMAC-signed assignment tokens.
+
 - **Auth**: mTLS (service mesh or cert-manager). Each component has a distinct identity.
 - **Threat**: Compromised pod impersonating another component
 - **Mitigations**: mTLS with per-service certificates, NetworkPolicy restricting pod-to-pod communication
@@ -35,6 +39,8 @@ r[sec.boundary.grpc-hmac]
   - Token lifetime is scoped to the build assignment; tokens expire after a configurable TTL (default: 2× the build timeout).
   - The signing key is a shared HMAC secret between the scheduler and store, stored as a Kubernetes Secret (recommend KMS/Vault for production).
   - **Read authorization:** Workers call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is authorized by mTLS component identity --- any authenticated worker can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) workers need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (workers only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
+
+> **Phase 3b deferral:** Neither mTLS nor HMAC assignment tokens are implemented yet. All inter-component gRPC channels currently use unauthenticated `http://` transport. There is no TLS configuration surface, no HMAC signing key, and `PutPath` performs no token verification. The security boundary is presently provided entirely by Kubernetes `NetworkPolicy` (pod-to-pod traffic restrictions). `r[sec.boundary.grpc-hmac]` is intentionally uncovered in `tracey query uncovered` until Phase 3b lands. See [Phase 3b](phases/phase3b.md).
 
 ### Boundary 3: Worker → Nix Sandbox
 
@@ -63,22 +69,25 @@ r[sec.boundary.grpc-hmac]
 | **S3 credential management** | IRSA (IAM Roles for Service Accounts) on EKS | Recommended |
 | **Worker isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
 | **Metadata service blocking** | NetworkPolicy egress deny `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
-| **Inter-component auth** | mTLS between all gRPC endpoints | Required |
+| **Inter-component auth** | mTLS between all gRPC endpoints | Phase 3b deferred (currently `http://` + NetworkPolicy) |
 | **Multi-tenant data isolation** | Per-tenant data visibility (Phase 5); shared workers with per-build overlay isolation | Planned |
 
 ## Derivation Validation
 
 r[sec.drv.validate]
-Before a derivation is executed, the gateway and worker enforce several validation checks:
+On `PutPath`, rio-store recomputes the SHA-256 digest of the uploaded NAR bytes and rejects the upload if the digest does not match the `nar_hash` declared in the accompanying `PathInfo`. This is the core integrity check: a worker cannot store data under a mismatched content hash. See `rio-store/src/validate.rs`.
 
-| Check | Where | Description |
-|-------|-------|-------------|
-| `__noChroot` rejection | Gateway | Derivations with `__noChroot = true` are rejected at the gateway. These derivations disable the Nix sandbox entirely and must never execute on shared workers. |
-| DAG size limit | Gateway | The total number of nodes in the derivation DAG must not exceed the tenant's `max_dag_size` (simple integer check). |
-| NAR size limit | Gateway | Individual NAR uploads are bounded by `max_nar_upload_size` per tenant. |
-| `restrict-eval` | Worker | The worker's `nix.conf` sets `restrict-eval = true`, preventing derivations from accessing paths outside the Nix store during evaluation. |
-| Sandbox enforcement | Worker | `sandbox = true` in `nix.conf` ensures all builds run inside the Nix sandbox (user/mount/PID/network namespaces). |
-| Output path match | Store | On `PutPath`, the store verifies the uploaded output path matches the assignment token's `expected_output_paths`. |
+Additional validation checks (below) are enforced at other points in the pipeline. These are **not** covered by `r[sec.drv.validate]` — each has its own tracey rule or phase deferral.
+
+| Check | Where | Status | Description |
+|-------|-------|--------|-------------|
+| NAR SHA-256 verification | Store | `r[sec.drv.validate]` | On `PutPath`, the store recomputes SHA-256 over the NAR bytes and rejects on mismatch. |
+| `restrict-eval` | Worker | Implemented | The worker's `nix.conf` sets `restrict-eval = true`, preventing derivations from accessing paths outside the Nix store during evaluation. |
+| Sandbox enforcement | Worker | Implemented | `sandbox = true` in `nix.conf` ensures all builds run inside the Nix sandbox (user/mount/PID/network namespaces). |
+| DAG size limit | Scheduler | Partial | The scheduler enforces `max_dag_size` on `SubmitBuild`. **Not yet enforced at the gateway** as an early rejection. |
+| `__noChroot` rejection | Gateway | **Not implemented** | Derivations with `__noChroot = true` must be rejected before dispatch. TODO(phase3b). |
+| Per-tenant NAR size limit | Gateway | **Not implemented** | Only the global `MAX_NAR_SIZE` limit exists. Per-tenant `max_nar_upload_size` is Phase 5. |
+| Output path match | Store | **Not implemented** | Blocked on HMAC assignment tokens (Phase 3b). Until then, any worker can `PutPath` any output. |
 
 ## Secrets Management
 
@@ -120,7 +129,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 
 - **Threat**: A malicious or buggy client submits a derivation DAG with millions of nodes, exhausting scheduler memory and CPU.
 - **Mitigation**: Per-tenant limits on maximum DAG size (`max_dag_size`) and maximum concurrent builds (`max_concurrent_builds`). See [Multi-Tenancy](multi-tenancy.md) for quota configuration.
-- **Implementation note**: `max_dag_size` is enforced at the gateway as a simple integer check on DAG node count before forwarding to the scheduler. This is implemented from Phase 2a onwards --- it is a cheap safeguard that must not be deferred.
+- **Implementation note**: `max_dag_size` is currently enforced **only at the scheduler** on `SubmitBuild`. Gateway-side early rejection (before gRPC transmission) is planned but not yet implemented — TODO(phase3b): add a simple node-count check in `rio-gateway/src/handler/build.rs` before calling `SubmitBuild`.
 
 ### Build-Time Secrets
 

@@ -3,7 +3,6 @@
 //! Both services run in the same scheduler binary. They communicate with the
 //! DAG actor via the `ActorHandle`.
 // r[impl proto.stream.bidi]
-// r[impl sec.boundary.grpc-hmac]
 
 use std::sync::Arc;
 
