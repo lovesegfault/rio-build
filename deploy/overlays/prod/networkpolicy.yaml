@@ -90,27 +90,24 @@ spec:
     # network on managed K8s). The kubernetes Service's
     # ClusterIP is stable (.1 in the service CIDR on most
     # distributions, but not guaranteed). Safer: allow egress
-    # to the whole cluster (internal IPs) + block the metadata
-    # endpoint specifically.
+    # to RFC1918 private ranges (covers cluster + apiserver
+    # on most managed K8s).
     #
     # This is less tight than the worker policy. The controller
     # is a trusted component (it manages infra); the tradeoff
-    # is "block metadata + internet, allow cluster" vs
+    # is "allow private-IP space, deny public + link-local" vs
     # "enumerate every internal IP the controller needs." The
     # former is maintainable.
+    #
+    # Metadata endpoint (169.254.169.254, link-local) is NOT in
+    # any RFC1918 block, so it's DENIED implicitly by the
+    # absence of a rule matching it. No `except` clause needed
+    # — nesting a link-local /32 under an RFC1918 CIDR would
+    # be a no-op (the subnet isn't a member of the parent).
     - to:
         - ipBlock:
-            # RFC1918 — covers most cluster CIDRs. Adjust if
-            # your cluster uses a different range.
             cidr: 10.0.0.0/8
-            except:
-              # AWS metadata endpoint. GCP is the same IP.
-              # Azure is 169.254.169.254 too. Blocking this
-              # prevents IMDS credential theft even if the
-              # controller is compromised.
-              - 169.254.169.254/32
-    - to:
         - ipBlock:
             cidr: 172.16.0.0/12
-            except:
-              - 169.254.169.254/32
+        - ipBlock:
+            cidr: 192.168.0.0/16
