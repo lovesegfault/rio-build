@@ -60,7 +60,7 @@ Each manifest is stored as a single PostgreSQL row with a `bytea` column contain
 - **S3 key schema:** `chunks/{first-2-hex-chars}/{full-blake3-hex}` (prefix-partitioned to avoid S3 hotspots)
 - Chunks are stored uncompressed in S3 to maximize dedup across packages
 - NAR streams are compressed on-the-fly (zstd) when serving via the binary cache HTTP endpoint
-- `FindMissingChunks` MUST be called before uploading to avoid redundant S3 PUTs
+- Dedup during `PutPath` uses a `refcount == 1` heuristic: after the refcount UPSERT, chunks whose refcount is exactly 1 were newly inserted by this upload and need to go to S3; chunks with refcount > 1 already existed. This has a small TOCTOU window (two concurrent uploaders of the same chunk may both skip upload), but the race is harmless — `GetPath` BLAKE3-verifies every chunk and surfaces `NotFound` as a clear error, not silent corruption. A separate `FindMissingChunks` gRPC batch-query exists for external callers (e.g., worker-side pre-upload checks).
 - **S3 backend requirements:** Strong read-after-write consistency is required. AWS S3 provides this natively. Non-AWS S3-compatible backends (MinIO, Ceph RADOS GW) must be validated for consistency.
 
 ## Chunk Lifecycle
@@ -71,7 +71,7 @@ Chunk refcounts track how many manifests reference each chunk. The `chunks` tabl
 |--------|------|-------------|
 | `blake3_hash` | `BYTEA PRIMARY KEY` | BLAKE3 digest of chunk content |
 | `refcount` | `INTEGER NOT NULL DEFAULT 0` | Number of manifests referencing this chunk |
-| `size` | `BIGINT` | Chunk size in bytes |
+| `size` | `BIGINT NOT NULL` | Chunk size in bytes |
 | `created_at` | `TIMESTAMPTZ` | Insertion timestamp |
 | `deleted` | `BOOLEAN NOT NULL DEFAULT FALSE` | Soft-delete flag (set by GC sweep) |
 
@@ -99,13 +99,15 @@ r[store.put.wal-manifest]
 
 > **Phase 2a deferral:** Assignment token HMAC signing and verification are deferred to Phase 3 (with leader election). In Phase 2a, tokens are opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. This matches the `types.proto` comment on `WorkAssignment.assignment_token`.
 
-1. Write manifest to PostgreSQL with `status='uploading'` (includes chunk list and chunk refcount increments --- this protects chunks from GC sweep immediately)
-2. Upload all chunks to S3 (call `FindMissingChunks` first to skip existing)
-3. Verify all chunks present in S3 (via HeadObject)
-4. Independently compute SHA-256 of the reassembled NAR and verify it matches the declared hash
-5. Flip manifest status to `'complete'` in a single PG transaction (also writes narinfo, references, content index entries)
+1. **Buffer + verify:** Buffer the uploaded NAR stream fully in memory, then compute SHA-256 over the buffered bytes and verify against the declared `NarHash`. Reject on mismatch before touching PostgreSQL or S3.
+2. **Write-ahead manifest (PG):** Chunk the buffered NAR with FastCDC, then in a single PostgreSQL transaction: write `manifest_data` (serialized chunk list) and UPSERT chunk refcounts. This protects chunks from GC sweep immediately — even if the upload crashes after this point, orphan cleanup will find the stale `'uploading'` row and decrement refcounts correctly.
+3. **Dedup check:** Query `chunks.refcount` for all chunks in the manifest. Chunks with `refcount == 1` were newly inserted by step 2 and need S3 upload; chunks with `refcount > 1` already existed before this upload.
+4. **Upload new chunks:** Parallel S3 PUTs (8-wide) for the `refcount == 1` subset. No post-upload HeadObject verification — integrity is guaranteed by BLAKE3 verification on every read (see `store.integrity.verify-on-get`).
+5. **Complete:** Flip manifest status to `'complete'` in a single PG transaction (also fills real narinfo fields, references, content index entries).
 
-On failure at any step, the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 2 hours). The chunk list in the stale manifest is used to decrement refcounts for referenced chunks. Only chunks whose refcount drops to 0 become eligible for S3 deletion via the `pending_s3_deletes` table. No full S3 enumeration needed.
+**On graceful error (steps 3–5 return `Err`):** `put_chunked` rolls back refcounts and deletes the `'uploading'` placeholder before returning. Chunks already uploaded to S3 are **not** deleted (GC sweep's responsibility — deleting now would race with a concurrent uploader that just incremented the same chunk).
+
+**On crash (process dies between steps 2 and 5):** the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 2 hours). The chunk list in `manifest_data` is used to decrement refcounts; only chunks whose refcount drops to 0 become eligible for S3 deletion via `pending_s3_deletes`. No full S3 enumeration needed.
 
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.
@@ -151,6 +153,8 @@ rio-store serves the standard Nix binary cache protocol so Nix clients can use i
 - **FileHash/FileSize omission:** narinfo responses omit the optional `FileHash` and `FileSize` fields because NARs are compressed on-the-fly from chunks (no pre-compressed file exists on disk or in S3). Nix falls back to `NarHash`/`NarSize` verification after decompression, which rio-store already guarantees via its content integrity checks.
 - `HEAD` requests for narinfo are handled efficiently (metadata lookup, no NAR reassembly)
 - **Authentication:** Bearer token or `netrc`-compatible authentication for private caches. Nix supports `netrc-file` and `access-tokens` settings for HTTP cache auth.
+
+> **Phase deferral:** Binary cache authentication (Bearer/netrc) is not yet implemented — the cache server currently serves all paths publicly. TODO(phase4): wire auth middleware alongside multi-tenancy.
 
 ## Signing Key Management
 
@@ -205,7 +209,7 @@ CREATE TABLE narinfo (
     deriver            TEXT,
     nar_hash           BYTEA NOT NULL,          -- SHA-256
     nar_size           BIGINT NOT NULL,
-    references         TEXT[] NOT NULL DEFAULT '{}',
+    "references"       TEXT[] NOT NULL DEFAULT '{}',  -- quoted: PG reserved keyword
     signatures         TEXT[] NOT NULL DEFAULT '{}',
     ca                 TEXT,                    -- content address (empty string for input-addressed)
     tenant_id          UUID,                    -- nullable: multi-tenancy deferred to Phase 4
@@ -242,7 +246,7 @@ CREATE TABLE manifest_data (
 CREATE TABLE chunks (
     blake3_hash      BYTEA PRIMARY KEY,
     refcount         INTEGER NOT NULL DEFAULT 0,
-    size             BIGINT,
+    size             BIGINT NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted          BOOLEAN NOT NULL DEFAULT FALSE
 );
@@ -294,13 +298,21 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - Attic's FastCDC-based chunking approach: reference for chunk size tuning and dedup strategy
 - NAR and narinfo formats: implemented from scratch in `rio-nix`
 
-## Key Files (Phase 2a)
+## Key Files (Phase 3a)
 
-- `rio-store/src/grpc.rs` --- StoreService gRPC implementation (PutPath, GetPath, QueryPathInfo, FindMissingPaths)
-- `rio-store/src/metadata.rs` --- narinfo + manifests persistence (PostgreSQL, rewritten for Phase 2c)
-- `rio-store/src/validate.rs` --- NAR hash verification (HashingReader, NarDigest)
+- `rio-store/src/grpc/` --- StoreService gRPC implementation
+  - `mod.rs` — service struct + shared state
+  - `put_path.rs` — PutPath handler (buffer, verify, branch inline/chunked)
+  - `get_path.rs` — GetPath handler (manifest load, parallel reassembly stream)
+  - `chunk.rs` — FindMissingChunks batch query RPC
+- `rio-store/src/metadata/` --- narinfo + manifest persistence (PostgreSQL)
+  - `mod.rs` — re-exports + shared types
+  - `inline.rs` — inline-blob fast path (write `manifests.inline_blob` BYTEA)
+  - `chunked.rs` — chunked-path manifest + refcount UPSERT
+  - `queries.rs` — narinfo SELECT/UPDATE, QueryPathInfo, FindMissingPaths
+- `rio-store/src/validate.rs` --- NAR hash verification (HashingReader, NarDigest, validate_nar_digest)
 - `rio-store/src/backend/` --- ChunkBackend trait + S3/filesystem/memory impls
-- `rio-store/src/cas.rs` --- put_chunked, ChunkCache (moka + singleflight + BLAKE3 verify), reassemble
+- `rio-store/src/cas.rs` --- put_chunked orchestration, ChunkCache (moka LRU + singleflight + BLAKE3 verify)
 - `rio-store/src/chunker.rs` --- FastCDC wrapper (16K/64K/256K min/avg/max)
 - `rio-store/src/manifest.rs` --- Chunk manifest (de)serialization, versioned binary format
 - `rio-store/src/content_index.rs` --- nar_hash → store_path reverse index (CA ContentLookup)
@@ -308,6 +320,6 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - `rio-store/src/cache_server.rs` --- axum binary cache HTTP (narinfo + nar.zst routes)
 - `rio-store/src/signing.rs` --- ed25519 narinfo signing at PutPath time
 
-## Planned Files (Phase 3a+)
+## Planned Files (Phase 4+)
 
 - `rio-store/src/gc.rs` --- Garbage collection (mark/grace/sweep + orphan cleanup)

@@ -590,7 +590,6 @@ impl ChunkCache {
 
 // r[verify store.singleflight]
 // r[verify store.integrity.verify-on-get]
-// r[verify store.integrity.verify-on-put]
 #[cfg(test)]
 mod cache_tests {
     use super::*;

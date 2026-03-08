@@ -179,6 +179,7 @@ pub fn validate_nar_digest(
 }
 
 // r[verify sec.drv.validate]
+// r[verify store.integrity.verify-on-put]
 #[cfg(test)]
 mod tests {
     use super::*;
