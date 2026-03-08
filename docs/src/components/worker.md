@@ -178,7 +178,11 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 2. **NAR each output**: Serialize each output path independently into a NAR archive.
 3. **Chunk**: Split each NAR into content-addressed chunks (matching rio-store's chunk size).
 4. **Upload**: Upload chunks to rio-store in parallel across outputs. Deduplicate against existing chunks (CAS).
-5. **Register**: Register each output path's narinfo (NAR hash, NAR size, references, signatures) with rio-store. All outputs from the same derivation are registered atomically.
+5. **Register**: Register each output path's NAR hash and NAR size with rio-store. References and signatures are sent **empty** --- rio-store computes references server-side from NAR content; output signing is a Phase 4 concern.
+
+Outputs are uploaded **concurrently and independently** via `buffer_unordered(MAX_PARALLEL_UPLOADS)` --- each output is its own `PutPath` stream. There is no cross-output atomicity: if one output's upload fails, the other outputs may already be registered. Partial registration is possible.
+
+> **Phase 4 deferral:** Atomic multi-output registration (all-or-nothing semantics across a derivation's outputs) is not implemented. A partially-registered derivation after upload failure leaves the store with some outputs present and others missing until a rebuild succeeds.
 
 **Upload failure handling:** If the upload to rio-store fails (S3 unavailable, network timeout), the worker retries the upload with exponential backoff (up to 3 attempts). If all upload retries are exhausted, the worker reports an `InfrastructureFailure` to the scheduler. The scheduler may reassign the derivation to a different worker, which must rebuild from scratch --- there is no mechanism to transfer the completed output from the original worker's local overlay. This is a known limitation; the completed output on the original worker is lost when the overlay is discarded.
 
