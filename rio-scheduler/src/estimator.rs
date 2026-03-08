@@ -5,7 +5,6 @@
 //! (short job waits behind long job), not incorrectness. So we err on the
 // r[impl sched.estimate.fallback-chain]
 // r[impl sched.estimate.ema-alpha]
-// r[impl sched.classify.penalty-overwrite]
 //! side of "always return SOMETHING" rather than "fail if uncertain".
 //!
 //! # Fallback chain (scheduler.md:97-102)

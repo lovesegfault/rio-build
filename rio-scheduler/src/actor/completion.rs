@@ -228,6 +228,7 @@ impl DagActor {
                 // classify() sees the real duration and picks right.
                 // Harsh but self-correcting — a fluke gets blended back
                 // down by the next normal completion.
+                // r[impl sched.classify.penalty-overwrite]
                 if let Some(assigned_class) = &state.assigned_size_class
                     && let Some(cutoff) =
                         crate::assignment::cutoff_for(assigned_class, &self.size_classes)
@@ -545,6 +546,7 @@ impl DagActor {
             // (and their completion handler will re-cascade if they succeed
             // but a sibling dep is dead — but actually they'd never become
             // Ready in the first place since all_deps_completed is false).
+            // r[impl sched.preempt.never-running]
             if !matches!(
                 state.status(),
                 DerivationStatus::Queued | DerivationStatus::Ready | DerivationStatus::Created
