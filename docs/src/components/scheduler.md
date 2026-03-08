@@ -104,13 +104,15 @@ Build duration estimates feed into critical-path priority computation and schedu
 
 | Priority | Method |
 |----------|--------|
-| Primary | Historical build data from `build_history` table, matched by `pname + system` |
-| Fallback 1 | Match by `pname`/`system` extracted from the `.drv` file for unknown derivations |
-| Fallback 2 | Use closure size as a rough proxy |
-| Default | Configurable constant (default: 30 seconds) |
+| 1 | Exact `(pname, system)` match in the `build_history` table (EMA) |
+| 2 | Cross-system `pname` match: mean of all `build_history` rows with the same `pname` (any system) |
+| 3 | Closure-size proxy: `input_srcs_nar_size / 10 MB/s`, floored at 5s |
+| 4 | Default constant: 30 seconds |
+
+Fallbacks 1–2 require a `pname` (extracted from the derivation's `env.pname` attr, or `None` for raw/FOD derivations without it). When `pname` is absent, the chain skips directly to fallback 3.
 
 r[sched.estimate.ema-alpha]
-After each build completes, the estimate is updated using an exponential moving average (alpha=0.3) of actual durations. Cold start: on a fresh deployment with no history, all derivations use Fallback 2 or Default. Critical-path scheduling quality improves as history accumulates (typically 5-10 builds per derivation for convergence).
+After each build completes, the estimate is updated using an exponential moving average (alpha=0.3) of actual durations. Cold start: on a fresh deployment with no history, all derivations use fallback 3 (closure-size proxy) or 4 (default). Critical-path scheduling quality improves as history accumulates (typically 5-10 builds per derivation for convergence).
 
 The `build_history` table also tracks peak resource usage (memory, CPU, output size) via EMA, reported by workers in `CompletionReport`. These feed into size-class routing decisions (see below).
 
@@ -135,14 +137,15 @@ If no `WorkerPoolSet` is configured, classification is skipped and all workers a
 ### Misclassification Handling
 
 r[sched.classify.penalty-overwrite]
-Nix builds are non-preemptible --- a running build cannot be checkpointed or migrated. If a build classified as "small" exceeds 2x the class cutoff while still running, the scheduler:
+Nix builds are non-preemptible --- a running build cannot be checkpointed or migrated. If a **completed** build's actual duration exceeds 2x its assigned-class cutoff, the scheduler (in the success-completion handler):
 
 1. Marks the derivation as **misclassified** in the `build_history` table
 2. Applies a **penalty** to the EMA: sets `ema_duration_secs = actual_duration` (replaces the smoothed estimate with the observed value, ignoring the usual alpha blending)
 3. Increments `misclassification_count` for the `(pname, system)` key
-4. Lets the build complete on its current worker (killing wastes all prior work; deterministic builds produce the same output regardless of host)
 
-Future instances of the same `(pname, system)` are routed to a larger class. After 3 consecutive misclassifications, the derivation's class is permanently bumped until a successful build on the higher class resets the counter.
+Detection happens post-completion, not mid-run --- by the time the check fires, the build has already finished on its original worker.
+
+Future instances of the same `(pname, system)` are routed to a larger class by virtue of the penalty-overwritten EMA: the next `classify()` call reads the updated `ema_duration_secs` and selects the appropriate cutoff. The `misclassification_count` column is currently incremented but not read by the classifier --- it is reserved for the Phase 4 `CutoffRebalancer` to detect systematically-wrong cutoffs. Penalty-overwrite alone drives current routing correction.
 
 ### Adaptive Cutoff Learning (SITA-E)
 
@@ -329,7 +332,7 @@ Worker registration is **two-step** --- there is no single registration RPC; ins
 r[sched.worker.deregister-reassign]
 **Deregistration:** A worker is removed from the scheduler's state when:
 - The `BuildExecution` stream is closed (graceful shutdown or network failure)
-- Three consecutive heartbeats are missed (heartbeat interval: 10s, timeout: 30s)
+- Heartbeat timeout: the actor's 10s tick finds `last_heartbeat` older than 30s **and** this has been observed on 3 consecutive ticks (effective wall-clock timeout: ~50–60s depending on tick phase alignment)
 
 On deregistration, all derivations in `assigned` state for that worker are transitioned back to `ready` for reassignment.
 
