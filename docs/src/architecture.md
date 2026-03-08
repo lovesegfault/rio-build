@@ -40,7 +40,7 @@
 │  Streaming worker  │  │  ┌─────────────────────────────────┐       │
 │  assignment        │  │  │ Blobs (S3-compatible)            │       │
 │  State: PostgreSQL │  │  │ Deduplicated chunks (BLAKE3)     │       │
-│                    │  │  │ Inline blobs for NARs < 256KB    │       │
+│                    │  │  │ Inline blobs for NARs < 256 KiB  │       │
 └────────┬───────────┘  │  └─────────────────────────────────┘       │
          │              │  Binary cache HTTP server (substituter)    │
          │ gRPC         └──────────────┬──────────────────────────────┘
@@ -55,7 +55,7 @@
 │  │            │  │            │  │            │  │            │    │
 │  │ FUSE mount │  │ FUSE mount │  │ FUSE mount │  │ FUSE mount │    │
 │  │ /nix/store │  │ /nix/store │  │ /nix/store │  │ /nix/store │    │
-│  │ (rio-fuse) │  │ (rio-fuse) │  │ (rio-fuse) │  │ (rio-fuse) │    │
+│  │ (fuse mod) │  │ (fuse mod) │  │ (fuse mod) │  │ (fuse mod) │    │
 │  │ + local    │  │ + local    │  │ + local    │  │ + local    │    │
 │  │   SSD cache│  │   SSD cache│  │   SSD cache│  │   SSD cache│    │
 │  │            │  │            │  │            │  │            │    │
@@ -88,6 +88,8 @@ The controller is a supervisor that manages the lifecycle of all other component
 - **[rio-worker](./components/worker.md)** --- Build executor with FUSE store
 - **[rio-controller](./components/controller.md)** --- Kubernetes operator
 - **[rio-proto](./components/proto.md)** --- gRPC service definitions
+- **rio-nix** --- Nix protocol implementation library (wire primitives, ATerm, NAR, store paths)
+- **rio-common** --- shared utilities (limits, bloom filter, observability init)
 - **[rio-dashboard](./components/dashboard.md)** --- Web dashboard (Phase 5)
 
 ```mermaid
