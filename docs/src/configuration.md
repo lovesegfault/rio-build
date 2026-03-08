@@ -97,9 +97,19 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 ## TLS / mTLS
 
-> **Phase 3b deferral:** Application-level TLS is **not implemented**. There is no `tls_enabled` / `tls_cert_path` / `tls_key_path` / `tls_ca_path` configuration surface. All internal gRPC currently uses plaintext HTTP/2.
->
-> For production deployments today, deploy a service mesh (Istio/Linkerd) to provide transparent mTLS. See [Security & Threat Model](./security.md) for the target design.
+Application-level mTLS is configured via a nested `TlsConfig` on each component:
+
+| Env var | Description |
+|---------|-------------|
+| `RIO_TLS__CERT_PATH` | Our certificate (PEM). Server presents on accept; client presents for mTLS. |
+| `RIO_TLS__KEY_PATH` | Our private key (PEM, PKCS8). cert-manager's `encoding: PKCS8` emits this for EC keys. |
+| `RIO_TLS__CA_PATH` | CA bundle (PEM). Server verifies client certs against this; client verifies server cert. |
+
+All three must be set together (partial config is a startup error). When set:
+- Scheduler + store: main gRPC port requires client certs. A second plaintext listener on `health_addr` (`RIO_HEALTH_ADDR`, default `:9101`/`:9102`) serves ONLY `grpc.health.v1.Health` for K8s probes, sharing the SAME `HealthReporter` so leadership status propagates.
+- Gateway, worker, controller: client-side TLS for outgoing connections (`connect_*` in `rio-proto/client.rs`).
+
+For K8s deployments, the prod overlay's `cert-manager.yaml` issues per-component certificates from a self-signed CA. See [Security & Threat Model](./security.md) for the threat model.
 
 ## Observability
 

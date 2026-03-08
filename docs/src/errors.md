@@ -86,10 +86,8 @@ Poisoned derivations:
 |-------|------------|-----------|--------|
 | Per-derivation wall-clock timeout | Worker | `tokio::time::timeout` wrapping the nix-daemon build. Duration is `WorkAssignment.build_options.build_timeout` if nonzero, else `DEFAULT_DAEMON_TIMEOUT` (7200s / 2h). Configurable via `RIO_DAEMON_TIMEOUT_SECS`, `--daemon-timeout-secs`, or `worker.toml`. | **Implemented** |
 | Per-derivation silence timeout | --- | `maxSilentTime` (kill if no output for N seconds) is **not** enforced by the worker. The nix-daemon subprocess may enforce it internally via `nix.conf`, but the worker does not monitor output cadence. | Not implemented |
-| Per-build overall timeout | --- | Scheduler-side cancellation when `Build.spec.timeout` is exceeded is **not** implemented. | Not implemented |
-| Scheduler backstop timeout | --- | Scheduler-side "worker is lost, reassign" based on missing completion within a multiple of estimated duration is **not** implemented. Worker loss is detected via heartbeat disconnect, not via per-derivation timeout. | Not implemented |
-
-> **Phase 3b deferral:** Per-build overall timeout and scheduler backstop timeout are planned for Phase 3b as part of K8s-aware retry hardening.
+| Per-build overall timeout | --- | Scheduler-side cancellation when `Build.spec.timeout` is exceeded is **not** implemented. | Not implemented (Phase 4) |
+| Scheduler backstop timeout | `handle_tick` | When a Running derivation's `running_since.elapsed()` exceeds `max(est_duration × 3, daemon_timeout + 10min)`, scheduler sends CancelSignal + resets to Ready + increments retry_count + adds worker to failed_workers. Catches "worker heartbeating but daemon wedged." | Implemented (Phase 3b) |
 
 ## Error Propagation: What the Client Sees
 

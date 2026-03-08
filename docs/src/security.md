@@ -40,7 +40,7 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
   - The signing key is a shared HMAC secret between the scheduler and store, stored as a Kubernetes Secret (recommend KMS/Vault for production).
   - **Read authorization:** Workers call `GetPath` and `QueryPathInfo` on the store for FUSE cache fetches. Read access is authorized by mTLS component identity --- any authenticated worker can read any store path. This is acceptable because: (a) store paths are content-addressed and immutable, (b) workers need access to shared paths (glibc, coreutils) regardless of tenant, (c) output isolation is enforced at the scheduling level (workers only build what they are assigned). For deployments requiring strict tenant read isolation, a future enhancement could add tenant-scoped read tokens.
 
-> **Phase 3b deferral:** Neither mTLS nor HMAC assignment tokens are implemented yet. All inter-component gRPC channels currently use unauthenticated `http://` transport. There is no TLS configuration surface, no HMAC signing key, and `PutPath` performs no token verification. The security boundary is presently provided entirely by Kubernetes `NetworkPolicy` (pod-to-pod traffic restrictions). `r[sec.boundary.grpc-hmac]` is intentionally uncovered in `tracey query uncovered` until Phase 3b lands. See [Phase 3b](phases/phase3b.md).
+> **Implemented (Phase 3b):** mTLS + HMAC assignment tokens are live. When `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` are set, all gRPC channels use TLS with client cert verification (`ServerTlsConfig::client_ca_root`). When `RIO_HMAC_KEY_PATH` is set on scheduler + store, assignment tokens are HMAC-SHA256-signed at dispatch and verified on `PutPath` (rejected if the uploaded path isn't in `claims.expected_outputs`). mTLS bypass: the gateway (only mTLS client without tokens) is exempted. See `rio-common/src/tls.rs`, `rio-common/src/hmac.rs`, `rio-store/src/grpc/put_path.rs`.
 
 ### Boundary 3: Worker → Nix Sandbox
 
@@ -73,7 +73,7 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 | **S3 credential management** | IRSA (IAM Roles for Service Accounts) on EKS | Recommended |
 | **Worker isolation** | Per-build overlayfs, Nix sandbox, NetworkPolicy | Designed |
 | **Metadata service blocking** | NetworkPolicy egress deny `169.254.169.254`; IMDSv2 hop limit=1 | Designed |
-| **Inter-component auth** | mTLS between all gRPC endpoints | Phase 3b deferred (currently `http://` + NetworkPolicy) |
+| **Inter-component auth** | mTLS between all gRPC endpoints | Implemented (Phase 3b) — configure via `RIO_TLS__*` env |
 | **Multi-tenant data isolation** | Per-tenant data visibility (Phase 5); shared workers with per-build overlay isolation | Planned |
 
 ## Derivation Validation
@@ -117,15 +117,13 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 | SSH host key (`ssh_host_ed25519_key`) | Gateway | Rarely (causes client known_hosts warnings) | Implemented |
 | Authorized SSH keys[^authkeys] | Gateway | Per-tenant lifecycle | Implemented (flat file; no tenant annotation) |
 | NAR signing key (`signing-key`) | Store | Annually or on compromise | Implemented |
-| HMAC signing key (assignment tokens)[^hmac] | Scheduler + Store | Annually or on compromise | **Phase 3b** — not yet read or verified |
+| HMAC signing key (assignment tokens) | Scheduler + Store | Annually or on compromise | Implemented — `RIO_HMAC_KEY_PATH`, same key file both sides |
 | JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | **Phase 5** — no tenant token issuance yet |
 | Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets | Implemented |
-| TLS certificates (if no service mesh)[^tls] | All gRPC components | Via cert-manager auto-renewal | **Phase 3b** — all channels currently `http://` |
+| TLS certificates | All gRPC components | Via cert-manager auto-renewal (90d certs, renew at 30d) | Implemented — see `deploy/overlays/prod/cert-manager.yaml` |
 
 [^authkeys]: Tenant annotation in the `authorized_keys` comment field (e.g., `ssh-ed25519 AAAA... tenant=acme`) is not yet parsed. All authenticated keys currently share a single implicit tenant. SSH key → tenant mapping is Phase 5.
-[^hmac]: No code path currently loads, signs, or verifies an HMAC key. `PutPath` accepts any upload from any caller. See the Phase 3b deferral under [Boundary 2](#boundary-2-gatewayworker--internal-services-grpc).
 [^jwt]: There is no JWT issuance or verification code. Tenant identity exists only as a string field in the scheduler's `BuildOptions` with no authentication backing.
-[^tls]: No `rustls`/`tls_config` wiring exists on any tonic client or server. All gRPC connections use plaintext HTTP/2.
 
 ## Additional Threats
 
@@ -154,7 +152,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
   - The proxy enforces a domain allowlist (configurable per deployment; default: `cache.nixos.org`, `github.com`, `gitlab.com`, common source forges).
   - All proxied requests are logged for audit. Requests to non-allowlisted domains are rejected.
   - Non-FOD builds retain the full egress deny NetworkPolicy --- no proxy access.
-- **Phase**: Phase 3b (not yet implemented). See [Phase 3b tasks](phases/phase3b.md).
+- **Phase**: Implemented (Phase 3b). See `deploy/base/fod-proxy.yaml` (Squid + allowlist) and the worker's `spawn_daemon_in_namespace` (`fod_proxy` param, injects env only when `is_fixed_output`).
 
 ### Log Injection
 

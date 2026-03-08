@@ -79,7 +79,7 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Authorized SSH keys (gateway)
 - NAR signing key (store)
 - Database credentials (scheduler, store)
-- HMAC signing key for assignment tokens (scheduler, store) --- **not yet implemented**; the current assignment token is an unsigned `format!("{worker_id}-{drv_hash}-{generation}")` string and the store does not validate it. Signed tokens are planned for Phase 3b.
+- HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{worker_id, drv_hash, expected_outputs, expiry} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
 > **SSH key mounting:** The base manifests and shipped overlays (`deploy/overlays/dev`, `deploy/overlays/prod`) do **not** mount the SSH host key or authorized_keys Secret into the gateway container --- without a mount, the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production deployments must add a `volumeMount` patch to the gateway Deployment for the SSH key Secret.
 
@@ -106,7 +106,7 @@ curl -s https://rio-cache.example.com/nix-cache-info
 
 - **PostgreSQL HA:** Use RDS Multi-AZ, Cloud SQL HA, or Patroni. See [Configuration: PostgreSQL Operations](./configuration.md#postgresql-operations).
 - **Monitoring:** Configure Prometheus scraping and Grafana dashboards. See [Integration: Monitoring](./integration.md#monitoring-integration).
-- **TLS:** Deploy a service mesh (Istio/Linkerd) for transparent mTLS between components. **Phase 3b:** application-level TLS is not yet implemented --- there is no `tls_enabled` config surface. See [Security](./security.md).
+- **TLS:** Application-level mTLS via `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars (see [Configuration: TLS/mTLS](./configuration.md#tls--mtls)). The prod overlay's `cert-manager.yaml` issues per-component certs from a self-signed CA. A service mesh (Istio/Linkerd) also works and may be preferred for large deployments.
 - **Backups:** PostgreSQL backups are critical. S3 data is durable by default. No additional backup needed for chunk storage.
 
 ## Upgrades
@@ -122,7 +122,7 @@ curl -s https://rio-cache.example.com/nix-cache-info
 - **S3:** Durable by default (11 nines). Chunk data in S3 is the source of truth for build artifacts. Enable S3 versioning as defense against accidental deletes.
 - **Recovery procedure:** Restore PostgreSQL from backup, verify S3 bucket accessibility, restart all components. Workers reconnect and re-register.
 
-    > **Phase 3b deferral:** Scheduler in-memory DAG reconstruction from PostgreSQL on startup is **not yet implemented**. A scheduler restart currently starts with an empty DAG --- in-flight builds are lost and must be resubmitted by clients. Crash recovery for scheduler state is planned for Phase 3b.
+    > **State recovery (Phase 3b):** On `LeaderAcquired` (lease acquisition), the scheduler calls `recover_from_pg` which rebuilds the in-memory DAG from PostgreSQL: loads non-terminal builds + derivations + edges + build_derivations, reconstructs `DerivationState` via `from_recovery_row`, recomputes critical-path priorities, repopulates the ready queue. The lease loop fire-and-forgets `LeaderAcquired` (non-blocking — keeps renewing during recovery); `recovery_complete` flag gates dispatch. If recovery fails (PG down), sets `recovery_complete=true` anyway with an empty DAG (degrade to pre-recovery behavior, don't block). Generation counter seeded from `MAX(assignments.generation) + 1` via `fetch_max` for defensive monotonicity. See `rio-scheduler/src/actor/recovery.rs`.
 - **RPO:** Determined by PostgreSQL backup frequency. With WAL archiving, RPO can be near-zero. S3 data has effectively zero RPO.
 - **RTO:** Determined by PostgreSQL restore time + component restart time. Typically 5-15 minutes for managed databases.
 
