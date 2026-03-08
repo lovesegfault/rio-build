@@ -6,27 +6,29 @@
 - No stored fixtures — tests always run against the current nix-daemon version, eliminating fixture staleness
 - STDERR activity stripping handles daemon messages (START\_ACTIVITY/STOP\_ACTIVITY) that rio-build omits
 - Fields that legitimately differ (version\_string, trusted) are skipped via a configurable skip list
-- Nix version compatibility: test against Nix 2.20+ stable and unstable, and Lix
-- Run conformance tests against multiple pinned Nix versions in CI
-- Nightly job tests against latest Nix from nixpkgs-unstable and alerts on failures
+
+> **Phase 4 deferral — multi-version Nix compatibility matrix:** Currently conformance tests run against the single Nix version pinned in `flake.nix`. Testing against multiple pinned Nix versions (2.20+ stable, unstable, Lix) and a nightly job against nixpkgs-unstable is deferred to Phase 4.
 
 ## Fuzzing
 
-Security-critical protocol parsers must be fuzz-tested:
+Security-critical protocol parsers must be fuzz-tested. Targets live in per-crate fuzz workspaces (`rio-nix/fuzz/`, `rio-store/fuzz/`):
 
-- `fuzz/wire_primitives` --- u64, padded strings, framed streams, empty strings, maximum sizes
-- `fuzz/opcodes` --- each opcode's payload parsing (wopAddToStoreNar, wopBuildDerivation, etc.)
-- `fuzz/nar_reader` --- NAR streaming reader with malformed input
-- `fuzz/narinfo_parser` --- narinfo text format parser
-- `fuzz/derivation_parser` --- `.drv` ATerm format parser (including `__structuredAttrs` with `__json`)
+- `wire_primitives` --- u64, padded strings, framed streams, empty strings, maximum sizes
+- `opcode_parsing` --- each opcode's payload parsing (wopAddToStoreNar, wopBuildDerivation, etc.)
+- `nar_parsing` --- NAR streaming reader with malformed input
+- `narinfo_parsing` --- narinfo text format parser
+- `derivation_parsing` --- `.drv` ATerm format parser (including `__structuredAttrs` with `__json`)
+- `derived_path_parsing` --- DerivedPath wire format (`!`-separated `drvPath!output` strings)
+- `build_result_parsing` --- BuildResult wire format (status, error message, timing, built outputs)
+- `manifest_deserialize` (rio-store) --- chunk manifest deserialization
 - Run continuously via `cargo-fuzz` / `libFuzzer`:
   - **PR tier:** 30s/target smoke run with seed corpus (`nix flake check` includes `checks.fuzz-smoke-*`)
   - **Nightly tier:** 10min/target deep run (`nix build .#fuzz-nightly-<target>`, or via `.#ci-slow` aggregate)
-  - Corpus seeded from `rio-nix/fuzz/corpus/` (committed, regenerable via `gen-corpus.sh`)
+  - Corpus seeded from `rio-nix/fuzz/corpus/<target>/` and `rio-store/fuzz/corpus/<target>/` (committed seeds prefixed `seed-`; NAR seeds regenerable via `gen-nar-corpus.sh`)
 
 ## Unit Tests
 
-- Wire format: roundtrip serialization for all protocol types (fuzz with `proptest` and `arbtest`)
+- Wire format: roundtrip serialization for all protocol types (property tests via `proptest`)
 - DAG scheduling: known graphs -> expected critical paths and worker assignments
 - Scheduler invariants (proptest): for any DAG and completion sequence, no derivation is dispatched before all dependencies complete
 - DAG merging: merging two DAGs produces correct dedup and shared-node priority inheritance
@@ -61,13 +63,14 @@ Security-critical protocol parsers must be fuzz-tested:
 - `PutPath` for output path not in assignment token's `expected_output_paths` -> rejected
 - Cross-tenant data isolation: tenant A cannot query tenant B's builds via `AdminService`
 - Cross-tenant data isolation: tenant A's `wopQueryPathInfo` returns 404 for tenant B's paths (when per-tenant scoping is enabled)
-- `__noChroot` derivation rejected at gateway with `STDERR_ERROR` before reaching worker
-- JWT tenant token with expired `exp` -> `UNAUTHENTICATED` on all downstream RPCs
-- JWT tenant token with invalid signature -> `UNAUTHENTICATED`
-- mTLS: connection with wrong client certificate -> rejected at gRPC layer
-- FOD proxy: request to non-allowlisted domain -> rejected with 403
-- Binary cache: unauthenticated request to `/nar/` endpoint -> rejected (when auth is required)
-- DAG size exceeding `max_dag_size` -> rejected at gateway before reaching scheduler
+- DAG size exceeding `max_dag_size` -> rejected at the scheduler (not gateway --- the gateway forwards derivations; the scheduler enforces DAG-level limits)
+
+> **Phase 4/5 deferral:** the following security tests are planned but not yet implemented:
+> - `__noChroot` derivation rejection at gateway (currently enforced by nix-daemon's sandbox; gateway-level pre-check deferred)
+> - JWT tenant token validation (expired `exp`, invalid signature) --- JWT issuance is Phase 5
+> - mTLS client certificate rejection --- mTLS is Phase 4
+> - FOD proxy domain allowlisting --- FOD egress proxy is Phase 4
+> - Binary cache auth enforcement --- cache auth is Phase 4
 
 ## Chaos Testing (Phase 4)
 
@@ -76,25 +79,41 @@ Security-critical protocol parsers must be fuzz-tested:
 - PostgreSQL unavailability -> verify readiness probes gate traffic; verify recovery
 - Scheduler crash during active builds -> verify state recovery algorithm
 - Network partition between worker and scheduler -> verify completion buffering and retry
-- Use `toxiproxy` or equivalent for network fault injection between components
+
+> **Phase 4 deferral:** chaos tests (including network fault injection via `toxiproxy` or equivalent) are not yet implemented.
 
 ## CI Pipeline Tiers
 
 | Tier | Trigger | Tests | Aggregate target | Time Budget |
 |------|---------|-------|------------------|-------------|
-| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 30s fuzz smoke ×7 | `.#ci-local-fast` | < 5 min |
-| Merge | Every merge to main | + Integration tests with testcontainers (PostgreSQL, MinIO), VM tests | `.#ci-fast` | < 15 min |
-| Nightly | Scheduled | + Nix version compatibility, criterion benchmarks, 10min fuzz ×7 | `.#ci-slow` | < 60 min |
-| Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests, cargo-mutants on scheduler+store | — | Unbounded |
+| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 30s fuzz smoke ×8 | `.#ci-local-fast` | < 5 min |
+| Merge | Every merge to main | + VM integration tests (see below) | `.#ci-fast` | < 15 min |
+| Nightly | Scheduled | + 10min fuzz ×8 | `.#ci-slow` | < 60 min |
+| Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests | — | Unbounded |
+
+> **Phase 4 deferral:** criterion benchmarks, Nix multi-version compatibility matrix, and `cargo-mutants` mutation testing are not yet wired into any CI tier.
+
+## VM Integration Tests
+
+NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--4 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci-fast` (needs KVM):
+
+| Test | VMs | Validates |
+|------|-----|-----------|
+| `vm-phase1a` | 2 | Read-only opcodes (store info, path-info, store ls, verify) |
+| `vm-phase1b` | 3 | Single-worker build end-to-end |
+| `vm-phase2a` | 4 | Distributed 2-worker build, FUSE assertions, metrics |
+| `vm-phase2b` | 4 | OTLP trace export (Tempo), build log forwarding, config overlay |
+| `vm-phase2c` | 4 | Size-class routing, chunked CAS, binary cache HTTP |
+| `vm-phase3a` | 2 | k3s in-cluster: WorkerPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
 
 ## Test Environment
 
 | Dependency | Purpose |
 |------------|---------|
-| Nix daemon | Live-daemon golden conformance tests (auto-started per test) |
-| PostgreSQL | Build state storage (testcontainers, auto-started) |
-| MinIO | S3 backend tests (testcontainers, auto-started) |
-| kind / EKS cluster | Phase 3+ Kubernetes integration tests |
+| Nix daemon | Live-daemon golden conformance tests (auto-started per test via `fresh_daemon_socket()`) |
+| PostgreSQL | Build state storage (ephemeral `initdb` per test via `rio-test-support::TestDb`; `PG_BIN` set by dev shell) |
+| MinIO | S3 backend tests (VM tests use `services.minio`; unit tests use filesystem backend) |
+| k3s | Kubernetes integration tests (bootstrapped in `vm-phase3a` VM; no external cluster needed) |
 
 ## Benchmarks
 
