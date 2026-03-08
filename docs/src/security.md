@@ -48,6 +48,8 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 - **Threat**: Malicious derivation escaping sandbox and accessing worker resources
 - **Mitigations**: `CAP_SYS_ADMIN` + custom seccomp profile (NOT `privileged: true`), dedicated node pool, NetworkPolicy, `automountServiceAccountToken: false`, IMDSv2 hop limit=1
 
+> **Phase deferral (seccomp):** The custom seccomp profile is not yet shipped. Worker pods currently run with the runtime-default seccomp profile only. A rio-specific profile blocking `ptrace`, `bpf`, `kexec_load`, and other unnecessary syscalls under `CAP_SYS_ADMIN` is tracked as TODO(phase3b). See [Known Limitations](#known-limitations) item 2.
+
 ### Boundary 4: Binary Cache HTTP → External Clients
 
 - **Auth**: Bearer token or `netrc`-compatible authentication. Nix clients use `netrc-file` or `access-tokens` settings.
@@ -58,6 +60,8 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
   - Rate limiting on `/nar/` downloads (configurable per tenant).
   - NetworkPolicy: restrict access to the HTTP port from trusted CIDR ranges or ingress controller only.
 - **Note**: The binary cache HTTP server runs in the same process as the gRPC StoreService. Consider separate NetworkPolicy rules for the HTTP port vs the gRPC port.
+
+> **Phase 5 deferral:** Bearer token authentication, per-tenant path visibility, and per-tenant download rate limiting for the binary cache HTTP endpoint are not yet implemented. The narinfo/NAR endpoints currently serve any valid store path to any caller. Until Phase 5, the only access control is `NetworkPolicy` CIDR restriction on the HTTP port. See [Multi-Tenancy](multi-tenancy.md).
 
 ## Key Security Properties
 
@@ -108,15 +112,20 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 
 ### Secret Inventory
 
-| Secret | Used By | Rotation |
-|--------|---------|----------|
-| SSH host key (`ssh_host_ed25519_key`) | Gateway | Rarely (causes client known_hosts warnings) |
-| Authorized SSH keys | Gateway | Per-tenant lifecycle |
-| NAR signing key (`signing-key`) | Store | Annually or on compromise |
-| HMAC signing key (assignment tokens) | Scheduler + Store | Annually or on compromise |
-| JWT signing key (tenant tokens) | Gateway | Annually; SIGHUP reload for zero-downtime |
-| Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets |
-| TLS certificates (if no service mesh) | All gRPC components | Via cert-manager auto-renewal |
+| Secret | Used By | Rotation | Status |
+|--------|---------|----------|--------|
+| SSH host key (`ssh_host_ed25519_key`) | Gateway | Rarely (causes client known_hosts warnings) | Implemented |
+| Authorized SSH keys[^authkeys] | Gateway | Per-tenant lifecycle | Implemented (flat file; no tenant annotation) |
+| NAR signing key (`signing-key`) | Store | Annually or on compromise | Implemented |
+| HMAC signing key (assignment tokens)[^hmac] | Scheduler + Store | Annually or on compromise | **Phase 3b** — not yet read or verified |
+| JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | **Phase 5** — no tenant token issuance yet |
+| Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets | Implemented |
+| TLS certificates (if no service mesh)[^tls] | All gRPC components | Via cert-manager auto-renewal | **Phase 3b** — all channels currently `http://` |
+
+[^authkeys]: Tenant annotation in the `authorized_keys` comment field (e.g., `ssh-ed25519 AAAA... tenant=acme`) is not yet parsed. All authenticated keys currently share a single implicit tenant. SSH key → tenant mapping is Phase 5.
+[^hmac]: No code path currently loads, signs, or verifies an HMAC key. `PutPath` accepts any upload from any caller. See the Phase 3b deferral under [Boundary 2](#boundary-2-gatewayworker--internal-services-grpc).
+[^jwt]: There is no JWT issuance or verification code. Tenant identity exists only as a string field in the scheduler's `BuildOptions` with no authentication backing.
+[^tls]: No `rustls`/`tls_config` wiring exists on any tonic client or server. All gRPC connections use plaintext HTTP/2.
 
 ## Additional Threats
 
