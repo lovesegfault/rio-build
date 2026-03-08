@@ -99,15 +99,16 @@ r[store.put.wal-manifest]
 
 > **Phase 3b deferral:** Assignment token HMAC signing and verification are not yet implemented. Tokens are currently opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. Leader election (Phase 3a) landed without HMAC.
 
-1. **Buffer + verify:** Buffer the uploaded NAR stream fully in memory, then compute SHA-256 over the buffered bytes and verify against the declared `NarHash`. Reject on mismatch before touching PostgreSQL or S3.
-2. **Write-ahead manifest (PG):** Chunk the buffered NAR with FastCDC, then in a single PostgreSQL transaction: write `manifest_data` (serialized chunk list) and UPSERT chunk refcounts. This protects chunks from GC sweep immediately — even if the upload crashes after this point, orphan cleanup will find the stale `'uploading'` row and decrement refcounts correctly.
-3. **Dedup check:** Query `chunks.refcount` for all chunks in the manifest. Chunks with `refcount == 1` were newly inserted by step 2 and need S3 upload; chunks with `refcount > 1` already existed before this upload.
-4. **Upload new chunks:** Parallel S3 PUTs (8-wide) for the `refcount == 1` subset. No post-upload HeadObject verification — integrity is guaranteed by BLAKE3 verification on every read (see `store.integrity.verify-on-get`).
-5. **Complete:** Flip manifest status to `'complete'` in a single PG transaction (also fills real narinfo fields, references, content index entries).
+1. **Idempotency check + `'uploading'` placeholder:** If a `'complete'` manifest already exists for this path, return success immediately (fast-path no-op). Otherwise, insert an `'uploading'` placeholder row in `manifests` as an idempotency lock --- this PG write happens **before** the NAR is buffered or verified.
+2. **Buffer + verify:** Accumulate the streamed NAR chunks into a buffer, then compute SHA-256 over the buffered bytes and verify against the declared `NarHash`. On mismatch, delete the placeholder row and reject.
+3. **Write-ahead manifest (PG):** Chunk the buffered NAR with FastCDC, then in a single PostgreSQL transaction: write `manifest_data` (serialized chunk list) and UPSERT chunk refcounts. This protects chunks from GC sweep immediately — even if the upload crashes after this point, orphan cleanup will find the stale `'uploading'` row and decrement refcounts correctly.
+4. **Dedup check:** Query `chunks.refcount` for all chunks in the manifest. Chunks with `refcount == 1` were newly inserted by step 3 and need S3 upload; chunks with `refcount > 1` already existed before this upload.
+5. **Upload new chunks:** Parallel S3 PUTs (8-wide) for the `refcount == 1` subset. No post-upload HeadObject verification — integrity is guaranteed by BLAKE3 verification on every read (see `store.integrity.verify-on-get`).
+6. **Complete:** Flip manifest status to `'complete'` in a single PG transaction (also fills real narinfo fields, references, content index entries).
 
-**On graceful error (steps 3–5 return `Err`):** `put_chunked` rolls back refcounts and deletes the `'uploading'` placeholder before returning. Chunks already uploaded to S3 are **not** deleted (GC sweep's responsibility — deleting now would race with a concurrent uploader that just incremented the same chunk).
+**On graceful error (steps 4–6 return `Err`):** `put_chunked` rolls back refcounts and deletes the `'uploading'` placeholder before returning. Chunks already uploaded to S3 are **not** deleted (GC sweep's responsibility — deleting now would race with a concurrent uploader that just incremented the same chunk).
 
-**On crash (process dies between steps 2 and 5):** the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 2 hours). The chunk list in `manifest_data` is used to decrement refcounts; only chunks whose refcount drops to 0 become eligible for S3 deletion via `pending_s3_deletes`. No full S3 enumeration needed.
+**On crash (process dies between steps 3 and 6):** the orphan scanner reclaims stale `'uploading'` records after a configurable timeout (default: 2 hours). The chunk list in `manifest_data` is used to decrement refcounts; only chunks whose refcount drops to 0 become eligible for S3 deletion via `pending_s3_deletes`. No full S3 enumeration needed.
 
 r[store.put.idempotent]
 **Idempotency:** If `PutPath` is called for a store path that already has a `'complete'` manifest, the call returns success immediately without re-uploading. This makes concurrent uploads of the same path safe.

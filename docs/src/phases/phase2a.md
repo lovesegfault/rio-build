@@ -16,7 +16,7 @@
 - [x] Store: simple filesystem or S3 backend (full NARs, no chunking) with NAR hash verification on PutPath
 - [x] Multi-process deployment (gateway, scheduler, store, workers as separate processes)
 - [x] IFD handling: `wopBuildDerivation` during evaluation treated as normal build request, prioritized in scheduler
-- [x] Basic TransientFailure retry (re-queue to another worker, 2 attempts; exponential backoff computed but immediate re-queue — delayed re-queue deferred to Phase 3)
+- [x] Basic TransientFailure retry (re-queue to another worker, 2 attempts; exponential backoff computed but immediate re-queue — delayed re-queue deferred to Phase 3b)
 - [x] Build hook protocol: `--builders` mode path where Nix delegates individual derivations to rio-build
 
 > **Shared derivation priority simplification:** Phase 2a uses a binary interactive/scheduled FIFO (interactive builds push_front the ready queue). Full max(priority) across interested builds is deferred to Phase 2c with critical-path scheduling.

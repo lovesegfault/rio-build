@@ -1,6 +1,6 @@
 # Components
 
-rio-build is composed of seven main components. During early development (Phase 1-2), most backend components live as modules within the `rio-build` crate. They are split into separate crates as interfaces stabilize.
+rio-build is composed of seven main components, each a dedicated workspace crate (the 3→9 crate split happened during Phase 1-2a; see [Crate Structure](./crate-structure.md)).
 
 | Component | Role |
 |-----------|------|

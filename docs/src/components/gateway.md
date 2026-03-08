@@ -516,7 +516,7 @@ This is a complex nested structure. The gateway must construct it correctly for 
 r[gw.stderr.error-before-return]
 **Every handler error path that returns `Err(...)` MUST send `STDERR_ERROR` to the client first.** Never use bare `?` to propagate errors from store operations, NAR extraction, or ATerm parsing --- always wrap in a match that sends `STDERR_ERROR` before returning. For batch opcodes like `wopBuildPathsWithResults`, per-entry errors should push `BuildResult::failure` and `continue`, not abort the entire batch.
 
-> **Exception — `wopQueryRealisation`:** The handler sends `STDERR_LAST` before invoking the store (to avoid buffering the response). A store error after that point is too late for `STDERR_ERROR`; instead the handler returns empty-set (`u64(0)`) and logs a warning. This is a degraded path (one missed CA cache hit), not a correctness violation; the next opcode on the session will hit the same store and fail through its own error path.
+> **Exception — `wopQueryRealisation`:** The handler invokes the store first, then sends `STDERR_LAST` unconditionally, then matches on the store result. A store error (already past `STDERR_LAST`) is too late for `STDERR_ERROR`; instead the handler returns empty-set (`u64(0)`) and logs a warning. This is a degraded path (one missed CA cache hit), not a correctness violation; the next opcode on the session will hit the same store and fail through its own error path. (This could be restructured to match before `STDERR_LAST` --- the result is already buffered --- but the degraded-path cost is trivial and the structure is simpler.)
 
 | Field | Type | Description |
 |-------|------|-------------|

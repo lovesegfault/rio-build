@@ -95,16 +95,16 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 
 ## VM Integration Tests
 
-NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--4 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci-fast` (needs KVM):
+NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci-fast` (needs KVM):
 
 | Test | VMs | Validates |
 |------|-----|-----------|
 | `vm-phase1a` | 2 | Read-only opcodes (store info, path-info, store ls, verify) |
 | `vm-phase1b` | 3 | Single-worker build end-to-end |
 | `vm-phase2a` | 4 | Distributed 2-worker build, FUSE assertions, metrics |
-| `vm-phase2b` | 4 | OTLP trace export (Tempo), build log forwarding, config overlay |
-| `vm-phase2c` | 4 | Size-class routing, chunked CAS, binary cache HTTP |
-| `vm-phase3a` | 2 | k3s in-cluster: WorkerPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
+| `vm-phase2b` | 5 | OTLP trace export (Tempo), build log forwarding, config overlay |
+| `vm-phase2c` | 5 | Size-class routing, chunked CAS, binary cache HTTP |
+| `vm-phase3a` | 3 | k3s in-cluster: WorkerPool CRD → pod → FUSE → build → cgroup memory.peak → build\_history |
 
 ## Test Environment
 

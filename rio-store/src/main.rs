@@ -262,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // The type param is the service struct, not the generated Server
     // wrapper. tonic-health uses it for the per-service name (clients
-    // can check "rio.store.v1.StoreService" specifically). We only
+    // can check "rio.store.StoreService" specifically). We only
     // register one — the empty-string "whole server" check falls through
     // to this when no specific service is named.
     health_reporter

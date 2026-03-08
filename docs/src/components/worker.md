@@ -187,7 +187,7 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 2. **NAR each output**: Serialize each output path independently into a NAR archive.
 3. **Chunk**: Split each NAR into content-addressed chunks (matching rio-store's chunk size).
 4. **Upload**: Upload chunks to rio-store in parallel across outputs. Deduplicate against existing chunks (CAS).
-5. **Register**: Register each output path's NAR hash and NAR size with rio-store. References and signatures are sent **empty** --- rio-store computes references server-side from NAR content; output signing is a Phase 4 concern.
+5. **Register**: Register each output path's NAR hash and NAR size with rio-store. References and signatures are sent **empty**. **Phase deferral:** neither the worker nor rio-store currently computes output references (NAR content scanning for store-path strings). Stored outputs have empty `references`; this is a known gap that will need resolution for GC correctness and for serving accurate narinfo from the binary cache. Output signing is a Phase 4 concern.
 
 Outputs are uploaded **concurrently and independently** via `buffer_unordered(MAX_PARALLEL_UPLOADS)` --- each output is its own `PutPath` stream. There is no cross-output atomicity: if one output's upload fails, the other outputs may already be registered. Partial registration is possible.
 

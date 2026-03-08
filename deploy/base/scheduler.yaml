@@ -103,14 +103,16 @@ spec:
               port: 9001
             periodSeconds: 10
             failureThreshold: 6
-          # Startup: gRPC health, generous threshold. Scheduler
-          # runs migrations + connects to PG + connects to store
-          # on startup — 60s worst case (slow migration on a
-          # big event_log table).
+          # Startup: TCP check (NOT the named gRPC service). The
+          # named SchedulerService only goes SERVING when is_leader=true;
+          # a standby replica never acquires the lease while the leader
+          # is healthy, so a named-service startupProbe would crash-loop
+          # the standby. TCP check just confirms the gRPC server is up.
+          # Generous threshold: scheduler runs migrations + connects to
+          # PG + connects to store on startup — 60s worst case.
           startupProbe:
-            grpc:
+            tcpSocket:
               port: 9001
-              service: rio.scheduler.SchedulerService
             periodSeconds: 5
             # 60s total (12 × 5s). Ignored once this passes.
             failureThreshold: 12

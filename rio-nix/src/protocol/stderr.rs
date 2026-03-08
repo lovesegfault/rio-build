@@ -211,7 +211,8 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         Ok(())
     }
 
-    /// Send STDERR_WRITE with data (used by `wopNarFromPath` to send NAR chunks).
+    /// Send STDERR_WRITE with data. Test-only: no production opcode uses
+    /// STDERR_WRITE currently (wopNarFromPath was fixed to raw-bytes-after-LAST).
     #[cfg(test)]
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), WireError> {
         self.check_not_finished()?;
@@ -221,7 +222,8 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         Ok(())
     }
 
-    /// Send STDERR_READ to request data from the client (used by `wopAddToStoreNar`).
+    /// Send STDERR_READ to request data from the client. Test-only: production
+    /// uses framed streams (protocol >= 1.23), not STDERR_READ.
     #[cfg(test)]
     pub async fn read_request(&mut self, count: u64) -> Result<(), WireError> {
         self.check_not_finished()?;

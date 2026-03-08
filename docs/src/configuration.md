@@ -9,19 +9,18 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `listen_addr` | string | `0.0.0.0:2222` | SSH listen address and port |
-| `max_connections` | u32 | 1000 | Maximum concurrent SSH connections |
-| `max_channels_per_connection` | u32 | 32 | Maximum SSH channels per connection |
-| `protocol_version_min` | u32 | `0x125` (1.37) | Minimum Nix protocol version accepted. Nix encodes protocol versions as `(major << 8) \| minor` on the wire, so version 1.37 = `(1 << 8) \| 37` = `0x125`. Corresponds to Nix 2.20+. |
-| `host_key_path` | string | `/etc/rio/ssh_host_ed25519_key` | SSH host key file |
-| `authorized_keys_path` | string | `/etc/rio/authorized_keys` | Authorized SSH keys file |
-| `scheduler_addr` | string | `rio-scheduler:50051` | Scheduler gRPC endpoint |
-| `store_addr` | string | `rio-store:50052` | Store gRPC endpoint |
+| `host_key` | string | (required) | SSH host key file path. If unset or missing, gateway generates an ephemeral key (breaks `known_hosts` on restart --- set in production). |
+| `authorized_keys` | string | (required) | Authorized SSH keys file path |
+| `scheduler_addr` | string | (required) | Scheduler gRPC endpoint |
+| `store_addr` | string | (required) | Store gRPC endpoint |
+
+> **Compile-time constants (not configurable):** `MIN_CLIENT_VERSION = 0x125` (1.37) --- the minimum Nix worker-protocol version accepted.
 
 ## Scheduler
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `listen_addr` | string | `0.0.0.0:50051` | gRPC listen address |
+| `listen_addr` | string | `0.0.0.0:9001` | gRPC listen address |
 | `database_url` | string | (required) | PostgreSQL connection string |
 | `w_locality` | const | 0.7 | Weight for transfer-cost locality scoring (compile-time const, not configurable) |
 | `w_load` | const | 0.3 | Weight for worker load scoring (compile-time const, not configurable) |
@@ -90,10 +89,9 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `listen_addr` | string | `0.0.0.0:8081` | HTTP listen address for health probes |
-| `scheduler_addr` | string | `rio-scheduler:50051` | Scheduler gRPC endpoint (for queue depth queries) |
-| `worker_pool_sync_interval` | Duration | 30s | How often to reconcile WorkerPool state |
-| `gc_schedule` | string | `0 3 * * *` | Cron schedule for automated GC triggers (Phase 4) |
+| `health_addr` | socket addr | `0.0.0.0:9194` | HTTP `/healthz` listen address |
+| `metrics_addr` | socket addr | `0.0.0.0:9094` | Prometheus metrics listen address |
+| `scheduler_addr` | string | (required) | Scheduler gRPC endpoint (for queue depth queries + DrainWorker on finalizer) |
 
 > **The controller is NOT leader-elected** (single replica by design). Only the scheduler uses a Kubernetes Lease (see scheduler `RIO_LEASE_NAME` / `RIO_LEASE_NAMESPACE` env vars documented in [scheduler: Leader Election](./components/scheduler.md#leader-election)).
 

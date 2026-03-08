@@ -438,10 +438,9 @@ pub async fn filter_and_inline_drv(
             continue;
         }
 
-        // Budget gate. Once we hit 16 MB, stop inlining. Remaining
-        // nodes fall back to worker-fetch. "Stop" not "skip" — there
-        // could be hundreds more small ones, not worth looping to find
-        // them when we're already over budget.
+        // Budget gate. Once we hit 16 MB, skip. Remaining nodes fall
+        // back to worker-fetch. We still loop to count skipped_budget
+        // for the metric, but no more inlining happens.
         if total_inlined + aterm_bytes.len() > INLINE_BUDGET_BYTES {
             skipped_budget += 1;
             continue;
