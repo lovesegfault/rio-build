@@ -337,6 +337,14 @@ impl DagActor {
                     // duplicate the value. 7200s = 2h.
                     7200
                 };
+                // Clamp BEFORE saturating_mul: a client sending
+                // build_timeout=u64::MAX would get saturating_mul
+                // → u64::MAX → expiry_unix = u64::MAX = immortal
+                // token. A leaked immortal token defeats the
+                // replay-prevention purpose of expiry entirely.
+                // 7 days max: well above any real build duration.
+                const MAX_HMAC_TIMEOUT_SECS: u64 = 7 * 86400;
+                let timeout_secs = timeout_secs.min(MAX_HMAC_TIMEOUT_SECS);
                 let expiry_unix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
