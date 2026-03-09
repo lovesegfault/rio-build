@@ -79,16 +79,21 @@ pub async fn scan_once(
         // batching isn't worth the complexity).
         let mut tx = pool.begin().await?;
 
-        // Re-read chunk_list INSIDE the tx with FOR UPDATE (X3 fix).
-        // The outer SELECT above is OUTSIDE any tx. Multi-replica
-        // race: store-0 reaps correctly (outer chunk_list = C1).
-        // Worker re-uploads same path with NEW chunk_list C2 before
-        // store-1's iteration. store-1's status-guarded DELETE
-        // succeeds (fresh placeholder IS uploading + stale again)
-        // but decrements OLD C1 → corruption (C1 refcount negative,
-        // C2 orphaned forever). Reading chunk_list INSIDE the tx
-        // (with FOR UPDATE locking the manifest row) guarantees we
-        // decrement the chunk_list that we actually DELETE.
+        // Re-read chunk_list INSIDE the tx with FOR UPDATE (X3 fix)
+        // AND re-check the stale threshold (Y3 fix).
+        //
+        // X3: the outer SELECT is OUTSIDE any tx. Reading chunk_list
+        // INSIDE the tx (with FOR UPDATE locking the manifest row)
+        // guarantees we decrement the chunk_list that we DELETE.
+        //
+        // Y3: status='uploading' alone doesn't catch the reap-then-
+        // reupload race. store-0 + store-1 both outer-SELECT the
+        // same stale hash; store-0 reaps; worker re-uploads (NEW
+        // row, same hash, status='uploading', updated_at=now());
+        // store-1's FOR UPDATE would match the NEW row (status is
+        // 'uploading' ✓) and reap a FRESH upload. Re-checking the
+        // stale threshold inside the tx catches this — fresh
+        // re-uploads have updated_at=now() → don't match.
         //
         // The FOR UPDATE blocks any concurrent re-upload until this
         // tx commits — same pattern as sweep.rs:64-76.
@@ -99,41 +104,43 @@ pub async fn scan_once(
               LEFT JOIN manifest_data md USING (store_path_hash)
              WHERE m.store_path_hash = $1
                AND m.status = 'uploading'
+               AND m.updated_at < now() - make_interval(secs => $2)
                FOR UPDATE OF m
             "#,
         )
         .bind(&store_path_hash)
+        .bind(threshold_secs)
         .fetch_optional(&mut *tx)
         .await?
         .flatten();
 
         // DELETE narinfo → CASCADE to manifests/manifest_data.
         //
-        // Status guard in WHERE: re-checks manifests.status='uploading'
-        // ATOMICALLY at DELETE time, inside this tx. Without this,
-        // an upload that completed between our outer SELECT (status-
-        // filtered but outside any tx) and this DELETE would have its
-        // now-valid narinfo reaped. rows_affected()==0 catches both
-        // "already gone" AND "completed since SELECT" (status flipped
-        // → EXISTS false → no rows match).
+        // Status + stale-threshold guards in EXISTS: atomic re-check
+        // at DELETE time. rows_affected()==0 catches: (a) another
+        // replica already reaped (gone), (b) upload completed since
+        // outer SELECT (status='complete' → EXISTS false), (c) Y3:
+        // reap-then-reupload left a FRESH 'uploading' row (updated_at
+        // recent → stale clause false → EXISTS false).
         //
-        // The FOR UPDATE above already locked the manifest row, so
-        // status can't have flipped since that SELECT — but the
-        // EXISTS guard is still needed for the case where the outer
-        // SELECT's row was reaped by another replica (FOR UPDATE
-        // returned 0 rows → chunk_list=None, this DELETE also
-        // returns 0 rows → skip).
+        // The FOR UPDATE above already re-checked stale+status and
+        // locked the row — the EXISTS guard is defense-in-depth for
+        // the case where FOR UPDATE returned 0 rows (chunk_list=None)
+        // but the DELETE would otherwise match a fresh row.
         let deleted = sqlx::query(
             r#"
             DELETE FROM narinfo n
              WHERE n.store_path_hash = $1
                AND EXISTS (
                    SELECT 1 FROM manifests m
-                    WHERE m.store_path_hash = $1 AND m.status = 'uploading'
+                    WHERE m.store_path_hash = $1
+                      AND m.status = 'uploading'
+                      AND m.updated_at < now() - make_interval(secs => $2)
                )
             "#,
         )
         .bind(&store_path_hash)
+        .bind(threshold_secs)
         .execute(&mut *tx)
         .await?;
         if deleted.rows_affected() == 0 {
@@ -272,19 +279,22 @@ mod tests {
         //
         // We can't easily interleave with scan_once's internal loop
         // from a unit test. Instead, we assert the INVARIANT
-        // directly: run the same DELETE query with status guard,
-        // verify rows_affected==0.
+        // directly: run the same DELETE query with status+stale
+        // guard (Y3), verify rows_affected==0.
         let deleted = sqlx::query(
             r#"
             DELETE FROM narinfo n
              WHERE n.store_path_hash = $1
                AND EXISTS (
                    SELECT 1 FROM manifests m
-                    WHERE m.store_path_hash = $1 AND m.status = 'uploading'
+                    WHERE m.store_path_hash = $1
+                      AND m.status = 'uploading'
+                      AND m.updated_at < now() - make_interval(secs => $2)
                )
             "#,
         )
         .bind(&hash)
+        .bind(0i64)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -342,5 +352,107 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 1, "fresh upload narinfo preserved");
+    }
+
+    /// Y3: reap-then-reupload race. store-0 + store-1 both
+    /// outer-SELECT the same stale hash. store-0 reaps it. Worker
+    /// re-uploads (NEW row, same hash, status='uploading',
+    /// updated_at fresh). store-1's inner FOR UPDATE + DELETE must
+    /// NOT reap the fresh re-upload.
+    ///
+    /// We can't race two scan_once calls; instead we simulate
+    /// store-1's inner-loop state: we already HAVE the hash from
+    /// a stale outer SELECT, but the DB now has a FRESH re-upload
+    /// at that hash. Running the inner queries directly (FOR UPDATE
+    /// + DELETE with the stale-threshold re-check) must return 0.
+    #[tokio::test]
+    async fn orphan_skips_fresh_reupload_after_another_replicas_reap() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let hash = vec![0x04u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("y3-reupload");
+
+        // --- store-0's turn: seed stale + reap ---
+        seed_stale_uploading(&db.pool, &hash, &path).await;
+        let reaped = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 1, "store-0 reaped the stale upload");
+
+        // --- Worker re-uploads same path (FRESH placeholder) ---
+        // updated_at = now() + 10s guarantees NOT stale under the
+        // test threshold (0s → `updated_at < now()`).
+        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() + interval '10 seconds' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // --- store-1's inner loop: has the hash from its OWN outer
+        // SELECT (which ran BEFORE store-0's reap, saw stale). ---
+        //
+        // Run the FOR UPDATE query directly. With the Y3 stale-
+        // threshold re-check, it should return None (fresh re-upload
+        // has updated_at > now()-threshold → doesn't match).
+        let mut tx = db.pool.begin().await.unwrap();
+        let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            SELECT md.chunk_list
+              FROM manifests m
+              LEFT JOIN manifest_data md USING (store_path_hash)
+             WHERE m.store_path_hash = $1
+               AND m.status = 'uploading'
+               AND m.updated_at < now() - make_interval(secs => $2)
+               FOR UPDATE OF m
+            "#,
+        )
+        .bind(&hash)
+        .bind(0i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap()
+        .flatten();
+        assert!(
+            chunk_list.is_none(),
+            "Y3: FOR UPDATE must NOT match fresh re-upload (stale re-check)"
+        );
+
+        // The DELETE should also skip (EXISTS with stale clause
+        // → false for fresh row).
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM narinfo n
+             WHERE n.store_path_hash = $1
+               AND EXISTS (
+                   SELECT 1 FROM manifests m
+                    WHERE m.store_path_hash = $1
+                      AND m.status = 'uploading'
+                      AND m.updated_at < now() - make_interval(secs => $2)
+               )
+            "#,
+        )
+        .bind(&hash)
+        .bind(0i64)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(
+            deleted.rows_affected(),
+            0,
+            "Y3: DELETE must NOT reap fresh re-upload"
+        );
+        tx.rollback().await.unwrap();
+
+        // Fresh re-upload's narinfo still present.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "Y3: fresh re-upload narinfo survived");
     }
 }
