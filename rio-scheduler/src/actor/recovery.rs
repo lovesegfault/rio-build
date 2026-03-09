@@ -464,22 +464,17 @@ impl DagActor {
                     self.check_build_completion(*build_id).await;
                 }
             } else {
-                // Worker died mid-build. Record the failure + check
-                // poison threshold (X6 fix — same shape as
-                // reassign_derivations).
-                if let Some(w) = &worker_id {
-                    if let Some(state) = self.dag.node_mut(&drv_hash) {
-                        state.failed_workers.insert(w.clone());
-                    }
-                    if let Err(e) = self.db.append_failed_worker(&drv_hash, w).await {
-                        error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_worker");
-                    }
-                }
-                let should_poison = self
-                    .dag
-                    .node(&drv_hash)
-                    .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
-                    .unwrap_or(false);
+                // Worker died mid-build. Record the failure (in-mem
+                // + PG) + check poison threshold (X6 fix — same
+                // helper as reassign_derivations).
+                let should_poison = if let Some(w) = &worker_id {
+                    self.record_failure_and_check_poison(&drv_hash, w).await
+                } else {
+                    self.dag
+                        .node(&drv_hash)
+                        .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+                        .unwrap_or(false)
+                };
                 if should_poison {
                     info!(drv_hash = %drv_hash, worker_id = ?worker_id,
                           "reconcile: POISON_THRESHOLD reached, poisoning");

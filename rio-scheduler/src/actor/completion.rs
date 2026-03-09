@@ -41,6 +41,32 @@ impl DagActor {
         }
     }
 
+    /// Record a worker failure for `drv_hash` (in-mem + PG
+    /// best-effort) and return whether POISON_THRESHOLD distinct
+    /// workers have now failed. Caller decides: poison_and_cascade
+    /// if true, reset_to_ready + retry if false.
+    ///
+    /// The in-mem insert comes first (scheduler-authoritative);
+    /// PG is for recovery only. A PG blip degrades to "might
+    /// retry on the same worker once post-recovery."
+    pub(super) async fn record_failure_and_check_poison(
+        &mut self,
+        drv_hash: &DrvHash,
+        worker_id: &WorkerId,
+    ) -> bool {
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            state.failed_workers.insert(worker_id.clone());
+        }
+        if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
+            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e,
+                   "failed to persist failed_worker");
+        }
+        self.dag
+            .node(drv_hash)
+            .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+            .unwrap_or(false)
+    }
+
     // -----------------------------------------------------------------------
     // ProcessCompletion
     // -----------------------------------------------------------------------
@@ -417,21 +443,16 @@ impl DagActor {
         drv_hash: &DrvHash,
         worker_id: &WorkerId,
     ) {
-        // Persist the failed worker BEFORE in-mem mutation — same
-        // write order as status updates. best-effort: if PG is down,
-        // the in-mem state is still authoritative; recovery would
-        // lose this one failure's worker-tracking (degrades to
-        // "might retry on same worker once post-recovery").
-        if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
-            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e,
-                   "failed to persist failed_worker");
-        }
+        // Record failure (in-mem HashSet insert + PG append,
+        // best-effort) + get poison verdict in one call — same
+        // helper as reassign_derivations (worker.rs) and
+        // handle_reconcile_assignments (recovery.rs).
+        let reached_poison = self
+            .record_failure_and_check_poison(drv_hash, worker_id)
+            .await;
 
         let should_retry = if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.failed_workers.insert(worker_id.clone());
-
-            // Check poison threshold
-            if state.failed_workers.len() >= POISON_THRESHOLD {
+            if reached_poison {
                 false // poison_and_cascade below does the transition
             } else if state.retry_count < self.retry_policy.max_retries {
                 state.ensure_running();
