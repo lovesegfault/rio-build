@@ -166,13 +166,20 @@ let
   testDrvFileB1 = mkTestDrvFile "hmac";
   testDrvFileS1 = mkTestDrvFile "recovery";
 
-  # V3: slow build for S1 in-flight recovery. 15s sleep survives
-  # the scheduler-restart window (~5s kill+wait + ~5s lease acquire).
-  # The build is backgrounded before restart; recovery should load
-  # its derivation row from PG → `derivations=1` in the recovery
-  # log. We don't wait for the build to complete (timing-sensitive
-  # — worker also restarts and loses overlay) — just assert the
-  # recovery log shows a non-zero derivation count.
+  # V3: slow build for S1 in-flight recovery. Sleep survives the
+  # scheduler-restart window (~5s kill+wait + ~5s lease acquire +
+  # up to 30s recovery wait). Backgrounded before restart; recovery
+  # should load its derivation row from PG → `derivations=1` in
+  # the recovery log.
+  #
+  # Round 4: increased 15s → 60s. With Z3 (phantom-Assigned cross-
+  # check), ReconcileAssignments now reconciles drvs that completed
+  # during scheduler downtime: worker finishes 15s build, reconnects
+  # with empty running_builds, Z3 detects this → store-check →
+  # output present → Completed. This is CORRECT behavior (Z3 works),
+  # but V3's PG check then finds 0 non-terminal. 60s outlives the
+  # full restart+recovery window (~40s worst case) so the build is
+  # still running at PG-check time.
   testDrvFileS1slow = pkgs.writeText "phase3b-recovery-slow.nix" ''
     { busybox }:
     derivation {
@@ -183,7 +190,7 @@ let
         "-c"
         '''
           set -ex
-          ''${busybox}/bin/busybox sleep 15
+          ''${busybox}/bin/busybox sleep 60
           ''${busybox}/bin/busybox mkdir -p $out
           ''${busybox}/bin/busybox echo "phase3b recovery-slow" > $out/stamp
         '''
