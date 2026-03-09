@@ -193,7 +193,15 @@
           # with the non-instrumented workspace. RUSTFLAGS invalidates
           # cargoArtifacts so a separate deps cache is used.
           covArgs = commonArgs // {
-            RUSTFLAGS = "-C instrument-coverage";
+            # -Z coverage-options=branch enables branch coverage (if/
+            # else, match arms). Default -C instrument-coverage only
+            # emits block (line/region) data. -Z is nightly-gated;
+            # RUSTC_BOOTSTRAP=1 unlocks it on the stable toolchain
+            # (stable rustc binaries contain the code, just feature-
+            # gated). This is coverage-only — the non-instrumented
+            # workspace build stays pure stable for CI parity.
+            RUSTFLAGS = "-C instrument-coverage -Z coverage-options=branch";
+            RUSTC_BOOTSTRAP = "1";
             pname = "rio-cov";
             # Build scripts and proc-macros are ALSO instrumented; when
             # they run at compile time (tonic-prost-build, sqlx macros),
@@ -369,7 +377,13 @@
                 # $out is a directory. The old cargoLlvmCov wrote lcov to $out
                 # directly (a file). lcov consumers downstream (lcov --summary
                 # in the dev shell) need updating to $out/lcov.info.
-                cargoLlvmCovExtraArgs = "--lcov --output-path $out/lcov.info";
+                #
+                # --branch: enable branch coverage (-Z coverage-options=
+                # branch under the hood, nightly-gated). RUSTC_BOOTSTRAP
+                # unlocks on stable. Matches rio-workspace-cov so unit +
+                # VM lcovs merge with consistent BRDA record structure.
+                cargoLlvmCovExtraArgs = "--branch --lcov --output-path $out/lcov.info";
+                RUSTC_BOOTSTRAP = "1";
                 # cargoNextest runs tests in checkPhase (vs cargoLlvmCov
                 # which used buildPhase), so nativeCheckInputs is correct
                 # here — matching the plain `nextest` check above.
@@ -795,7 +809,7 @@
                 --output-file $TMPDIR/cleaned.lcov
               cd ${commonArgs.src}
               ${pkgs.lcov}/bin/genhtml $TMPDIR/cleaned.lcov \
-                --output-directory $out
+                --branch-coverage --output-directory $out
             '';
           }
           # 10-minute nightly fuzz runs — NOT in checks, explicitly invoked
