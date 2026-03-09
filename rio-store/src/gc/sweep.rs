@@ -19,8 +19,10 @@ const SWEEP_BATCH_SIZE: usize = 100;
 /// Sweep unreachable paths. For each:
 /// 1. `SELECT chunk_list FOR UPDATE` (TOCTOU guard vs PutPath
 ///    incrementing a refcount we're about to decrement)
-/// 2. `DELETE narinfo` (CASCADE → manifests/manifest_data/
-///    content_index/realisations)
+/// 2a. `DELETE realisations` for this path (NO FK to narinfo —
+///    explicit delete prevents dangling wopQueryRealisation rows)
+/// 2b. `DELETE narinfo` (CASCADE → manifests/manifest_data/
+///    content_index)
 /// 3. `UPDATE chunks SET refcount = refcount - 1`
 /// 4. `UPDATE chunks SET deleted = true WHERE refcount = 0 RETURNING`
 /// 5. `INSERT INTO pending_s3_deletes` for each returned chunk
@@ -75,8 +77,27 @@ pub async fn sweep(
             .await?
             .flatten();
 
-            // Step 2: DELETE narinfo. CASCADE takes manifests,
-            // manifest_data, content_index, realisations.
+            // Step 2a: DELETE realisations for this path. NOT via
+            // CASCADE — realisations has NO FK to narinfo (002_
+            // store.sql:134). Without this explicit DELETE, dangling
+            // realisations rows point to swept paths →
+            // wopQueryRealisation returns a path that 404s on fetch.
+            // The realisations_output_idx index makes this fast.
+            sqlx::query(
+                r#"
+                DELETE FROM realisations
+                 WHERE output_path = (
+                   SELECT store_path FROM narinfo WHERE store_path_hash = $1
+                 )
+                "#,
+            )
+            .bind(store_path_hash)
+            .execute(&mut *tx)
+            .await?;
+
+            // Step 2b: DELETE narinfo. CASCADE takes manifests,
+            // manifest_data, content_index (but NOT realisations —
+            // see step 2a above).
             let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
                 .bind(store_path_hash)
                 .execute(&mut *tx)
@@ -120,4 +141,97 @@ pub async fn sweep(
     );
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::TestDb;
+    use sha2::Digest;
+
+    async fn seed_complete_path(pool: &PgPool, path: &str) -> Vec<u8> {
+        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $1, 0)",
+        )
+        .bind(&hash)
+        .bind(path)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .unwrap();
+        hash
+    }
+
+    /// X8 regression: sweep must DELETE realisations rows pointing
+    /// to swept paths. realisations has NO FK to narinfo (002_store.
+    /// sql:134); without the explicit DELETE, dangling rows →
+    /// wopQueryRealisation returns a path that 404s on fetch.
+    #[tokio::test]
+    async fn sweep_deletes_realisations() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed a complete path + a realisation pointing to it.
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-sweep-target";
+        let hash = seed_complete_path(&db.pool, path).await;
+        sqlx::query(
+            "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash) \
+             VALUES ($1, 'out', $2, $3)",
+        )
+        .bind(vec![0x11u8; 32])
+        .bind(path)
+        .bind(vec![0x22u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Sweep the path.
+        let stats = sweep(&db.pool, None, vec![hash.clone()], false)
+            .await
+            .unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+
+        // narinfo gone (CASCADE took manifests too).
+        let narinfo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(narinfo_count, 0);
+
+        // X8 FIX: realisation ALSO gone (explicit DELETE, not CASCADE).
+        let realisations_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM realisations")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            realisations_count, 0,
+            "sweep should delete realisations pointing to swept path (X8 fix)"
+        );
+    }
+
+    /// Dry-run: compute stats but ROLLBACK. Nothing actually deleted.
+    #[tokio::test]
+    async fn sweep_dry_run_rolls_back() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dryrun";
+        let hash = seed_complete_path(&db.pool, path).await;
+
+        let stats = sweep(&db.pool, None, vec![hash.clone()], true)
+            .await
+            .unwrap();
+        // Stats SHOW the path would be deleted.
+        assert_eq!(stats.paths_deleted, 1);
+
+        // But narinfo still there (rolled back).
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "dry-run should roll back");
+    }
 }
