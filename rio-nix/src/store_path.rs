@@ -505,9 +505,6 @@ mod tests {
     #[test]
     fn test_empty_name() {
         let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-";
-        // This has empty name after the dash — the strip_prefix('-') leaves empty string
-        // But actually the hash part is 32 chars, then we need '-' then name
-        // so the path without name after dash should fail
         assert!(StorePath::parse(path).is_err());
     }
 
@@ -533,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_nixbase32_roundtrip() -> anyhow::Result<()> {
-        let data = vec![0u8; 20]; // 20 zero bytes
+        let data = vec![0u8; 20];
         let encoded = nixbase32::encode(&data);
         assert_eq!(encoded.len(), 32); // ceil(20*8/5) = 32
         let decoded = nixbase32::decode(&encoded)?;

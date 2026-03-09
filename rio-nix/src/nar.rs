@@ -198,7 +198,6 @@ fn expect_str(r: &mut impl Read, expected: &str) -> Result<()> {
 ///
 /// Returns the root [`NarNode`] representing the archived path.
 pub fn parse(r: &mut impl Read) -> Result<NarNode> {
-    // Read magic
     let magic = read_string(r)?;
     if magic != NAR_MAGIC {
         return Err(NarError::InvalidMagic(magic));

@@ -252,7 +252,7 @@ impl NarInfo {
 ///
 /// # Why a free function, not a method on NarInfo
 ///
-/// B2's signer calls this with fields from `ValidatedPathInfo` (the
+/// The store's signer calls this with fields from `ValidatedPathInfo` (the
 /// store's internal type), not from a `NarInfo` struct. Making it a
 /// method would force constructing a NarInfo just to sign — wasteful
 /// and backwards (we sign BEFORE building the narinfo text).
@@ -808,8 +808,7 @@ FileSize: 54321
         let serialized = original.serialize();
         let reparsed = NarInfo::parse(&serialized)?;
 
-        // PartialEq covers all 11 fields; the field-by-field assertions
-        // above were redundant boilerplate from when fields were private.
+        // PartialEq covers all 11 fields.
         assert_eq!(original, reparsed);
         Ok(())
     }

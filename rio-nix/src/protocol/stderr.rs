@@ -212,7 +212,7 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     /// Send STDERR_WRITE with data. Test-only: no production opcode uses
-    /// STDERR_WRITE currently (wopNarFromPath was fixed to raw-bytes-after-LAST).
+    /// STDERR_WRITE (wopNarFromPath writes raw bytes after STDERR_LAST).
     #[cfg(test)]
     pub async fn write_data(&mut self, data: &[u8]) -> Result<(), WireError> {
         self.check_not_finished()?;

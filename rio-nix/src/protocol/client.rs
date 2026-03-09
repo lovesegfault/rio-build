@@ -506,7 +506,7 @@ mod tests {
     }
 
     /// Full STDERR_ERROR with position + traces — exercises the have_pos
-    /// branch (124-131) and the trace loop (139-151).
+    /// branch and the trace-with-position loop in read_stderr_error.
     #[tokio::test]
     async fn test_read_stderr_error_with_position_and_traces() -> anyhow::Result<()> {
         let mut buf = Vec::new();
