@@ -482,7 +482,16 @@ impl DagActor {
                 // est_duration is in seconds (f64). 0.0 = no
                 // estimate (fresh derivation, estimator had no
                 // history) → floor applies.
-                let est_3x_secs = (state.est_duration * 3.0).max(0.0);
+                //
+                // is_finite() guard: NaN/inf propagate through max()
+                // (NaN.max(x)=NaN, inf.max(x)=inf) → `elapsed > NaN`
+                // is always false → backstop never fires. Treat
+                // non-finite est as "no estimate" (0.0 → floor wins).
+                let est_3x_secs = if state.est_duration.is_finite() && state.est_duration > 0.0 {
+                    state.est_duration * 3.0
+                } else {
+                    0.0
+                };
                 let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
                 let backstop_secs = est_3x_secs.max(floor_secs);
 
@@ -529,27 +538,11 @@ impl DagActor {
             if let Some(worker) = self.workers.get_mut(worker_id) {
                 worker.running_builds.remove(drv_hash);
             }
-            // Reset + track failed worker + requeue. Same pattern
-            // as reassign_derivations (worker disconnect).
-            if let Some(state) = self.dag.node_mut(drv_hash) {
-                if let Err(e) = state.reset_to_ready() {
-                    warn!(drv_hash = %drv_hash, error = %e, "backstop reset failed");
-                    continue;
-                }
-                state.retry_count += 1;
-                state.failed_workers.insert(worker_id.clone());
-                self.push_ready(drv_hash.clone());
-            }
-            if let Err(e) = self.db.increment_retry_count(drv_hash).await {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
-            }
-            if let Err(e) = self
-                .db
-                .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
-                .await
-            {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready after backstop");
-            }
+            // Reassign (same path as worker disconnect): reset_to_
+            // ready + retry++ + failed_workers.insert (in-mem AND
+            // PG via append_failed_worker) + PG status + push_ready.
+            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(worker_id))
+                .await;
         }
 
         for drv_hash in expired_poisons {
