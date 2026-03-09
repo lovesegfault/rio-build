@@ -148,6 +148,14 @@ impl StoreServiceImpl {
     ) -> Result<Response<PutPathResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let start = std::time::Instant::now();
+        // Round 4 Z20: record duration on ANY exit (success, error,
+        // early return). Prior code only recorded on the success path
+        // → p99 latency metrics were artificially good (failures not
+        // counted). scopeguard records unconditionally on Drop.
+        let _duration_guard = scopeguard::guard((), move |()| {
+            metrics::histogram!("rio_store_put_path_duration_seconds")
+                .record(start.elapsed().as_secs_f64());
+        });
 
         // r[impl sec.boundary.grpc-hmac]
         // HMAC token check BEFORE into_inner (need metadata access).
@@ -563,8 +571,7 @@ impl StoreServiceImpl {
         drop(mark_lock_conn);
 
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
-        metrics::histogram!("rio_store_put_path_duration_seconds")
-            .record(start.elapsed().as_secs_f64());
+        // Duration recorded by _duration_guard on Drop (Round 4 Z20).
         Ok(Response::new(PutPathResponse { created: true }))
     }
 }

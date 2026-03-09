@@ -58,7 +58,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_s3_requests_total",
-        "S3 API calls (labeled by operation: put_object/get_object/head_object)"
+        "S3 API calls (labeled by operation: put_object/get_object/head_object/delete_object)"
     );
     describe_counter!(
         "rio_store_chunk_cache_hits_total",
@@ -71,5 +71,27 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_store_gc_path_resurrected_total",
         "Paths skipped by sweep because a new referrer appeared after mark (Z2 race window)"
+    );
+    // Round 4 Z19: 5 store metrics were emitted but not described.
+    // s3_requests_total description updated to include delete_object.
+    describe_counter!(
+        "rio_store_hmac_rejected_total",
+        "PutPath rejections by HMAC assignment-token check (labeled by reason)"
+    );
+    describe_counter!(
+        "rio_store_hmac_bypass_total",
+        "PutPath HMAC checks bypassed via mTLS cert CN=rio-gateway (labeled by cn)"
+    );
+    describe_gauge!(
+        "rio_store_s3_deletes_pending",
+        "Rows in pending_s3_deletes awaiting drain"
+    );
+    describe_gauge!(
+        "rio_store_s3_deletes_stuck",
+        "pending_s3_deletes rows at max retry attempts (alert if > 0)"
+    );
+    describe_counter!(
+        "rio_store_gc_chunk_resurrected_total",
+        "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
     );
 }

@@ -103,6 +103,32 @@ fn chunk_key(hash: &[u8; 32]) -> String {
     format!("{}/{}", &hex[..2], hex)
 }
 
+/// Validate a chunk key before Path::join or S3 DeleteObject.
+///
+/// Round 4 Z17: keys come from pending_s3_deletes which WE wrote via
+/// key_for, but defense-in-depth: if a corrupted row or somehow an
+/// injected key got into the table, Path::join would resolve `..` etc.
+/// Reject non-conforming keys; drain increments attempts → stuck →
+/// operator alert. Shape: `{2 hex chars}/{64 hex chars}`.
+fn validate_chunk_key(key: &str) -> anyhow::Result<()> {
+    let Some((prefix, hex)) = key.split_once('/') else {
+        anyhow::bail!("invalid chunk key {key:?}: missing '/'");
+    };
+    if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid chunk key {key:?}: prefix not 2 hex chars");
+    }
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid chunk key {key:?}: body not 64 hex chars");
+    }
+    // Also verify prefix matches first 2 chars of body (chunk_key's
+    // own convention). Not strictly necessary for safety but catches
+    // malformed rows earlier.
+    if prefix != &hex[..2] {
+        anyhow::bail!("invalid chunk key {key:?}: prefix doesn't match body");
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Memory backend (tests)
 // ============================================================================
@@ -304,9 +330,18 @@ impl ChunkBackend for FilesystemChunkBackend {
     }
 
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
+        // Round 4 Z17: validate key format before Path::join. The
+        // key comes from pending_s3_deletes which WE wrote (via
+        // key_for), but defense-in-depth: if a corrupted row or
+        // SQL injection somehow got "../etc/passwd" into the table,
+        // Path::join would resolve it. Reject non-conforming keys;
+        // drain increments attempts → stuck row → alert.
+        //
+        // chunk_key format is `{aa}/{64 hex chars}` where aa is
+        // the first 2 hex chars of the blake3 hash.
+        validate_chunk_key(key)?;
+
         // key is the relative path from key_for. Rejoin to base_dir.
-        // No path-traversal concern: chunk_key output is always
-        // `{aa}/{hex}` from a [u8;32], no `..`.
         let path = self.base_dir.join(key);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
@@ -518,6 +553,46 @@ mod tests {
         assert_eq!(&chunk_key(&HASH_A)[..2], "00");
         // All-ones: prefix "ff".
         assert_eq!(&chunk_key(&HASH_B)[..2], "ff");
+    }
+
+    /// Round 4 Z17: validate_chunk_key rejects malformed keys
+    /// before Path::join can resolve them.
+    #[test]
+    fn validate_chunk_key_accepts_wellformed() {
+        // Round-trip: chunk_key output always validates.
+        assert!(validate_chunk_key(&chunk_key(&HASH_A)).is_ok());
+        assert!(validate_chunk_key(&chunk_key(&HASH_B)).is_ok());
+        assert!(validate_chunk_key(&chunk_key(&HASH_C)).is_ok());
+    }
+
+    #[test]
+    fn validate_chunk_key_rejects_path_traversal() {
+        // THE security case: Path::join("../etc/passwd") would
+        // resolve outside base_dir. Reject before join.
+        assert!(validate_chunk_key("../etc/passwd").is_err());
+        assert!(validate_chunk_key("../../evil").is_err());
+        // Absolute path also bad.
+        assert!(validate_chunk_key("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_chunk_key_rejects_malformed() {
+        // No slash.
+        assert!(validate_chunk_key("ab1234").is_err());
+        // Wrong prefix length.
+        assert!(validate_chunk_key("abc/abcdef").is_err());
+        // Non-hex prefix.
+        assert!(validate_chunk_key("zz/abcdef").is_err());
+        // Wrong body length.
+        assert!(validate_chunk_key("ab/short").is_err());
+        // Non-hex body.
+        let bad_body = format!("ab/{}", "z".repeat(64));
+        assert!(validate_chunk_key(&bad_body).is_err());
+        // Prefix/body mismatch (ab/cd...)
+        let mismatch = format!("ab/{}", "cd".repeat(32));
+        assert!(validate_chunk_key(&mismatch).is_err());
+        // Empty.
+        assert!(validate_chunk_key("").is_err());
     }
 
     // ------------------------------------------------------------------------

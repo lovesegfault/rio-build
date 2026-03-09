@@ -173,22 +173,37 @@ pub(super) async fn decrement_and_enqueue(
 
     // Enqueue S3 keys. Only if we have a chunk backend (inline store
     // has no S3 keys to delete).
+    //
+    // Round 4 Z18: batched via unnest — one RTT per manifest instead
+    // of per-chunk. A manifest with 1000 chunks went from 1000 INSERTs
+    // (~1s at 1ms RTT) to 1 (~1ms). Significant for large sweeps.
     if let Some(backend) = backend {
+        let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
+        let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());
         for (hash, _) in &zeroed {
             let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
                 warn!("GC: chunk hash wrong length, skipping S3 enqueue");
                 continue;
             };
-            let key = backend.key_for(&arr);
+            keys.push(backend.key_for(&arr));
+            hashes.push(hash.clone());
+        }
+        if !keys.is_empty() {
             // blake3_hash lets drain re-check chunks.(deleted AND
             // refcount=0) before S3 delete — catches the TOCTOU where
             // PutPath resurrected the chunk after sweep enqueued it.
-            sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
-                .bind(&key)
-                .bind(hash)
-                .execute(&mut **tx)
-                .await?;
-            stats.s3_keys_enqueued += 1;
+            // ON CONFLICT DO NOTHING: duplicate enqueues are fine
+            // (idempotent — drain deletes the row after S3 success).
+            sqlx::query(
+                "INSERT INTO pending_s3_deletes (s3_key, blake3_hash) \
+                 SELECT * FROM unnest($1::text[], $2::bytea[]) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&keys)
+            .bind(&hashes)
+            .execute(&mut **tx)
+            .await?;
+            stats.s3_keys_enqueued = keys.len() as u64;
         }
     }
 

@@ -48,7 +48,8 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// count), one after sweep (collected + bytes), final with
     /// is_complete=true.
     ///
-    /// `grace_period_hours`: 0 = use default (2). Protects paths
+    /// `grace_period_hours`: None = default (2h). Some(0) = zero
+    /// grace (explicit). Protects paths
     /// created in the last N hours from collection even if not
     /// yet referenced.
     ///
@@ -65,11 +66,11 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         let req = request.into_inner();
-        let grace_hours = if req.grace_period_hours == 0 {
-            2 // default
-        } else {
-            req.grace_period_hours
-        };
+        // Round 4 Z21: proto3 `optional uint32` — None = unset (use
+        // default 2h), Some(0) = explicit zero grace. Prior code
+        // treated 0 as "use default" → impossible to request zero
+        // grace (useful for tests + pre-shutdown GC).
+        let grace_hours = req.grace_period_hours.unwrap_or(2);
 
         info!(
             dry_run = req.dry_run,
@@ -506,7 +507,7 @@ mod tests {
         let resp = svc
             .trigger_gc(Request::new(GcRequest {
                 dry_run: true,
-                grace_period_hours: 24,
+                grace_period_hours: Some(24),
                 extra_roots: vec![],
             }))
             .await
@@ -531,7 +532,7 @@ mod tests {
         let resp = svc
             .trigger_gc(Request::new(GcRequest {
                 dry_run: true,
-                grace_period_hours: 24,
+                grace_period_hours: Some(24),
                 extra_roots: vec![],
             }))
             .await
