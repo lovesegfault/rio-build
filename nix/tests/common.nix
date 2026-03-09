@@ -45,8 +45,14 @@ let
   # phase3a/3b do `systemctl restart rio-*` multiple times), %m =
   # binary signature (each binary has a distinct coverage map; enables
   # safe on-line merging).
+  #
+  # DOUBLE-% ESCAPE: systemd's Environment= expands specifiers (%p =
+  # unit prefix name, %m = machine ID, etc). Without escaping, systemd
+  # replaces %p with e.g. "rio-gateway" before the binary sees it →
+  # restarts overwrite the same file (no PID uniqueness). `%%` →
+  # literal `%` → LLVM sees `%p-%m` and expands correctly.
   covEnv = lib.optionalAttrs coverage {
-    LLVM_PROFILE_FILE = "/var/lib/rio/cov/rio-%p-%m.profraw";
+    LLVM_PROFILE_FILE = "/var/lib/rio/cov/rio-%%p-%%m.profraw";
   };
   covTmpfiles = lib.optional coverage "d /var/lib/rio/cov 0755 root root -";
   # Instrumented binaries are ~2× RSS; bump VM memory.

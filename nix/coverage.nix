@@ -76,14 +76,25 @@ let
         exit 0
       fi
       ${sysroot}/llvm-profdata merge -sparse $TMPDIR/raw/*.profraw -o $TMPDIR/m.profdata
+      # 2>/dev/null: llvm-cov writes warnings ("N functions have
+      # mismatched data") to stdout, which corrupts the lcov file.
+      # These warnings are expected (shared libs between binaries);
+      # stderr of lcov step shows any real issues.
+      # target/release/build/: generated proto code (tonic-prost-build
+      # output). Source doesn't exist in commonSrc (build artifact),
+      # so genhtml would fail. These are wrapper code, not ours —
+      # the real coverage signal is in rio-*/src/.
       ${sysroot}/llvm-cov export \
         --format=lcov \
         --instr-profile=$TMPDIR/m.profdata \
         ${objectFlags} \
-        --ignore-filename-regex='\.cargo/registry|\.cargo/git|/rustc/|/nix/store/.*-vendor' \
-        > $TMPDIR/raw.lcov
+        --ignore-filename-regex='\.cargo/registry|\.cargo/git|/rustc/|/nix/store/.*-vendor|target/release/build' \
+        2>/dev/null > $TMPDIR/raw.lcov
+      # `-a` (add tracefile) is the operation; `--substitute`
+      # piggybacks on it. lcov requires one of -z/-c/-a/-e/-r/-l
+      # alongside --substitute (it's a modifier, not standalone).
       ${pkgs.lcov}/bin/lcov --substitute '${stripPrefix}' \
-        --output-file $out $TMPDIR/raw.lcov
+        -a $TMPDIR/raw.lcov -o $out
     '';
 
   perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
@@ -106,10 +117,10 @@ let
     lcov $args -o $out
   '';
 
-  # Unit-test lcov, path-normalized the same way.
+  # Unit-test lcov, path-normalized the same way. Same `-a` trick.
   unitLcov = pkgs.runCommand "rio-cov-unit-clean" { nativeBuildInputs = [ pkgs.lcov ]; } ''
     lcov --substitute '${stripPrefix}' \
-      --output-file $out ${unitCoverage}/lcov.info
+      -a ${unitCoverage}/lcov.info -o $out
   '';
 in
 {
@@ -145,9 +156,12 @@ in
         lcov --extract $TMPDIR/combined.lcov 'rio-*' -o $out/lcov.info
 
         # HTML report. cd into source so genhtml can find files
-        # for the source view.
+        # for the source view. --ignore-errors source: safety net
+        # for any remaining build-time-generated paths that slip
+        # through the regex (genhtml synthesizes a placeholder).
         cd ${commonSrc}
-        genhtml $out/lcov.info --output-directory $out/html
+        genhtml $out/lcov.info --output-directory $out/html \
+          --ignore-errors source
 
         # Summary to build log for quick inspection.
         echo "=== Combined Coverage Summary ==="

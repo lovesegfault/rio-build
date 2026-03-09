@@ -195,6 +195,13 @@
           covArgs = commonArgs // {
             RUSTFLAGS = "-C instrument-coverage";
             pname = "rio-cov";
+            # Build scripts and proc-macros are ALSO instrumented; when
+            # they run at compile time (tonic-prost-build, sqlx macros),
+            # they try to write profraws to CWD — RO in the sandbox →
+            # "LLVM Profile Error: Read-only file system" noise. Discard
+            # build-time profraws. At RUNTIME, the VM's systemd env sets
+            # LLVM_PROFILE_FILE=/var/lib/rio/cov/... which overrides this.
+            LLVM_PROFILE_FILE = "/dev/null";
           };
           cargoArtifactsCov = craneLib.buildDepsOnly covArgs;
           rio-workspace-cov = craneLib.buildPackage (

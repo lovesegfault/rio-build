@@ -62,6 +62,9 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
+| `nix-build-remote -- .#coverage-full` | Combined unit+VM coverage (lcov+HTML, ~25min, needs KVM) |
+| `nix-build-remote -- .#cov-vm-phase1a` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
+| `nix build .#coverage-vm-phase1a` | Per-test lcov from one coverage-mode VM run |
 
 ### CI aggregate targets
 
@@ -73,6 +76,25 @@ Single-target validation bundles — build one of these instead of remembering i
 | **with VM tests** | `ci-fast` | `ci-slow` |
 
 The VM-including aggregates need KVM — use `nix-build-remote -- .#ci-slow`. On non-Linux, `ci-local-*` degrades to cargo checks + pre-commit only (fuzz is Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
+
+### Coverage
+
+Two tiers:
+
+- **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
+- **Combined unit+VM** (~25min, manual, needs KVM): `nix-build-remote -- .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-phase*.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `ci-fast`/`ci-slow` — invoke on demand.
+
+VM coverage architecture (`nix/coverage.nix`):
+
+1. **Instrumented build** (`rio-workspace-cov`): `RUSTFLAGS="-C instrument-coverage"` + distinct pname → separate deps cache, builds in parallel with normal workspace.
+2. **Coverage-mode VM tests** (`vmTestsCov`): same tests with `coverage=true` → `LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw` set in all rio-* service envs (`%p`=PID for restarts, `%m`=binary signature for safe merging).
+3. **Graceful shutdown** (`rio-common::signal::shutdown_signal`): SIGTERM → CancellationToken → main() returns normally → atexit handlers fire → LLVM profraw flush. All binaries: store, scheduler, gateway, worker (already had it), controller (already had it).
+4. **Collection** (`common.nix collectCoverage`): at end of each testScript, `systemctl stop rio-*` → graceful drain → tar `/var/lib/rio/cov` → `copy_from_vm` to `$out/coverage/<node>/profraw.tar.gz`. phase3a also deletes the k3s STS so the worker pod's hostPath-mounted profraws flush.
+5. **Merge** (`nix/coverage.nix`): toolchain `llvm-profdata merge` → `llvm-cov export --lcov` → source-path normalize (strip sandbox prefix, anchor on `source/`) → `lcov -a` union with unit-test lcov → `--extract 'rio-*'` → genhtml.
+
+Gotchas:
+- Source-path normalization MUST match between unit and VM lcovs — both anchor on `source/` (crane's unpackPhase convention). If `lcov -a` merge shows doubled files with zero intersection, the strip regex is wrong.
+- Use **toolchain** `llvm-profdata`/`llvm-cov` (`$(rustc --print sysroot)/lib/rustlib/<target>/bin/`), never system llvm. Profile format versioning is tied to rustc.
 
 ## Formatting
 
