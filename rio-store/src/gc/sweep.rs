@@ -19,13 +19,13 @@ const SWEEP_BATCH_SIZE: usize = 100;
 /// Sweep unreachable paths. For each:
 /// 1. `SELECT chunk_list FOR UPDATE` (TOCTOU guard vs PutPath
 ///    incrementing a refcount we're about to decrement)
-/// 2a. `DELETE realisations` for this path (NO FK to narinfo —
+/// 2. `DELETE realisations` for this path (NO FK to narinfo —
 ///    explicit delete prevents dangling wopQueryRealisation rows)
-/// 2b. `DELETE narinfo` (CASCADE → manifests/manifest_data/
+/// 3. `DELETE narinfo` (CASCADE → manifests/manifest_data/
 ///    content_index)
-/// 3. `UPDATE chunks SET refcount = refcount - 1`
-/// 4. `UPDATE chunks SET deleted = true WHERE refcount = 0 RETURNING`
-/// 5. `INSERT INTO pending_s3_deletes` for each returned chunk
+/// 4. `UPDATE chunks SET refcount = refcount - 1`
+/// 5. `UPDATE chunks SET deleted = true WHERE refcount = 0 RETURNING`
+/// 6. `INSERT INTO pending_s3_deletes` for each returned chunk
 ///
 /// Batched: steps 1-5 run in ONE transaction for SWEEP_BATCH_SIZE
 /// paths at a time. If `dry_run`: do the work, compute stats, then

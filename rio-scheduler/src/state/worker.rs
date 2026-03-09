@@ -186,7 +186,13 @@ impl RetryPolicy {
         // A 1-year backoff is far above any sane value — the clamp
         // exists to prevent a crash from misconfigured backoff_max_
         // secs=inf (e.g., parsed from TOML that had "inf" literally).
+        //
+        // NOT using .clamp() (clippy suggestion): clamp returns NaN
+        // if input is NaN, which would then panic from_secs_f64.
+        // The .max(0.0) form handles NaN correctly (NaN.max(x) = x
+        // per IEEE 754).
         const MAX_BACKOFF_SECS: f64 = 365.0 * 86400.0;
+        #[allow(clippy::manual_clamp)]
         let final_secs = with_jitter.max(0.0).min(MAX_BACKOFF_SECS);
 
         std::time::Duration::from_secs_f64(final_secs)
