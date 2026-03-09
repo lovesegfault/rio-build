@@ -181,7 +181,13 @@ impl RetryPolicy {
         let mut rng = rand::rng();
         let jitter = rng.random_range(-self.jitter_fraction..=self.jitter_fraction);
         let with_jitter = clamped * (1.0 + jitter);
-        let final_secs = with_jitter.max(0.0);
+        // Clamp to [0, 1yr]. max(0.0) handles NaN (NaN.max(x) = x);
+        // min(1yr) handles infinity (from_secs_f64(inf) PANICS).
+        // A 1-year backoff is far above any sane value — the clamp
+        // exists to prevent a crash from misconfigured backoff_max_
+        // secs=inf (e.g., parsed from TOML that had "inf" literally).
+        const MAX_BACKOFF_SECS: f64 = 365.0 * 86400.0;
+        let final_secs = with_jitter.max(0.0).min(MAX_BACKOFF_SECS);
 
         std::time::Duration::from_secs_f64(final_secs)
     }
@@ -255,5 +261,26 @@ mod tests {
         assert!(d0.as_secs_f64() > 3.0 && d0.as_secs_f64() < 7.0);
         // Second attempt should be around 10s +/- jitter
         assert!(d1.as_secs_f64() > 7.0 && d1.as_secs_f64() < 13.0);
+    }
+
+    /// X20 regression: backoff_max_secs = infinity (e.g., from a
+    /// misconfigured TOML that had "inf" literally) must not panic
+    /// in Duration::from_secs_f64. The 1-year clamp catches it.
+    #[test]
+    fn test_retry_backoff_infinity_clamped() {
+        let policy = RetryPolicy {
+            backoff_max_secs: f64::INFINITY,
+            ..Default::default()
+        };
+        // Large attempt → base * multiplier^N → unbounded → .min(inf)
+        // = inf → from_secs_f64(inf) would PANIC without the clamp.
+        let d = policy.backoff_duration(100);
+        // Clamped to 1yr. Jitter is applied BEFORE the clamp, and
+        // inf * (1 +/- jitter) = inf, so the final value is exactly
+        // 1yr (jitter has no effect on infinity).
+        assert!(
+            d.as_secs() <= 366 * 86400,
+            "infinity backoff clamped to ~1yr"
+        );
     }
 }
