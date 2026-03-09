@@ -13,6 +13,17 @@ use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus, DrvHash, WorkerId};
 
+/// Terminal derivation statuses (wire strings). Single source of
+/// truth for SQL filters in both `sweep_stale_live_pins` (delete
+/// pins whose drv is terminal) and `load_nonterminal_derivations`
+/// (exclude terminal drvs from recovery). A new terminal status
+/// added to [`DerivationStatus::is_terminal`] must also be added
+/// here or recovery/GC will diverge.
+///
+/// Bound as `status <> ALL($1::text[])` — cleaner than a hardcoded
+/// `NOT IN (...)` literal and gets the planner the same predicate.
+const TERMINAL_STATUSES: &[&str] = &["completed", "poisoned", "dependency_failed", "cancelled"];
+
 /// One row from `build_history`. Fields in SELECT order:
 /// `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores)`.
 ///
@@ -362,19 +373,20 @@ impl SchedulerDb {
     /// crash-between-pin-and-unpin — scheduler crashed after pin at
     /// dispatch but before unpin at completion).
     ///
-    /// The subquery matches load_nonterminal_derivations' filter:
-    /// a drv NOT in that set is terminal (or deleted entirely).
+    /// The subquery matches load_nonterminal_derivations' filter
+    /// (both use [`TERMINAL_STATUSES`]): a drv NOT in that set is
+    /// terminal (or deleted entirely).
     pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             DELETE FROM scheduler_live_pins
              WHERE drv_hash NOT IN (
                SELECT drv_hash FROM derivations
-                WHERE status NOT IN ('completed', 'poisoned',
-                                     'dependency_failed', 'cancelled')
+                WHERE status <> ALL($1::text[])
              )
             "#,
         )
+        .bind(TERMINAL_STATUSES)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -620,8 +632,9 @@ impl SchedulerDb {
     }
 
     /// Load all non-terminal derivations. Same terminal-exclusion
-    /// rationale as builds; the partial index (status_idx) makes
-    /// this efficient for large tables.
+    /// filter ([`TERMINAL_STATUSES`]) as sweep_stale_live_pins; the
+    /// partial index (status_idx) makes this efficient for large
+    /// tables.
     pub async fn load_nonterminal_derivations(
         &self,
     ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {
@@ -632,9 +645,10 @@ impl SchedulerDb {
                    expected_output_paths, output_names, is_fixed_output,
                    failed_workers
             FROM derivations
-            WHERE status NOT IN ('completed', 'poisoned', 'dependency_failed', 'cancelled')
+            WHERE status <> ALL($1::text[])
             "#,
         )
+        .bind(TERMINAL_STATUSES)
         .fetch_all(&self.pool)
         .await
     }
