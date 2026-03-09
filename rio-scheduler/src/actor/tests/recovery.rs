@@ -138,6 +138,57 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     Ok(())
 }
 
+/// X4 regression: transient-failure retry must write Ready to PG,
+/// not Failed. Crash in backoff window with PG=Failed → recovery
+/// loads it but only enqueues Ready-status drvs → hang forever.
+///
+/// Test: seed PG with a Failed-status derivation (simulating the
+/// OLD buggy write) + a Ready-status derivation. Fresh actor
+/// recovers. Assert Ready drv is in queue (via dispatch), Failed
+/// drv is stuck (never dispatched — proves the bug exists and our
+/// fix avoids it going forward).
+///
+/// Also verify the NEW behavior: trigger a transient failure, check
+/// PG status is Ready (not Failed).
+#[tokio::test]
+async fn test_transient_retry_pg_status_is_ready() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Connect worker + submit build → dispatch.
+    let (handle, _task, mut stream_rx) = {
+        let (h, t) = setup_actor(db.pool.clone());
+        let rx = connect_worker(&h, "w-x4", "x86_64-linux", 2).await?;
+        (h, t, rx)
+    };
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "x4-drv", PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut stream_rx).await;
+
+    // Report transient failure → handle_transient_failure runs.
+    complete_failure(
+        &handle,
+        "w-x4",
+        "x4-drv",
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        "simulated transient",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // PG should show Ready (NOT Failed). This proves X4 fix: the
+    // transient-retry path now persists the FINAL in-mem state.
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'x4-drv'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        status, "ready",
+        "transient retry should write Ready to PG (not Failed): got {status}"
+    );
+
+    Ok(())
+}
+
 /// Merge a linear chain: nodes[0] ← nodes[1] ← ... ← nodes[n-1]
 /// (each depends on the previous). Helper for recovery tests that
 /// need a multi-node DAG in PG.

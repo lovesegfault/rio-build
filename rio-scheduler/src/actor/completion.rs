@@ -356,6 +356,51 @@ impl DagActor {
         }
     }
 
+    /// Transition a derivation to Poisoned, persist, cascade
+    /// DependencyFailed to ancestors, and propagate to interested
+    /// builds. Called when POISON_THRESHOLD distinct workers have
+    /// failed (or max retries hit).
+    ///
+    /// Expects the derivation's CURRENT status to be Assigned or
+    /// Running. Handles the Assigned→Running intermediate (state
+    /// machine requires Running before Poisoned). For the reassign
+    /// path (worker disconnect), the caller checks the threshold
+    /// BEFORE calling reset_to_ready — the drv is still Assigned/
+    /// Running at that point.
+    pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash) {
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            // Assigned→Running intermediate (state machine requires
+            // Running before Poisoned; Assigned→Poisoned is invalid).
+            if state.status() == DerivationStatus::Assigned
+                && let Err(e) = state.transition(DerivationStatus::Running)
+            {
+                warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
+            }
+            if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+                warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
+            }
+            state.poisoned_at = Some(Instant::now());
+        }
+
+        if let Err(e) = self
+            .db
+            .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
+            .await
+        {
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
+        }
+
+        // Cascade: parents of a poisoned derivation can never complete.
+        // Transition them to DependencyFailed so keepGoing builds terminate.
+        self.cascade_dependency_failure(drv_hash).await;
+
+        // Propagate failure to interested builds.
+        let interested_builds = self.get_interested_builds(drv_hash);
+        for build_id in interested_builds {
+            self.handle_derivation_failure(build_id, drv_hash).await;
+        }
+    }
+
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,
@@ -376,17 +421,7 @@ impl DagActor {
 
             // Check poison threshold
             if state.failed_workers.len() >= POISON_THRESHOLD {
-                // Transition to poisoned
-                if state.status() == DerivationStatus::Assigned
-                    && let Err(e) = state.transition(DerivationStatus::Running)
-                {
-                    warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
-                }
-                if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                    warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
-                }
-                state.poisoned_at = Some(Instant::now());
-                false
+                false // poison_and_cascade below does the transition
             } else if state.retry_count < self.retry_policy.max_retries {
                 // Transition running -> failed
                 if state.status() == DerivationStatus::Assigned
@@ -399,20 +434,10 @@ impl DagActor {
                 }
                 true
             } else {
-                // Max retries exceeded: treat as permanent
-                if state.status() == DerivationStatus::Assigned
-                    && let Err(e) = state.transition(DerivationStatus::Running)
-                {
-                    warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
-                }
-                if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                    warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
-                }
-                state.poisoned_at = Some(Instant::now());
-                false
+                false // poison_and_cascade below does the transition
             }
         } else {
-            false
+            return;
         };
 
         if should_retry {
@@ -427,13 +452,6 @@ impl DagActor {
                 state.assigned_worker = None;
             }
 
-            if let Err(e) = self
-                .db
-                .update_derivation_status(drv_hash, DerivationStatus::Failed, None)
-                .await
-            {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist Failed status");
-            }
             if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
             }
@@ -463,24 +481,22 @@ impl DagActor {
                     self.push_ready(drv_hash_owned);
                 }
             }
-        } else {
+            // PG status: Ready, NOT Failed. The in-mem state machine
+            // goes Failed→Ready (Failed is an intermediate); PG must
+            // match the FINAL in-mem state. Crash in the backoff
+            // window (up to 300s) with PG=Failed → recovery loads it
+            // (Failed not in db.rs:537 terminal filter) but only
+            // pushes Ready-status drvs to the queue (recovery.rs:225)
+            // → Failed drv sits in DAG forever, never dispatched.
             if let Err(e) = self
                 .db
-                .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
+                .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
                 .await
             {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status for retry");
             }
-
-            // Cascade: parents of a poisoned derivation can never complete.
-            // Transition them to DependencyFailed so keepGoing builds terminate.
-            self.cascade_dependency_failure(drv_hash).await;
-
-            // Propagate failure to interested builds
-            let interested_builds = self.get_interested_builds(drv_hash);
-            for build_id in interested_builds {
-                self.handle_derivation_failure(build_id, drv_hash).await;
-            }
+        } else {
+            self.poison_and_cascade(drv_hash).await;
         }
     }
 
