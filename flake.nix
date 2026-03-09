@@ -383,83 +383,12 @@
             );
           };
 
-          # Per-phase VM tests (Linux-only — need NixOS VMs + KVM).
-          # Each validates the corresponding milestone in docs/src/phases/.
-          #
-          #   vm-phase1a — 2 VMs: read-only opcodes (path-info, store ls)
-          #   vm-phase1b — 3 VMs: single-worker end-to-end build
-          #   vm-phase2a — 4 VMs: distributed build across 2+ workers
-          #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Tempo (OTLP)
-          #   vm-phase2c — 5 VMs: CA + critical-path + size-class + circuit-breaker
-          vmTests = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-            let
-              vmTestArgs = {
-                inherit pkgs rio-workspace;
-                rioModules = inputs.self.nixosModules;
-              };
-              # Request a minimum CPU allocation from nixbuild.net. Each
-              # VM has `virtualisation.cores = 4` in common.nix; without
-              # this, nixbuild.net's heuristic allocation can under-provision
-              # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
-              # physical, 2 VMs fell back to TCG, worker1's kernel boot
-              # starved at PCI enumeration → Shell disconnected flake).
-              # numVMs × 4 (cores per VM) + 1 for the test driver itself.
-              withMinCpu =
-                numVMs: test:
-                test.overrideTestDerivation {
-                  NIXBUILDNET_MIN_CPU = toString (numVMs * 4 + 1);
-                };
-            in
-            {
-              vm-phase1a = withMinCpu 2 (import ./nix/tests/phase1a.nix vmTestArgs);
-              vm-phase1b = withMinCpu 3 (import ./nix/tests/phase1b.nix vmTestArgs);
-              vm-phase2a = withMinCpu 4 (import ./nix/tests/phase2a.nix vmTestArgs);
-              vm-phase2b = withMinCpu 5 (import ./nix/tests/phase2b.nix vmTestArgs);
-              vm-phase2c = withMinCpu 5 (import ./nix/tests/phase2c.nix vmTestArgs);
-              # vm-phase3a needs extended args: dockerImages (airgap
-              # preload into k3s) + crds (auto-deployed via
-              # services.k3s.manifests). Both are defined below in
-              # this same let-block's scope, so pass them through.
-              # 3 VMs but k8s is 8-core (k3s + worker pod) → higher
-              # MIN_CPU than the count would suggest.
-              vm-phase3a = withMinCpu 4 (
-                import ./nix/tests/phase3a.nix (
-                  vmTestArgs
-                  // {
-                    inherit dockerImages;
-                    inherit (inputs.self.packages.${system}) crds;
-                  }
-                )
-              );
-              # vm-phase3b: production hardening (mTLS, HMAC, cancel,
-              # recovery, GC, gateway validation). 4 VMs: pki (cert
-              # gen), control (with TLS+HMAC), k8s (worker with TLS),
-              # client. Same extended args as 3a (dockerImages + crds).
-              #
-              # Iteration 1: control-plane sections (T/G) only — k8s
-              # node is stubbed pending iteration 2 (TLS-mounted
-              # worker pod). The test script `pass`es through
-              # TODO(vm-phase3b-iteration) sections; those paths
-              # ARE covered by unit tests.
-              vm-phase3b = withMinCpu 4 (
-                import ./nix/tests/phase3b.nix (
-                  vmTestArgs
-                  // {
-                    inherit dockerImages;
-                    inherit (inputs.self.packages.${system}) crds;
-                  }
-                )
-              );
-            }
-          );
-
           # Container images (Linux-only — dockerTools uses Linux VM
           # namespaces for layering). Worker image includes nix + fuse3
           # + util-linux + passwd stubs; others are minimal.
           #
           # Factored into a function so the coverage pipeline can rebuild
-          # images with the instrumented workspace (dockerImagesCov in
-          # the vmTestsCov let-block below).
+          # images with the instrumented workspace (dockerImagesCov below).
           mkDockerImages =
             ws:
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
@@ -469,6 +398,102 @@
               }
             );
           dockerImages = mkDockerImages rio-workspace;
+
+          # --------------------------------------------------------------
+          # Per-phase VM tests (Linux-only — need NixOS VMs + KVM)
+          # --------------------------------------------------------------
+          #
+          # Each validates the corresponding milestone in docs/src/phases/.
+          #
+          #   vm-phase1a — 2 VMs: read-only opcodes (path-info, store ls)
+          #   vm-phase1b — 3 VMs: single-worker end-to-end build
+          #   vm-phase2a — 4 VMs: distributed build across 2+ workers
+          #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Tempo (OTLP)
+          #   vm-phase2c — 5 VMs: CA + critical-path + size-class + circuit-breaker
+          #   vm-phase3a — 3 VMs: k3s operator, WorkerPool CRD, cgroup memory.peak
+          #   vm-phase3b — 4 VMs: mTLS, HMAC, recovery, GC, Build CRD
+          #
+          # mkVmTests: build the attrset for a given (workspace,
+          # dockerImages, coverage) triple. vmTests uses the normal
+          # build; vmTestsCov uses the instrumented build + coverage=
+          # true so common.nix sets LLVM_PROFILE_FILE and appends
+          # collectCoverage to each testScript.
+
+          # Request a minimum CPU allocation from nixbuild.net. Each
+          # VM has `virtualisation.cores = 4` in common.nix; without
+          # this, nixbuild.net's heuristic allocation can under-provision
+          # (vm-phase2a once got 5 CPUs for 4 VMs → 16 vCPUs on 5
+          # physical, 2 VMs fell back to TCG, worker1's kernel boot
+          # starved at PCI enumeration → Shell disconnected flake).
+          # numVMs × 4 (cores per VM) + 1 for the test driver itself.
+          withMinCpu =
+            numVMs: test:
+            test.overrideTestDerivation {
+              NIXBUILDNET_MIN_CPU = toString (numVMs * 4 + 1);
+            };
+
+          mkVmTests =
+            {
+              rio-workspace,
+              dockerImages,
+              coverage,
+            }:
+            let
+              vmTestArgs = {
+                inherit pkgs rio-workspace coverage;
+                rioModules = inputs.self.nixosModules;
+              };
+              # phase3a/3b need dockerImages + crds on top of the base args.
+              k3sArgs = vmTestArgs // {
+                inherit dockerImages;
+                inherit (inputs.self.packages.${system}) crds;
+              };
+            in
+            pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+              vm-phase1a = withMinCpu 2 (import ./nix/tests/phase1a.nix vmTestArgs);
+              vm-phase1b = withMinCpu 3 (import ./nix/tests/phase1b.nix vmTestArgs);
+              vm-phase2a = withMinCpu 4 (import ./nix/tests/phase2a.nix vmTestArgs);
+              vm-phase2b = withMinCpu 5 (import ./nix/tests/phase2b.nix vmTestArgs);
+              vm-phase2c = withMinCpu 5 (import ./nix/tests/phase2c.nix vmTestArgs);
+              # 3 VMs but k8s is 8-core (k3s + worker pod) → higher
+              # MIN_CPU than the count would suggest.
+              vm-phase3a = withMinCpu 4 (import ./nix/tests/phase3a.nix k3sArgs);
+              vm-phase3b = withMinCpu 4 (import ./nix/tests/phase3b.nix k3sArgs);
+            };
+
+          vmTests = mkVmTests {
+            inherit rio-workspace dockerImages;
+            coverage = false;
+          };
+
+          # Coverage-mode VM tests. Not in `checks` (too slow for flake
+          # check) — exposed as packages.cov-vm-phaseXY for manual runs
+          # + consumed by nix/coverage.nix for the merged lcov.
+          vmTestsCov = mkVmTests {
+            rio-workspace = rio-workspace-cov;
+            dockerImages = mkDockerImages rio-workspace-cov;
+            coverage = true;
+          };
+
+          # --------------------------------------------------------------
+          # Coverage merge pipeline (Linux-only — depends on vmTestsCov)
+          # --------------------------------------------------------------
+          #
+          # nix/coverage.nix merges profraws from each coverage-mode VM
+          # test with the unit-test lcov, producing combined + per-test
+          # lcov + genhtml report. See that file for the full pipeline.
+          coverage = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+            import ./nix/coverage.nix {
+              inherit
+                pkgs
+                rustStable
+                rio-workspace-cov
+                vmTestsCov
+                ;
+              commonSrc = commonArgs.src;
+              unitCoverage = cargoChecks.coverage;
+            }
+          );
 
           # --------------------------------------------------------------
           # CI aggregate targets
@@ -709,7 +734,28 @@
             crds = pkgs.runCommand "rio-crds.yaml" { } ''
               ${rio-workspace}/bin/crdgen > $out
             '';
+
+            # ──────────────────────────────────────────────────────────
+            # VM coverage targets (manual — NOT in ci-fast/ci-slow)
+            # ──────────────────────────────────────────────────────────
+            #
+            # coverage-full: unit + all 7 VM tests merged. ~25min,
+            # needs KVM (run via nix-build-remote). Output:
+            #   result/lcov.info   — combined, stripped to workspace paths
+            #   result/html/       — genhtml report
+            #   result/per-test/   — vm-phase*.lcov individual breakdowns
+            coverage-full = coverage.full;
+            # VM-only combined (no unit-test merge). Debugging.
+            coverage-vm = coverage.vmLcov;
           }
+          # Per-test lcovs: coverage-vm-phase1a etc. Useful for
+          # "why is X not covered" — inspect one VM test's
+          # contribution in isolation.
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "coverage-${n}" v) coverage.perTestLcov
+          # Coverage-mode VM test runs: cov-vm-phase1a etc. Build
+          # one to get the raw profraws at result/coverage/<node>/.
+          # Used during smoke debugging.
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "cov-${n}" v) vmTestsCov
           // {
 
             # HTML coverage report generated from the lcov tracefile.
