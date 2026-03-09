@@ -424,6 +424,22 @@ mod tests {
                 MetadataError::Other(sqlx::Error::RowNotFound),
                 Code::Internal,
             ),
+            (
+                MetadataError::CorruptManifest {
+                    store_path: "/nix/store/x".into(),
+                    source: crate::manifest::ManifestError::Empty,
+                },
+                Code::DataLoss,
+            ),
+            (
+                MetadataError::MalformedRow(
+                    rio_proto::validated::PathInfoValidationError::StorePath {
+                        path: "bad".into(),
+                        source: rio_nix::store_path::StorePathError::TooShort,
+                    },
+                ),
+                Code::Internal,
+            ),
         ];
         for (err, expected_code) in cases {
             // MetadataError isn't Clone; reconstruct for the call.
@@ -507,8 +523,16 @@ mod tests {
                 store_path: store_path.clone(),
             },
             MetadataError::InvariantViolation(s) => MetadataError::InvariantViolation(s.clone()),
-            MetadataError::CorruptManifest { .. } => unreachable!("not in test cases"),
-            MetadataError::MalformedRow(_) => unreachable!("not in test cases"),
+            MetadataError::CorruptManifest { store_path, .. } => MetadataError::CorruptManifest {
+                store_path: store_path.clone(),
+                source: crate::manifest::ManifestError::Empty,
+            },
+            MetadataError::MalformedRow(_) => MetadataError::MalformedRow(
+                rio_proto::validated::PathInfoValidationError::StorePath {
+                    path: "x".into(),
+                    source: rio_nix::store_path::StorePathError::TooShort,
+                },
+            ),
             MetadataError::Other(_) => MetadataError::Other(sqlx::Error::RowNotFound),
         }
     }
