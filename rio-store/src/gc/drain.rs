@@ -15,10 +15,10 @@ use crate::backend::chunk::ChunkBackend;
 const DRAIN_BATCH_SIZE: i64 = 100;
 
 /// Max attempts before we stop retrying a row. After this, the row
-/// stays (attempts >= MAX → excluded by the partial index) and the
-/// `rio_store_s3_deletes_pending` gauge stays non-zero — operator
-/// investigates. Usually: S3 permission change, key format mismatch
-/// after a config change, or the object is Glacier-archived.
+/// stays (attempts >= MAX → excluded by the partial index) and shows
+/// in `rio_store_s3_deletes_stuck` (not `_pending`; pending counts
+/// only retriable rows). Usually: S3 permission change, key format
+/// mismatch after a config change, or the object is Glacier-archived.
 const MAX_ATTEMPTS: i32 = 10;
 
 /// Interval between drain iterations. 30s: fast enough to keep
@@ -98,9 +98,16 @@ pub async fn drain_once(
         // is locked (no other replica touches it), but the CHUNKS
         // row is NOT locked by this tx — PutPath can still flip it
         // between this check and the S3 delete. That window is
-        // small (one PG roundtrip + one S3 call) and the blast
-        // radius of missing it is "one chunk re-uploaded on next
-        // GetPath miss" — acceptable.
+        // small (one PG roundtrip + one S3 call).
+        //
+        // Known narrow race: if this re-check misses AND two
+        // concurrent PutPaths BOTH see refcount≥2 (each saw the
+        // other's increment) → both skip upload (cas.rs:243) →
+        // permanent S3 hole. Requires: drain delete + 2 PutPaths
+        // for SAME chunk in ~milliseconds. GetPath's BLAKE3
+        // verify catches the hole (NotFound, not silent
+        // corruption). TODO(phase4): xmax-based inserted-check
+        // in cas.rs upsert to close this.
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(
                 "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",
@@ -159,15 +166,22 @@ pub async fn drain_once(
         debug!(deleted, failed, "drain iteration complete");
     }
 
-    // Update the pending gauge. COUNT(*) of eligible rows —
-    // operators track this; non-zero after several intervals
-    // with failed=0 means permanently-failed rows need attention.
-    let pending: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM pending_s3_deletes WHERE attempts < $1")
-            .bind(MAX_ATTEMPTS)
-            .fetch_one(pool)
-            .await?;
-    metrics::gauge!("rio_store_s3_deletes_pending").set(pending.0 as f64);
+    // Two gauges: _pending = retriable backlog (attempts < MAX),
+    // _stuck = permanently-failed (attempts >= MAX, excluded from
+    // drain). Operators alert on _stuck > 0 — those need manual
+    // intervention (S3 perms, key format, Glacier). _pending > 0
+    // with steady drain activity is normal.
+    let (pending, stuck): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           COUNT(*) FILTER (WHERE attempts < $1), \
+           COUNT(*) FILTER (WHERE attempts >= $1) \
+         FROM pending_s3_deletes",
+    )
+    .bind(MAX_ATTEMPTS)
+    .fetch_one(pool)
+    .await?;
+    metrics::gauge!("rio_store_s3_deletes_pending").set(pending as f64);
+    metrics::gauge!("rio_store_s3_deletes_stuck").set(stuck as f64);
 
     Ok((deleted, failed))
 }
