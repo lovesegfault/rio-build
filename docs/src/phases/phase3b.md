@@ -50,7 +50,7 @@ Iteration 2 had caught a **latent TLS SNI bug**: `load_client_tls` set `domain_n
 - **H1-H5:** backstop timeout didn't persist `failed_worker` to PG; drain lacked `SKIP LOCKED` for multi-replica; gateway reconnect counter never reset on success; backstop block duplicated `reassign_derivations`; GC sweep/orphan had ~50 lines duplicated.
 - **M1-M5:** HMAC key CRLF not trimmed; `GcRoots` no dedup; Assigned-with-NULL-worker silently skipped; PinPath FK check via string match; backstop NaN never fires.
 
-**Validation-round-2 bugs fixed (iteration 4, 19 commits 54c5baa..21cc06d, 976→991 tests):** Fresh deep review found 5 CRITICAL + 9 HIGH + 7 MEDIUM bugs + 2 hollow VM test sections (S1 never ran recovery; C2 never committed).
+**Validation-round-2 bugs fixed (iteration 4, 23 commits 54c5baa..c57158d, 976→991 tests):** Fresh deep review found 5 CRITICAL + 9 HIGH + 7 MEDIUM bugs + 2 hollow VM test sections (S1 never ran recovery; C2 never committed).
 - **X1** (CRIT) mTLS bypass defeated HMAC: `has_peer_certs + no token → bypass`. Compromised worker omits token → uploads arbitrary paths. Fixed via x509-parser CN check: only `CN=rio-gateway` bypasses.
 - **X2** (CRIT) Build CRD stuck at `build_id="submitted"` — no resubmit path. Fixed: apply() detects orphaned sentinel (no watch running) → falls through to resubmit.
 - **X3** (CRIT) Orphan scanner stale `chunk_list` from outer SELECT → multi-replica race decrements wrong chunks. Fixed: re-read `chunk_list` INSIDE tx with `FOR UPDATE OF m` (mirrors sweep.rs pattern).
@@ -63,5 +63,15 @@ Iteration 2 had caught a **latent TLS SNI bug**: `load_client_tls` set `domain_n
 - **X10-X21**: gateway reconnect-reset-on-event (not Ok()), controller build_id/phase/scopeguard/cleanup fixes, poison-TTL PG clear, HMAC expiry clamp, backoff infinity clamp, s3_deletes_stuck gauge, pg_try_advisory_lock for TriggerGC, dispatch_ready after LeaderAcquired.
 - **V1** (VM test hollow): S1 never ran recovery (`always_leader()` from boot). Fixed: wire scheduler to k3s Lease. kubeconfig copy before `waitForControlPlane` → scheduler standby → acquire → `LeaderAcquired` → recovery ACTUALLY runs. Asserts journalctl log + metric.
 - **V2** (VM test hollow): C2 never committed (all in grace → `unreachable=vec[]` → for-batch body never runs). Fixed: backdate S1's output past grace → sweep DELETES 1 path → proves commit.
+
+**Validation-round-3 bugs fixed (iteration 5, 9 commits fbadbfc..7d98a3c, 991→994 tests):** Deep review of round-2 code found 1 HIGH + 2 MEDIUM bugs + 2 more hollow VM sections + ~200 lines of needless duplication.
+- **Y1** (HIGH) Controller watch-dedup delete+recreate race: `watching` keyed by `{ns}/{name}` → old drain_stream's scopeguard removes NEW entry after delete+recreate → duplicate watch (C1 regression). Fixed: key by `b.uid()` (unique per K8s object).
+- **Y2** (MED) Pin leak on orphan-completion: `handle_reconcile_assignments` orphan-complete branch never called `unpin_live_inputs` → pins leak until next restart. Fixed + test seeds pins before reconcile.
+- **Y3** (MED) Orphan scanner reap-then-reupload race: X3's `FOR UPDATE` re-checked `status='uploading'` but NOT the stale threshold → fresh re-upload with same hash gets reaped. Fixed: `AND updated_at < threshold` in both FOR UPDATE + DELETE EXISTS.
+- **Y5** (LOW, latent) `poison_and_cascade` unconditional PG write on transition failure → in-mem ≠ PG + spurious cascade. Unreachable today (3 callers guarantee precondition); fixed via debug_assert! + early-return.
+- **Y4** (LOW, comment) Advisory-lock-on-panic comment wrong: `PoolConnection::drop` returns to pool (not closes) → lock leaks until sqlx recycles. No panic points currently — corrected comment, noted to avoid `.unwrap()`.
+- **D1-D5** (duplication): Extracted `persist_status` (13 sites), `record_failure_and_check_poison` (3 sites), `unpin_best_effort` (5 sites), `ensure_running` (4 sites), `TERMINAL_STATUSES` const (2 SQL queries). ~200 lines net reduction in actor/*.
+- **V3** (VM test hollow): S1 recovered 0 rows (B1+S1-setup terminal before restart). Fixed: background 15s-sleep build before restart → PG has non-terminal row → recovery loads real data. PG query asserts ≥1 non-terminal.
+- **V4** (VM test hollow): B1 didn't prove HMAC verifier active (broken `load` → verifier=None → PutPath accepts all → B1 passes anyway). Fixed: assert `rio_store_hmac_bypass_total{cn="rio-gateway"}` ≥ 1 after seedBusybox — metric only increments when verifier non-None.
 
 **EKS smoke:** manual trigger (`infra/eks/smoke-test.sh`). Deploys, builds hello, kills worker, verifies reassign via metrics delta.

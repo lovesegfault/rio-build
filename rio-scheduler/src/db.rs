@@ -374,7 +374,7 @@ impl SchedulerDb {
     /// dispatch but before unpin at completion).
     ///
     /// The subquery matches load_nonterminal_derivations' filter
-    /// (both use [`TERMINAL_STATUSES`]): a drv NOT in that set is
+    /// (both use `TERMINAL_STATUSES`): a drv NOT in that set is
     /// terminal (or deleted entirely).
     pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
@@ -632,7 +632,7 @@ impl SchedulerDb {
     }
 
     /// Load all non-terminal derivations. Same terminal-exclusion
-    /// filter ([`TERMINAL_STATUSES`]) as sweep_stale_live_pins; the
+    /// filter (`TERMINAL_STATUSES`) as sweep_stale_live_pins; the
     /// partial index (status_idx) makes this efficient for large
     /// tables.
     pub async fn load_nonterminal_derivations(
