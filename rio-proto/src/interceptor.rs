@@ -54,8 +54,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 ///
 /// No-op if there's no active span (e.g., called outside any
 /// `#[instrument]` or `info_span!().entered()`). No-op-ish if the
-/// propagator isn't registered (C11 registers it unconditionally, so
-/// in practice this always works after `init_tracing()`).
+/// propagator isn't registered (rio_common::observability::init_tracing
+/// registers it unconditionally, so in practice this always works after
+/// `init_tracing()`).
 pub fn inject_current(metadata: &mut MetadataMap) {
     let cx = tracing::Span::current().context();
     opentelemetry::global::get_text_map_propagator(|prop| {
@@ -141,7 +142,7 @@ mod tests {
     ///
     /// This test has to set up a local tracer provider because the global
     /// one isn't installed in test builds (no init_tracing() call).
-    /// We also need to register the W3C propagator (C11 does this in
+    /// We also need to register the W3C propagator (normally done by
     /// init_tracing; tests don't go through that).
     #[test]
     fn inject_then_extract_roundtrips_trace_id() {

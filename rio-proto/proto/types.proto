@@ -23,7 +23,7 @@ message DerivationNode {
   // between the gateway's FindMissingPaths and the scheduler's queue.
   repeated string expected_output_paths = 8;
   // ATerm-serialized .drv content. Empty = scheduler/worker fetches
-  // from store (the pre-D8 path, still works). Populated by the
+  // from store (the inline-content fallback). Populated by the
   // gateway via filter_and_inline_drv ONLY for nodes whose outputs
   // are missing from the store (= will actually dispatch). Cache-hit
   // nodes stay empty — no point inflating SubmitBuild for derivations
@@ -190,11 +190,11 @@ message CompletionReport {
   // tree under nix-daemon — the daemon itself + the builder it forks
   // + every compiler sub-process. One read at build end, no polling.
   //
-  // Prior to phase3a this read /proc/{daemon_pid}/status VmHWM, which
-  // measured nix-daemon's RSS (~10MB regardless of builder memory —
-  // the daemon forks the builder and waitpid()s, so the builder's
-  // footprint never appeared in daemon's /proc). cgroup memory.peak
-  // fixes that: it captures the TREE, not a single PID.
+  // cgroup v2 memory.peak is essential here (NOT /proc/{pid}/status
+  // VmHWM): VmHWM would only measure nix-daemon's own RSS (~10MB)
+  // because the daemon forks the builder and waitpid()s — the
+  // builder's footprint never appears in the daemon's /proc.
+  // memory.peak captures the whole TREE.
   //
   // Feeds build_history.ema_peak_memory_bytes for size-class
   // memory-bump: a derivation that fits the "small" duration class
@@ -281,8 +281,8 @@ message WorkAssignment {
   reserved "input_paths";
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
-  string assignment_token = 6;            // Opaque token (NOT cryptographically signed;
-                                          //  HMAC-SHA256 signing deferred to Phase 3b)
+  string assignment_token = 6;            // HMAC-SHA256-signed claims (worker_id, drv_hash,
+                                          //  expected_outputs, expiry) — store verifies on PutPath
   uint64 generation = 7;                  // Leader election generation counter
   bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
 }
@@ -432,7 +432,7 @@ message PathInfo {
 //
 // metadata.info.nar_hash MUST be empty — hash/size arrive in the trailer.
 // The store rejects non-empty metadata hash as a protocol violation
-// (hash-upfront mode was removed in the pre-phase3a cleanup).
+// (hash-upfront mode is not supported — trailer only).
 //
 // Both the gateway (chunk_nar_for_put) and worker (single-pass tee upload)
 // use this shape. The worker reads the file once, hashing + streaming
@@ -493,8 +493,8 @@ message FindMissingPathsResponse {
 // Content-addressed lookup: find a store path by its content hash.
 message ContentLookupRequest {
   bytes content_hash = 1;                 // SHA-256 of the output content
-  // Field 2 (output_name) was never read by the handler — content_index
-  // is keyed purely on content_hash. Removed in pre-phase3a cleanup.
+  // Field 2 (output_name) was never read — content_index is keyed
+  // purely on content_hash.
   reserved 2;
   reserved "output_name";
 }
@@ -700,8 +700,8 @@ message GCRequest {
   // Override default grace period (default: 2h). Proto3 optional:
   // absence = use default, presence of 0 = zero grace (collect
   // everything eligible NOW — useful for tests or pre-shutdown GC).
-  // Prior to round 4 this was non-optional with 0 meaning "use
-  // default" — impossible to request zero grace.
+  // Without `optional`, a wire-zero would be ambiguous ("use default"
+  // vs "zero grace").
   optional uint32 grace_period_hours = 2;
   // Scheduler-populated: expected output paths for all non-terminal
   // derivations (live builds). Protects in-flight build outputs that

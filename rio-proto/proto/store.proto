@@ -36,8 +36,7 @@ service StoreService {
   // Append signatures to an existing store path's narinfo.
   //
   // wopAddSignatures (37): Nix clients send this after `nix store sign`.
-  // Previously stubbed (read wire data, discard). Now we actually persist:
-  // UPDATE narinfo SET signatures = signatures || $2.
+  // Persists: UPDATE narinfo SET signatures = signatures || $2.
   rpc AddSignatures(rio.types.AddSignaturesRequest) returns (rio.types.AddSignaturesResponse);
 
   // Register a CA derivation realisation (wopRegisterDrvOutput, 42).

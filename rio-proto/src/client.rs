@@ -22,8 +22,8 @@ use crate::validated::ValidatedPathInfo;
 
 /// Unified chunk size for NAR streaming (256 KiB).
 ///
-/// Previously inconsistent: gateway used 64 KiB, worker used 256 KiB.
-/// 256 KiB reduces per-chunk overhead with negligible latency impact.
+/// 256 KiB reduces per-chunk overhead vs. smaller chunk sizes, with
+/// negligible latency impact.
 pub const NAR_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Process-global client TLS config. Set once via [`init_client_tls`] in
@@ -195,7 +195,7 @@ pub async fn collect_nar_stream(
 ///
 /// Trailer-mode only: `nar_hash`/`nar_size` are zeroed in the metadata
 /// PathInfo and sent in the trailer. This is the ONLY PutPath mode the
-/// store accepts (hash-upfront was deleted in the pre-phase3a cleanup).
+/// store accepts.
 ///
 /// Takes `Arc<[u8]>` so chunks borrow without eagerly materializing
 /// a `Vec<PutPathRequest>`. The returned stream is lazy — chunks are

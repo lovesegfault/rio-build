@@ -14,14 +14,14 @@
 //! - Behavior tests (scheduler dispatches work, store stores bytes, etc.)
 //!   — those are in each crate's integration tests.
 //! - Tests for bounds already covered elsewhere. Grep first; don't dup.
-//! - The PutPath trailer contract tests — those landed with C14 in
+//! - The PutPath trailer contract tests — those are in
 //!   rio-store/tests/grpc_integration.rs (closer to the implementation).
 
 use rio_proto::interceptor;
 use tonic::Request;
 
 // ===========================================================================
-// Trace propagation metadata roundtrip (C12 interceptor, C13 wiring)
+// Trace propagation metadata roundtrip (rio-proto::interceptor)
 // ===========================================================================
 
 /// A traceparent injected into outgoing metadata survives tonic's
@@ -54,8 +54,9 @@ fn traceparent_survives_request_wrapping() {
 }
 
 /// link_parent on a request WITHOUT traceparent doesn't panic (already
-/// covered by C12's unit test, but this is the contract-test phrasing:
-/// "a client that doesn't trace doesn't break the server").
+/// covered by the interceptor module's unit test, but this is the
+/// contract-test phrasing: "a client that doesn't trace doesn't break
+/// the server").
 #[test]
 fn untraced_request_does_not_break_server_extraction() {
     opentelemetry::global::set_text_map_propagator(
@@ -135,13 +136,13 @@ fn limits_are_reasonable() {
         )
     };
 
-    // NAR_CHUNK_SIZE: bounds per-upload memory. Phase2b's streaming
-    // work specifically gets peak from 8GiB to ~1MiB; a 64MiB chunk
-    // size would put us back into phase2a territory.
+    // NAR_CHUNK_SIZE: bounds per-upload memory. Streaming upload gets
+    // peak memory from 8GiB to ~1MiB; a 64MiB chunk size would undo
+    // that.
     const {
         assert!(
             rio_proto::client::NAR_CHUNK_SIZE <= 1024 * 1024,
-            "NAR_CHUNK_SIZE bloats per-upload memory; phase2b streaming was to avoid this"
+            "NAR_CHUNK_SIZE bloats per-upload memory; streaming upload design depends on small chunks"
         )
     };
 
