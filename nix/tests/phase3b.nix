@@ -931,7 +931,7 @@ pkgs.testers.runNixOSTest {
             f"V14: expected currentPath to describe delete outcome "
             f"(mark+sweep ran), got: {result[:500]}"
         )
-        print(f"C1 PASS: TriggerGC dry-run completed via AdminService proxy (V14: currentPath describes outcome)")
+        print("C1 PASS: TriggerGC dry-run completed via AdminService proxy (V14: currentPath describes outcome)")
 
     # ════════════════════════════════════════════════════════════════
     # Section G: gateway validation (from iteration 1)
