@@ -440,13 +440,29 @@ async fn main() -> anyhow::Result<()> {
     // DESTROY → Filesystem::destroy() never runs → passthrough-
     // failure stats lost, profraw never flushed for that code.
     // umount_and_join() unmounts THEN joins the thread, ensuring
-    // destroy() completes before main returns. spawn_blocking because
-    // join() blocks the OS thread.
-    let join_result = tokio::task::spawn_blocking(move || fuse_session.umount_and_join()).await;
+    // destroy() completes before main returns.
+    //
+    // 5s timeout: if the FUSE mount is busy (overlay still stacked
+    // on top — shouldn't happen after drain but belt-and-suspenders)
+    // or the FUSE thread is stuck processing a slow request,
+    // umount_and_join() would block forever. This would wedge pod
+    // termination in k8s (SIGTERM never returns → SIGKILL after
+    // terminationGracePeriodSeconds). Better to abandon the graceful
+    // unmount and let process exit handle it (kernel unmounts on
+    // process death anyway; we just lose destroy() and its profraw).
+    let join_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || fuse_session.umount_and_join()),
+    )
+    .await;
     match join_result {
-        Ok(Ok(())) => tracing::debug!("FUSE session unmounted and joined"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "FUSE umount/join failed"),
-        Err(e) => tracing::warn!(error = %e, "FUSE join task panicked"),
+        Ok(Ok(Ok(()))) => tracing::debug!("FUSE session unmounted and joined"),
+        Ok(Ok(Err(e))) => tracing::warn!(error = %e, "FUSE umount/join failed"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "FUSE join task panicked"),
+        Err(_) => tracing::warn!(
+            "FUSE umount/join timed out (5s); abandoning graceful unmount. \
+             Mount may be busy — kernel will unmount on process exit."
+        ),
     }
 
     Ok(())
