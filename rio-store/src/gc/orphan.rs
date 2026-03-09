@@ -100,57 +100,10 @@ pub async fn scan_once(
             continue;
         }
 
-        // Chunk decrement + enqueue (if chunked). Same logic
-        // as sweep::sweep.
+        // Chunk decrement + enqueue (if chunked). Same helper as
+        // sweep::sweep — see gc::decrement_and_enqueue.
         if let Some(bytes) = chunk_list {
-            match crate::manifest::Manifest::deserialize(&bytes) {
-                Ok(manifest) => {
-                    let unique_hashes: Vec<Vec<u8>> = {
-                        let mut seen = std::collections::HashSet::<[u8; 32]>::new();
-                        manifest
-                            .entries
-                            .into_iter()
-                            .filter(|e| seen.insert(e.hash))
-                            .map(|e| e.hash.to_vec())
-                            .collect()
-                    };
-                    if !unique_hashes.is_empty() {
-                        sqlx::query(
-                            "UPDATE chunks SET refcount = refcount - 1 \
-                             WHERE blake3_hash = ANY($1)",
-                        )
-                        .bind(&unique_hashes)
-                        .execute(&mut *tx)
-                        .await?;
-
-                        let zeroed: Vec<(Vec<u8>,)> = sqlx::query_as(
-                            "UPDATE chunks SET deleted = true \
-                             WHERE blake3_hash = ANY($1) AND refcount = 0 \
-                               AND deleted = false \
-                             RETURNING blake3_hash",
-                        )
-                        .bind(&unique_hashes)
-                        .fetch_all(&mut *tx)
-                        .await?;
-
-                        if let Some(backend) = chunk_backend {
-                            for (hash,) in &zeroed {
-                                let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
-                                    continue;
-                                };
-                                let key = backend.key_for(&arr);
-                                sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
-                                    .bind(&key)
-                                    .execute(&mut *tx)
-                                    .await?;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "orphan scan: corrupt chunk_list, skipping decrement");
-                }
-            }
+            super::decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
         }
 
         tx.commit().await?;

@@ -4,12 +4,11 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::backend::chunk::ChunkBackend;
-use crate::manifest::Manifest;
 
-use super::GcStats;
+use super::{GcStats, decrement_and_enqueue};
 
 /// Batch size for sweep transactions. Each batch is a single tx:
 /// N narinfo DELETEs + chunk refcount decrements + pending_s3_deletes
@@ -88,89 +87,10 @@ pub async fn sweep(
             // Steps 3-5: chunk refcount + pending_s3_deletes.
             // Only if chunked storage (chunk_list non-None).
             if let Some(bytes) = chunk_list {
-                // Parse the manifest format (versioned binary).
-                // Manifest::deserialize returns entries with
-                // {hash: [u8;32], size: u32}. We only need hashes.
-                let manifest = match Manifest::deserialize(&bytes) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        // Corrupt manifest — already CASCADEd away
-                        // by DELETE narinfo. Log and continue; the
-                        // chunks this manifest referenced will have
-                        // their refcounts off by one (slightly over-
-                        // counted), which just means they survive
-                        // until a future GC sees them at actual 0.
-                        warn!(error = %e, "sweep: corrupt chunk_list, skipping decrement");
-                        continue;
-                    }
-                };
-
-                // Collect unique chunk hashes (a manifest CAN
-                // repeat chunks if the NAR has duplicate content
-                // blocks; we decrement once per unique hash).
-                // HashSet<[u8;32]> for dedup; Vec<Vec<u8>> for the
-                // PG ANY() bind (sqlx needs owned Vec, not [u8;32]).
-                let unique_hashes: Vec<Vec<u8>> = {
-                    let mut seen = std::collections::HashSet::<[u8; 32]>::new();
-                    manifest
-                        .entries
-                        .into_iter()
-                        .filter(|e| seen.insert(e.hash))
-                        .map(|e| e.hash.to_vec())
-                        .collect()
-                };
-                if unique_hashes.is_empty() {
-                    continue;
-                }
-
-                // Step 3: decrement refcounts. ANY($1) for batch.
-                sqlx::query(
-                    "UPDATE chunks SET refcount = refcount - 1 WHERE blake3_hash = ANY($1)",
-                )
-                .bind(&unique_hashes)
-                .execute(&mut *tx)
-                .await?;
-
-                // Step 4: mark refcount=0 as deleted, return hashes
-                // + sizes for stats. Only rows we JUST touched (ANY)
-                // AND that are now at 0 (other paths may reference
-                // them too).
-                let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-                    r#"
-                    UPDATE chunks SET deleted = true
-                     WHERE blake3_hash = ANY($1) AND refcount = 0
-                       AND deleted = false
-                    RETURNING blake3_hash, size
-                    "#,
-                )
-                .bind(&unique_hashes)
-                .fetch_all(&mut *tx)
-                .await?;
-
-                stats.chunks_deleted += zeroed.len() as u64;
-                stats.bytes_freed += zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
-
-                // Step 5: enqueue S3 keys. Only if we have a
-                // chunk backend (inline store has no S3 keys to
-                // delete).
-                if let Some(backend) = chunk_backend {
-                    for (hash, _) in &zeroed {
-                        // hash is Vec<u8>; key_for wants [u8;32].
-                        // Malformed (wrong length) → skip with
-                        // warn; chunk_list came from our own
-                        // serializer so this shouldn't happen.
-                        let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) else {
-                            warn!("sweep: chunk hash wrong length, skipping S3 enqueue");
-                            continue;
-                        };
-                        let key = backend.key_for(&arr);
-                        sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
-                            .bind(&key)
-                            .execute(&mut *tx)
-                            .await?;
-                        stats.s3_keys_enqueued += 1;
-                    }
-                }
+                let dec = decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
+                stats.chunks_deleted += dec.chunks_zeroed;
+                stats.s3_keys_enqueued += dec.s3_keys_enqueued;
+                stats.bytes_freed += dec.bytes_freed;
             }
         }
 
