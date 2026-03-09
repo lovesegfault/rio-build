@@ -852,12 +852,13 @@ pkgs.testers.runNixOSTest {
         )
         assert '"isComplete": true' in result or '"isComplete":true' in result, \
             f"C2: expected GCProgress.isComplete=true: {result[:500]}"
-        # V2: pathsDeleted should be 1 (S1's backdated output).
-        # proto3 JSON uint64 serializes as string.
+        # V2: pathsCollected should be 1 (S1's backdated output).
+        # proto3 JSON uint64 serializes as string. Proto field is
+        # paths_collected → camelCase pathsCollected.
         assert (
-            '"pathsDeleted": "1"' in result
-            or '"pathsDeleted":"1"' in result
-        ), f"C2/V2: expected 1 path deleted (S1 backdated): {result[:500]}"
+            '"pathsCollected": "1"' in result
+            or '"pathsCollected":"1"' in result
+        ), f"C2/V2: expected 1 path collected (S1 backdated): {result[:500]}"
 
         # V2: S1 is GONE — nix path-info should FAIL.
         client.fail(
