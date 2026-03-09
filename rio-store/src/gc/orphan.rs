@@ -173,10 +173,12 @@ pub async fn scan_once(
 }
 
 /// Spawn the periodic orphan scanner. Runs `scan_once` every
-/// SCAN_INTERVAL. Errors logged; next iteration retries.
+/// SCAN_INTERVAL. Errors logged; next iteration retries. Exits
+/// cleanly when `shutdown` is cancelled.
 pub fn spawn_scanner(
     pool: PgPool,
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     rio_common::task::spawn_monitored("gc-orphan-scanner", async move {
         let mut interval = tokio::time::interval(SCAN_INTERVAL);
@@ -185,9 +187,16 @@ pub fn spawn_scanner(
         // background task.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
-            if let Err(e) = scan_once(&pool, chunk_backend.as_ref()).await {
-                warn!(error = %e, "orphan scan failed (will retry next interval)");
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("gc-orphan-scanner shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = scan_once(&pool, chunk_backend.as_ref()).await {
+                        warn!(error = %e, "orphan scan failed (will retry next interval)");
+                    }
+                }
             }
         }
     })

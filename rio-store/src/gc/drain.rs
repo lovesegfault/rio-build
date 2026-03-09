@@ -187,18 +187,26 @@ pub async fn drain_once(
 }
 
 /// Spawn the periodic drain task. Runs `drain_once` every
-/// DRAIN_INTERVAL.
+/// DRAIN_INTERVAL. Exits cleanly when `shutdown` is cancelled.
 pub fn spawn_drain_task(
     pool: PgPool,
     backend: Arc<dyn ChunkBackend>,
+    shutdown: rio_common::signal::Token,
 ) -> tokio::task::JoinHandle<()> {
     rio_common::task::spawn_monitored("gc-drain-task", async move {
         let mut interval = tokio::time::interval(DRAIN_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
-            if let Err(e) = drain_once(&pool, &backend).await {
-                warn!(error = %e, "drain iteration failed (will retry)");
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("gc-drain-task shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = drain_once(&pool, &backend).await {
+                        warn!(error = %e, "drain iteration failed (will retry)");
+                    }
+                }
             }
         }
     })

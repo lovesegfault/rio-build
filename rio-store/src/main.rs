@@ -151,6 +151,12 @@ async fn main() -> anyhow::Result<()> {
     let _root_guard = tracing::info_span!("store", component = "store").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-store");
 
+    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Cloned into each
+    // background loop; .cancelled_owned() for serve_with_shutdown. Lets
+    // main() return normally so atexit handlers (LLVM coverage profraw
+    // flush, tracing shutdown) fire.
+    let shutdown = rio_common::signal::shutdown_signal();
+
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_store::describe_metrics();
 
@@ -280,9 +286,13 @@ async fn main() -> anyhow::Result<()> {
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
         chunk_cache.as_ref().map(|c| c.backend());
     let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone());
-    rio_store::gc::orphan::spawn_scanner(pool.clone(), chunk_backend_for_gc.clone());
+    rio_store::gc::orphan::spawn_scanner(
+        pool.clone(),
+        chunk_backend_for_gc.clone(),
+        shutdown.clone(),
+    );
     if let Some(backend) = chunk_backend_for_gc {
-        rio_store::gc::drain::spawn_drain_task(pool.clone(), backend);
+        rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }
 
     // Binary-cache HTTP server (narinfo + nar.zst routes). Spawned
@@ -297,11 +307,15 @@ async fn main() -> anyhow::Result<()> {
             chunk_cache: chunk_cache.clone(),
         });
         let router = cache_server::router(state);
+        let http_shutdown = shutdown.clone();
         rio_common::task::spawn_monitored("cache-http-server", async move {
             info!(addr = %http_addr, "starting binary-cache HTTP server");
             match tokio::net::TcpListener::bind(http_addr).await {
                 Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, router).await {
+                    if let Err(e) = axum::serve(listener, router)
+                        .with_graceful_shutdown(http_shutdown.cancelled_owned())
+                        .await
+                    {
                         error!(error = %e, "cache HTTP server failed");
                     }
                 }
@@ -340,11 +354,12 @@ async fn main() -> anyhow::Result<()> {
     let health_service_plain = health_service.clone();
     if server_tls.is_some() {
         let health_addr = cfg.health_addr;
+        let health_shutdown = shutdown.clone();
         info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
         rio_common::task::spawn_monitored("health-plaintext", async move {
             if let Err(e) = Server::builder()
                 .add_service(health_service_plain)
-                .serve(health_addr)
+                .serve_with_shutdown(health_addr, health_shutdown.cancelled_owned())
                 .await
             {
                 tracing::error!(error = %e, "plaintext health server failed");
@@ -364,9 +379,10 @@ async fn main() -> anyhow::Result<()> {
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
         .add_service(ChunkServiceServer::new(chunk_service))
         .add_service(StoreAdminServiceServer::new(admin_service))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown.cancelled_owned())
         .await?;
 
+    info!("store shut down cleanly");
     Ok(())
 }
 
