@@ -37,19 +37,30 @@ const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// - On success: DELETE the pending row
 /// - On failure: UPDATE attempts = attempts + 1, last_error
 ///
-/// NOT transactional across the batch: each row is committed
-/// individually. A mid-batch S3 outage means we process some,
-/// fail some, and retry the failed ones next iteration. The PG
-/// DELETE/UPDATE per-row means a crash mid-batch doesn't re-
-/// process already-deleted rows.
+/// Transactional: SELECT ... FOR UPDATE SKIP LOCKED grabs a batch
+/// of rows and holds row-level locks until commit. Multiple store
+/// replicas running drain concurrently each grab DISJOINT batches
+/// (SKIP LOCKED). Without this, all replicas select the same 100
+/// rows → duplicate S3 DeleteObject calls (idempotent but wasteful,
+/// noisy logs).
+///
+/// S3 delete happens inside the tx → long-held row locks (~seconds
+/// per S3 call). This is acceptable: locks are row-level, other
+/// replicas skip locked rows and drain different ones concurrently.
+/// If the tx rolls back (PG error mid-batch), S3 deletes that
+/// already happened are lost from PG's view → next iteration re-
+/// processes those rows → S3 delete of non-existent key is a no-op.
 pub async fn drain_once(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
 ) -> Result<(u64, u64), sqlx::Error> {
-    // SELECT eligible rows. The partial index (WHERE attempts < 10)
-    // makes this efficient even if permanently-failed rows
-    // accumulate. ORDER BY enqueued_at: oldest first (roughly
-    // FIFO, though retries can reorder).
+    let mut tx = pool.begin().await?;
+
+    // SELECT eligible rows. FOR UPDATE SKIP LOCKED: multi-replica
+    // coordination. The partial index (WHERE attempts < 10) makes
+    // this efficient even if permanently-failed rows accumulate.
+    // ORDER BY enqueued_at: oldest first (roughly FIFO, though
+    // retries can reorder).
     //
     // blake3_hash is nullable: pre-migration-006 rows have NULL
     // → drain proceeds unconditionally (old behavior). New rows
@@ -60,14 +71,17 @@ pub async fn drain_once(
          WHERE attempts < $1
          ORDER BY enqueued_at
          LIMIT $2
+           FOR UPDATE SKIP LOCKED
         "#,
     )
     .bind(MAX_ATTEMPTS)
     .bind(DRAIN_BATCH_SIZE)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     if rows.is_empty() {
+        // Nothing to do — commit (no-op) to release.
+        tx.commit().await?;
         return Ok((0, 0));
     }
 
@@ -79,12 +93,20 @@ pub async fn drain_once(
         // it? PutPath's ON CONFLICT sets deleted=false + refcount+1.
         // If so, the chunk is live again — skip S3, drop pending row.
         // NULL blake3_hash (pre-006 row) → skip re-check, proceed.
+        //
+        // Re-check runs inside the SKIP LOCKED tx: the pending row
+        // is locked (no other replica touches it), but the CHUNKS
+        // row is NOT locked by this tx — PutPath can still flip it
+        // between this check and the S3 delete. That window is
+        // small (one PG roundtrip + one S3 call) and the blast
+        // radius of missing it is "one chunk re-uploaded on next
+        // GetPath miss" — acceptable.
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(
                 "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",
             )
             .bind(hash)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?
             // Row gone entirely = still dead (nothing references it,
             // and the chunks row itself was deleted somehow — S3
@@ -93,7 +115,7 @@ pub async fn drain_once(
             if !still_dead {
                 sqlx::query("DELETE FROM pending_s3_deletes WHERE id = $1")
                     .bind(id)
-                    .execute(pool)
+                    .execute(&mut *tx)
                     .await?;
                 metrics::counter!("rio_store_gc_chunk_resurrected_total").increment(1);
                 debug!(id, key = %key, "drain: chunk resurrected, skipping S3 delete");
@@ -103,44 +125,35 @@ pub async fn drain_once(
 
         match backend.delete_by_key(&key).await {
             Ok(()) => {
-                // DELETE the pending row. Fire-and-forget: if
-                // PG is down here (S3 succeeded, PG failed), the
-                // row stays and we'll retry the S3 delete next
-                // iteration — idempotent (S3 delete of non-
-                // existent key is a no-op).
-                if let Err(e) = sqlx::query("DELETE FROM pending_s3_deletes WHERE id = $1")
+                // DELETE the pending row (same tx). If tx commit
+                // later fails, the S3 delete already happened —
+                // next iteration re-processes this row, S3 delete
+                // of non-existent key is a no-op.
+                sqlx::query("DELETE FROM pending_s3_deletes WHERE id = $1")
                     .bind(id)
-                    .execute(pool)
-                    .await
-                {
-                    warn!(id, error = %e, "drain: S3 delete ok but PG row delete failed (will retry S3, harmless)");
-                }
+                    .execute(&mut *tx)
+                    .await?;
                 deleted += 1;
             }
             Err(e) => {
-                // Increment attempts + record error. Next iteration
-                // retries (if attempts < MAX). After MAX: row stays,
-                // excluded by partial index, operator investigates.
-                if let Err(pg_err) = sqlx::query(
+                // Increment attempts + record error (same tx).
+                // Next iteration retries (if attempts < MAX).
+                sqlx::query(
                     "UPDATE pending_s3_deletes \
                      SET attempts = attempts + 1, last_error = $2 \
                      WHERE id = $1",
                 )
                 .bind(id)
                 .bind(e.to_string())
-                .execute(pool)
-                .await
-                {
-                    // Both S3 and PG failing — double whammy.
-                    // Log and move on; next iteration will pick
-                    // up the row again (attempts unchanged).
-                    warn!(id, s3_error = %e, pg_error = %pg_err, "drain: S3 delete failed AND PG update failed");
-                }
+                .execute(&mut *tx)
+                .await?;
                 failed += 1;
                 debug!(id, key = %key, error = %e, "drain: S3 delete failed (will retry)");
             }
         }
     }
+
+    tx.commit().await?;
 
     if deleted > 0 || failed > 0 {
         debug!(deleted, failed, "drain iteration complete");
@@ -373,5 +386,63 @@ mod tests {
         // Operator investigates; this row is effectively "parked."
         assert_eq!(deleted, 0);
         assert_eq!(failed, 0, "max-attempts row excluded from drain");
+    }
+
+    /// SKIP LOCKED: two concurrent drain_once calls against the same
+    /// pool must grab DISJOINT batches. With 5 pending rows, total
+    /// S3 deletes should be exactly 5 (not 10).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_skip_locked_disjoint_batches() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed 5 chunks + pending rows.
+        for i in 0..5u8 {
+            let hash = [i; 32];
+            backend
+                .put(&hash, bytes::Bytes::from(vec![i; 8]))
+                .await
+                .unwrap();
+            let key = backend.key_for(&hash);
+            sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
+                .bind(&key)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Run two drains concurrently. Each holds a FOR UPDATE
+        // SKIP LOCKED tx — one grabs some rows, the other skips
+        // those and grabs the rest. Total deleted = 5.
+        //
+        // Note: with MemoryChunkBackend, S3 delete is instant, so
+        // the lock window is tiny. Both might serialize (one gets
+        // all 5, other gets 0). Either way, total == 5 proves no
+        // DUPLICATE processing — that's the invariant.
+        let pool_a = db.pool.clone();
+        let pool_b = db.pool.clone();
+        let backend_a = backend.clone();
+        let backend_b = backend.clone();
+
+        let (a, b) = tokio::join!(
+            drain_once(&pool_a, &backend_a),
+            drain_once(&pool_b, &backend_b),
+        );
+        let (del_a, fail_a) = a.unwrap();
+        let (del_b, fail_b) = b.unwrap();
+
+        assert_eq!(fail_a + fail_b, 0, "no failures");
+        assert_eq!(
+            del_a + del_b,
+            5,
+            "total deletes = 5 (no duplicates); split was {del_a}/{del_b}"
+        );
+
+        // All pending rows gone.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "all pending rows removed exactly once");
     }
 }
