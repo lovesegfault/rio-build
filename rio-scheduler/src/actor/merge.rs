@@ -116,11 +116,23 @@ impl DagActor {
             return Err(e);
         }
 
-        // Transition build to active. If this fails, roll back everything.
-        if let Err(e) = self.transition_build(build_id, BuildState::Active).await {
-            error!(build_id = %build_id, error = %e, "transition to Active failed; rolling back");
-            self.cleanup_failed_merge(build_id, &merge_result).await;
-            return Err(e);
+        // Transition build to active. If DB write fails, roll back everything.
+        // Pending→Active is always a valid transition for a fresh build; we
+        // debug_assert the outcome but don't branch on it (Rejected here
+        // would be a bug in BuildInfo::transition, not a recoverable error).
+        match self.transition_build(build_id, BuildState::Active).await {
+            Ok(outcome) => {
+                debug_assert_eq!(
+                    outcome,
+                    super::build::TransitionOutcome::Applied,
+                    "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
+                );
+            }
+            Err(e) => {
+                error!(build_id = %build_id, error = %e, "transition to Active failed; rolling back");
+                self.cleanup_failed_merge(build_id, &merge_result).await;
+                return Err(e);
+            }
         }
 
         // === Step 6: Post-Active processing ==========================

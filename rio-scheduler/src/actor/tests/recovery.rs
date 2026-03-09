@@ -476,3 +476,111 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
 
     Ok(())
 }
+
+/// Round 4 Z3: phantom-Assigned after crash-during-dispatch.
+///
+/// Scenario: scheduler persists PG=Assigned+worker, crashes BEFORE
+/// try_send (the actual channel send to the worker). On restart,
+/// worker reconnects (heartbeat → in self.workers). Old
+/// reconcile_assignments saw "worker present, leave it" → drv
+/// stuck forever (worker never got it, no running_since →
+/// backstop timeout won't fire).
+///
+/// Z3 fix: cross-check worker.running_builds even when worker is
+/// present. If drv NOT in the worker's heartbeat, reconcile it
+/// (store-check → Completed, or reset → Ready).
+#[tokio::test]
+async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let build_id = Uuid::new_v4();
+
+    // --- Phase 1: merge build, shut down ---
+    {
+        let (handle, task) = setup_actor(sched_db.pool.clone());
+        let node = make_test_node("phantom-drv", "x86_64-linux");
+        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate: simulate "persist_status(Assigned) + insert_assignment
+    // ran, but try_send never did" (crash between PG write and channel
+    // send). Worker 'phantom-w1' WILL reconnect in phase 2.
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', \
+         assigned_worker_id = 'phantom-w1' WHERE drv_hash = 'phantom-drv'",
+    )
+    .execute(&sched_db.pool)
+    .await?;
+
+    // --- Phase 2: fresh actor, worker reconnects WITHOUT the drv ---
+    let (handle, _task) = setup_actor(sched_db.pool.clone());
+
+    // Worker reconnects: BuildExecution stream + heartbeat with
+    // EMPTY running_builds (because it never actually got the
+    // assignment — the try_send never happened).
+    let _worker_rx = connect_worker(&handle, "phantom-w1", "x86_64-linux", 4).await?;
+    barrier(&handle).await;
+
+    // LeaderAcquired → recover_from_pg loads Assigned drv.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Verify: drv is Assigned, worker is in self.workers, but
+    // running_builds does NOT contain the drv (phantom!).
+    let pre = handle
+        .debug_query_derivation("phantom-drv")
+        .await?
+        .expect("drv recovered");
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Assigned,
+        "drv should be Assigned after recovery"
+    );
+
+    // ReconcileAssignments → Z3 fix: worker present BUT drv not
+    // in running_builds → reconcile. No store client here, so
+    // store-check fails → reset to Ready (not Completed).
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    // THE KEY ASSERTION: drv should be Ready (or re-dispatched).
+    // Before Z3, it would stay Assigned forever — worker present
+    // meant "leave it, completion will arrive", but the worker
+    // never had it so no completion ever comes.
+    let post = handle
+        .debug_query_derivation("phantom-drv")
+        .await?
+        .expect("drv exists");
+    assert!(
+        matches!(
+            post.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "phantom-Assigned should be reconciled (Ready or re-dispatched to Assigned), got {:?}",
+        post.status
+    );
+    // If it's Assigned again, it should have been re-dispatched
+    // to our connected worker (not stale "phantom-w1"). Actually
+    // we DID connect phantom-w1, so re-dispatch goes to the same
+    // worker — that's fine, the worker now ACTUALLY has it.
+    //
+    // More precise: it should NOT be the OLD Assigned (stuck).
+    // The way to tell: if reset_to_ready ran, PG has retry_count
+    // bumped OR the assignment row was cleaned. Check retry_count.
+    let retry_count: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM derivations WHERE drv_hash = 'phantom-drv'")
+            .fetch_one(&sched_db.pool)
+            .await?;
+    // retry_count was 0 before recovery. reset_to_ready bumps it.
+    // If Z3 reconciled → retry_count >= 1. If stuck → still 0.
+    assert!(
+        retry_count >= 1,
+        "Z3: phantom Assigned should be reset (retry_count bumped), got {retry_count}"
+    );
+
+    Ok(())
+}

@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// Result of a [`DagActor::transition_build`] call.
+///
+/// `Applied` = state machine transition + DB update both committed.
+/// `Rejected` = state machine rejected (e.g., already terminal).
+/// Callers should skip side effects (events, metrics, cleanup) on
+/// `Rejected` — the build is already in its final state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransitionOutcome {
+    Applied,
+    Rejected,
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // CancelBuild
@@ -313,8 +325,17 @@ impl DagActor {
     }
 
     pub(super) async fn complete_build(&mut self, build_id: Uuid) -> Result<(), ActorError> {
-        self.transition_build(build_id, BuildState::Succeeded)
-            .await?;
+        // Round 4 Z4: skip all side effects if transition was rejected
+        // (already terminal). Before this, a double-complete would emit
+        // a spurious BuildCompleted event + metric + cleanup schedule.
+        if self
+            .transition_build(build_id, BuildState::Succeeded)
+            .await?
+            == TransitionOutcome::Rejected
+        {
+            debug!(build_id = %build_id, "complete_build: transition rejected (already terminal), skipping side effects");
+            return Ok(());
+        }
 
         // Collect output paths from root derivations
         let roots = self.dag.find_roots(build_id);
@@ -356,7 +377,12 @@ impl DagActor {
             })
             .unwrap_or_default();
 
-        self.transition_build(build_id, BuildState::Failed).await?;
+        // Round 4 Z4: skip side effects on Rejected (already terminal).
+        if self.transition_build(build_id, BuildState::Failed).await? == TransitionOutcome::Rejected
+        {
+            debug!(build_id = %build_id, "transition_build_to_failed: rejected (already terminal), skipping side effects");
+            return Ok(());
+        }
 
         self.emit_build_event(
             build_id,
@@ -371,24 +397,38 @@ impl DagActor {
         Ok(())
     }
 
+    /// Attempt to transition a build to a new state.
+    ///
+    /// Returns `Applied` if the transition succeeded (in-memory state
+    /// machine + DB update both committed). Returns `Rejected` if the
+    /// in-memory state machine rejected the transition (e.g., already
+    /// terminal → Succeeded would double-complete).
+    ///
+    /// Round 4 Z4: prior to this, rejection returned `Ok(())`
+    /// indistinguishably from success. Callers (complete_build,
+    /// transition_build_to_failed) would then emit spurious
+    /// BuildCompleted events + metrics + schedule cleanup. Combined
+    /// with Z1 (orphan builds) + Z16 (0-derivation builds complete
+    /// trivially), a resurrected orphan would emit a spurious
+    /// BuildCompleted with empty output_paths to the gateway.
     pub(super) async fn transition_build(
         &mut self,
         build_id: Uuid,
         new_state: BuildState,
-    ) -> Result<(), ActorError> {
+    ) -> Result<TransitionOutcome, ActorError> {
         if let Some(build) = self.builds.get_mut(&build_id) {
             if let Err(e) = build.transition(new_state) {
                 // Already terminal or otherwise invalid. Skip the DB write to
-                // avoid in-memory/DB drift (previously: `let _` discarded the
-                // error but DB was still overwritten with the rejected state).
+                // avoid in-memory/DB drift. Return Rejected so callers skip
+                // side effects (events, metrics, cleanup).
                 debug!(
                     build_id = %build_id,
                     from = ?build.state(),
                     to = ?new_state,
                     error = %e,
-                    "build transition rejected; skipping DB update (already terminal)"
+                    "build transition rejected; skipping DB update + side effects"
                 );
-                return Ok(());
+                return Ok(TransitionOutcome::Rejected);
             }
 
             // Record build duration on terminal transition.
@@ -408,7 +448,7 @@ impl DagActor {
             .update_build_status(build_id, new_state, error_summary)
             .await?;
 
-        Ok(())
+        Ok(TransitionOutcome::Applied)
     }
 
     /// Schedule delayed cleanup of terminal build state. After

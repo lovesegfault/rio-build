@@ -354,9 +354,31 @@ impl DagActor {
             })
             .filter_map(|(h, s)| match s.assigned_worker.as_ref() {
                 Some(w) if self.workers.contains_key(w) => {
-                    // Worker reconnected — leave it, completion
-                    // report will arrive normally.
-                    None
+                    // Worker reconnected. Cross-check running_builds:
+                    // if the worker's heartbeat doesn't include this
+                    // drv_hash, the assignment is phantom — PG says
+                    // Assigned+worker but the worker never got the
+                    // message (scheduler crashed between persist_status
+                    // and try_send). No running_since → backstop won't
+                    // fire → stuck forever without this check.
+                    //
+                    // Round 4 Z3: before this check, phantom-Assigned
+                    // derivations were skipped entirely because the
+                    // worker reconnected. Now we reconcile them.
+                    let hash: DrvHash = h.into();
+                    if self
+                        .workers
+                        .get(w)
+                        .is_some_and(|ws| ws.running_builds.contains(&hash))
+                    {
+                        // Real assignment — worker has it. Leave it,
+                        // completion report will arrive normally.
+                        None
+                    } else {
+                        warn!(drv_hash = %hash, worker_id = %w,
+                              "reconcile: worker reconnected but phantom Assigned (not in worker.running_builds) — reconciling");
+                        Some((hash, Some(w.clone()), s.expected_output_paths.clone()))
+                    }
                 }
                 Some(w) => Some((h.into(), Some(w.clone()), s.expected_output_paths.clone())),
                 None => {
