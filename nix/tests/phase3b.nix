@@ -230,6 +230,26 @@ pkgs.testers.runNixOSTest {
       hostName = "control";
       memorySize = 2048;
       extraServiceEnv = controlTlsEnv;
+      # V1: wire scheduler to k3s Lease. kubeconfig is copied from
+      # k8s VM at test time (see testScript's k3s bootstrap). Before
+      # that, scheduler starts in STANDBY (lease loop's kube client
+      # init fails on missing /etc/kube/config → graceful return →
+      # is_leader stays false → dispatch_ready early-returns).
+      # After kubeconfig copy + restart: lease acquired →
+      # LeaderAcquired fired → recover_from_pg runs → recovery_
+      # complete=true → dispatch unblocked.
+      #
+      # This is the FIX for S1 being hollow: always_leader() in
+      # the no-lease default sets recovery_complete=true from boot
+      # → recovery NEVER runs. With lease config, recovery is gated
+      # on lease acquisition → actually tested.
+      extraSchedulerConfig = {
+        lease = {
+          name = "rio-scheduler-lease";
+          namespace = "default";
+          kubeconfigPath = "/etc/kube/config";
+        };
+      };
       # grpcurl: T1/T2/C1 (gRPC calls with/without TLS).
       # grpc-health-probe: T2/T3 (health checks without needing
       #   reflection or a protoset — it has grpc.health.v1 baked in).
@@ -288,8 +308,50 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     start_all()
 
-    # ── Control plane boot ────────────────────────────────────────────
+    # ── Control plane boot (PG + store; scheduler in STANDBY) ────────
+    # V1: scheduler now has lease config. At boot, kubeconfig doesn't
+    # exist → lease loop's kube client init fails → is_leader stays
+    # false → dispatch gated → scheduler in STANDBY. gRPC port still
+    # binds (wait_for_open_port passes) but health reports NOT_SERVING.
+    #
+    # We CANNOT restart scheduler before PG is ready (rio-store runs
+    # migrations; scheduler needs the schema). So: wait for control
+    # plane FIRST (scheduler is standby but port bound), THEN
+    # kubeconfig + restart.
     ${common.waitForControlPlane "control"}
+
+    # ── V1: k3s bootstrap + kubeconfig copy → scheduler restart ──────
+    # k3s boots in parallel; wait for its kubeconfig.
+    k8s.wait_for_unit("k3s.service")
+    k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
+    k8s.wait_until_succeeds("k3s kubectl get ns default", timeout=60)
+
+    # Copy kubeconfig. Rewrite 127.0.0.1 → k8s (--tls-san k8s set
+    # in common.mkK3sNode so cert is valid for that name).
+    # NOT an f-string: kubeconfig YAML has {} empty maps.
+    kubeconfig = k8s.succeed("cat /etc/rancher/k3s/k3s.yaml")
+    kubeconfig = kubeconfig.replace("127.0.0.1", "k8s")
+    control.succeed("mkdir -p /etc/kube")
+    control.succeed(
+        "cat > /etc/kube/config << 'KUBEEOF'\n" + kubeconfig + "\nKUBEEOF"
+    )
+    control.succeed("chmod 600 /etc/kube/config")
+
+    # Restart scheduler to pick up kubeconfig. Lease loop will now:
+    # acquire → fetch_add(1) + is_leader=true → fire LeaderAcquired
+    # → recover_from_pg runs (empty DAG, still runs through) →
+    # recovery_complete=true → dispatch unblocked → SERVING.
+    control.succeed("systemctl restart rio-scheduler")
+    control.wait_for_unit("rio-scheduler.service")
+    control.wait_for_open_port(9001)
+
+    # Wait for lease acquire + recovery. Poll the recovery log
+    # line (recovery.rs:238). 30s: lease ticks every ~5s.
+    control.wait_until_succeeds(
+        "journalctl -u rio-scheduler --no-pager --since '30 seconds ago' | "
+        "grep -q 'state recovery complete'",
+        timeout=30
+    )
 
     # ── SSH key + gateway restart (authorized_keys) ───────────────────
     ${common.sshKeySetup "control"}
@@ -300,6 +362,14 @@ pkgs.testers.runNixOSTest {
     # and this wait times out — so reaching B1 below IS the T-section
     # positive proof. But we also do explicit probes (T1-T3) for
     # clarity.
+    #
+    # V1 caveat: worker may have exhausted its restart budget during
+    # scheduler's standby → leader transition (boot + kubeconfig
+    # restart = 2 scheduler process cycles; each scheduler exit
+    # drops the worker stream → worker restarts). reset-failed
+    # clears the burst counter; restart forces a fresh attempt.
+    worker.succeed("systemctl reset-failed rio-worker || true")
+    worker.succeed("systemctl restart rio-worker")
     worker.wait_for_unit("rio-worker.service")
     control.wait_until_succeeds(
         "curl -sf http://localhost:9091/metrics | "
@@ -430,8 +500,9 @@ pkgs.testers.runNixOSTest {
     # Section S: scheduler state recovery
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("S1: scheduler restart triggers recovery"):
-        # The recovery path (rio-scheduler/src/actor/recovery.rs):
+    with subtest("S1: scheduler restart triggers REAL recovery (via lease)"):
+        # V1 fix: scheduler now has lease config. The recovery path
+        # (rio-scheduler/src/actor/recovery.rs) is ACTUALLY EXERCISED:
         #   1. lease loop acquires → fires ActorCommand::LeaderAcquired
         #   2. actor handles it → recover_from_pg() runs → reads
         #      non-terminal builds/derivations/edges from PG
@@ -439,15 +510,32 @@ pkgs.testers.runNixOSTest {
         #   4. dispatch_ready gate: if !is_leader || !recovery_complete
         #      → no-op. Dispatch is BLOCKED until recovery completes.
         #
-        # Proof strategy: restart scheduler, wait for it to re-register
-        # the worker (mTLS handshake again), then do a FRESH build.
-        # The build succeeding proves dispatch is unblocked, which
-        # proves recovery_complete was set, which proves recovery ran.
+        # Before V1: always_leader() set recovery_complete=true from
+        # boot, RIO_LEASE_NAME unset → lease loop never ran →
+        # LeaderAcquired never sent → recover_from_pg NEVER CALLED.
+        # S1's post-restart build worked via the always-on dispatch,
+        # proving NOTHING about recovery.
         #
         # We don't test in-flight build recovery here — that needs
         # precise timing (submit, kill mid-build, restart, assert
         # completion). Unit-tested in rio-scheduler/src/actor/
         # tests/recovery.rs with seeded PG rows.
+
+        # Assert the INITIAL (boot-time) recovery already ran: the
+        # k3s-bootstrap kubeconfig-copy restart above should have
+        # fired LeaderAcquired → recovery → "state recovery complete"
+        # log line (recovery.rs:238).
+        control.succeed(
+            "journalctl -u rio-scheduler --no-pager | "
+            "grep -q 'state recovery complete'"
+        )
+
+        # Also assert via metric: rio_scheduler_recovery_total{
+        # outcome="success"} ≥ 1. Initial boot = 1.
+        control.succeed(
+            "curl -sf http://localhost:9091/metrics | "
+            "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} [1-9]'"
+        )
 
         control.succeed("systemctl restart rio-scheduler")
         control.wait_for_unit("rio-scheduler.service")
@@ -457,6 +545,17 @@ pkgs.testers.runNixOSTest {
         control.wait_for_open_port(9001)
         # Plaintext health port also back up (re-spawned on restart).
         control.wait_for_open_port(9101)
+
+        # Lease re-acquire after restart → LeaderAcquired fired
+        # again → recovery runs again. Poll for the NEW recovery
+        # log line (journalctl -b0 captures this process's logs).
+        # 30s timeout: lease loop ticks every 5s; first tick after
+        # kube client init creates/renews lease → LeaderAcquired.
+        control.wait_until_succeeds(
+            "journalctl -u rio-scheduler --no-pager --since '10 seconds ago' | "
+            "grep -q 'state recovery complete'",
+            timeout=30
+        )
 
         # Worker restart. The worker's main loop exits on scheduler
         # disconnect ("shutting down"); systemd restarts it. But early
@@ -477,13 +576,22 @@ pkgs.testers.runNixOSTest {
 
         # Post-restart build. DIFFERENT derivation than B1 (stamp
         # differs → output path differs) so this is NOT a cache hit
-        # — it goes through dispatch, proving dispatch is unblocked.
+        # — it goes through dispatch, proving dispatch is unblocked
+        # AFTER the lease re-acquire + recovery sequence.
         out_s1 = build_drv([worker], "${testDrvFileS1}", capture_stderr=False).strip()
         assert out_s1.startswith("/nix/store/"), \
             f"S1: post-restart build should succeed: {out_s1!r}"
         assert out_s1 != out_b1, \
             f"S1: should be a DIFFERENT path than B1 (not cache hit): {out_s1!r} == {out_b1!r}"
-        print(f"S1 PASS: scheduler restart → recovery → dispatch unblocked, built {out_s1}")
+
+        # Final metric check: recovery_total should be 1 (fresh
+        # process, ONE lease acquire → ONE recovery). Proves
+        # recovery actually ran in THIS process lifetime.
+        control.succeed(
+            "curl -sf http://localhost:9091/metrics | "
+            "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} 1'"
+        )
+        print(f"S1 PASS: scheduler restart → LEASE ACQUIRE → recovery ran → dispatch unblocked, built {out_s1}")
 
     # ════════════════════════════════════════════════════════════════
     # Section F: Build CRD watch dedup (k3s controller)
@@ -641,13 +749,16 @@ pkgs.testers.runNixOSTest {
     # Runs LAST: worker uploads have references: Vec::new()
     # (upload.rs:228 — phase4 gap) so pinning B1 does NOT reach
     # busybox. If we GC with grace=0, busybox gets swept → all
-    # subsequent builds break. grace=24h keeps everything safe.
+    # subsequent builds break. grace=24h keeps everything safe FOR
+    # THE PINNED/REFERENCED PATHS — but we now backdate S1's
+    # output to prove ACTUAL deletion works (V2 fix).
     #
     # What this proves: PinPath FK passes, sweep tx.commit runs
-    # (vs C1's ROLLBACK), stream completes, UnpinPath round-trip.
-    # NOT proving actual deletion — grace covers everything.
+    # (vs C1's ROLLBACK), stream completes, UnpinPath round-trip,
+    # AND (V2) one path is ACTUALLY deleted when past grace →
+    # proves the for-batch loop body executes.
 
-    with subtest("C2: PinPath + non-dry-run GC sweep + UnpinPath"):
+    with subtest("C2: PinPath + non-dry-run GC sweep PROVES commit (V2)"):
         # Pin B1's output. PinPath is rio.store.StoreAdminService
         # on port 9002 (store), NOT rio.admin.AdminService on 9001
         # (scheduler — that has TriggerGC proxy, not Pin/Unpin).
@@ -666,9 +777,26 @@ pkgs.testers.runNixOSTest {
             "'SELECT COUNT(*) FROM gc_roots' | grep -q 1"
         )
 
+        # V2: backdate S1's output past grace so sweep picks it up.
+        # This is THE test that proves sweep's for-batch loop body
+        # actually executes — with all-in-grace paths (before V2),
+        # unreachable=vec![] → loop never runs → neither commit NOR
+        # rollback fires. The test claimed "commit runs" but it was
+        # just "nothing to commit."
+        #
+        # S1's output is unpinned + unreferenced (worker uploads
+        # have references=vec![], and we only pinned B1). Backdating
+        # created_at past grace makes it unreachable via mark →
+        # sweep deletes it. B1 stays protected by the pin.
+        control.succeed(
+            f"sudo -u postgres psql rio -c "
+            f"\"UPDATE narinfo SET created_at = now() - interval '25 hours' "
+            f"WHERE store_path = '{out_s1}'\""
+        )
+
         # Non-dry-run sweep via scheduler proxy. dry_run=false →
-        # sweep COMMITs (vs C1's ROLLBACK). grace=24h so nothing
-        # actually deletes (everything in this VM test is fresh).
+        # sweep COMMITs (vs C1's ROLLBACK). grace=24h; S1's output
+        # is now past grace → unreachable → DELETED.
         result = control.succeed(
             "grpcurl "
             "-cacert ${pki}/ca.crt "
@@ -680,17 +808,19 @@ pkgs.testers.runNixOSTest {
         )
         assert '"isComplete": true' in result or '"isComplete":true' in result, \
             f"C2: expected GCProgress.isComplete=true: {result[:500]}"
-        # pathsDeleted should be 0 (everything within grace).
-        # grpcurl proto3 JSON may omit default values, or emit
-        # explicit "0" — accept both.
+        # V2: pathsDeleted should be 1 (S1's backdated output).
+        # proto3 JSON uint64 serializes as string.
         assert (
-            '"pathsDeleted": "0"' in result
-            or '"pathsDeleted":"0"' in result
-            or "pathsDeleted" not in result
-        ), f"C2: expected 0 paths deleted (all in grace): {result[:500]}"
+            '"pathsDeleted": "1"' in result
+            or '"pathsDeleted":"1"' in result
+        ), f"C2/V2: expected 1 path deleted (S1 backdated): {result[:500]}"
 
-        # B1 still queryable (proves commit didn't delete it —
-        # paranoia check; grace should cover it anyway).
+        # V2: S1 is GONE — nix path-info should FAIL.
+        client.fail(
+            f"nix path-info --store 'ssh-ng://control' {out_s1}"
+        )
+
+        # B1 still queryable (pin protected it from GC).
         client.succeed(
             f"nix path-info --store 'ssh-ng://control' {out_b1}"
         )
@@ -709,13 +839,13 @@ pkgs.testers.runNixOSTest {
             "sudo -u postgres psql rio -tc "
             "'SELECT COUNT(*) FROM gc_roots' | grep -q 0"
         )
-        print("C2 PASS: PinPath + non-dry-run sweep (commit) + UnpinPath round-trip")
+        print("C2 PASS: PinPath + non-dry-run sweep DELETES 1 path (V2 proves commit) + UnpinPath round-trip")
 
     # ════════════════════════════════════════════════════════════════
     print("=" * 60)
-    print("Phase 3b iteration 3: T1-T3 (mTLS), B1 (HMAC), S1 (recovery),")
-    print("F1 (Build CRD watch dedup), C1 (GC dry-run), G1 (__noChroot),")
-    print("C2 (GC commit + PinPath) — all PASS.")
+    print("Phase 3b validation round 2: T1-T3 (mTLS), B1 (HMAC),")
+    print("S1 (REAL recovery via lease — V1 fix), F1 (Build CRD watch dedup),")
+    print("C1 (GC dry-run), G1 (__noChroot), C2 (GC PROVES commit — V2 fix) — all PASS.")
     print()
     print("Skipped:")
     print("  E (PDB/NetPol/Events/seccomp) — needs NetworkPolicy enforcement")
