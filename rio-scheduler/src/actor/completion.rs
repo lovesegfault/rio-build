@@ -408,20 +408,39 @@ impl DagActor {
     /// builds. Called when POISON_THRESHOLD distinct workers have
     /// failed (or max retries hit).
     ///
-    /// Expects the derivation's CURRENT status to be Assigned or
-    /// Running. Handles the Assigned→Running intermediate (state
-    /// machine requires Running before Poisoned). For the reassign
-    /// path (worker disconnect), the caller checks the threshold
-    /// BEFORE calling reset_to_ready — the drv is still Assigned/
-    /// Running at that point.
+    /// **Precondition:** status must be Assigned or Running.
+    /// Enforced via debug_assert! (tests catch violations) +
+    /// early-return on transition failure (release builds don't
+    /// cascade spuriously). All 3 current callers guarantee this;
+    /// actor is single-threaded so no race between filter and call.
+    /// Handles the Assigned→Running intermediate (state machine
+    /// requires Running before Poisoned). For the reassign path
+    /// (worker disconnect), the caller checks the threshold BEFORE
+    /// reset_to_ready — the drv is still Assigned/Running then.
     pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash) {
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.ensure_running();
-            if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
-            }
-            state.poisoned_at = Some(Instant::now());
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        debug_assert!(
+            matches!(
+                state.status(),
+                DerivationStatus::Assigned | DerivationStatus::Running
+            ),
+            "poison_and_cascade precondition violated: got {:?}",
+            state.status()
+        );
+        state.ensure_running();
+        if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+            // Unexpected state (not Assigned/Running). debug_assert!
+            // above fires in tests; in release, DON'T write Poisoned
+            // to PG or cascade — in-mem ≠ PG + spurious cascade is
+            // worse than a missed poison (which the next tick/
+            // completion will re-evaluate).
+            warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                  "poison_and_cascade: ->Poisoned transition rejected, skipping PG write + cascade");
+            return;
         }
+        state.poisoned_at = Some(Instant::now());
 
         self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
             .await;
