@@ -43,6 +43,39 @@ patches:
       - op: replace
         path: /spec/type
         value: ClusterIP
+  # Gateway: auto-generated host key (persists for pod lifetime via
+  # emptyDir, matches NixOS module's StateDirectory convention) +
+  # authorized_keys from Secret.
+  - target:
+      kind: Deployment
+      name: rio-gateway
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rio-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                env:
+                  - name: RIO_HOST_KEY
+                    value: /var/lib/rio/gateway/host_key
+                  - name: RIO_AUTHORIZED_KEYS
+                    value: /etc/rio/ssh/authorized_keys
+                volumeMounts:
+                  - name: gateway-state
+                    mountPath: /var/lib/rio/gateway
+                  - name: gateway-ssh
+                    mountPath: /etc/rio/ssh
+                    readOnly: true
+            volumes:
+              - name: gateway-state
+                emptyDir: {}
+              - name: gateway-ssh
+                secret:
+                  secretName: rio-gateway-ssh
   # MinIO creds + S3 chunk backend. The MinIO deployment in
   # this overlay uses these same creds (hardcoded; dev only).
   - target:
