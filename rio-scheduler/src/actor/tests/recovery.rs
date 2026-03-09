@@ -175,3 +175,101 @@ async fn merge_chain(
         .await?;
     Ok(rx.await??)
 }
+
+/// C4 regression: orphan-completion (outputs in store, worker didn't
+/// reconnect) must fire check_build_completion. Without this, if the
+/// orphan-completed drv was the LAST outstanding one, the build stays
+/// Active forever — no other completion will trigger the check.
+///
+/// Setup: first actor merges a single-drv build, then we backdate PG
+/// to simulate "drv was Assigned to a worker that's now gone, and
+/// outputs ARE in the store (worker finished while scheduler was
+/// down)." Second actor (with store client) recovers, reconciles,
+/// finds orphan completion → drv Completed → build Succeeded.
+#[tokio::test]
+async fn test_orphan_completion_fires_build_completion() -> TestResult {
+    use super::integration::{put_test_path, setup_inproc_store};
+
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+
+    // In-process store, pre-seeded with the output path.
+    let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+    let out_path = test_store_path("orphan-out");
+    put_test_path(&mut store_client, &out_path).await?;
+
+    // --- Phase 1: first "leader" writes build + drv to PG ---
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(sched_db.pool.clone());
+        // Single-node DAG — the orphan-completed drv IS the whole
+        // build. This is the critical case: if check_build_completion
+        // doesn't fire, NOTHING else will (no other drv completing).
+        let mut node = make_test_node("orphan-drv", "x86_64-linux");
+        node.expected_output_paths = vec![out_path.clone()];
+        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+
+        // Shut down (scheduler death).
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate PG: simulate "drv was dispatched to worker 'dead-w1'
+    // before scheduler died." The worker won't reconnect (we never
+    // register it on the second actor).
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', assigned_worker_id = 'dead-w1' \
+         WHERE drv_hash = 'orphan-drv'",
+    )
+    .execute(&sched_db.pool)
+    .await?;
+
+    // --- Phase 2: fresh actor WITH store client recovers ---
+    let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone()));
+
+    // LeaderAcquired → recover_from_pg (loads Assigned drv + build).
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Verify recovery found the Assigned drv.
+    let pre = handle
+        .debug_query_derivation("orphan-drv")
+        .await?
+        .expect("drv should be recovered");
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Assigned,
+        "drv should be Assigned after recovery (before reconcile)"
+    );
+
+    // ReconcileAssignments → worker 'dead-w1' not in self.workers
+    // → store check → outputs present → orphan completion →
+    // check_build_completion fires.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    // Drv should be Completed.
+    let post = handle
+        .debug_query_derivation("orphan-drv")
+        .await?
+        .expect("drv should still exist");
+    assert_eq!(
+        post.status,
+        DerivationStatus::Completed,
+        "orphan completion should transition drv to Completed"
+    );
+
+    // THE KEY ASSERTION: build should be Succeeded. Without
+    // check_build_completion, it would stay Active.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build should be Succeeded after orphan completion (C4 fix)"
+    );
+
+    Ok(())
+}

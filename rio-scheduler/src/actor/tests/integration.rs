@@ -5,7 +5,7 @@ use super::*;
 // -----------------------------------------------------------------------
 
 /// Spin up an in-process rio-store on an ephemeral port.
-async fn setup_inproc_store(
+pub(super) async fn setup_inproc_store(
     pool: sqlx::PgPool,
 ) -> anyhow::Result<(StoreServiceClient<Channel>, tokio::task::JoinHandle<()>)> {
     use rio_proto::StoreServiceServer;
@@ -23,7 +23,7 @@ async fn setup_inproc_store(
 }
 
 /// Build a minimal single-file NAR and upload it to the store (trailer mode).
-async fn put_test_path(
+pub(super) async fn put_test_path(
     client: &mut StoreServiceClient<Channel>,
     store_path: &str,
 ) -> anyhow::Result<()> {

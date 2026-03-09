@@ -300,7 +300,13 @@ impl DagActor {
         // Collect (drv_hash, assigned_worker, expected_outputs)
         // for Assigned/Running with unknown workers. Clone before
         // mutating (node_mut borrow).
-        let orphaned: Vec<(DrvHash, WorkerId, Vec<String>)> = self
+        //
+        // worker_id is Option: Assigned/Running with assigned_worker
+        // =None is inconsistent state (shouldn't happen, but recovery
+        // loads from PG which could have drifted). We still reconcile
+        // it (check store for outputs → Completed, else Ready) rather
+        // than silently skipping and leaving it stuck forever.
+        let orphaned: Vec<(DrvHash, Option<WorkerId>, Vec<String>)> = self
             .dag
             .iter_nodes()
             .filter(|(_, s)| {
@@ -309,16 +315,18 @@ impl DagActor {
                     DerivationStatus::Assigned | DerivationStatus::Running
                 )
             })
-            .filter_map(|(h, s)| {
-                s.assigned_worker.as_ref().and_then(|w| {
-                    if self.workers.contains_key(w) {
-                        // Worker reconnected — leave it, completion
-                        // report will arrive normally.
-                        None
-                    } else {
-                        Some((h.into(), w.clone(), s.expected_output_paths.clone()))
-                    }
-                })
+            .filter_map(|(h, s)| match s.assigned_worker.as_ref() {
+                Some(w) if self.workers.contains_key(w) => {
+                    // Worker reconnected — leave it, completion
+                    // report will arrive normally.
+                    None
+                }
+                Some(w) => Some((h.into(), Some(w.clone()), s.expected_output_paths.clone())),
+                None => {
+                    warn!(drv_hash = ?h, status = ?s.status(),
+                          "reconcile: Assigned/Running drv with NULL worker — reconciling anyway");
+                    Some((h.into(), None, s.expected_output_paths.clone()))
+                }
             })
             .collect();
 
@@ -364,8 +372,17 @@ impl DagActor {
 
             if all_present {
                 // Orphan completion: transition Completed.
-                info!(drv_hash = %drv_hash, worker_id = %worker_id,
+                info!(drv_hash = %drv_hash, worker_id = ?worker_id,
                       "reconcile: orphan completion (outputs found in store)");
+                // Capture interested_builds BEFORE transitioning —
+                // check_build_completion (below) needs to know which
+                // builds care. Must read before node_mut (borrow).
+                let interested: Vec<Uuid> = self
+                    .dag
+                    .node(&drv_hash)
+                    .map(|s| s.interested_builds.iter().copied().collect())
+                    .unwrap_or_default();
+
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
                     // Assigned → Running first if needed (state
                     // machine doesn't allow Assigned → Completed).
@@ -411,9 +428,19 @@ impl DagActor {
                         self.push_ready(ready_hash.clone());
                     }
                 }
+
+                // Fire build completion check (same as
+                // handle_success_completion does). Without this,
+                // if the orphan-completed drv was the LAST
+                // outstanding one, the build stays Active forever
+                // — no other completion will trigger the check.
+                for build_id in &interested {
+                    self.update_build_counts(*build_id);
+                    self.check_build_completion(*build_id).await;
+                }
             } else {
                 // Worker died mid-build. Reset + retry.
-                info!(drv_hash = %drv_hash, worker_id = %worker_id,
+                info!(drv_hash = %drv_hash, worker_id = ?worker_id,
                       "reconcile: worker didn't reconnect, resetting to Ready");
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
                     if let Err(e) = state.reset_to_ready() {
@@ -421,13 +448,20 @@ impl DagActor {
                         continue;
                     }
                     state.retry_count += 1;
-                    state.failed_workers.insert(worker_id.clone());
+                    // Only record failed_worker if we HAVE a worker
+                    // — NULL worker case (inconsistent state) just
+                    // resets without blaming anyone.
+                    if let Some(w) = &worker_id {
+                        state.failed_workers.insert(w.clone());
+                    }
                     self.push_ready(drv_hash.clone());
                 }
                 if let Err(e) = self.db.increment_retry_count(&drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry++");
                 }
-                if let Err(e) = self.db.append_failed_worker(&drv_hash, &worker_id).await {
+                if let Some(w) = &worker_id
+                    && let Err(e) = self.db.append_failed_worker(&drv_hash, w).await
+                {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_worker");
                 }
                 if let Err(e) = self
