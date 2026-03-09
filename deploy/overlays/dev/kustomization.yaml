@@ -100,8 +100,18 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value:
-          name: RIO_CHUNK_BACKEND
-          value: '{"kind":"s3","bucket":"rio-chunks","prefix":""}'
+          name: RIO_CHUNK_BACKEND__KIND
+          value: s3
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RIO_CHUNK_BACKEND__BUCKET
+          value: rio-chunks
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RIO_CHUNK_BACKEND__PREFIX
+          value: ""
 
 # Airgap: images are preloaded, not pulled. Never → fail if not
 # preloaded (clear error vs pull timeout).
