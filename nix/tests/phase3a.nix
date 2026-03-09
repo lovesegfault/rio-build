@@ -125,9 +125,11 @@ let
     }
   '';
 
-  # WorkerPool CR to auto-deploy via k3s manifests. Nix attrs →
-  # services.k3s.manifests.<name>.content renders to JSON (which
-  # YAML parsers accept). Matches the crds/workerpool.rs schema.
+  # WorkerPool CR. Applied via testScript (NOT via manifests/
+  # auto-apply) — see the manifests= comment in the node config
+  # below. JSON file (YAML parsers accept JSON). Matches the
+  # crds/workerpool.rs schema.
+  workerPoolCRFile = pkgs.writeText "workerpool.json" (builtins.toJSON workerPoolCR);
   workerPoolCR = {
     apiVersion = "rio.build/v1alpha1";
     kind = "WorkerPool";
@@ -224,7 +226,14 @@ pkgs.testers.runNixOSTest {
       };
       manifests = {
         "00-rio-crds".source = crds;
-        "10-rio-workerpool".content = workerPoolCR;
+        # WorkerPool CR is applied LATER in testScript (after
+        # waiting for ctr images import). Applying it here via
+        # manifests/ auto-apply meant the pod got scheduled
+        # BEFORE the image was imported → kubelet tried to pull
+        # from docker.io → DNS failure (airgap) → ErrImagePull
+        # log noise. Harmless (IfNotPresent retries and
+        # eventually finds it) but clutters the log and slows
+        # first-pod-ready by ~30s (ImagePullBackOff retry cycle).
       };
       extraK3sImages = [ dockerImages.worker ];
     };
@@ -326,14 +335,20 @@ pkgs.testers.runNixOSTest {
     control.wait_for_open_port(9001)
 
     # Airgap import: k3s ctr imports images on start, but it's
-    # async. Wait for OUR image to show up. Note: the pod may
-    # be scheduled BEFORE import completes (controller is fast,
-    # ctr import is slow). With imagePullPolicy=IfNotPresent,
-    # kubelet retries after backoff and eventually finds it.
+    # async. Wait for OUR image to show up BEFORE applying the
+    # WorkerPool CR — otherwise the controller creates the STS,
+    # kubelet schedules the pod, tries to pull from docker.io
+    # (airgap → DNS fail → ErrImagePull log noise). Applying
+    # the CR AFTER the image is present means the pod starts
+    # immediately with no pull attempts.
     k8s.wait_until_succeeds(
         "k3s ctr images ls -q | grep -q 'rio-worker:dev'",
         timeout=120
     )
+    # NOW apply the WorkerPool CR. Image is in containerd →
+    # kubelet finds it immediately → no ErrImagePull, no
+    # ImagePullBackOff retry cycle (~30s saved on first-pod-ready).
+    k8s.succeed("k3s kubectl apply -f ${workerPoolCRFile}")
 
     # ── CRDs established ───────────────────────────────────────────
     # k3s auto-applies manifests/ on startup, but apiserver might
