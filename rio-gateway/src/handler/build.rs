@@ -53,6 +53,7 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
     active_build_ids: &mut HashMap<String, u64>,
+    reconnect_attempts: &mut u32,
 ) -> Result<BuildEventOutcome, StreamProcessError> {
     let mut drv_activity_ids: HashMap<String, u64> = HashMap::new();
 
@@ -61,6 +62,15 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
         .await
         .map_err(StreamProcessError::Transport)?
     {
+        // Reset reconnect counter on first SUCCESSFUL event from
+        // the stream (not on WatchBuild Ok() — that only proves
+        // the scheduler accepted the RPC, not that the stream is
+        // healthy). Without this, a scheduler that accepts but
+        // immediately drops the stream would cause an infinite
+        // 1s-sleep loop: 0→1→Ok()→reset→0→1→... Matches controller
+        // build.rs:599 pattern (reset on Ok(Some(ev))).
+        *reconnect_attempts = 0;
+
         // Update active_build_ids with latest sequence
         if let Some(seq) = active_build_ids.get_mut(&event.build_id) {
             *seq = event.sequence;
@@ -249,7 +259,14 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     let mut reconnect_attempts = 0u32;
 
     let outcome = loop {
-        match process_build_events(stderr, &mut event_stream, active_build_ids).await {
+        match process_build_events(
+            stderr,
+            &mut event_stream,
+            active_build_ids,
+            &mut reconnect_attempts,
+        )
+        .await
+        {
             Ok(outcome) => break Ok(outcome),
             // EOF or wire error: NOT reconnect-worthy. EOF =
             // scheduler closed gracefully but incompletely (not a
@@ -307,11 +324,12 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     Ok(resp) => {
                         tracing::info!(%build_id, since_seq, "reconnected via WatchBuild");
                         event_stream = resp.into_inner();
-                        // Reset: successful reconnect = fresh attempt
-                        // budget. Otherwise a long-running build
-                        // surviving 4 transient blips fails
-                        // permanently on the 5th.
-                        reconnect_attempts = 0;
+                        // DON'T reset reconnect_attempts here —
+                        // WatchBuild Ok() only proves the scheduler
+                        // accepted the RPC. The stream might error
+                        // immediately (scheduler accepts, then drops
+                        // — infinite 1s-loop). Reset happens on
+                        // FIRST EVENT inside process_build_events.
                         // Loop continues: next process_build_events
                         // reads from the new stream.
                     }
