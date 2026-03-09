@@ -85,13 +85,27 @@ pub async fn scan_once(
         let mut tx = pool.begin().await?;
 
         // DELETE narinfo → CASCADE to manifests/manifest_data.
-        // If rowcount 0, someone else (concurrent scan, or the
-        // upload actually completed between our SELECT and now)
-        // got to it first. Skip.
-        let deleted = sqlx::query("DELETE FROM narinfo WHERE store_path_hash = $1")
-            .bind(&store_path_hash)
-            .execute(&mut *tx)
-            .await?;
+        //
+        // Status guard in WHERE: re-checks manifests.status='uploading'
+        // ATOMICALLY at DELETE time, inside this tx. Without this,
+        // an upload that completed between our outer SELECT (status-
+        // filtered but outside any tx) and this DELETE would have its
+        // now-valid narinfo reaped. rows_affected()==0 catches both
+        // "already gone" AND "completed since SELECT" (status flipped
+        // → EXISTS false → no rows match).
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM narinfo n
+             WHERE n.store_path_hash = $1
+               AND EXISTS (
+                   SELECT 1 FROM manifests m
+                    WHERE m.store_path_hash = $1 AND m.status = 'uploading'
+               )
+            "#,
+        )
+        .bind(&store_path_hash)
+        .execute(&mut *tx)
+        .await?;
         if deleted.rows_affected() == 0 {
             // Gone or completed — either way, not an orphan
             // anymore. Rollback (no-op, nothing changed) and
@@ -138,4 +152,163 @@ pub fn spawn_scanner(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::TestDb;
+
+    /// Helper: insert an 'uploading' placeholder AND backdate
+    /// updated_at so the stale-threshold check deterministically
+    /// matches (test STALE_THRESHOLD.as_secs()==0 means the query
+    /// needs updated_at < now(), which is fragile if set to now()
+    /// in the same statement — backdating avoids the race).
+    async fn seed_stale_uploading(pool: &PgPool, hash: &[u8], path: &str) {
+        crate::metadata::insert_manifest_uploading(pool, hash, path)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() - interval '1 hour' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(hash)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_reaps_stale_uploading() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x01u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("orphan-stale");
+        seed_stale_uploading(&db.pool, &hash, &path).await;
+
+        let reaped = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 1, "stale uploading manifest reaped");
+
+        // narinfo gone (CASCADE took manifests too).
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 0, "narinfo deleted");
+    }
+
+    /// TOCTOU regression: upload completes between scan's SELECT
+    /// and DELETE. The status guard in the DELETE's WHERE must
+    /// catch this and SKIP the delete.
+    #[tokio::test]
+    async fn orphan_skips_completed_upload_toctou() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed stale uploading placeholder — it WOULD be reaped.
+        let hash = vec![0x02u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("orphan-raced");
+        seed_stale_uploading(&db.pool, &hash, &path).await;
+
+        // Simulate upload completing BETWEEN the outer SELECT and
+        // the per-path DELETE. In the real race, this happens while
+        // scan_once is iterating. Here we flip status directly
+        // before calling scan_once — the DELETE's WHERE EXISTS
+        // (status='uploading') should see status='complete' → no
+        // match → rows_affected()==0 → skipped.
+        //
+        // Also set nar_size>0 so it's clearly a real completed path
+        // (not that the DELETE checks this — the status guard is
+        // what matters).
+        sqlx::query("UPDATE manifests SET status = 'complete' WHERE store_path_hash = $1")
+            .bind(&hash)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE narinfo SET nar_size = 42 WHERE store_path_hash = $1")
+            .bind(&hash)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Key point: the outer SELECT in scan_once filters on
+        // status='uploading' + updated_at. Since we already flipped
+        // status, scan_once's SELECT won't even find this hash. To
+        // test the DELETE guard SPECIFICALLY (not the SELECT), we
+        // need the SELECT to find it but the DELETE to skip it.
+        //
+        // We can't easily interleave with scan_once's internal loop
+        // from a unit test. Instead, we assert the INVARIANT
+        // directly: run the same DELETE query with status guard,
+        // verify rows_affected==0.
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM narinfo n
+             WHERE n.store_path_hash = $1
+               AND EXISTS (
+                   SELECT 1 FROM manifests m
+                    WHERE m.store_path_hash = $1 AND m.status = 'uploading'
+               )
+            "#,
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            deleted.rows_affected(),
+            0,
+            "status guard prevented delete of completed upload"
+        );
+
+        // narinfo still present.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "completed upload NOT deleted by status guard");
+
+        // And scan_once itself finds nothing (status already
+        // complete → SELECT filters it out).
+        let reaped = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 0, "scan_once found nothing (status=complete)");
+    }
+
+    #[tokio::test]
+    async fn orphan_skips_fresh_uploading() {
+        // Fresh (not stale) upload in progress → NOT reaped.
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let hash = vec![0x03u8; 32];
+        let path = rio_test_support::fixtures::test_store_path("orphan-fresh");
+        // Insert WITHOUT backdating — updated_at = now(). With test
+        // STALE_THRESHOLD.as_secs()==0, query is `updated_at < now()`.
+        // Set updated_at slightly in the future to guarantee NOT stale.
+        crate::metadata::insert_manifest_uploading(&db.pool, &hash, &path)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE manifests SET updated_at = now() + interval '10 seconds' \
+             WHERE store_path_hash = $1",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let reaped = scan_once(&db.pool, None).await.unwrap();
+        assert_eq!(reaped, 0, "fresh upload not reaped");
+
+        // narinfo still present.
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1, "fresh upload narinfo preserved");
+    }
 }
