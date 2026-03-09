@@ -10,6 +10,8 @@ Receives derivation build requests, analyzes the DAG, and publishes work to work
 - Critical-path priority computation (bottom-up: priority = own\_duration + max(successor priorities)); recomputed incrementally on completion by walking ancestors with dirty-flag propagation
 - Duration estimation from historical build data in PostgreSQL (EMA with alpha=0.3)
 - Resource-aware scheduling: match derivation `requiredSystemFeatures` and resource needs to worker capabilities (subset matching: all required features must be present on the worker)
+- Auto-pin live build inputs: on dispatch, `pin_live_inputs` writes the derivation's input closure to the `scheduler_live_pins` table (used by rio-store's GC mark phase as a root seed); unpinned on completion
+- Proxy `AdminService.TriggerGC` to rio-store, first collecting live-build output paths via `ActorCommand::GcRoots` and forwarding them as `extra_roots`
 - Closure-locality affinity: score workers by normalized transfer cost, using bloom filter approximation from worker heartbeats
 - Priority queue with inter-build priority (CI > interactive > scheduled) and intra-build priority (critical path)
 - IFD prioritization: builds that block evaluation get maximum priority (detected by protocol sequencing --- `wopBuildDerivation` arriving before `wopBuildPathsWithResults` on the same session)
@@ -60,9 +62,9 @@ The scheduling algorithm below is implemented as of Phase 2c: critical-path prio
       - Combined score: normalized_cost * W_locality + load_fraction * W_load
         Lowest score wins. Both terms are in [0, 1], making weights directly comparable.
    d. Assign to the best-scoring worker via the bidirectional BuildExecution stream.
-      The WorkAssignment carries an assignment token — currently a plain format-string
-      `{worker_id}-{drv_hash}-{generation}`. HMAC-SHA256 signing with expected_output_paths
-      and expiry is deferred to Phase 3b.
+      The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
+      `worker_id`, `drv_hash`, `expected_outputs`, `expiry_unix`). The store verifies
+      the token on PutPath and rejects uploads for paths not in `expected_outputs`.
       See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 8. As builds complete (reported via BuildExecution stream):
    a. Upload output to rio-store (worker does this before reporting)
@@ -234,7 +236,7 @@ r[sched.state.transitions]
 | `ready → assigned` | A worker passes resource-fit check and is selected by the scoring algorithm |
 | `assigned → running` | Worker sends acknowledgement on the `BuildExecution` stream |
 | `running → completed` | Worker reports success (output uploaded by worker before reporting; scheduler does not re-verify against rio-store) |
-| `running → failed` | Worker reports a retriable error (`TransientFailure` / `InfrastructureFailure`); retry count < max_retries (default 2) **and** failed_workers count < poisonThreshold. `failed` is a non-terminal intermediate state --- it always transitions to `ready` after retry backoff (**Phase 3b:** backoff is computed but not yet applied; re-queue is currently immediate). |
+| `running → failed` | Worker reports a retriable error (`TransientFailure` / `InfrastructureFailure`); retry count < max_retries (default 2) **and** failed_workers count < poisonThreshold. `failed` is a non-terminal intermediate state --- it always transitions to `ready` after retry backoff (stored in `DerivationState.backoff_until`; `dispatch_ready` defers until `Instant::now() >= backoff_until`). |
 | `running → poisoned` | Any of: **(a)** derivation has failed on `poisonThreshold` distinct workers (default: 3; poison tracking spans across builds, not just one build's retry attempts), **(b)** retry_count >= max_retries with failed_workers below threshold, **(c)** worker reports a permanent-class failure (`PermanentFailure`, `OutputRejected`, `CachedFailure`, `LogLimitExceeded`, `DependencyFailed`) --- poisoned immediately on first attempt, no retry |
 | `assigned → ready` | Assigned worker is lost (heartbeat timeout, pod termination) |
 | `failed → ready` | Derivation re-enters the ready queue. See `running → failed` above. |
@@ -282,12 +284,11 @@ r[sched.build.keep-going]
 
 The scheduler uses a leader-elected model for the in-memory global DAG. On leadership transitions:
 
-> **Phase 3b deferral:** Only step 1 is implemented. Steps 2-4 depend on State Recovery (see below), which is not yet implemented. Currently, a new leader starts with an empty in-memory DAG and workers reconnect organically via the standard registration protocol; in-flight builds from the previous leader are lost.
-
-1. **Assignment generation counter**: Incremented on each leader election (by the lease loop's acquire transition). Each `WorkAssignment` carries this generation number. Workers compare it against the generation seen in `HeartbeatResponse` and reject stale-generation assignments.
-2. **State reconstruction**: New leader reconstructs state from PostgreSQL (see State Recovery below), then increments the generation counter.
-3. **Worker reconnection**: Workers reconnect their `BuildExecution` streams to the new leader. Stale completion reports (carrying an old generation number) are verified against rio-store for output existence before acceptance.
-4. **In-flight assignments**: Assignments from the old leader are verified via heartbeat. If a worker reports it is still running the assigned derivation, the new leader reuses the assignment with the new generation number.
+1. **Assignment generation counter**: Incremented on each leader election (by the lease loop's acquire transition via `fetch_add` on the shared `Arc<AtomicU64>`). Each `WorkAssignment` carries this generation number. Workers compare it against the generation seen in `HeartbeatResponse` and reject stale-generation assignments.
+2. **Recovery flag cleared**: The lease acquire transition clears `recovery_complete` and fires a `LeaderAcquired` command to the actor (fire-and-forget via `tokio::spawn` --- lease renewal MUST NOT block on recovery completing).
+3. **State reconstruction**: The actor's `LeaderAcquired` handler invokes state recovery (see State Recovery below), then sets `recovery_complete = true`. Dispatch is a no-op while `recovery_complete` is false.
+4. **Worker reconnection**: Workers reconnect their `BuildExecution` streams to the new leader. Stale completion reports (carrying an old generation number) are verified against rio-store for output existence before acceptance.
+5. **In-flight assignments**: Assignments from the old leader are verified via heartbeat. If a worker reports it is still running the assigned derivation, the new leader reuses the assignment with the new generation number.
 
 ## Synchronous vs. Async Writes
 
@@ -302,9 +303,10 @@ On crash, async writes may be lost but are non-critical: EMA re-converges after 
 
 ## State Recovery
 
-> **Phase 3b deferral:** State recovery is not yet implemented. After scheduler restart, in-flight builds are lost (clients hang waiting on `SubmitBuild` streams that the new scheduler knows nothing about). The protocol below is the target design.
+r[sched.recovery.gate-dispatch]
+On startup or leadership acquisition, the scheduler reconstructs its in-memory state from PostgreSQL. Recovery runs inside the DAG actor (via the `LeaderAcquired` command). Dispatch is **gated** on the `recovery_complete` flag --- `dispatch_ready` is a no-op until recovery finishes, preventing a partially-loaded DAG from issuing assignments.
 
-On startup, the scheduler reconstructs its in-memory state:
+Recovery sequence:
 
 1. Load all non-terminal builds from PostgreSQL (`builds` and `derivations` tables)
 2. Reconstruct DAGs from the derivations table and their edges
@@ -340,6 +342,9 @@ r[sched.worker.deregister-reassign]
 
 On deregistration, all derivations in `assigned` state for that worker are transitioned back to `ready` for reassignment.
 
+r[sched.backstop.timeout]
+**Backstop timeout:** Separately from worker deregistration, `handle_tick` checks each `running` derivation's `running_since` timestamp. If elapsed time exceeds `max(est_duration × 3, daemon_timeout + 10min)`, the scheduler sends a CancelSignal to the worker, resets the derivation to `ready`, increments `retry_count`, and adds the worker to `failed_workers`. This catches the "worker is heartbeating but daemon is wedged" case where no stream-close or heartbeat-timeout fires. The `rio_scheduler_backstop_timeouts_total` counter tracks these events.
+
 ## Backpressure
 
 The scheduler applies backpressure at multiple layers to prevent overload:
@@ -369,6 +374,7 @@ Normal processing resumes when the queue depth drops below 60% (hysteresis to pr
 | `build_history` | Running EMA per (pname, system) for duration estimation (not per-build rows) |
 | `build_logs` | S3 blob metadata per (build_id, drv_hash) — `s3_key`, `line_count`, `is_complete` for log-flush UPSERTs |
 | `build_event_log` | Prost-encoded `BuildEvent` per (build_id, sequence) for gateway `since_sequence` replay across failover |
+| `scheduler_live_pins` | Auto-pinned live-build input closures (`store_path_hash`, `drv_hash`). Written by `pin_live_inputs` at dispatch; unpinned on completion. Used by rio-store's GC mark phase as a root seed. |
 
 ### Schema (pseudo-DDL)
 
@@ -462,7 +468,7 @@ The scheduler uses a **Kubernetes Lease** (`coordination.k8s.io/v1`) for leader 
 r[sched.lease.generation-fence]
 **Generation-based staleness detection is worker-side only.** On each lease acquisition, the new leader increments an in-memory `Arc<AtomicU64>` generation counter. Workers see the new generation in `HeartbeatResponse` and reject any `WorkAssignment` carrying an older generation. **No PostgreSQL-level write fencing exists.** A deposed leader's in-flight PG writes will succeed; the split-brain window is bounded by the Lease renew deadline (default 15s). Because the writes in question are idempotent upserts keyed by `drv_hash` and status transitions are monotone, brief dual-writer windows do not corrupt state.
 
-> **Phase 3b deferral (optional hardening):** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
+> **Optional hardening (Phase 4+):** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
 
 ## Incremental Critical-Path Maintenance
 
@@ -487,9 +493,10 @@ This approach keeps per-event processing well under the 1ms budget needed for 10
 - `rio-scheduler/src/grpc/` — SchedulerService + WorkerService gRPC implementations
 - `rio-scheduler/src/db.rs` — PostgreSQL persistence (derivations, assignments, build_history EMA)
 - `rio-scheduler/src/logs/` — LogBuffers ring buffer + S3 LogFlusher
-- `rio-scheduler/src/lease.rs` — Kubernetes Lease leader-election loop (generation counter, is_leader flag)
+- `rio-scheduler/src/lease.rs` — Kubernetes Lease leader-election loop (generation counter, is_leader flag, recovery_complete gate)
+- `rio-scheduler/src/actor/recovery.rs` — State recovery: reload non-terminal builds/derivations from PG on LeaderAcquired
 - `rio-scheduler/src/event_log.rs` — PostgreSQL-backed build_event_log writes for gateway `since_sequence` replay
-- `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs)
+- `rio-scheduler/src/admin/` — AdminService gRPC (ClusterStatus, DrainWorker, GetBuildLogs, TriggerGC)
 
 ## Planned Files (Phase 4/5)
 

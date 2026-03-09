@@ -18,14 +18,16 @@ spec:
   timeoutSeconds: 3600                        # 0 = no timeout
   tenant: team-infra
 status:
-  phase: Building                             # Pending/Building/Succeeded/Failed
+  phase: Building                             # Pending/Building/Succeeded/Failed/Cancelled
                                                # Evaluating is an optional phase set by external eval
                                                # orchestrators; the controller does not set this phase itself
+  progress: "31/47"                            # completed/total derivations (printcolumn)
+  lastSequence: 142                            # last BuildEvent sequence seen by the watch task
   totalDerivations: 47
   completedDerivations: 31
   cachedDerivations: 12
   startedAt: 2026-02-13T06:00:00Z
-  # Phase 3b deferral: criticalPathRemaining + workers not yet
+  # Phase 4 deferral: criticalPathRemaining + workers not yet
   # surfaced in BuildStatus. Scheduler has the data (critical_path.rs
   # + assignments table); requires a BuildEvent extension.
   conditions:
@@ -38,7 +40,7 @@ status:
 
 Condition types: `Scheduled`, `InputsResolved`, `Building`, `Succeeded`, `Failed`. Each carries `lastTransitionTime`, `reason`, and `message`. `Succeeded` and `Failed` are terminal and mutually exclusive.
 
-> **Phase 3b deferral:** Currently only `Failed` and `Cancelled` conditions are set by the Build reconciler; `phase` is the coarse signal for progress (`Pending` → `Building` → `Succeeded`/`Failed`/`Cancelled`). The finer-grained `Scheduled`/`InputsResolved`/`Building` conditions require per-event condition updates from the watch task.
+> **Phase 4 deferral:** Currently only `Failed` and `Cancelled` conditions are set by the Build reconciler; `phase` is the coarse signal for progress (`Pending` → `Building` → `Succeeded`/`Failed`/`Cancelled`). The finer-grained `Scheduled`/`InputsResolved`/`Building` conditions require per-event condition updates from the watch task.
 
 ### WorkerPool
 
@@ -65,6 +67,10 @@ spec:
   image: rio-worker:dev                        # required — container image ref
   imagePullPolicy: IfNotPresent                # optional — K8s default if omitted
   sizeClass: small                             # maps to RIO_SIZE_CLASS env
+  tlsSecretName: rio-worker-tls                # optional — Secret with tls.crt/tls.key/ca.crt for mTLS
+  fodProxyUrl: http://fod-proxy.rio.svc:3128   # optional — injected as http(s)_proxy for FOD builds
+  hostNetwork: false                           # optional — true only for VM-test/airgap escapes
+  topologySpread: true                         # optional — add topologySpreadConstraints across zones
   # securityContext: NOT a CRD field. The controller hardcodes
   # capabilities (SYS_ADMIN + SYS_CHROOT) in build_pod_spec().
   # Only `privileged: bool` is exposed (for VM-test/airgap escape
@@ -162,7 +168,7 @@ r[ctrl.reconcile.owner-refs]
 - **Build reconciler**: create Build CRDs from API/webhook triggers, track status, update conditions.
 - **GC reconciler**: trigger store garbage collection on schedule, clean up completed Build resources.
 
-> **Phase deferral:** The WorkerPoolSet reconciler (Phase 4) and GC reconciler (blocked on `store.gc.*` implementation) do not exist yet. Only the WorkerPool and Build reconcilers are implemented.
+> **Phase deferral:** The WorkerPoolSet reconciler (Phase 4) and scheduled GC reconciler do not exist yet. GC is currently triggered manually via `AdminService.TriggerGC`. Only the WorkerPool and Build reconcilers are implemented.
 
 ## RBAC
 
@@ -173,13 +179,14 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting (
 | `rio.build` | workerpools, builds | get, list, watch, create, update, patch, delete |
 | `rio.build` | workerpools/status, builds/status | get, patch |
 | `apps` | statefulsets | get, list, watch, create, update, patch, delete |
+| `policy` | poddisruptionbudgets | get, list, watch, create, update, patch, delete |
 | `""` (core) | pods | get, list, watch |
 | `""` (core) | services | get, list, watch, create, update, patch, delete |
 | `""` (core) | events | create, patch |
 
 Lease permissions (`coordination.k8s.io/leases`: get, create, update) are granted to the **scheduler's** ServiceAccount via a namespaced Role, not the controller (the controller has no leader election).
 
-> **Note:** The controller does NOT currently hold permissions for `PodDisruptionBudgets`, `NetworkPolicies`, `ConfigMaps`, or `Leases`. PDBs and NetworkPolicies are deployed as static kustomize manifests (see below), not controller-managed. These permissions would be added in Phase 4 when/if the controller takes over PDB management.
+> **Note:** The controller holds `policy/poddisruptionbudgets` permissions (get, list, watch, create, update, patch, delete) for per-pool PDB management. It does NOT hold permissions for `NetworkPolicies`, `ConfigMaps`, or `Leases`. NetworkPolicies are deployed as static kustomize manifests (see below).
 
 ## NetworkPolicy
 
@@ -194,15 +201,15 @@ NetworkPolicy resources are deployed via the prod kustomize overlay (`deploy/ove
 ## PodDisruptionBudget
 
 r[ctrl.pdb.workers]
-The controller creates PDBs for each component:
+The WorkerPool reconciler creates a `PodDisruptionBudget` child for each pool with `maxUnavailable: 1`. The PDB carries `ownerReferences` to the WorkerPool (garbage-collected on pool deletion). See `build_pdb` in `rio-controller/src/reconcilers/workerpool/builders.rs`.
 
-| Component | Policy | Rationale |
-|---|---|---|
-| Workers | `minAvailable` based on `WorkerPool.spec.replicas.min` | Maintain minimum build capacity during node drain |
-| Scheduler | `maxUnavailable: 1` | Leader election handles failover; at most one pod unavailable |
-| Gateway | `minAvailable: 1` | At least one pod must remain for SSH connectivity |
+| Component | Managed by | Policy | Rationale |
+|---|---|---|---|
+| Workers | Controller (per-pool) | `maxUnavailable: 1` | Maintain build capacity during node drain; `ownerReferences` → pool |
+| Scheduler | Static manifest | `maxUnavailable: 1` | Leader election handles failover; at most one pod unavailable |
+| Gateway | Static manifest | `minAvailable: 1` | At least one pod must remain for SSH connectivity |
 
-> **Phase 4 deferral:** Worker PDBs are not controller-managed. Only the scheduler and gateway PDBs exist, deployed as static manifests in the prod kustomize overlay (`deploy/overlays/prod/pdb.yaml`). Per-pool worker PDBs (deriving `minAvailable` from `WorkerPool.spec.replicas.min`) require the reconciler to create/update `PodDisruptionBudget` children alongside the StatefulSet.
+Scheduler and gateway PDBs remain static manifests in the prod kustomize overlay (`deploy/overlays/prod/pdb.yaml`) --- the controller does not deploy scheduler/store.
 
 ## Service Definitions
 
@@ -223,7 +230,7 @@ K8s readiness probes on gRPC components MUST target a named health check service
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|
 | Gateway | TCP check on SSH port | After scheduler gRPC connection established | — |
-| Scheduler | gRPC health check | After leader election won + PostgreSQL connected | gRPC check. Startup budget will need to grow once Phase 3b state recovery lands. |
+| Scheduler | gRPC health check | After leader election won + PostgreSQL connected + recovery_complete | gRPC check. Startup budget sized for state recovery (reload non-terminal builds from PG). |
 | Store | gRPC health check | After PostgreSQL + S3 reachable | — |
 | Controller | HTTP `/healthz` | After CRD watches established | — |
 | Worker | HTTP `/healthz` + `/readyz` (no gRPC server) | `/readyz` 200 after first accepted heartbeat | HTTP check, `failureThreshold × periodSeconds ≥ 120s` (FUSE mount + cache warm) |
@@ -264,6 +271,9 @@ SSH-initiated builds do NOT require Build CRDs; Build CRDs are an alternative su
 
 r[ctrl.build.sentinel]
 **Double-submit guard:** The reconciler MUST set `status.build_id` to the literal sentinel string `"submitted"` **immediately** on first reconcile, before the finalizer-add re-reconcile fires. Otherwise the second reconcile sees an empty `build_id` and re-submits to the scheduler. The watch task later overwrites the sentinel with the real scheduler-assigned UUID.
+
+r[ctrl.build.watch-by-uid]
+**Watch deduplication:** The reconciler spawns a background `WatchBuild` task to stream `BuildEvent`s from the scheduler. To prevent duplicate watches on re-reconcile, a `DashMap` in the reconciler context tracks active watches **keyed by Build UID** (`b.uid()`), not `{namespace}/{name}`. UID-keying guards against a delete+recreate race where a new Build with the same name would collide with an old-Build's still-running watch guard; the old scopeguard (on exit) would then remove the NEW Build's entry. A scopeguard removes the `watching` entry on any watch-task exit (terminal, error, or cancel).
 
 **Finalizer:** All Build CRDs carry a `rio.build/build-cleanup` finalizer. Before a Build CRD is deleted, the controller sends `CancelBuild` to the scheduler to ensure in-flight work is properly handled.
 

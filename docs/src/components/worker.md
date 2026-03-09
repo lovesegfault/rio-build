@@ -111,7 +111,7 @@ graph TB
 
 ## Worker Nix Configuration
 
-Worker pods must ship a minimal `nix.conf` mounted via ConfigMap:
+Worker pods ship a minimal `nix.conf` with an optional operator override from the `rio-nix-conf` ConfigMap, mounted **as a directory** at `/etc/rio/nix-conf/` (not via `subPath` --- an optional ConfigMap with `subPath` produces an empty directory rather than a clean ENOENT, which caused `substitute=true` to silently re-enable and hang on DNS). `setup_nix_conf` checks `/etc/rio/nix-conf/nix.conf` first; if present, it's copied into the overlay. Otherwise the compiled-in default is used:
 
 ```ini
 # Prevent build hook recursion --- workers ARE the builders
@@ -124,8 +124,8 @@ sandbox = true
 sandbox-fallback = false
 # Prevent derivations from accessing paths outside the Nix store during eval
 restrict-eval = true
-# No experimental features needed for build execution
-experimental-features =
+# Content-addressed derivation support (Phase 2c+)
+experimental-features = ca-derivations
 ```
 
 > **Security note**: `__noChroot` derivations (which disable the sandbox) are rejected at the gateway level before they ever reach a worker. See [Derivation Validation](../security.md#derivation-validation).
@@ -139,7 +139,7 @@ Each worker advertises two capability lists in its heartbeat so the scheduler ca
 - **`systems`** (`Vec<String>`): Nix system identifiers this worker can build for (e.g., `x86_64-linux`, `aarch64-linux`). The scheduler's `can_build()` does an **any-match** against the derivation's `system` field. If unset, the worker auto-detects a single element as `{arch}-{os}` via `std::env::consts`. Multi-element configurations are for qemu-user-static or cross-arch workers. Configure via `RIO_SYSTEMS=x86_64-linux,aarch64-linux` (comma-separated env), `systems = ["x86_64-linux"]` (TOML array), or repeated `--system` CLI flags.
 - **`features`** (`Vec<String>`): `requiredSystemFeatures` this worker supports (e.g., `kvm`, `big-parallel`). The scheduler's `can_build()` does an **all-match** --- every feature the derivation requires must be present here. Empty by default. Configure via `RIO_FEATURES`, `features` in TOML, or repeated `--feature` flags.
 
-> **Recursive Nix is not supported.** Derivations that invoke Nix internally (`__recursive` / `recursive-nix` experimental feature) will fail because `substitute = false`, `builders =`, and `experimental-features =` prevent the inner Nix from fetching dependencies or delegating builds. This is an explicit non-goal for the initial release. Supporting recursive Nix would require the worker to act as both a builder and a store client for the inner Nix instance, significantly complicating the worker architecture.
+> **Recursive Nix is not supported.** Derivations that invoke Nix internally (`__recursive` / `recursive-nix` experimental feature) will fail because `substitute = false` and `builders =` prevent the inner Nix from fetching dependencies or delegating builds, and `recursive-nix` is not in `experimental-features`. This is an explicit non-goal for the initial release. Supporting recursive Nix would require the worker to act as both a builder and a store client for the inner Nix instance, significantly complicating the worker architecture.
 
 ## rio-nix Client Protocol
 
@@ -172,7 +172,7 @@ r[worker.overlay.upper-not-overlayfs]
 After build completes:
 
 1. Read new paths from upper layer
-2. Chunk and upload to rio-store (CAS), presenting the scheduler-issued assignment token for authorization (see [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc))
+2. Chunk and upload to rio-store (CAS). Each `PutPath` request carries the scheduler-issued HMAC assignment token in the `x-rio-assignment-token` gRPC metadata header; the store verifies the token and rejects uploads for paths not in `claims.expected_outputs` (see [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc))
 3. Register path metadata (narinfo, references)
 4. Discard upper layer
 
@@ -246,7 +246,7 @@ r[worker.fod.verify-hash]
 Fixed-output derivations (FODs) have a known output hash declared in `outputHash`. They require special handling:
 
 1. **Detection**: A derivation is a FOD if its `outputHash` attribute is non-empty.
-2. **Network access**: Unlike regular derivations, FODs are allowed network access inside the sandbox. This is handled by `nix-daemon` internally — when it sees `outputHash` set on a derivation via `wopBuildDerivation`, it automatically relaxes network namespace isolation for that build. The worker does not need to configure anything special; `sandbox = true` in the worker's `nix.conf` is sufficient (Nix's sandbox is FOD-aware).
+2. **Network access**: Unlike regular derivations, FODs are allowed network access inside the sandbox. This is handled by `nix-daemon` internally — when it sees `outputHash` set on a derivation via `wopBuildDerivation`, it automatically relaxes network namespace isolation for that build. The worker does not need to configure anything special; `sandbox = true` in the worker's `nix.conf` is sufficient (Nix's sandbox is FOD-aware). When `WorkerPool.spec.fodProxyUrl` is set, `spawn_daemon_in_namespace` injects `http_proxy`/`https_proxy` environment variables (only when `is_fixed_output` is true) so FOD traffic routes through the forward proxy with domain allowlisting.
 3. **Output verification**: After the build completes, the worker computes the hash of the output and verifies it matches the declared `outputHash`. A mismatch is a build failure.
 4. **Caching**: FODs are cached by their output hash, not their derivation hash. Two FODs with different `src` attributes but the same `outputHash` share the same cached output.
 
@@ -272,11 +272,7 @@ Workers require elevated privileges for FUSE mounts, overlayfs mounts, and the N
 
 > **Spike finding (Phase 1a):** `CAP_SYS_ADMIN` + `CAP_SYS_CHROOT` without `privileged: true` is not sufficient for `/dev/fuse` access because the container's device cgroup does not include the FUSE character device (major 10, minor 229) by default. Production deployments must use a FUSE device plugin (e.g., [`smarter-device-manager`](https://gitlab.com/arm-research/smarter/smarter-device-manager)) that adds `/dev/fuse` to the device cgroup allowlist, enabling the non-privileged security context described above.
 
-**Custom seccomp profile** (default-deny allowlist, extending the Docker default profile):
-- **Allow:** `mount`, `umount2` (overlayfs and FUSE), `unshare`, `clone` with namespace flags (Nix sandbox), `pivot_root` (Nix sandbox)
-- **Explicitly block** (in addition to Docker default blocks): `ptrace`, `bpf`, `kexec_load`, `reboot`, `syslog`, `setns` (prevent namespace entry/escape), `keyctl` (prevent kernel keyring manipulation)
-
-> **Important:** This is a default-deny allowlist, NOT a blocklist. Any syscall not in the Docker default set or the additions above is denied. This prevents `CAP_SYS_ADMIN`-enabled syscall-based escapes.
+**Seccomp profile:** Worker pods set `seccompProfile: RuntimeDefault` at the pod level (applies to all containers + init containers) when `privileged != true`. RuntimeDefault blocks ~40 syscalls including `kexec_load`, `open_by_handle_at`, `userfaultfd` that builds don't need. A custom default-deny allowlist profile (additionally blocking `ptrace`, `bpf`, `setns`, `keyctl` under `CAP_SYS_ADMIN`) is tracked for Phase 4 --- RuntimeDefault is sufficient for the current threat model.
 
 **Recommended cluster configuration:**
 - Dedicated node pool with taint `rio.build/worker=true:NoSchedule` to isolate worker pods from other workloads.
@@ -359,9 +355,10 @@ A future improvement would split the worker into two processes:
 
 **Status:** Deferred. Will be investigated when the basic worker architecture is stable (post Phase 3).
 
-## Deferred: Build Cancellation (Phase 3b)
+## Build Cancellation
 
-The worker currently logs and ignores `Cancel` messages from the scheduler. Phase 3b will implement cancellation by writing `1` to the build's `cgroup.kill` (SIGKILLs the whole tree), releasing the semaphore permit, and sending `CompletionReport{status: Cancelled}`. This is needed for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
+r[worker.cancel.cgroup-kill]
+When the scheduler sends a `CancelSignal` on the BuildExecution stream, the worker's `try_cancel_build` writes `1` to the target build's `cgroup.kill` (SIGKILLs the entire cgroup tree). The build's executor task detects the daemon exit, releases the semaphore permit, tears down the overlay, and sends `CompletionReport{status: Cancelled}`. If the cancel arrives before the cgroup exists (race with build setup), `cgroup.kill` returns ENOENT --- logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed). This is used for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
 
 ## Key Files
 

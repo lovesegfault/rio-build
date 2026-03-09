@@ -459,7 +459,7 @@ When the gateway receives `wopBuildDerivation` or `wopBuildPathsWithResults`, it
 1. **During store uploads:** The gateway intercepts each uploaded path. If the path ends in `.drv`, the gateway extracts the `.drv` file from the NAR, parses the ATerm-format derivation, and caches the parsed result in per-session memory (keyed by store path). This applies to all upload opcodes: `wopAddToStore` (7), `wopAddTextToStore` (8), `wopAddToStoreNar` (39), and `wopAddMultipleToStore` (44). In all four cases the NAR data is buffered in the handler before being sent to the store, so the `.drv` is extracted directly from the buffer via `try_cache_drv`.
 2. **On `wopBuildDerivation`/`wopBuildPathsWithResults`:** The gateway identifies all requested derivation paths. For each, it looks up the parsed derivation from the session cache (step 1). If a `.drv` was not uploaded in the current session (e.g., it was uploaded in a previous session and already exists in the store), the gateway fetches it from rio-store via `GetPath`, unpacks the NAR, and parses the ATerm.
 3. **DAG construction:** Starting from the requested derivation(s), the gateway walks `inputDrvs` references recursively (BFS) to build the full DAG. **DAG reconstruction is capped at 10,000 transitive input derivations** (`MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation graphs. The gateway sends the **full DAG** to the scheduler; cache-hit determination (which nodes have outputs already in the store) happens in the scheduler, not here.
-4. **Validation:** Malformed `.drv` files cause `STDERR_ERROR` with type `"Error"` and a descriptive message. Missing `.drv` files (referenced by `inputDrvs` but not in the store) cause `STDERR_ERROR` with type `"Error"`.
+4. **Validation (`validate_dag`):** Malformed `.drv` files cause `STDERR_ERROR` with type `"Error"` and a descriptive message. Missing `.drv` files (referenced by `inputDrvs` but not in the store) cause `STDERR_ERROR` with type `"Error"`. `validate_dag` also enforces two early rejections before the gRPC round-trip: (a) `nodes.len() > MAX_DAG_NODES` (scheduler enforces this too, but gateway-side early reject saves the submission), and (b) any derivation with `__noChroot=1` in its env (sandbox escape --- this check is ONLY at the gateway; the scheduler does not re-check). `validate_dag` is invoked from all three build handlers (`wopBuildDerivation`, `wopBuildPaths`, `wopBuildPathsWithResults`).
 5. **The reconstructed DAG is sent to the scheduler via `SubmitBuild`.** The gateway holds the SSH connection open and converts the `BuildEvent` response stream into STDERR messages for the Nix client.
 
 ### Inline .drv Optimization
@@ -585,7 +585,7 @@ Unknown or unsupported opcodes return `STDERR_ERROR` and **close the connection*
 
 **Note on `wopQueryDerivationOutputMap`:** Moved from "CA-aware" to "Fully implemented" because modern Nix clients call this for ALL derivation types. For input-addressed derivations, it returns the statically-known output paths. For CA derivations, it returns the realized output paths if known.
 
-**Note on `wopAddTempRoot`:** Accepts the store path and records it as a connection-scoped temporary GC root in-memory. These temp roots prevent GC of paths the client is actively using. They are lost on gateway pod restart, which is acceptable given the store's 24-hour GC grace period. The store's GC relies on the 24-hour grace period rather than querying gateways for active temp roots.
+**Note on `wopAddTempRoot`:** Accepts the store path and records it as a connection-scoped temporary GC root in-memory. These temp roots prevent GC of paths the client is actively using. They are lost on gateway pod restart, which is acceptable given the store's GC grace period (default 2h). The store's GC relies on the grace period rather than querying gateways for active temp roots.
 
 ## Build Hook Protocol Path
 
@@ -616,6 +616,12 @@ r[gw.hook.ifd-detection]
 - Session state is connection-scoped --- the gateway is stateless beyond the lifetime of a single SSH connection.
 - If a gateway pod dies, the affected SSH connections drop. Clients reconnect automatically (standard Nix retry behavior) and land on a healthy replica.
 - Builds that were already in progress continue in the scheduler; only the log-streaming link is lost.
+
+r[gw.reconnect.backoff]
+**WatchBuild reconnect:** When the `SubmitBuild` / `WatchBuild` response stream breaks (scheduler failover, transient network), the gateway's `process_stream` distinguishes error classes via `StreamProcessError`:
+- `Transport` (scheduler connection dropped) → retried up to **5 times** with exponential backoff (**1s/2s/4s/8s/16s**). The scheduler replays `BuildEvent`s from `build_event_log` starting at `since_sequence`.
+- `EofWithoutTerminal` / `Wire` → **not** retried; the gateway returns `MiscFailure` to the Nix client immediately. These indicate the build itself terminated incompletely or a protocol bug, not a transient connectivity issue.
+The reconnect counter resets on the first successful `BuildEvent` received after a reconnect.
 - The gateway does not own durable state. All persistent data lives in the scheduler (PostgreSQL) and the store.
 - Consider using a non-standard SSH port (e.g., 2222) to avoid conflicts with host SSH daemons and corporate firewalls blocking port 22 for non-standard destinations.
 - Gateway pods should have a preStop hook and `terminationGracePeriodSeconds` (e.g., 600s) to allow in-flight SSH sessions to complete during rolling updates.

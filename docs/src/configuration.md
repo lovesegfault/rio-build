@@ -29,6 +29,8 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `poison_threshold` | u32 | 3 | Failures across different workers before poisoning |
 | `poison_ttl` | Duration | 24h | Time before poison state expires |
 | `max_retries` | u32 | 2 | Maximum retry attempts per derivation |
+| `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token signing. Env: `RIO_HMAC_KEY_PATH`. Same file must be configured on the store. |
+| `store_admin_addr` | string | (unset) | Store admin gRPC endpoint (for `TriggerGC` proxy). If unset, `AdminService.TriggerGC` returns UNIMPLEMENTED. |
 
 ## Store
 
@@ -41,6 +43,7 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `chunk_backend` | tagged enum | `{ kind = "inline" }` | Where chunks live. See `ChunkBackendKind` below. |
 | `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
 | `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
+| `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token verification on PutPath. Env: `RIO_HMAC_KEY_PATH`. Same file as scheduler. None = no token verification (dev mode). |
 
 `chunk_backend` TOML syntax (tagged enum):
 
@@ -57,7 +60,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 > **Compile-time constants (not configurable):** `INLINE_THRESHOLD` = 256 KiB, `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).
 
-> **GC is unimplemented** --- `gc_grace_period` and `orphan_scanner_interval` do not exist yet. See [store: GC](./components/store.md#two-phase-garbage-collection).
+> **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 2h). See [store: GC](./components/store.md#two-phase-garbage-collection).
 
 ## Worker
 
@@ -82,6 +85,7 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 | `size_class` | string | `""` | Size-class label (e.g., `small`, `large`). If the scheduler has `size_classes` configured, workers with an empty `size_class` are **rejected**. |
 | `max_leaked_mounts` | usize | 3 | After this many overlay-teardown (`umount2`) failures, the worker refuses new builds with `InfrastructureFailure`. |
 | `daemon_timeout_secs` | u64 | 7200 (2h) | Timeout for the local `nix-daemon --stdio` subprocess when the client didn't set `build_timeout`. |
+| `fod_proxy_url` | string | (unset) | Forward proxy URL for fixed-output derivations. Injected as `http_proxy`/`https_proxy` env only when `is_fixed_output`. Set via `WorkerPool.spec.fodProxyUrl` in K8s. |
 
 > **Heartbeat interval** is a compile-time constant (`HEARTBEAT_INTERVAL_SECS = 10` in `rio-common::limits`), not a configurable parameter. Changing it would require the scheduler's heartbeat-timeout to be adjusted in lockstep.
 

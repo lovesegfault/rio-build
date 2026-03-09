@@ -12,7 +12,7 @@ Referenced by: [Phase 3](phases/phase3.md) (basic retry), [Phase 4](phases/phase
 | **TransientFailure** | Yes (with backoff) | Worker OOM-killed, worker pod preempted, network timeout during input fetch | `BuildResult::TransientFailure` | 3 |
 | **InfrastructureFailure** | Yes (different worker) | S3 unavailable, PostgreSQL connection timeout, FUSE cache I/O error, overlay mount failure | `BuildResult::TransientFailure` + reassignment | 3 |
 | **DependencyFailed** | No (dep must succeed first) | An input derivation failed | `BuildResult::DependencyFailed` | 2a |
-| **CachedFailure** | No (until TTL expires) | Derivation marked as poisoned | `BuildResult::CachedFailure` | 4 |
+| **CachedFailure** | No (until TTL expires) | Derivation marked as poisoned | `BuildResult::CachedFailure` | 2a (in-memory poison) |
 
 > **Note:** There is no `TimedOut` variant in the `BuildResultStatus` proto enum. Nix's `BuildStatus::TimedOut` (wire value 8) currently maps to `PermanentFailure` via the worker's fallthrough mapping.
 
@@ -33,6 +33,14 @@ The worker maps `rio_nix::BuildStatus` (the real Nix wire enum) to the proto `Bu
 | `NoSubstituters` (14) | PermanentFailure | Fallthrough. rio-build does not use external substituters. |
 
 See `rio-worker/src/executor/mod.rs` for the mapping implementation.
+
+### Infrastructure Error Types (rio-common)
+
+| Error Type | Source | Description |
+|------------|--------|-------------|
+| `HmacError` | `rio-common/src/hmac.rs` | Token verification failures: I/O reading key file, empty key, malformed token (wrong part count, bad base64/JSON), signature mismatch, expiry in the past. Surfaced to clients as `PERMISSION_DENIED`. |
+| `TlsError` | `rio-common/src/tls.rs` | TLS config load failures: I/O reading PEM files, empty cert/key, PEM parse errors. These are **startup** errors (fail-fast), not runtime. |
+| `StreamProcessError` | `rio-gateway/src/handler/build.rs` | Gateway-internal enum distinguishing `Transport` (scheduler connection dropped — **retried** with 5× backoff 1/2/4/8/16s), `EofWithoutTerminal` (stream ended without terminal BuildEvent — **not retried**, build state lost), and `Wire` (protocol parse error — **not retried**). Only `Transport` triggers the WatchBuild reconnect loop. |
 
 ### FUSE/Overlay Failures
 
@@ -64,7 +72,7 @@ Only `TransientFailure` and `InfrastructureFailure` errors trigger retries. `Per
 
 ## Poison Derivation Tracking
 
-Derivations that consistently fail are marked as "poisoned" to prevent infinite retry loops. Introduced in Phase 4.
+Derivations that consistently fail are marked as "poisoned" to prevent infinite retry loops. In-memory poison tracking (`failed_workers` HashSet per derivation) is **live**. PostgreSQL-backed persistence (surviving scheduler restart) is Phase 4.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -96,6 +104,6 @@ Poisoned derivations:
 | Worker OOM-killed | Build retried on another worker. Client sees continued STDERR streaming. If all retries exhausted: `TransientFailure`. |
 | S3 unavailable | Upload retried with backoff. If persistent: `TransientFailure` for the derivation, reassigned. |
 | PostgreSQL down | Gateway returns `STDERR_ERROR("build service temporarily unavailable")`. Client can retry. |
-| Scheduler failover | Client's `SubmitBuild` stream breaks. Client reconnects; build reattaches if within orphan timeout. |
-| Gateway crash | SSH connection drops. Client reconnects; build reattaches. Logs between crash and reconnect are lost unless log persistence is configured. |
+| Scheduler failover | Gateway's `BuildEvent` stream breaks with a `Transport` error. Gateway transparently reconnects via `WatchBuild(since_sequence)` up to 5× with backoff (1/2/4/8/16s); scheduler replays from `build_event_log`. If reconnect budget exhausted → `MiscFailure` to client. |
+| Gateway crash | SSH connection drops. Client reconnects; build reattaches via DAG-merge cache hits (stored outputs are instant-hit). Logs between crash and reconnect are lost unless log persistence is configured. |
 | Derivation poisoned | `CachedFailure` with message identifying the poisoned derivation and the failure history. |

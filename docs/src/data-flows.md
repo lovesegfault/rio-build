@@ -187,19 +187,26 @@ sequenceDiagram
 ```
 1. Scheduler leader pod dies (crash, node failure, rolling update)
 2. New scheduler pod acquires the Kubernetes Lease for leader election
-3. New leader reconstructs in-memory state from PostgreSQL (see scheduler.md)
+3. New leader reconstructs in-memory state from PostgreSQL
+   (see scheduler.md State Recovery). Dispatch is gated on
+   recovery_complete.
 4. Workers detect stream break, reconnect BuildExecution streams to new leader
 5. For gateway connections with active SubmitBuild streams:
-   a. The SubmitBuild response stream (BuildEvent) breaks with a gRPC error
-   b. The gateway currently returns a MiscFailure BuildResult to the Nix
-      client. The client must re-run nix build; the scheduler's DAG merge
-      and cache hits on already-stored outputs make the retry cheap
-   c. If the gateway itself also restarted, see Client Disconnection above
-6. Log events between the old leader's crash and the client retry may be
-   lost unless log persistence is configured (see observability.md)
+   a. The SubmitBuild response stream (BuildEvent) breaks with a gRPC
+      Transport error
+   b. Gateway's process_stream classifies the error as
+      StreamProcessError::Transport and re-subscribes via
+      WatchBuild(build_id, since_sequence) — up to 5 times with
+      exponential backoff (1/2/4/8/16s)
+   c. New scheduler replays BuildEvents from build_event_log starting
+      at since_sequence. Nix client sees continuous STDERR streaming
+      (possibly a brief pause during backoff)
+   d. If all 5 reconnects fail OR the error is EofWithoutTerminal/Wire
+      → gateway returns MiscFailure to the client (manual retry)
+   e. If the gateway itself also restarted, see Client Disconnection above
+6. Log events between the old leader's last S3 flush and its crash may
+   be lost (bounded by the 30s periodic flush; see observability.md)
 ```
-
-> **Phase 3b deferral:** Gateway-side `WatchBuild(build_id, since_sequence)` re-subscription after scheduler failover is not yet implemented. The gateway does not maintain a per-session `(SSH channel -> build_id)` mapping for transparent failover. Until Phase 3b, scheduler restarts are surfaced to the Nix client as a transient build failure. See [Phase 3b](phases/phase3b.md).
 
 ## Import-From-Derivation (IFD)
 

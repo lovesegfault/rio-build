@@ -30,9 +30,10 @@
 //!
 //! Phase 2a used `push_front` for interactive (IFD) builds. That
 //! doesn't translate to a heap. Instead: add a large constant to
-//! interactive builds' priority. `INTERACTIVE_BOOST = 1e6` dwarfs
+//! interactive builds' priority. `INTERACTIVE_BOOST = 1e9` dwarfs
 //! any realistic critical-path value (even a 10k-derivation DAG at
-//! 300s each is only 3e6... hmm, that's close). Use 1e9 to be safe.
+//! 300s each is only 3e6; a 1.2M-derivation DAG at 300s would be
+//! 3.6e8 — 1e9 still wins).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};

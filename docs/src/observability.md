@@ -107,6 +107,11 @@ r[obs.metric.scheduler]
 | `rio_scheduler_event_persist_dropped_total` | Counter | BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained. |
 | `rio_scheduler_lease_acquired_total` | Counter | Kubernetes Lease acquire transitions (standby → leader). *Internal — primary use is VM test observability.* |
 | `rio_scheduler_lease_lost_total` | Counter | Kubernetes Lease loss transitions (leader → standby). *Internal — non-zero on a single-replica deployment is a bug.* |
+| `rio_scheduler_recovery_total` | Counter | State recovery runs (on LeaderAcquired). Labeled by `outcome`: `success`/`failure`. |
+| `rio_scheduler_recovery_duration_seconds` | Histogram | Time to reload non-terminal builds/derivations from PostgreSQL. |
+| `rio_scheduler_backstop_timeouts_total` | Counter | Running derivations reset to Ready by the backstop timeout (running_since > max(est_duration×3, daemon_timeout+10m)). Non-zero indicates wedged workers. |
+| `rio_scheduler_worker_disconnects_total` | Counter | BuildExecution stream closures (worker gone). Triggers reassignment. |
+| `rio_scheduler_cancel_signals_total` | Counter | CancelSignal messages sent to workers (explicit CancelBuild, backstop timeout, or finalizer drain). |
 | `rio_scheduler_estimator_refresh_total` | Counter | Build-history estimator refresh ticks (60s cadence). *Internal — VM test sync signal.* |
 | `rio_scheduler_class_load_fraction` *(Phase 4+)* | Gauge | Load fraction per size class (adaptive rebalancer input) |
 
@@ -123,13 +128,19 @@ r[obs.metric.store]
 | `rio_store_s3_requests_total` | Counter | S3 API calls (labeled by operation) |
 | `rio_store_chunk_cache_hits_total` | Counter | moka chunk cache hits (for cross-instance aggregation) |
 | `rio_store_chunk_cache_misses_total` | Counter | moka chunk cache misses |
+| `rio_store_hmac_rejected_total` | Counter | PutPath calls rejected by HMAC verifier (bad signature, expired, path not in `expected_outputs`). Alert if rate > 0: indicates misconfiguration or compromise attempt. |
+| `rio_store_hmac_bypass_total` | Counter | PutPath calls that skipped HMAC verification via mTLS CN bypass (labeled by `cn`). Expected `cn="rio-gateway"` only. |
+| `rio_store_gc_path_resurrected_total` | Counter | Paths skipped by GC sweep because a reference appeared between mark and sweep (sweep's per-path reference re-check caught it). |
+| `rio_store_gc_chunk_resurrected_total` | Counter | S3 deletes skipped by the drain task because chunk refcount re-check found the chunk back in use (TOCTOU guard via `pending_s3_deletes.blake3_hash`). |
+| `rio_store_s3_deletes_pending` | Gauge | Rows in `pending_s3_deletes` with `attempts < 10`. Normal operation: near-zero. |
+| `rio_store_s3_deletes_stuck` | Gauge | Rows in `pending_s3_deletes` with `attempts >= 10` (max retries exhausted). Alert if > 0: manual investigation needed. |
 
 ### Worker Metrics
 
 r[obs.metric.worker]
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rio_worker_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`) |
+| `rio_worker_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`/`cancelled`) |
 | `rio_worker_builds_active` | Gauge | Currently running builds on this worker |
 | `rio_worker_uploads_total` | Counter | Output uploads (labeled by `status`) |
 | `rio_worker_build_duration_seconds` | Histogram | Per-derivation build time |
@@ -151,6 +162,7 @@ r[obs.metric.controller]
 | `rio_controller_reconcile_errors_total` | Counter | Reconcile errors (labeled by reconciler) |
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
+| `rio_controller_build_watch_spawns_total` | Counter | WatchBuild background tasks spawned by the Build reconciler. Should equal the number of distinct Build UIDs seen (dedup by `ctx.watching` DashMap). Alert if >> Build count: indicates watch dedup failure → duplicate event processing. |
 | `rio_controller_gc_runs_total` *(Phase 4+)* | Counter | GC runs (labeled by result: success/failure) — not yet emitted |
 
 ### Histogram Buckets

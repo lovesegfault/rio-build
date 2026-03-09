@@ -95,9 +95,7 @@ Chunks with `refcount = 0` are not immediately deleted from S3; they become elig
 ### Write-Ahead Manifest Pattern (PutPath flow)
 
 r[store.put.wal-manifest]
-**Authorization:** Worker `PutPath` calls must include a valid assignment token (HMAC-SHA256, issued by the scheduler). The store verifies the token signature and checks that the output path matches `expected_output_paths`. See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
-
-> **Phase 3b deferral:** Assignment token HMAC signing and verification are not yet implemented. Tokens are currently opaque strings (`{worker_id}-{drv_hash}-{generation}`) and the store does not verify them. Leader election (Phase 3a) landed without HMAC.
+**Authorization:** Worker `PutPath` calls include an HMAC-SHA256-signed assignment token in the `x-rio-assignment-token` gRPC metadata header. The store verifies the token signature, checks expiry, and rejects uploads whose `store_path` is not in `claims.expected_outputs`. Callers presenting a client certificate with `CN=rio-gateway` bypass the HMAC check (the gateway handles `nix copy --to` and has no assignment). See [Security: assignment tokens](../security.md#boundary-2-gatewayworker--internal-services-grpc).
 
 1. **Idempotency check + `'uploading'` placeholder:** If a `'complete'` manifest already exists for this path, return success immediately (fast-path no-op). Otherwise, insert an `'uploading'` placeholder row in `manifests` as an idempotency lock --- this PG write happens **before** the NAR is buffered or verified.
 2. **Buffer + verify:** Accumulate the streamed NAR chunks into a buffer, then compute SHA-256 over the buffered bytes and verify against the declared `NarHash`. On mismatch, delete the placeholder row and reject.
@@ -181,9 +179,9 @@ CA `Realisation` objects carry their own ed25519 signatures over the tuple `(drv
 ## Two-Phase Garbage Collection
 
 r[store.gc.two-phase]
-- **Phase 1 (Mark):** Identify paths unreachable from GC roots. GC roots include: active builds, queued builds, pinned paths, paths with active binary cache serving sessions, paths in `'uploading'` manifests, `wopAddTempRoot` temp roots from gateways.
-- **Grace period:** Wait T hours (configurable, default 24h). Configurable per-invocation via `GCRequest`.
-- **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Use `UPDATE chunks SET deleted=true WHERE blake3_hash=$1 AND refcount=0` atomically in PostgreSQL before issuing S3 DELETEs. This statement MUST execute under `SERIALIZABLE` isolation level or use explicit row-level locking (`SELECT ... FOR UPDATE` on the chunk row, then conditional `UPDATE`) to prevent a TOCTOU race where a concurrent `PutPath` increments the refcount between the read and the update. Delete path metadata from PostgreSQL first (making paths invisible), then enqueue S3 deletions via `pending_s3_deletes` (async/batched). Also clean up content index entries for swept paths.
+- **Phase 1 (Mark):** Identify paths unreachable from GC roots via a recursive CTE over `narinfo."references"`. GC root seeds: explicit pins in the `gc_roots` table, auto-pinned live-build inputs in the `scheduler_live_pins` table, manifests with `status='uploading'` (in-flight PutPath), paths with `created_at > now() - grace_hours` (recent uploads), and `extra_roots` passed from the scheduler's live-build output paths (`ActorCommand::GcRoots`). Mark takes an **exclusive** advisory lock (`GC_MARK_LOCK_ID = 0x724F47430002`); PutPath takes the same lock **shared** around its placeholder-insert → complete-manifest window. This blocks PutPath for ~1s (CTE duration) during mark.
+- **Grace period:** Configurable per-invocation via `GcRequest.grace_period_hours` (default **2h**). Protects paths uploaded shortly before GC that builds haven't referenced yet.
+- **Phase 2 (Sweep):** Re-read chunk refcounts at sweep time (NOT from a mark-phase snapshot). Per unreachable path, in batched transactions: `SELECT chunk_list ... FOR UPDATE OF m` locks the **manifest** row (not chunk rows), then sweep **re-checks references** (GIN-indexed) --- if a PutPath completed between mark and sweep with a reference to this path, the delete is skipped (`rio_store_gc_path_resurrected_total` metric). DELETE narinfo (CASCADE), decrement chunk refcounts, mark `refcount=0` chunks deleted, enqueue S3 keys to `pending_s3_deletes` --- all in the same PG transaction. Sweep does NOT hold the mark advisory lock.
 
 **Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 2 hours). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
@@ -194,10 +192,12 @@ Configurable retention policies per tenant/project. Supports dry-run mode via `G
 r[store.gc.pending-deletes]
 S3 deletes are not transactional with PostgreSQL. To prevent data leaks (chunks removed from PG but never deleted from S3) or premature deletes on crash, rio-store uses a transactional outbox pattern:
 
-1. In the same PostgreSQL transaction that marks chunks as `deleted=true` (GC sweep) or decrements refcounts to 0 (orphan cleanup), write the corresponding S3 keys to the `pending_s3_deletes` table.
-2. A background worker polls `pending_s3_deletes`, issues S3 DELETE requests, and removes rows on success.
+1. In the same PostgreSQL transaction that marks chunks as `deleted=true` (GC sweep) or decrements refcounts to 0 (orphan cleanup), write the corresponding S3 keys **and `blake3_hash`** to the `pending_s3_deletes` table.
+2. A background drain task polls `pending_s3_deletes` on a **fixed 30s interval** (`DRAIN_INTERVAL`, not exponential --- S3 DELETE failures are rare and transient; queueing absorbs bursts). Before issuing each S3 DELETE, drain **re-checks the chunk state by `blake3_hash`** (TOCTOU guard: if a concurrent PutPath re-incremented the refcount since sweep enqueued the key, skip the delete and remove the row --- `rio_store_gc_chunk_resurrected_total` metric). On S3 success, the row is removed; on failure, `attempts` is incremented.
 3. On crash/restart, unprocessed rows are retried automatically --- S3 DELETE is idempotent.
-4. The worker uses exponential backoff with jitter for transient S3 errors. Rows exceeding a max retry count (default: 10) are logged as alerts for manual investigation.
+4. Rows exceeding max retry count (default: 10) remain in the table for alerting (`rio_store_s3_deletes_stuck` gauge).
+
+**GC-vs-GC serialization:** `TriggerGC` takes a non-blocking advisory lock (`GC_LOCK_ID = 0x724F47430001`) via `pg_try_advisory_lock`. A second concurrent `TriggerGC` gets "already running" and returns early.
 
 ## PostgreSQL Schema
 
@@ -279,12 +279,31 @@ CREATE TABLE realisations (
 CREATE INDEX realisations_output_idx ON realisations (output_path);
 ```
 
-> **Phase deferral (GC):** The `pending_s3_deletes` table is part of the unimplemented GC subsystem. This DDL is the target design.
+> GC tables (`gc_roots`, `scheduler_live_pins`, `pending_s3_deletes`) are added by `migrations/006_gc_safety.sql`. See the `rio-store/src/gc/` module for the mark/sweep/drain implementation.
 
 ```sql
+CREATE TABLE gc_roots (
+    store_path_hash  BYTEA PRIMARY KEY
+                     REFERENCES narinfo(store_path_hash),
+    source           TEXT NOT NULL,               -- 'admin' / 'test' / etc
+    pinned_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Scheduler auto-pins input closures of dispatched derivations.
+-- Unpinned on completion. NOT FK'd to narinfo (input paths may not
+-- be in the local store yet — they'll arrive via worker upload).
+CREATE TABLE scheduler_live_pins (
+    store_path_hash  BYTEA NOT NULL,
+    drv_hash         TEXT NOT NULL,
+    pinned_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (store_path_hash, drv_hash)
+);
+
 CREATE TABLE pending_s3_deletes (
     id               BIGSERIAL PRIMARY KEY,
     s3_key           TEXT NOT NULL,
+    blake3_hash      BYTEA,                       -- drain re-checks chunk state
+                                                   -- before S3 DELETE (TOCTOU guard)
     enqueued_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     attempts         INTEGER NOT NULL DEFAULT 0,
     last_error       TEXT
@@ -323,6 +342,11 @@ CREATE INDEX idx_pending_s3_deletes_drain
 - `rio-store/src/cache_server.rs` --- axum binary cache HTTP (narinfo + nar.zst routes)
 - `rio-store/src/signing.rs` --- ed25519 narinfo signing at PutPath time
 
-## Planned Files (Phase 4+)
+## GC Files
 
-- `rio-store/src/gc.rs` --- Garbage collection (mark/grace/sweep + orphan cleanup)
+- `rio-store/src/gc/mod.rs` --- GC lock constants (`GC_LOCK_ID`, `GC_MARK_LOCK_ID`), `GcStats`, `run_gc` orchestration
+- `rio-store/src/gc/mark.rs` --- `compute_unreachable` recursive CTE (seeds: gc_roots, scheduler_live_pins, uploading manifests, grace-period, extra_roots)
+- `rio-store/src/gc/sweep.rs` --- Per-path batched delete with `FOR UPDATE OF m` + reference re-check
+- `rio-store/src/gc/drain.rs` --- Background S3 delete drain (30s interval, blake3_hash re-check)
+- `rio-store/src/gc/orphan.rs` --- Stale `'uploading'` manifest cleanup
+- `rio-store/src/grpc/admin.rs` --- `StoreAdminService` (TriggerGC, PinPath, UnpinPath)
