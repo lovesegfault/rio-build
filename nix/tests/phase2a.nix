@@ -23,9 +23,17 @@
   pkgs,
   rio-workspace,
   rioModules,
+  coverage ? false,
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
 
   # The 5-node test DAG. Passed to `nix-build` on the client via
   # `--arg busybox '<storePath>'`.
@@ -143,5 +151,7 @@ pkgs.testers.runNixOSTest {
         "curl -sf http://localhost:9092/metrics | "
         "grep -E 'rio_store_put_path_total\\{result=\"created\"\\} ([5-9]|[1-9][0-9])'"
     )
+
+    ${common.collectCoverage "control, worker1, worker2, client"}
   '';
 }

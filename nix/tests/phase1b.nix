@@ -26,9 +26,17 @@
   pkgs,
   rio-workspace,
   rioModules,
+  coverage ? false,
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
 
   # Single trivial derivation — one leaf from the phase2a DAG.
   # Reuses the same builder pattern (busybox sh + mkdir + echo).
@@ -114,5 +122,7 @@ pkgs.testers.runNixOSTest {
     client.succeed(
         f"nix path-info --store 'ssh-ng://control' {out}"
     )
+
+    ${common.collectCoverage "control, worker, client"}
   '';
 }

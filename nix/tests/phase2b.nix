@@ -29,9 +29,17 @@
   pkgs,
   rio-workspace,
   rioModules,
+  coverage ? false,
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
 
   testDrvFile = ./phase2b-derivation.nix;
 
@@ -271,5 +279,7 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
     print("V10 PASS: both scheduler AND gateway traces visible in Tempo")
+
+    ${common.collectCoverage "control, worker1, worker2, client"}
   '';
 }

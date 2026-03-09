@@ -22,9 +22,17 @@
   pkgs,
   rio-workspace,
   rioModules,
+  coverage ? false,
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
   inherit (common) busybox;
 in
 pkgs.testers.runNixOSTest {
@@ -116,5 +124,7 @@ pkgs.testers.runNixOSTest {
         "nix path-info --store 'ssh-ng://gateway' "
         "/nix/store/0000000000000000000000000000000a-nonexistent"
     )
+
+    ${common.collectCoverage "gateway, client"}
   '';
 }

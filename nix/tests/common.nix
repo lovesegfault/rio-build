@@ -31,9 +31,26 @@
   pkgs,
   rio-workspace,
   rioModules,
+  # Coverage mode: rio-workspace is the instrumented build,
+  # LLVM_PROFILE_FILE is set in all rio-* service environments, and
+  # collectCoverage emits the profraw-collection testScript snippet.
+  # false (default, vmTests) → all three are no-ops.
+  coverage ? false,
 }:
 let
   inherit (pkgs) lib;
+
+  # --- Coverage plumbing (all are no-ops when coverage=false) ---
+  # LLVM_PROFILE_FILE template: %p = PID (handles service restarts —
+  # phase3a/3b do `systemctl restart rio-*` multiple times), %m =
+  # binary signature (each binary has a distinct coverage map; enables
+  # safe on-line merging).
+  covEnv = lib.optionalAttrs coverage {
+    LLVM_PROFILE_FILE = "/var/lib/rio/cov/rio-%p-%m.profraw";
+  };
+  covTmpfiles = lib.optional coverage "d /var/lib/rio/cov 0755 root root -";
+  # Instrumented binaries are ~2× RSS; bump VM memory.
+  covMemBump = if coverage then 256 else 0;
 in
 rec {
   # ── Shared let-bindings ─────────────────────────────────────────────
@@ -132,14 +149,15 @@ rec {
       ];
       networking.hostName = hostName;
 
-      # phase3b TLS/HMAC env injection. Empty attrset = no-op (NixOS
-      # module merge with {} is identity). When set, the module system
-      # merges these keys with each module's own `environment = {...}`
-      # — no risk of clobbering RIO_LISTEN_ADDR etc.
+      # phase3b TLS/HMAC env injection + coverage env. Empty attrset
+      # = no-op (NixOS module merge with {} is identity). When set,
+      # the module system merges these keys with each module's own
+      # `environment = {...}` — no risk of clobbering RIO_LISTEN_ADDR
+      # etc. covEnv is {} when coverage=false.
       systemd.services = {
-        rio-store.environment = extraServiceEnv;
-        rio-scheduler.environment = extraServiceEnv;
-        rio-gateway.environment = extraServiceEnv;
+        rio-store.environment = extraServiceEnv // covEnv;
+        rio-scheduler.environment = extraServiceEnv // covEnv;
+        rio-gateway.environment = extraServiceEnv // covEnv;
       };
 
       services.rio = {
@@ -164,7 +182,7 @@ rec {
         };
       };
 
-      systemd.tmpfiles.rules = gatewayTmpfiles;
+      systemd.tmpfiles.rules = gatewayTmpfiles ++ covTmpfiles;
 
       environment.systemPackages = [ pkgs.curl ] ++ extraPackages;
 
@@ -180,7 +198,8 @@ rec {
 
       virtualisation = {
         cores = 4;
-        inherit memorySize diskSize;
+        memorySize = memorySize + covMemBump;
+        inherit diskSize;
       };
     };
 
@@ -234,7 +253,10 @@ rec {
         lib.optionalAttrs (otelEndpoint != null) {
           RIO_OTEL_ENDPOINT = otelEndpoint;
         }
-        // extraServiceEnv;
+        // extraServiceEnv
+        // covEnv;
+
+      systemd.tmpfiles.rules = covTmpfiles;
 
       # curl for metric scraping.
       environment.systemPackages = [ pkgs.curl ];
@@ -244,7 +266,7 @@ rec {
       # threads to drive the reactor; 4 cores gives headroom at
       # maxBuilds=2.
       virtualisation = {
-        memorySize = 1024;
+        memorySize = 1024 + covMemBump;
         diskSize = 4096;
         cores = 4;
         # Worker VMs must NOT have a writable /nix/store. With
@@ -420,10 +442,6 @@ rec {
       # to hybrid, worker's own_cgroup() parser fails).
       boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
 
-      # containerd needs cgroup delegation to create pod cgroups.
-      # Without this: pods stuck in ContainerCreating.
-      systemd.services.k3s.serviceConfig.Delegate = "yes";
-
       services.k3s = {
         enable = true;
         role = "server";
@@ -449,21 +467,32 @@ rec {
         inherit manifests;
       };
 
-      # rio-controller as systemd (not pod). Simpler for VM tests
-      # — no RBAC bootstrap ordering problem (k3s.yaml is
-      # cluster-admin). After=k3s but k3s "starts" before
-      # apiserver is ready; RestartSec handles the gap.
-      systemd.services.rio-controller = {
-        description = "rio-controller (K8s operator)";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "k3s.service" ];
-        requires = [ "k3s.service" ];
-        environment = controllerEnv;
-        serviceConfig = {
-          ExecStart = "${rio-workspace}/bin/rio-controller";
-          Restart = "on-failure";
-          RestartSec = 5;
+      systemd = {
+        # containerd needs cgroup delegation to create pod cgroups.
+        # Without this: pods stuck in ContainerCreating.
+        services.k3s.serviceConfig.Delegate = "yes";
+
+        # rio-controller as systemd (not pod). Simpler for VM tests
+        # — no RBAC bootstrap ordering problem (k3s.yaml is
+        # cluster-admin). After=k3s but k3s "starts" before
+        # apiserver is ready; RestartSec handles the gap.
+        services.rio-controller = {
+          description = "rio-controller (K8s operator)";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "k3s.service" ];
+          requires = [ "k3s.service" ];
+          # covEnv propagates LLVM_PROFILE_FILE — the controller's
+          # builders.rs checks this env var and, if set, injects a
+          # hostPath cov volume + env into the worker pod (phase3a).
+          environment = controllerEnv // covEnv;
+          serviceConfig = {
+            ExecStart = "${rio-workspace}/bin/rio-controller";
+            Restart = "on-failure";
+            RestartSec = 5;
+          };
         };
+
+        tmpfiles.rules = covTmpfiles;
       };
 
       environment.systemPackages = [
@@ -472,11 +501,56 @@ rec {
       ];
 
       virtualisation = {
-        memorySize = 4096;
+        memorySize = 4096 + covMemBump;
         cores = 8;
         diskSize = 8192;
       };
     };
+
+  # ── Coverage profraw collection (appended to end of testScript) ─────
+  #
+  # When coverage=true, stops all rio services (SIGTERM → graceful
+  # drain via shutdown_signal → atexit → LLVM profraw flush), tars
+  # /var/lib/rio/cov, and copies to $out/coverage/<node>/.
+  #
+  # `pyNodeVars` is a Python expression evaluating to a list of Machine
+  # instances — typically comma-separated node var names, e.g.,
+  # "gateway, client" or "control, worker1, worker2, client".
+  #
+  # systemctl stop is synchronous (returns when unit inactive). || true
+  # tolerates missing services (not every node runs every service).
+  # For k8s nodes (phase3a), also deletes STS so the pod terminates
+  # cleanly (pod PID 1 gets SIGTERM → worker's existing drain →
+  # profraw flushed to hostPath mount).
+  collectCoverage =
+    pyNodeVars:
+    if !coverage then
+      ""
+    else
+      ''
+        with subtest("collect coverage profraws"):
+            for n in [${pyNodeVars}]:
+                n.execute(
+                    "systemctl stop rio-gateway rio-scheduler rio-store "
+                    "rio-worker rio-controller 2>/dev/null || true"
+                )
+                # k3s worker pod (phase3a only): delete STS, wait for
+                # pod termination. --wait blocks until pod is gone.
+                n.execute(
+                    "[ -f /etc/rancher/k3s/k3s.yaml ] && "
+                    "k3s kubectl delete sts --all --wait=true --timeout=30s "
+                    "2>/dev/null || true"
+                )
+                # Empty tarball if dir doesn't exist (e.g., client node
+                # runs no rio services).
+                n.execute(
+                    "mkdir -p /var/lib/rio/cov && "
+                    "tar czf /tmp/profraw.tar.gz -C /var/lib/rio/cov . "
+                    "2>/dev/null || "
+                    "tar czf /tmp/profraw.tar.gz --files-from=/dev/null"
+                )
+                n.copy_from_vm("/tmp/profraw.tar.gz", f"coverage/{n.name}")
+      '';
 
   mkBuildHelper =
     { gatewayHost, testDrvFile }:

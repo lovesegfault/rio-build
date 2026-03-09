@@ -29,13 +29,21 @@
   rioModules,
   # crds: auto-deployed via k3s manifests (F1 section).
   crds,
+  coverage ? false,
   # dockerImages: passed by flake for k3s airgap preload. Unused
   # here (worker stays native NixOS service, no WorkerPool CR) so
   # swallowed via `...` — alternative is flake-side branching.
   ...
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
 
   # ── PKI: self-signed CA + server/client certs + HMAC key ────────────
   #
@@ -1065,5 +1073,7 @@ pkgs.testers.runNixOSTest {
     print("  A (cancel via cgroup.kill)    — timing-sensitive; 6 unit tests")
     print("  B2 (PutPath token reject)     — raw gRPC stream; 10 unit tests")
     print("=" * 60)
+
+    ${common.collectCoverage "control, worker, k8s, client"}
   '';
 }

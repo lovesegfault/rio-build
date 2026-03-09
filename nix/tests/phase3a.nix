@@ -43,9 +43,17 @@
   # Extended args (not in vmTestArgs — passed separately by flake):
   dockerImages, # for airgap preload into k3s
   crds, # nix build .#crds output — auto-deployed via manifests
+  coverage ? false,
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
 
   # 2-node chain: child → parent. Parent's dispatch triggers
   # send_prefetch_hint with child's output path (approx_input_closure
@@ -870,5 +878,10 @@ pkgs.testers.runNixOSTest {
         "curl -sf http://localhost:9091/metrics | "
         "grep -E 'rio_scheduler_workers_active 0'"
     )
+
+    # Pod was already deleted above (finalizer drain), but profraws
+    # from its lifetime are on the k8s node's hostPath-mounted
+    # /var/lib/rio/cov. collectCoverage tars that dir.
+    ${common.collectCoverage "control, k8s, client"}
   '';
 }

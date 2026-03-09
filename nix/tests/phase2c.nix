@@ -30,9 +30,17 @@
   pkgs,
   rio-workspace,
   rioModules,
+  coverage ? false,
 }:
 let
-  common = import ./common.nix { inherit pkgs rio-workspace rioModules; };
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
 
   testDrvFile = ./phase2c-derivation.nix;
 
@@ -341,5 +349,7 @@ pkgs.testers.runNixOSTest {
         "rio_store_chunk_dedup_ratio metric should be exported "
         "(chunked PutPath path ran)"
     )
+
+    ${common.collectCoverage "control, wsmall1, wsmall2, wlarge, client"}
   '';
 }
