@@ -209,3 +209,257 @@ pub(super) async fn decrement_and_enqueue(
 
     Ok(stats)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::chunk::MemoryChunkBackend;
+    use crate::manifest::{Manifest, ManifestEntry};
+    use rio_test_support::TestDb;
+    use sqlx::PgPool;
+
+    /// Seed a chunk row with the given refcount. Returns the blake3 hash.
+    async fn seed_chunk(pool: &PgPool, tag: u8, refcount: i32, size: i64) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[0] = tag; // distinct per tag
+        sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, $2, $3)")
+            .bind(&hash[..])
+            .bind(refcount)
+            .bind(size)
+            .execute(pool)
+            .await
+            .unwrap();
+        hash
+    }
+
+    /// Build a serialized manifest referencing the given chunk hashes.
+    fn make_manifest(hashes: &[[u8; 32]]) -> Vec<u8> {
+        Manifest {
+            entries: hashes
+                .iter()
+                .map(|h| ManifestEntry {
+                    hash: *h,
+                    size: 100,
+                })
+                .collect(),
+        }
+        .serialize()
+    }
+
+    // r[verify store.chunk.refcount-txn]
+    /// Core: manifest references chunks with refcount > 1 → decrement,
+    /// nobody hits zero, no deleted=true, no S3 enqueue.
+    #[tokio::test]
+    async fn decrement_refcounts_no_zero() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h1 = seed_chunk(&db.pool, 1, 2, 1000).await;
+        let h2 = seed_chunk(&db.pool, 2, 3, 2000).await;
+        let manifest = make_manifest(&[h1, h2]);
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stats.chunks_zeroed, 0, "nobody hit zero");
+        assert_eq!(stats.s3_keys_enqueued, 0);
+        assert_eq!(stats.bytes_freed, 0);
+
+        // Refcounts decremented (2→1, 3→2), not deleted.
+        let rows: Vec<(Vec<u8>, i32, bool)> = sqlx::query_as(
+            "SELECT blake3_hash, refcount, deleted FROM chunks ORDER BY blake3_hash",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, 1, "h1 refcount 2→1");
+        assert!(!rows[0].2);
+        assert_eq!(rows[1].1, 2, "h2 refcount 3→2");
+        assert!(!rows[1].2);
+    }
+
+    /// Chunk at refcount=1 → decrement → 0 → deleted=true + enqueued
+    /// to pending_s3_deletes. Stats reflect bytes freed.
+    #[tokio::test]
+    async fn zeroes_and_enqueues_s3() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h = seed_chunk(&db.pool, 1, 1, 5000).await;
+        let manifest = make_manifest(&[h]);
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stats.chunks_zeroed, 1);
+        assert_eq!(stats.s3_keys_enqueued, 1);
+        assert_eq!(stats.bytes_freed, 5000);
+
+        // Chunk row: refcount=0, deleted=true.
+        let (refcount, deleted): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(&h[..])
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(refcount, 0);
+        assert!(deleted, "zeroed chunk marked deleted");
+
+        // pending_s3_deletes has a row with the backend's key + hash.
+        let (s3_key, blake3): (String, Vec<u8>) =
+            sqlx::query_as("SELECT s3_key, blake3_hash FROM pending_s3_deletes")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(s3_key, backend.key_for(&h));
+        assert_eq!(blake3, h.to_vec());
+    }
+
+    /// Manifest can repeat chunk hashes (duplicate content blocks in
+    /// the NAR). decrement_and_enqueue MUST dedup — decrement once
+    /// per unique hash, not once per entry. Prevents refcount
+    /// underflow and double-enqueue.
+    #[tokio::test]
+    async fn dedupes_duplicate_manifest_entries() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h = seed_chunk(&db.pool, 1, 2, 1000).await;
+        // Manifest references h THREE times.
+        let manifest = make_manifest(&[h, h, h]);
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, &manifest, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stats.chunks_zeroed, 0);
+
+        // Refcount decremented ONCE (2→1), not three times (2→-1).
+        let (refcount,): (i32,) =
+            sqlx::query_as("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+                .bind(&h[..])
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(refcount, 1, "dedup: 3 manifest refs → 1 decrement");
+    }
+
+    /// Corrupt chunk_list bytes → warn + zero stats, no panic.
+    /// The narinfo DELETE (caller's responsibility) has already
+    /// CASCADEd the manifest away, so worst case = leaked refcounts.
+    #[tokio::test]
+    async fn corrupt_manifest_returns_zero_stats() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let _h = seed_chunk(&db.pool, 1, 2, 1000).await;
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, b"garbage bytes", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stats.chunks_zeroed, 0);
+        assert_eq!(stats.bytes_freed, 0);
+        assert_eq!(stats.s3_keys_enqueued, 0);
+
+        // Chunk untouched (corrupt manifest → skipped).
+        let (refcount,): (i32,) = sqlx::query_as("SELECT refcount FROM chunks")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(refcount, 2, "corrupt manifest → no decrement");
+    }
+
+    /// `backend: None` (inline store — no S3). Refcounts decremented
+    /// + chunks marked deleted, but NO pending_s3_deletes rows
+    /// (nothing to delete from S3).
+    #[tokio::test]
+    async fn no_backend_skips_s3_enqueue() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h = seed_chunk(&db.pool, 1, 1, 1000).await;
+        let manifest = make_manifest(&[h]);
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, &manifest, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stats.chunks_zeroed, 1, "chunk still zeroed");
+        assert_eq!(stats.s3_keys_enqueued, 0, "no backend → no enqueue");
+
+        let enqueued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(enqueued, 0);
+    }
+
+    /// Empty manifest (no entries) → early return with zero stats.
+    #[tokio::test]
+    async fn empty_manifest_noop() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let manifest = make_manifest(&[]);
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, &manifest, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stats.chunks_zeroed, 0);
+        assert_eq!(stats.s3_keys_enqueued, 0);
+        assert_eq!(stats.bytes_freed, 0);
+    }
+
+    /// ON CONFLICT DO NOTHING: running twice with the same chunk
+    /// already zeroed + enqueued → second call doesn't error, doesn't
+    /// duplicate the pending_s3_deletes row. (Drain deletes rows
+    /// after S3 success; idempotent re-enqueue before drain is fine.)
+    #[tokio::test]
+    async fn idempotent_enqueue_on_conflict() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Two chunks: h1 at 1 (will zero), h2 at 2 (won't).
+        let h1 = seed_chunk(&db.pool, 1, 1, 1000).await;
+        let h2 = seed_chunk(&db.pool, 2, 2, 2000).await;
+        let manifest = make_manifest(&[h1, h2]);
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // First pass: h1 zeroed + enqueued.
+        let mut tx = db.pool.begin().await.unwrap();
+        decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Second pass (same manifest — e.g., orphan scan after GC
+        // already swept). h1 stays deleted (deleted=true filter in
+        // the UPDATE...RETURNING), h2 goes 1→0 + enqueued.
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats2 = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Second pass zeroed h2 (went 1→0) but NOT h1 (deleted=true
+        // filter in RETURNING skips already-deleted).
+        assert_eq!(stats2.chunks_zeroed, 1, "only h2 zeroed second pass");
+        assert_eq!(stats2.s3_keys_enqueued, 1, "only h2 enqueued");
+
+        // pending_s3_deletes has exactly 2 rows (h1 from first pass,
+        // h2 from second). No duplicates despite ON CONFLICT exercised
+        // for h1's re-enqueue attempt (it was already deleted=true so
+        // wasn't in the zeroed list — but if it HAD been, the INSERT
+        // would conflict-do-nothing).
+        let enqueued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(enqueued, 2);
+    }
+}

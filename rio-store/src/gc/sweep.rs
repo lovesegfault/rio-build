@@ -336,4 +336,107 @@ mod tests {
         assert_eq!(stats.paths_deleted, 1);
         assert_eq!(stats.paths_resurrected, 0);
     }
+
+    // r[verify store.chunk.refcount-txn]
+    /// Sweep a path WITH chunk_list (chunked storage): verify the
+    /// `if let Some(bytes) = chunk_list` branch fires, decrements
+    /// refcounts, marks zeroed chunks deleted, and enqueues S3 keys.
+    /// All existing sweep tests use `seed_complete_path` which sets
+    /// NO chunk_list — this is the chunked-storage path.
+    #[tokio::test]
+    async fn sweep_chunked_path_decrements_and_enqueues() {
+        use crate::backend::chunk::{ChunkBackend, MemoryChunkBackend};
+        use crate::manifest::{Manifest, ManifestEntry};
+        use std::sync::Arc;
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let path = "/nix/store/dddddddddddddddddddddddddddddddd-chunked";
+        let path_hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+
+        // Seed two chunks at refcount=1 (will zero + enqueue).
+        let mut chunk_h1 = [0u8; 32];
+        chunk_h1[0] = 0xAA;
+        let mut chunk_h2 = [0u8; 32];
+        chunk_h2[0] = 0xBB;
+        for (h, size) in [(&chunk_h1, 1000i64), (&chunk_h2, 2000i64)] {
+            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 1, $2)")
+                .bind(&h[..])
+                .bind(size)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        // Seed narinfo + manifest + manifest_data (chunked: inline_blob
+        // NULL, chunk_list set).
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $1, 0)",
+        )
+        .bind(&path_hash)
+        .bind(path)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', NULL)",
+        )
+        .bind(&path_hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let chunk_list = Manifest {
+            entries: vec![
+                ManifestEntry {
+                    hash: chunk_h1,
+                    size: 1000,
+                },
+                ManifestEntry {
+                    hash: chunk_h2,
+                    size: 2000,
+                },
+            ],
+        }
+        .serialize();
+        sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+            .bind(&path_hash)
+            .bind(&chunk_list)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Sweep with a backend → decrement + enqueue.
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+        let stats = sweep(&db.pool, Some(&backend), vec![path_hash.clone()], false)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.paths_deleted, 1);
+        assert_eq!(stats.chunks_deleted, 2, "both chunks zeroed");
+        assert_eq!(stats.s3_keys_enqueued, 2);
+        assert_eq!(stats.bytes_freed, 3000, "1000 + 2000");
+
+        // Both chunks: refcount=0, deleted=true.
+        let deleted_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE refcount = 0 AND deleted = true")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(deleted_count, 2);
+
+        // pending_s3_deletes has 2 rows.
+        let enqueued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(enqueued, 2);
+
+        // narinfo + manifest gone (CASCADE).
+        let narinfo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM narinfo")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(narinfo_count, 0);
+    }
 }
