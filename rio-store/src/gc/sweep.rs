@@ -77,6 +77,39 @@ pub async fn sweep(
             .await?
             .flatten();
 
+            // Step 1b: Z2 reference re-check. Mark held GC_MARK_LOCK_ID
+            // exclusive, but we RELEASED it before sweep (to avoid
+            // blocking PutPath during the longer sweep phase). A PutPath
+            // that completed BETWEEN mark and now may have written
+            // references=[this_path]. Re-check via GIN index before
+            // deleting. If found: skip, increment resurrected metric.
+            //
+            // The subquery resolves hash→path because narinfo."references"
+            // is TEXT[] (store_path strings, not hashes). The GIN index
+            // (migration 008) makes `= ANY("references")` index-scannable.
+            let has_referrer: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                  SELECT 1 FROM narinfo
+                   WHERE (SELECT store_path FROM narinfo WHERE store_path_hash = $1)
+                         = ANY("references")
+                   LIMIT 1
+                )
+                "#,
+            )
+            .bind(store_path_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_referrer {
+                tracing::debug!(
+                    store_path_hash = %hex::encode(store_path_hash),
+                    "GC sweep: path resurrected (new referrer after mark), skipping"
+                );
+                metrics::counter!("rio_store_gc_path_resurrected_total").increment(1);
+                stats.paths_resurrected += 1;
+                continue;
+            }
+
             // Step 2a: DELETE realisations for this path. NOT via
             // CASCADE — realisations has NO FK to narinfo (002_
             // store.sql:134). Without this explicit DELETE, dangling
@@ -133,6 +166,7 @@ pub async fn sweep(
 
     info!(
         paths_deleted = stats.paths_deleted,
+        paths_resurrected = stats.paths_resurrected,
         chunks_deleted = stats.chunks_deleted,
         s3_keys_enqueued = stats.s3_keys_enqueued,
         bytes_freed = stats.bytes_freed,
@@ -233,5 +267,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "dry-run should roll back");
+    }
+
+    /// Z2 hybrid: sweep's per-path reference re-check catches paths
+    /// that gained a new referrer AFTER mark. This simulates the race:
+    /// mark declared P unreachable, a PutPath for Q completes with
+    /// references=[P], sweep runs and must skip P.
+    #[tokio::test]
+    async fn sweep_resurrected_path_skipped() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // P: marked unreachable (would be swept).
+        let p = "/nix/store/pppppppppppppppppppppppppppppppp-resurrected";
+        let p_hash = seed_complete_path(&db.pool, p).await;
+
+        // Q: references P. Seeded AFTER mark (simulating the race:
+        // mark returned [p_hash], THEN PutPath for Q completed).
+        let q = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-referrer";
+        let q_hash: Vec<u8> = sha2::Sha256::digest(q.as_bytes()).to_vec();
+        sqlx::query(
+            r#"INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size, "references")
+               VALUES ($1, $2, $1, 0, ARRAY[$3::text])"#,
+        )
+        .bind(&q_hash)
+        .bind(q)
+        .bind(p)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+            .bind(&q_hash)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Sweep with P in the unreachable list. Z2 re-check should
+        // find Q.references=[P] → skip P → paths_resurrected=1.
+        let stats = sweep(&db.pool, None, vec![p_hash.clone()], false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.paths_deleted, 0,
+            "P should NOT be deleted — Q references it"
+        );
+        assert_eq!(
+            stats.paths_resurrected, 1,
+            "P should be counted as resurrected (Z2 re-check)"
+        );
+
+        // P still exists in narinfo.
+        let p_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM narinfo WHERE store_path_hash = $1)")
+                .bind(&p_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(p_exists, "P should still exist (resurrected, not swept)");
+    }
+
+    /// Z2 sanity: if nobody references the path, sweep proceeds
+    /// normally (no false-positive resurrection).
+    #[tokio::test]
+    async fn sweep_unreferenced_path_deleted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let p = "/nix/store/cccccccccccccccccccccccccccccccc-unreferenced";
+        let hash = seed_complete_path(&db.pool, p).await;
+
+        let stats = sweep(&db.pool, None, vec![hash], false).await.unwrap();
+        assert_eq!(stats.paths_deleted, 1);
+        assert_eq!(stats.paths_resurrected, 0);
     }
 }

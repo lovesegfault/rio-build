@@ -68,4 +68,8 @@ pub fn describe_metrics() {
         "rio_store_chunk_cache_misses_total",
         "moka chunk cache misses"
     );
+    describe_counter!(
+        "rio_store_gc_path_resurrected_total",
+        "Paths skipped by sweep because a new referrer appeared after mark (Z2 race window)"
+    );
 }

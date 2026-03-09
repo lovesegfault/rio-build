@@ -92,6 +92,9 @@ x509-parser = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# Advisory lock RAII: detach PoolConnection on ANY exit (including
+# cancel) so PG session-scoped lock auto-releases. Round 4 Z2/Z7.
+scopeguard = "1"
 
 # Config
 serde = { workspace = true }

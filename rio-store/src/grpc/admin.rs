@@ -16,11 +16,7 @@ use rio_proto::types::{GcProgress, GcRequest, PinPathRequest, PinPathResponse};
 
 use crate::backend::chunk::ChunkBackend;
 use crate::gc;
-
-/// PG advisory lock ID for TriggerGC. Arbitrary constant — just
-/// needs to not collide with other advisory locks in the schema
-/// (currently none). "rOGC" ASCII + 1.
-const GC_LOCK_ID: i64 = 0x724F_4743_0001;
+use crate::gc::{GC_LOCK_ID, GC_MARK_LOCK_ID};
 
 /// StoreAdminService gRPC server.
 pub struct StoreAdminServiceImpl {
@@ -163,6 +159,54 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             }
 
             // --- Mark phase ---
+            // Z2 hybrid: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
+            // CTE only (~1s for typical store). PutPath holds this
+            // SHARED around placeholder→complete, so mark blocks until
+            // no PutPath is mid-write. This guarantees the reference
+            // graph seen by mark is consistent: no PutPath can add a
+            // new reference to a path mark is about to declare dead.
+            //
+            // Uses a SEPARATE connection (mark_lock_conn) from
+            // lock_conn (GC_LOCK_ID) — both are session-scoped, but
+            // keeping them on separate connections means we can drop
+            // mark_lock_conn immediately after mark returns (releasing
+            // the PutPath-blocking lock early) while GC_LOCK_ID stays
+            // held through sweep.
+            let mark_lock_conn = match pool.acquire().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "TriggerGC: pool acquire for mark lock failed");
+                    let _ = tx
+                        .send(Err(Status::internal(format!("mark lock acquire: {e}"))))
+                        .await;
+                    gc_unlock(lock_conn).await;
+                    return;
+                }
+            };
+            // scopeguard: if mark fails or task is cancelled, the
+            // connection is DETACHED (not returned to pool) → PG
+            // auto-releases the session-scoped lock on connection
+            // close. On success we explicitly unlock + defuse below.
+            let mut mark_lock_guard = scopeguard::guard(mark_lock_conn, |c| {
+                // detach() removes from pool; dropping the detached
+                // Connection closes it → PG releases session lock.
+                let _ = c.detach();
+            });
+
+            // Acquire exclusive. Blocks until no PutPath holds shared.
+            if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(GC_MARK_LOCK_ID)
+                .execute(&mut **mark_lock_guard)
+                .await
+            {
+                warn!(error = %e, "TriggerGC: mark advisory lock query failed");
+                let _ = tx
+                    .send(Err(Status::internal(format!("mark lock: {e}"))))
+                    .await;
+                gc_unlock(lock_conn).await;
+                return; // mark_lock_guard detached by scopeguard
+            }
+
             let unreachable =
                 match gc::mark::compute_unreachable(&pool, grace_hours, &req.extra_roots).await {
                     Ok(u) => u,
@@ -172,9 +216,22 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                             .send(Err(Status::internal(format!("mark phase: {e}"))))
                             .await;
                         gc_unlock(lock_conn).await;
-                        return;
+                        return; // mark_lock_guard detached by scopeguard
                     }
                 };
+
+            // Mark done — release the mark lock EXPLICITLY (early,
+            // before sweep) and defuse the scopeguard. PutPath can now
+            // proceed; sweep's per-path re-check handles any race.
+            let mut mark_lock_conn = scopeguard::ScopeGuard::into_inner(mark_lock_guard);
+            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(GC_MARK_LOCK_ID)
+                .execute(&mut *mark_lock_conn)
+                .await
+            {
+                warn!(error = %e, "TriggerGC: mark advisory unlock failed (continuing — conn drop will release)");
+            }
+            drop(mark_lock_conn); // returns to pool (lock already released)
 
             // Progress after mark: scanned count. We don't have
             // a "total paths" count cheaply (would need COUNT(*)

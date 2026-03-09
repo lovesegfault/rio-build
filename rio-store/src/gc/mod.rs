@@ -42,6 +42,30 @@ pub mod mark;
 pub mod orphan;
 pub mod sweep;
 
+/// PG advisory lock ID for TriggerGC. Arbitrary constant — just
+/// needs to not collide with other advisory locks in the schema
+/// (only GC_MARK_LOCK_ID below). "rOGC" ASCII + 1.
+///
+/// Serializes GC-vs-GC: two concurrent TriggerGC calls would
+/// waste work and produce misleading stats. `pg_try_advisory_lock`
+/// (non-blocking) — second caller gets "already running".
+pub const GC_LOCK_ID: i64 = 0x724F_4743_0001;
+
+/// PG advisory lock ID for the mark-vs-PutPath race. Round 4 Z2.
+///
+/// PutPath takes this SHARED (`pg_advisory_lock_shared`) around
+/// the placeholder insert → complete_manifest window. Mark takes
+/// this EXCLUSIVE (`pg_advisory_lock`) around `compute_unreachable`.
+/// Sweep does NOT hold it — instead it re-checks references
+/// per-path inside the FOR UPDATE tx (GIN-indexed).
+///
+/// This gives: mark blocks PutPath for ~1s (CTE duration),
+/// sweep doesn't block PutPath at all. If a PutPath completes
+/// BETWEEN mark and sweep with a reference to a marked-unreachable
+/// path, sweep's re-check catches it and skips the delete
+/// (`rio_store_gc_path_resurrected_total` metric).
+pub const GC_MARK_LOCK_ID: i64 = 0x724F_4743_0002;
+
 use std::sync::Arc;
 
 use sqlx::{Postgres, Transaction};
@@ -61,6 +85,12 @@ pub struct GcStats {
     pub s3_keys_enqueued: u64,
     /// Total bytes of chunks marked deleted (for storage savings estimate).
     pub bytes_freed: u64,
+    /// Paths skipped because a new narinfo referenced them after
+    /// mark (Z2 hybrid race window — a PutPath completed BETWEEN
+    /// mark and sweep with this path in its references). Sweep's
+    /// per-path re-check catches these and skips the delete.
+    /// Metric for alerting if this is frequent.
+    pub paths_resurrected: u64,
 }
 
 /// Result of [`decrement_and_enqueue`]: stats for the chunks touched by

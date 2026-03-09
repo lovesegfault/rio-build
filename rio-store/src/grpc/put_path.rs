@@ -274,7 +274,39 @@ impl StoreServiceImpl {
             }
         }
 
-        // Step 3: Insert manifest placeholder with status='uploading'.
+        // Step 3a: Take GC_MARK_LOCK_ID SHARED. Round 4 Z2 hybrid.
+        // Held from placeholder insert → complete_manifest (or abort).
+        // Mark takes this EXCLUSIVE around compute_unreachable, so
+        // mark sees a consistent reference graph: no PutPath can be
+        // mid-write (placeholder exists, references='{}') while mark
+        // runs. Shared-shared is compatible — multiple PutPaths don't
+        // block each other.
+        //
+        // scopeguard: on ANY exit (error, cancel, early return), the
+        // connection is detached (not returned to pool). PG auto-
+        // releases session-scoped locks on connection close. On
+        // success, we defuse (ScopeGuard::into_inner) and explicitly
+        // unlock + return the conn to the pool.
+        let mark_lock_conn = match self.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                drain_stream(&mut stream).await;
+                return Err(internal_error("PutPath: mark lock acquire", e));
+            }
+        };
+        let mut mark_lock_guard = scopeguard::guard(mark_lock_conn, |c| {
+            let _ = c.detach();
+        });
+        if let Err(e) = sqlx::query("SELECT pg_advisory_lock_shared($1)")
+            .bind(crate::gc::GC_MARK_LOCK_ID)
+            .execute(&mut **mark_lock_guard)
+            .await
+        {
+            drain_stream(&mut stream).await;
+            return Err(internal_error("PutPath: mark lock shared", e));
+        }
+
+        // Step 3b: Insert manifest placeholder with status='uploading'.
         // Returns false (ON CONFLICT DO NOTHING no-op) if another uploader
         // already holds a placeholder. In that case we must NOT proceed: if
         // we do and later fail validation, delete_manifest_uploading would
@@ -514,6 +546,21 @@ impl StoreServiceImpl {
                 "content_index insert failed (path still addressable by store_path)"
             );
         }
+
+        // Upload complete — release mark lock (shared) and return
+        // connection to pool. Defuse the scopeguard (we don't want
+        // detach on the happy path — that'd leak a pool slot).
+        let mut mark_lock_conn = scopeguard::ScopeGuard::into_inner(mark_lock_guard);
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
+            .bind(crate::gc::GC_MARK_LOCK_ID)
+            .execute(&mut *mark_lock_conn)
+            .await
+        {
+            // Non-fatal: upload succeeded, lock will release when
+            // conn recycles. Log so we notice if this is frequent.
+            warn!(error = %e, "PutPath: mark lock shared unlock failed");
+        }
+        drop(mark_lock_conn);
 
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::histogram!("rio_store_put_path_duration_seconds")
