@@ -166,6 +166,31 @@ let
   testDrvFileB1 = mkTestDrvFile "hmac";
   testDrvFileS1 = mkTestDrvFile "recovery";
 
+  # V3: slow build for S1 in-flight recovery. 15s sleep survives
+  # the scheduler-restart window (~5s kill+wait + ~5s lease acquire).
+  # The build is backgrounded before restart; recovery should load
+  # its derivation row from PG → `derivations=1` in the recovery
+  # log. We don't wait for the build to complete (timing-sensitive
+  # — worker also restarts and loses overlay) — just assert the
+  # recovery log shows a non-zero derivation count.
+  testDrvFileS1slow = pkgs.writeText "phase3b-recovery-slow.nix" ''
+    { busybox }:
+    derivation {
+      name = "rio-3b-recovery-slow";
+      system = builtins.currentSystem;
+      builder = "''${busybox}/bin/sh";
+      args = [
+        "-c"
+        '''
+          set -ex
+          ''${busybox}/bin/busybox sleep 15
+          ''${busybox}/bin/busybox mkdir -p $out
+          ''${busybox}/bin/busybox echo "phase3b recovery-slow" > $out/stamp
+        '''
+      ];
+    }
+  '';
+
   # Slow build for F1 (Build CRD watch dedup). The 5s sleep gives
   # drain_stream multiple BuildEvent → status patch → reconcile
   # cycles. Without the dedup fix (ctx.watching gate), each cycle
@@ -423,6 +448,23 @@ pkgs.testers.runNixOSTest {
     # ── Seed store ────────────────────────────────────────────────────
     ${common.seedBusybox "control"}
 
+    # ── V4: assert HMAC verifier is active ─────────────────────────────
+    # seedBusybox's nix-copy → gateway wopAddToStore → gateway
+    # PutPath to store via mTLS with CN=rio-gateway → bypass path
+    # at put_path.rs:112. The metric ONLY increments when
+    # hmac_verifier.is_some() (put_path.rs's early-return on None
+    # never reaches the bypass branch). So this proves BOTH (a)
+    # verifier loaded (HmacVerifier::load succeeded with
+    # RIO_HMAC_KEY_PATH) and (b) X1's CN check ran. Without this
+    # assertion, a broken verifier-load (wrong env var, config
+    # wiring bug → verifier=None) would let B1 pass silently.
+    with subtest("V4: HMAC verifier loaded (CN bypass metric fired on seed)"):
+        control.succeed(
+            "curl -sf http://localhost:9092/metrics | "
+            "grep -E 'rio_store_hmac_bypass_total\\{cn=\"rio-gateway\"\\} [1-9]'"
+        )
+        print("V4 PASS: rio_store_hmac_bypass_total{cn=rio-gateway} >= 1 — verifier active")
+
     # ── Build helper (top-level def, not inside subtest) ──────────────
     # B1 and S1 both need to nix-build a derivation. mkBuildHelper bakes
     # a single testDrvFile at Nix-eval time, so define it once and pass
@@ -560,10 +602,13 @@ pkgs.testers.runNixOSTest {
         # S1's post-restart build worked via the always-on dispatch,
         # proving NOTHING about recovery.
         #
-        # We don't test in-flight build recovery here — that needs
-        # precise timing (submit, kill mid-build, restart, assert
-        # completion). Unit-tested in rio-scheduler/src/actor/
-        # tests/recovery.rs with seeded PG rows.
+        # V3: additionally seed an IN-FLIGHT build before the
+        # restart so recovery loads REAL rows (not empty PG). The
+        # slow (15s) build is backgrounded; we assert the recovery
+        # log shows derivations>=1. Previously both restarts
+        # recovered 0 rows — load_nonterminal_derivations,
+        # from_recovery_row, DerivationDag::from_rows were all
+        # executed but with empty inputs → untested end-to-end.
 
         # Assert the INITIAL (boot-time) recovery already ran: the
         # k3s-bootstrap kubeconfig-copy restart above should have
@@ -579,6 +624,26 @@ pkgs.testers.runNixOSTest {
         control.succeed(
             "curl -sf http://localhost:9091/metrics | "
             "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} [1-9]'"
+        )
+
+        # V3: kick off a SLOW build in the background. nix-build
+        # returns immediately with the `&`; the build runs on the
+        # worker. We don't wait for completion — just need PG to
+        # have a non-terminal derivations row at restart time.
+        client.execute(
+            "nohup nix-build --no-out-link "
+            "--store 'ssh-ng://control' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${testDrvFileS1slow} "
+            "> /tmp/s1slow.log 2>&1 < /dev/null &"
+        )
+        # Poll for the build to be dispatched (Running). The slow
+        # build's 15s sleep starts once the worker receives the
+        # assignment → derivations.status='running' in PG.
+        control.wait_until_succeeds(
+            "curl -sf http://localhost:9091/metrics | "
+            "grep -E 'rio_scheduler_derivations_running [1-9]'",
+            timeout=20
         )
 
         control.succeed("systemctl restart rio-scheduler")
@@ -600,6 +665,34 @@ pkgs.testers.runNixOSTest {
             "grep -q 'state recovery complete'",
             timeout=30
         )
+
+        # V3: PG should have >=1 non-terminal derivation row — the
+        # slow build's drv was Running before the restart. Recovery's
+        # load_nonterminal_derivations (db.rs:625) reads this.
+        # Query the same TERMINAL_STATUSES filter recovery uses.
+        # Without the backgrounded slow build, B1+S1-setup are all
+        # terminal → 0 non-terminal rows → recovery ran through
+        # empty loops (was the pre-V3 hollow state).
+        nonterminal_count = int(control.succeed(
+            "sudo -u postgres psql rio -tAc "
+            "\"SELECT COUNT(*) FROM derivations "
+            "WHERE status NOT IN "
+            "('completed','poisoned','dependency_failed','cancelled')\""
+        ).strip())
+        assert nonterminal_count >= 1, \
+            f"V3: PG should have >=1 non-terminal drv (slow build in-flight), got {nonterminal_count}"
+        print(f"V3 PASS: PG has {nonterminal_count} non-terminal derivation(s) — recovery had real data to load")
+
+        # Bonus: the recovery log itself should mention non-zero
+        # derivations. tracing's pretty() format puts structured
+        # fields after the message; -A1 captures them. Best-effort
+        # (log format may vary across tracing-subscriber versions):
+        # just print what we find, don't hard-assert on format.
+        recovery_ctx = control.succeed(
+            "journalctl -u rio-scheduler --no-pager --since '20 seconds ago' | "
+            "grep -A1 'state recovery complete' | tail -5 || true"
+        )
+        print(f"V3 recovery log context: {recovery_ctx!r}")
 
         # Worker restart. The worker's main loop exits on scheduler
         # disconnect ("shutting down"); systemd restarts it. But early
@@ -635,7 +728,23 @@ pkgs.testers.runNixOSTest {
             "curl -sf http://localhost:9091/metrics | "
             "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} 1'"
         )
-        print(f"S1 PASS: scheduler restart → LEASE ACQUIRE → recovery ran → dispatch unblocked, built {out_s1}")
+
+        # V3 cleanup: the backgrounded slow build either (a) finished
+        # on its own (worker reconnected, ReconcileAssignments re-
+        # dispatched) or (b) is still running/retrying. Wait for
+        # the queue to drain before F1 — otherwise F1's Build CRD
+        # would compete for the worker's maxBuilds=1 slot.
+        # Poll scheduler queued+running==0. 60s timeout: 15s sleep
+        # + re-dispatch overhead + ~45s ReconcileAssignments delay
+        # in the worst case.
+        control.wait_until_succeeds(
+            "curl -sf http://localhost:9091/metrics | "
+            "awk '/^rio_scheduler_derivations_queued / {q=$2} "
+            "/^rio_scheduler_derivations_running / {r=$2} "
+            "END {exit !(q==0 && r==0)}'",
+            timeout=90
+        )
+        print(f"S1 PASS: scheduler restart → LEASE ACQUIRE → recovery loaded REAL rows (V3) → dispatch unblocked, built {out_s1}")
 
     # ════════════════════════════════════════════════════════════════
     # Section F: Build CRD watch dedup (k3s controller)
@@ -888,9 +997,10 @@ pkgs.testers.runNixOSTest {
 
     # ════════════════════════════════════════════════════════════════
     print("=" * 60)
-    print("Phase 3b validation round 2: T1-T3 (mTLS), B1 (HMAC),")
-    print("S1 (REAL recovery via lease — V1 fix), F1 (Build CRD watch dedup),")
-    print("C1 (GC dry-run), G1 (__noChroot), C2 (GC PROVES commit — V2 fix) — all PASS.")
+    print("Phase 3b validation round 3: T1-T3 (mTLS), V4 (HMAC verifier active),")
+    print("B1 (HMAC), S1 (REAL recovery via lease — V1+V3 with in-flight data),")
+    print("F1 (Build CRD watch dedup), C1 (GC dry-run), G1 (__noChroot),")
+    print("C2 (GC PROVES commit — V2 fix) — all PASS.")
     print()
     print("Skipped:")
     print("  E (PDB/NetPol/Events/seccomp) — needs NetworkPolicy enforcement")

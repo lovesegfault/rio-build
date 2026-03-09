@@ -420,7 +420,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
     // not yet uploaded). SHA-256 of a fake input path.
     let input_path = test_store_path("y2-fake-input");
     let db = SchedulerDb::new(sched_db.pool.clone());
-    db.pin_live_inputs(&"y2-drv".into(), &[input_path.clone()])
+    db.pin_live_inputs(&"y2-drv".into(), std::slice::from_ref(&input_path))
         .await?;
 
     // Verify pin seeded.
