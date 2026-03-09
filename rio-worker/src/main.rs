@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
 
-    let _fuse_session = fuse::mount_fuse_background(
+    let fuse_session = fuse::mount_fuse_background(
         &cfg.fuse_mount_point,
         cache,
         store_client.clone(),
@@ -433,6 +433,22 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    // Explicit unmount+join: BackgroundSession has NO Drop impl, so
+    // dropping it detaches the FUSE thread. Mount's Drop DOES umount
+    // (kernel sends DESTROY to the session), but the main thread
+    // races to exit() before the detached FUSE thread can process
+    // DESTROY → Filesystem::destroy() never runs → passthrough-
+    // failure stats lost, profraw never flushed for that code.
+    // umount_and_join() unmounts THEN joins the thread, ensuring
+    // destroy() completes before main returns. spawn_blocking because
+    // join() blocks the OS thread.
+    let join_result = tokio::task::spawn_blocking(move || fuse_session.umount_and_join()).await;
+    match join_result {
+        Ok(Ok(())) => tracing::debug!("FUSE session unmounted and joined"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "FUSE umount/join failed"),
+        Err(e) => tracing::warn!(error = %e, "FUSE join task panicked"),
+    }
+
     Ok(())
 }
 
@@ -543,9 +559,10 @@ async fn run_drain(
                 }
             }
 
-            // _fuse_session Drop handles unmount. build_stream Drop
-            // closes the gRPC stream → scheduler WorkerDisconnected
-            // → removes our entry (if DrainWorker didn't already).
+            // FUSE unmount+join after return (see end of main).
+            // build_stream Drop closes gRPC → scheduler
+            // WorkerDisconnected → removes our entry (if DrainWorker
+            // didn't already).
             info!("drain complete, exiting");
         }
         DrainReason::StreamClosed => {

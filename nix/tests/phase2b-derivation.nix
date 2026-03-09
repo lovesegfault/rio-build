@@ -36,6 +36,11 @@ let
               ''
                 ${bb} cat ${dep}/chain > $out/chain
                 ${bb} echo "${name}" >> $out/chain
+                # Exercise FUSE readdir: builds otherwise access deps by
+                # known path only (cat ${dep}/chain). Listing the dep dir
+                # goes overlayfs-lower → FUSE readdir() — without this,
+                # ops.rs:readdir stays uncov (~70 lines).
+                ${bb} ls -la ${dep}/ >&2
               ''
           }
         ''
