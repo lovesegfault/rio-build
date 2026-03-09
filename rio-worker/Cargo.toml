@@ -28,6 +28,10 @@ fuser = { workspace = true }
 sqlx = { workspace = true }
 nix = { workspace = true }
 sha2 = { workspace = true }
+# FOD hash verification: Nix FODs can declare sha1/sha256/sha512.
+# Round 4 Z8: sha1 FODs were rejected with a false-positive because
+# verify_fod_hashes hardcoded SHA-256.
+sha1 = { workspace = true }
 hex = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

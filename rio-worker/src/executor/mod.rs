@@ -600,6 +600,51 @@ pub async fn execute_build(
     // sum of uploaded NAR sizes (only set on successful upload path).
     let mut output_size_bytes = 0u64;
     let proto_result = if build_result.status.is_success() {
+        // Round 4 Z9: FOD defense-in-depth BEFORE upload.
+        // verify_fod_hashes now computes local NAR hashes (via
+        // dump_path_streaming + digest sink) so we can reject a
+        // bad output WITHOUT uploading it first. Prior to this,
+        // verify ran after upload using uploads[].nar_hash — the
+        // bad output was already in the store (content-index
+        // inserted, manifest complete) before we noticed.
+        //
+        // spawn_blocking: verify_fod_hashes does sync filesystem I/O
+        // (fs::read for flat, dump_path_streaming for recursive) +
+        // hashing. Typical FOD outputs are small (fetchurl), so
+        // this is fast.
+        if assignment.is_fixed_output {
+            let drv_for_verify = drv.clone();
+            let upper_for_verify = overlay_mount.upper_dir().to_path_buf();
+            let verify_result = tokio::task::spawn_blocking(move || {
+                verify_fod_hashes(&drv_for_verify, &upper_for_verify)
+            })
+            .await
+            .map_err(|e| ExecutorError::BuildFailed(format!("FOD verify task panicked: {e}")))?;
+
+            if let Err(e) = verify_result {
+                tracing::error!(
+                    drv_path = %drv_path,
+                    error = %e,
+                    "FOD output hash verification failed — NOT uploading"
+                );
+                return Ok(ExecutionResult {
+                    drv_path: drv_path.clone(),
+                    result: ProtoBuildResult {
+                        status: BuildResultStatus::OutputRejected.into(),
+                        error_msg: format!("FOD output hash verification failed: {e}"),
+                        ..Default::default()
+                    },
+                    assignment_token: assignment.assignment_token.clone(),
+                    // Build DID run (FOD verification is post-build).
+                    // cgroup was populated → memory+cpu are meaningful
+                    // even though we reject the output.
+                    peak_memory_bytes,
+                    output_size_bytes: 0,
+                    peak_cpu_cores,
+                });
+            }
+        }
+
         tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
 
         // Upload outputs
@@ -615,34 +660,6 @@ pub async fn execute_build(
         .await
         {
             Ok(upload_results) => {
-                // FOD defense-in-depth: verify output hashes match declared outputHash.
-                // nix-daemon already verifies, but we re-check before accepting.
-                if assignment.is_fixed_output
-                    && let Err(e) =
-                        verify_fod_hashes(&drv, &upload_results, overlay_mount.upper_dir())
-                {
-                    tracing::error!(
-                        drv_path = %drv_path,
-                        error = %e,
-                        "FOD output hash verification failed"
-                    );
-                    return Ok(ExecutionResult {
-                        drv_path: drv_path.clone(),
-                        result: ProtoBuildResult {
-                            status: BuildResultStatus::OutputRejected.into(),
-                            error_msg: format!("FOD output hash verification failed: {e}"),
-                            ..Default::default()
-                        },
-                        assignment_token: assignment.assignment_token.clone(),
-                        // Build DID run (FOD verification is post-build).
-                        // cgroup was populated → memory+cpu are meaningful
-                        // even though we reject the output.
-                        peak_memory_bytes,
-                        output_size_bytes: 0,
-                        peak_cpu_cores,
-                    });
-                }
-
                 // Sum NAR sizes for the CompletionReport. Feeds
                 // build_history.ema_output_size_bytes — not used for
                 // routing yet but useful for dashboards / capacity.
