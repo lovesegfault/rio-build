@@ -1,26 +1,25 @@
 # Phase 3b milestone validation: production hardening.
 #
-# Iteration 2: mTLS (T), HMAC (B), state recovery (S), GC (C),
-# gateway validation (G). Skips k3s-dependent sections (E/F/D) —
-# those need real K8s API (PDB/NetPol/Events/Build CRD); the FOD
-# proxy (D) needs a Squid VM. Skips A (cancel via cgroup.kill) —
-# complex timing, unit-tested in rio-worker/src/runtime.rs.
+# Iteration 3: mTLS (T), HMAC (B), state recovery (S), Build CRD
+# watch dedup (F), GC dry-run (C1), gateway validation (G), real
+# GC sweep + PinPath (C2). Skips E/D (PDB/NetPol/FOD proxy) —
+# those need NetworkPolicy + Squid VM. Skips A (cancel timing).
 #
-# Topology (3 VMs):
+# Topology (4 VMs — iteration 3 adds k8s):
 #   control — PG + store + scheduler + gateway. Server cert with
 #             SANs {control, localhost, 127.0.0.1}. HMAC key
 #             shared with itself (scheduler signs, store verifies).
-#   worker  — rio-worker. Client cert signed by the same CA.
-#             Connects to control:9001/9002 → SNI=control (tonic
-#             derives SNI from URL host; see rio-common/src/tls.rs).
-#   client  — nix client, ssh-ng to gateway. SSH doesn't use gRPC
-#             TLS — client stays plaintext.
+#   worker  — rio-worker (NATIVE NixOS service, not a pod).
+#             Client cert signed by the same CA. Connects to
+#             control:9001/9002 → SNI=control.
+#   k8s     — k3s + rio-controller. Build CRD reconciler connects
+#             to control:9001/9002 via client cert (same CA).
+#             No worker pod — the native worker handles builds.
+#   client  — nix client, ssh-ng to gateway.
 #
 # PKI: generated at Nix eval time via pkgs.runCommand + openssl.
-# Self-signed CA → server cert → client cert. Simpler than
-# cert-manager in VM; cert-manager correctness is EKS smoke scope.
-# The PKI derivation is a store path → available on all VMs (NixOS
-# test driver makes the test's closure available on every node).
+# Self-signed CA → server cert → client cert. The PKI derivation
+# is a store path → available on all VMs.
 #
 # Run:
 #   NIXBUILDNET_REUSE_BUILD_FAILURES=false nix-build-remote --no-nom -- -L .#checks.x86_64-linux.vm-phase3b
@@ -28,10 +27,11 @@
   pkgs,
   rio-workspace,
   rioModules,
-  # dockerImages + crds: passed for k3s sections (iteration 3).
-  # Unused in iteration 2 but the flake passes them to all
-  # phase3* tests — `...` swallows them so deadnix is happy and
-  # the callers don't branch.
+  # crds: auto-deployed via k3s manifests (F1 section).
+  crds,
+  # dockerImages: passed by flake for k3s airgap preload. Unused
+  # here (worker stays native NixOS service, no WorkerPool CR) so
+  # swallowed via `...` — alternative is flake-side branching.
   ...
 }:
 let
@@ -123,7 +123,7 @@ let
           --proto_path=${../../rio-proto/proto} \
           --descriptor_set_out=$out/rio.protoset \
           --include_imports \
-          admin.proto types.proto
+          admin.proto store.proto types.proto
       '';
 
   # ── Trivial derivation for build tests (B1, S1) ─────────────────────
@@ -152,6 +152,28 @@ let
 
   testDrvFileB1 = mkTestDrvFile "hmac";
   testDrvFileS1 = mkTestDrvFile "recovery";
+
+  # Slow build for F1 (Build CRD watch dedup). The 5s sleep gives
+  # drain_stream multiple BuildEvent → status patch → reconcile
+  # cycles. Without the dedup fix (ctx.watching gate), each cycle
+  # spawns a duplicate watch. The metric assertion catches it.
+  testDrvFileF1 = pkgs.writeText "phase3b-watchdedup.nix" ''
+    { busybox }:
+    derivation {
+      name = "rio-3b-watchdedup";
+      system = builtins.currentSystem;
+      builder = "''${busybox}/bin/sh";
+      args = [
+        "-c"
+        '''
+          set -ex
+          ''${busybox}/bin/busybox sleep 5
+          ''${busybox}/bin/busybox mkdir -p $out
+          ''${busybox}/bin/busybox echo "phase3b watchdedup" > $out/stamp
+        '''
+      ];
+    }
+  '';
 
   # __noChroot derivation: REJECTED by gateway's translate::validate_dag.
   # Rejection is pre-SubmitBuild so scheduler never sees it — no TLS
@@ -236,6 +258,26 @@ pkgs.testers.runNixOSTest {
       hostName = "worker";
       maxBuilds = 1;
       extraServiceEnv = workerTlsEnv;
+    };
+
+    # k3s + rio-controller for F1 (Build CRD watch dedup). Worker
+    # stays NATIVE (above) — no WorkerPool CR, no pod. The
+    # controller only reconciles Build CRs. Controller connects
+    # OUTBOUND to control:9001/9002 using the client cert (same
+    # workerTlsEnv — CN is cosmetic, CA chain is what matters).
+    k8s = common.mkK3sNode {
+      controllerEnv = {
+        KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
+        RIO_SCHEDULER_ADDR = "control:9001";
+        RIO_STORE_ADDR = "control:9002";
+        RIO_LOG_FORMAT = "pretty";
+      }
+      // workerTlsEnv;
+      manifests = {
+        # Just CRDs — no WorkerPool. Worker is native.
+        "00-rio-crds".source = crds;
+      };
+      # No extraK3sImages: no pods to preload.
     };
 
     client = common.mkClientNode {
@@ -444,6 +486,88 @@ pkgs.testers.runNixOSTest {
         print(f"S1 PASS: scheduler restart → recovery → dispatch unblocked, built {out_s1}")
 
     # ════════════════════════════════════════════════════════════════
+    # Section F: Build CRD watch dedup (k3s controller)
+    # ════════════════════════════════════════════════════════════════
+
+    with subtest("F1: Build CRD watch spawns once, not per-reconcile"):
+        # Wait for k3s apiserver + CRDs established. The k8s node
+        # has been booting in parallel since start_all; by now
+        # (after T1-S1, ~60s+) it should be well past k3s startup.
+        k8s.wait_for_unit("k3s.service")
+        k8s.wait_until_succeeds(
+            "k3s kubectl get crd builds.rio.build", timeout=60
+        )
+        k8s.wait_for_unit("rio-controller.service")
+
+        # Seed the .drv into rio-store (no build yet — just the
+        # .drv file). `nix copy --derivation` uploads the .drv
+        # closure without building outputs. The Build reconciler's
+        # fetch_and_build_node reads it from store.
+        drv_path_f1 = client.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${testDrvFileF1} 2>/dev/null"
+        ).strip()
+        client.succeed(
+            f"nix copy --derivation --to 'ssh-ng://control' {drv_path_f1}"
+        )
+
+        # Apply Build CR. The 5s sleep in the derivation gives
+        # multiple BuildEvent cycles (Pending → Building → log
+        # lines → Succeeded). Each cycle: drain_stream patches
+        # status → apiserver watch event → controller re-enqueues
+        # → apply() runs. Without dedup: each cycle spawns a
+        # duplicate drain_stream.
+        k8s.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Build\n"
+            "metadata:\n"
+            "  name: test-watch-dedup\n"
+            "  namespace: default\n"
+            "spec:\n"
+            f"  derivation: {drv_path_f1}\n"
+            "  priority: 10\n"
+            "EOF"
+        )
+
+        # Wait for terminal phase (5s sleep + dispatch overhead).
+        k8s.wait_until_succeeds(
+            "k3s kubectl get build test-watch-dedup "
+            "-o jsonpath='{.status.phase}' | "
+            "grep -E '^(Succeeded|Completed|Cached)$'",
+            timeout=60
+        )
+
+        # Assert 1: rio_controller_build_watch_spawns_total == 1.
+        # Without dedup: ≥3 (one per status transition that
+        # triggered a reconcile). The metric is on port 9094
+        # (controller's prometheus exporter).
+        spawns = k8s.succeed(
+            "curl -sf http://localhost:9094/metrics | "
+            "grep '^rio_controller_build_watch_spawns_total ' | "
+            "awk '{print $2}'"
+        ).strip()
+        assert spawns == "1", \
+            f"F1: expected 1 watch spawn (dedup), got {spawns}"
+
+        # Assert 2: controller did NOT log "reconnecting
+        # WatchBuild". Without dedup, each reconcile after the
+        # first hits the is_real_uuid && !is_terminal gate →
+        # "reconnecting" log + spawn_reconnect_watch. With dedup,
+        # ctx.watching.contains_key returns true → silent skip.
+        reconnect_count = k8s.succeed(
+            "journalctl -u rio-controller --no-pager | "
+            "grep -c 'reconnecting WatchBuild' || true"
+        ).strip()
+        assert reconnect_count == "0", \
+            f"F1: expected 0 reconnect-path spawns, got {reconnect_count}"
+
+        # Cleanup. --wait=false: don't block on finalizer.
+        k8s.succeed("k3s kubectl delete build test-watch-dedup --wait=false")
+        print(f"F1 PASS: Build CRD watch spawned once (spawns={spawns}, reconnects={reconnect_count})")
+
+    # ════════════════════════════════════════════════════════════════
     # Section C: GC (mark-sweep + pending_s3_deletes)
     # ════════════════════════════════════════════════════════════════
 
@@ -511,13 +635,90 @@ pkgs.testers.runNixOSTest {
         print("G1 PASS: __noChroot rejected at gateway")
 
     # ════════════════════════════════════════════════════════════════
+    # Section C2: real GC sweep (non-dry-run commit path) + PinPath
+    # ════════════════════════════════════════════════════════════════
+    #
+    # Runs LAST: worker uploads have references: Vec::new()
+    # (upload.rs:228 — phase4 gap) so pinning B1 does NOT reach
+    # busybox. If we GC with grace=0, busybox gets swept → all
+    # subsequent builds break. grace=24h keeps everything safe.
+    #
+    # What this proves: PinPath FK passes, sweep tx.commit runs
+    # (vs C1's ROLLBACK), stream completes, UnpinPath round-trip.
+    # NOT proving actual deletion — grace covers everything.
+
+    with subtest("C2: PinPath + non-dry-run GC sweep + UnpinPath"):
+        # Pin B1's output. PinPath is rio.store.StoreAdminService
+        # on port 9002 (store), NOT rio.admin.AdminService on 9001
+        # (scheduler — that has TriggerGC proxy, not Pin/Unpin).
+        control.succeed(
+            "grpcurl "
+            "-cacert ${pki}/ca.crt "
+            "-cert ${pki}/server.crt -key ${pki}/server.key "
+            "-authority localhost "
+            "-protoset ${protoset}/rio.protoset "
+            f"""-d '{{"store_path": "{out_b1}", "source": "vm-phase3b"}}' """
+            "localhost:9002 rio.store.StoreAdminService/PinPath"
+        )
+        # Verify pin persisted (gc_roots has 1 row).
+        control.succeed(
+            "sudo -u postgres psql rio -tc "
+            "'SELECT COUNT(*) FROM gc_roots' | grep -q 1"
+        )
+
+        # Non-dry-run sweep via scheduler proxy. dry_run=false →
+        # sweep COMMITs (vs C1's ROLLBACK). grace=24h so nothing
+        # actually deletes (everything in this VM test is fresh).
+        result = control.succeed(
+            "grpcurl "
+            "-cacert ${pki}/ca.crt "
+            "-cert ${pki}/server.crt -key ${pki}/server.key "
+            "-authority localhost "
+            "-protoset ${protoset}/rio.protoset "
+            """-d '{"dry_run": false, "grace_period_hours": 24}' """
+            "localhost:9001 rio.admin.AdminService/TriggerGC 2>&1"
+        )
+        assert '"isComplete": true' in result or '"isComplete":true' in result, \
+            f"C2: expected GCProgress.isComplete=true: {result[:500]}"
+        # pathsDeleted should be 0 (everything within grace).
+        # grpcurl proto3 JSON may omit default values, or emit
+        # explicit "0" — accept both.
+        assert (
+            '"pathsDeleted": "0"' in result
+            or '"pathsDeleted":"0"' in result
+            or "pathsDeleted" not in result
+        ), f"C2: expected 0 paths deleted (all in grace): {result[:500]}"
+
+        # B1 still queryable (proves commit didn't delete it —
+        # paranoia check; grace should cover it anyway).
+        client.succeed(
+            f"nix path-info --store 'ssh-ng://control' {out_b1}"
+        )
+
+        # UnpinPath round-trip (idempotent unpin).
+        control.succeed(
+            "grpcurl "
+            "-cacert ${pki}/ca.crt "
+            "-cert ${pki}/server.crt -key ${pki}/server.key "
+            "-authority localhost "
+            "-protoset ${protoset}/rio.protoset "
+            f"""-d '{{"store_path": "{out_b1}"}}' """
+            "localhost:9002 rio.store.StoreAdminService/UnpinPath"
+        )
+        control.succeed(
+            "sudo -u postgres psql rio -tc "
+            "'SELECT COUNT(*) FROM gc_roots' | grep -q 0"
+        )
+        print("C2 PASS: PinPath + non-dry-run sweep (commit) + UnpinPath round-trip")
+
+    # ════════════════════════════════════════════════════════════════
     print("=" * 60)
-    print("Phase 3b iteration 2: T1-T3 (mTLS), B1 (HMAC), S1 (recovery),")
-    print("C1 (GC), G1 (__noChroot) — all PASS.")
+    print("Phase 3b iteration 3: T1-T3 (mTLS), B1 (HMAC), S1 (recovery),")
+    print("F1 (Build CRD watch dedup), C1 (GC dry-run), G1 (__noChroot),")
+    print("C2 (GC commit + PinPath) — all PASS.")
     print()
-    print("Skipped (k3s-dependent, iteration 3 scope):")
-    print("  E (PDB/NetPol/Events/seccomp) — needs real K8s API")
-    print("  F (WatchBuild reconnect)      — needs Build CRD")
+    print("Skipped:")
+    print("  E (PDB/NetPol/Events/seccomp) — needs NetworkPolicy enforcement")
     print("  D (FOD proxy)                 — needs Squid VM + NetworkPolicy")
     print("  A (cancel via cgroup.kill)    — timing-sensitive; 6 unit tests")
     print("  B2 (PutPath token reject)     — raw gRPC stream; 10 unit tests")
