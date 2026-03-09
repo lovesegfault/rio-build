@@ -312,7 +312,7 @@ pub async fn spawn_build_task(
         .await;
 
         // Send CompletionReport. Resource fields flow from the executor
-        // (cgroup memory.peak + polled cpu.stat — wired in I2).
+        // (cgroup memory.peak + polled cpu.stat).
         let completion = match result {
             Ok(exec_result) => CompletionReport {
                 drv_path: exec_result.drv_path,
@@ -441,8 +441,7 @@ pub async fn spawn_build_task(
 /// Handle a PrefetchHint from the scheduler: spawn one fire-and-forget
 /// task per path to warm the FUSE cache.
 ///
-/// Extracted from main.rs's event loop — previously a 6-level-nested
-/// inline match arm. Does NOT block the caller: each path is spawned
+/// Called from main.rs's event loop. Does NOT block the caller: each path is spawned
 /// as an independent tokio task that acquires a permit from `sem`
 /// before entering the blocking pool.
 ///
@@ -682,10 +681,9 @@ mod tests {
         assert_eq!(req.size_class, "", "empty = unclassified");
     }
 
-    /// systems + features are populated from static config slices.
-    /// Previously supported_features was hardcoded to Vec::new() —
-    /// the CRD's features field was silently ignored and any
-    /// derivation with requiredSystemFeatures would never dispatch.
+    /// Regression: supported_features must reflect the config — if
+    /// hardcoded empty, the CRD's features field is silently ignored
+    /// and any derivation with requiredSystemFeatures never dispatches.
     #[tokio::test]
     async fn test_heartbeat_includes_systems_and_features() {
         let running = Arc::new(RwLock::new(HashSet::new()));

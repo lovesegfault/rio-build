@@ -5,7 +5,7 @@
 //!   (lookup, getattr). Handles singleflight WAIT semantics — if
 //!   another thread is fetching, block on condvar until it finishes.
 //! - [`prefetch_path_blocking`]: called from the PrefetchHint
-//!   handler (B2) via spawn_blocking. Same singleflight but with
+//!   handler via spawn_blocking. Same singleflight but with
 //!   RETURN-EARLY on WaitFor — prefetch is a hint, not a dependency;
 //!   if FUSE already has it in flight, we're done.
 //!
@@ -85,7 +85,7 @@ impl NixStoreFs {
 /// Why a prefetch returned without fetching. Not an error — both
 /// mean "somebody else is/has handling/handled it."
 ///
-/// Exposed so the B2 metric can distinguish the cases (cache-hit
+/// Exposed so the prefetch metric can distinguish the cases (cache-hit
 /// vs in-flight). Both are "success" from prefetch's perspective.
 #[derive(Debug, Clone, Copy)]
 pub enum PrefetchSkip {
@@ -107,7 +107,7 @@ pub enum PrefetchSkip {
 /// Cache methods use `runtime.block_on` internally (designed for
 /// FUSE callbacks on dedicated blocking threads). Calling from an
 /// async context would panic with nested-runtime. So this fn is
-/// sync and the B2 handler wraps it in spawn_blocking.
+/// sync and the prefetch handler wraps it in spawn_blocking.
 ///
 /// Returns:
 /// - `Ok(None)`: fetched successfully, path is now in cache
@@ -115,7 +115,7 @@ pub enum PrefetchSkip {
 /// - `Err(errno)`: fetch failed (store error, disk full, etc)
 ///
 /// `Err` is an actual problem the operator should see in metrics.
-/// The B2 caller logs at debug (prefetch is a hint — if the store
+/// The prefetch caller logs at debug (prefetch is a hint — if the store
 /// is flaky, the build's own FUSE ops will surface the real error).
 ///
 /// Singleflight: shared with ensure_cached via the same `inflight`

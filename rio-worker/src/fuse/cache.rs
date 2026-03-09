@@ -262,11 +262,10 @@ impl Cache {
                 continue;
             };
             // Match foo.tmp-<16 hex chars> EXACTLY (the pattern used
-            // by fetch_and_extract). Round 4 D5: previously matched
-            // any ".tmp-" substring — a legitimate store path named
-            // e.g. "rust-1.75.0-tmp-build" would be deleted. Require
-            // the suffix to be exactly 16 hex chars (tempfile's
-            // 8-byte random suffix, hex-encoded).
+            // by fetch_and_extract). Require the suffix to be exactly
+            // 16 hex chars (tempfile's 8-byte random suffix) — a
+            // loose `.tmp-` substring match would delete legitimate
+            // store paths like "rust-1.75.0-tmp-build".
             let is_stale_tmp = name_str.rsplit_once(".tmp-").is_some_and(|(_, suffix)| {
                 suffix.len() == 16 && suffix.chars().all(|c| c.is_ascii_hexdigit())
             });
@@ -742,7 +741,7 @@ mod tests {
         Ok(())
     }
 
-    /// The TOCTOU fix: an entry touched within the grace window must NOT be
+    /// TOCTOU protection: an entry touched within the grace window must NOT be
     /// evicted, even when the cache is over limit. An entry outside the grace
     /// window IS evicted. This closes the race where `get_path()` returned a
     /// path that `evict_if_needed()` (running concurrently on another FUSE
@@ -829,8 +828,8 @@ mod tests {
         let fetch_count = Arc::new(AtomicU32::new(0));
 
         // Two threads race to fetch the same path. Exactly one should get
-        // Fetch; the other should WaitFor and be woken promptly (not after
-        // the old 1.4s backoff).
+        // Fetch; the other should WaitFor and be woken promptly by the
+        // condvar notify, not time out.
         let (c1, f1) = (cache.clone(), fetch_count.clone());
         let (c2, f2) = (cache, fetch_count.clone());
 

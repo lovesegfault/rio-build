@@ -147,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up FUSE cache and mount. Arc so we can clone handles
     // BEFORE moving into mount_fuse_background: bloom_handle for
-    // heartbeat, and the Arc itself for B2's prefetch handler.
+    // heartbeat, and the Arc itself for the prefetch handler.
     // Same extract-before-move pattern as bloom_handle always used.
     let cache =
         Arc::new(fuse::cache::Cache::new(cfg.fuse_cache_dir, cfg.fuse_cache_size_gb).await?);
@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
     // same RwLock that cache.insert() writes to — inserts by FUSE
     // ops show up in subsequent heartbeat snapshots.
     let heartbeat_bloom = cache.bloom_handle();
-    // Clone for prefetch (B2). Cache methods use runtime.block_on
+    // Clone for prefetch. Cache methods use runtime.block_on
     // internally (sync, designed for FUSE callbacks on dedicated
     // threads). The prefetch handler will call them via
     // spawn_blocking — async → nested-runtime panic.
@@ -325,9 +325,6 @@ async fn main() -> anyhow::Result<()> {
     // stream messages. K8s sends SIGTERM then starts the grace period
     // clock; we want to react immediately, not after the next gap in
     // assignments.
-    //
-    // The loop body is identical to the old while-let; SIGTERM just
-    // breaks out so the drain sequence below runs.
     let mut build_stream = build_stream;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -529,23 +526,9 @@ async fn run_drain(
             // completion. This is the synchronization point: when this
             // returns, no build is mid-upload.
             //
-            // close() BEFORE acquire_many: close doesn't affect already-
-            // issued permits (they return on drop as usual), it just
-            // rejects new acquires. With the loop broken, no new
-            // acquires happen anyway — close() is belt-and-suspenders.
-            // close() BEFORE the wait has a subtle interaction (see
-            // drain_wait_semaphore_synchronization test): a CLOSED
-            // semaphore returns Err to waiters even when permits DO
-            // return. So if any build is still running when we hit
-            // acquire_many, we get Err — but the builds still complete
-            // (their OwnedPermit Drop works fine; close doesn't affect
-            // that). We just can't OBSERVE completion via acquire.
-            //
-            // Fix: DON'T close() before waiting. close() was meant to
-            // reject new acquires, but we already broke out of the
-            // loop — no new acquires can happen. Skip close() entirely
-            // and acquire_many works as the synchronization primitive
-            // it's meant to be.
+            // DON'T close() before acquire_many: close makes waiting
+            // acquires return Err even when permits return. The loop
+            // already broke — no new acquires can happen.
             match semaphore.acquire_many(max_builds).await {
                 Ok(_all_permits) => {
                     info!("all in-flight builds complete");
@@ -594,7 +577,7 @@ mod tests {
     /// exactly when all in-flight build tasks have dropped their
     /// OwnedPermits.
     ///
-    /// This test CAUGHT A BUG in the initial D3 implementation. The
+    /// This test caught a real bug in an earlier drain implementation. The
     /// original drain sequence was:
     ///   1. `sem.close()`   (reject new acquires)
     ///   2. `sem.acquire_many(max)` (wait for in-flight)
@@ -681,7 +664,7 @@ mod tests {
         assert!(
             result.is_err(),
             "close() cancels waiting acquires even when permits would return. \
-             This is why main.rs skips close() — it was the D3 bug."
+             This is why main.rs skips close() before draining."
         );
     }
 }

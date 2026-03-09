@@ -1,6 +1,6 @@
 //! Per-build cgroup v2 resource tracking.
 //!
-//! Fixes the phase2c VmHWM bug: `read_vmhwm_bytes(daemon.id())`
+//! Solves the whole-tree measurement problem: `read_vmhwm_bytes(daemon.id())`
 //! measured nix-daemon's RSS (~10MB) because nix-daemon FORKS the
 //! builder and waitpid()s — the builder's memory never appeared in
 // r[impl worker.cgroup.sibling-layout]
@@ -16,8 +16,8 @@
 //!
 //! `own_cgroup()` returns `Err` if `/sys/fs/cgroup` isn't cgroup2fs.
 //! `enable_subtree_controllers()` returns `Err` if delegation isn't
-//! set up (systemd `Delegate=yes` on the worker unit — H1 configures
-//! this). The worker's main.rs propagates both with `?` — startup
+//! set up (systemd `Delegate=yes` on the worker unit — the NixOS module
+//! configures this). The worker's main.rs propagates both with `?` — startup
 //! fails. No degraded mode: if a worker pod is Running, cgroup
 //! tracking is live.
 //!
@@ -414,7 +414,7 @@ pub fn own_cgroup() -> io::Result<PathBuf> {
 /// systemd's `Delegate=yes` handles the "worker can write to its
 /// own subtree_control" part — it grants ownership of the cgroup
 /// subtree to the service's UID. Without it, this write fails
-/// EACCES. H1 configures it in the NixOS module.
+/// EACCES. The NixOS module (nix/modules/worker.nix) configures it.
 ///
 /// Idempotent: writing `+memory +cpu` when they're already enabled
 /// is a no-op (kernel returns success). Safe to call on every

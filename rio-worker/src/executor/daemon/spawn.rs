@@ -211,7 +211,7 @@ mod tests {
     use crate::log_stream::LogBatcher;
 
     // -----------------------------------------------------------------------
-    // Group 3: Daemon lifecycle
+    // Daemon lifecycle
     // -----------------------------------------------------------------------
 
     /// Verify that run_daemon_build fails when the process doesn't speak the

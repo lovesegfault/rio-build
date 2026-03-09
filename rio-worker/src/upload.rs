@@ -27,12 +27,10 @@ const MAX_UPLOAD_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
-/// Maximum concurrent output uploads. Phase2a held one full NAR in memory
-/// per in-flight upload (8GiB peak for a 4GiB NAR × 4 = 32GiB). Phase2b's
-/// streaming tee bounds each in-flight upload to `STREAM_CHANNEL_BUF × 256KiB`
-/// (~1MiB buffered), so 4 parallel is now ~4MiB peak. We keep 4 as the
-/// default — disk read bandwidth is the new bottleneck, and 4 concurrent
-/// reads saturate most NVMe queues.
+/// Maximum concurrent output uploads. Each in-flight upload buffers at
+/// most `STREAM_CHANNEL_BUF × 256KiB` (~1MiB); 4 parallel is ~4MiB peak.
+/// Disk read bandwidth is the bottleneck; 4 concurrent reads saturate
+/// typical NVMe queues.
 const MAX_PARALLEL_UPLOADS: usize = 4;
 
 /// Channel buffer between the sync `dump_path_streaming` (in spawn_blocking)
@@ -57,11 +55,9 @@ pub struct UploadResult {
 
 /// Errors from upload operations.
 ///
-/// Phase2a had a `NarSerialize` variant — removed in phase2b. NAR
-/// serialization now happens INSIDE the retry loop (each retry is a fresh
-/// disk read), so NAR errors surface as `UploadExhausted` wrapping a
-/// `tonic::Status::internal("NAR serialization failed...")`. Same fidelity
-/// (error message names path + cause), one fewer match arm for callers.
+/// NAR serialization happens inside the retry loop (each retry is a
+/// fresh disk read), so NAR errors surface as `UploadExhausted` wrapping
+/// a `tonic::Status::internal("NAR serialization failed...")`.
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
     #[error("upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}")]
@@ -99,13 +95,12 @@ pub fn scan_new_outputs(upper_dir: &Path) -> std::io::Result<Vec<String>> {
 
 /// Upload a single output path to the store via single-pass streaming tee.
 ///
-/// ## Single-pass architecture (phase2b)
+/// ## Single-pass streaming tee
 ///
-/// Phase2a: `dump_path()` → full NAR in memory → `Sha256::digest()` →
-/// `chunk_nar_for_put()`. For a 4GiB output: 4GiB for `NarNode::contents`
-/// + 4GiB for the serialized Vec = 8GiB peak.
+/// A naive approach (`dump_path()` → full NAR in memory → `Sha256::digest()`
+/// → chunk) would peak at 2× the NAR size in memory (4GiB output = 8GiB peak).
 ///
-/// Phase2b: `dump_path_streaming()` (inside `spawn_blocking`) writes to a
+/// Instead: `dump_path_streaming()` (inside `spawn_blocking`) writes to a
 /// `HashingChannelWriter` that (a) hashes every byte through SHA-256 AND
 /// (b) buffers into 256KiB chunks → `blocking_send()` to an mpsc channel.
 /// Tonic polls the channel as `PutPathRequest` stream. Hash finalized
@@ -630,11 +625,9 @@ mod tests {
             .await
             .expect_err("should fail NAR serialization");
 
-        // Behavior change: phase2a surfaced NarSerialize (a specific
-        // variant); phase2b surfaces UploadExhausted because the NAR
-        // error happens inside the retry loop (each retry re-reads disk,
-        // each gets the same ENOENT). Same fidelity — error message names
-        // the path and the cause.
+        // NAR error happens inside the retry loop (each retry re-reads
+        // disk, each gets the same ENOENT) → UploadExhausted. Error
+        // message still names path + cause.
         assert!(
             matches!(err, UploadError::UploadExhausted { .. }),
             "expected UploadExhausted, got {err:?}"
@@ -680,7 +673,7 @@ mod tests {
 
     /// The recorded PutPath call in MockStore has the REAL hash from the
     /// trailer — proves the MockStore trailer-apply logic and the upload
-    /// tee produce the same result as phase2a's eager dump+digest.
+    /// tee produce the same result as a naive dump_path() + digest().
     #[tokio::test]
     async fn test_upload_streaming_mockstore_has_trailer_hash() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;

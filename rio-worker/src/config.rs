@@ -30,8 +30,9 @@ pub(crate) struct Config {
     pub(crate) systems: Vec<String>,
     /// requiredSystemFeatures this worker supports (e.g., "kvm",
     /// "big-parallel"). Scheduler's can_build() all-matches the
-    /// derivation's required_features against this. Previously
-    /// hardcoded empty — CRD features field was silently dropped.
+    /// derivation's required_features against this. Must be populated
+    /// or the scheduler's can_build() check fails for any derivation
+    /// with requiredSystemFeatures.
     #[serde(deserialize_with = "rio_common::config::comma_vec")]
     pub(crate) features: Vec<String>,
     pub(crate) fuse_mount_point: PathBuf,
@@ -269,7 +270,7 @@ mod tests {
         assert_eq!(d.overlay_base_dir, PathBuf::from("/var/rio/overlays"));
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9093");
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9193");
-        // Phase2b additions — spec values from configuration.md:68-69.
+        // Spec values from configuration.md:68-69.
         assert_eq!(d.log_rate_limit, 10_000);
         assert_eq!(d.log_size_limit, 100 * 1024 * 1024);
         assert_eq!(d.max_leaked_mounts, 3);

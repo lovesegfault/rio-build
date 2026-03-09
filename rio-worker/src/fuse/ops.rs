@@ -96,13 +96,12 @@ impl Filesystem for NixStoreFs {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            // Materialize on lookup. Previously this returned a synthetic
-            // dir attr ("exists, details later") with a 1-hour ATTR_TTL,
-            // deferring the actual NAR fetch to getattr/open/readdir. But
-            // the kernel caches the lookup attr and NEVER calls getattr —
-            // so `lookup(busybox_ino, "bin")` hit an empty cache_dir →
-            // ENOENT → build fails with OutputRejected. Fetching here
-            // ensures the whole tree is on disk before any child lookup.
+            // Materialize on lookup (not deferred to getattr/open/readdir):
+            // the kernel caches the lookup attr for ATTR_TTL and NEVER calls
+            // getattr. A synthetic "exists, details later" attr would mean
+            // `lookup(busybox_ino, "bin")` hits an empty cache_dir → ENOENT
+            // → build fails. Fetching here ensures the whole tree is on disk
+            // before any child lookup.
             match self.ensure_cached(&name_str) {
                 Ok(local_path) => match local_path.symlink_metadata() {
                     Ok(meta) => {
@@ -432,8 +431,9 @@ impl Filesystem for NixStoreFs {
         };
 
         // Stream entries directly to reply.add() with an offset counter,
-        // breaking early when the kernel's buffer fills. Previously collected
-        // ALL entries into a Vec then .skip(offset)'d — O(n) alloc per resume.
+        // breaking early when the kernel's buffer fills. Avoids collecting
+        // ALL entries into a Vec + .skip(offset) — that would be O(n) alloc
+        // per resume call.
         let mut idx: u64 = 0;
         if offset < 1 && reply.add(ino, 1, FileType::Directory, ".") {
             reply.ok();

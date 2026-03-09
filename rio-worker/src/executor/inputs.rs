@@ -107,11 +107,9 @@ fn compute_local_nar_hash(path: &Path, algo: FodHashAlgo) -> anyhow::Result<Vec<
 /// Verify FOD output hashes match the declared outputHash (defense-in-depth;
 /// nix-daemon also verifies, but we re-check BEFORE upload).
 ///
-/// Round 4 Z8/Z9: prior to this, verify_fod_hashes (a) hardcoded SHA-256
-/// so sha1/sha512 FODs were false-rejected, and (b) ran AFTER upload,
-/// using `uploads[].nar_hash` — defeating the defense-in-depth (bad
-/// output already in the store). Now dispatches on outputHashAlgo and
-/// computes the hash LOCALLY before any upload.
+/// Dispatches on outputHashAlgo (sha1/sha256/sha512) and computes the
+/// hash LOCALLY before upload — a bad output is rejected before it
+/// enters the store.
 ///
 /// For `r:<algo>` (recursive): hash the NAR serialization of the output
 /// path. For `<algo>` (flat): hash the file contents directly.
@@ -129,7 +127,7 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, overlay_upper: &Path) -> anyho
         let expected = hex::decode(output.hash())
             .with_context(|| format!("FOD outputHash is not valid hex: {}", output.hash()))?;
 
-        // Round 4 Z8: dispatch on outputHashAlgo. Unknown algo →
+        // Dispatch on outputHashAlgo. Unknown algo →
         // skip (log warn, don't false-reject). nix-daemon's own
         // verification still runs; we're just defense-in-depth.
         let Some(algo) = FodHashAlgo::from_nix_str(output.hash_algo()) else {
@@ -151,9 +149,8 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, overlay_upper: &Path) -> anyho
         let fs_path = overlay_upper.join("nix/store").join(store_basename);
 
         let computed = if is_recursive {
-            // Round 4 Z9: compute NAR hash LOCALLY (before upload).
-            // Previously this used uploads[].nar_hash which meant
-            // the bad output was already in the store.
+            // Compute NAR hash locally (before upload) so a bad
+            // output is rejected without entering the store.
             compute_local_nar_hash(&fs_path, algo)?
         } else {
             // Flat hash — read file and hash contents directly.
@@ -292,7 +289,7 @@ pub(super) async fn compute_input_closure(
 
         // Fetch this layer concurrently. Each result is
         // (path, Option<references>); None means NotFound.
-        // References are Vec<StorePath> now (ValidatedPathInfo); convert
+        // References are Vec<StorePath> (from ValidatedPathInfo); convert
         // to String here since `closure` is a HashSet<String> (closure
         // membership is checked against string keys from the .drv parse).
         let results: Vec<(String, Option<Vec<String>>)> = stream::iter(batch)
@@ -389,7 +386,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Group 6: FOD output hash verification
+    // FOD output hash verification
     // -----------------------------------------------------------------------
 
     fn make_fod_drv(
@@ -421,9 +418,8 @@ mod tests {
 
     #[test]
     fn test_verify_fod_recursive_sha256_ok() -> anyhow::Result<()> {
-        // Round 4 Z9: recursive now computes LOCAL NAR hash (was
-        // using uploads[].nar_hash). Seed a real file, compute its
-        // NAR hash, use that as the expected hash.
+        // Recursive mode computes the LOCAL NAR hash. Seed a real
+        // file, compute its NAR hash, use that as the expected hash.
         let content = b"recursive fod sha256 test content";
         let (tmp, store_dir) = seed_output("test-fod", content)?;
 
@@ -480,7 +476,7 @@ mod tests {
         Ok(())
     }
 
-    /// Round 4 Z8: sha1 FODs should verify correctly (was hardcoded sha256).
+    /// sha1 FODs verify correctly (algo dispatch, not hardcoded sha256).
     #[test]
     fn test_verify_fod_flat_sha1_ok() -> anyhow::Result<()> {
         use sha1::Digest;
@@ -492,12 +488,12 @@ mod tests {
 
         assert!(
             verify_fod_hashes(&drv, tmp.path()).is_ok(),
-            "sha1 FOD should verify (Z8: was hardcoded sha256 → false-reject)"
+            "sha1 FOD should verify (algo dispatch; hardcoded sha256 would false-reject)"
         );
         Ok(())
     }
 
-    /// Round 4 Z8: sha512 FODs should verify correctly.
+    /// sha512 FODs verify correctly.
     #[test]
     fn test_verify_fod_flat_sha512_ok() -> anyhow::Result<()> {
         use sha2::{Digest, Sha512};
@@ -515,7 +511,7 @@ mod tests {
         Ok(())
     }
 
-    /// Round 4 Z8: recursive sha1 (NAR hash via sha1).
+    /// Recursive sha1 (NAR hash computed via sha1).
     #[test]
     fn test_verify_fod_recursive_sha1_ok() -> anyhow::Result<()> {
         let content = b"r:sha1 nar content";
@@ -645,7 +641,7 @@ mod tests {
 
     /// Regression: a real gRPC error (e.g., store unavailable) must propagate
     /// with its original status code, NOT be collapsed into a fabricated
-    /// NotFound. The old `Ok(None) | Err(_)` arm discarded the real error.
+    /// NotFound — a naive `Ok(None) | Err(_)` arm would discard the real error.
     #[tokio::test]
     async fn test_fetch_input_metadata_grpc_error_preserves_code() -> anyhow::Result<()> {
         let (store, client) = spawn_and_connect().await?;
@@ -668,7 +664,7 @@ mod tests {
                 assert_eq!(
                     source.code(),
                     tonic::Code::Unavailable,
-                    "real gRPC error code must propagate (was collapsed to NotFound before fix)"
+                    "real gRPC error code must propagate (not be collapsed to NotFound)"
                 );
             }
             other => panic!("expected MetadataFetch, got {other:?}"),

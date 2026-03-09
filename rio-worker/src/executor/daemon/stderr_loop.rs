@@ -48,8 +48,8 @@ pub(in crate::executor) async fn run_daemon_build(
         .ok_or_else(|| ExecutorError::DaemonSetup("failed to get daemon stdout".into()))?;
 
     // Handshake + setOptions + send build — all bounded by DAEMON_SETUP_TIMEOUT.
-    // Previously only the handshake was timed out; a stuck setOptions or
-    // a stalled write would hang until build_timeout (potentially hours).
+    // All three steps share DAEMON_SETUP_TIMEOUT: a stuck setOptions or stalled
+    // write must not hang until build_timeout (potentially hours).
     // We need &mut access to stdout for the setup sequence (handshake reads
     // the daemon's version etc.), but read_build_stderr_loop takes stdout by
     // value for its owned reader task. So: put stdout in an Option, borrow
@@ -102,9 +102,9 @@ pub(in crate::executor) async fn run_daemon_build(
 /// The reader is spawned into an owned task that pushes each parsed
 /// `StderrMessage` onto an mpsc channel. The main loop `select!`s on that
 /// channel and a `BATCH_TIMEOUT` interval, so a partial batch is flushed
-/// during silent build periods (previously it was held until the next
-/// STDERR message arrived, which for a quiet 60s compile meant the gateway
-/// saw nothing — build appeared hung).
+/// during silent build periods. Without this, a partial batch would wait
+/// for the next STDERR message — for a quiet 60s compile the gateway sees
+/// nothing and the build appears hung.
 ///
 /// This approach is cancel-safe: wrapping `read_stderr_message()` directly
 /// in `tokio::time::timeout` would drop the read future mid-u64-read,
@@ -146,10 +146,9 @@ where
         Break(Result<Option<BuildResult>, wire::WireError>),
     }
 
-    /// Round 4 D2: shared log-line handling for STDERR_NEXT and
-    /// STDERR_RESULT BuildLogLine. Both do: msg_count bound check,
-    /// batcher.add_line, and dispatch on AddLineResult. Was ~40
-    /// lines duplicated; now one helper.
+    /// Shared log-line handling for STDERR_NEXT and STDERR_RESULT
+    /// BuildLogLine — both need msg_count bound check + batcher.add_line
+    /// + AddLineResult dispatch.
     async fn handle_log_line(
         line: Vec<u8>,
         msg_count: &mut u64,
@@ -330,7 +329,7 @@ where
         }
     };
 
-    // Final flush: the loop owns the batcher now (caller moved it in), so
+    // Final flush: the loop owns the batcher (by-value), so
     // any partial batch must be drained here. Best-effort — the build
     // result is already determined; if the log channel is closed, just drop.
     if batcher.has_pending() {
@@ -426,7 +425,7 @@ mod tests {
         let (result, batches) = run_loop(buf).await;
         let br = result.expect("loop should succeed");
         assert_eq!(br.status, BuildStatus::Built);
-        // The loop now owns the batcher and does a final flush after
+        // The loop owns the batcher and does a final flush after
         // STDERR_LAST, so both lines are deterministically in `batches`.
         assert_eq!(count_log_lines(&batches), 2);
         Ok(())
@@ -545,7 +544,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Cancel-safety + silent-period flush (the C4 fix)
+    // Cancel-safety + silent-period flush
     // -----------------------------------------------------------------------
 
     /// A build that goes silent for >100ms MUST flush its partial batch via
@@ -713,8 +712,8 @@ mod tests {
     }
 
     /// The final flush (inside the loop, after STDERR_LAST) must drain any
-    /// partial batch. Previously this was the caller's job (executor/mod.rs);
-    /// now the loop owns the batcher.
+    /// partial batch. The loop owns the batcher by-value, so draining is
+    /// its responsibility.
     #[tokio::test]
     async fn test_final_flush_after_last() -> anyhow::Result<()> {
         let mut buf = Vec::new();
@@ -731,8 +730,6 @@ mod tests {
         let (result, batches) = run_loop(buf).await;
         result.expect("should succeed");
         // The 3 lines MUST be in the batches (final flush fired).
-        // Previously, with caller-side flush, run_loop's dropped batcher
-        // meant these were silently lost in this test harness.
         assert_eq!(
             count_log_lines(&batches),
             3,

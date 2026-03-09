@@ -111,12 +111,9 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 /// opcodes, no `nix` CLI involvement. Dropped here to reduce attack
 /// surface in the sandbox-spawned daemon.
 ///
-/// Drift history: this was previously `experimental-features =`
-/// (empty) while the ConfigMap had `ca-derivations` — but the
-/// ConfigMap was never mounted, so CA builds used THIS empty value
-/// and failed with "ca-derivations is an experimental feature."
-/// Phase 2c worked because VM tests use native NixOS modules (not
-/// this code path); the drift only bit K8s deployments.
+/// This constant must stay in sync with deploy/base/configmaps.yaml —
+/// a mismatch means K8s deployments get different behavior than VM
+/// tests (which use native NixOS modules, not this path).
 const WORKER_NIX_CONF: &str = "\
 builders =
 substitute = false
@@ -134,11 +131,11 @@ const NIX_CONF_OVERRIDE_PATH: &str = "/etc/rio/nix-conf/nix.conf";
 
 /// Error type for executor operations.
 ///
-/// No `#[from] anyhow::Error` — every variant has a typed source. Before
-/// C1, `Overlay(#[from] anyhow::Error)` was the only type-erasing `From`
-/// in the codebase: any `?` on an `anyhow::Result` anywhere in
-/// `execute_build` became "overlay setup failed", even for unrelated
-/// failures. Now the compiler catches those at the `?` site.
+/// No `#[from] anyhow::Error` — every variant has a typed source. A
+/// catch-all `#[from] anyhow::Error` would mean any `?` on an
+/// anyhow::Result anywhere in execute_build silently becomes the wrong
+/// variant. Typed sources make the compiler catch misattribution at
+/// the `?` site.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
     #[error("overlay setup failed: {0}")]
@@ -309,7 +306,7 @@ pub async fn execute_build(
     .map_err(ExecutorError::OverlayTaskPanic)??;
 
     // 2. Parse the derivation. Scheduler inlines drv_content for
-    // missing-output nodes (phase2c D8); empty means cache-hit or
+    // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
     let drv = if assignment.drv_content.is_empty() {
         fetch_drv_from_store(store_client, drv_path).await?
@@ -544,7 +541,7 @@ pub async fn execute_build(
     });
 
     // All daemon I/O is in a helper so we can ALWAYS kill on error.
-    // The cgroup setup above (create/add_process, added in phase3a)
+    // The cgroup setup above (create/add_process)
     // is NOT inside this helper — its `?` paths rely on the
     // kill_on_drop set in spawn_daemon_in_namespace as a safety
     // net. The explicit kill below remains the primary cleanup
@@ -590,8 +587,8 @@ pub async fn execute_build(
     // restart).
     drop(build_cgroup);
 
-    // (Final log flush happens inside read_build_stderr_loop, which now
-    // owns the batcher.)
+    // (Final log flush happens inside read_build_stderr_loop — it owns
+    // the batcher by-value.)
 
     // NOW propagate any daemon error (after kill).
     let build_result = build_result?;
@@ -600,13 +597,12 @@ pub async fn execute_build(
     // sum of uploaded NAR sizes (only set on successful upload path).
     let mut output_size_bytes = 0u64;
     let proto_result = if build_result.status.is_success() {
-        // Round 4 Z9: FOD defense-in-depth BEFORE upload.
-        // verify_fod_hashes now computes local NAR hashes (via
-        // dump_path_streaming + digest sink) so we can reject a
-        // bad output WITHOUT uploading it first. Prior to this,
-        // verify ran after upload using uploads[].nar_hash — the
-        // bad output was already in the store (content-index
-        // inserted, manifest complete) before we noticed.
+        // FOD defense-in-depth BEFORE upload: verify_fod_hashes
+        // computes local NAR hashes (via dump_path_streaming +
+        // digest sink) so a bad output is rejected WITHOUT entering
+        // the store. Verifying after upload would mean the bad
+        // output is already content-indexed and manifest-complete
+        // before the mismatch is noticed.
         //
         // spawn_blocking: verify_fod_hashes does sync filesystem I/O
         // (fs::read for flat, dump_path_streaming for recursive) +
@@ -698,8 +694,9 @@ pub async fn execute_build(
                 // Scheduler guards update_build_history on BOTH being
                 // Some (completion.rs:182) — without them, EMA duration
                 // can't be computed and the WHOLE build_history write
-                // is skipped (peak_memory_bytes included). Never caught
-                // before: phase2c.nix pre-seeds via psql INSERT.
+                // is skipped (peak_memory_bytes included). VM tests
+                // bypass this via direct psql INSERT — only live
+                // scheduler-worker integration exercises it.
                 //
                 // 0 → None: nix-daemon sends 0 on some error paths.
                 // A real build at 1970-01-01 doesn't exist.
@@ -799,11 +796,11 @@ fn setup_nix_conf(upper_dir: &Path) -> Result<(), ExecutorError> {
     //
     // The mount is a DIRECTORY (no subPath): `optional: true`
     // ConfigMap + missing ConfigMap → K8s mounts an empty dir →
-    // read("dir/nix.conf") → clean ENOENT → fallback. Previously
-    // used subPath which creates empty-file-or-dir weirdness when
-    // the ConfigMap is missing — vm-phase3a caught a 600s+ hang
-    // (empty nix.conf → Nix defaults → substitute=true → tries
-    // cache.nixos.org → airgap DNS timeout).
+    // read("dir/nix.conf") → clean ENOENT → fallback. Directory
+    // mount (no subPath): subPath creates an empty file/dir when
+    // the ConfigMap is missing → empty nix.conf → Nix defaults →
+    // substitute=true → cache.nixos.org lookup → airgap DNS
+    // timeout (600s+ hang).
     let content = match std::fs::read(NIX_CONF_OVERRIDE_PATH) {
         Ok(bytes) if !bytes.is_empty() => {
             tracing::debug!(
@@ -946,8 +943,4 @@ mod tests {
         assert_eq!(leak_counter.load(Ordering::Relaxed), 999);
         Ok(())
     }
-
-    // read_vmhwm_bytes tests removed — function replaced by cgroup
-    // memory.peak (I2). The equivalent canary (real-system parse)
-    // is cgroup::tests::own_cgroup_parses_on_this_system.
 }

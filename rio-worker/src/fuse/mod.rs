@@ -58,7 +58,7 @@ pub struct NixStoreFs {
     ///
     /// `Arc` so main.rs can clone a handle BEFORE moving into
     /// `mount_fuse_background` (same pattern as `bloom_handle()`).
-    /// The clone goes to the PrefetchHint handler (B2). All Cache
+    /// The clone goes to the PrefetchHint handler. All Cache
     /// methods use `runtime.block_on` internally — they're SYNC,
     /// designed for FUSE callbacks (dedicated blocking threads).
     /// The prefetch handler calls them via `spawn_blocking` to
@@ -79,11 +79,10 @@ impl NixStoreFs {
     /// directory. FUSE callbacks (`getattr`, `lookup`, `readdir`) then do
     /// `stat()`/`read_dir()` on those cache paths — normal filesystem ops.
     ///
-    /// Previously the InodeMap was rooted at the mount point, so `getattr(ROOT)`
-    /// did `stat(mount_point)` — which re-enters FUSE via `getattr(ROOT)`,
-    /// recursing until all FUSE threads deadlocked. This bug was latent (unit
-    /// tests never actually mounted) until the VM milestone test called
-    /// `overlay::setup_overlay`, which stats the FUSE mount as the overlay lower.
+    /// Rooted at cache_dir, NOT the mount point: `stat(mount_point)` re-enters
+    /// FUSE via `getattr(ROOT)` and recurses until all FUSE threads deadlock.
+    /// This matters whenever something stats the FUSE mount directly (e.g.,
+    /// overlayfs validating its lower layer).
     pub fn new(
         cache: Arc<Cache>,
         store_client: StoreServiceClient<Channel>,
