@@ -261,8 +261,8 @@ impl Drop for BuildCgroup {
 /// Fails if:
 /// - `/proc/self/cgroup` is cgroup v1 format (multiple lines)
 /// - the parent path doesn't exist or isn't a cgroup
-/// - we're at ns root AND moving ourselves fails (ro mount,
-///   no-delegation — shouldn't happen with privileged)
+/// - we're at ns root AND remounting /sys/fs/cgroup rw fails
+///   (missing CAP_SYS_ADMIN or seccomp blocks mount(2))
 ///
 /// All mean cgroup v2 isn't properly set up. Hard error — startup fails.
 pub fn delegated_root() -> io::Result<PathBuf> {
@@ -284,18 +284,35 @@ pub fn delegated_root() -> io::Result<PathBuf> {
     // `own == Path::new(CGROUP_ROOT)` — Path comparison handles
     // trailing slashes correctly. Don't string-compare.
     if own == Path::new(CGROUP_ROOT) {
+        // Containerd mounts /sys/fs/cgroup read-only for non-
+        // privileged pods, even with CAP_SYS_ADMIN. Remount rw
+        // so we can create sub-cgroups and write subtree_control.
+        // CAP_SYS_ADMIN + RuntimeDefault seccomp permits mount(2).
+        // Idempotent: remounting an already-rw mount is a no-op.
+        nix::mount::mount(
+            None::<&str>,
+            CGROUP_ROOT,
+            None::<&str>,
+            nix::mount::MsFlags::MS_REMOUNT,
+            None::<&str>,
+        )
+        .map_err(|e| {
+            io::Error::other(format!(
+                "cannot remount {CGROUP_ROOT} rw: {e} \
+                 (needs CAP_SYS_ADMIN — check pod securityContext)"
+            ))
+        })?;
+
         let leaf = own.join("leaf");
         // EEXIST: prior worker crashed after mkdir before
         // move-procs. Treat as already-created (we're about to
         // move ourselves into it anyway). Any other error —
-        // ro mount, no perms — bubbles.
+        // no perms — bubbles.
         if let Err(e) = fs::create_dir(&leaf)
             && e.kind() != io::ErrorKind::AlreadyExists
         {
             return Err(io::Error::other(format!(
-                "cannot create leaf cgroup {} in namespace root: {e} \
-                 (cgroup ns root not writable — is the pod privileged? \
-                 is /sys/fs/cgroup mounted rw?)",
+                "cannot create leaf cgroup {} in namespace root: {e}",
                 leaf.display()
             )));
         }
