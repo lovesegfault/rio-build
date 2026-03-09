@@ -34,3 +34,7 @@ spec:
   systems:
     - x86_64-linux
   features: []
+  # DEV ONLY. /dev/fuse device cgroup needs a device plugin
+  # (smarter-device-manager) in prod — see worker.md § Security
+  # Context + ADR-012. privileged bypasses device cgroup entirely.
+  privileged: true
