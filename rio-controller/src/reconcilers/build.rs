@@ -95,10 +95,18 @@ async fn reconcile_inner(b: Arc<Build>, ctx: Arc<Ctx>) -> Result<Action> {
 async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     let ns = b.namespace().expect("checked in reconcile()");
     let name = b.name_any();
-    // Watch dedup key. drain_stream patches status → API server
-    // emits watch event → reconcile → apply() runs again. Without
-    // this gate, each cycle spawns a duplicate drain_stream.
-    let watch_key = format!("{ns}/{name}");
+    // Watch dedup key: the Build's UID. drain_stream patches
+    // status → API server emits watch event → reconcile → apply()
+    // runs again. Without this gate, each cycle spawns a duplicate
+    // drain_stream.
+    //
+    // UID (not {ns}/{name}): delete+recreate with the same name
+    // gets a FRESH uid. If we keyed by name, an old drain_stream's
+    // scopeguard (for the deleted Build) would remove the NEW
+    // Build's entry when it finally exits after stream-EOF → next
+    // reconcile spawns a duplicate (Y1). uid is apiserver-assigned
+    // on create, always unique.
+    let watch_key = b.uid().unwrap_or_default();
 
     // Idempotence gate. build_id non-empty → already submitted.
     // Phase 3b: if phase is non-terminal, reconnect the watch via
@@ -374,14 +382,16 @@ fn spawn_reconnect_watch(
 
 async fn cleanup(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     let name = b.name_any();
-    let ns = b.namespace().unwrap_or_default();
 
-    // X15: remove watching entry so a delete-then-recreate with
-    // the same name isn't blocked by a stale entry. The in-flight
-    // drain_stream for the old Build will PATCH-fail on the deleted
-    // CRD and exit on its own (its own guard removes the entry too
-    // — this is idempotent, removing twice is a no-op).
-    let watch_key = format!("{ns}/{name}");
+    // X15: remove watching entry so a never-exiting drain_stream
+    // (bug, hung stream) doesn't block a future reconcile. Keyed
+    // by uid: a delete-then-recreate gets a FRESH uid, so the old
+    // drain_stream's guard removing the OLD uid doesn't touch the
+    // new Build's entry (Y1). Removing here is belt-and-suspenders:
+    // the old drain_stream will PATCH-fail on the deleted CRD and
+    // exit via its own guard eventually, but we don't know how
+    // long that takes.
+    let watch_key = b.uid().unwrap_or_default();
     ctx.watching.remove(&watch_key);
 
     // Read build_id from status. If never submitted (empty) or
@@ -1031,5 +1041,57 @@ mod tests {
         // Different type → new entry.
         set_condition(&mut conds, "Failed", "True", "X", "boom");
         assert_eq!(conds.len(), 2);
+    }
+
+    /// Y1: keying watching by uid (not {ns}/{name}) means an old
+    /// drain_stream's scopeguard removing the OLD uid doesn't touch
+    /// a NEW Build's entry after delete+recreate with the same name.
+    ///
+    /// This is a mechanical test of the DashMap + scopeguard
+    /// interaction — the old test-by-name would pass with the old
+    /// key scheme because reconciles are serialized; the RACE is
+    /// the old scopeguard firing AFTER new apply() inserts.
+    #[test]
+    fn watch_dedup_uid_keying_survives_delete_recreate() {
+        let watching: Arc<dashmap::DashMap<String, ()>> = Arc::new(dashmap::DashMap::new());
+
+        // --- Old Build (uid-A) gets a watch ---
+        let old_uid = "uid-aaaa-1111".to_string();
+        watching.insert(old_uid.clone(), ());
+        // Simulate drain_stream's scopeguard: captures the key by
+        // value, removes on drop. We DON'T drop it yet — it's
+        // "in flight" (the stream hasn't EOF'd).
+        let old_guard = {
+            let watching = watching.clone();
+            let key = old_uid.clone();
+            scopeguard::guard((), move |()| {
+                watching.remove(&key);
+            })
+        };
+
+        // --- kubectl delete build → cleanup() removes old uid ---
+        watching.remove(&old_uid);
+        assert!(!watching.contains_key(&old_uid));
+
+        // --- User recreates Build with same name → NEW uid ---
+        let new_uid = "uid-bbbb-2222".to_string();
+        // apply() inserts the new uid + spawns drain_stream.
+        watching.insert(new_uid.clone(), ());
+        assert!(watching.contains_key(&new_uid));
+
+        // --- Old drain_stream finally exits → scopeguard fires ---
+        drop(old_guard);
+
+        // With uid keying: old guard removed old_uid (already gone,
+        // no-op). New entry is UNTOUCHED.
+        assert!(
+            watching.contains_key(&new_uid),
+            "Y1: old scopeguard must NOT remove new uid's entry"
+        );
+        // If we keyed by {ns}/{name} and both Builds had the same
+        // key "default/foo", this assertion would FAIL: the old
+        // guard's remove("default/foo") would remove the NEW
+        // entry → next reconcile sees !contains_key → spawns
+        // duplicate watch (C1 regression).
     }
 }

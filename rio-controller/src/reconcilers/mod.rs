@@ -47,7 +47,13 @@ pub struct Ctx {
     /// reporter); `publish` takes the object_ref per-call. So we
     /// hold one Recorder and pass the ref at publish time.
     pub recorder: kube::runtime::events::Recorder,
-    /// Tracks in-flight Build watch tasks, keyed by "{ns}/{name}".
+    /// Tracks in-flight Build watch tasks, keyed by Build **uid**
+    /// (NOT {ns}/{name}). uid is unique per K8s object lifetime:
+    /// delete+recreate with the same name gets a FRESH uid. Keying
+    /// by name would let an old drain_stream's scopeguard remove
+    /// the NEW Build's entry after a delete+recreate → next
+    /// reconcile spawns a duplicate watch (regressing the C1 fix
+    /// we built this map to prevent).
     ///
     /// Dedupes spawns across reconciles: drain_stream patches
     /// Build.status on each BuildEvent → K8s API server emits a
