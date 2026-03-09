@@ -916,30 +916,22 @@ pkgs.testers.runNixOSTest {
         assert '"isComplete": true' in result or '"isComplete":true' in result, \
             f"C1: expected GCProgress with isComplete=true, got: {result[:500]}"
 
-        # Round 4 V14: also assert pathsScanned >= 3. The store has
-        # at least busybox (seed) + B1's output + S1's output at
-        # this point. If mark returned 0 (a bug where it scans
-        # nothing), isComplete=true would still fire — this catches
-        # that. proto3 JSON serializes uint64 as quoted string.
+        # Round 4 V14: also verify the currentPath describes the
+        # actual outcome (not just "complete"). With grace=24h,
+        # everything is within grace → mark finds 0 unreachable →
+        # currentPath says "would delete 0 paths". We check for
+        # "delete" in the dry-run message — proves the store
+        # actually ran mark+sweep (even if sweep found nothing)
+        # rather than short-circuiting.
         #
-        # NOTE: with grace_period_hours=24, everything is within
-        # grace → mark returns empty unreachable set → pathsScanned
-        # = len(unreachable) = 0. That's the CORRECT behavior for
-        # grace=24h. To verify mark actually SEES paths, we'd need
-        # grace=0 — but that would delete them (even dry-run
-        # counts them). The real assertion is: the RPC completed
-        # without error AND the count is non-negative (proving the
-        # field was serialized). Accept either >=0 (grace=24)
-        # OR >=3 (grace=0 not used here).
-        #
-        # Simpler fix: just check the field is PRESENT and parseable.
-        import re
-        scanned_match = re.search(r'"pathsScanned"\s*:\s*"?(\d+)"?', result)
-        assert scanned_match, (
-            f"V14: expected pathsScanned field in GCProgress, got: {result[:500]}"
+        # Note: pathsScanned=0 is OMITTED from proto3 JSON (zero-
+        # value default), so we can't regex-match the field. The
+        # currentPath string is the reliable signal.
+        assert "delete" in result.lower() and "path" in result.lower(), (
+            f"V14: expected currentPath to describe delete outcome "
+            f"(mark+sweep ran), got: {result[:500]}"
         )
-        paths_scanned = int(scanned_match.group(1))
-        print(f"C1 PASS: TriggerGC dry-run completed, pathsScanned={paths_scanned}")
+        print(f"C1 PASS: TriggerGC dry-run completed via AdminService proxy (V14: currentPath describes outcome)")
 
     # ════════════════════════════════════════════════════════════════
     # Section G: gateway validation (from iteration 1)
