@@ -50,4 +50,18 @@ Iteration 2 had caught a **latent TLS SNI bug**: `load_client_tls` set `domain_n
 - **H1-H5:** backstop timeout didn't persist `failed_worker` to PG; drain lacked `SKIP LOCKED` for multi-replica; gateway reconnect counter never reset on success; backstop block duplicated `reassign_derivations`; GC sweep/orphan had ~50 lines duplicated.
 - **M1-M5:** HMAC key CRLF not trimmed; `GcRoots` no dedup; Assigned-with-NULL-worker silently skipped; PinPath FK check via string match; backstop NaN never fires.
 
+**Validation-round-2 bugs fixed (iteration 4, 19 commits 54c5baa..21cc06d, 976→991 tests):** Fresh deep review found 5 CRITICAL + 9 HIGH + 7 MEDIUM bugs + 2 hollow VM test sections (S1 never ran recovery; C2 never committed).
+- **X1** (CRIT) mTLS bypass defeated HMAC: `has_peer_certs + no token → bypass`. Compromised worker omits token → uploads arbitrary paths. Fixed via x509-parser CN check: only `CN=rio-gateway` bypasses.
+- **X2** (CRIT) Build CRD stuck at `build_id="submitted"` — no resubmit path. Fixed: apply() detects orphaned sentinel (no watch running) → falls through to resubmit.
+- **X3** (CRIT) Orphan scanner stale `chunk_list` from outer SELECT → multi-replica race decrements wrong chunks. Fixed: re-read `chunk_list` INSIDE tx with `FOR UPDATE OF m` (mirrors sweep.rs pattern).
+- **X4** (CRIT) Transient-failure retry wrote Failed to PG, in-mem went Ready → crash → recovery loads Failed but never enqueues → hang. Fixed: write Ready to PG matching final in-mem state.
+- **X5** (CRIT) Recovery missed all-complete builds (crash between last-drv-Completed and build-Succeeded). Fixed: post-recovery `check_build_completion` sweep for all builds.
+- **X6** (HIGH) `reassign_derivations` had no POISON_THRESHOLD check → 3 disconnects leave Ready-but-undispatchable. Fixed via `poison_and_cascade` helper.
+- **X7** (HIGH) FastCDC duplicate chunks crash PG ON CONFLICT same-row-twice. Fixed: dedup before UNNEST.
+- **X8** (HIGH) Sweep didn't delete realisations (no FK to narinfo) → dangling `wopQueryRealisation` → 404. Fixed: explicit DELETE before narinfo CASCADE.
+- **X9** (HIGH) Auto-pin live-build INPUTS via `scheduler_live_pins` table + CTE seed (e). Scheduler pins at dispatch, unpins at terminal.
+- **X10-X21**: gateway reconnect-reset-on-event (not Ok()), controller build_id/phase/scopeguard/cleanup fixes, poison-TTL PG clear, HMAC expiry clamp, backoff infinity clamp, s3_deletes_stuck gauge, pg_try_advisory_lock for TriggerGC, dispatch_ready after LeaderAcquired.
+- **V1** (VM test hollow): S1 never ran recovery (`always_leader()` from boot). Fixed: wire scheduler to k3s Lease. kubeconfig copy before `waitForControlPlane` → scheduler standby → acquire → `LeaderAcquired` → recovery ACTUALLY runs. Asserts journalctl log + metric.
+- **V2** (VM test hollow): C2 never committed (all in grace → `unreachable=vec[]` → for-batch body never runs). Fixed: backdate S1's output past grace → sweep DELETES 1 path → proves commit.
+
 **EKS smoke:** manual trigger (`infra/eks/smoke-test.sh`). Deploys, builds hello, kills worker, verifies reassign via metrics delta.
