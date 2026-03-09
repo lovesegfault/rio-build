@@ -192,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler_addr: cfg.scheduler_addr.clone(),
         store_addr: cfg.store_addr.clone(),
         recorder,
+        watching: Arc::new(dashmap::DashMap::new()),
     });
 
     // ---- WorkerPool controller ----

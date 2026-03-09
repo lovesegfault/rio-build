@@ -13,6 +13,9 @@
 pub mod build;
 pub mod workerpool;
 
+use std::sync::Arc;
+
+use dashmap::DashMap;
 use kube::Client;
 
 /// Shared context for all reconcilers. Cloned into each
@@ -44,6 +47,19 @@ pub struct Ctx {
     /// reporter); `publish` takes the object_ref per-call. So we
     /// hold one Recorder and pass the ref at publish time.
     pub recorder: kube::runtime::events::Recorder,
+    /// Tracks in-flight Build watch tasks, keyed by "{ns}/{name}".
+    ///
+    /// Dedupes spawns across reconciles: drain_stream patches
+    /// Build.status on each BuildEvent → K8s API server emits a
+    /// watch event → controller re-enqueues → apply() runs again.
+    /// Without this gate, each reconcile spawns ANOTHER
+    /// drain_stream — linear growth (N transitions = N tasks).
+    ///
+    /// drain_stream holds a scopeguard that removes the entry on
+    /// exit (success, error, panic, cancel — any path). apply()
+    /// checks contains_key() before spawning; if the watch is
+    /// already running, returns await_change() without spawning.
+    pub watching: Arc<DashMap<String, ()>>,
 }
 
 impl Ctx {

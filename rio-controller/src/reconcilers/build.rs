@@ -95,6 +95,10 @@ async fn reconcile_inner(b: Arc<Build>, ctx: Arc<Ctx>) -> Result<Action> {
 async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     let ns = b.namespace().expect("checked in reconcile()");
     let name = b.name_any();
+    // Watch dedup key. drain_stream patches status → API server
+    // emits watch event → reconcile → apply() runs again. Without
+    // this gate, each cycle spawns a duplicate drain_stream.
+    let watch_key = format!("{ns}/{name}");
 
     // Idempotence gate. build_id non-empty → already submitted.
     // Phase 3b: if phase is non-terminal, reconnect the watch via
@@ -117,6 +121,14 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         let is_terminal = matches!(status.phase.as_str(), "Succeeded" | "Failed" | "Cancelled");
 
         if is_real_uuid && !is_terminal {
+            // Dedup: if drain_stream already running for this Build,
+            // don't spawn another. The running task will handle
+            // status updates; this reconcile was triggered by its
+            // own status patch.
+            if ctx.watching.contains_key(&watch_key) {
+                debug!(build = %name, "watch already running, skipping reconnect spawn");
+                return Ok(Action::await_change());
+            }
             // Reconnect: WatchBuild + spawn fresh drain_stream.
             // since_sequence from status.last_sequence (0 for
             // pre-Phase-3b rows = replay all, safe default).
@@ -131,6 +143,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 .map_err(|e| {
                     Error::SchedulerUnavailable(tonic::Status::unavailable(e.to_string()))
                 })?;
+            ctx.watching.insert(watch_key.clone(), ());
+            metrics::counter!("rio_controller_build_watch_spawns_total").increment(1);
             spawn_reconnect_watch(
                 name.clone(),
                 Api::namespaced(ctx.client.clone(), &ns),
@@ -138,6 +152,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 status.build_id.clone(),
                 status.last_sequence as u64,
                 ctx.scheduler_addr.clone(),
+                ctx.watching.clone(),
+                watch_key,
             );
             return Ok(Action::await_change());
         }
@@ -232,6 +248,18 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // next reconcile. The stream drains in the background.
     //
     // scheduler_addr cloned in for reconnect on stream error.
+    //
+    // Dedup gate: should already be empty (first apply, build_id
+    // was empty above), but guard anyway — the sentinel patch
+    // above triggers a reconcile, and if that races with THIS
+    // code path (unlikely, but reconcile queue is async) we'd
+    // double-spawn.
+    if ctx.watching.contains_key(&watch_key) {
+        debug!(build = %name, "watch already running, skipping initial spawn");
+        return Ok(Action::await_change());
+    }
+    ctx.watching.insert(watch_key.clone(), ());
+    metrics::counter!("rio_controller_build_watch_spawns_total").increment(1);
     rio_common::task::spawn_monitored(
         "build-watch",
         drain_stream(
@@ -242,6 +270,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             // since_seq=0 for initial connect — this IS the
             // SubmitBuild stream, it starts from the beginning.
             0,
+            ctx.watching.clone(),
+            watch_key,
         ),
     );
 
@@ -257,6 +287,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 /// WatchBuild fails (scheduler down, unknown build_id after
 /// recovery didn't find it), logs and exits — status stays stale.
 /// Next controller restart retries.
+#[allow(clippy::too_many_arguments)]
 fn spawn_reconnect_watch(
     name: String,
     api: Api<Build>,
@@ -264,8 +295,21 @@ fn spawn_reconnect_watch(
     build_id: String,
     since_seq: u64,
     scheduler_addr: String,
+    watching: Arc<dashmap::DashMap<String, ()>>,
+    watch_key: String,
 ) {
     rio_common::task::spawn_monitored("build-watch-reconnect", async move {
+        // Guard removes the watching entry on ANY exit (WatchBuild
+        // error below, drain_stream normal return, panic).
+        // drain_stream has its own guard, but we need one here too
+        // for the WatchBuild-fails-immediately path.
+        let _guard = scopeguard::guard((), {
+            let watching = watching.clone();
+            let watch_key = watch_key.clone();
+            move |()| {
+                watching.remove(&watch_key);
+            }
+        });
         match sched
             .watch_build(types::WatchBuildRequest {
                 build_id: build_id.clone(),
@@ -275,7 +319,16 @@ fn spawn_reconnect_watch(
         {
             Ok(resp) => {
                 info!(build = %name, %build_id, since_seq, "WatchBuild reconnect ok");
-                drain_stream(name, api, resp.into_inner(), scheduler_addr, since_seq).await;
+                drain_stream(
+                    name,
+                    api,
+                    resp.into_inner(),
+                    scheduler_addr,
+                    since_seq,
+                    watching,
+                    watch_key,
+                )
+                .await;
             }
             Err(e) => {
                 // Scheduler down, or build not found (recovery
@@ -514,7 +567,16 @@ async fn drain_stream(
     mut stream: tonic::Streaming<types::BuildEvent>,
     scheduler_addr: String,
     start_seq: u64,
+    watching: Arc<dashmap::DashMap<String, ()>>,
+    watch_key: String,
 ) {
+    // Remove watching entry on exit (any path — terminal, error,
+    // panic, reconnect-exhausted). Next apply() can re-spawn if
+    // needed (e.g., controller restart, or this task died early).
+    let _guard = scopeguard::guard((), move |()| {
+        watching.remove(&watch_key);
+    });
+
     // Accumulate status across events. We PATCH the FULL status
     // object each time (server-side apply merges), so this tracks
     // the "last known good" state. last_sequence initialized from

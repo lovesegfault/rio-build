@@ -545,6 +545,7 @@ fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         scheduler_addr: "http://127.0.0.1:1".into(),
         store_addr: "http://127.0.0.1:1".into(),
         recorder,
+        watching: Arc::new(dashmap::DashMap::new()),
     })
 }
 

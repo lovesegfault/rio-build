@@ -4574,6 +4574,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dashmap",
  "futures-util",
  "http 1.4.0",
  "http-body-util",
@@ -4585,6 +4586,7 @@ dependencies = [
  "rio-proto",
  "rustls 0.23.37",
  "schemars",
+ "scopeguard",
  "serde",
  "serde_json",
  "serde_yml",
