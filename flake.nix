@@ -180,6 +180,32 @@
           );
 
           # --------------------------------------------------------------
+          # Coverage-instrumented workspace build
+          # --------------------------------------------------------------
+          #
+          # RUSTFLAGS=-Cinstrument-coverage injects LLVM profile-generate
+          # instrumentation. Binaries write .profraw files (via atexit)
+          # to LLVM_PROFILE_FILE. VM tests run these binaries, stop them
+          # gracefully (C1-C4 graceful shutdown), collect profraws,
+          # and nix/coverage.nix merges them with unit-test lcov.
+          #
+          # Distinct pname → distinct store path, builds in parallel
+          # with the non-instrumented workspace. RUSTFLAGS invalidates
+          # cargoArtifacts so a separate deps cache is used.
+          covArgs = commonArgs // {
+            RUSTFLAGS = "-C instrument-coverage";
+            pname = "rio-cov";
+          };
+          cargoArtifactsCov = craneLib.buildDepsOnly covArgs;
+          rio-workspace-cov = craneLib.buildPackage (
+            covArgs
+            // {
+              cargoArtifacts = cargoArtifactsCov;
+              doCheck = false;
+            }
+          );
+
+          # --------------------------------------------------------------
           # Fuzz build pipeline (extracted to nix/fuzz.nix)
           # --------------------------------------------------------------
           #
@@ -430,9 +456,19 @@
           # Container images (Linux-only — dockerTools uses Linux VM
           # namespaces for layering). Worker image includes nix + fuse3
           # + util-linux + passwd stubs; others are minimal.
-          dockerImages = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-            import ./nix/docker.nix { inherit pkgs rio-workspace; }
-          );
+          #
+          # Factored into a function so the coverage pipeline can rebuild
+          # images with the instrumented workspace (dockerImagesCov in
+          # the vmTestsCov let-block below).
+          mkDockerImages =
+            ws:
+            pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+              import ./nix/docker.nix {
+                inherit pkgs;
+                rio-workspace = ws;
+              }
+            );
+          dockerImages = mkDockerImages rio-workspace;
 
           # --------------------------------------------------------------
           # CI aggregate targets
@@ -629,6 +665,9 @@
           # --------------------------------------------------------------
           packages = {
             default = rio-workspace;
+            # Instrumented build (inspection: `objdump -h result/bin/rio-store
+            # | grep llvm_prf`). Used by vmTestsCov and nix/coverage.nix.
+            inherit rio-workspace-cov;
             # debug: nix build .#fuzz-build-nix / .#fuzz-build-store
             fuzz-build-nix = fuzz.builds.rio-nix-fuzz-build;
             fuzz-build-store = fuzz.builds.rio-store-fuzz-build;
