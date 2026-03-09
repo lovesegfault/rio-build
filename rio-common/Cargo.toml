@@ -27,6 +27,8 @@ serde = { workspace = true }
 # Async runtime (for spawn_monitored)
 tokio = { workspace = true }
 futures-util = { workspace = true }
+# CancellationToken (graceful shutdown, signal.rs).
+tokio-util = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
@@ -52,6 +54,8 @@ workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# libc::raise for signal self-delivery test.
+libc = "0.2"
 # figment::Jail (test-only env/cwd manipulation under a global mutex)
 figment = { workspace = true, features = ["test"] }
 # In-memory cert generation for mTLS integration test. Generates

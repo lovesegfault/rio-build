@@ -12,5 +12,6 @@ pub mod hmac;
 pub mod limits;
 pub mod newtype;
 pub mod observability;
+pub mod signal;
 pub mod task;
 pub mod tls;
