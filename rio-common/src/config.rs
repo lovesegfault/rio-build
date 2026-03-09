@@ -137,6 +137,48 @@ where
     d.deserialize_any(CommaVecVisitor)
 }
 
+/// Redact the password component of a database URL for safe logging.
+///
+/// `postgres://user:SECRET@host:5432/db` → `postgres://user:***@host:5432/db`.
+///
+/// Falls back to `"<redacted>"` if the URL doesn't parse in the
+/// expected `scheme://[user[:pass]@]host[...]` shape — better to
+/// over-redact than leak a password from an unusual format.
+///
+/// Round 4 Z6: prior to this, rio-store's main.rs logged
+/// `cfg.database_url` verbatim at INFO, including the password.
+/// A `kubectl logs` grep (or log-aggregator misconfiguration)
+/// exposed the PG credentials.
+pub fn redact_db_url(url: &str) -> String {
+    // Find scheme://. If absent, not a URL we recognize.
+    let Some(scheme_end) = url.find("://") else {
+        return "<redacted>".to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+
+    // Find the userinfo@host boundary. If no '@', there's no
+    // userinfo component → no password → safe as-is.
+    let Some(at_idx) = after_scheme.find('@') else {
+        return url.to_string();
+    };
+
+    // Userinfo is everything before '@'. If it contains ':', the
+    // part after ':' is the password.
+    let userinfo = &after_scheme[..at_idx];
+    let Some(colon_idx) = userinfo.find(':') else {
+        // user@host (no password) → safe as-is.
+        return url.to_string();
+    };
+
+    // Rebuild: scheme:// + user + :*** + @host...
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..scheme_end + 3]); // scheme://
+    out.push_str(&userinfo[..colon_idx]); // user
+    out.push_str(":***");
+    out.push_str(&after_scheme[at_idx..]); // @host:port/db?...
+    out
+}
+
 /// Same as [`load`] but with an explicit TOML file path (for tests).
 /// Skips the `/etc/rio/` and cwd search paths entirely.
 #[cfg(test)]
@@ -508,5 +550,46 @@ mod tests {
             assert!(cfg.features.is_empty());
             Ok(())
         });
+    }
+
+    // --- Z6: redact_db_url tests ---
+
+    #[test]
+    fn redact_db_url_basic() {
+        assert_eq!(
+            redact_db_url("postgres://user:secretpw@host:5432/db"),
+            "postgres://user:***@host:5432/db"
+        );
+    }
+
+    #[test]
+    fn redact_db_url_no_password() {
+        // No password → returned as-is (nothing to redact).
+        assert_eq!(
+            redact_db_url("postgres://user@host/db"),
+            "postgres://user@host/db"
+        );
+    }
+
+    #[test]
+    fn redact_db_url_no_userinfo() {
+        // No userinfo → returned as-is.
+        assert_eq!(redact_db_url("postgres://host/db"), "postgres://host/db");
+    }
+
+    #[test]
+    fn redact_db_url_malformed() {
+        // Doesn't look like a URL → fully redacted (safe default).
+        assert_eq!(redact_db_url("not a url"), "<redacted>");
+        assert_eq!(redact_db_url(""), "<redacted>");
+    }
+
+    #[test]
+    fn redact_db_url_preserves_query() {
+        // Query params after the path should be preserved.
+        assert_eq!(
+            redact_db_url("postgres://u:pw@h:5432/d?sslmode=require&connect_timeout=30"),
+            "postgres://u:***@h:5432/d?sslmode=require&connect_timeout=30"
+        );
     }
 }

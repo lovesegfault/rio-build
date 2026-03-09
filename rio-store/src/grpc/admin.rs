@@ -139,16 +139,31 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                 return;
             }
             // lock_conn held for the whole GC; explicit unlock at
-            // the end. NOTE: if this task panics, lock_conn drops
-            // back into the POOL (NOT closed) — the advisory lock
-            // stays held until sqlx recycles that pooled connection
-            // (which may be long-lived). No panic points currently
-            // in mark/sweep (all Result-returning), but avoid
-            // .unwrap()/.expect() in this task to keep it that way.
+            // the end via gc_unlock.
             //
-            // Inner helper: unlock + drop. Called from all exit
-            // paths past this point (mark fail, sweep fail, success).
-            async fn gc_unlock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+            // Round 4 Z7: scopeguard detaches on ANY exit not going
+            // through gc_unlock — including task cancellation (client
+            // drops the stream → tonic may abort this tokio::spawn) and
+            // panics. detach() removes the connection from the pool;
+            // dropping the detached connection closes it → PG releases
+            // the session-scoped lock. Before this, cancel/panic left
+            // the connection in the pool with the lock held → next
+            // TriggerGC would get "already running" until sqlx recycled
+            // that pooled connection (possibly hours).
+            //
+            // gc_unlock DEFUSES the scopeguard (ScopeGuard::into_inner)
+            // and explicitly unlocks + returns conn to pool (cheaper
+            // than detach on the happy path).
+            let lock_conn = scopeguard::guard(lock_conn, |c| {
+                let _ = c.detach();
+            });
+            async fn gc_unlock(
+                conn: scopeguard::ScopeGuard<
+                    sqlx::pool::PoolConnection<sqlx::Postgres>,
+                    impl FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>),
+                >,
+            ) {
+                let mut conn = scopeguard::ScopeGuard::into_inner(conn);
                 if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
                     .bind(GC_LOCK_ID)
                     .execute(&mut *conn)

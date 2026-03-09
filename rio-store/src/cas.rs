@@ -474,7 +474,24 @@ impl ChunkCache {
             // real (cosmic rays, bad RAM). The alternative — trusting
             // the cache unconditionally — means a single bit-flip
             // propagates to every subsequent GetPath until restart.
-            return Self::verify(hash, bytes);
+            //
+            // Round 4 Z5: if verify fails, INVALIDATE the LRU entry.
+            // Before this, corrupt bytes stuck in the cache forever —
+            // every subsequent get_verified for this hash returned the
+            // same error. Invalidating forces the next call to re-fetch
+            // from the backend (which might have intact bytes).
+            match Self::verify(hash, bytes) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %hex::encode(hash),
+                        error = %e,
+                        "LRU hit failed verification — invalidating entry"
+                    );
+                    self.lru.invalidate(hash).await;
+                    return Err(e);
+                }
+            }
         }
         metrics::counter!("rio_store_chunk_cache_misses_total").increment(1);
 
@@ -782,5 +799,48 @@ mod cache_tests {
         // Second call also hits backend (inflight didn't cache the miss).
         let second = cache.get_verified(&hash).await;
         assert!(matches!(second, Err(ChunkError::NotFound(_))));
+    }
+
+    /// Round 4 Z5: corrupt bytes in the LRU must be INVALIDATED on
+    /// verify failure. Before this, a bit-flip in cached bytes would
+    /// stick forever — every subsequent get_verified returned the
+    /// same error. Invalidating forces a re-fetch from the backend.
+    #[tokio::test]
+    async fn lru_invalidated_on_corrupt_hit() {
+        let (backend, cache) = make_cache();
+        let (hash, good_data) = sample_chunk();
+
+        // Seed the backend with GOOD data.
+        backend.put(&hash, good_data.clone()).await.unwrap();
+
+        // Manually insert CORRUPT bytes into the LRU, simulating
+        // memory corruption (cosmic ray bit-flip, bad RAM). In
+        // production, good data went in; corruption happened later
+        // inside the cache's memory.
+        cache
+            .lru
+            .insert(hash, Bytes::from_static(b"bit-flipped garbage"))
+            .await;
+        cache.lru.run_pending_tasks().await;
+
+        // First call: LRU hit → verify fails → Err(Corrupt). This
+        // ALSO invalidates the entry (Z5 fix).
+        let first = cache.get_verified(&hash).await;
+        assert!(
+            matches!(first, Err(ChunkError::Corrupt { .. })),
+            "first call should fail verification (corrupt LRU bytes)"
+        );
+
+        // THE KEY ASSERTION: second call should SUCCEED (entry was
+        // invalidated → cache miss → re-fetch from backend → good
+        // data). Before Z5, this would return the SAME error.
+        let second = cache.get_verified(&hash).await.expect(
+            "Z5: second call should succeed — LRU entry should have \
+             been invalidated on the first verify failure",
+        );
+        assert_eq!(
+            second, good_data,
+            "second call should fetch fresh good data from backend"
+        );
     }
 }

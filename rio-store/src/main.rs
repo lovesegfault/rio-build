@@ -154,8 +154,11 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_store::describe_metrics();
 
-    // Connect to PostgreSQL
-    info!(url = %cfg.database_url, "connecting to PostgreSQL");
+    // Connect to PostgreSQL. Round 4 Z6: redact password before logging.
+    info!(
+        url = %rio_common::config::redact_db_url(&cfg.database_url),
+        "connecting to PostgreSQL"
+    );
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .connect(&cfg.database_url)
