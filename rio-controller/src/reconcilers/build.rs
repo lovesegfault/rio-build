@@ -41,7 +41,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event, finalizer};
-use kube::{CustomResourceExt, ResourceExt};
+use kube::{CustomResourceExt, Resource, ResourceExt};
 use rio_proto::types::{self, build_event::Event as BuildEv};
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
@@ -186,6 +186,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 ctx.scheduler_addr.clone(),
                 ctx.watching.clone(),
                 watch_key,
+                ctx.recorder.clone(),
+                b.object_ref(&()),
             );
             return Ok(Action::await_change());
         } else {
@@ -232,33 +234,27 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         keep_going: false,
     };
 
-    let stream = sched.submit_build(req).await?.into_inner();
-
     let api: Api<Build> = Api::namespaced(ctx.client.clone(), &ns);
 
-    // ---- Sentinel patch FIRST, then spawn watch ----
-    // Set phase=Pending immediately so the idempotence gate
-    // above doesn't fire AGAIN if we're re-reconciled before the
-    // first BuildStarted arrives. build_id is set by the watch
-    // task (from BuildEvent.build_id — the scheduler assigns it).
-    // But there's a race: this reconcile returns → controller
-    // re-enqueues (finalizer added triggers a change event) →
-    // apply() runs again → build_id still empty → DOUBLE SUBMIT.
+    // ---- Sentinel patch BEFORE submit (Round 4 Z10) ----
+    // Set build_id="submitted" so the idempotence gate above skips
+    // re-reconciles. This MUST land BEFORE submit_build so:
+    //   (a) if sentinel patch fails → clean retry (no scheduler
+    //       state to clean up)
+    //   (b) if submit fails AFTER sentinel → orphaned-sentinel
+    //       resubmit path (line ~143 above) handles it cleanly
+    //   (c) if a fast build's first event races this reconcile,
+    //       the sentinel is already persisted before drain_stream
+    //       can patch (prevents Pending/submitted overwrite of
+    //       Building/<uuid>)
     //
-    // Close it: set build_id to a SENTINEL ("submitted") here.
-    // The watch task overwrites with the real UUID on first
-    // event. The idempotence gate checks !is_empty(), not
-    // validity — sentinel passes.
-    //
-    // ORDER MATTERS: the sentinel patch MUST land before the
-    // watch task's first patch. Previously the spawn came first,
-    // which meant a fast build's first event (BuildStarted with
-    // real UUID) could race the sentinel: drain_stream patches
-    // {phase:Building, build_id:<uuid>}, then apply() overwrites
-    // with {phase:Pending, build_id:"submitted"}. For a build
-    // that completes before the next event (already cached), the
-    // CRD would be stuck at Pending/submitted despite success.
-    // Awaiting this patch first eliminates the race.
+    // Prior to round 4, submit came first. If patch failed after
+    // submit, the stream was dropped (this function returns Err),
+    // but the scheduler had a live build. Next reconcile → build_id
+    // still empty → DOUBLE SUBMIT → zombie build (scheduler's
+    // MergeDag dedups derivations by hash, but still creates a PG
+    // builds row + broadcast channel — leaked until terminal
+    // cleanup or scheduler restart).
     patch_status(
         &api,
         &name,
@@ -269,6 +265,24 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         },
     )
     .await?;
+
+    let stream = sched.submit_build(req).await?.into_inner();
+
+    // Round 4 Z11: K8s Event for the submit. Operators see this
+    // in `kubectl describe build <name>` before any scheduler
+    // events arrive. Best-effort (event publish failure logged,
+    // not propagated).
+    ctx.publish_event(
+        b.as_ref(),
+        &kube::runtime::events::Event {
+            type_: kube::runtime::events::EventType::Normal,
+            reason: "Submitted".into(),
+            note: Some(format!("SubmitBuild accepted for {}", b.spec.derivation)),
+            action: "Submit".into(),
+            secondary: None,
+        },
+    )
+    .await;
 
     // ---- Spawn watch task ----
     // Runs until the stream ends (build terminal) or PATCH fails
@@ -293,6 +307,11 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     }
     ctx.watching.insert(watch_key.clone(), ());
     metrics::counter!("rio_controller_build_watch_spawns_total").increment(1);
+    // obj_ref is an immutable snapshot of the Build's identity
+    // (name/ns/uid/kind). drain_stream uses it for K8s Event
+    // publishing; the Build's spec/status may change during the
+    // watch but identity doesn't.
+    let obj_ref = b.object_ref(&());
     rio_common::task::spawn_monitored(
         "build-watch",
         drain_stream(
@@ -308,6 +327,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             None,
             ctx.watching.clone(),
             watch_key,
+            ctx.recorder.clone(),
+            obj_ref,
         ),
     );
 
@@ -333,6 +354,8 @@ fn spawn_reconnect_watch(
     scheduler_addr: String,
     watching: Arc<dashmap::DashMap<String, ()>>,
     watch_key: String,
+    recorder: kube::runtime::events::Recorder,
+    obj_ref: k8s_openapi::api::core::v1::ObjectReference,
 ) {
     rio_common::task::spawn_monitored("build-watch-reconnect", async move {
         // No outer scopeguard here (X14 fix). drain_stream has its
@@ -365,6 +388,8 @@ fn spawn_reconnect_watch(
                     Some(build_id),
                     watching,
                     watch_key,
+                    recorder,
+                    obj_ref,
                 )
                 .await;
                 // drain_stream's guard removed the entry on exit.
@@ -632,6 +657,12 @@ async fn drain_stream(
     known_build_id: Option<String>,
     watching: Arc<dashmap::DashMap<String, ()>>,
     watch_key: String,
+    // Round 4 Z11: recorder + obj_ref for K8s Events. recorder
+    // is Clone (Arc-backed); obj_ref is an immutable snapshot of
+    // the Build's identity at spawn time (name/ns/uid don't change
+    // across the watch's lifetime even if spec is edited).
+    recorder: kube::runtime::events::Recorder,
+    obj_ref: k8s_openapi::api::core::v1::ObjectReference,
 ) {
     // Remove watching entry on exit (any path — terminal, error,
     // panic, reconnect-exhausted). Next apply() can re-spawn if
@@ -687,7 +718,36 @@ async fn drain_stream(
                 status.last_sequence = ev.sequence as i64;
 
                 let Some(inner) = ev.event else { continue };
-                let should_patch = apply_event(&mut status, inner);
+                let (should_patch, k8s_event) = apply_event(&mut status, inner);
+
+                // Round 4 Z11: publish K8s Event for meaningful
+                // transitions (Building/Succeeded/Failed/Cancelled).
+                // Operators see these in `kubectl describe build <name>`
+                // and `kubectl get events`. Best-effort — event-publish
+                // failure is logged, not propagated (events are
+                // observability, not correctness).
+                if let Some(info) = k8s_event {
+                    let ev_type = if info.is_warning {
+                        kube::runtime::events::EventType::Warning
+                    } else {
+                        kube::runtime::events::EventType::Normal
+                    };
+                    if let Err(e) = recorder
+                        .publish(
+                            &kube::runtime::events::Event {
+                                type_: ev_type,
+                                reason: info.reason.into(),
+                                note: Some(info.note),
+                                action: "Reconcile".into(),
+                                secondary: None,
+                            },
+                            &obj_ref,
+                        )
+                        .await
+                    {
+                        warn!(build = %name, error = %e, "K8s event publish failed");
+                    }
+                }
 
                 if should_patch && let Err(e) = patch_status(&api, &name, status.clone()).await {
                     // PATCH failed. Most likely: CRD deleted
@@ -799,11 +859,29 @@ async fn drain_stream(
     }
 }
 
-/// Apply one event to the accumulated status. Returns whether
-/// this event warrants a PATCH (state transitions yes, logs no).
+/// K8s Event to publish for a Build transition. `reason` is the
+/// PascalCase short code (shows in `kubectl get events` REASON
+/// column). `note` is the human-readable message.
+pub(crate) struct K8sEventInfo {
+    pub reason: &'static str,
+    pub note: String,
+    /// Whether this is a warning-type event (Failed). Normal otherwise.
+    pub is_warning: bool,
+}
+
+/// Apply one event to the accumulated status.
+///
+/// Returns `(should_patch, k8s_event)`:
+/// - `should_patch`: whether this event warrants a K8s API PATCH
+///   (state transitions yes, logs no)
+/// - `k8s_event`: if `Some`, publish this as a K8s Event (shows
+///   in `kubectl describe build <name>` and `kubectl get events`).
+///   Only meaningful transitions (Started, Succeeded, Failed,
+///   Cancelled) emit events — Progress spam would flood the event
+///   stream.
 ///
 /// `pub(crate)` for unit testing without a live stream.
-pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> bool {
+pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> (bool, Option<K8sEventInfo>) {
     match ev {
         BuildEv::Started(s) => {
             status.phase = "Building".into();
@@ -811,7 +889,19 @@ pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> bool {
             status.cached_derivations = s.cached_derivations as i32;
             status.progress = format!("0/{}", s.total_derivations);
             status.started_at = Some(Time(k8s_openapi::jiff::Timestamp::now()));
-            true
+            (
+                true,
+                Some(K8sEventInfo {
+                    reason: "Building",
+                    note: format!(
+                        "Build started: {}/{} cached, {} to build",
+                        s.cached_derivations,
+                        s.total_derivations,
+                        s.total_derivations.saturating_sub(s.cached_derivations)
+                    ),
+                    is_warning: false,
+                }),
+            )
         }
         BuildEv::Progress(p) => {
             status.completed_derivations = p.completed as i32;
@@ -828,14 +918,25 @@ pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> bool {
             if status.phase == "Pending" {
                 status.phase = "Building".into();
             }
-            true
+            (true, None) // No K8s Event — Progress would spam
         }
         BuildEv::Completed(_) => {
             status.phase = "Succeeded".into();
-            true
+            (
+                true,
+                Some(K8sEventInfo {
+                    reason: "Succeeded",
+                    note: format!(
+                        "Build completed successfully ({}/{} derivations)",
+                        status.completed_derivations, status.total_derivations
+                    ),
+                    is_warning: false,
+                }),
+            )
         }
         BuildEv::Failed(f) => {
             status.phase = "Failed".into();
+            let msg = format!("{}: {}", f.failed_derivation, f.error_message);
             // Record the error in a condition. Find-or-push so
             // repeated Failed events (shouldn't happen, but
             // defensive) don't duplicate.
@@ -844,9 +945,16 @@ pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> bool {
                 "Failed",
                 "True",
                 "BuildFailed",
-                &format!("{}: {}", f.failed_derivation, f.error_message),
+                &msg,
             );
-            true
+            (
+                true,
+                Some(K8sEventInfo {
+                    reason: "Failed",
+                    note: msg,
+                    is_warning: true,
+                }),
+            )
         }
         BuildEv::Cancelled(c) => {
             status.phase = "Cancelled".into();
@@ -857,14 +965,21 @@ pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> bool {
                 "BuildCancelled",
                 &c.reason,
             );
-            true
+            (
+                true,
+                Some(K8sEventInfo {
+                    reason: "Cancelled",
+                    note: format!("Build cancelled: {}", c.reason),
+                    is_warning: false,
+                }),
+            )
         }
         // DerivationEvent: per-drv state change. Interesting for
         // dashboards but we only track aggregates. Skip patch —
         // the next Progress event carries the updated count.
-        BuildEv::Derivation(_) => false,
+        BuildEv::Derivation(_) => (false, None),
         // Log: filtered, same as everywhere else. Too chatty.
-        BuildEv::Log(_) => false,
+        BuildEv::Log(_) => (false, None),
     }
 }
 
@@ -941,54 +1056,84 @@ mod tests {
     }
 
     /// apply_event: state events patch, Log/Derivation don't.
+    /// Also verifies Z11 K8s event emission: Started/Completed
+    /// return Some(K8sEventInfo), Progress/Log/Derivation return None.
     /// Mirrors emit_build_event's Log filter — same "too chatty"
     /// rationale, different target (apiserver not PG).
     #[test]
     fn apply_event_filters_noise() {
         let mut status = BuildStatus::default();
 
-        assert!(apply_event(
+        let (patch, ev) = apply_event(
             &mut status,
             BuildEv::Started(types::BuildStarted {
                 total_derivations: 10,
                 cached_derivations: 3,
-            })
-        ));
+            }),
+        );
+        assert!(patch);
+        assert!(ev.is_some(), "Started should emit K8s event (Z11)");
+        assert_eq!(ev.as_ref().unwrap().reason, "Building");
         assert_eq!(status.phase, "Building");
         assert_eq!(status.total_derivations, 10);
         assert_eq!(status.progress, "0/10");
 
-        // Log → no patch, status untouched.
-        assert!(!apply_event(
-            &mut status,
-            BuildEv::Log(types::BuildLogBatch::default())
-        ));
+        // Log → no patch, no K8s event, status untouched.
+        let (patch, ev) = apply_event(&mut status, BuildEv::Log(types::BuildLogBatch::default()));
+        assert!(!patch);
+        assert!(ev.is_none(), "Log should not emit K8s event (spam)");
         assert_eq!(status.phase, "Building", "Log didn't clobber phase");
 
-        // DerivationEvent → no patch either.
-        assert!(!apply_event(
+        // DerivationEvent → no patch, no K8s event.
+        let (patch, ev) = apply_event(
             &mut status,
-            BuildEv::Derivation(types::DerivationEvent::default())
-        ));
+            BuildEv::Derivation(types::DerivationEvent::default()),
+        );
+        assert!(!patch);
+        assert!(ev.is_none());
 
-        // Progress → patch, counts update.
-        assert!(apply_event(
+        // Progress → patch, counts update, NO K8s event (spam).
+        let (patch, ev) = apply_event(
             &mut status,
             BuildEv::Progress(types::BuildProgress {
                 completed: 5,
                 running: 2,
                 queued: 3,
                 total: 10,
-            })
-        ));
+            }),
+        );
+        assert!(patch);
+        assert!(ev.is_none(), "Progress should not emit K8s event (spam)");
         assert_eq!(status.progress, "5/10");
 
-        // Completed → terminal.
-        assert!(apply_event(
+        // Completed → terminal + K8s event.
+        let (patch, ev) = apply_event(
             &mut status,
-            BuildEv::Completed(types::BuildCompleted::default())
-        ));
+            BuildEv::Completed(types::BuildCompleted::default()),
+        );
+        assert!(patch);
+        assert!(ev.is_some(), "Completed should emit K8s event (Z11)");
+        assert_eq!(ev.as_ref().unwrap().reason, "Succeeded");
+        assert!(!ev.unwrap().is_warning);
         assert_eq!(status.phase, "Succeeded");
+    }
+
+    /// Z11: Failed event emits a WARNING-type K8s event.
+    #[test]
+    fn apply_event_failed_is_warning() {
+        let mut status = BuildStatus::default();
+        let (patch, ev) = apply_event(
+            &mut status,
+            BuildEv::Failed(types::BuildFailed {
+                error_message: "oops".into(),
+                failed_derivation: "/nix/store/foo.drv".into(),
+            }),
+        );
+        assert!(patch);
+        let ev = ev.expect("Failed should emit K8s event");
+        assert_eq!(ev.reason, "Failed");
+        assert!(ev.is_warning, "Failed should be Warning type");
+        assert!(ev.note.contains("oops"));
     }
 
     /// derivation_to_node extracts pname/system/outputs from a

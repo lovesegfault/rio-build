@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::apps::v1::StatefulSet;
 use kube::api::{Api, Patch, PatchParams};
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
 
@@ -140,6 +140,10 @@ pub struct Autoscaler {
     /// Timing knobs. `Copy` — passed by value into
     /// check_stabilization (3 Durations = 24 bytes).
     timing: ScalingTiming,
+    /// K8s Events recorder. Round 4 Z11: emit ScaledUp/ScaledDown
+    /// events on successful scale patches so operators see the
+    /// autoscaler's decisions in `kubectl describe workerpool`.
+    recorder: kube::runtime::events::Recorder,
 }
 
 impl Autoscaler {
@@ -147,12 +151,14 @@ impl Autoscaler {
         client: Client,
         scheduler: AdminServiceClient<Channel>,
         timing: ScalingTiming,
+        recorder: kube::runtime::events::Recorder,
     ) -> Self {
         Self {
             client,
             scheduler,
             states: HashMap::new(),
             timing,
+            recorder,
         }
     }
 
@@ -354,6 +360,35 @@ impl Autoscaler {
                         metrics::counter!("rio_controller_scaling_decisions_total",
                             "direction" => direction.as_str())
                         .increment(1);
+
+                        // Round 4 Z11: emit K8s Event on scale.
+                        // Operators see ScaledUp/ScaledDown in
+                        // `kubectl describe workerpool <name>`.
+                        // Best-effort (event publish fail logged).
+                        let event_reason = match direction {
+                            Direction::Up => "ScaledUp",
+                            Direction::Down => "ScaledDown",
+                        };
+                        if let Err(e) = self
+                            .recorder
+                            .publish(
+                                &kube::runtime::events::Event {
+                                    type_: kube::runtime::events::EventType::Normal,
+                                    reason: event_reason.into(),
+                                    note: Some(format!(
+                                        "Scaled replicas {current}→{desired} (queued={}, active={})",
+                                        status.queued_derivations,
+                                        status.active_workers
+                                    )),
+                                    action: "Scale".into(),
+                                    secondary: None,
+                                },
+                                &pool.object_ref(&()),
+                            )
+                            .await
+                        {
+                            warn!(pool = %key, error = %e, "K8s scale event publish failed");
+                        }
 
                         // Best-effort: record the scale in
                         // WorkerPool.status. Fire-and-forget

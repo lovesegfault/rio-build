@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
         client: client.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
         store_addr: cfg.store_addr.clone(),
-        recorder,
+        recorder: recorder.clone(),
         watching: Arc::new(dashmap::DashMap::new()),
     });
 
@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
         min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
     };
     info!(?timing, "autoscaler timing");
-    let autoscaler = Autoscaler::new(client.clone(), scheduler, timing);
+    let autoscaler = Autoscaler::new(client.clone(), scheduler, timing, recorder);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run());
 
     // ---- Build controller ----
