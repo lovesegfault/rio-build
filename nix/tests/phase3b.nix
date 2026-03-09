@@ -687,7 +687,7 @@ pkgs.testers.runNixOSTest {
             "> /tmp/s1slow.log 2>&1 < /dev/null &"
         )
         # Poll for the build to be dispatched (Running). The slow
-        # build's 15s sleep starts once the worker receives the
+        # build's 60s sleep starts once the worker receives the
         # assignment → derivations.status='running' in PG.
         control.wait_until_succeeds(
             "curl -sf http://localhost:9091/metrics | "
@@ -695,7 +695,17 @@ pkgs.testers.runNixOSTest {
             timeout=20
         )
 
-        control.succeed("systemctl restart rio-scheduler")
+        # SIGKILL, not `systemctl restart` (which sends SIGTERM).
+        # With graceful shutdown (serve_with_shutdown), SIGTERM
+        # waits for in-flight streams to drain — the slow build's
+        # BuildExecution stream keeps the scheduler alive until
+        # the 60s build completes → drv marked completed in PG →
+        # V3 fails. V3's intent is "recovery from abrupt CRASH
+        # with in-flight work" — SIGKILL simulates that. Graceful
+        # shutdown is tested separately (collectCoverage uses
+        # `systemctl stop` + verifies profraw flush).
+        control.succeed("systemctl kill -s KILL rio-scheduler")
+        control.succeed("systemctl start rio-scheduler")
         control.wait_for_unit("rio-scheduler.service")
         # Main port (TLS) listening again. wait_for_open_port just
         # TCP-connects — works for TLS ports too (TLS handshake is
