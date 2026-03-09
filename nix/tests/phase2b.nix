@@ -253,29 +253,34 @@ pkgs.testers.runNixOSTest {
     # search above only proves scheduler EXPORTS; this proves the
     # gateway→scheduler propagation via rio_proto::interceptor.
     #
-    # Approach: fetch one traceID from scheduler traces, then query
-    # that trace and check it contains spans from BOTH services.
+    # Approach: fetch scheduler traceIDs, query each full trace,
+    # check if any contains spans from BOTH gateway and scheduler.
     # Tempo's /api/traces/{id} returns the full trace with all spans.
-    control.wait_until_succeeds(
-        "curl -sf 'http://localhost:3200/api/search?tags=service.name%3Dscheduler&limit=5' | "
-        "python3 -c '"
-        "import sys, json, urllib.request; "
-        "d = json.load(sys.stdin); "
-        "traces = d.get(\"traces\", []); "
-        "assert traces, \"no scheduler traces\"; "
+    #
+    # Written as a temp Python script to avoid -c quoting hell
+    # (for-loops and semicolons don't mix in python -c).
+    control.succeed(
+        "cat > /tmp/check_trace_propagation.py << 'PYEOF'\n"
+        "import sys, json, urllib.request\n"
+        "search = json.load(urllib.request.urlopen('http://localhost:3200/api/search?tags=service.name%3Dscheduler&limit=5'))\n"
+        "traces = search.get('traces', [])\n"
+        "assert traces, 'no scheduler traces found'\n"
         "for t in traces:\n"
-        "  tid = t[\"traceID\"]; "
-        "  full = json.load(urllib.request.urlopen(f\"http://localhost:3200/api/traces/{tid}\")); "
-        "  svcs = set(); "
-        "  for batch in full.get(\"batches\", []):\n"
-        "    for attr in batch.get(\"resource\", {}).get(\"attributes\", []):\n"
-        "      if attr.get(\"key\") == \"service.name\":\n"
-        "        svcs.add(attr[\"value\"][\"stringValue\"]);\n"
-        "  if \"gateway\" in svcs and \"scheduler\" in svcs:\n"
-        "    print(f\"V10 PASS: trace {tid} has gateway+scheduler spans (propagation works)\"); "
-        "    sys.exit(0);\n"
-        "assert False, f\"no trace with both gateway AND scheduler spans (checked {len(traces)}); propagation broken?\""
-        "'",
+        "    tid = t['traceID']\n"
+        "    full = json.load(urllib.request.urlopen(f'http://localhost:3200/api/traces/{tid}'))\n"
+        "    svcs = set()\n"
+        "    for batch in full.get('batches', []):\n"
+        "        for attr in batch.get('resource', {}).get('attributes', []):\n"
+        "            if attr.get('key') == 'service.name':\n"
+        "                svcs.add(attr['value']['stringValue'])\n"
+        "    if 'gateway' in svcs and 'scheduler' in svcs:\n"
+        "        print(f'V10 PASS: trace {tid} has gateway+scheduler spans (propagation works)')\n"
+        "        sys.exit(0)\n"
+        "sys.exit(f'no trace with both gateway AND scheduler spans (checked {len(traces)}); propagation broken?')\n"
+        "PYEOF"
+    )
+    control.wait_until_succeeds(
+        "python3 /tmp/check_trace_propagation.py",
         timeout=30
     )
   '';
