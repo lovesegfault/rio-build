@@ -752,6 +752,12 @@
             #   result/html/       — genhtml report
             #   result/per-test/   — vm-phase*.lcov individual breakdowns
             coverage-full = coverage.full;
+            # Same data as coverage-full, HTML-only output at result/
+            # (no lcov.info / per-test subdirs). Mirrors coverage-html's
+            # relationship to the unit-test coverage check.
+            coverage-full-html = pkgs.runCommand "rio-coverage-full-html" { } ''
+              ln -s ${coverage.full}/html $out
+            '';
             # VM-only combined (no unit-test merge). Debugging.
             coverage-vm = coverage.vmLcov;
           }
