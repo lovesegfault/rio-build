@@ -1,11 +1,11 @@
 # Phase 3b milestone validation: production hardening.
 #
-# Iteration 3: mTLS (T), HMAC (B), state recovery (S), Build CRD
-# watch dedup (F), GC dry-run (C1), gateway validation (G), real
-# GC sweep + PinPath (C2). Skips E/D (PDB/NetPol/FOD proxy) —
-# those need NetworkPolicy + Squid VM. Skips A (cancel timing).
+# Validates: mTLS, HMAC assignment tokens, scheduler state recovery,
+# Build-CRD watch dedup, GC dry-run + real sweep + PinPath, gateway
+# validation. Skips PDB/NetPol/FOD-proxy (need NetworkPolicy + Squid
+# VM) and cancel-timing (covered by unit tests).
 #
-# Topology (4 VMs — iteration 3 adds k8s):
+# Topology (4 VMs):
 #   control — PG + store + scheduler + gateway. Server cert with
 #             SANs {control, localhost, 127.0.0.1}. HMAC key
 #             shared with itself (scheduler signs, store verifies).
@@ -27,7 +27,7 @@
   pkgs,
   rio-workspace,
   rioModules,
-  # crds: auto-deployed via k3s manifests (F1 section).
+  # crds: auto-deployed via k3s manifests (Build CRD watch-dedup section).
   crds,
   coverage ? false,
   # dockerImages: passed by flake for k3s airgap preload. Unused
@@ -102,8 +102,8 @@ let
           -out $out/client.crt -days 3650
 
         # ── Gateway client cert (CN=rio-gateway for HMAC bypass) ────
-        # X1 fix: store's PutPath HMAC bypass requires CN=rio-gateway.
-        # The gateway connects to the store as a CLIENT (store's
+        # Store's PutPath HMAC bypass requires CN=rio-gateway. The
+        # gateway connects to the store as a CLIENT (store's
         # ServerTlsConfig with client_ca_root verifies this cert).
         # Without CN=rio-gateway, PutPath rejects with "assignment
         # token required (CN=... is not rio-gateway)".
@@ -125,7 +125,7 @@ let
   #
   # rio-scheduler + rio-store don't register tonic-reflection. grpcurl
   # without a protoset/proto can only probe the health service (via
-  # bundled grpc.health.v1 descriptors). For TriggerGC (C1) we need
+  # bundled grpc.health.v1 descriptors). For TriggerGC we need
   # rio.admin.AdminService → compile the protos to a FileDescriptorSet
   # that grpcurl loads with -protoset.
   #
@@ -147,11 +147,12 @@ let
           admin.proto store.proto types.proto
       '';
 
-  # ── Trivial derivation for build tests (B1, S1) ─────────────────────
+  # ── Trivial derivation for build tests (HMAC, recovery) ─────────────
   # Same pattern as phase1b: one leaf, no inputDrvs, busybox builder.
   # The content of $out varies per-section (parameterized below) so
-  # S1's post-restart build produces a DIFFERENT store path than B1's
-  # — otherwise S1 would be a cache hit and not prove dispatch works.
+  # the post-restart recovery build produces a DIFFERENT store path
+  # than the HMAC build — otherwise it would be a cache hit and not
+  # prove dispatch works.
   mkTestDrvFile =
     stamp:
     pkgs.writeText "phase3b-${stamp}.nix" ''
@@ -171,24 +172,23 @@ let
       }
     '';
 
-  testDrvFileB1 = mkTestDrvFile "hmac";
-  testDrvFileS1 = mkTestDrvFile "recovery";
+  testDrvFileHmac = mkTestDrvFile "hmac";
+  testDrvFileRecovery = mkTestDrvFile "recovery";
 
-  # V3: slow build for S1 in-flight recovery. Sleep survives the
+  # Slow build for in-flight recovery. Sleep survives the
   # scheduler-restart window (~5s kill+wait + ~5s lease acquire +
   # up to 30s recovery wait). Backgrounded before restart; recovery
   # should load its derivation row from PG → `derivations=1` in
   # the recovery log.
   #
-  # Round 4: increased 15s → 60s. With Z3 (phantom-Assigned cross-
-  # check), ReconcileAssignments now reconciles drvs that completed
-  # during scheduler downtime: worker finishes 15s build, reconnects
-  # with empty running_builds, Z3 detects this → store-check →
-  # output present → Completed. This is CORRECT behavior (Z3 works),
-  # but V3's PG check then finds 0 non-terminal. 60s outlives the
-  # full restart+recovery window (~40s worst case) so the build is
-  # still running at PG-check time.
-  testDrvFileS1slow = pkgs.writeText "phase3b-recovery-slow.nix" ''
+  # 60s (not shorter): ReconcileAssignments cross-checks phantom-
+  # Assigned drvs that completed during scheduler downtime — worker
+  # finishes a short build, reconnects with empty running_builds,
+  # cross-check detects this → store-check → output present →
+  # Completed. A shorter sleep would let the build finish during
+  # downtime; 60s outlives the full restart+recovery window (~40s
+  # worst case) so the build is still running at PG-check time.
+  testDrvFileRecoverySlow = pkgs.writeText "phase3b-recovery-slow.nix" ''
     { busybox }:
     derivation {
       name = "rio-3b-recovery-slow";
@@ -206,11 +206,11 @@ let
     }
   '';
 
-  # Slow build for F1 (Build CRD watch dedup). The 5s sleep gives
+  # Slow build for Build CRD watch dedup. The 5s sleep gives
   # drain_stream multiple BuildEvent → status patch → reconcile
   # cycles. Without the dedup fix (ctx.watching gate), each cycle
   # spawns a duplicate watch. The metric assertion catches it.
-  testDrvFileF1 = pkgs.writeText "phase3b-watchdedup.nix" ''
+  testDrvFileWatchDedup = pkgs.writeText "phase3b-watchdedup.nix" ''
     { busybox }:
     derivation {
       name = "rio-3b-watchdedup";
@@ -230,8 +230,8 @@ let
 
   # __noChroot derivation: REJECTED by gateway's translate::validate_dag.
   # Rejection is pre-SubmitBuild so scheduler never sees it — no TLS
-  # on the scheduler path exercised, but G1 still proves the rejection
-  # happens. Kept from iteration 1.
+  # on the scheduler path exercised, but this still proves the
+  # rejection happens.
   noChrootDrvFile = pkgs.writeText "phase3b-nochroot.nix" ''
     { busybox }:
     derivation {
@@ -274,9 +274,9 @@ let
     RIO_TLS__CA_PATH = "${pki}/ca.crt";
   };
 
-  # Gateway env: SEPARATE client cert with CN=rio-gateway (X1 fix).
-  # The gateway's TlsConfig is CLIENT-only (its server side is SSH
-  # port 2222, not gRPC). The store's PutPath HMAC bypass requires
+  # Gateway env: SEPARATE client cert with CN=rio-gateway. The
+  # gateway's TlsConfig is CLIENT-only (its server side is SSH port
+  # 2222, not gRPC). The store's PutPath HMAC bypass requires
   # CN=rio-gateway. Without this, the gateway would use the shared
   # controlTlsEnv (CN=control) → PutPath rejects with "assignment
   # token required (CN=control is not rio-gateway)".
@@ -304,19 +304,20 @@ pkgs.testers.runNixOSTest {
           hostName = "control";
           memorySize = 2048;
           extraServiceEnv = controlTlsEnv;
-          # V1: wire scheduler to k3s Lease. kubeconfig is copied from
-          # k8s VM at test time (see testScript's k3s bootstrap). Before
-          # that, scheduler starts in STANDBY (lease loop's kube client
-          # init fails on missing /etc/kube/config → graceful return →
-          # is_leader stays false → dispatch_ready early-returns).
-          # After kubeconfig copy + restart: lease acquired →
-          # LeaderAcquired fired → recover_from_pg runs → recovery_
-          # complete=true → dispatch unblocked.
+          # Wire scheduler to k3s Lease. kubeconfig is copied from
+          # k8s VM at test time (see testScript's k3s bootstrap).
+          # Before that, scheduler starts in STANDBY (lease loop's
+          # kube client init fails on missing /etc/kube/config →
+          # graceful return → is_leader stays false → dispatch_ready
+          # early-returns). After kubeconfig copy + restart: lease
+          # acquired → LeaderAcquired fired → recover_from_pg runs →
+          # recovery_complete=true → dispatch unblocked.
           #
-          # This is the FIX for S1 being hollow: always_leader() in
-          # the no-lease default sets recovery_complete=true from boot
-          # → recovery NEVER runs. With lease config, recovery is gated
-          # on lease acquisition → actually tested.
+          # The lease config is what makes the recovery test non-
+          # hollow: always_leader() in the no-lease default sets
+          # recovery_complete=true from boot → recovery NEVER runs.
+          # With lease config, recovery is gated on lease acquisition
+          # → actually tested.
           extraSchedulerConfig = {
             lease = {
               name = "rio-scheduler-lease";
@@ -324,10 +325,10 @@ pkgs.testers.runNixOSTest {
               kubeconfigPath = "/etc/kube/config";
             };
           };
-          # grpcurl: T1/T2/C1 (gRPC calls with/without TLS).
-          # grpc-health-probe: T2/T3 (health checks without needing
-          #   reflection or a protoset — it has grpc.health.v1 baked in).
-          # openssl: T1 fallback (s_client for raw TLS handshake check).
+          # grpcurl: mTLS + GC sections (gRPC calls with/without TLS).
+          # grpc-health-probe: health checks without needing reflection
+          #   or a protoset — it has grpc.health.v1 baked in.
+          # openssl: mTLS fallback (s_client for raw TLS handshake check).
           extraPackages = [
             pkgs.grpcurl
             pkgs.grpc-health-probe
@@ -364,9 +365,9 @@ pkgs.testers.runNixOSTest {
       extraServiceEnv = workerTlsEnv;
     };
 
-    # k3s + rio-controller for F1 (Build CRD watch dedup). Worker
-    # stays NATIVE (above) — no WorkerPool CR, no pod. The
-    # controller only reconciles Build CRs. Controller connects
+    # k3s + rio-controller for Build CRD watch dedup. Worker stays
+    # NATIVE (above) — no WorkerPool CR, no pod. The controller
+    # only reconciles Build CRs. Controller connects
     # OUTBOUND to control:9001/9002 using the client cert (same
     # workerTlsEnv — CN is cosmetic, CA chain is what matters).
     k8s = common.mkK3sNode {
@@ -393,10 +394,10 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Control plane boot (PG + store; scheduler in STANDBY) ────────
-    # V1: scheduler now has lease config. At boot, kubeconfig doesn't
-    # exist → lease loop's kube client init fails → is_leader stays
-    # false → dispatch gated → scheduler in STANDBY. gRPC port still
-    # binds (wait_for_open_port passes) but health reports NOT_SERVING.
+    # Scheduler has lease config. At boot, kubeconfig doesn't exist →
+    # lease loop's kube client init fails → is_leader stays false →
+    # dispatch gated → scheduler in STANDBY. gRPC port still binds
+    # (wait_for_open_port passes) but health reports NOT_SERVING.
     #
     # We CANNOT restart scheduler before PG is ready (rio-store runs
     # migrations; scheduler needs the schema). So: wait for control
@@ -404,7 +405,7 @@ pkgs.testers.runNixOSTest {
     # kubeconfig + restart.
     ${common.waitForControlPlane "control"}
 
-    # ── V1: k3s bootstrap + kubeconfig copy → scheduler restart ──────
+    # ── k3s bootstrap + kubeconfig copy → scheduler restart ──────────
     # k3s boots in parallel; wait for its kubeconfig.
     k8s.wait_for_unit("k3s.service")
     k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
@@ -421,11 +422,11 @@ pkgs.testers.runNixOSTest {
     )
     control.succeed("chmod 600 /etc/kube/config")
 
-    # Round 4 V13: T3 standby-window NOT_SERVING probe. The scheduler
-    # is still in STANDBY (no kubeconfig until now, no lease). The
-    # plaintext health port (9101) shares the HealthReporter with the
-    # mTLS port (9001) via health_service.clone(). Standby's
-    # set_not_serving on the NAMED service should be visible on BOTH.
+    # Standby-window NOT_SERVING probe. The scheduler is still in
+    # STANDBY (no kubeconfig until now, no lease). The plaintext
+    # health port (9101) shares the HealthReporter with the mTLS port
+    # (9001) via health_service.clone(). Standby's set_not_serving on
+    # the NAMED service should be visible on BOTH.
     #
     # grpc-health-probe exits 1 for NOT_SERVING. We expect that here
     # (before restart). After restart + lease acquire, we'll probe
@@ -439,7 +440,7 @@ pkgs.testers.runNixOSTest {
         "grpc-health-probe -addr localhost:9101 "
         "-service rio.scheduler.SchedulerService"
     )
-    print("V13 standby: plaintext health port reports NOT_SERVING (shared reporter)")
+    print("health-standby: plaintext health port reports NOT_SERVING (shared reporter)")
 
     # Restart scheduler to pick up kubeconfig. Lease loop will now:
     # acquire → fetch_add(1) + is_leader=true → fire LeaderAcquired
@@ -463,15 +464,15 @@ pkgs.testers.runNixOSTest {
     # ── Worker registration (mTLS handshake proven implicitly) ────────
     # The worker's Register RPC goes over mTLS (client cert required).
     # If the cert/CA/SAN config is wrong, the worker never registers
-    # and this wait times out — so reaching B1 below IS the T-section
-    # positive proof. But we also do explicit probes (T1-T3) for
+    # and this wait times out — so reaching the HMAC build below IS
+    # the mTLS positive proof. But we also do explicit probes for
     # clarity.
     #
-    # V1 caveat: worker may have exhausted its restart budget during
-    # scheduler's standby → leader transition (boot + kubeconfig
-    # restart = 2 scheduler process cycles; each scheduler exit
-    # drops the worker stream → worker restarts). reset-failed
-    # clears the burst counter; restart forces a fresh attempt.
+    # Worker may have exhausted its restart budget during scheduler's
+    # standby → leader transition (boot + kubeconfig restart = 2
+    # scheduler process cycles; each scheduler exit drops the worker
+    # stream → worker restarts). reset-failed clears the burst
+    # counter; restart forces a fresh attempt.
     worker.succeed("systemctl reset-failed rio-worker || true")
     worker.succeed("systemctl restart rio-worker")
     worker.wait_for_unit("rio-worker.service")
@@ -483,27 +484,29 @@ pkgs.testers.runNixOSTest {
     # ── Seed store ────────────────────────────────────────────────────
     ${common.seedBusybox "control"}
 
-    # ── V4: assert HMAC verifier is active ─────────────────────────────
+    # ── Assert HMAC verifier is active ────────────────────────────────
     # seedBusybox's nix-copy → gateway wopAddToStore → gateway
     # PutPath to store via mTLS with CN=rio-gateway → bypass path
     # at put_path.rs:112. The metric ONLY increments when
     # hmac_verifier.is_some() (put_path.rs's early-return on None
     # never reaches the bypass branch). So this proves BOTH (a)
     # verifier loaded (HmacVerifier::load succeeded with
-    # RIO_HMAC_KEY_PATH) and (b) X1's CN check ran. Without this
+    # RIO_HMAC_KEY_PATH) and (b) the CN check ran. Without this
     # assertion, a broken verifier-load (wrong env var, config
-    # wiring bug → verifier=None) would let B1 pass silently.
-    with subtest("V4: HMAC verifier loaded (CN bypass metric fired on seed)"):
+    # wiring bug → verifier=None) would let the HMAC build pass
+    # silently.
+    with subtest("HMAC-verifier: loaded (CN bypass metric fired on seed)"):
         control.succeed(
             "curl -sf http://localhost:9092/metrics | "
             "grep -E 'rio_store_hmac_bypass_total\\{cn=\"rio-gateway\"\\} [1-9]'"
         )
-        print("V4 PASS: rio_store_hmac_bypass_total{cn=rio-gateway} >= 1 — verifier active")
+        print("HMAC-verifier PASS: rio_store_hmac_bypass_total{cn=rio-gateway} >= 1 — verifier active")
 
     # ── Build helper (top-level def, not inside subtest) ──────────────
-    # B1 and S1 both need to nix-build a derivation. mkBuildHelper bakes
-    # a single testDrvFile at Nix-eval time, so define it once and pass
-    # the drv file via Python. The wrapped build_drv() accepts any path.
+    # HMAC and recovery sections both need to nix-build a derivation.
+    # mkBuildHelper bakes a single testDrvFile at Nix-eval time, so
+    # define it once and pass the drv file via Python. The wrapped
+    # build_drv() accepts any path.
     def build_drv(workers, drv_path, capture_stderr=True):
         cmd = (
             "nix-build --no-out-link "
@@ -525,7 +528,7 @@ pkgs.testers.runNixOSTest {
     # Section T: mTLS
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("T1: plaintext connect to TLS port fails"):
+    with subtest("mTLS-reject: plaintext connect to TLS port fails"):
         # grpcurl -plaintext against the scheduler's main port (9001,
         # mTLS). The TCP connection succeeds but the TLS handshake
         # fails — the server expects a ClientHello, gets a plaintext
@@ -544,17 +547,17 @@ pkgs.testers.runNixOSTest {
         # refused" (that would mean the port isn't listening at all,
         # which is a different failure).
         assert "refused" not in result.lower(), \
-            f"T1: port should be OPEN (TLS rejects, not refused): {result[:200]}"
-        print("T1 PASS: plaintext rejected on mTLS port 9001")
+            f"port should be OPEN (TLS rejects, not refused): {result[:200]}"
+        print("mTLS-reject PASS: plaintext rejected on mTLS port 9001")
 
-    with subtest("T2: mTLS connect with valid client cert succeeds"):
-        # Round 4 V12: use the DEDICATED client cert (CN=rio-worker)
-        # instead of the server cert. Previously reused server.crt
-        # which happened to work (same CA) but didn't prove the
-        # CLIENT cert verification path — a client-cert-only check
-        # might reject CN=control. client.crt has CN=rio-worker
-        # (the actual worker identity); using it proves client-auth
-        # truly validates against the CA, not server identity.
+    with subtest("mTLS-accept: connect with valid client cert succeeds"):
+        # Use the DEDICATED client cert (CN=rio-worker) instead of
+        # the server cert. Reusing server.crt would work (same CA)
+        # but wouldn't prove the CLIENT cert verification path — a
+        # client-cert-only check might reject CN=control. client.crt
+        # has CN=rio-worker (the actual worker identity); using it
+        # proves client-auth truly validates against the CA, not
+        # server identity.
         #
         # -tls-server-name localhost: grpc-health-probe doesn't
         # derive SNI from -addr the way tonic does; we set it
@@ -574,21 +577,21 @@ pkgs.testers.runNixOSTest {
             "-tls-client-key ${pki}/client.key "
             "-tls-server-name localhost"
         )
-        print("T2 PASS: mTLS with CLIENT cert (CN=rio-worker) accepted on 9001 + 9002")
+        print("mTLS-accept PASS: mTLS with CLIENT cert (CN=rio-worker) accepted on 9001 + 9002")
 
-    with subtest("T3: plaintext health port shares HealthReporter with mTLS port"):
+    with subtest("mTLS-health: plaintext health port shares HealthReporter with mTLS port"):
         # The scheduler/store spawn a SECOND plaintext server on
         # health_addr (9101/9102) when TLS is enabled. K8s gRPC
         # probes can't do mTLS — this port is for them. It serves
         # ONLY grpc.health.v1.Health, sharing the same HealthReporter
         # as the main port (so leadership toggles propagate).
         #
-        # Round 4 V13: prove shared reporter. We already checked
-        # NOT_SERVING during standby (before restart, above). Now
-        # the scheduler is leader → SERVING. Probe the NAMED service
-        # (set_serving/set_not_serving only affect named, not "").
-        # If the reporter wasn't shared, plaintext port would have
-        # defaulted to SERVING during standby too.
+        # Prove shared reporter: we already checked NOT_SERVING
+        # during standby (before restart, above). Now the scheduler
+        # is leader → SERVING. Probe the NAMED service (set_serving/
+        # set_not_serving only affect named, not ""). If the reporter
+        # wasn't shared, plaintext port would have defaulted to
+        # SERVING during standby too.
         control.succeed(
             "grpc-health-probe -addr localhost:9101 "
             "-service rio.scheduler.SchedulerService"
@@ -596,14 +599,14 @@ pkgs.testers.runNixOSTest {
         # Default service (always SERVING) — proves port is bound.
         control.succeed("grpc-health-probe -addr localhost:9101")
         control.succeed("grpc-health-probe -addr localhost:9102")
-        print("T3 PASS: plaintext health ports share reporter "
+        print("mTLS-health PASS: plaintext health ports share reporter "
               "(NOT_SERVING in standby, SERVING after lease acquire)")
 
     # ════════════════════════════════════════════════════════════════
     # Section B: HMAC assignment tokens
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("B1: build succeeds with HMAC in the loop"):
+    with subtest("HMAC: build succeeds with token in the loop"):
         # Positive path: scheduler has HMAC signer, store has HMAC
         # verifier. A successful build proves the full token flow:
         #   1. scheduler signs Claims{worker_id, drv_hash,
@@ -618,9 +621,9 @@ pkgs.testers.runNixOSTest {
         # needs crafting a raw PutPath gRPC stream with NAR chunks
         # — complex via grpcurl. Covered by 10 unit tests in
         # rio-store/src/grpc/put_path.rs hmac module.
-        out_b1 = build_drv([worker], "${testDrvFileB1}", capture_stderr=False).strip()
-        assert out_b1.startswith("/nix/store/"), \
-            f"B1: HMAC-signed build should succeed: {out_b1!r}"
+        out_hmac = build_drv([worker], "${testDrvFileHmac}", capture_stderr=False).strip()
+        assert out_hmac.startswith("/nix/store/"), \
+            f"HMAC-signed build should succeed: {out_hmac!r}"
 
         # Metric: PutPath succeeded (token accepted). result="created"
         # means the path was NEW (not a cache hit) — so the HMAC check
@@ -629,14 +632,14 @@ pkgs.testers.runNixOSTest {
             "curl -sf http://localhost:9092/metrics | "
             "grep -E 'rio_store_put_path_total\\{result=\"created\"\\} [1-9]'"
         )
-        print(f"B1 PASS: build with HMAC token succeeded, output {out_b1}")
+        print(f"HMAC PASS: build with HMAC token succeeded, output {out_hmac}")
 
     # ════════════════════════════════════════════════════════════════
     # Section S: scheduler state recovery
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("S1: scheduler restart triggers REAL recovery (via lease)"):
-        # V1 fix: scheduler now has lease config. The recovery path
+    with subtest("recovery: scheduler restart triggers REAL recovery (via lease)"):
+        # Scheduler has lease config, so the recovery path
         # (rio-scheduler/src/actor/recovery.rs) is ACTUALLY EXERCISED:
         #   1. lease loop acquires → fires ActorCommand::LeaderAcquired
         #   2. actor handles it → recover_from_pg() runs → reads
@@ -645,19 +648,18 @@ pkgs.testers.runNixOSTest {
         #   4. dispatch_ready gate: if !is_leader || !recovery_complete
         #      → no-op. Dispatch is BLOCKED until recovery completes.
         #
-        # Before V1: always_leader() set recovery_complete=true from
-        # boot, RIO_LEASE_NAME unset → lease loop never ran →
-        # LeaderAcquired never sent → recover_from_pg NEVER CALLED.
-        # S1's post-restart build worked via the always-on dispatch,
-        # proving NOTHING about recovery.
+        # Without lease config: always_leader() sets recovery_complete
+        # =true from boot, RIO_LEASE_NAME unset → lease loop never
+        # runs → LeaderAcquired never sent → recover_from_pg NEVER
+        # CALLED. A post-restart build would work via always-on
+        # dispatch, proving NOTHING about recovery.
         #
-        # V3: additionally seed an IN-FLIGHT build before the
-        # restart so recovery loads REAL rows (not empty PG). The
-        # slow (15s) build is backgrounded; we assert the recovery
-        # log shows derivations>=1. Previously both restarts
-        # recovered 0 rows — load_nonterminal_derivations,
-        # from_recovery_row, DerivationDag::from_rows were all
-        # executed but with empty inputs → untested end-to-end.
+        # Additionally seed an IN-FLIGHT build before the restart so
+        # recovery loads REAL rows (not empty PG). The slow build is
+        # backgrounded; we assert the recovery log shows
+        # derivations>=1. With empty PG, load_nonterminal_derivations,
+        # from_recovery_row, DerivationDag::from_rows all execute but
+        # with empty inputs → untested end-to-end.
 
         # Assert the INITIAL (boot-time) recovery already ran: the
         # k3s-bootstrap kubeconfig-copy restart above should have
@@ -675,16 +677,16 @@ pkgs.testers.runNixOSTest {
             "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} [1-9]'"
         )
 
-        # V3: kick off a SLOW build in the background. nix-build
-        # returns immediately with the `&`; the build runs on the
-        # worker. We don't wait for completion — just need PG to
-        # have a non-terminal derivations row at restart time.
+        # Kick off a SLOW build in the background. nix-build returns
+        # immediately with the `&`; the build runs on the worker. We
+        # don't wait for completion — just need PG to have a non-
+        # terminal derivations row at restart time.
         client.execute(
             "nohup nix-build --no-out-link "
             "--store 'ssh-ng://control' "
             "--arg busybox '(builtins.storePath ${common.busybox})' "
-            "${testDrvFileS1slow} "
-            "> /tmp/s1slow.log 2>&1 < /dev/null &"
+            "${testDrvFileRecoverySlow} "
+            "> /tmp/recovery-slow.log 2>&1 < /dev/null &"
         )
         # Poll for the build to be dispatched (Running). The slow
         # build's 60s sleep starts once the worker receives the
@@ -700,10 +702,11 @@ pkgs.testers.runNixOSTest {
         # waits for in-flight streams to drain — the slow build's
         # BuildExecution stream keeps the scheduler alive until
         # the 60s build completes → drv marked completed in PG →
-        # V3 fails. V3's intent is "recovery from abrupt CRASH
-        # with in-flight work" — SIGKILL simulates that. Graceful
-        # shutdown is tested separately (collectCoverage uses
-        # `systemctl stop` + verifies profraw flush).
+        # the non-terminal-row check fails. We want "recovery from
+        # abrupt CRASH with in-flight work" — SIGKILL simulates
+        # that. Graceful shutdown is tested separately
+        # (collectCoverage uses `systemctl stop` + verifies
+        # profraw flush).
         control.succeed("systemctl kill -s KILL rio-scheduler")
         control.succeed("systemctl start rio-scheduler")
         control.wait_for_unit("rio-scheduler.service")
@@ -725,13 +728,13 @@ pkgs.testers.runNixOSTest {
             timeout=30
         )
 
-        # V3: PG should have >=1 non-terminal derivation row — the
-        # slow build's drv was Running before the restart. Recovery's
-        # load_nonterminal_derivations (db.rs:625) reads this.
-        # Query the same TERMINAL_STATUSES filter recovery uses.
-        # Without the backgrounded slow build, B1+S1-setup are all
-        # terminal → 0 non-terminal rows → recovery ran through
-        # empty loops (was the pre-V3 hollow state).
+        # PG should have >=1 non-terminal derivation row — the slow
+        # build's drv was Running before the restart. Recovery's
+        # load_nonterminal_derivations (db.rs:625) reads this. Query
+        # the same TERMINAL_STATUSES filter recovery uses. Without
+        # the backgrounded slow build, all earlier drvs are terminal
+        # → 0 non-terminal rows → recovery runs through empty loops
+        # (hollow).
         nonterminal_count = int(control.succeed(
             "sudo -u postgres psql rio -tAc "
             "\"SELECT COUNT(*) FROM derivations "
@@ -739,8 +742,8 @@ pkgs.testers.runNixOSTest {
             "('completed','poisoned','dependency_failed','cancelled')\""
         ).strip())
         assert nonterminal_count >= 1, \
-            f"V3: PG should have >=1 non-terminal drv (slow build in-flight), got {nonterminal_count}"
-        print(f"V3 PASS: PG has {nonterminal_count} non-terminal derivation(s) — recovery had real data to load")
+            f"PG should have >=1 non-terminal drv (slow build in-flight), got {nonterminal_count}"
+        print(f"recovery data: PG has {nonterminal_count} non-terminal derivation(s) — recovery had real data to load")
 
         # Bonus: the recovery log itself should mention non-zero
         # derivations. tracing's pretty() format puts structured
@@ -751,7 +754,7 @@ pkgs.testers.runNixOSTest {
             "journalctl -u rio-scheduler --no-pager --since '20 seconds ago' | "
             "grep -A1 'state recovery complete' | tail -5 || true"
         )
-        print(f"V3 recovery log context: {recovery_ctx!r}")
+        print(f"recovery log context: {recovery_ctx!r}")
 
         # Worker restart. The worker's main loop exits on scheduler
         # disconnect ("shutting down"); systemd restarts it. But early
@@ -770,15 +773,15 @@ pkgs.testers.runNixOSTest {
             "grep -E 'rio_scheduler_workers_active 1'"
         )
 
-        # Post-restart build. DIFFERENT derivation than B1 (stamp
+        # Post-restart build. DIFFERENT derivation than HMAC (stamp
         # differs → output path differs) so this is NOT a cache hit
         # — it goes through dispatch, proving dispatch is unblocked
         # AFTER the lease re-acquire + recovery sequence.
-        out_s1 = build_drv([worker], "${testDrvFileS1}", capture_stderr=False).strip()
-        assert out_s1.startswith("/nix/store/"), \
-            f"S1: post-restart build should succeed: {out_s1!r}"
-        assert out_s1 != out_b1, \
-            f"S1: should be a DIFFERENT path than B1 (not cache hit): {out_s1!r} == {out_b1!r}"
+        out_recovery = build_drv([worker], "${testDrvFileRecovery}", capture_stderr=False).strip()
+        assert out_recovery.startswith("/nix/store/"), \
+            f"post-restart build should succeed: {out_recovery!r}"
+        assert out_recovery != out_hmac, \
+            f"should be a DIFFERENT path than HMAC build (not cache hit): {out_recovery!r} == {out_hmac!r}"
 
         # Final metric check: recovery_total should be 1 (fresh
         # process, ONE lease acquire → ONE recovery). Proves
@@ -788,14 +791,14 @@ pkgs.testers.runNixOSTest {
             "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} 1'"
         )
 
-        # V3 cleanup: the backgrounded slow build either (a) finished
+        # Cleanup: the backgrounded slow build either (a) finished
         # on its own (worker reconnected, ReconcileAssignments re-
         # dispatched) or (b) is still running/retrying. Wait for
-        # the queue to drain before F1 — otherwise F1's Build CRD
-        # would compete for the worker's maxBuilds=1 slot.
-        # Poll scheduler queued+running==0. 60s timeout: 15s sleep
-        # + re-dispatch overhead + ~45s ReconcileAssignments delay
-        # in the worst case.
+        # the queue to drain before the watch-dedup section —
+        # otherwise its Build CRD would compete for the worker's
+        # maxBuilds=1 slot. Poll scheduler queued+running==0. 90s
+        # timeout: slow-build sleep + re-dispatch overhead +
+        # ReconcileAssignments delay in the worst case.
         control.wait_until_succeeds(
             "curl -sf http://localhost:9091/metrics | "
             "awk '/^rio_scheduler_derivations_queued / {q=$2} "
@@ -803,16 +806,17 @@ pkgs.testers.runNixOSTest {
             "END {exit !(q==0 && r==0)}'",
             timeout=90
         )
-        print(f"S1 PASS: scheduler restart → LEASE ACQUIRE → recovery loaded REAL rows (V3) → dispatch unblocked, built {out_s1}")
+        print(f"recovery PASS: scheduler restart → LEASE ACQUIRE → recovery loaded REAL rows → dispatch unblocked, built {out_recovery}")
 
     # ════════════════════════════════════════════════════════════════
     # Section F: Build CRD watch dedup (k3s controller)
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("F1: Build CRD watch spawns once, not per-reconcile"):
+    with subtest("watch-dedup: Build CRD watch spawns once, not per-reconcile"):
         # Wait for k3s apiserver + CRDs established. The k8s node
         # has been booting in parallel since start_all; by now
-        # (after T1-S1, ~60s+) it should be well past k3s startup.
+        # (after mTLS + HMAC + recovery, ~60s+) it should be well
+        # past k3s startup.
         k8s.wait_for_unit("k3s.service")
         k8s.wait_until_succeeds(
             "k3s kubectl get crd builds.rio.build", timeout=60
@@ -823,13 +827,13 @@ pkgs.testers.runNixOSTest {
         # .drv file). `nix copy --derivation` uploads the .drv
         # closure without building outputs. The Build reconciler's
         # fetch_and_build_node reads it from store.
-        drv_path_f1 = client.succeed(
+        drv_path_watchdedup = client.succeed(
             "nix-instantiate "
             "--arg busybox '(builtins.storePath ${common.busybox})' "
-            "${testDrvFileF1} 2>/dev/null"
+            "${testDrvFileWatchDedup} 2>/dev/null"
         ).strip()
         client.succeed(
-            f"nix copy --derivation --to 'ssh-ng://control' {drv_path_f1}"
+            f"nix copy --derivation --to 'ssh-ng://control' {drv_path_watchdedup}"
         )
 
         # Apply Build CR. The 5s sleep in the derivation gives
@@ -846,7 +850,7 @@ pkgs.testers.runNixOSTest {
             "  name: test-watch-dedup\n"
             "  namespace: default\n"
             "spec:\n"
-            f"  derivation: {drv_path_f1}\n"
+            f"  derivation: {drv_path_watchdedup}\n"
             "  priority: 10\n"
             "EOF"
         )
@@ -869,7 +873,7 @@ pkgs.testers.runNixOSTest {
             "awk '{print $2}'"
         ).strip()
         assert spawns == "1", \
-            f"F1: expected 1 watch spawn (dedup), got {spawns}"
+            f"expected 1 watch spawn (dedup), got {spawns}"
 
         # Assert 2: controller did NOT log "reconnecting
         # WatchBuild". Without dedup, each reconcile after the
@@ -881,17 +885,17 @@ pkgs.testers.runNixOSTest {
             "grep -c 'reconnecting WatchBuild' || true"
         ).strip()
         assert reconnect_count == "0", \
-            f"F1: expected 0 reconnect-path spawns, got {reconnect_count}"
+            f"expected 0 reconnect-path spawns, got {reconnect_count}"
 
         # Cleanup. --wait=false: don't block on finalizer.
         k8s.succeed("k3s kubectl delete build test-watch-dedup --wait=false")
-        print(f"F1 PASS: Build CRD watch spawned once (spawns={spawns}, reconnects={reconnect_count})")
+        print(f"watch-dedup PASS: Build CRD watch spawned once (spawns={spawns}, reconnects={reconnect_count})")
 
     # ════════════════════════════════════════════════════════════════
     # Section C: GC (mark-sweep + pending_s3_deletes)
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("C1: TriggerGC dry-run via AdminService proxy"):
+    with subtest("GC-dry-run: TriggerGC via AdminService proxy"):
         # AdminService.TriggerGC (on the scheduler) proxies to
         # StoreAdminService.TriggerGC after populating extra_roots
         # with live-build output paths (rio-scheduler/src/admin/
@@ -899,10 +903,10 @@ pkgs.testers.runNixOSTest {
         # does ROLLBACK + returns stats (no actual deletes).
         #
         # The store has ≥3 paths at this point: busybox (seed) +
-        # B1's output + S1's output. None are reachable from gc_roots
-        # (no pins), but all are within grace period — so with
-        # grace_period_hours=24 nothing should be collected. We
-        # just verify the RPC completes with is_complete=true.
+        # HMAC output + recovery output. None are reachable from
+        # gc_roots (no pins), but all are within grace period — so
+        # with grace_period_hours=24 nothing should be collected.
+        # We just verify the RPC completes with is_complete=true.
         #
         # -protoset: no gRPC reflection on rio servers (see protoset
         # derivation above). grpcurl needs compiled descriptors for
@@ -932,30 +936,30 @@ pkgs.testers.runNixOSTest {
         # store → mark → sweep(rollback) → progress stream → proxy
         # back to client.
         assert '"isComplete": true' in result or '"isComplete":true' in result, \
-            f"C1: expected GCProgress with isComplete=true, got: {result[:500]}"
+            f"expected GCProgress with isComplete=true, got: {result[:500]}"
 
-        # Round 4 V14: also verify the currentPath describes the
-        # actual outcome (not just "complete"). With grace=24h,
-        # everything is within grace → mark finds 0 unreachable →
-        # currentPath says "would delete 0 paths". We check for
-        # "delete" in the dry-run message — proves the store
-        # actually ran mark+sweep (even if sweep found nothing)
-        # rather than short-circuiting.
+        # Also verify the currentPath describes the actual outcome
+        # (not just "complete"). With grace=24h, everything is
+        # within grace → mark finds 0 unreachable → currentPath
+        # says "would delete 0 paths". We check for "delete" in
+        # the dry-run message — proves the store actually ran
+        # mark+sweep (even if sweep found nothing) rather than
+        # short-circuiting.
         #
         # Note: pathsScanned=0 is OMITTED from proto3 JSON (zero-
         # value default), so we can't regex-match the field. The
         # currentPath string is the reliable signal.
         assert "delete" in result.lower() and "path" in result.lower(), (
-            f"V14: expected currentPath to describe delete outcome "
+            f"expected currentPath to describe delete outcome "
             f"(mark+sweep ran), got: {result[:500]}"
         )
-        print("C1 PASS: TriggerGC dry-run completed via AdminService proxy (V14: currentPath describes outcome)")
+        print("GC-dry-run PASS: TriggerGC completed via AdminService proxy (currentPath describes outcome)")
 
     # ════════════════════════════════════════════════════════════════
-    # Section G: gateway validation (from iteration 1)
+    # Section G: gateway validation
     # ════════════════════════════════════════════════════════════════
 
-    with subtest("G1: __noChroot derivation rejected"):
+    with subtest("gateway-validate: __noChroot derivation rejected"):
         # nix-build a derivation with __noChroot=true → gateway's
         # translate::validate_dag rejects with "sandbox escape" error
         # BEFORE SubmitBuild. The scheduler never sees it, so no TLS
@@ -967,27 +971,27 @@ pkgs.testers.runNixOSTest {
             --store ssh-ng://control 2>&1
         """)
         assert ("sandbox escape" in result or "noChroot" in result), \
-            f"G1: expected __noChroot rejection, got: {result[:500]}"
-        print("G1 PASS: __noChroot rejected at gateway")
+            f"expected __noChroot rejection, got: {result[:500]}"
+        print("gateway-validate PASS: __noChroot rejected at gateway")
 
     # ════════════════════════════════════════════════════════════════
-    # Section C2: real GC sweep (non-dry-run commit path) + PinPath
+    # Real GC sweep (non-dry-run commit path) + PinPath
     # ════════════════════════════════════════════════════════════════
     #
     # Runs LAST: worker uploads have references: Vec::new()
-    # (upload.rs:228 — phase4 gap) so pinning B1 does NOT reach
-    # busybox. If we GC with grace=0, busybox gets swept → all
-    # subsequent builds break. grace=24h keeps everything safe FOR
-    # THE PINNED/REFERENCED PATHS — but we now backdate S1's
-    # output to prove ACTUAL deletion works (V2 fix).
+    # (upload.rs:228 — phase4 gap) so pinning the HMAC output does
+    # NOT reach busybox. If we GC with grace=0, busybox gets swept
+    # → all subsequent builds break. grace=24h keeps everything
+    # safe FOR THE PINNED/REFERENCED PATHS — but we backdate the
+    # recovery output to prove ACTUAL deletion works.
     #
     # What this proves: PinPath FK passes, sweep tx.commit runs
-    # (vs C1's ROLLBACK), stream completes, UnpinPath round-trip,
-    # AND (V2) one path is ACTUALLY deleted when past grace →
-    # proves the for-batch loop body executes.
+    # (vs dry-run's ROLLBACK), stream completes, UnpinPath
+    # round-trip, AND one path is ACTUALLY deleted when past grace
+    # → proves the for-batch loop body executes.
 
-    with subtest("C2: PinPath + non-dry-run GC sweep PROVES commit (V2)"):
-        # Pin B1's output. PinPath is rio.store.StoreAdminService
+    with subtest("GC-sweep: PinPath + non-dry-run sweep PROVES commit"):
+        # Pin HMAC output. PinPath is rio.store.StoreAdminService
         # on port 9002 (store), NOT rio.admin.AdminService on 9001
         # (scheduler — that has TriggerGC proxy, not Pin/Unpin).
         control.succeed(
@@ -996,7 +1000,7 @@ pkgs.testers.runNixOSTest {
             "-cert ${pki}/server.crt -key ${pki}/server.key "
             "-authority localhost "
             "-protoset ${protoset}/rio.protoset "
-            f"""-d '{{"store_path": "{out_b1}", "source": "vm-phase3b"}}' """
+            f"""-d '{{"store_path": "{out_hmac}", "source": "vm-phase3b"}}' """
             "localhost:9002 rio.store.StoreAdminService/PinPath"
         )
         # Verify pin persisted (gc_roots has 1 row).
@@ -1005,26 +1009,27 @@ pkgs.testers.runNixOSTest {
             "'SELECT COUNT(*) FROM gc_roots' | grep -q 1"
         )
 
-        # V2: backdate S1's output past grace so sweep picks it up.
+        # Backdate recovery output past grace so sweep picks it up.
         # This is THE test that proves sweep's for-batch loop body
-        # actually executes — with all-in-grace paths (before V2),
+        # actually executes — with all-in-grace paths,
         # unreachable=vec![] → loop never runs → neither commit NOR
-        # rollback fires. The test claimed "commit runs" but it was
-        # just "nothing to commit."
+        # rollback fires. A naive test would claim "commit runs"
+        # when really there was nothing to commit.
         #
-        # S1's output is unpinned + unreferenced (worker uploads
-        # have references=vec![], and we only pinned B1). Backdating
-        # created_at past grace makes it unreachable via mark →
-        # sweep deletes it. B1 stays protected by the pin.
+        # Recovery output is unpinned + unreferenced (worker uploads
+        # have references=vec![], and we only pinned HMAC output).
+        # Backdating created_at past grace makes it unreachable via
+        # mark → sweep deletes it. HMAC output stays protected by
+        # the pin.
         control.succeed(
             f"sudo -u postgres psql rio -c "
             f"\"UPDATE narinfo SET created_at = now() - interval '25 hours' "
-            f"WHERE store_path = '{out_s1}'\""
+            f"WHERE store_path = '{out_recovery}'\""
         )
 
         # Non-dry-run sweep via scheduler proxy. dry_run=false →
-        # sweep COMMITs (vs C1's ROLLBACK). grace=24h; S1's output
-        # is now past grace → unreachable → DELETED.
+        # sweep COMMITs (vs dry-run's ROLLBACK). grace=24h; recovery
+        # output is now past grace → unreachable → DELETED.
         result = control.succeed(
             "grpcurl "
             "-cacert ${pki}/ca.crt "
@@ -1035,23 +1040,23 @@ pkgs.testers.runNixOSTest {
             "localhost:9001 rio.admin.AdminService/TriggerGC 2>&1"
         )
         assert '"isComplete": true' in result or '"isComplete":true' in result, \
-            f"C2: expected GCProgress.isComplete=true: {result[:500]}"
-        # V2: pathsCollected should be 1 (S1's backdated output).
+            f"expected GCProgress.isComplete=true: {result[:500]}"
+        # pathsCollected should be 1 (backdated recovery output).
         # proto3 JSON uint64 serializes as string. Proto field is
         # paths_collected → camelCase pathsCollected.
         assert (
             '"pathsCollected": "1"' in result
             or '"pathsCollected":"1"' in result
-        ), f"C2/V2: expected 1 path collected (S1 backdated): {result[:500]}"
+        ), f"expected 1 path collected (recovery output backdated): {result[:500]}"
 
-        # V2: S1 is GONE — nix path-info should FAIL.
+        # Recovery output is GONE — nix path-info should FAIL.
         client.fail(
-            f"nix path-info --store 'ssh-ng://control' {out_s1}"
+            f"nix path-info --store 'ssh-ng://control' {out_recovery}"
         )
 
-        # B1 still queryable (pin protected it from GC).
+        # HMAC output still queryable (pin protected it from GC).
         client.succeed(
-            f"nix path-info --store 'ssh-ng://control' {out_b1}"
+            f"nix path-info --store 'ssh-ng://control' {out_hmac}"
         )
 
         # UnpinPath round-trip (idempotent unpin).
@@ -1061,28 +1066,14 @@ pkgs.testers.runNixOSTest {
             "-cert ${pki}/server.crt -key ${pki}/server.key "
             "-authority localhost "
             "-protoset ${protoset}/rio.protoset "
-            f"""-d '{{"store_path": "{out_b1}"}}' """
+            f"""-d '{{"store_path": "{out_hmac}"}}' """
             "localhost:9002 rio.store.StoreAdminService/UnpinPath"
         )
         control.succeed(
             "sudo -u postgres psql rio -tc "
             "'SELECT COUNT(*) FROM gc_roots' | grep -q 0"
         )
-        print("C2 PASS: PinPath + non-dry-run sweep DELETES 1 path (V2 proves commit) + UnpinPath round-trip")
-
-    # ════════════════════════════════════════════════════════════════
-    print("=" * 60)
-    print("Phase 3b validation round 3: T1-T3 (mTLS), V4 (HMAC verifier active),")
-    print("B1 (HMAC), S1 (REAL recovery via lease — V1+V3 with in-flight data),")
-    print("F1 (Build CRD watch dedup), C1 (GC dry-run), G1 (__noChroot),")
-    print("C2 (GC PROVES commit — V2 fix) — all PASS.")
-    print()
-    print("Skipped:")
-    print("  E (PDB/NetPol/Events/seccomp) — needs NetworkPolicy enforcement")
-    print("  D (FOD proxy)                 — needs Squid VM + NetworkPolicy")
-    print("  A (cancel via cgroup.kill)    — timing-sensitive; 6 unit tests")
-    print("  B2 (PutPath token reject)     — raw gRPC stream; 10 unit tests")
-    print("=" * 60)
+        print("GC-sweep PASS: PinPath + non-dry-run sweep DELETES 1 path (proves commit) + UnpinPath round-trip")
 
     ${common.collectCoverage "control, worker, k8s, client"}
   '';
