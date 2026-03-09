@@ -142,10 +142,15 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 
         if orphaned_sentinel {
             // Fall through to the "first apply" path below — we'll
-            // resubmit. The scheduler's idempotence (MergeDag on
-            // existing DAG is a no-op) means this is safe even if
-            // the original SubmitBuild DID succeed and we just lost
-            // the stream.
+            // resubmit. SubmitBuild generates a FRESH build_id
+            // (grpc/mod.rs:353), so this is NOT a true no-op: the
+            // scheduler's MergeDag dedups derivation NODES by
+            // drv_hash (no duplicate builds execute), but a zombie
+            // build_id + PG builds row is created. It's reaped by
+            // terminal cleanup (or by the scheduler's merge
+            // immediately completing it if all drvs are already
+            // Completed from the first submit). Safe, converges
+            // correctly — just not free.
             info!(build = %name, "orphaned 'submitted' sentinel with no watch; resubmitting");
         } else if is_real_uuid && !is_terminal {
             // Dedup: if drain_stream already running for this Build,

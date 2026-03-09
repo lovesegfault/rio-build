@@ -143,8 +143,13 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                 return;
             }
             // lock_conn held for the whole GC; explicit unlock at
-            // the end (or implicit on connection-close if the task
-            // panics — advisory locks are connection-scoped).
+            // the end. NOTE: if this task panics, lock_conn drops
+            // back into the POOL (NOT closed) — the advisory lock
+            // stays held until sqlx recycles that pooled connection
+            // (which may be long-lived). No panic points currently
+            // in mark/sweep (all Result-returning), but avoid
+            // .unwrap()/.expect() in this task to keep it that way.
+            //
             // Inner helper: unlock + drop. Called from all exit
             // paths past this point (mark fail, sweep fail, success).
             async fn gc_unlock(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
