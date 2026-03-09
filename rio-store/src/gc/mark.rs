@@ -10,6 +10,7 @@ use sqlx::PgPool;
 /// - uploading manifests (in-flight PutPath)
 /// - recently-created paths (grace period)
 /// - `extra_roots` (scheduler live-build outputs)
+/// - `scheduler_live_pins` (scheduler auto-pinned live-build inputs)
 ///
 /// Returns all COMPLETE manifest `store_path_hash` NOT in the
 /// reachable set. These are sweep candidates.
@@ -48,11 +49,12 @@ pub async fn compute_unreachable(
     // The CTE. Walking through the query:
     //
     // `reachable` recursive CTE:
-    //   - Anchor (UNION of four seeds, all producing store_path TEXT):
+    //   - Anchor (UNION of five seeds, all producing store_path TEXT):
     //     a) gc_roots JOIN narinfo on hash → get path
     //     b) uploading manifests JOIN narinfo on hash → get path
     //     c) narinfo created_at > now - grace → path directly
     //     d) unnest($2) extra_roots (already paths)
+    //     e) scheduler_live_pins JOIN narinfo on hash → get path
     //   - Recursive: for each reachable path, unnest its references
     //     (which are store_path strings) — those are also reachable.
     //
@@ -87,6 +89,14 @@ pub async fn compute_unreachable(
             UNION
             -- Seed (d): scheduler live-build roots (may not be in narinfo)
             SELECT unnest($2::text[])
+            UNION
+            -- Seed (e): scheduler auto-pinned live-build INPUTS.
+            -- JOIN narinfo naturally excludes pins for paths not
+            -- yet in store (scheduler writes best-effort at dispatch
+            -- time; some inputs may still be uploading).
+            SELECT n.store_path
+              FROM scheduler_live_pins p
+              JOIN narinfo n USING (store_path_hash)
             UNION
             -- Recursive: references of reachable paths
             SELECT unnest(n."references")
@@ -228,6 +238,36 @@ mod tests {
         assert!(
             unreachable.is_empty(),
             "transitive references from pinned root → all reachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_live_pins_protect() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // Old path, no gc_roots, not in extra_roots → would be
+        // unreachable. But scheduler has it pinned as a live-build
+        // input → protected via seed (e).
+        let hash = seed_path(&db.pool, "/nix/store/hhh-live-input", &[], 48).await;
+
+        // Without pin: unreachable.
+        let without = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert_eq!(without.len(), 1, "unpinned old path → unreachable");
+
+        // Insert scheduler_live_pins row. drv_hash is arbitrary text
+        // (scheduler-assigned); store_path_hash must match narinfo.
+        sqlx::query(
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash) VALUES ($1, 'test-drv')",
+        )
+        .bind(&hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // WITH pin: reachable.
+        let with = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
+        assert!(
+            with.is_empty(),
+            "scheduler_live_pins should protect in-flight build input"
         );
     }
 
