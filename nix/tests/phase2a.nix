@@ -105,8 +105,8 @@ pkgs.testers.runNixOSTest {
     # ── Phase 6: Verification ─────────────────────────────────────────
     # Build succeeded (exit code already checked by succeed()).
     #
-    # Round 4 V11: verify the build output CONTENT via ssh-ng. The
-    # root's $out/stamp contains its own name followed by all 4 child
+    # Verify the build output CONTENT via ssh-ng. The root's
+    # $out/stamp contains its own name followed by all 4 child
     # stamps (phase2a-derivation.nix:27-28). grep -c 'rio-leaf-' == 4
     # proves: (a) the output is actually retrievable via wopNarFromPath,
     # (b) the collector concatenated all 4 children (DAG walked

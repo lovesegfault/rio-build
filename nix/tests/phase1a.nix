@@ -74,9 +74,9 @@ pkgs.testers.runNixOSTest {
     assert path_info == "${busybox}", f"path-info returned {path_info!r}, expected busybox path"
 
     # JSON mode: parse and compare narHash + narSize EXACTLY against
-    # the client's local store. Round 4 V5: prior check only verified
-    # "startswith sha256-" and "> 0" — a WRONG hash from the gateway
-    # would pass. Now we compute ground truth locally and compare.
+    # the client's local store. Comparing exact values against local
+    # ground truth catches corruption — a weaker "startswith sha256-"
+    # check would let a wrong hash pass silently.
     import json
     # Ground truth from the client's LOCAL store (busybox is in
     # systemPackages so it's registered locally).

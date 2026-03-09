@@ -83,11 +83,11 @@ in
     ];
   };
 
-  # Round 4 V7: chunk-backend validation. Writes a 300KiB blob that
-  # exceeds INLINE_THRESHOLD (256 KiB) so the chunked PutPath path
-  # MUST run (other derivations here are ~100-byte text files →
-  # inline path only, chunk backend untested). The VM test asserts
-  # chunk file count increases after this build.
+  # Chunk-backend validation. Writes a 300KiB blob that exceeds
+  # INLINE_THRESHOLD (256 KiB) so the chunked PutPath path MUST run
+  # (other derivations here are ~100-byte text files → inline path
+  # only, chunk backend untested). The VM test asserts chunk file
+  # count increases after this build.
   bigblob = derivation {
     name = "rio-2c-bigblob";
     system = builtins.currentSystem;

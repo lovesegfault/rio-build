@@ -256,12 +256,11 @@ pkgs.testers.runNixOSTest {
         "assert len(d.get(\"traces\",[])) > 0, \"no traces in Tempo for service=scheduler\"'"
     )
 
-    # Round 4 V10: prove gateway ALSO exports traces to Tempo.
-    # The original assertion only checked service.name=scheduler.
-    # This adds: service.name=gateway must also have traces —
-    # proves (a) gateway's init_tracing OTLP layer is wired,
-    # (b) gateway's RIO_OTEL_ENDPOINT is read, (c) gateway spans
-    # (e.g., session handling) actually fire.
+    # Gateway must ALSO export traces to Tempo (not just scheduler).
+    # service.name=gateway having traces proves (a) gateway's
+    # init_tracing OTLP layer is wired, (b) gateway's
+    # RIO_OTEL_ENDPOINT is read, (c) gateway spans (e.g., session
+    # handling) actually fire.
     #
     # A stronger check would verify gateway+scheduler share a
     # traceID (traceparent propagation through gRPC), but that
@@ -278,7 +277,7 @@ pkgs.testers.runNixOSTest {
         "assert len(d.get(\"traces\",[])) > 0, \"no traces in Tempo for service=gateway\"'",
         timeout=30
     )
-    print("V10 PASS: both scheduler AND gateway traces visible in Tempo")
+    print("Trace export check: both scheduler AND gateway traces visible in Tempo")
 
     ${common.collectCoverage "control, worker1, worker2, client"}
   '';

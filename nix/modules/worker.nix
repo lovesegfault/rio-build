@@ -154,8 +154,9 @@ in
         # cgroup v2 per-build resource tracking. The worker creates a
         # sub-cgroup per build and moves the spawned nix-daemon into
         # it. memory.peak + polled cpu.stat give tree-wide peak memory
-        # and CPU (fixes the phase2c bug where VmHWM measured ~10MB
-        # nix-daemon RSS instead of the builder's actual footprint).
+        # and CPU. Per-PID VmHWM would only capture nix-daemon's own
+        # RSS (~10MB) — the builder is a fork()ed child whose footprint
+        # never appears there.
         #
         # Delegate=yes: grants the service ownership of its cgroup
         # subtree. Without this, cgroup.subtree_control writes fail

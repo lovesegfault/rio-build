@@ -3,8 +3,8 @@
 # Milestone (docs/src/phases/phase2c.md:32):
 #   Chunk dedup ratio > 30% on nixpkgs rebuild; scheduling latency p99 < 5s.
 #
-# Chunk dedup + binary cache HTTP: main.rs wiring landed in phase3a
-# (A2). This VM test enables the filesystem chunk backend and asserts
+# Chunk dedup + binary cache HTTP: main.rs wiring landed in phase3a.
+# This VM test enables the filesystem chunk backend and asserts
 # the dedup metric after a build. Validates end-to-end:
 #
 #   1. Size-class config load: cutoff_seconds gauge from /etc/rio/scheduler.toml
@@ -12,7 +12,7 @@
 #   3. Size-class routing: pre-seeded "bigthing" → w-large not w-small
 #   4. content_index populated: PutPath writes nar_hash → store_path rows
 #
-# Circuit breaker: covered by E5 unit tests. Can't trigger via nix-build
+# Circuit breaker: covered by unit tests. Can't trigger via nix-build
 # when store is fully down — gateway's wopEnsurePath fails before
 # SubmitBuild reaches the scheduler's merge where the breaker lives.
 #
@@ -161,8 +161,8 @@ pkgs.testers.runNixOSTest {
     # — let's first check if it does by running a build, then verify
     # via psql. If it turns out nix doesn't send Register for IA
     # derivations, this still validates the table EXISTS and queries
-    # work (via E3's schema), and the G2 unit test covers the wire
-    # path.
+    # work (schema migration applied), and the unit test covers the
+    # wire path.
     #
     # Realisations count before (should be 0).
     before = control.succeed(
@@ -195,8 +195,8 @@ pkgs.testers.runNixOSTest {
     # to nodes with accumulated work: chain-b=60, chain-c=90 (est_dur +
     # max(children.priority) bottom-up). The benefit is chain-b beating
     # a fresh leaf AFTER chain-a completes — not chain-a beating solo.
-    # Unit tests (D4/D5) prove the priority computation; here we just
-    # check the wiring is live.
+    # Unit tests prove the priority computation; here we just check
+    # the wiring is live.
     sched_log = control.succeed(
         "journalctl -u rio-scheduler --no-pager | "
         "grep 'worker acknowledged assignment' || true"
@@ -216,7 +216,6 @@ pkgs.testers.runNixOSTest {
     # been running for ~60s (bootstrap + worker registration + earlier
     # builds) so the counter is already well above 0. We need to wait
     # for it to INCREASE after the INSERT, not reach a fixed value.
-    # (The original sleep(15) was simpler but racy; this is race-free.)
     baseline = int(control.succeed(
         "curl -sf http://localhost:9091/metrics | "
         "grep -E '^rio_scheduler_estimator_refresh_total ' | "
@@ -242,10 +241,10 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
 
-    # Round 4 V9: capture size_class_assignments_total{class="large"}
-    # baseline BEFORE bigthing build. Prior check (`[1-9]` after build)
-    # could false-pass if an earlier build somehow routed to large.
-    # Baseline-delta proves THIS build specifically went to large.
+    # Capture size_class_assignments_total{class="large"} baseline
+    # BEFORE bigthing build. A simple `[1-9]` after-build check could
+    # false-pass if an earlier build somehow routed to large; the
+    # baseline-delta proves THIS build specifically went to large.
     large_baseline = int(control.succeed(
         "curl -sf http://localhost:9091/metrics | "
         "grep -E '^rio_scheduler_size_class_assignments_total\\{class=\"large\"\\} ' | "
@@ -269,10 +268,10 @@ pkgs.testers.runNixOSTest {
         "awk '{print $2}'"
     ).strip())
     assert large_after >= large_baseline + 1, (
-        f"V9: bigthing should increment large assignments by >=1; "
+        f"bigthing should increment large assignments by >=1; "
         f"baseline={large_baseline}, after={large_after} (delta={large_after - large_baseline})"
     )
-    print(f"V9 PASS: large assignments {large_baseline}→{large_after} (delta={large_after - large_baseline})")
+    print(f"size-class routing: large assignments {large_baseline}→{large_after} (delta={large_after - large_baseline})")
 
     # Softer check: wlarge's logs should show the bigthing assignment,
     # small workers' should NOT. (journalctl grep; noisier than the
@@ -288,7 +287,7 @@ pkgs.testers.runNixOSTest {
         "journalctl -u rio-worker --no-pager | grep 'rio-2c-bigthing'"
     )
 
-    # ── Circuit breaker: covered by E5 unit tests ────────────────────
+    # ── Circuit breaker: covered by unit tests ───────────────────────
     # The scheduler's CacheCheckBreaker is inside merge.rs → it fires
     # when FindMissingPaths fails INSIDE the scheduler. But nix-build
     # hits the GATEWAY first, and the gateway does its own store calls
@@ -299,27 +298,27 @@ pkgs.testers.runNixOSTest {
     # This is correct layering — the gateway fails fast too, just not
     # via the breaker. To VM-test the breaker we'd need a store that's
     # UP for gateway calls but DOWN for the scheduler's FindMissingPaths,
-    # which is impractical to rig. E5's unit test directly triggers
+    # which is impractical to rig. The unit test directly triggers
     # merge with a failing MockStore: that's the authoritative coverage.
 
     # ── Final: content_index populated ───────────────────────────────
-    # Every PutPath now inserts into content_index (G1). Count should
-    # be > 0 after all the builds. This validates the insert path is
-    # wired in the real binary, not just tests.
+    # Every PutPath inserts into content_index. Count should be > 0
+    # after all the builds. This validates the insert path is wired
+    # in the real binary, not just tests.
     ci_count = control.succeed(
         "sudo -u postgres psql rio -t -c 'SELECT count(*) FROM content_index'"
     ).strip()
     assert int(ci_count) > 0, f"content_index should have entries after builds; got {ci_count}"
 
-    # ── A3: chunk backend wired (main.rs A2 landed) ──────────────────
+    # ── Chunk backend wired ──────────────────────────────────────────
     # The filesystem backend is enabled via extraStoreConfig above.
     #
-    # Round 4 V7: prior check was `chunk_count > 0` — but the builds
-    # above (all + bigthing) are tiny text files, likely ALL inline.
-    # Prove the CHUNKED path specifically: capture baseline, build
-    # the bigblob derivation (300 KiB > INLINE_THRESHOLD), assert
-    # chunk count increased. Delta check proves this build went
-    # through chunked PutPath, not inline.
+    # Builds above (all + bigthing) are tiny text files, likely ALL
+    # inline — a `chunk_count > 0` check would not prove the chunked
+    # path ran. Instead: capture baseline, build the bigblob
+    # derivation (300 KiB > INLINE_THRESHOLD), assert chunk count
+    # increased. Delta check proves this build went through chunked
+    # PutPath, not inline.
     chunk_baseline = int(control.succeed(
         "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
     ).strip())
@@ -333,12 +332,12 @@ pkgs.testers.runNixOSTest {
         "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
     ).strip())
     assert chunk_after > chunk_baseline, (
-        f"V7: bigblob (300 KiB) should write chunks to disk "
+        f"bigblob (300 KiB) should write chunks to disk "
         f"(>INLINE_THRESHOLD). baseline={chunk_baseline}, "
         f"after={chunk_after} — chunk backend not wired, or "
         f"INLINE_THRESHOLD changed?"
     )
-    print(f"V7 PASS: chunks {chunk_baseline}→{chunk_after} "
+    print(f"chunk backend: chunks {chunk_baseline}→{chunk_after} "
           f"(delta={chunk_after - chunk_baseline})")
 
     # The dedup metric should also be present (non-zero is fine,

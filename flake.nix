@@ -186,7 +186,7 @@
           # RUSTFLAGS=-Cinstrument-coverage injects LLVM profile-generate
           # instrumentation. Binaries write .profraw files (via atexit)
           # to LLVM_PROFILE_FILE. VM tests run these binaries, stop them
-          # gracefully (C1-C4 graceful shutdown), collect profraws,
+          # gracefully (SIGTERM → drain → atexit profraw flush), collect profraws,
           # and nix/coverage.nix merges them with unit-test lcov.
           #
           # Distinct pname → distinct store path, builds in parallel
@@ -801,8 +801,6 @@
           # 10-minute nightly fuzz runs — NOT in checks, explicitly invoked
           # by the nightly pipeline. Shares rio-{nix,store}-fuzz-build with
           # the smoke tier.
-          # TODO(phase3b): corpus persistence (S3 upload/download) so runs
-          # accumulate findings instead of discarding the work corpus.
           // fuzz.nightly
           // ciAggregates;
 

@@ -6,7 +6,7 @@
 #   build chain. FUSE works inside the pod. PrefetchHint fires
 #   (parent's dispatch → child's output path). cgroup v2
 #   memory.peak → build_history.ema_peak_memory_bytes end-to-end
-#   (the phase2c VmHWM fix, verified via psql). Finalizer drain.
+#   (cgroup memory.peak captures tree-wide footprint). Finalizer drain.
 #
 # Topology (3 VMs):
 #   k8s     — k3s server + rio-controller (systemd, not pod).
@@ -69,7 +69,7 @@ let
   # Escaping: ''${x} → ${x} in the WRITTEN file (inner .nix reads
   # its own let-bound child, its own busybox arg). ''' → '' (the
   # inner .nix's own indented string for builder args).
-  # G3 autoscaler exercise: 5 independent derivations for queue
+  # Autoscaler exercise: 5 independent derivations for queue
   # pressure. All leaves (no deps) → all go Ready immediately.
   # With maxConcurrentBuilds=1, 1 runs + 4 queue → queued=4.
   # compute_desired(4, target=2) = ceil(4/2) = 2 → scale to 2.
@@ -192,13 +192,13 @@ pkgs.testers.runNixOSTest {
       # Short tick — faster dispatch retry after worker registers.
       extraSchedulerConfig = {
         tickIntervalSecs = 2;
-        # H1 lease smoke: scheduler talks to k3s apiserver for
-        # leader election. kubeconfig is copied from k8s VM at
-        # test time (see testScript). The scheduler starts in
-        # standby (lease loop's kube client init fails → graceful
-        # return, is_leader stays false → no dispatch). After
-        # the test copies kubeconfig + restarts scheduler, it
-        # acquires the lease and starts dispatching.
+        # Lease smoke: scheduler talks to k3s apiserver for leader
+        # election. kubeconfig is copied from k8s VM at test time
+        # (see testScript). The scheduler starts in standby (lease
+        # loop's kube client init fails → graceful return,
+        # is_leader stays false → no dispatch). After the test
+        # copies kubeconfig + restarts scheduler, it acquires the
+        # lease and starts dispatching.
         #
         # This tests the OUT-OF-CLUSTER kubeconfig path
         # (KUBECONFIG env var) which is kube::Client::try_default's
@@ -223,11 +223,11 @@ pkgs.testers.runNixOSTest {
         RIO_SCHEDULER_ADDR = "control:9001";
         RIO_STORE_ADDR = "control:9002";
         RIO_LOG_FORMAT = "pretty"; # human-readable in VM logs
-        # G3 autoscaler exercise: 3s windows instead of 30s.
-        # Defaults (30s poll × 30s up-window × 30s anti-flap)
-        # would mean ~60s to first scale — too long for a VM
-        # test. 3s each → ~9s, well within our queue-pressure
-        # window (5 builds × 15s sleep = ~75s total).
+        # Autoscaler exercise: 3s windows instead of 30s. Defaults
+        # (30s poll × 30s up-window × 30s anti-flap) would mean
+        # ~60s to first scale — too long for a VM test. 3s each
+        # → ~9s, well within our queue-pressure window (5 builds
+        # × 15s sleep = ~75s total).
         RIO_AUTOSCALER_POLL_SECS = "3";
         RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS = "3";
         RIO_AUTOSCALER_MIN_INTERVAL_SECS = "3";
@@ -266,7 +266,7 @@ pkgs.testers.runNixOSTest {
     # check below, it should be up.
     k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
 
-    # ── Lease leader election smoke (H1) ───────────────────────────
+    # ── Lease leader election smoke ────────────────────────────────
     # The scheduler on `control` has lease config pointing at
     # /etc/kube/config (which doesn't exist yet). On startup, the
     # lease loop's kube client init failed → loop returned →
@@ -322,10 +322,10 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
 
-    # Metric: H1a added rio_scheduler_lease_acquired_total. This
-    # proves the ACQUIRE TRANSITION ran (not just "lease exists"
-    # — the scheduler might have restarted between create and
-    # this check, losing the counter). Value ≥1 = at least one
+    # Metric: rio_scheduler_lease_acquired_total proves the
+    # ACQUIRE TRANSITION ran (not just "lease exists" — the
+    # scheduler might have restarted between create and this
+    # check, losing the counter). Value ≥1 = at least one
     # acquire transition this process lifetime.
     #
     # lease_acquired → is_leader=true → dispatch_ready() unblocked.
@@ -451,18 +451,18 @@ pkgs.testers.runNixOSTest {
     # ── Phase 3a assertions ────────────────────────────────────────
 
     try:
-        # ── PrefetchHint fired (B3) ───────────────────────────────
+        # ── PrefetchHint fired ────────────────────────────────────
         # Parent has 1 DAG child (rio-3a-child). When parent
         # dispatches, approx_input_closure(dag, parent) returns
         # [child's output path]. send_prefetch_hint checks
         # worker's bloom — worker is cold (first build), bloom
         # miss → hint sent. Assert ≥1 (not just registered).
         #
-        # Round 4 V8: check paths_sent_total instead of hints_sent.
-        # hints_sent counts MESSAGES (1 per dispatch with a hint).
-        # paths_sent counts PATHS inside those hints. An empty-hint
-        # bug (message sent but 0 paths) would pass hints≥1 but fail
-        # paths≥1. paths is the tighter check.
+        # Check paths_sent_total, not hints_sent: hints_sent counts
+        # MESSAGES (1 per dispatch with a hint). paths_sent counts
+        # PATHS inside those hints. An empty-hint bug (message sent
+        # but 0 paths) would pass hints≥1 but fail paths≥1. paths
+        # is the tighter check.
         #
         # Prometheus counters only appear in /metrics AFTER first
         # increment (describe_counter! just attaches help text).
@@ -480,8 +480,8 @@ pkgs.testers.runNixOSTest {
         # this grep proves the CODEPATH (no silent hard-requirement
         # regression where Ready passes for wrong reasons).
         #
-        # Note on de1cb87's "cgroup namespace root" codepath: that
-        # fires when /proc/self/cgroup shows 0::/ (containerd cgroupns).
+        # Note on the cgroup-namespace-root codepath (containerd
+        # cgroupns): that fires when /proc/self/cgroup shows 0::/.
         # With privileged=true, containerd DOESN'T namespace cgroups
         # — we see the host's kubepods.slice/... path. The ns-root
         # fix matters for non-privileged production pods (granular
@@ -498,9 +498,11 @@ pkgs.testers.runNixOSTest {
         )
 
         # ── cgroup memory.peak → build_history (end-to-end) ───────
-        # THE FIX for phase2c VmHWM bug: daemon.id() was nix-daemon's
-        # PID, measured ~10MB. cgroup memory.peak captures the WHOLE
-        # TREE (daemon + builder + every compiler subprocess).
+        # cgroup memory.peak captures the WHOLE TREE (daemon +
+        # builder + every compiler subprocess). Per-PID VmHWM
+        # would only measure nix-daemon's own ~10MB RSS — the
+        # builder is a fork()ed child whose footprint never
+        # appears there.
         #
         # Chain: BuildCgroup.memory_peak() → ExecutionResult →
         # CompletionReport → scheduler handle_completion (filters
@@ -533,12 +535,12 @@ pkgs.testers.runNixOSTest {
             timeout=10
         )
 
-        # ── cgroup cpu.stat → build_history (G2) ──────────────────
+        # ── cgroup cpu.stat → build_history ───────────────────────
         # The derivation sleeps 2s specifically so the 1Hz CPU poll
-        # (executor/mod.rs:456) fires at least once. Previously only
-        # memory was asserted — the CPU chain (poll → peak_cpu_cores
-        # → CompletionReport → COALESCE blend → ema_peak_cpu_cores)
-        # was never end-to-end tested. `> 0` (not =0): sleep uses
+        # (executor/mod.rs:456) fires at least once. The CPU chain
+        # (poll → peak_cpu_cores → CompletionReport → COALESCE blend
+        # → ema_peak_cpu_cores) is asserted here end-to-end.
+        # `> 0` (not =0): sleep uses
         # negligible CPU but the poll baseline captures daemon
         # overhead; a value > 0 proves the chain ran. Non-null is
         # the real signal (completion.rs:202 filters 0 → None).
@@ -570,7 +572,7 @@ pkgs.testers.runNixOSTest {
     # Output queryable via ssh-ng (round-trips through rio-store).
     client.succeed(f"nix path-info --store 'ssh-ng://control' {out}")
 
-    # ── Build CRD reconciler exercise (G4) ─────────────────────────
+    # ── Build CRD reconciler exercise ──────────────────────────────
     # The ssh-ng build above put both .drv files in rio-store. Now
     # submit a build via the K8s-native path: kubectl apply a Build
     # CR pointing at the parent .drv. The reconciler's apply() should:
@@ -580,8 +582,8 @@ pkgs.testers.runNixOSTest {
     #   4. Patch status with sentinel first, then real build_id
     #
     # This is the FIRST time the Build reconciler has run against a
-    # real apiserver. Previously only unit-tested (4 pure-fn tests).
-    # Validates B1's fix: sentinel patch before drain_stream spawn.
+    # real apiserver. Validates the patch-ordering fix: sentinel
+    # patch before drain_stream spawn.
     #
     # nix-instantiate on client gives us the .drv path. The .drv is
     # ALREADY in rio-store (nix-build copied the closure). The
@@ -624,26 +626,26 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
 
-    # build_id should be a UUID (not empty, not "submitted"). This
-    # validates B1's fix: if the sentinel patch ran AFTER the watch
-    # task's first patch, build_id would be stuck at "submitted".
-    # The regex checks for UUID-like shape (8-4-4-4-12 hex).
+    # build_id should be a UUID (not empty, not "submitted"). If the
+    # sentinel patch ran AFTER the watch task's first patch, build_id
+    # would be stuck at "submitted". The regex checks for UUID-like
+    # shape (8-4-4-4-12 hex).
     build_id = k8s.succeed(
         "k3s kubectl get build test-crd-build "
         "-o jsonpath='{.status.buildId}'"
     ).strip()
     print(f"Build CRD build_id: {build_id}")
     assert build_id != "" and build_id != "submitted", \
-        f"build_id stuck at sentinel/empty (B1 race?): {build_id!r}"
+        f"build_id stuck at sentinel/empty (patch-ordering race?): {build_id!r}"
     import re
     assert re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-', build_id), \
         f"build_id not UUID-like: {build_id!r}"
 
-    # Round 4 B9+V4: K8s Events published on Build transitions.
-    # The controller's Recorder (wired in round 4) should have
-    # emitted at least: Submitted (from apply()), and a terminal
-    # event (Building + Succeeded, or Building + Cached). Check
-    # for at least 2 events on this Build object.
+    # K8s Events published on Build transitions. The controller's
+    # Recorder should have emitted at least: Submitted (from
+    # apply()), and a terminal event (Building + Succeeded, or
+    # Building + Cached). Check for at least 2 events on this
+    # Build object.
     events_json = k8s.succeed(
         "k3s kubectl get events -n default "
         "--field-selector involvedObject.name=test-crd-build,involvedObject.kind=Build "
@@ -654,11 +656,11 @@ pkgs.testers.runNixOSTest {
     event_reasons = [e.get("reason", "") for e in events]
     print(f"Build CRD events: {event_reasons}")
     assert len(events) >= 2, (
-        f"B9: expected >=2 K8s Events on test-crd-build "
+        f"expected >=2 K8s Events on test-crd-build "
         f"(Submitted + terminal), got {len(events)}: {event_reasons}"
     )
     assert "Submitted" in event_reasons, (
-        f"B9: expected Submitted event from apply(), got: {event_reasons}"
+        f"expected Submitted event from apply(), got: {event_reasons}"
     )
 
     # Delete → finalizer's cleanup() runs → CancelBuild (NotFound
@@ -719,21 +721,20 @@ pkgs.testers.runNixOSTest {
         timeout=15
     )
 
-    # ── Autoscaler real poll loop (G3) ─────────────────────────────
+    # ── Autoscaler real poll loop ──────────────────────────────────
     # FIRST TIME the autoscaler's scale_one() runs against a real
-    # apiserver. Previously: unit-tested only (scaling.rs has 10
-    # tests). The kubectl-scale test above proved the reconciler
+    # apiserver. The kubectl-scale test above proved the reconciler
     # doesn't STOMP autoscaler replicas, but the autoscaler ITSELF
-    # never patched anything.
+    # never patched anything until this section.
     #
     # Controller env (set above in systemd.services.rio-controller)
     # overrides timing to 3s: poll/up-window/min-interval. With
     # defaults (30s each), first scale would take ~60s — too slow.
     # 3s each → first scale in ~6-9s after sustained queue pressure.
     #
-    # This proves A1's fix (apiVersion+kind in SSA patch body) AND
-    # C2's fix (autoscaler patches WorkerPool.status.lastScaleTime).
-    # Without A1, the STS patch would 400 silently (warn log only).
+    # Proves: (a) SSA patch body includes apiVersion+kind (without
+    # them the STS patch 400s silently, warn-log only), AND (b)
+    # autoscaler patches WorkerPool.status.lastScaleTime.
     #
     # Flow:
     #   1. Launch 5 builds in background (all leaves, all Ready)
@@ -784,11 +785,11 @@ pkgs.testers.runNixOSTest {
         timeout=20
     )
 
-    # THE BIG ONE: autoscaler patches STS replicas 1→2. This is
-    # the A1 SSA fix proof. Previously: patch body {spec:{replicas:
-    # 2}} → apiserver 400 "apiVersion must be set" → warn log →
-    # autoscaler silently never scaled. Now: body has apiVersion+
-    # kind → patch succeeds.
+    # THE BIG ONE: autoscaler patches STS replicas 1→2. A patch
+    # body of just {spec:{replicas:2}} would give apiserver 400
+    # "apiVersion must be set" → warn log → autoscaler silently
+    # never scales. With apiVersion+kind in the body, the patch
+    # succeeds.
     #
     # Timing: 3s poll + 3s up-window + anti-flap (already past
     # due to earlier scale) = ~6-12s to first patch. 45s timeout
@@ -799,10 +800,10 @@ pkgs.testers.runNixOSTest {
         timeout=45
     )
 
-    # C2 proof: autoscaler patched WorkerPool.status.lastScaleTime.
-    # Previously written as None on every reconcile (clobbered).
-    # Now owned by autoscaler's separate SSA field-manager.
-    # Non-empty string = set (K8s serializes Time as RFC3339).
+    # Autoscaler patched WorkerPool.status.lastScaleTime. Owned by
+    # autoscaler's separate SSA field-manager (not the reconciler,
+    # which would clobber it to None on every reconcile). Non-empty
+    # string = set (K8s serializes Time as RFC3339).
     k8s.wait_until_succeeds(
         "sc=$(k3s kubectl get workerpool default "
         "-o jsonpath='{.status.lastScaleTime}'); "
@@ -810,8 +811,8 @@ pkgs.testers.runNixOSTest {
         timeout=15
     )
 
-    # Scaling conditions: reason=ScaledUp, status=True. C2 adds
-    # these to explain WHY replicas changed.
+    # Scaling conditions: reason=ScaledUp, status=True. Explains
+    # WHY replicas changed.
     k8s.succeed(
         "k3s kubectl get workerpool default "
         "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "

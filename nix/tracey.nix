@@ -2,7 +2,7 @@
 #
 # Links r[req.id] markers in markdown specs to // r[impl …] / // r[verify …]
 # code annotations, surfaces uncovered/untested/stale via CLI/LSP/MCP.
-# rio-build uses `tracey query validate --deny warnings` as a CI check.
+# rio-build uses `tracey query validate` as a CI check (grep for "0 total error(s)" — v1.3.0 exit code is always 0).
 #
 # Build note: upstream's build.rs runs `pnpm install` + `pnpm build` to
 # compile the web dashboard, which breaks in the nix sandbox (network
