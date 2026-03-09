@@ -229,6 +229,25 @@ impl DagActor {
             self.push_ready(hash);
         }
 
+        // --- Check for all-complete builds (X5 fix) ---
+        // A crash between "last drv → Completed" and "build →
+        // Succeeded" leaves the build Active in PG with all its
+        // derivations terminal. Recovery loads the build (Active)
+        // but loads 0 non-terminal derivations for it (all filtered
+        // by db.rs:537). Without this sweep, check_build_completion
+        // never fires → build stays Active forever.
+        //
+        // update_build_counts recomputes completed/failed from DAG.
+        // For a build with 0 recovered derivations: total=0,
+        // completed=0, failed=0 → all_completed (0>=0), failed==0
+        // → complete_build(). The build goes Succeeded and the
+        // terminal-cleanup timer is scheduled as normal.
+        let build_ids_to_check: Vec<Uuid> = self.builds.keys().copied().collect();
+        for build_id in build_ids_to_check {
+            self.update_build_counts(build_id);
+            self.check_build_completion(build_id).await;
+        }
+
         let elapsed = start.elapsed();
         info!(
             builds = self.builds.len(),
@@ -439,7 +458,29 @@ impl DagActor {
                     self.check_build_completion(*build_id).await;
                 }
             } else {
-                // Worker died mid-build. Reset + retry.
+                // Worker died mid-build. Record the failure + check
+                // poison threshold (X6 fix — same shape as
+                // reassign_derivations).
+                if let Some(w) = &worker_id {
+                    if let Some(state) = self.dag.node_mut(&drv_hash) {
+                        state.failed_workers.insert(w.clone());
+                    }
+                    if let Err(e) = self.db.append_failed_worker(&drv_hash, w).await {
+                        error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_worker");
+                    }
+                }
+                let should_poison = self
+                    .dag
+                    .node(&drv_hash)
+                    .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+                    .unwrap_or(false);
+                if should_poison {
+                    info!(drv_hash = %drv_hash, worker_id = ?worker_id,
+                          "reconcile: POISON_THRESHOLD reached, poisoning");
+                    self.poison_and_cascade(&drv_hash).await;
+                    continue;
+                }
+
                 info!(drv_hash = %drv_hash, worker_id = ?worker_id,
                       "reconcile: worker didn't reconnect, resetting to Ready");
                 if let Some(state) = self.dag.node_mut(&drv_hash) {
@@ -448,21 +489,10 @@ impl DagActor {
                         continue;
                     }
                     state.retry_count += 1;
-                    // Only record failed_worker if we HAVE a worker
-                    // — NULL worker case (inconsistent state) just
-                    // resets without blaming anyone.
-                    if let Some(w) = &worker_id {
-                        state.failed_workers.insert(w.clone());
-                    }
                     self.push_ready(drv_hash.clone());
                 }
                 if let Err(e) = self.db.increment_retry_count(&drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry++");
-                }
-                if let Some(w) = &worker_id
-                    && let Err(e) = self.db.append_failed_worker(&drv_hash, w).await
-                {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_worker");
                 }
                 if let Err(e) = self
                     .db

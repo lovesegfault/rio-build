@@ -189,6 +189,51 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     Ok(())
 }
 
+/// X5 regression: recovery must check build completion for builds
+/// whose derivations are ALL terminal. Crash between "last drv →
+/// Completed" and "build → Succeeded" → recovery loads build as
+/// Active with 0 non-terminal derivations → without the sweep,
+/// check_build_completion never fires → Active forever.
+#[tokio::test]
+async fn test_recovery_completes_all_terminal_build() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: write state simulating "crashed before build→Succeeded" ---
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _rx = merge_single_node(&handle, build_id, "x5-drv", PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate: drv → completed (terminal), build stays active.
+    // This simulates crash-after-last-drv-complete.
+    sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'x5-drv'")
+        .execute(&db.pool)
+        .await?;
+    // Build stays 'active' (merge_chain sets it Active via handle_merge_dag).
+
+    // --- Phase 2: fresh actor recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // X5 fix: the post-recovery sweep should fire check_build_
+    // completion for the build. With 0 recovered derivations
+    // (all terminal, filtered by db.rs:537), total=0, completed=0,
+    // failed=0 → all_completed → complete_build → Succeeded.
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build with all-terminal drvs should be Succeeded after recovery (X5 fix)"
+    );
+
+    Ok(())
+}
+
 /// Merge a linear chain: nodes[0] ← nodes[1] ← ... ← nodes[n-1]
 /// (each depends on the previous). Helper for recovery tests that
 /// need a multi-node DAG in PG.
