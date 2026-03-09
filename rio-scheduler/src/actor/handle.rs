@@ -229,4 +229,23 @@ impl ActorHandle {
         .await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
+
+    /// Test-only: backdate `running_since` and force Running status.
+    /// For backstop-timeout tests. Returns `false` if not found or
+    /// not in Assigned/Running.
+    #[cfg(test)]
+    pub async fn debug_backdate_running(
+        &self,
+        drv_hash: &str,
+        secs_ago: u64,
+    ) -> Result<bool, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(ActorCommand::DebugBackdateRunning {
+            drv_hash: drv_hash.to_string(),
+            secs_ago,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
 }

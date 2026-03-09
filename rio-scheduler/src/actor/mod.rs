@@ -570,6 +570,45 @@ impl DagActor {
                     };
                     let _ = reply.send(ok);
                 }
+                #[cfg(test)]
+                ActorCommand::DebugBackdateRunning {
+                    drv_hash,
+                    secs_ago,
+                    reply,
+                } => {
+                    // Force to Running with running_since backdated.
+                    // Used by backstop-timeout tests (handle_tick
+                    // checks Running + running_since > threshold).
+                    // The cfg(test) backstop floor is 0s so any
+                    // secs_ago > 0 triggers the backstop on Tick.
+                    let ok = if let Some(state) = self.dag.node_mut(&drv_hash) {
+                        // Transition to Running if not already there.
+                        // Assigned → Running is a valid transition;
+                        // Ready/Created would fail (need Assigned
+                        // first). DebugForceAssign → Assigned, then
+                        // this → Running is the typical test sequence.
+                        let running = match state.status() {
+                            DerivationStatus::Running => true,
+                            DerivationStatus::Assigned => {
+                                state.transition(DerivationStatus::Running).is_ok()
+                            }
+                            _ => false,
+                        };
+                        if running {
+                            // Backdate. checked_sub is used defensively:
+                            // if secs_ago is absurd (e.g. u64::MAX) and
+                            // Instant::now() can't represent that far
+                            // back, clamp to "now" (effectively 0 elapsed).
+                            state.running_since = Instant::now()
+                                .checked_sub(std::time::Duration::from_secs(secs_ago))
+                                .or(Some(Instant::now()));
+                        }
+                        running
+                    } else {
+                        false
+                    };
+                    let _ = reply.send(ok);
+                }
             }
         }
 

@@ -208,3 +208,209 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
 
     Ok(())
 }
+
+/// WorkerDisconnected for a never-connected worker → no-op. The
+/// handler's early-return on `workers.remove(worker_id) == None`
+/// means no gauge decrement (would go negative otherwise) and no
+/// reassign pass (nothing to reassign).
+#[tokio::test]
+async fn test_worker_disconnect_unknown_noop() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Disconnect a worker that was never connected.
+    handle
+        .send_unchecked(ActorCommand::WorkerDisconnected {
+            worker_id: "ghost".into(),
+        })
+        .await?;
+
+    // Actor should still be alive (no panic on None remove).
+    let workers = handle.debug_query_workers().await?;
+    assert!(workers.is_empty(), "workers should remain empty");
+    assert!(handle.is_alive(), "actor should survive unknown disconnect");
+
+    Ok(())
+}
+
+/// Heartbeat reports a running build the scheduler never assigned
+/// (but which IS in the DAG) → warn + adopt it into running_builds.
+/// This is the "split-brain or restart" recovery path: maybe a
+/// previous scheduler assigned it, we lost in-mem state, worker
+/// still running it. The worker knows better than we do.
+///
+/// Note: the drv_path must resolve via `dag.hash_for_path` — unknown
+/// paths are silently filtered BEFORE the reconcile. So this test
+/// merges the drv first (puts it in the DAG) without dispatching it
+/// to the heartbeating worker.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Merge a drv into the DAG. NO worker connected yet → stays
+    // Ready (not dispatched). This puts the drv_path→hash mapping
+    // in the DAG so the heartbeat filter lets it through.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "hb-drv", PriorityClass::Scheduled).await?;
+
+    // Connect worker via WorkerConnected only (no initial heartbeat)
+    // so we control the first heartbeat's running_builds precisely.
+    let (stream_tx, _stream_rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "hb-worker".into(),
+            stream_tx,
+        })
+        .await?;
+
+    // Heartbeat with running_builds claiming the drv we merged but
+    // never assigned to this worker. max_builds=0 so the heartbeat
+    // doesn't trigger dispatch (which would ALSO assign the drv and
+    // muddy the test — we want "worker claims it, scheduler didn't
+    // know" to be clearly distinguishable).
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            bloom: None,
+            size_class: None,
+            worker_id: "hb-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 0,
+            running_builds: vec![test_drv_path("hb-drv")],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert!(
+        logs_contain("heartbeat reports running build scheduler did not assign"),
+        "unknown-build heartbeat should warn"
+    );
+
+    // The drv SHOULD be adopted into running_builds (worker is
+    // authoritative about what it's actually running).
+    let workers = handle.debug_query_workers().await?;
+    let w = workers
+        .iter()
+        .find(|w| w.worker_id == "hb-worker")
+        .expect("worker registered");
+    assert!(
+        w.running_builds.contains(&"hb-drv".to_string()),
+        "worker's claim should be adopted into running_builds"
+    );
+
+    Ok(())
+}
+
+/// DrainWorker(force=true) on an idle worker → running=0, no
+/// CancelSignal sent (nothing to cancel). The to_reassign vec is
+/// empty, the CancelSignal loop does 0 iterations.
+#[tokio::test]
+async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("idle-worker", "x86_64-linux", 4).await?;
+
+    // Worker is idle (no builds assigned). Force-drain.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainWorker {
+            worker_id: "idle-worker".into(),
+            force: true,
+            reply: reply_tx,
+        })
+        .await?;
+    let result = reply_rx.await?;
+
+    assert!(result.accepted, "known worker → accepted=true");
+    assert_eq!(
+        result.running_builds, 0,
+        "idle worker → nothing to reassign"
+    );
+
+    // No CancelSignal should appear in the stream. barrier-then-
+    // try_recv: any message sent during drain would be in the
+    // channel by now (mpsc is ordered).
+    barrier(&handle).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no CancelSignal should be sent for idle worker (nothing running)"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.backstop.timeout]
+/// Backstop timeout: a derivation Running far longer than expected
+/// gets CancelSignal + reset_to_ready on Tick. The cfg(test) floor
+/// is 0s (BACKSTOP_DAEMON_TIMEOUT_SECS=0, BACKSTOP_SLACK_SECS=0) so
+/// any positive `running_since` elapsed triggers the backstop.
+///
+/// Uses DebugBackdateRunning to force Running status with a stale
+/// timestamp, bypassing the normal Assigned→Running transition
+/// (which would require worker ack + heartbeat roundtrips).
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_backstop_timeout_cancels_and_reassigns() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("bs-worker", "x86_64-linux", 1).await?;
+
+    // Merge + dispatch → Assigned.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "bs-drv", PriorityClass::Scheduled).await?;
+    let _assignment = recv_assignment(&mut rx).await;
+
+    // Backdate running_since. 100s is plenty past the 0s test floor.
+    // Also transitions Assigned → Running (required for the backstop
+    // check: it only fires on status==Running).
+    let ok = handle.debug_backdate_running("bs-drv", 100).await?;
+    assert!(ok, "debug_backdate_running should succeed for Assigned drv");
+
+    // Tick → backstop check → CancelSignal + reassign.
+    handle.send_unchecked(ActorCommand::Tick).await?;
+    barrier(&handle).await;
+
+    // The backstop-timeout branch should have logged.
+    assert!(
+        logs_contain("backstop timeout"),
+        "backstop should log on timeout"
+    );
+
+    // CancelSignal should appear in the worker's stream.
+    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("CancelSignal should arrive within 2s")
+        .expect("channel should not close");
+    match msg.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Cancel(c)) => {
+            assert!(
+                c.reason.contains("backstop"),
+                "cancel reason should mention backstop: {}",
+                c.reason
+            );
+        }
+        other => panic!("expected CancelSignal, got {other:?}"),
+    }
+
+    // Drv should be Ready (reset for retry) with retry_count bumped
+    // and the worker recorded in failed_workers. It may immediately
+    // re-dispatch to the same worker (only one available) IF
+    // best_worker doesn't exclude it — but the worker IS in
+    // failed_workers now. Either Ready (excluded) or a fresh
+    // Assigned (dispatch fired again). What matters is: NOT stuck
+    // in Running.
+    let post = handle
+        .debug_query_derivation("bs-drv")
+        .await?
+        .expect("drv exists");
+    assert!(
+        matches!(
+            post.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned
+        ),
+        "backstop should reset drv (not leave it Running); got {:?}",
+        post.status
+    );
+    assert!(
+        post.retry_count >= 1,
+        "retry_count should be bumped after backstop reassign"
+    );
+
+    Ok(())
+}

@@ -574,6 +574,58 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// GetBuildLogs with a non-empty but malformed build_id → InvalidArgument.
+/// The ring buffer is empty (no match on drv_path), so it falls through
+/// to the S3 path, which parses build_id.
+#[tokio::test]
+async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
+    // Ring buffer empty → forces S3 fallback → build_id parse.
+    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+    let result = svc
+        .get_build_logs(Request::new(GetBuildLogsRequest {
+            build_id: "not-a-uuid".into(),
+            derivation_path: "/nix/store/nowhere.drv".into(),
+            since_line: 0,
+        }))
+        .await;
+
+    let status = result.expect_err("invalid build_id should be InvalidArgument");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("build_id"),
+        "error should mention build_id: {}",
+        status.message()
+    );
+    Ok(())
+}
+
+/// TriggerGC with store unreachable → Status::Unavailable.
+/// The store_addr in setup_svc is `127.0.0.1:1` which never listens
+/// → connect_store_admin fails → UNAVAILABLE. Not UNIMPLEMENTED —
+/// the RPC IS implemented, just the downstream dependency is down.
+/// Client should retry.
+#[tokio::test]
+async fn test_trigger_gc_store_unreachable() -> anyhow::Result<()> {
+    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+    let result = svc.trigger_gc(Request::new(GcRequest::default())).await;
+
+    let status = result.expect_err("unreachable store should be Unavailable");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unavailable,
+        "store unreachable → UNAVAILABLE (not Unimplemented, not Internal)"
+    );
+    // Message should mention the store admin connect failure.
+    assert!(
+        status.message().contains("store admin") || status.message().contains("connect"),
+        "error should mention store connect: {}",
+        status.message()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};

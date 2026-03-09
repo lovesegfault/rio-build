@@ -584,3 +584,271 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
 
     Ok(())
 }
+
+/// Recovery must skip rows with unparseable drv_path (StorePath::parse
+/// fails) and continue loading valid rows. A corrupted/hand-edited PG
+/// row shouldn't block recovery of the entire DAG.
+///
+/// Note: the analogous "unknown derivation status" skip path can't be
+/// tested via direct INSERT — the PG CHECK constraint rejects values
+/// outside the allowed set before they reach recovery. The drv_path
+/// column has no such constraint, so we test the skip-bad-rows logic
+/// via that path instead (same `continue` pattern in recover_from_pg).
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_recovery_skips_bad_drv_path_rows() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed a VALID row via the normal merge path (simpler than
+    // hand-crafting all columns for a minimal INSERT).
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _rx =
+            merge_single_node(&handle, build_id, "z1-good-drv", PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Seed a BAD row with a garbage drv_path that StorePath::parse
+    // will reject. Other columns must satisfy NOT NULL + CHECK;
+    // status='ready' keeps it non-terminal (loadable by recovery).
+    sqlx::query(
+        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+         VALUES ('z1-bad-drv', 'not-a-store-path', 'x86_64-linux', 'ready')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // Fresh actor recovers.
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The bad-row skip should have logged.
+    assert!(
+        logs_contain("invalid drv_path in PG"),
+        "recovery should log invalid drv_path skip"
+    );
+
+    // The GOOD row should still be in the DAG — skip-and-continue,
+    // not skip-and-abort.
+    let good = handle.debug_query_derivation("z1-good-drv").await?;
+    assert!(
+        good.is_some(),
+        "valid drv should still be recovered despite bad sibling row"
+    );
+
+    // The bad row should NOT be in the DAG.
+    let bad = handle.debug_query_derivation("z1-bad-drv").await?;
+    assert!(bad.is_none(), "invalid drv_path row should be skipped");
+
+    Ok(())
+}
+
+/// Recovery must seed generation from `MAX(generation) FROM assignments`
+/// via fetch_max. Defensive monotonicity: if the k8s Lease annotation
+/// reset (deleted Lease, stale etcd restore), a worker holding a stale
+/// assignment with generation=100 would ALSO accept new ones from
+/// whatever the lease loop set (e.g., 1). Seeding from PG's high-water
+/// mark prevents that: after recovery, generation >= PG max + 1.
+#[tokio::test]
+async fn test_recovery_seeds_generation_from_assignments() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed a derivation (FK target for assignments) + an assignment
+    // with generation=100. Use the normal merge path to write the
+    // derivation row with all required columns, then insert the
+    // assignment directly.
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _rx =
+            merge_single_node(&handle, build_id, "z2-gen-drv", PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Look up the derivation_id for the FK.
+    let (drv_id,): (Uuid,) =
+        sqlx::query_as("SELECT derivation_id FROM derivations WHERE drv_hash = 'z2-gen-drv'")
+            .fetch_one(&db.pool)
+            .await?;
+
+    // Seed assignment with generation=100.
+    sqlx::query(
+        "INSERT INTO assignments (derivation_id, worker_id, generation, status) \
+         VALUES ($1, 'seed-worker', 100, 'completed')",
+    )
+    .bind(drv_id)
+    .execute(&db.pool)
+    .await?;
+
+    // Fresh actor recovers. The default setup_actor starts with
+    // generation=1 (non-K8s mode); recovery's fetch_max should
+    // bump it to max(1, 100+1) = 101.
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    let g = handle.leader_generation();
+    assert!(
+        g >= 101,
+        "generation should be seeded from PG high-water mark: expected >= 101, got {g}"
+    );
+
+    Ok(())
+}
+
+/// Recovery must skip builds that have ZERO build_derivations rows.
+/// These are orphans: crash-during-merge BEFORE the link rows were
+/// written, or a failed rollback. Without this skip, the all-terminal
+/// completion sweep would fire check_build_completion on them → spurious
+/// BuildCompleted with empty output_paths.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_recovery_z16_orphan_build_skipped() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed a builds row DIRECTLY with NO build_derivations links.
+    // status='active' so it's loadable (non-terminal).
+    let orphan_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'active')")
+        .bind(orphan_id)
+        .execute(&db.pool)
+        .await?;
+
+    // Also seed a NORMAL build (with links) to prove recovery
+    // doesn't skip everything.
+    let normal_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let _rx =
+            merge_single_node(&handle, normal_id, "z16-normal", PriorityClass::Scheduled).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Fresh actor recovers.
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // The orphan-skip should have logged.
+    assert!(
+        logs_contain("ZERO build_derivations"),
+        "recovery should log orphan build skip"
+    );
+
+    // The orphan build IS loaded (it's in self.builds — the sweep
+    // just skips completion check for it). query_status should find
+    // it, still Active (not spuriously Succeeded).
+    let orphan_status = query_status(&handle, orphan_id).await?;
+    assert_eq!(
+        orphan_status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "orphan build should stay Active (completion check skipped)"
+    );
+
+    // Normal build still recovered normally.
+    let normal = handle.debug_query_derivation("z16-normal").await?;
+    assert!(normal.is_some(), "normal drv should be recovered");
+
+    Ok(())
+}
+
+/// Reconcile with store unreachable (FindMissingPaths errors) → falls
+/// back to "assume incomplete" → reset_to_ready + retry. The
+/// `warn!("reconcile: FindMissingPaths failed")` branch.
+///
+/// Setup: orphan-Assigned drv (worker never reconnects), store client
+/// present but the store's PG is closed → FindMissingPaths fails →
+/// fallback path taken.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
+    use super::integration::setup_inproc_store;
+
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+
+    // In-process store (real client) — we'll break it by closing
+    // its PG pool before reconcile.
+    let (store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+
+    // --- Phase 1: first "leader" writes build + drv ---
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(sched_db.pool.clone());
+        let mut node = make_test_node("z4-drv", "x86_64-linux");
+        // Must have expected_output_paths or the reconcile short-
+        // circuits before the store call ("No expected outputs =
+        // can't verify orphan completion. Conservative: treat as
+        // incomplete."). That's a DIFFERENT code path.
+        node.expected_output_paths = vec![test_store_path("z4-out")];
+        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate: simulate "dispatched to a worker that won't reconnect".
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', \
+         assigned_worker_id = 'z4-dead-worker' WHERE drv_hash = 'z4-drv'",
+    )
+    .execute(&sched_db.pool)
+    .await?;
+
+    // Break the store: close its PG pool. FindMissingPaths will
+    // return an Err (sqlx::Error::PoolClosed → tonic::Status).
+    store_db.pool.close().await;
+
+    // --- Phase 2: fresh actor WITH (broken) store client recovers ---
+    let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client));
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Pre-reconcile: drv should be Assigned (recovered from PG).
+    let pre = handle
+        .debug_query_derivation("z4-drv")
+        .await?
+        .expect("drv recovered");
+    assert_eq!(pre.status, DerivationStatus::Assigned);
+
+    // ReconcileAssignments → worker not in self.workers → store
+    // check → FindMissingPaths FAILS (pool closed) → fallback:
+    // assume incomplete → reset to Ready.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    // The fallback branch should have logged.
+    assert!(
+        logs_contain("FindMissingPaths failed"),
+        "reconcile should log store-unreachable fallback"
+    );
+
+    // Drv should be Ready (NOT Completed — store couldn't verify
+    // outputs) and retry_count bumped.
+    let post = handle
+        .debug_query_derivation("z4-drv")
+        .await?
+        .expect("drv exists");
+    assert_eq!(
+        post.status,
+        DerivationStatus::Ready,
+        "store unreachable → assume incomplete → reset to Ready"
+    );
+    assert!(
+        post.retry_count >= 1,
+        "retry_count should be bumped (this is a retry)"
+    );
+
+    Ok(())
+}

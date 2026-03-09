@@ -241,6 +241,19 @@ pub enum ActorCommand {
         worker_id: WorkerId,
         reply: oneshot::Sender<bool>,
     },
+
+    /// Test-only: backdate a derivation's `running_since` and force it
+    /// into Running status. For backstop-timeout tests: with the
+    /// cfg(test) floor of 0s, any positive elapsed triggers the
+    /// backstop on the next Tick. `secs_ago` controls how stale the
+    /// timestamp looks. Returns `false` if the derivation isn't in
+    /// the DAG or the transition to Running failed.
+    #[cfg(test)]
+    DebugBackdateRunning {
+        drv_hash: String,
+        secs_ago: u64,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Reply for `ActorCommand::DrainWorker`.

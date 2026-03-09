@@ -891,3 +891,286 @@ async fn test_read_event_log_half_open_range() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ===========================================================================
+// BuildExecution stream: malformed-message handling
+// ===========================================================================
+
+/// Helper: set up an in-process WorkerService server backed by a
+/// live actor. Returns (actor_handle, worker_client, _server, _db).
+/// The server task + actor task are held alive via returned guards.
+async fn setup_worker_svc() -> anyhow::Result<(
+    ActorHandle,
+    WorkerServiceClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>, // server guard
+    tokio::task::JoinHandle<()>, // actor guard
+    TestDb,
+)> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, actor_task) = setup_actor(db.pool.clone());
+
+    let grpc = SchedulerGrpc::new_for_tests(handle.clone());
+    let router = tonic::transport::Server::builder().add_service(WorkerServiceServer::new(grpc));
+    let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    Ok((
+        handle,
+        WorkerServiceClient::new(channel),
+        server,
+        actor_task,
+        db,
+    ))
+}
+
+/// Duplicate WorkerRegister on an established stream → warn + ignore,
+/// stream stays open. A buggy/retrying worker that re-sends Register
+/// after stream open shouldn't be kicked — the worker_id is already
+/// bound, a re-Register is a no-op. Kicking would cause a disconnect
+/// + reassign cascade for no good reason.
+///
+/// Note: can't use `#[traced_test]` with multi_thread flavor — the
+/// recv task (spawn_monitored) runs on a worker thread, and
+/// traced_test's subscriber is thread-local to the test thread. We
+/// assert on observable state instead: if the duplicate Register
+/// were NOT ignored, the recv loop would break → stream close →
+/// WorkerDisconnected → worker removed from actor.workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()> {
+    let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(8);
+    // First Register (opens stream).
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Register(
+                rio_proto::types::WorkerRegister {
+                    worker_id: "dup-worker".into(),
+                },
+            )),
+        })
+        .await?;
+
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let _inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Second Register — should be logged (from the spawned recv task)
+    // + ignored. We can't check the log (thread-local subscriber) so
+    // we assert the post-condition: stream stays open.
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Register(
+                rio_proto::types::WorkerRegister {
+                    worker_id: "dup-worker".into(),
+                },
+            )),
+        })
+        .await?;
+
+    // barrier to ensure the recv task processed the duplicate.
+    crate::actor::tests::barrier(&handle).await;
+
+    // Stream should still be open: worker is still in the actor's
+    // workers map. If the duplicate Register caused a break/error,
+    // WorkerDisconnected would have fired and removed the entry.
+    let workers = handle.debug_query_workers().await?;
+    assert!(
+        workers.iter().any(|w| w.worker_id == "dup-worker"),
+        "worker should still be connected after duplicate Register \
+         (stream stayed open, no spurious disconnect)"
+    );
+
+    // Stronger: the stream_tx should still be usable (channel open).
+    // Send a no-op Progress to prove the recv task is still looping.
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Progress(
+                rio_proto::types::ProgressUpdate::default(),
+            )),
+        })
+        .await
+        .expect("stream_tx should still be open after duplicate Register");
+
+    Ok(())
+}
+
+/// CompletionReport with result: None → synthesizes InfrastructureFailure.
+/// A malformed completion must not silently drop — the drv would hang
+/// Running forever. The recv task's `.unwrap_or_else` synthesizes a
+/// failure result so the actor transitions the drv out of Running.
+///
+/// Note: same multi_thread + traced_test limitation as
+/// test_build_execution_duplicate_register_ignored. We assert on
+/// the derivation's post-state instead of the log message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_build_execution_completion_none_result_synthesizes_failure() -> anyhow::Result<()> {
+    let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
+
+    // Open stream + Register.
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(8);
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Register(
+                rio_proto::types::WorkerRegister {
+                    worker_id: "none-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let mut inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Heartbeat to fully register so dispatch works.
+    worker_client
+        .heartbeat(rio_proto::types::HeartbeatRequest {
+            worker_id: "none-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            max_builds: 1,
+            ..Default::default()
+        })
+        .await?;
+
+    // Merge + dispatch a drv → Assigned to none-worker.
+    let build_id = Uuid::new_v4();
+    let _ev = crate::actor::tests::merge_single_node(
+        &handle,
+        build_id,
+        "none-drv",
+        crate::state::PriorityClass::Scheduled,
+    )
+    .await?;
+
+    // Drain the WorkAssignment (proves dispatch happened).
+    let assignment = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+        .await?
+        .expect("assignment")
+        .expect("not an error");
+    let work = match assignment.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => a,
+        other => panic!("expected Assignment, got {other:?}"),
+    };
+
+    // Send CompletionReport with result: None.
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Completion(
+                rio_proto::types::CompletionReport {
+                    drv_path: work.drv_path.clone(),
+                    result: None, // malformed!
+                    assignment_token: work.assignment_token,
+                    peak_memory_bytes: 0,
+                    output_size_bytes: 0,
+                    peak_cpu_cores: 0.0,
+                },
+            )),
+        })
+        .await?;
+
+    // Wait for the recv task (running on another thread) to process
+    // the Completion and send ProcessCompletion to the actor. A bare
+    // actor barrier isn't sufficient — the barrier message could be
+    // enqueued before the recv task's ProcessCompletion message.
+    // Poll the drv state with a bounded retry loop instead of a
+    // fixed sleep (more robust on slow CI).
+    let mut info = None;
+    for _ in 0..50 {
+        crate::actor::tests::barrier(&handle).await;
+        let drv = handle
+            .debug_query_derivation("none-drv")
+            .await?
+            .expect("drv exists");
+        if drv.retry_count >= 1 {
+            info = Some(drv);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let info = info.expect(
+        "None-result completion should be synthesized as InfrastructureFailure \
+         (transient → retry_count bumped) within 500ms",
+    );
+
+    // InfrastructureFailure is transient → retry → Ready (or
+    // re-Assigned if dispatch fired again). Either way retry_count
+    // bumps. Without the synthesis, the completion would be dropped
+    // silently and the drv would stay Assigned forever with
+    // retry_count=0 (the "stuck" state this test guards against).
+    assert!(
+        info.retry_count >= 1,
+        "None-result completion should be synthesized as InfrastructureFailure \
+         (transient → retry_count bumped); got retry_count={}, status={:?}",
+        info.retry_count,
+        info.status
+    );
+
+    Ok(())
+}
+
+/// ProgressUpdate message is a no-op (dropped). Phase 4 will wire
+/// it for live preemption/migration, but today it's explicitly
+/// discarded. Test: send one, stream stays open, actor stays alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_build_execution_progress_message_is_noop() -> anyhow::Result<()> {
+    let (handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
+
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(8);
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Register(
+                rio_proto::types::WorkerRegister {
+                    worker_id: "prog-worker".into(),
+                },
+            )),
+        })
+        .await?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let _inbound = worker_client.build_execution(outbound).await?.into_inner();
+
+    // Send Progress — should be silently dropped.
+    stream_tx
+        .send(rio_proto::types::WorkerMessage {
+            msg: Some(rio_proto::types::worker_message::Msg::Progress(
+                rio_proto::types::ProgressUpdate::default(),
+            )),
+        })
+        .await?;
+
+    crate::actor::tests::barrier(&handle).await;
+
+    // Stream still open, actor alive.
+    assert!(handle.is_alive(), "actor should survive Progress message");
+    let workers = handle.debug_query_workers().await?;
+    assert!(
+        workers.iter().any(|w| w.worker_id == "prog-worker"),
+        "worker should still be connected after Progress no-op"
+    );
+
+    Ok(())
+}
+
+/// BuildExecution stream with no messages (client opens + immediately
+/// closes) → InvalidArgument("empty BuildExecution stream"). The
+/// first-message-must-be-Register handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_build_execution_empty_stream_rejected() -> anyhow::Result<()> {
+    let (_handle, mut worker_client, _srv, _actor, _db) = setup_worker_svc().await?;
+
+    // Open stream, immediately close (no Register sent).
+    let (stream_tx, stream_rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(1);
+    drop(stream_tx); // close before sending anything
+
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
+    let result = worker_client.build_execution(outbound).await;
+
+    let status = result.expect_err("empty stream should be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("empty"),
+        "error should mention empty stream: {}",
+        status.message()
+    );
+
+    Ok(())
+}
