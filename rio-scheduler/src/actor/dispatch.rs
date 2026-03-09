@@ -267,13 +267,8 @@ impl DagActor {
         let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
 
         // Update DB (non-terminal: log failure, don't block dispatch)
-        if let Err(e) = self
-            .db
-            .update_derivation_status(drv_hash, DerivationStatus::Assigned, Some(worker_id))
-            .await
-        {
-            error!(drv_hash = %drv_hash, worker_id = %worker_id, error = %e, "failed to persist Assigned status");
-        }
+        self.persist_status(drv_hash, DerivationStatus::Assigned, Some(worker_id))
+            .await;
 
         // Create assignment in DB. PG BIGINT is signed; cast at THIS
         // boundary, not at the proto-encode sites below. One cast

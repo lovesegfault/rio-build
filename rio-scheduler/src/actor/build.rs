@@ -96,17 +96,9 @@ impl DagActor {
             }
             // Persist. fire-and-forget via db; completion handler's
             // no-op for Cancelled means no double-write.
-            if let Err(e) = self
-                .db
-                .update_derivation_status(drv_hash, DerivationStatus::Cancelled, None)
-                .await
-            {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist Cancelled status");
-            }
-            // X9 unpin: terminal (Cancelled) → release live-input pins.
-            if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
-                debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
-            }
+            self.persist_status(drv_hash, DerivationStatus::Cancelled, None)
+                .await;
+            self.unpin_best_effort(drv_hash).await;
         }
         if !to_cancel.is_empty() {
             info!(

@@ -158,13 +158,8 @@ impl DagActor {
                 if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
                 }
-                if let Err(e) = self
-                    .db
-                    .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
-                    .await
-                {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status");
-                }
+                self.persist_status(drv_hash, DerivationStatus::Ready, None)
+                    .await;
                 self.push_ready(drv_hash.clone());
             }
         }
@@ -574,13 +569,8 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, error = %e, "poison reset failed");
                 continue;
             }
-            if let Err(e) = self
-                .db
-                .update_derivation_status(&drv_hash, DerivationStatus::Created, None)
-                .await
-            {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist poison reset");
-            }
+            self.persist_status(&drv_hash, DerivationStatus::Created, None)
+                .await;
             // reset_from_poison (in-mem) clears failed_workers +
             // retry_count; PG must match. Without this, crash after
             // reset → recovery loads stale failed_workers (3 workers)

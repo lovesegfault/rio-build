@@ -434,14 +434,8 @@ impl DagActor {
                     state.output_paths = expected_outputs;
                     state.assigned_worker = None;
                 }
-                if let Err(e) = self
-                    .db
-                    .update_derivation_status(&drv_hash, DerivationStatus::Completed, None)
-                    .await
-                {
-                    error!(drv_hash = %drv_hash, error = %e,
-                           "failed to persist orphan completion");
-                }
+                self.persist_status(&drv_hash, DerivationStatus::Completed, None)
+                    .await;
                 // Release parents (same find_newly_ready pattern as
                 // handle_success_completion). Partial re-implementation:
                 // DON'T emit BuildEvent (the build is recovered,
@@ -454,14 +448,8 @@ impl DagActor {
                     if let Some(s) = self.dag.node_mut(ready_hash)
                         && s.transition(DerivationStatus::Ready).is_ok()
                     {
-                        if let Err(e) = self
-                            .db
-                            .update_derivation_status(ready_hash, DerivationStatus::Ready, None)
-                            .await
-                        {
-                            error!(drv_hash = %ready_hash, error = %e,
-                                   "failed to persist orphan-released Ready");
-                        }
+                        self.persist_status(ready_hash, DerivationStatus::Ready, None)
+                            .await;
                         self.push_ready(ready_hash.clone());
                     }
                 }
@@ -512,13 +500,8 @@ impl DagActor {
                 if let Err(e) = self.db.increment_retry_count(&drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry++");
                 }
-                if let Err(e) = self
-                    .db
-                    .update_derivation_status(&drv_hash, DerivationStatus::Ready, None)
-                    .await
-                {
-                    error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready");
-                }
+                self.persist_status(&drv_hash, DerivationStatus::Ready, None)
+                    .await;
             }
         }
 

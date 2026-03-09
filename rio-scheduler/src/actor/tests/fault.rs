@@ -63,7 +63,7 @@ async fn test_completion_db_fault_build_history_logged() -> TestResult {
 
     // The three DB-error branches should all have logged.
     assert!(
-        logs_contain("failed to update derivation status"),
+        logs_contain("failed to persist derivation status"),
         "derivation status DB failure should be logged"
     );
     assert!(
@@ -99,7 +99,8 @@ async fn test_transient_failure_db_fault_retry_persist_logged() -> TestResult {
 
     // Transient with retry_count < max → should hit the retry-persist branches.
     assert!(
-        logs_contain("failed to persist Failed status") || logs_contain("failed to persist retry"),
+        logs_contain("failed to persist derivation status")
+            || logs_contain("failed to persist retry"),
         "transient-failure DB write failure should be logged"
     );
     Ok(())
@@ -152,7 +153,7 @@ async fn test_newly_ready_db_fault_status_persist_logged() -> TestResult {
         a.status
     );
     assert!(
-        logs_contain("failed to update status"),
+        logs_contain("failed to persist derivation status"),
         "newly-ready DB write failure should be logged"
     );
     Ok(())

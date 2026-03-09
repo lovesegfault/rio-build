@@ -6,6 +6,42 @@ use super::*;
 
 impl DagActor {
     // -----------------------------------------------------------------------
+    // Best-effort persist helpers (13 call sites across actor/*)
+    // -----------------------------------------------------------------------
+
+    /// Best-effort PG persist of derivation status. Logs error!,
+    /// never returns it — PG blips shouldn't abort in-mem
+    /// transitions (the scheduler is authoritative for live state;
+    /// PG is recovery-only).
+    pub(super) async fn persist_status(
+        &self,
+        drv_hash: &DrvHash,
+        status: DerivationStatus,
+        worker_id: Option<&WorkerId>,
+    ) {
+        if let Err(e) = self
+            .db
+            .update_derivation_status(drv_hash, status, worker_id)
+            .await
+        {
+            error!(drv_hash = %drv_hash, ?status, error = %e,
+                   "failed to persist derivation status");
+        }
+    }
+
+    /// Best-effort unpin of `scheduler_live_pins` rows for a
+    /// terminal derivation. Called at every terminal transition
+    /// (Completed/Poisoned/Cancelled; DependencyFailed is never
+    /// dispatched so never pinned). `sweep_stale_live_pins` on
+    /// recovery is the crash safety net for missed unpins.
+    pub(super) async fn unpin_best_effort(&self, drv_hash: &DrvHash) {
+        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
+            debug!(drv_hash = %drv_hash, error = %e,
+                   "failed to unpin live inputs (best-effort)");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // ProcessCompletion
     // -----------------------------------------------------------------------
 
@@ -140,12 +176,7 @@ impl DagActor {
     ) {
         // Transition to completed
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            // Ensure we're in running state first
-            if state.status() == DerivationStatus::Assigned
-                && let Err(e) = state.transition(DerivationStatus::Running)
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
-            }
+            state.ensure_running();
             if let Err(e) = state.transition(DerivationStatus::Completed) {
                 // Worker reported success but the in-memory state machine rejected
                 // the transition (e.g., derivation was cascaded to DependencyFailed
@@ -171,19 +202,9 @@ impl DagActor {
                 .collect();
         }
 
-        // Update DB
-        if let Err(e) = self
-            .db
-            .update_derivation_status(drv_hash, DerivationStatus::Completed, None)
-            .await
-        {
-            error!(drv_hash = %drv_hash, error = %e, "failed to update derivation status in DB");
-        }
-
-        // X9 unpin: terminal → release live-input pins. Best-effort.
-        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
-            debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
-        }
+        self.persist_status(drv_hash, DerivationStatus::Completed, None)
+            .await;
+        self.unpin_best_effort(drv_hash).await;
 
         // Update assignment (non-terminal progress write: log failure, don't block)
         if let Some(state) = self.dag.node(drv_hash)
@@ -343,13 +364,8 @@ impl DagActor {
             if let Some(state) = self.dag.node_mut(ready_hash)
                 && state.transition(DerivationStatus::Ready).is_ok()
             {
-                if let Err(e) = self
-                    .db
-                    .update_derivation_status(ready_hash, DerivationStatus::Ready, None)
-                    .await
-                {
-                    error!(drv_hash = %ready_hash, error = %e, "failed to update status");
-                }
+                self.persist_status(ready_hash, DerivationStatus::Ready, None)
+                    .await;
                 self.push_ready(ready_hash.clone());
             }
         }
@@ -374,31 +390,16 @@ impl DagActor {
     /// Running at that point.
     pub(super) async fn poison_and_cascade(&mut self, drv_hash: &DrvHash) {
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            // Assigned→Running intermediate (state machine requires
-            // Running before Poisoned; Assigned→Poisoned is invalid).
-            if state.status() == DerivationStatus::Assigned
-                && let Err(e) = state.transition(DerivationStatus::Running)
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
-            }
+            state.ensure_running();
             if let Err(e) = state.transition(DerivationStatus::Poisoned) {
                 warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
             }
             state.poisoned_at = Some(Instant::now());
         }
 
-        if let Err(e) = self
-            .db
-            .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
-            .await
-        {
-            error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
-        }
-
-        // X9 unpin: terminal (Poisoned) → release live-input pins.
-        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
-            debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
-        }
+        self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
+            .await;
+        self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
         // Transition them to DependencyFailed so keepGoing builds terminate.
@@ -433,12 +434,7 @@ impl DagActor {
             if state.failed_workers.len() >= POISON_THRESHOLD {
                 false // poison_and_cascade below does the transition
             } else if state.retry_count < self.retry_policy.max_retries {
-                // Transition running -> failed
-                if state.status() == DerivationStatus::Assigned
-                    && let Err(e) = state.transition(DerivationStatus::Running)
-                {
-                    warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
-                }
+                state.ensure_running();
                 if let Err(e) = state.transition(DerivationStatus::Failed) {
                     warn!(drv_hash = %drv_hash, error = %e, "Running->Failed transition failed");
                 }
@@ -498,13 +494,8 @@ impl DagActor {
             // (Failed not in db.rs:537 terminal filter) but only
             // pushes Ready-status drvs to the queue (recovery.rs:225)
             // → Failed drv sits in DAG forever, never dispatched.
-            if let Err(e) = self
-                .db
-                .update_derivation_status(drv_hash, DerivationStatus::Ready, None)
-                .await
-            {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist Ready status for retry");
-            }
+            self.persist_status(drv_hash, DerivationStatus::Ready, None)
+                .await;
         } else {
             self.poison_and_cascade(drv_hash).await;
         }
@@ -517,30 +508,16 @@ impl DagActor {
         _worker_id: &WorkerId,
     ) {
         if let Some(state) = self.dag.node_mut(drv_hash) {
-            if state.status() == DerivationStatus::Assigned
-                && let Err(e) = state.transition(DerivationStatus::Running)
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "Assigned->Running transition failed");
-            }
-            // Permanent failure -> poisoned (no retry)
+            state.ensure_running();
             if let Err(e) = state.transition(DerivationStatus::Poisoned) {
                 warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
             }
             state.poisoned_at = Some(Instant::now());
         }
 
-        if let Err(e) = self
-            .db
-            .update_derivation_status(drv_hash, DerivationStatus::Poisoned, None)
-            .await
-        {
-            error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
-        }
-
-        // X9 unpin: terminal (Poisoned) → release live-input pins.
-        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
-            debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
-        }
+        self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
+            .await;
+        self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
         self.cascade_dependency_failure(drv_hash).await;
@@ -627,13 +604,8 @@ impl DagActor {
             // Remove from ready queue if present (Ready -> DependencyFailed).
             self.ready_queue.remove(&parent_hash);
 
-            if let Err(e) = self
-                .db
-                .update_derivation_status(&parent_hash, DerivationStatus::DependencyFailed, None)
-                .await
-            {
-                error!(drv_hash = %parent_hash, error = %e, "failed to persist DependencyFailed");
-            }
+            self.persist_status(&parent_hash, DerivationStatus::DependencyFailed, None)
+                .await;
 
             // Continue cascade: this parent's parents also cannot complete.
             to_visit.extend(self.dag.get_parents(&parent_hash));

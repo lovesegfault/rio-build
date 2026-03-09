@@ -440,6 +440,20 @@ impl DerivationState {
         Ok(())
     }
 
+    /// If Assigned, transition to Running (intermediate step — the
+    /// state machine requires Running before Completed/Poisoned/
+    /// Failed; Assigned→X directly is invalid for those). No-op if
+    /// already Running or past it. Returns true if the transition
+    /// succeeded or wasn't needed; false if Assigned→Running was
+    /// rejected (unexpected — that transition is always valid).
+    pub fn ensure_running(&mut self) -> bool {
+        if self.status() == DerivationStatus::Assigned {
+            self.transition(DerivationStatus::Running).is_ok()
+        } else {
+            true
+        }
+    }
+
     /// Test-only: directly set status bypassing state machine validation.
     /// For setting up test preconditions where the full transition chain
     /// would be verbose noise.
