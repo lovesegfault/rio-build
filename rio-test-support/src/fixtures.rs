@@ -34,10 +34,7 @@ pub fn test_drv_path(name: &str) -> String {
 /// callers get a valid `/nix/store/{32-char-hash}-{tag}.drv` path for free.
 /// `drv_hash` is set to `tag` (scheduler tests key on the hash string).
 ///
-/// Consolidates five near-identical copies that were scattered across
-/// rio-scheduler test modules. The only variation among the originals was
-/// `pname` (`""` / `"test"` / `"test-pkg"`); none of the tests assert on
-/// it, so this uses `"test-pkg"` uniformly.
+/// `pname` is hardcoded to `"test-pkg"` — no scheduler test asserts on it.
 pub fn make_derivation_node(tag: &str, system: &str) -> DerivationNode {
     DerivationNode {
         drv_hash: tag.into(),

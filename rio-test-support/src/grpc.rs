@@ -49,7 +49,7 @@ pub struct MockStore {
     /// error-path tests (distinguishing real gRPC errors from NotFound).
     pub fail_query_path_info: Arc<AtomicBool>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
-    /// For E4's gateway wopRegisterDrvOutput/wopQueryRealisation tests.
+    /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
 }
 
@@ -185,7 +185,7 @@ impl StoreService for MockStore {
         let paths = self.paths.read().unwrap();
         // Exact match only. Hash-part prefix lookups go through
         // query_path_from_hash_part (below), not here — the gateway
-        // switched to that dedicated RPC in phase2c.
+        // uses that dedicated RPC.
         paths
             .get(&store_path)
             .map(|(info, _)| Response::new(info.clone()))
@@ -239,11 +239,7 @@ impl StoreService for MockStore {
         request: Request<types::QueryPathFromHashPartRequest>,
     ) -> Result<Response<types::PathInfo>, Status> {
         let hash_part = request.into_inner().hash_part;
-        // Prefix-match: /nix/store/{hash}-...
-        // This is the same prefix-lookup query_path_info already did for the
-        // gateway's old workaround; now it's the dedicated RPC. The fallthrough
-        // prefix-scan in query_path_info stays (some tests may still hit it)
-        // but new tests should use this RPC.
+        // Prefix-match: find a stored path starting with /nix/store/{hash}-.
         let prefix = format!("/nix/store/{hash_part}-");
         let paths = self.paths.read().unwrap();
         for (k, (info, _)) in paths.iter() {
@@ -477,9 +473,7 @@ impl SchedulerService for MockScheduler {
 ///
 /// Uses `yield_now()` for synchronization — the listener is already bound
 /// and accepting before `spawn` returns, so a single yield is sufficient to
-/// let the server task enter its accept loop. **Replaces the `sleep(50ms)`**
-/// that ~6 test modules were using after their own hand-rolled spawn,
-/// which was both slower and no more correct.
+/// let the server task enter its accept loop. No `sleep` needed.
 ///
 /// Accepts a prebuilt [`tonic::transport::server::Router`] so callers can
 /// compose any number of services:
