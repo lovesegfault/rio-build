@@ -226,8 +226,17 @@ async fn test_golden_live_query_path_info() -> anyhow::Result<()> {
 
     let op = golden::build_query_path_info_bytes(&test_path).await?;
 
-    // Also skip reg_time — mock store uses the JSON-queried time
-    let skip: &[&str] = &["version_string", "trusted", "reg_time"];
+    // Skip environment-dependent fields:
+    // - reg_time: mock store uses JSON-queried time, daemon uses its own
+    // - sigs: the hermetic-vs-real-db detection in query_path_info_json
+    //   (checks /nix/var/nix/db exists) and start_local_daemon (checks
+    //   read_dir /nix/var/nix contains "db" entry) can diverge under
+    //   some Nix sandbox configurations. When they do, the mock is
+    //   seeded with sigs=[] (hermetic branch) but the daemon has the
+    //   real db's sigs (or vice versa). Skipping sigs avoids this
+    //   flake; test_golden_live_add_signatures still validates sig
+    //   wire encoding.
+    let skip: &[&str] = &["version_string", "trusted", "reg_time", "sigs"];
     run_live_conformance(Some(&op), store, skip, |data| {
         Box::pin(golden::parse_query_path_info_fields(data))
     })
