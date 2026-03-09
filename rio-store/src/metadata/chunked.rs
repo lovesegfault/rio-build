@@ -105,12 +105,20 @@ pub async fn upgrade_manifest_to_chunked(
     // ON CONFLICT DO UPDATE is atomic per-row. PG's conflict resolution
     // serializes INSERT vs UPDATE — two concurrent PutPaths with
     // overlapping chunk lists both increment correctly.
+    //
+    // `deleted = false`: resurrects a chunk that GC sweep marked for
+    // deletion (refcount hit 0) between sweep and drain. Without
+    // this, PutPath would bump refcount but leave `deleted=true` →
+    // chunk still looks dead. The drain re-check (drain.rs) is the
+    // PRIMARY guard; this is defense-in-depth so `chunks` row state
+    // is self-consistent (refcount>0 implies deleted=false).
     sqlx::query(
         r#"
         INSERT INTO chunks (blake3_hash, refcount, size)
         SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[])
                AS t(hash, one, size)
-        ON CONFLICT (blake3_hash) DO UPDATE SET refcount = chunks.refcount + 1
+        ON CONFLICT (blake3_hash) DO UPDATE
+            SET refcount = chunks.refcount + 1, deleted = false
         "#,
     )
     .bind(chunk_hashes)

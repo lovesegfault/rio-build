@@ -441,6 +441,65 @@ mod tests {
         }
     }
 
+    /// upgrade_manifest_to_chunked's ON CONFLICT upsert must clear
+    /// `deleted=false` when resurrecting a chunk. Without this,
+    /// PutPath bumps refcount but leaves deleted=true → chunks row
+    /// is inconsistent (refcount>0 but marked deleted). The drain
+    /// re-check catches it either way, but self-consistent row state
+    /// makes the chunks table correct on its own.
+    #[tokio::test]
+    async fn integration_chunked_upsert_clears_deleted() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed a "sweep just marked me dead" chunk: refcount=0,
+        // deleted=true.
+        let chunk_hash = vec![0xEEu8; 32];
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 0, 100, true)",
+        )
+        .bind(&chunk_hash)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Set up placeholder for upgrade_manifest_to_chunked (requires
+        // existing 'uploading' manifests row, which requires narinfo).
+        let store_path_hash = vec![0xDDu8; 32];
+        insert_manifest_uploading(&db.pool, &store_path_hash, "/nix/store/d-dummy")
+            .await
+            .unwrap();
+
+        // Upgrade with a chunk_list referencing our dead chunk.
+        // Minimal Manifest: one entry. The upsert should bump
+        // refcount 0→1 AND clear deleted→false.
+        let manifest = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: [0xEEu8; 32],
+                size: 100,
+            }],
+        };
+        chunked::upgrade_manifest_to_chunked(
+            &db.pool,
+            &store_path_hash,
+            &manifest.serialize(),
+            std::slice::from_ref(&chunk_hash),
+            &[100i64],
+        )
+        .await
+        .unwrap();
+
+        // Verify: refcount=1, deleted=false. refcount is PG INTEGER → i32.
+        let (refcount, deleted): (i32, bool) =
+            sqlx::query_as("SELECT refcount, deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(&chunk_hash)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(refcount, 1, "upsert bumped refcount");
+        assert!(!deleted, "upsert cleared deleted=false (chunk resurrected)");
+    }
+
     /// Test-only shallow clone. MetadataError can't derive Clone (holds
     /// sqlx::Error which isn't Clone); this reconstructs equivalent
     /// variants for the mapping test above.

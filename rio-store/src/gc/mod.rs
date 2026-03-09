@@ -150,8 +150,12 @@ pub(super) async fn decrement_and_enqueue(
                 continue;
             };
             let key = backend.key_for(&arr);
-            sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
+            // blake3_hash lets drain re-check chunks.(deleted AND
+            // refcount=0) before S3 delete — catches the TOCTOU where
+            // PutPath resurrected the chunk after sweep enqueued it.
+            sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
                 .bind(&key)
+                .bind(hash)
                 .execute(&mut **tx)
                 .await?;
             stats.s3_keys_enqueued += 1;

@@ -46,13 +46,17 @@ pub async fn sweep(
 
         for store_path_hash in batch {
             // Step 1: SELECT chunk_list FOR UPDATE. NULL for
-            // inline storage. The FOR UPDATE locks the manifest
-            // row — a concurrent PutPath with the same hash would
-            // block until we COMMIT. This is the TOCTOU guard:
-            // without it, PutPath could increment a refcount
-            // between our "SELECT" and "UPDATE refcount - 1",
-            // and we'd decrement a count that was JUST incremented
-            // → chunk prematurely at refcount=0.
+            // inline storage. The FOR UPDATE locks the MANIFEST
+            // row — a concurrent PutPath for the SAME path blocks
+            // until we COMMIT (prevents re-upload mid-sweep).
+            //
+            // This does NOT guard chunk-level races: a DIFFERENT
+            // path sharing chunk X can PutPath after we've already
+            // set X to deleted=true+refcount=0 and enqueued it.
+            // That race is handled by drain.rs's blake3_hash
+            // re-check against chunks.(deleted AND refcount=0)
+            // before calling S3 DeleteObject — PutPath's upsert
+            // clears deleted=false, drain sees "not dead", skips.
             //
             // LEFT JOIN manifest_data: inline paths have no row
             // there. `chunk_list` is NULL for inline; we skip

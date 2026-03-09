@@ -29,6 +29,10 @@ const DRAIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Run one drain iteration. Returns (deleted_count, failed_count).
 ///
 /// For each pending row (up to DRAIN_BATCH_SIZE):
+/// - Re-check `chunks.(deleted AND refcount=0)` — if the chunk was
+///   resurrected by a PutPath since sweep enqueued it, skip S3
+///   delete (just remove the pending row). Guards the sweep-vs-
+///   PutPath TOCTOU for chunks shared across different paths.
 /// - `ChunkBackend::delete_by_key` (S3 DeleteObject or fs rm)
 /// - On success: DELETE the pending row
 /// - On failure: UPDATE attempts = attempts + 1, last_error
@@ -46,9 +50,13 @@ pub async fn drain_once(
     // makes this efficient even if permanently-failed rows
     // accumulate. ORDER BY enqueued_at: oldest first (roughly
     // FIFO, though retries can reorder).
-    let rows: Vec<(i64, String)> = sqlx::query_as(
+    //
+    // blake3_hash is nullable: pre-migration-006 rows have NULL
+    // → drain proceeds unconditionally (old behavior). New rows
+    // have the hash → re-check `chunks` before S3 delete.
+    let rows: Vec<(i64, String, Option<Vec<u8>>)> = sqlx::query_as(
         r#"
-        SELECT id, s3_key FROM pending_s3_deletes
+        SELECT id, s3_key, blake3_hash FROM pending_s3_deletes
          WHERE attempts < $1
          ORDER BY enqueued_at
          LIMIT $2
@@ -66,7 +74,33 @@ pub async fn drain_once(
     let mut deleted = 0u64;
     let mut failed = 0u64;
 
-    for (id, key) in rows {
+    for (id, key, blake3_hash) in rows {
+        // Re-check: was this chunk resurrected since sweep enqueued
+        // it? PutPath's ON CONFLICT sets deleted=false + refcount+1.
+        // If so, the chunk is live again — skip S3, drop pending row.
+        // NULL blake3_hash (pre-006 row) → skip re-check, proceed.
+        if let Some(hash) = &blake3_hash {
+            let still_dead: bool = sqlx::query_scalar(
+                "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",
+            )
+            .bind(hash)
+            .fetch_optional(pool)
+            .await?
+            // Row gone entirely = still dead (nothing references it,
+            // and the chunks row itself was deleted somehow — S3
+            // delete is still safe).
+            .unwrap_or(true);
+            if !still_dead {
+                sqlx::query("DELETE FROM pending_s3_deletes WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                metrics::counter!("rio_store_gc_chunk_resurrected_total").increment(1);
+                debug!(id, key = %key, "drain: chunk resurrected, skipping S3 delete");
+                continue;
+            }
+        }
+
         match backend.delete_by_key(&key).await {
             Ok(()) => {
                 // DELETE the pending row. Fire-and-forget: if
@@ -212,6 +246,114 @@ mod tests {
                 .unwrap();
         assert_eq!(attempts, 1, "attempts incremented");
         assert!(last_error.is_some(), "last_error recorded");
+    }
+
+    #[tokio::test]
+    async fn drain_skips_resurrected_chunk() {
+        // Sweep-vs-PutPath TOCTOU regression test: sweep marks chunk
+        // X deleted + enqueues S3 delete; PutPath for a DIFFERENT
+        // path (sharing X) resurrects it (refcount→1, deleted→false).
+        // Drain must re-check and SKIP the S3 delete.
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        // Seed chunk X in backend + chunks table (resurrected state:
+        // refcount=1, deleted=false — as PutPath's upsert would leave it).
+        let hash_x = [0x11u8; 32];
+        backend
+            .put(&hash_x, bytes::Bytes::from_static(b"chunk-X-live-data"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 1, 17, false)",
+        )
+        .bind(hash_x.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Pending row (sweep enqueued this BEFORE PutPath resurrected).
+        let key_x = backend.key_for(&hash_x);
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
+            .bind(&key_x)
+            .bind(hash_x.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Also seed chunk Y — genuinely dead (refcount=0, deleted=true).
+        // Proves the re-check doesn't accidentally skip REAL deletes.
+        let hash_y = [0x22u8; 32];
+        backend
+            .put(&hash_y, bytes::Bytes::from_static(b"chunk-Y-dead-data"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 0, 17, true)",
+        )
+        .bind(hash_y.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let key_y = backend.key_for(&hash_y);
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key, blake3_hash) VALUES ($1, $2)")
+            .bind(&key_y)
+            .bind(hash_y.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Drain.
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        assert_eq!(deleted, 1, "only Y S3-deleted; X resurrected → skipped");
+        assert_eq!(failed, 0);
+
+        // X still in backend (NOT deleted — resurrection detected).
+        assert!(
+            backend.get(&hash_x).await.unwrap().is_some(),
+            "resurrected chunk X preserved in backend"
+        );
+        // Y gone from backend (genuine delete went through).
+        assert!(
+            backend.get(&hash_y).await.unwrap().is_none(),
+            "dead chunk Y deleted from backend"
+        );
+        // Both pending rows gone (X: removed by re-check; Y: normal).
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pending_s3_deletes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "both pending rows removed");
+    }
+
+    #[tokio::test]
+    async fn drain_proceeds_on_null_blake3_hash() {
+        // Pre-migration-006 rows have NULL blake3_hash → no re-check,
+        // proceed unconditionally (old behavior).
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let backend: Arc<dyn ChunkBackend> = Arc::new(MemoryChunkBackend::new());
+
+        let hash = [0x33u8; 32];
+        backend
+            .put(&hash, bytes::Bytes::from_static(b"legacy-chunk"))
+            .await
+            .unwrap();
+        let key = backend.key_for(&hash);
+        // blake3_hash NOT set (NULL) — simulates pre-006 row.
+        sqlx::query("INSERT INTO pending_s3_deletes (s3_key) VALUES ($1)")
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let (deleted, failed) = drain_once(&db.pool, &backend).await.unwrap();
+        assert_eq!(deleted, 1, "NULL blake3_hash → drain proceeds");
+        assert_eq!(failed, 0);
+        assert!(
+            backend.get(&hash).await.unwrap().is_none(),
+            "S3 delete went through"
+        );
     }
 
     #[tokio::test]
