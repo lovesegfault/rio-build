@@ -234,18 +234,37 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
 
+    # Round 4 V9: capture size_class_assignments_total{class="large"}
+    # baseline BEFORE bigthing build. Prior check (`[1-9]` after build)
+    # could false-pass if an earlier build somehow routed to large.
+    # Baseline-delta proves THIS build specifically went to large.
+    large_baseline = int(control.succeed(
+        "curl -sf http://localhost:9091/metrics | "
+        "grep -E '^rio_scheduler_size_class_assignments_total\\{class=\"large\"\\} ' | "
+        "awk '{print $2}' || echo 0"
+    ).strip() or "0")
+    print(f"size_class large baseline: {large_baseline}")
+
     # Build bigthing (pname="rio-2c-bigthing" in env — estimator keys
     # on that). With the 120s seeded EMA and 30s small cutoff,
     # classify() picks "large".
     build(workers, attr="bigthing")
 
-    # Check the size_class_assignments metric: large should increment.
-    # This is the hard signal — a metric bump proves classify() ran
-    # and picked "large", and best_worker filtered accordingly.
-    control.succeed(
+    # Check the size_class_assignments metric: large should be
+    # EXACTLY baseline+1 (bigthing is a single-node derivation).
+    # If the delta is 0, classify() picked small (wrong). If >1,
+    # something else went to large (unexpected but not fatal —
+    # just assert >= baseline+1).
+    large_after = int(control.succeed(
         "curl -sf http://localhost:9091/metrics | "
-        "grep -E 'rio_scheduler_size_class_assignments_total\\{class=\"large\"\\} [1-9]'"
+        "grep -E '^rio_scheduler_size_class_assignments_total\\{class=\"large\"\\} ' | "
+        "awk '{print $2}'"
+    ).strip())
+    assert large_after >= large_baseline + 1, (
+        f"V9: bigthing should increment large assignments by >=1; "
+        f"baseline={large_baseline}, after={large_after} (delta={large_after - large_baseline})"
     )
+    print(f"V9 PASS: large assignments {large_baseline}→{large_after} (delta={large_after - large_baseline})")
 
     # Softer check: wlarge's logs should show the bigthing assignment,
     # small workers' should NOT. (journalctl grep; noisier than the
@@ -286,23 +305,33 @@ pkgs.testers.runNixOSTest {
 
     # ── A3: chunk backend wired (main.rs A2 landed) ──────────────────
     # The filesystem backend is enabled via extraStoreConfig above.
-    # After the builds, there should be chunks on disk. Not asserting
-    # a specific dedup ratio (VM test builds are tiny, mostly-unique
-    # scripts — meaningful dedup needs real nixpkgs overlap). Just
-    # prove the wiring: chunks/ has content.
     #
-    # `find -type f | wc -l` > 0: at least one chunk written. The
-    # chunks table in PG would also prove this, but checking DISK
-    # proves the filesystem backend path specifically (not inline).
-    chunk_count = control.succeed(
+    # Round 4 V7: prior check was `chunk_count > 0` — but the builds
+    # above (all + bigthing) are tiny text files, likely ALL inline.
+    # Prove the CHUNKED path specifically: capture baseline, build
+    # the bigblob derivation (300 KiB > INLINE_THRESHOLD), assert
+    # chunk count increased. Delta check proves this build went
+    # through chunked PutPath, not inline.
+    chunk_baseline = int(control.succeed(
         "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
-    ).strip()
-    assert int(chunk_count) > 0, (
-        f"filesystem chunk backend should have written chunks to "
-        f"/var/lib/rio/store/chunks; got {chunk_count} files. "
-        f"Either backend not wired, or all NARs were under "
-        f"INLINE_THRESHOLD (256 KiB)."
+    ).strip())
+    print(f"chunk baseline: {chunk_baseline}")
+
+    # bigblob: 300 KiB of zeros → exceeds INLINE_THRESHOLD (256 KiB).
+    # MUST go through chunked path.
+    build(workers, attr="bigblob")
+
+    chunk_after = int(control.succeed(
+        "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
+    ).strip())
+    assert chunk_after > chunk_baseline, (
+        f"V7: bigblob (300 KiB) should write chunks to disk "
+        f"(>INLINE_THRESHOLD). baseline={chunk_baseline}, "
+        f"after={chunk_after} — chunk backend not wired, or "
+        f"INLINE_THRESHOLD changed?"
     )
+    print(f"V7 PASS: chunks {chunk_baseline}→{chunk_after} "
+          f"(delta={chunk_after - chunk_baseline})")
 
     # The dedup metric should also be present (non-zero is fine,
     # even if ratio is low — proves the gauge is registered and

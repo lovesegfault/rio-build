@@ -65,16 +65,34 @@ pkgs.testers.runNixOSTest {
     ).strip()
     assert path_info == "${busybox}", f"path-info returned {path_info!r}, expected busybox path"
 
-    # JSON mode: parse and check narHash + narSize are populated.
+    # JSON mode: parse and compare narHash + narSize EXACTLY against
+    # the client's local store. Round 4 V5: prior check only verified
+    # "startswith sha256-" and "> 0" — a WRONG hash from the gateway
+    # would pass. Now we compute ground truth locally and compare.
     import json
-    path_info_json = json.loads(client.succeed(
+    # Ground truth from the client's LOCAL store (busybox is in
+    # systemPackages so it's registered locally).
+    local_json = json.loads(client.succeed(
+        "nix path-info --json ${busybox}"
+    ))
+    local_info = local_json["${busybox}"]
+    # Gateway response.
+    gateway_json = json.loads(client.succeed(
         "nix path-info --json --store 'ssh-ng://gateway' ${busybox}"
     ))
-    # Output shape: {"/nix/store/...-busybox": {"narHash": "...", "narSize": N, ...}}
-    info = path_info_json["${busybox}"]
-    assert info["narHash"].startswith("sha256-"), f"bad narHash: {info['narHash']}"
-    assert info["narSize"] > 0, f"bad narSize: {info['narSize']}"
-    print(f"path-info: narHash={info['narHash']}, narSize={info['narSize']}")
+    gateway_info = gateway_json["${busybox}"]
+    # Exact match. If gateway returns a different hash/size, the
+    # wopQueryPathInfo handler is corrupting data.
+    assert gateway_info["narHash"] == local_info["narHash"], (
+        f"narHash MISMATCH: gateway={gateway_info['narHash']!r}, "
+        f"local={local_info['narHash']!r}"
+    )
+    assert gateway_info["narSize"] == local_info["narSize"], (
+        f"narSize MISMATCH: gateway={gateway_info['narSize']}, "
+        f"local={local_info['narSize']}"
+    )
+    print(f"path-info EXACT match: narHash={gateway_info['narHash']}, "
+          f"narSize={gateway_info['narSize']}")
 
     # ── Milestone: `nix store ls` ─────────────────────────────────────
     # Exercises wopNarFromPath (fetches NAR, parses directory structure).

@@ -450,12 +450,18 @@ pkgs.testers.runNixOSTest {
         # worker's bloom — worker is cold (first build), bloom
         # miss → hint sent. Assert ≥1 (not just registered).
         #
+        # Round 4 V8: check paths_sent_total instead of hints_sent.
+        # hints_sent counts MESSAGES (1 per dispatch with a hint).
+        # paths_sent counts PATHS inside those hints. An empty-hint
+        # bug (message sent but 0 paths) would pass hints≥1 but fail
+        # paths≥1. paths is the tighter check.
+        #
         # Prometheus counters only appear in /metrics AFTER first
         # increment (describe_counter! just attaches help text).
         # So grep >= 1 is the only form that works.
         control.succeed(
             "curl -sf http://localhost:9091/metrics | "
-            "grep -E 'rio_scheduler_prefetch_hints_sent_total [1-9]'"
+            "grep -E 'rio_scheduler_prefetch_paths_sent_total [1-9]'"
         )
 
         # ── cgroup v2 per-build: the phase3a headline ─────────────
@@ -624,6 +630,28 @@ pkgs.testers.runNixOSTest {
     import re
     assert re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-', build_id), \
         f"build_id not UUID-like: {build_id!r}"
+
+    # Round 4 B9+V4: K8s Events published on Build transitions.
+    # The controller's Recorder (wired in round 4) should have
+    # emitted at least: Submitted (from apply()), and a terminal
+    # event (Building + Succeeded, or Building + Cached). Check
+    # for at least 2 events on this Build object.
+    events_json = k8s.succeed(
+        "k3s kubectl get events -n default "
+        "--field-selector involvedObject.name=test-crd-build,involvedObject.kind=Build "
+        "-o json"
+    )
+    import json
+    events = json.loads(events_json).get("items", [])
+    event_reasons = [e.get("reason", "") for e in events]
+    print(f"Build CRD events: {event_reasons}")
+    assert len(events) >= 2, (
+        f"B9: expected >=2 K8s Events on test-crd-build "
+        f"(Submitted + terminal), got {len(events)}: {event_reasons}"
+    )
+    assert "Submitted" in event_reasons, (
+        f"B9: expected Submitted event from apply(), got: {event_reasons}"
+    )
 
     # Delete → finalizer's cleanup() runs → CancelBuild (NotFound
     # OK since already terminal) → finalizer removed → CR gone.

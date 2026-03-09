@@ -247,5 +247,36 @@ pkgs.testers.runNixOSTest {
         "python3 -c 'import sys,json; d=json.load(sys.stdin); "
         "assert len(d.get(\"traces\",[])) > 0, \"no traces in Tempo for service=scheduler\"'"
     )
+
+    # Round 4 V10: trace PROPAGATION — prove gateway and scheduler
+    # share a traceID (traceparent header passed through gRPC). The
+    # search above only proves scheduler EXPORTS; this proves the
+    # gateway→scheduler propagation via rio_proto::interceptor.
+    #
+    # Approach: fetch one traceID from scheduler traces, then query
+    # that trace and check it contains spans from BOTH services.
+    # Tempo's /api/traces/{id} returns the full trace with all spans.
+    control.wait_until_succeeds(
+        "curl -sf 'http://localhost:3200/api/search?tags=service.name%3Dscheduler&limit=5' | "
+        "python3 -c '"
+        "import sys, json, urllib.request; "
+        "d = json.load(sys.stdin); "
+        "traces = d.get(\"traces\", []); "
+        "assert traces, \"no scheduler traces\"; "
+        "for t in traces:\n"
+        "  tid = t[\"traceID\"]; "
+        "  full = json.load(urllib.request.urlopen(f\"http://localhost:3200/api/traces/{tid}\")); "
+        "  svcs = set(); "
+        "  for batch in full.get(\"batches\", []):\n"
+        "    for attr in batch.get(\"resource\", {}).get(\"attributes\", []):\n"
+        "      if attr.get(\"key\") == \"service.name\":\n"
+        "        svcs.add(attr[\"value\"][\"stringValue\"]);\n"
+        "  if \"gateway\" in svcs and \"scheduler\" in svcs:\n"
+        "    print(f\"V10 PASS: trace {tid} has gateway+scheduler spans (propagation works)\"); "
+        "    sys.exit(0);\n"
+        "assert False, f\"no trace with both gateway AND scheduler spans (checked {len(traces)}); propagation broken?\""
+        "'",
+        timeout=30
+    )
   '';
 }

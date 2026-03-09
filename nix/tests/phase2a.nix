@@ -90,10 +90,28 @@ pkgs.testers.runNixOSTest {
       gatewayHost = "control";
       inherit testDrvFile;
     }}
-    build([worker1, worker2])
+    # capture_stderr=False so stdout is clean (just the output path).
+    out = build([worker1, worker2], capture_stderr=False).strip()
+    print(f"built output: {out}")
 
     # ── Phase 6: Verification ─────────────────────────────────────────
     # Build succeeded (exit code already checked by succeed()).
+    #
+    # Round 4 V11: verify the build output CONTENT via ssh-ng. The
+    # root's $out/stamp contains its own name followed by all 4 child
+    # stamps (phase2a-derivation.nix:27-28). grep -c 'rio-leaf-' == 4
+    # proves: (a) the output is actually retrievable via wopNarFromPath,
+    # (b) the collector concatenated all 4 children (DAG walked
+    # correctly), (c) the NAR bytes are intact (wrong content → wrong
+    # grep count).
+    leaf_count = client.succeed(
+        f"nix store cat --store 'ssh-ng://control' {out}/stamp | "
+        f"grep -c 'rio-leaf-'"
+    ).strip()
+    assert leaf_count == "4", (
+        f"expected 4 'rio-leaf-' lines in {out}/stamp (one per child), "
+        f"got {leaf_count}. DAG walk or NAR content corrupted?"
+    )
 
     # Scheduler: at least one build reached terminal success.
     # Metric format: `rio_scheduler_builds_total{outcome="success"} N`
