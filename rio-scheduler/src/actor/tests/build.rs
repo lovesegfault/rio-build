@@ -347,3 +347,136 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Build not-found paths
+// ---------------------------------------------------------------------------
+
+/// CancelBuild for a never-submitted build_id → BuildNotFound.
+#[tokio::test]
+async fn test_cancel_unknown_build_returns_not_found() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: Uuid::new_v4(),
+            reason: "test".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    let result = reply_rx.await?;
+    assert!(
+        matches!(result, Err(ActorError::BuildNotFound(_))),
+        "unknown build → BuildNotFound, got {result:?}"
+    );
+    Ok(())
+}
+
+/// QueryBuildStatus for unknown build_id → BuildNotFound.
+#[tokio::test]
+async fn test_query_unknown_build_returns_not_found() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let result = try_query_status(&handle, Uuid::new_v4()).await?;
+    assert!(
+        matches!(result, Err(ActorError::BuildNotFound(_))),
+        "unknown build → BuildNotFound"
+    );
+    Ok(())
+}
+
+/// WatchBuild after Failed/Cancelled terminal states also replays
+/// the terminal event (not just Succeeded).
+#[tokio::test]
+async fn test_watch_build_after_failure_replays_failed() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("fail-watch-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let _original_rx =
+        merge_single_node(&handle, build_id, "fail-watch", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    // Permanent failure → build Failed.
+    complete_failure(
+        &handle,
+        "fail-watch-w",
+        &test_drv_path("fail-watch"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "test permanent failure",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Late WatchBuild.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            since_sequence: 0,
+            reply: reply_tx,
+        })
+        .await?;
+    let (mut watch_rx, _) = reply_rx.await??;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.recv())
+        .await
+        .expect("should not hang")
+        .expect("should receive");
+    assert!(
+        matches!(
+            event.event,
+            Some(rio_proto::types::build_event::Event::Failed(_))
+        ),
+        "late WatchBuild on Failed build should replay BuildFailed, got {:?}",
+        event.event
+    );
+    Ok(())
+}
+
+/// Same for Cancelled.
+#[tokio::test]
+async fn test_watch_build_after_cancel_replays_cancelled() -> TestResult {
+    let (_db, handle, _task, _rx) = setup_with_worker("cancel-watch-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let _original_rx =
+        merge_single_node(&handle, build_id, "cancel-watch", PriorityClass::Scheduled).await?;
+    barrier(&handle).await;
+
+    // Cancel.
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            reason: "test cancel".into(),
+            reply: cancel_tx,
+        })
+        .await?;
+    let _ = cancel_rx.await??;
+
+    // Late WatchBuild.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            since_sequence: 0,
+            reply: reply_tx,
+        })
+        .await?;
+    let (mut watch_rx, _) = reply_rx.await??;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.recv())
+        .await
+        .expect("should not hang")
+        .expect("should receive");
+    assert!(
+        matches!(
+            event.event,
+            Some(rio_proto::types::build_event::Event::Cancelled(_))
+        ),
+        "late WatchBuild on Cancelled build should replay BuildCancelled, got {:?}",
+        event.event
+    );
+    Ok(())
+}

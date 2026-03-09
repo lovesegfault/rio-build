@@ -580,7 +580,10 @@ impl DagActor {
     // Backpressure
     // -----------------------------------------------------------------------
 
-    fn update_backpressure(&mut self, queue_len: usize, capacity: usize) {
+    // pub(crate) for hysteresis unit test (tests/misc.rs). Called once
+    // per command iteration at the top of run_inner (line ~295); tests
+    // exercise the watermark transitions directly on a bare actor.
+    pub(crate) fn update_backpressure(&mut self, queue_len: usize, capacity: usize) {
         let fraction = queue_len as f64 / capacity as f64;
         let was_active = self.backpressure_active.load(Ordering::Relaxed);
 

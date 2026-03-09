@@ -18,6 +18,7 @@ mod fault;
 mod integration;
 mod keep_going;
 mod merge;
+mod misc;
 mod recovery;
 mod wiring;
 mod worker;

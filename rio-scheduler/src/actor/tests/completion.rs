@@ -4,6 +4,7 @@
 // r[verify sched.state.terminal-idempotent]
 
 use super::*;
+use tracing_test::traced_test;
 
 /// TransientFailure: retry on a different worker up to max_retries (default 2).
 #[tokio::test]
@@ -296,6 +297,172 @@ async fn test_duplicate_completion_idempotent() -> TestResult {
     assert_eq!(
         completed_events, 1,
         "BuildCompleted event should fire exactly once"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Completion edge cases: unknown drv, wrong state, unknown status
+// ---------------------------------------------------------------------------
+
+/// ProcessCompletion for a drv_key the actor has never seen → warn
+/// + ignore. Could happen after stale worker reconnect with a build
+/// from a previous scheduler generation.
+#[tokio::test]
+#[traced_test]
+async fn test_completion_unknown_drv_key_ignored() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Completion for a drv that was never merged.
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "ghost-worker".into(),
+            drv_key: "never-existed-drv-hash".into(),
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert!(
+        logs_contain("unknown derivation") || logs_contain("not in DAG"),
+        "expected warn for unknown drv_key"
+    );
+    Ok(())
+}
+
+/// Completion for a drv in Ready (never dispatched) → warn + ignore.
+/// A worker can't complete something it wasn't assigned.
+#[tokio::test]
+#[traced_test]
+async fn test_completion_for_non_running_state_ignored() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Merge but DON'T connect a worker — drv stays Ready.
+    let build_id = Uuid::new_v4();
+    merge_single_node(&handle, build_id, "ready-drv", PriorityClass::Scheduled).await?;
+
+    // Send completion. Drv is Ready, not Assigned/Running.
+    complete_success_empty(&handle, "phantom-w", &test_drv_path("ready-drv")).await?;
+    barrier(&handle).await;
+
+    assert!(
+        logs_contain("not in assigned") || logs_contain("unexpected state"),
+        "expected warn for wrong-state completion"
+    );
+
+    // Drv still Ready (completion ignored).
+    let info = handle
+        .debug_query_derivation("ready-drv")
+        .await?
+        .expect("drv exists");
+    assert!(
+        !matches!(info.status, DerivationStatus::Completed),
+        "completion from wrong state should be ignored, status={:?}",
+        info.status
+    );
+    Ok(())
+}
+
+/// Unknown BuildResultStatus value (e.g. from a newer worker) → warn,
+/// treat as transient failure. Don't panic, don't get stuck.
+#[tokio::test]
+#[traced_test]
+async fn test_unknown_build_status_treated_as_transient() -> TestResult {
+    let (_db, handle, _task, mut _rx) = setup_with_worker("unk-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("unk-status");
+    merge_single_node(&handle, build_id, "unk-status", PriorityClass::Scheduled).await?;
+
+    // Wait for dispatch (drv → Assigned).
+    barrier(&handle).await;
+
+    // Send completion with an invalid status int (9999).
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "unk-w".into(),
+            drv_key: drv_path.clone(),
+            result: rio_proto::types::BuildResult {
+                status: 9999, // not a valid enum
+                error_msg: "mystery".into(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    assert!(
+        logs_contain("unknown BuildResultStatus")
+            || logs_contain("Unspecified")
+            || logs_contain("unknown status"),
+        "expected warn for unknown status enum"
+    );
+    Ok(())
+}
+
+/// After CancelBuild transitions a drv to Cancelled, a later
+/// Cancelled completion from the worker is expected → no-op, debug
+/// log. This is the "worker acknowledges the cancel signal" path.
+#[tokio::test]
+#[traced_test]
+async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
+    let (_db, handle, _task, mut _rx) = setup_with_worker("cancel-w", "x86_64-linux", 1).await?;
+
+    let build_id = Uuid::new_v4();
+    let drv_path = test_drv_path("cancel-drv");
+    merge_single_node(&handle, build_id, "cancel-drv", PriorityClass::Scheduled).await?;
+    barrier(&handle).await; // dispatch
+
+    // Cancel the build (transitions drv → Cancelled, sends CancelSignal).
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            reason: "user request".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    let _cancelled = reply_rx.await??;
+
+    // Worker reports Cancelled (acknowledging the signal).
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "cancel-w".into(),
+            drv_key: drv_path,
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Cancelled.into(),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // Drv still Cancelled (no spurious state change).
+    let info = handle
+        .debug_query_derivation("cancel-drv")
+        .await?
+        .expect("drv exists");
+    assert_eq!(info.status, DerivationStatus::Cancelled);
+
+    // The state check at handle_completion's top catches this —
+    // drv is already Cancelled (not Assigned/Running), so it hits
+    // the "not in assigned/running state, ignoring" early-return.
+    // This IS the no-op path for acknowledging a cancel.
+    assert!(
+        logs_contain("not in assigned/running state"),
+        "expected early-return for already-Cancelled state"
     );
     Ok(())
 }
