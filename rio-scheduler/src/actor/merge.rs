@@ -73,7 +73,37 @@ impl DagActor {
         );
         self.builds.insert(build_id, build_info);
 
-        // === Step 4: DB persistence with rollback on error ============
+        // Index proto nodes by hash for efficient lookup during cache-check + transitions.
+        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
+            nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
+
+        // === Step 4: Scheduler-side cache check (BEFORE DB persist) ====
+        // Query the store for expected_output_paths of newly-inserted
+        // derivations. If all outputs exist, skip straight to Completed.
+        // This closes the TOCTOU window between the gateway's
+        // FindMissingPaths and our merge (another build may have completed
+        // the derivation in between).
+        //
+        // Err(StoreUnavailable) → circuit breaker is open (sustained store
+        // outage). Roll back the merge and reject the whole SubmitBuild.
+        // The alternative — queueing with 100% cache miss — causes a rebuild
+        // avalanche once the store recovers.
+        //
+        // ORDERING: this check runs BEFORE persist_merge_to_db so the
+        // rollback is in-memory only (no build_derivations FK rows to
+        // cascade-delete). Prior to round 4, this ran AFTER persist and
+        // delete_build silently failed the FK constraint, leaving orphan
+        // build rows that recovery would resurrect.
+        let cached_hashes = match self.check_cached_outputs(newly_inserted, &node_index).await {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
+                self.cleanup_failed_merge(build_id, &merge_result).await;
+                return Err(e);
+            }
+        };
+
+        // === Step 5: DB persistence with rollback on error ============
         // If any of these fail, roll back the merge AND the map inserts
         // AND delete the DB build row, so in-memory and DB state stay
         // consistent. After this block the build is committed (Active).
@@ -93,40 +123,13 @@ impl DagActor {
             return Err(e);
         }
 
-        // === Step 5: Post-Active processing ==========================
+        // === Step 6: Post-Active processing ==========================
         // From here on, DB write failures are log-and-continue (build is
         // Active and in a valid state; DB sync will catch up on next status
         // update or heartbeat reconciliation).
 
-        // Index proto nodes by hash for efficient lookup during the transition loop.
-        let node_index: HashMap<&str, &rio_proto::types::DerivationNode> =
-            nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
-
         let total_derivations = nodes.len() as u32;
         let mut cached_count = 0u32;
-
-        // Scheduler-side cache check: query the store for expected_output_paths
-        // of newly-inserted derivations. If all outputs exist, skip straight to
-        // Completed. This closes the TOCTOU window between the gateway's
-        // FindMissingPaths and our merge (another build may have completed the
-        // derivation in between).
-        //
-        // Err(StoreUnavailable) → circuit breaker is open (sustained store
-        // outage). Roll back the merge and reject the whole SubmitBuild. The
-        // alternative — queueing with 100% cache miss — causes a rebuild
-        // avalanche once the store recovers.
-        let cached_hashes = match self.check_cached_outputs(newly_inserted, &node_index).await {
-            Ok(hashes) => hashes,
-            Err(e) => {
-                // Same rollback as persist_merge_to_db failure: undo the DAG
-                // merge, the map inserts, and the DB build row. Without this,
-                // the build would be half-committed (Active in the DB but
-                // rejected to the client).
-                error!(build_id = %build_id, error = %e, "cache-check circuit breaker open; rolling back merge");
-                self.cleanup_failed_merge(build_id, &merge_result).await;
-                return Err(e);
-            }
-        };
 
         for drv_hash in &cached_hashes {
             let Some(node) = node_index.get(drv_hash.as_str()) else {

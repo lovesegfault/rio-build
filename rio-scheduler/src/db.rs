@@ -177,9 +177,16 @@ impl SchedulerDb {
     }
 
     /// Delete a build row (best-effort cleanup after a failed merge).
-    /// Cascade deletes build_derivations links. Used by handle_merge_dag
-    /// rollback to clean up the orphan build row if DB persistence fails
-    /// after insert_build succeeded.
+    /// Cascade-deletes build_derivations links (migration 008 added
+    /// ON DELETE CASCADE). Used by handle_merge_dag rollback to clean up
+    /// the orphan build row if DB persistence fails after insert_build
+    /// succeeded.
+    ///
+    /// In practice, cleanup_failed_merge calls this BEFORE
+    /// persist_merge_to_db has run, so there are typically no
+    /// build_derivations rows to cascade. The CASCADE is defense-in-depth
+    /// for the persist-failed path (where rows exist but the tx rolled
+    /// back, so they don't) and for manual admin cleanup.
     pub async fn delete_build(&self, build_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM builds WHERE build_id = $1")
             .bind(build_id)
