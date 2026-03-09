@@ -73,12 +73,12 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
 }
 
 /// wopBuildPaths when the scheduler stream closes without a terminal event
-/// (BuildCompleted/BuildFailed/BuildCancelled). Regression for commit b2d3863:
+/// (BuildCompleted/BuildFailed/BuildCancelled). Regression guard:
 /// process_build_events must NOT send STDERR_ERROR itself — it returns Err
 /// and lets the CALLER send STDERR_ERROR (opcode 9) or STDERR_LAST + failure
-/// (opcode 46). Before b2d3863, process_build_events sent STDERR_ERROR inside
-/// the loop, causing a double-STDERR_ERROR or STDERR_ERROR-then-STDERR_LAST
-/// invalid frame sequence depending on the opcode.
+/// (opcode 46). If process_build_events sent STDERR_ERROR inside the loop,
+/// we'd get a double-STDERR_ERROR or STDERR_ERROR-then-STDERR_LAST invalid
+/// frame sequence depending on the opcode.
 ///
 /// For opcode 9, the correct behavior is: EXACTLY ONE STDERR_ERROR, then the
 /// session closes. We verify this by using drain_stderr_expecting_error which
@@ -104,7 +104,7 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyho
     );
 
     // For opcode 9: caller (handle_build_paths) sends STDERR_ERROR on failure.
-    // process_build_events must NOT also have sent one (that's the b2d3863 fix).
+    // process_build_events must NOT also have sent one (that's what this regression guards).
     // drain_stderr_expecting_error reads one STDERR_ERROR and stops; if there
     // were two, the leftover bytes would desync the stream and h.finish()
     // would fail.
@@ -226,8 +226,8 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
     // cpuUser(tag+val?) + cpuSystem(tag+val?) + builtOutputs
     let status = wire::read_u64(&mut h.stream).await?;
     // Mock sent send_completed: true, so status should be Built (0), not
-    // just "any valid status". Previously: assert!(status <= 14) accepted
-    // failures as passing.
+    // just "any valid status" — a weak assertion here would let failure
+    // states pass silently.
     assert_eq!(
         status, 0,
         "status should be Built (0) since mock sent completed, got {status}"
@@ -270,9 +270,9 @@ async fn test_build_paths_with_results_invalid_derived_path() -> anyhow::Result<
         u64: 0,                                  // buildMode = Normal
     );
 
-    // Per CLAUDE.md: "per-entry errors in batch opcodes push
-    // BuildResult::failure and continue, not abort". So we should get
-    // STDERR_LAST + a failed BuildResult, not STDERR_ERROR.
+    // Batch opcodes: per-entry errors push BuildResult::failure and
+    // continue, not abort the whole batch. So we get STDERR_LAST + a
+    // failed BuildResult, not STDERR_ERROR.
     drain_stderr_until_last(&mut h.stream).await?;
     let count = wire::read_u64(&mut h.stream).await?;
     assert_eq!(count, 1, "should get one result for one input path");

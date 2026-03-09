@@ -277,7 +277,7 @@ async fn send_store_error<W: AsyncWrite + Unpin>(
 }
 
 /// If `path` is a `.drv`, parse the ATerm from NAR data and cache it.
-/// Round 4 Z24: cap drv_cache at MAX_TRANSITIVE_INPUTS. The cache
+/// Cap drv_cache at MAX_TRANSITIVE_INPUTS. The cache
 /// is session-scoped; a client uploading 100k .drv files would
 /// consume ~100k * (avg drv size ~1KB parsed) = ~100MB per session.
 /// MAX_TRANSITIVE_INPUTS (10k) matches the BFS limit in
@@ -313,8 +313,8 @@ fn try_cache_drv(
             if insert_drv_bounded(drv_cache, path.clone(), drv) {
                 debug!(path = %path, "cached parsed derivation");
             } else {
-                // Log once-ish (every subsequent insert fails too).
-                // The upload itself succeeds; only the cache skip.
+                // Log at warn (not per-insert spam): every subsequent insert
+                // at cap also fails. The upload itself still succeeds.
                 warn!(
                     path = %path,
                     cap = crate::translate::MAX_TRANSITIVE_INPUTS,
@@ -346,11 +346,11 @@ pub(crate) async fn resolve_derivation(
     let drv = Derivation::parse_from_nar(&nar_data)
         .map_err(|e| anyhow::anyhow!("failed to parse .drv '{}': {e}", drv_path))?;
 
-    // Round 4 Z24: bound drv_cache. resolve_derivation is called
-    // from BFS in translate::reconstruct_dag — cap hit means the
-    // DAG is too large (MAX_TRANSITIVE_INPUTS enforced by the BFS
-    // itself, but the cache could grow beyond that across multiple
-    // builds in one session). Error propagates as DAG failure.
+    // Bound drv_cache. resolve_derivation is called from BFS in
+    // translate::reconstruct_dag — cap hit means the DAG is too large
+    // (MAX_TRANSITIVE_INPUTS enforced by the BFS itself, but the cache
+    // could grow beyond that across multiple builds in one session).
+    // Error propagates as DAG failure.
     if !insert_drv_bounded(drv_cache, drv_path.clone(), drv.clone()) {
         return Err(anyhow::anyhow!(
             "per-session derivation cache full ({} entries, cap {})",

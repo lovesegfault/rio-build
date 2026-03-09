@@ -27,9 +27,9 @@ enum PostLastRead {
 ///
 /// Each call starts a NEW daemon — no static, no sharing across tests.
 /// This ensures isolation under both nextest (each test in its own process)
-/// AND cargo test (all tests share a process). The previous LazyLock-based
-/// sharing caused test interdependence under cargo test: add_signatures
-/// mutates the daemon's db, and query_path_info then sees the mutation.
+/// AND cargo test (all tests share a process). A shared daemon instance
+/// would cause test interdependence: add_signatures mutates the daemon's
+/// db, and query_path_info would then see the mutation.
 ///
 /// The caller must bind the returned guard (`let (socket, _guard) = ...;`)
 /// to keep the daemon alive for the duration of the test.

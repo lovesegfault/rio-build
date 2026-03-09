@@ -63,14 +63,13 @@ async fn test_set_options_standalone() -> anyhow::Result<()> {
 }
 
 // ===========================================================================
-// Ported error-path tests from rio-build/tests/direct_protocol.rs
+// Error-path tests
 // ===========================================================================
 //
-// NOTE: hash/size mismatch tests for AddToStoreNar are NOT ported — in the
-// rio-gateway architecture, the gateway passes the declared hash through
-// unchanged (see test_add_to_store_nar_passes_declared_hash above). Hash
-// validation is rio-store's responsibility; see rio-store/src/validate.rs
-// tests (validate_nar_rejects_hash_mismatch et al.) and
+// Hash/size mismatch tests for AddToStoreNar live in rio-store: the gateway
+// passes the declared hash through unchanged (see
+// test_add_to_store_nar_passes_declared_hash). Hash validation is
+// rio-store's responsibility — see rio-store/src/validate.rs and
 // rio-store/tests/grpc_integration.rs::test_put_path_hash_mismatch_cleans_up.
 
 /// Handshake-level: client sends a version older than 1.37 → STDERR_ERROR.

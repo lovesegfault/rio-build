@@ -35,9 +35,8 @@ pub struct StorePathEntry {
 
 /// Seed a `MockStore` with the given store path entries.
 ///
-/// Replaces the rio-build monolith's `build_memory_store_from` which seeded
-/// a local `dyn Store` — we seed the gRPC `MockStore` instead. NAR data is
-/// fetched via `nix-store --dump` for each entry.
+/// Seeds the gRPC `MockStore`. NAR data is fetched via `nix-store --dump`
+/// for each entry.
 pub fn seed_mock_store_from(store: &MockStore, entries: &[StorePathEntry]) {
     for entry in entries {
         let nar_hash = NixHash::parse(&entry.nar_hash)
@@ -343,8 +342,7 @@ pub async fn parse_query_missing_fields(data: &[u8]) -> Vec<ResponseField> {
     .await
 }
 
-/// Parse NarFromPath response. Both rio-gateway and nix-daemon now use the
-/// same format: [activity messages...] STDERR_LAST <raw NAR bytes>.
+/// Parse NarFromPath response: [activity messages...] STDERR_LAST <raw NAR bytes>.
 pub fn parse_nar_from_path_fields(
     data: &[u8],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ResponseField>> + '_>> {
@@ -354,8 +352,8 @@ pub fn parse_nar_from_path_fields(
         let mut cursor = Cursor::new(data.to_vec());
 
         // Skip activity messages until STDERR_LAST. Both nix-daemon and
-        // rio-gateway send STDERR_LAST then raw NAR bytes (the old
-        // STDERR_WRITE framing was bug #11: `error: no sink`).
+        // rio-gateway send STDERR_LAST then raw NAR bytes (STDERR_WRITE
+        // framing here would trigger client `error: no sink`).
         let last_bytes;
         loop {
             let msg_bytes = read_u64_field(&mut cursor).await;

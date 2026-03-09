@@ -112,7 +112,7 @@ struct CliArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider MUST be installed before any TLS use.
-    // tonic's tls-aws-lc feature (Phase 3b) enables aws-lc-rs; without
+    // tonic's tls-aws-lc feature enables aws-lc-rs; without
     // this install_default, rustls can't auto-select and panics on
     // first handshake. Gateway's outgoing gRPC (scheduler + store)
     // is the TLS user here — incoming is SSH.
@@ -185,7 +185,6 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_gateway::describe_metrics();
 
-    // Connect to gRPC services
     info!(addr = %cfg.store_addr, "connecting to store service");
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
 
@@ -229,11 +228,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Load SSH keys
     let host_key = rio_gateway::load_or_generate_host_key(&cfg.host_key)?;
     let authorized_keys = rio_gateway::load_authorized_keys(&cfg.authorized_keys)?;
 
-    // Start SSH server
     let server = rio_gateway::GatewayServer::new(store_client, scheduler_client, authorized_keys);
 
     info!(

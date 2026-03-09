@@ -238,8 +238,6 @@ pub(super) async fn handle_set_options<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 ///
 /// Nix client: `processStderr(ex)` (no sink) → `copyNAR(from, sink)`.
 /// The stderr loop exits on STDERR_LAST; the NAR is read as raw bytes after.
-/// Previously this used STDERR_WRITE (like wopExportPaths), but narFromPath's
-/// client does NOT pass a sink to processStderr → 'error: no sink'.
 #[instrument(skip_all)]
 pub(super) async fn handle_nar_from_path<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
@@ -313,10 +311,9 @@ pub(super) async fn handle_query_path_from_hash_part<
     let hash_part = wire::read_string(reader).await?;
     debug!(hash_part = %hash_part, "wopQueryPathFromHashPart");
 
-    // Dedicated RPC (resolves the old phase2c-tagged workaround).
     // The store validates hash_part (32 chars, nixbase32 charset) and
-    // does the LIKE prefix query. NOT_FOUND → empty string to Nix; other
-    // gRPC errors → STDERR_ERROR.
+    // does the LIKE prefix query. NOT_FOUND → empty string to Nix;
+    // other gRPC errors → STDERR_ERROR.
     let req = types::QueryPathFromHashPartRequest { hash_part };
     let path_str = match rio_common::grpc::with_timeout(
         "QueryPathFromHashPart",
@@ -358,10 +355,10 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
     let sigs = wire::read_strings(reader).await?;
     debug!(path = %path_str, count = sigs.len(), "wopAddSignatures");
 
-    // Dedicated RPC (resolves the old phase2c-tagged stub). The store
-    // appends to narinfo.signatures TEXT[]. NOT_FOUND → STDERR_ERROR
-    // (matches the real daemon: signing a path you don't have is an error,
-    // not a silent no-op — `nix store sign` expects to hear about it).
+    // The store appends to narinfo.signatures TEXT[]. NOT_FOUND →
+    // STDERR_ERROR (matches the real daemon: signing a path you don't
+    // have is an error, not a silent no-op — `nix store sign` expects
+    // to hear about it).
     let req = types::AddSignaturesRequest {
         store_path: path_str,
         signatures: sigs,
@@ -385,7 +382,7 @@ pub(super) async fn handle_add_signatures<R: AsyncRead + Unpin, W: AsyncWrite + 
 ///
 /// Wire format: `"sha256:<hex>!<name>"` — hex (not nixbase32), exclamation
 /// separator. This is the same format Nix uses in BuildResult builtOutputs
-/// (see `rio-nix/src/protocol/build.rs:341`). The `sha256:` prefix is
+/// (see rio-nix BuildResult::built_outputs encoding). The `sha256:` prefix is
 /// literal; Nix doesn't support other hash algos here.
 ///
 /// Returns `None` for malformed input. Caller logs + soft-fails (accept
@@ -410,10 +407,9 @@ fn parse_drv_output_id(id: &str) -> Option<([u8; 32], String)> {
 /// `dependentRealisations` (ignored — phase 5's early cutoff uses it, not
 /// us). Response: nothing after STDERR_LAST (no result data).
 ///
-/// Soft-fail on malformed JSON/id: log + return success. The old stub
-/// accepted everything; suddenly hard-failing would break clients that were
-/// already "working" (silently). A bad registration just means the cache-hit
-/// doesn't happen — degraded, not broken.
+/// Soft-fail on malformed JSON/id: log + return success. Hard-failing
+/// here would break buggy clients; a bad registration just means the
+/// cache-hit doesn't happen — degraded, not broken.
 // r[impl gw.opcode.mandatory-set]
 #[instrument(skip_all)]
 pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -519,9 +515,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     let id = wire::read_string(reader).await?;
     debug!(id = %id, "wopQueryRealisation");
 
-    // Malformed id → empty set. Same soft-fail rationale as Register:
-    // the old stub returned empty for everything, so hard-failing here
-    // would be a regression for buggy clients.
+    // Malformed id → empty set (same soft-fail rationale as Register).
     let Some((drv_hash, output_name)) = parse_drv_output_id(&id) else {
         warn!(id = %id, "wopQueryRealisation: malformed DrvOutput id, returning empty");
         stderr.finish().await?;
@@ -610,7 +604,6 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         })
         .collect();
 
-    // Collect store paths for batch lookup
     let store_paths: Vec<String> = derived
         .iter()
         .map(|(_, dp)| dp.store_path().to_string())

@@ -14,7 +14,7 @@
 //!   3. wopQueryRealisation with the same DrvOutput id — gets outPath
 //!      back. This is the cache-hit lookup.
 //!   4. ContentLookup via gRPC with the nar_hash — finds the path by
-//!      content identity. G1's content_index in action.
+//!      content identity — the store's content_index in action.
 //!
 //! All against MockStore (in-memory). The wire protocol path is real
 //! (gateway session with DuplexStream); the store is mocked to keep

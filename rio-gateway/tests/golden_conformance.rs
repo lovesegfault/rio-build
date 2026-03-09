@@ -303,8 +303,8 @@ async fn test_golden_live_query_missing() -> anyhow::Result<()> {
 }
 
 /// NarFromPath golden test. Documents the wire-format: rio-gateway sends
-/// STDERR_LAST then raw NAR bytes (matching nix-daemon); the old rio-build
-/// monolith used STDERR_WRITE chunks.
+/// STDERR_LAST then raw NAR bytes (matching nix-daemon) — NOT STDERR_WRITE
+/// chunks, which the client rejects with "error: no sink".
 #[tokio::test]
 async fn test_golden_live_nar_from_path() -> anyhow::Result<()> {
     let test_path = golden::daemon::build_test_path();
@@ -336,8 +336,8 @@ async fn test_golden_live_nar_from_path() -> anyhow::Result<()> {
     let rio_so_fields = golden::parse_set_options_fields(&rio_so).await;
     golden::assert_field_conformance(&daemon_so_fields, &rio_so_fields, SKIP_FIELDS);
 
-    // Compare NAR content. Both sides now use STDERR_LAST + raw NAR (rio-gateway
-    // was fixed to match the daemon; see wopNarFromPath handler).
+    // Compare NAR content. Both sides use STDERR_LAST + raw NAR (see
+    // wopNarFromPath handler for the protocol rationale).
     let daemon_op_fields = golden::parse_nar_from_path_fields(&daemon_op).await;
     let rio_op_fields = golden::parse_nar_from_path_fields(&rio_op).await;
 

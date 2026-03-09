@@ -102,10 +102,6 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
     //   for each: ValidPathInfo (9 fields) + NAR as narSize PLAIN bytes
     // The NAR is NOT nested-framed — `addToStore(info, source)` reads narSize
     // bytes directly from the already-framed outer stream.
-    //
-    // Previous test wrote NO count prefix + inner-framed NAR, matching a buggy
-    // parser rather than the spec. Fixed after VM test caught it running real
-    // `nix copy --to ssh-ng://`.
     let test_path_b = "/nix/store/22222222222222222222222222222222-multi-b";
     let inner = wire_bytes![
         u64: 2,                            // Count prefix
@@ -197,12 +193,10 @@ async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
 }
 
 // ===========================================================================
-// Stub opcode tests: AddSignatures (37), RegisterDrvOutput (42),
-// QueryRealisation (43)
+// AddSignatures (37), RegisterDrvOutput (42), QueryRealisation (43)
 // ===========================================================================
 
 /// AddSignatures on a seeded path: appends to MockStore and returns success.
-/// No longer a stub (phase2c E2) — actually calls the store RPC now.
 #[tokio::test]
 async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -218,8 +212,7 @@ async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()>
     let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1, "AddSignatures should return 1 (success)");
 
-    // Verify MockStore actually recorded the sigs (the old stub discarded
-    // them silently — this assertion would have caught that).
+    // Verify MockStore actually recorded the sigs (not just the wire parse).
     let stored_sigs = h
         .store
         .paths
@@ -239,8 +232,7 @@ async fn test_add_signatures_appends_and_returns_success() -> anyhow::Result<()>
 }
 
 /// AddSignatures on unknown path: STDERR_ERROR (not silent success).
-/// The old stub accepted everything; now unknown paths fail, matching
-/// the real daemon's behavior.
+/// Unknown paths fail (STDERR_ERROR), matching the real daemon's behavior.
 #[tokio::test]
 async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -264,7 +256,7 @@ async fn test_add_signatures_unknown_path_errors() -> anyhow::Result<()> {
 }
 
 /// RegisterDrvOutput with valid Realisation JSON: parses, calls store,
-/// MockStore records it. No longer a stub (phase2c E4).
+/// MockStore records it.
 #[tokio::test]
 async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -284,8 +276,7 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
     drain_stderr_until_last(&mut h.stream).await?;
     // No result data after STDERR_LAST.
 
-    // Verify MockStore recorded it. The old stub discarded silently — this
-    // assertion would have caught that.
+    // Verify MockStore recorded it (not just the wire parse).
     let drv_hash = hex::decode(&drv_hash_hex)?;
     let key = (drv_hash, "out".to_string());
     let stored = h.store.realisations.read().unwrap().get(&key).cloned();
@@ -297,8 +288,8 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Malformed JSON: soft-fail (accept + discard, log). The old stub did this
-/// implicitly; now it's explicit. Hard-failing would regress buggy clients.
+/// Malformed JSON: soft-fail (accept + discard, log). Hard-failing would
+/// regress buggy clients.
 #[tokio::test]
 async fn test_register_drv_output_malformed_json_soft_fails() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -325,8 +316,6 @@ async fn test_register_drv_output_malformed_id_soft_fails() -> anyhow::Result<()
     let mut h = GatewaySession::new_with_handshake().await?;
 
     // "abc" is 3 hex chars — not 64, so hex::decode → wrong length.
-    // Previously the stub test used exactly this and it "passed" because
-    // the stub didn't parse the id at all.
     let bad_json = r#"{"id":"sha256:abc!out","outPath":"/nix/store/xyz","signatures":[],"dependentRealisations":{}}"#;
     wire_send!(&mut h.stream;
         u64: 42,

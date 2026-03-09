@@ -8,7 +8,8 @@ use rio_proto::validated::ValidatedPathInfo;
 /// registration_time=0, ultimate=true, signatures=[].
 ///
 /// Takes pre-parsed `StorePath` and `Vec<StorePath>` references — callers
-/// already parse these (they were being thrown away before this commit).
+/// already parse both for their own validation, so re-parsing from strings
+/// here would be redundant.
 fn path_info_for_computed(
     store_path: StorePath,
     nar_hash: [u8; 32],
@@ -69,19 +70,16 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         stderr_err!(stderr, "nar_size {nar_size} exceeds maximum for {path_str}");
     }
 
-    // Validate store path
     let path = match StorePath::parse(&path_str) {
         Ok(p) => p,
         Err(e) => stderr_err!(stderr, "invalid store path '{path_str}': {e}"),
     };
 
-    // Validate narHash hex
     let nar_hash_bytes = match hex::decode(&nar_hash_str) {
         Ok(b) => b,
         Err(e) => stderr_err!(stderr, "invalid narHash hex '{nar_hash_str}': {e}"),
     };
 
-    // Read NAR data via framed stream
     let nar_data = match wire::read_framed_stream(reader).await {
         Ok(data) => data,
         Err(e) => stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}"),
@@ -111,7 +109,6 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         Err(e) => stderr_err!(stderr, "wopAddToStoreNar for '{path_str}': {e}"),
     };
 
-    // Cache .drv before uploading (we have the NAR data buffered)
     try_cache_drv(&path, &nar_data, drv_cache);
 
     if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
@@ -185,7 +182,6 @@ async fn parse_add_multiple_entry(
     let nar_data = buf[pos..end].to_vec();
     cursor.set_position(end as u64);
 
-    // Cache .drv before uploading
     try_cache_drv(&path, &nar_data, drv_cache);
 
     let raw_info = types::PathInfo {
@@ -304,7 +300,6 @@ pub(super) async fn handle_add_to_store<R: AsyncRead + Unpin, W: AsyncWrite + Un
         return send_store_error(stderr, e).await;
     }
 
-    // Send STDERR_LAST + ValidPathInfo
     stderr.finish().await?;
     let w = stderr.inner_mut();
 
@@ -423,11 +418,6 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError>
 ///       ValidPathInfo (9 fields — see parse_add_multiple_entry)
 ///       NAR data (narSize plain bytes, NOT nested-framed)
 ///   ]
-///
-/// This was previously parsed WRONG (no count prefix, NAR read as nested
-/// framed). The bug was masked by a byte-level test written to match the
-/// buggy parser rather than the spec — caught by the VM test running real
-/// `nix copy --to ssh-ng://`.
 // r[impl gw.opcode.add-multiple.batch]
 // r[impl gw.opcode.add-multiple.unaligned-frames]
 // r[impl gw.opcode.add-multiple.dont-check-sigs-ignored]
@@ -496,7 +486,6 @@ mod tests {
     use super::parse_cam_str;
     use rio_nix::hash::HashAlgo;
 
-    /// parse_cam_str: text:sha256 → (is_text=true, is_recursive=false, SHA256)
     #[test]
     fn test_parse_cam_str_text_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("text:sha256").unwrap();
@@ -506,7 +495,6 @@ mod tests {
         Ok(())
     }
 
-    /// parse_cam_str: fixed:r:sha256 → (is_text=false, is_recursive=true, SHA256)
     #[test]
     fn test_parse_cam_str_fixed_recursive_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:r:sha256").unwrap();
@@ -516,8 +504,6 @@ mod tests {
         Ok(())
     }
 
-    /// parse_cam_str: fixed:git:sha1 → (is_text=false, is_recursive=true, SHA1)
-    /// git: prefix is treated as recursive (same as r:)
     #[test]
     fn test_parse_cam_str_fixed_git_sha1() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:git:sha1").unwrap();
@@ -527,7 +513,6 @@ mod tests {
         Ok(())
     }
 
-    /// parse_cam_str: fixed:sha256 (flat) → (is_text=false, is_recursive=false, SHA256)
     #[test]
     fn test_parse_cam_str_fixed_flat_sha256() -> anyhow::Result<()> {
         let (is_text, is_recursive, algo) = parse_cam_str("fixed:sha256").unwrap();
@@ -537,7 +522,6 @@ mod tests {
         Ok(())
     }
 
-    /// parse_cam_str: unknown method → Err
     #[test]
     fn test_parse_cam_str_rejects_unknown_method() {
         assert!(parse_cam_str("bogus:sha256").is_err());
@@ -545,7 +529,6 @@ mod tests {
         assert!(parse_cam_str("sha256").is_err()); // missing method prefix
     }
 
-    /// parse_cam_str: unknown hash algo → Err
     #[test]
     fn test_parse_cam_str_rejects_unknown_algo() {
         assert!(parse_cam_str("text:md5").is_err());

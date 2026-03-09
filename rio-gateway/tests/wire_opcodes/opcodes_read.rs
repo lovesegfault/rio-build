@@ -64,8 +64,8 @@ async fn test_ensure_path_exists() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Phase 2a: EnsurePath is a stub that always returns success regardless of
-/// whether the path exists. It reads the path argument and returns 1.
+/// EnsurePath stub: always returns success regardless of whether the path
+/// exists — reads the path argument and returns 1 (no substituter support).
 #[tokio::test]
 async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -75,7 +75,7 @@ async fn test_ensure_path_stub_always_succeeds() -> anyhow::Result<()> {
         string: TEST_PATH_MISSING,
     );
 
-    // Phase 2a stub: always STDERR_LAST + 1, even for missing paths.
+    // Stub behavior: always STDERR_LAST + 1, even for missing paths.
     drain_stderr_until_last(&mut h.stream).await?;
     let result = wire::read_u64(&mut h.stream).await?;
     assert_eq!(result, 1, "EnsurePath stub returns 1 unconditionally");
@@ -276,8 +276,8 @@ async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
 }
 
 // r[verify gw.opcode.mandatory-set]
-/// QueryRealisation: malformed id → empty set (soft-fail, same as the old
-/// stub). "abc" is 3 hex chars, not 64.
+/// QueryRealisation: malformed id → empty set (soft-fail).
+/// "abc" is 3 hex chars, not 64.
 #[tokio::test]
 async fn test_query_realisation_malformed_id_returns_empty() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -400,7 +400,10 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
         "missing Built .drv should be in willBuild"
     );
     assert!(will_build[0].contains(drv_path));
-    assert!(will_substitute.is_empty(), "Phase 2a: no substitutes");
+    assert!(
+        will_substitute.is_empty(),
+        "no substituter support → willSubstitute empty"
+    );
     assert!(unknown.is_empty());
     assert_eq!(download_size, 0);
     assert_eq!(nar_size, 0);
@@ -467,7 +470,7 @@ async fn test_query_derivation_output_map_found() -> anyhow::Result<()> {
 }
 
 // ===========================================================================
-// Additional coverage: K2/K3 from phase 2a review
+// Graceful-degradation coverage (invalid-path → non-error responses)
 // ===========================================================================
 //
 // Note on error-path behavior discovered during test development:

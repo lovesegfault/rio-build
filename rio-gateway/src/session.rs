@@ -36,7 +36,6 @@ where
 {
     let mut ctx = SessionContext::new(store_client.clone(), scheduler_client.clone());
 
-    // Step 1: Handshake
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {
         Ok(result) => {
@@ -79,14 +78,12 @@ where
         }
     }
 
-    // Step 2: Opcode loop
     loop {
         let opcode = match wire::read_u64(reader).await {
             Ok(op) => op,
             Err(wire::WireError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!("client disconnected (EOF)");
 
-                // On disconnect, cancel all active builds
                 for build_id in ctx.active_build_ids.keys() {
                     debug!(build_id = %build_id, "cancelling build on disconnect");
                     let req = types::CancelBuildRequest {

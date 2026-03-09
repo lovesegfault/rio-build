@@ -49,7 +49,6 @@ pub async fn reconstruct_dag(
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(StorePath, Derivation)> = VecDeque::new();
 
-    // Start with the root
     visited.insert(root_path.to_string());
     queue.push_back((root_path.clone(), root_drv.clone()));
 
@@ -63,11 +62,9 @@ pub async fn reconstruct_dag(
             ));
         }
 
-        // Create a DerivationNode for this derivation
         let node = derivation_to_node(&drv_path, &drv);
         nodes.push(node);
 
-        // Walk inputDrvs to create edges and discover children
         for child_path_str in drv.input_drvs().keys() {
             // Create edge: parent depends on child
             edges.push(types::DerivationEdge {
@@ -544,7 +541,7 @@ pub fn build_submit_request(
     };
 
     types::SubmitBuildRequest {
-        tenant_id: String::new(), // Populated from SSH key in production
+        tenant_id: String::new(), // TODO(phase4): derive from SSH key identity
         priority_class: priority_class.to_string(),
         nodes,
         edges,
@@ -636,7 +633,7 @@ mod tests {
     // needs a Derivation in drv_cache with __noChroot=1 in env,
     // and constructing a full Derivation (not BasicDerivation)
     // requires ATerm parsing or a complex builder. Coverage comes
-    // from vm-phase3b's G1 section (submit a real .drv with
+    // from the vm-phase3b integration test (submit a real .drv with
     // __noChroot, assert STDERR_ERROR "sandbox escape").
 
     #[test]
@@ -680,7 +677,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // T7: reconstruct_dag unit tests (8.7)
+    // reconstruct_dag unit tests
     // -------------------------------------------------------------------
     //
     // reconstruct_dag calls resolve_derivation which checks drv_cache FIRST
@@ -704,8 +701,8 @@ mod tests {
         make_test_derivation_with_srcs(out_path, input_drvs, &[])
     }
 
-    /// Same as make_test_derivation but with explicit inputSrcs.
-    /// For J1 tests that need input_srcs populated.
+    /// Same as make_test_derivation but with explicit inputSrcs
+    /// (for populate_input_srcs_sizes tests).
     fn make_test_derivation_with_srcs(
         out_path: &str,
         input_drvs: &[(&str, &[&str])],
@@ -785,8 +782,8 @@ mod tests {
     #[tokio::test]
     async fn test_reconstruct_dag_unresolvable_inputdrv_fails() {
         // inputDrv not in cache AND store unreachable -> hard failure.
-        // Previously this produced a stub leaf with system:"" that never
-        // matched any worker, causing a silent hang. Now it fails immediately.
+        // Regression: unresolvable inputDrv must fail, not produce a
+        // stub leaf that silently hangs.
         let root_path = sp(&test_drv_path("root"));
         let missing_child = "/nix/store/cccccccccccccccccccccccccccccccc-missing.drv";
 
@@ -989,7 +986,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // J1: populate_input_srcs_sizes
+    // populate_input_srcs_sizes
     // -------------------------------------------------------------------
 
     /// Two input_srcs seeded in store → node gets their sum.

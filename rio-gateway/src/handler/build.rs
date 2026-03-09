@@ -67,8 +67,9 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
         // the scheduler accepted the RPC, not that the stream is
         // healthy). Without this, a scheduler that accepts but
         // immediately drops the stream would cause an infinite
-        // 1s-sleep loop: 0→1→Ok()→reset→0→1→... Matches controller
-        // build.rs:599 pattern (reset on Ok(Some(ev))).
+        // 1s-sleep loop: 0→1→Ok()→reset→0→1→... Matches the
+        // controller's reconnect pattern (reset on Ok(Some(ev)),
+        // not on stream-open Ok()).
         *reconnect_attempts = 0;
 
         // Update active_build_ids with latest sequence
@@ -204,10 +205,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     .await?
     .into_inner();
 
-    // Extract build_id from first event if available
-    // (the first event should be BuildStarted)
-    // We'll track the build_id as we process events
-
     // Peek at first message to get build_id
     let first = event_stream
         .message()
@@ -221,7 +218,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
     active_build_ids.insert(build_id.clone(), 0);
 
-    // Process the first event
     if let Some(ev) = &first {
         if let Some(types::build_event::Event::Started(ref started)) = ev.event {
             debug!(
@@ -232,7 +228,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
             );
         }
         if let Some(types::build_event::Event::Completed(_)) = ev.event {
-            // Remove from active builds
             active_build_ids.remove(&build_id);
             return Ok(BuildResult::success());
         }
@@ -243,11 +238,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 failed.error_message.clone(),
             ));
         }
-        // Round 4 Z22: Cancelled as first event (was missing; only
-        // handled in the loop at :150). Can happen if a WatchBuild
-        // reconnect arrives after the build was already cancelled —
-        // the scheduler replays from build_event_log and Cancelled
-        // is the first (and only) event past since_sequence.
+        // Handle Cancelled as first event (the loop body handles it,
+        // but the first-event peek above did not). Can happen if a
+        // WatchBuild reconnect arrives after the build was already
+        // cancelled — the scheduler replays from build_event_log and
+        // Cancelled is the first (and only) event past since_sequence.
         if let Some(types::build_event::Event::Cancelled(ref cancelled)) = ev.event {
             active_build_ids.remove(&build_id);
             return Ok(BuildResult::failure(
@@ -366,7 +361,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         }
     };
 
-    // Remove from active builds
     active_build_ids.remove(&build_id);
 
     match outcome {
@@ -429,14 +423,12 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         "wopBuildDerivation"
     );
 
-    // IFD detection: if we haven't seen wopBuildPathsWithResults on this session,
-    // this is likely an IFD or build-hook request
     let is_ifd_hint = !*has_seen_build_paths_with_results;
 
-    // Round 4 Z23: check __noChroot on the BasicDerivation DIRECTLY.
-    // validate_dag (called below) checks drv_cache entries, but if the
-    // full drv isn't available (falls back to single_node_from_basic),
-    // the drv is never in the cache → __noChroot check is skipped. The
+    // Check __noChroot on the BasicDerivation DIRECTLY. validate_dag
+    // (called below) checks drv_cache entries, but if the full drv
+    // isn't available (falls back to single_node_from_basic), the drv
+    // is never in the cache → __noChroot check is skipped. The
     // BasicDerivation wire format DOES include env; we have it here.
     //
     // A malicious client could send __noChroot=1 via wopBuildDerivation
@@ -462,10 +454,8 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         Err(e) => stderr_err!(stderr, "invalid drv path '{drv_path_str}': {e}"),
     };
 
-    // Try to get the full derivation with inputDrvs
     let full_drv = resolve_derivation(&drv_path, store_client, drv_cache).await;
 
-    // Reconstruct the DAG
     let (nodes, edges) = match &full_drv {
         Ok(drv) => {
             match translate::reconstruct_dag(&drv_path, drv, store_client, drv_cache).await {
@@ -609,15 +599,14 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         return Ok(());
     }
 
-    // Deduplicate nodes by drv_path
     let mut seen: HashSet<String> = HashSet::new();
     all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
-    // Round 4 D4: also dedup EDGES. Multi-root builds with shared
-    // deps (e.g., both root1 and root2 depend on glibc) produce
-    // duplicate edges when each root's BFS walks the shared subgraph.
-    // Scheduler's MergeDag likely tolerates dups (DAG merge is
-    // idempotent) but sending 2× the edges wastes bytes and PG
+    // Also dedup EDGES (nodes were deduped above). Multi-root builds
+    // with shared deps (e.g., both root1 and root2 depend on glibc)
+    // produce duplicate edges when each root's BFS walks the shared
+    // subgraph. Scheduler's MergeDag likely tolerates dups (DAG merge
+    // is idempotent) but sending 2× the edges wastes bytes and PG
     // writes (derivation_edges has PRIMARY KEY (parent,child) so
     // dups are ON CONFLICT DO NOTHING — but that's still an RTT).
     let mut seen_edges: HashSet<(String, String)> = HashSet::new();
@@ -758,11 +747,10 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        // Deduplicate nodes
         let mut seen: HashSet<String> = HashSet::new();
         all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
-        // Round 4 D4: also dedup edges (see comment at :614).
+        // Also dedup edges (same rationale as handle_build_paths above).
         let mut seen_edges: HashSet<(String, String)> = HashSet::new();
         all_edges
             .retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
@@ -838,7 +826,6 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             }
         }
     } else {
-        // All paths were opaque
         for idx in 0..raw_paths.len() {
             results.push(opaque_results.remove(&idx).unwrap_or_else(|| {
                 BuildResult::failure(BuildStatus::MiscFailure, "unknown path".to_string())

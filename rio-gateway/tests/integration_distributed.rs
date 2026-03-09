@@ -176,15 +176,15 @@ async fn test_distributed_handshake_wire_sequence() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// T2: CancelBuild sent on SSH disconnect (8.2)
+// CancelBuild sent on SSH disconnect
 // ---------------------------------------------------------------------------
 
 /// Verify that when a client disconnects (EOF) while active_build_ids is
 /// non-empty, the gateway calls CancelBuild on the scheduler.
 ///
-/// The realistic flow in Phase 2a: gateway processes opcodes serially, so
-/// active_build_ids is only populated DURING submit_and_process_build. That
-/// function removes the build_id unconditionally on return (handler.rs:623).
+/// The gateway processes opcodes serially, so active_build_ids is only
+/// populated DURING submit_and_process_build. That function removes the
+/// build_id unconditionally on return (see submit_and_process_build).
 /// So CancelBuild-on-disconnect fires only if the client disconnects while
 /// a build is in-flight AND the event stream closes without a terminal event.
 ///
@@ -205,7 +205,6 @@ async fn test_disconnect_without_active_build_no_cancel() -> anyhow::Result<()> 
         let s = &mut sess.stream;
         do_handshake(s).await?;
         send_set_options(s).await?;
-        // Disconnect immediately — no build submitted.
     }
     // Replace stream with a fresh (unconnected) one to drop the client side
     // and trigger EOF on the server. Then wait for server to finish.
