@@ -307,3 +307,91 @@ pub async fn find_missing_chunks(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<Ve
         .map(|h| !present_set.contains(h.as_slice()))
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::TestDb;
+
+    /// X7 regression (proves the PG constraint): duplicate hashes
+    /// in the UNNEST batch → PG error "ON CONFLICT DO UPDATE
+    /// command cannot affect row a second time". cas.rs put_chunked
+    /// now DEDUPS before calling this. This test documents the PG
+    /// behavior that motivates the dedup.
+    #[tokio::test]
+    async fn upgrade_duplicate_hashes_pg_rejects() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Seed placeholder (upgrade requires an existing 'uploading'
+        // manifest row).
+        let store_path_hash = vec![0xAAu8; 32];
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dup-chunks";
+        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path)
+            .await
+            .unwrap();
+
+        // Duplicate hashes: same BLAKE3 twice. FastCDC can produce
+        // this for identical content blocks (e.g., zero-filled pages).
+        let dup_hash = vec![0xBBu8; 32];
+        let chunk_hashes = vec![dup_hash.clone(), dup_hash.clone()];
+        let chunk_sizes = vec![1024i64, 1024i64];
+
+        let result = upgrade_manifest_to_chunked(
+            &db.pool,
+            &store_path_hash,
+            b"dummy-chunk-list",
+            &chunk_hashes,
+            &chunk_sizes,
+        )
+        .await;
+
+        // PG rejects with SQLSTATE 21000 (cardinality violation).
+        // This documents WHY cas.rs must dedup before calling us.
+        assert!(
+            result.is_err(),
+            "duplicate hashes in UNNEST batch MUST be rejected by PG"
+        );
+        let err = result.unwrap_err();
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains("affect row a second time") || err_str.contains("21000"),
+            "expected PG cardinality violation, got: {err_str}"
+        );
+    }
+
+    /// Complement: DEDUPED hashes → upgrade succeeds. Proves the
+    /// cas.rs dedup is correct.
+    #[tokio::test]
+    async fn upgrade_deduped_hashes_ok() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let store_path_hash = vec![0xCCu8; 32];
+        let path = "/nix/store/cccccccccccccccccccccccccccccccc-deduped";
+        crate::metadata::insert_manifest_uploading(&db.pool, &store_path_hash, path)
+            .await
+            .unwrap();
+
+        // One unique hash (cas.rs's dedup would produce this from
+        // the duplicate input above).
+        let chunk_hashes = vec![vec![0xDDu8; 32]];
+        let chunk_sizes = vec![1024i64];
+
+        upgrade_manifest_to_chunked(
+            &db.pool,
+            &store_path_hash,
+            b"dummy-chunk-list",
+            &chunk_hashes,
+            &chunk_sizes,
+        )
+        .await
+        .expect("deduped hashes should succeed");
+
+        // refcount = 1 (one unique hash).
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk_hashes[0])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 1, "deduped insert → refcount = 1");
+    }
+}

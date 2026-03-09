@@ -116,8 +116,30 @@ pub async fn put_chunked(
             .collect(),
     };
     let chunk_list_bytes = manifest.serialize();
-    let chunk_hashes: Vec<Vec<u8>> = chunks.iter().map(|c| c.hash.to_vec()).collect();
-    let chunk_sizes: Vec<i64> = chunks.iter().map(|c| c.data.len() as i64).collect();
+    // Dedup chunk_hashes/sizes for the UNNEST upsert (X7 fix).
+    // FastCDC CAN produce duplicate chunks (identical 16KB+ runs,
+    // e.g., zero-filled pages). The `INSERT ... SELECT FROM UNNEST
+    // ... ON CONFLICT DO UPDATE` with duplicate PKs in the SAME
+    // batch → PG error "ON CONFLICT DO UPDATE command cannot
+    // affect row a second time" (SQLSTATE 21000).
+    //
+    // Deduping here also fixes refcount semantics: 1 ref per
+    // UNIQUE chunk per manifest, matching decrement_and_enqueue's
+    // HashSet dedup (gc/mod.rs:106). The manifest serialization
+    // above still has dups (chunk_list_bytes) — reassembly needs
+    // the full in-order chunk list. Only the refcount arrays dedup.
+    //
+    // `chunks` vec (for S3 upload) stays undeduped — S3 PutObject
+    // is idempotent (same bytes → same result), and do_upload's
+    // need_upload HashSet (line ~241) already implicitly dedups.
+    let (chunk_hashes, chunk_sizes): (Vec<Vec<u8>>, Vec<i64>) = {
+        let mut seen = std::collections::HashSet::<[u8; 32]>::new();
+        chunks
+            .iter()
+            .filter(|c| seen.insert(c.hash))
+            .map(|c| (c.hash.to_vec(), c.data.len() as i64))
+            .unzip()
+    };
 
     // --- Step 2: Upgrade write-ahead ---
     // Caller owns the 'uploading' placeholder from step 3. We add
