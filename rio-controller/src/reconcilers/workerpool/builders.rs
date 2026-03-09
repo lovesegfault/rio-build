@@ -375,6 +375,21 @@ fn build_pod_spec(
                 }),
                 ..Default::default()
             });
+            // Coverage propagation: see the LLVM_PROFILE_FILE env
+            // push in build_container below. DirectoryOrCreate lets
+            // K8s make the dir with 0755 root — the common.nix
+            // tmpfiles rule also creates it, whichever runs first
+            // wins (both are 0755 root, idempotent).
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                v.push(Volume {
+                    name: "cov".into(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/var/lib/rio/cov".into(),
+                        type_: Some("DirectoryOrCreate".into()),
+                    }),
+                    ..Default::default()
+                });
+            }
             v
         }),
 
@@ -486,6 +501,20 @@ fn build_container(
             if let Some(url) = &wp.spec.fod_proxy_url {
                 e.push(env("RIO_FOD_PROXY_URL", url));
             }
+            // Coverage propagation (test-only): if the controller
+            // is running under -Cinstrument-coverage (VM test
+            // coverage mode sets LLVM_PROFILE_FILE in
+            // controllerEnv), inject the same template into the
+            // pod. Prod controllers don't set this env var, so
+            // prod pods are unaffected. The hostPath volume below
+            // surfaces profraws to the k8s node's
+            // /var/lib/rio/cov for collectCoverage.
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                e.push(env(
+                    "LLVM_PROFILE_FILE",
+                    "/var/lib/rio/cov/rio-%p-%m.profraw",
+                ));
+            }
             e
         }),
 
@@ -535,6 +564,14 @@ fn build_container(
                 read_only: Some(true),
                 ..Default::default()
             });
+            // Coverage: mount the hostPath. See the env push above.
+            if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+                m.push(VolumeMount {
+                    name: "cov".into(),
+                    mount_path: "/var/lib/rio/cov".into(),
+                    ..Default::default()
+                });
+            }
             m
         }),
 

@@ -4577,6 +4577,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dashmap",
+ "figment",
  "futures-util",
  "http 1.4.0",
  "http-body-util",

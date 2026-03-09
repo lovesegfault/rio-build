@@ -67,3 +67,5 @@ tower-test = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# figment::Jail for serialized env-var tests (coverage propagation test).
+figment = { workspace = true, features = ["test"] }

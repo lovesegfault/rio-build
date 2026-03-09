@@ -768,3 +768,95 @@ async fn cleanup_polls_until_replicas_zero() {
         .unwrap()
         .unwrap();
 }
+
+// -------------------------------------------------------------------
+// Coverage propagation (builders.rs LLVM_PROFILE_FILE check).
+//
+// figment::Jail serializes env access (global mutex) so parallel
+// tests don't see each other's set_env/remove_var. Same pattern
+// as rio-scheduler/src/lease.rs tests.
+// -------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::result_large_err)] // figment::Error is large, API-fixed
+fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("LLVM_PROFILE_FILE", "/var/lib/rio/cov/ctrl-%p-%m.profraw");
+
+        let wp = test_wp();
+        let sts = test_sts(&wp);
+        let spec = sts.spec.unwrap().template.spec.unwrap();
+        let container = &spec.containers[0];
+
+        // Env var injected with the canonical pod-side template (NOT
+        // the controller's own — the pod writes to the same mount
+        // path, but %p/%m expand inside the pod).
+        let envs = container.env.as_ref().expect("env vars");
+        let profile_env = envs
+            .iter()
+            .find(|e| e.name == "LLVM_PROFILE_FILE")
+            .expect("LLVM_PROFILE_FILE env injected");
+        assert_eq!(
+            profile_env.value.as_deref(),
+            Some("/var/lib/rio/cov/rio-%p-%m.profraw")
+        );
+
+        // Volume: hostPath to /var/lib/rio/cov on the k8s node.
+        let volumes = spec.volumes.as_ref().expect("volumes");
+        let cov_vol = volumes
+            .iter()
+            .find(|v| v.name == "cov")
+            .expect("cov volume");
+        let hp = cov_vol.host_path.as_ref().expect("hostPath");
+        assert_eq!(hp.path, "/var/lib/rio/cov");
+        assert_eq!(hp.type_.as_deref(), Some("DirectoryOrCreate"));
+
+        // Mount at the same path inside the container.
+        let mounts = container.volume_mounts.as_ref().expect("mounts");
+        let cov_mount = mounts.iter().find(|m| m.name == "cov").expect("cov mount");
+        assert_eq!(cov_mount.mount_path, "/var/lib/rio/cov");
+
+        Ok(())
+    });
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::result_large_err)]
+fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
+    figment::Jail::expect_with(|_jail| {
+        // SAFETY: Jail serializes env access via a global mutex — no
+        // other thread touches LLVM_PROFILE_FILE while we're here.
+        // std::env::remove_var is unsafe in Rust 2024 for the general
+        // "env is process-global" race reason; Jail's lock is the
+        // synchronization that makes it safe here.
+        unsafe {
+            std::env::remove_var("LLVM_PROFILE_FILE");
+        }
+
+        let wp = test_wp();
+        let sts = test_sts(&wp);
+        let spec = sts.spec.unwrap().template.spec.unwrap();
+        let container = &spec.containers[0];
+
+        // NO env var, volume, or mount — prod pods are clean.
+        let envs = container.env.as_ref().expect("env vars");
+        assert!(
+            !envs.iter().any(|e| e.name == "LLVM_PROFILE_FILE"),
+            "coverage env should be absent in normal mode"
+        );
+        let volumes = spec.volumes.as_ref().expect("volumes");
+        assert!(
+            !volumes.iter().any(|v| v.name == "cov"),
+            "cov volume should be absent"
+        );
+        let mounts = container.volume_mounts.as_ref().expect("mounts");
+        assert!(
+            !mounts.iter().any(|m| m.name == "cov"),
+            "cov mount should be absent"
+        );
+
+        Ok(())
+    });
+    Ok(())
+}
