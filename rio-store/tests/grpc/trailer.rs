@@ -284,3 +284,130 @@ async fn test_trailer_chunk_after_trailer_rejected() -> TestResult {
 
     Ok(())
 }
+
+/// Two trailer messages in the stream → reject. The server's state
+/// machine should reject the second trailer as a protocol violation.
+#[tokio::test]
+async fn test_trailer_duplicate_trailer_rejected() -> TestResult {
+    let mut s = StoreSession::new().await?;
+    let (nar, info) = trailer_fixture("dup-trailer");
+    let mut raw: PathInfo = info.clone().into();
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut raw.nar_hash),
+        nar_size: std::mem::take(&mut raw.nar_size),
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(raw),
+        })),
+    })
+    .await
+    .expect("fresh channel");
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .expect("fresh channel");
+    // First trailer.
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer.clone())),
+    })
+    .await
+    .expect("fresh channel");
+    // VIOLATION: second trailer.
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
+
+    let status = s
+        .client
+        .put_path(ReceiverStream::new(rx))
+        .await
+        .expect_err("duplicate trailer → reject");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+/// Trailer with nar_size > MAX_NAR_SIZE → reject. The bound check
+/// should fire before any chunk hashing/verification.
+#[tokio::test]
+async fn test_trailer_oversized_nar_size_rejected() -> TestResult {
+    let mut s = StoreSession::new().await?;
+    let (nar, info) = trailer_fixture("oversized-trailer");
+    let mut raw: PathInfo = info.into();
+    raw.nar_hash.clear();
+    raw.nar_size = 0;
+
+    let status = put_path_trailer_mode(
+        &mut s.client,
+        raw,
+        nar,
+        PutPathTrailer {
+            nar_hash: vec![0xAA; 32],
+            // 4 GiB + 1 — bigger than MAX_NAR_SIZE.
+            nar_size: rio_common::limits::MAX_NAR_SIZE + 1,
+        },
+    )
+    .await
+    .expect_err("oversized nar_size → reject");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+/// Stream starts with NarChunk (not Metadata) → reject. Metadata
+/// must be first for the server to know what path is being uploaded.
+#[tokio::test]
+async fn test_first_message_chunk_rejected() -> TestResult {
+    let mut s = StoreSession::new().await?;
+
+    let (tx, rx) = mpsc::channel(4);
+    // Violation: chunk first, no metadata.
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(b"no metadata".to_vec())),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
+
+    let status = s
+        .client
+        .put_path(ReceiverStream::new(rx))
+        .await
+        .expect_err("chunk-first → reject");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+/// Stream starts with Trailer (not Metadata) → reject.
+#[tokio::test]
+async fn test_first_message_trailer_rejected() -> TestResult {
+    let mut s = StoreSession::new().await?;
+
+    let (tx, rx) = mpsc::channel(4);
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(PutPathTrailer {
+            nar_hash: vec![0xAA; 32],
+            nar_size: 100,
+        })),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
+
+    let status = s
+        .client
+        .put_path(ReceiverStream::new(rx))
+        .await
+        .expect_err("trailer-first → reject");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}

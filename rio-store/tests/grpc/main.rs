@@ -66,6 +66,17 @@ impl StoreSession {
         Ok(Self { db, client, server })
     }
 
+    /// Store with HMAC verifier enabled. PutPath requires a valid
+    /// `x-rio-assignment-token` header unless peer is mTLS-identified
+    /// as rio-gateway. For testing the assignment-token enforcement.
+    pub async fn new_with_hmac(key: Vec<u8>) -> anyhow::Result<Self> {
+        let db = TestDb::new(&MIGRATOR).await;
+        let verifier = rio_common::hmac::HmacVerifier::from_key(key);
+        let service = StoreServiceImpl::new(db.pool.clone()).with_hmac_verifier(verifier);
+        let (client, server) = spawn_store_server(service).await?;
+        Ok(Self { db, client, server })
+    }
+
     /// Store WITH chunk backend. NARs ≥ 256 KiB are FastCDC-chunked.
     /// Returns the `MemoryChunkBackend` so tests can inspect chunk counts.
     pub async fn new_chunked() -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
@@ -164,6 +175,49 @@ pub async fn put_path_raw(
     Ok(response.into_inner().created)
 }
 
+/// Like [`put_path`] but sets the `x-rio-assignment-token` metadata
+/// header. For HMAC enforcement tests — `put_path_raw` passes the
+/// stream directly (no `Request::new()` exposed to attach headers).
+pub async fn put_path_with_token(
+    client: &mut StoreServiceClient<Channel>,
+    info: ValidatedPathInfo,
+    nar: Vec<u8>,
+    token: &str,
+) -> Result<bool, tonic::Status> {
+    let mut info: PathInfo = info.into();
+    let (tx, rx) = mpsc::channel(8);
+    let trailer = PutPathTrailer {
+        nar_hash: std::mem::take(&mut info.nar_hash),
+        nar_size: std::mem::take(&mut info.nar_size),
+    };
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Metadata(PutPathMetadata {
+            info: Some(info),
+        })),
+    })
+    .await
+    .expect("fresh channel");
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::NarChunk(nar)),
+    })
+    .await
+    .expect("fresh channel");
+    tx.send(PutPathRequest {
+        msg: Some(put_path_request::Msg::Trailer(trailer)),
+    })
+    .await
+    .expect("fresh channel");
+    drop(tx);
+
+    let mut req = tonic::Request::new(ReceiverStream::new(rx));
+    req.metadata_mut().insert(
+        "x-rio-assignment-token",
+        token.parse().expect("token must be valid header value"),
+    );
+    let response = client.put_path(req).await?;
+    Ok(response.into_inner().created)
+}
+
 /// Build a NAR of roughly `payload_size` bytes. Content is pseudo-random
 /// enough for FastCDC to find boundaries but deterministic for
 /// reproducible tests.
@@ -194,6 +248,7 @@ mod chunk_service;
 mod chunked;
 mod core;
 mod hash_part;
+mod hmac;
 mod realisations;
 mod reassembly;
 mod signing;

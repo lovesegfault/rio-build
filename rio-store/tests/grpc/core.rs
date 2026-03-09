@@ -483,6 +483,37 @@ async fn test_put_path_rejects_excessive_references() -> TestResult {
     Ok(())
 }
 
+/// Mirror of excessive_references but for signatures (MAX_SIGNATURES=100).
+#[tokio::test]
+async fn test_put_path_rejects_excessive_signatures() -> TestResult {
+    let mut s = StoreSession::new().await?;
+
+    let nar = make_nar(b"sigs-test").0;
+    let base: PathInfo = make_path_info_for_nar(
+        "/nix/store/88888888888888888888888888888888-too-many-sigs",
+        &nar,
+    )
+    .into();
+    let info = PathInfo {
+        signatures: (0..rio_common::limits::MAX_SIGNATURES + 1)
+            .map(|i| format!("cache-{i}:sig{i}"))
+            .collect(),
+        ..base
+    };
+
+    let status = put_path_raw(&mut s.client, info, nar)
+        .await
+        .expect_err("excessive signatures → reject");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("signatures"),
+        "msg: {}",
+        status.message()
+    );
+
+    Ok(())
+}
+
 /// PutPath with a malformed reference path should be rejected.
 #[tokio::test]
 async fn test_put_path_rejects_malformed_reference() -> TestResult {
