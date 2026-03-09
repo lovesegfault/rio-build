@@ -307,6 +307,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     Ok(resp) => {
                         tracing::info!(%build_id, since_seq, "reconnected via WatchBuild");
                         event_stream = resp.into_inner();
+                        // Reset: successful reconnect = fresh attempt
+                        // budget. Otherwise a long-running build
+                        // surviving 4 transient blips fails
+                        // permanently on the 5th.
+                        reconnect_attempts = 0;
                         // Loop continues: next process_build_events
                         // reads from the new stream.
                     }
