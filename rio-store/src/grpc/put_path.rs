@@ -81,7 +81,7 @@ impl StoreServiceImpl {
         // for CN=rio-gateway. Previously: ANY peer cert + no token
         // → bypass. That defeated the entire HMAC threat model: a
         // compromised worker omits the token → uploads arbitrary
-        // paths → backdoored libc injection. (X1 fix)
+        // paths → backdoored libc injection.
         let peer_cn = request
             .peer_certs()
             .and_then(|certs| certs.first().and_then(|c| cert_cn(c.as_ref())));
@@ -116,7 +116,7 @@ impl StoreServiceImpl {
                     Some(other_cn) => {
                         // mTLS client with NON-gateway CN (worker,
                         // controller) and no token → REJECT. This is
-                        // the X1 threat model: compromised worker
+                        // the threat model: compromised worker
                         // skipping its token to upload arbitrary paths.
                         warn!(cn = %other_cn,
                               "PutPath: mTLS client with non-gateway CN and no token, rejecting");
@@ -148,10 +148,10 @@ impl StoreServiceImpl {
     ) -> Result<Response<PutPathResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let start = std::time::Instant::now();
-        // Round 4 Z20: record duration on ANY exit (success, error,
-        // early return). Prior code only recorded on the success path
-        // → p99 latency metrics were artificially good (failures not
-        // counted). scopeguard records unconditionally on Drop.
+        // Record duration on ANY exit (success, error, early return)
+        // via scopeguard on Drop. Recording only on the success path
+        // would make p99 latency metrics artificially good (failures
+        // not counted).
         let _duration_guard = scopeguard::guard((), move |()| {
             metrics::histogram!("rio_store_put_path_duration_seconds")
                 .record(start.elapsed().as_secs_f64());
@@ -282,7 +282,7 @@ impl StoreServiceImpl {
             }
         }
 
-        // Step 3a: Take GC_MARK_LOCK_ID SHARED. Round 4 Z2 hybrid.
+        // Step 3a: Take GC_MARK_LOCK_ID SHARED (mark-vs-PutPath protection).
         // Held from placeholder insert → complete_manifest (or abort).
         // Mark takes this EXCLUSIVE around compute_unreachable, so
         // mark sees a consistent reference graph: no PutPath can be
@@ -571,7 +571,7 @@ impl StoreServiceImpl {
         drop(mark_lock_conn);
 
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
-        // Duration recorded by _duration_guard on Drop (Round 4 Z20).
+        // Duration recorded by _duration_guard on Drop.
         Ok(Response::new(PutPathResponse { created: true }))
     }
 }
@@ -580,7 +580,7 @@ impl StoreServiceImpl {
 mod tests {
     use super::*;
 
-    /// X1 CN parsing: verify cert_cn extracts the CN correctly.
+    /// CN parsing: verify cert_cn extracts the CN correctly.
     /// Uses rcgen to build an in-memory cert (test-only dep).
     fn make_cert_with_cn(cn: &str) -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
@@ -604,7 +604,7 @@ mod tests {
     fn cert_cn_parses_worker() {
         let der = make_cert_with_cn("rio-worker");
         // CN=rio-worker → returned as-is. verify_assignment_token
-        // will reject this in the None-token path (X1 fix).
+        // will reject this in the None-token path (non-gateway CN with no token → PERMISSION_DENIED).
         assert_eq!(cert_cn(&der), Some("rio-worker".into()));
     }
 

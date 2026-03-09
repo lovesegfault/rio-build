@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use tracing::{debug, instrument};
 
 // ---------------------------------------------------------------------------
-// Chunked manifest ops (phase2c C3)
+// Chunked manifest ops
 // ---------------------------------------------------------------------------
 
 /// Upgrade an existing 'uploading' manifest to chunked: write manifest_data
@@ -313,11 +313,10 @@ mod tests {
     use super::*;
     use rio_test_support::TestDb;
 
-    /// X7 regression (proves the PG constraint): duplicate hashes
-    /// in the UNNEST batch → PG error "ON CONFLICT DO UPDATE
-    /// command cannot affect row a second time". cas.rs put_chunked
-    /// now DEDUPS before calling this. This test documents the PG
-    /// behavior that motivates the dedup.
+    /// PG constraint: duplicate hashes in the UNNEST batch → PG error
+    /// "ON CONFLICT DO UPDATE command cannot affect row a second time".
+    /// cas.rs put_chunked dedups before calling this. This test documents
+    /// the PG behavior that motivates the dedup.
     #[tokio::test]
     async fn upgrade_duplicate_hashes_pg_rejects() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -359,8 +358,7 @@ mod tests {
         );
     }
 
-    /// Complement: DEDUPED hashes → upgrade succeeds. Proves the
-    /// cas.rs dedup is correct.
+    /// Deduped hashes → upgrade succeeds. Proves the cas.rs dedup is correct.
     #[tokio::test]
     async fn upgrade_deduped_hashes_ok() {
         let db = TestDb::new(&crate::MIGRATOR).await;

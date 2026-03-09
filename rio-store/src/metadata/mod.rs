@@ -157,10 +157,6 @@ pub enum ManifestKind {
     Inline(Bytes),
     /// NAR chunked; reassemble from this ordered list.
     /// Each entry is `(blake3_digest, chunk_size_bytes)`.
-    ///
-    /// E1 returns an empty Vec here (chunking lands in C3) — this is
-    /// future-proofing the return type so GetPath doesn't need a second
-    /// rewrite when chunking lands.
     Chunked(Vec<([u8; 32], u32)>),
 }
 
@@ -214,7 +210,6 @@ impl NarinfoRow {
             nar_hash: self.nar_hash,
             nar_size: self.nar_size as u64,
             references: self.references,
-            // Now actually roundtrip (was 0/false before phase2c).
             // `as u64` cast: registration_time is Unix epoch seconds,
             // non-negative in practice. A negative value in the DB would
             // be corruption; the cast wraps, which is detectable downstream.
@@ -432,7 +427,6 @@ mod tests {
         ];
         for (err, expected_code) in cases {
             // MetadataError isn't Clone; reconstruct for the call.
-            // (We move out of the match-tuple via shadowing.)
             let code = metadata_status("test", clone_for_test(err)).code();
             assert_eq!(
                 code, *expected_code,

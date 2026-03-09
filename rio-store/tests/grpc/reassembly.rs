@@ -3,7 +3,7 @@
 use super::*;
 
 // ===========================================================================
-// Chunked GetPath reassembly (phase2c C5)
+// Chunked GetPath reassembly
 // ===========================================================================
 
 /// THE roundtrip test: chunked PutPath → GetPath reassembles the exact

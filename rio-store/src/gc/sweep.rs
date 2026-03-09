@@ -77,7 +77,7 @@ pub async fn sweep(
             .await?
             .flatten();
 
-            // Step 1b: Z2 reference re-check. Mark held GC_MARK_LOCK_ID
+            // Step 1b: reference re-check. Mark held GC_MARK_LOCK_ID
             // exclusive, but we RELEASED it before sweep (to avoid
             // blocking PutPath during the longer sweep phase). A PutPath
             // that completed BETWEEN mark and now may have written
@@ -202,10 +202,10 @@ mod tests {
         hash
     }
 
-    /// X8 regression: sweep must DELETE realisations rows pointing
-    /// to swept paths. realisations has NO FK to narinfo (002_store.
-    /// sql:134); without the explicit DELETE, dangling rows →
-    /// wopQueryRealisation returns a path that 404s on fetch.
+    /// Sweep must DELETE realisations rows pointing to swept paths.
+    /// realisations has NO FK to narinfo (002_store.sql:134); without
+    /// the explicit DELETE, dangling rows → wopQueryRealisation returns
+    /// a path that 404s on fetch.
     #[tokio::test]
     async fn sweep_deletes_realisations() {
         let db = TestDb::new(&crate::MIGRATOR).await;
@@ -237,14 +237,14 @@ mod tests {
             .unwrap();
         assert_eq!(narinfo_count, 0);
 
-        // X8 FIX: realisation ALSO gone (explicit DELETE, not CASCADE).
+        // Realisation ALSO gone (explicit DELETE, not CASCADE).
         let realisations_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM realisations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(
             realisations_count, 0,
-            "sweep should delete realisations pointing to swept path (X8 fix)"
+            "sweep should delete realisations pointing to swept path (no FK CASCADE)"
         );
     }
 
@@ -269,9 +269,9 @@ mod tests {
         assert_eq!(count, 1, "dry-run should roll back");
     }
 
-    /// Z2 hybrid: sweep's per-path reference re-check catches paths
-    /// that gained a new referrer AFTER mark. This simulates the race:
-    /// mark declared P unreachable, a PutPath for Q completes with
+    /// Sweep's per-path reference re-check catches paths that gained
+    /// a new referrer AFTER mark. This simulates the race: mark
+    /// declared P unreachable, a PutPath for Q completes with
     /// references=[P], sweep runs and must skip P.
     #[tokio::test]
     async fn sweep_resurrected_path_skipped() {
@@ -301,7 +301,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Sweep with P in the unreachable list. Z2 re-check should
+        // Sweep with P in the unreachable list. The reference re-check should
         // find Q.references=[P] → skip P → paths_resurrected=1.
         let stats = sweep(&db.pool, None, vec![p_hash.clone()], false)
             .await
@@ -312,7 +312,7 @@ mod tests {
         );
         assert_eq!(
             stats.paths_resurrected, 1,
-            "P should be counted as resurrected (Z2 re-check)"
+            "P should be counted as resurrected (reference re-check)"
         );
 
         // P still exists in narinfo.
@@ -325,8 +325,7 @@ mod tests {
         assert!(p_exists, "P should still exist (resurrected, not swept)");
     }
 
-    /// Z2 sanity: if nobody references the path, sweep proceeds
-    /// normally (no false-positive resurrection).
+    /// If nobody references the path, sweep proceeds normally (no false-positive resurrection).
     #[tokio::test]
     async fn sweep_unreferenced_path_deleted() {
         let db = TestDb::new(&crate::MIGRATOR).await;

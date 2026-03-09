@@ -1,4 +1,4 @@
-//! ChunkService gRPC implementation (phase2c C6).
+//! ChunkService gRPC implementation.
 //!
 //! These RPCs are infrastructure — not used by the current PutPath flow
 //! (which calls `metadata::find_missing_chunks` directly and uploads via

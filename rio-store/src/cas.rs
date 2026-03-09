@@ -116,22 +116,20 @@ pub async fn put_chunked(
             .collect(),
     };
     let chunk_list_bytes = manifest.serialize();
-    // Dedup chunk_hashes/sizes for the UNNEST upsert (X7 fix).
-    // FastCDC CAN produce duplicate chunks (identical 16KB+ runs,
-    // e.g., zero-filled pages). The `INSERT ... SELECT FROM UNNEST
-    // ... ON CONFLICT DO UPDATE` with duplicate PKs in the SAME
-    // batch → PG error "ON CONFLICT DO UPDATE command cannot
-    // affect row a second time" (SQLSTATE 21000).
+    // Dedup chunk_hashes/sizes for the UNNEST upsert. FastCDC CAN
+    // produce duplicate chunks (identical 16KB+ runs, e.g., zero-
+    // filled pages). PG rejects `INSERT ... ON CONFLICT DO UPDATE`
+    // with duplicate PKs in the SAME batch: "ON CONFLICT DO UPDATE
+    // command cannot affect row a second time" (SQLSTATE 21000).
     //
-    // Deduping here also fixes refcount semantics: 1 ref per
-    // UNIQUE chunk per manifest, matching decrement_and_enqueue's
-    // HashSet dedup (gc/mod.rs:106). The manifest serialization
-    // above still has dups (chunk_list_bytes) — reassembly needs
-    // the full in-order chunk list. Only the refcount arrays dedup.
+    // Deduping here also fixes refcount semantics: 1 ref per UNIQUE
+    // chunk per manifest, matching decrement_and_enqueue's HashSet
+    // dedup. The manifest serialization above still has dups
+    // (chunk_list_bytes) — reassembly needs the full in-order chunk
+    // list. Only the refcount arrays dedup.
     //
-    // `chunks` vec (for S3 upload) stays undeduped — S3 PutObject
-    // is idempotent (same bytes → same result), and do_upload's
-    // need_upload HashSet (line ~241) already implicitly dedups.
+    // `chunks` vec (for S3 upload) stays undeduped — S3 PutObject is
+    // idempotent, and do_upload's need_upload HashSet implicitly dedups.
     let (chunk_hashes, chunk_sizes): (Vec<Vec<u8>>, Vec<i64>) = {
         let mut seen = std::collections::HashSet::<[u8; 32]>::new();
         chunks
@@ -190,49 +188,13 @@ async fn do_upload(
     chunks: &[chunker::Chunk<'_>],
     chunk_hashes: &[Vec<u8>],
 ) -> anyhow::Result<PutChunkedStats> {
-    // --- Step 3: Find missing ---
-    // Checks PG (chunks table), not S3. The table was populated in step 2
-    // (our refcount increments), so our OWN chunks are now "present" — but
-    // that's fine: chunks that were NEW (not previously in the table) need
-    // uploading; chunks that were already there (refcount was >0 before
-    // our increment) were uploaded by someone else.
-    //
-    // Hmm, actually: find_missing_chunks checks "blake3_hash = ANY($1)" —
-    // it finds rows that EXIST. After step 2, ALL our chunks exist in the
-    // table (we just UPSERTed them). So find_missing_chunks returns
-    // all-present → we upload nothing → bug.
-    //
-    // Fix: check missing BEFORE step 2? No — then there's a TOCTOU:
-    // chunk missing at check, another uploader inserts+uploads between
-    // check and our step 2, we redundantly upload.
-    //
-    // Better fix: the UPSERT in step 2 returns rows_affected. Actually
-    // no, ON CONFLICT DO UPDATE always affects a row. We need to know
-    // WHICH rows were INSERTed (new, need upload) vs UPDATEd (existed,
-    // skip). RETURNING with a CASE on xmax? PG has `(xmax = 0)` to
-    // detect INSERT vs UPDATE in an UPSERT...
-    //
-    // Actually — simplest correct approach: check missing BEFORE step 2.
-    // The TOCTOU redundant upload is harmless (S3 PutObject is idempotent,
-    // same bytes → same result). The cost is one wasted S3 PUT per chunk
-    // that another uploader races us to. That's rare and cheap.
-    //
-    // But we already CALLED step 2 above. So this function needs to be
-    // called with a PRE-CHECK result. Restructuring...
-    //
-    // Or: step 2 could return which chunks were new. Let me just do the
-    // pre-check here and accept the small TOCTOU window. The alternative
-    // (xmax RETURNING tricks) is fragile.
-
-    // Actually wait — I realize the structure is wrong. find_missing
-    // should happen BEFORE insert_manifest_chunked_uploading, and the
-    // result should be passed through. Let me restructure by making
-    // the refcount check separate.
-    //
-    // No — simpler: just check which of OUR chunks have refcount == 1.
-    // Those are the ones WE just inserted (refcount was 0 → 1 via our
-    // UPSERT). Chunks with refcount > 1 existed before us.
-
+    // --- Step 3: Find which chunks need upload ---
+    // Step 2 already UPSERTed all our chunks into PG, so "missing from
+    // chunks table" is the wrong question — they're all there now.
+    // Instead: check which of OUR chunks have refcount == 1. Those are
+    // the ones WE just inserted (refcount was 0 → 1 via our UPSERT).
+    // Chunks with refcount > 1 existed before us (someone else already
+    // uploaded them).
     let refcounts: Vec<(Vec<u8>, i32)> = sqlx::query_as(
         r#"
         SELECT blake3_hash, refcount FROM chunks
@@ -277,7 +239,7 @@ async fn do_upload(
     );
 
     // --- Step 4: Upload missing chunks ---
-    // Batched join_all (same pattern as C2's exists_batch). Each batch
+    // Batched join_all (same pattern as ChunkBackend::exists_batch). Each batch
     // is up to UPLOAD_CONCURRENCY simultaneous PUTs.
     for batch in chunks.chunks(UPLOAD_CONCURRENCY) {
         let futs: Vec<_> = batch
@@ -315,7 +277,7 @@ async fn do_upload(
 
 /// Best-effort rollback. Errors are logged, not propagated — the caller
 /// is already returning an error; a rollback failure shouldn't mask it.
-/// The orphan scanner (future phase) catches any leaked state.
+/// The orphan scanner (gc/orphan.rs) catches any leaked state.
 async fn rollback(pool: &PgPool, store_path_hash: &[u8], chunk_hashes: &[Vec<u8>]) {
     if let Err(e) =
         metadata::delete_manifest_chunked_uploading(pool, store_path_hash, chunk_hashes).await
@@ -330,7 +292,7 @@ async fn rollback(pool: &PgPool, store_path_hash: &[u8], chunk_hashes: &[Vec<u8>
 
 /// In-process chunk cache with singleflight coalescing and BLAKE3 verify.
 ///
-/// Wraps a `ChunkBackend`. GetPath (C5) uses this instead of the backend
+/// Wraps a `ChunkBackend`. GetPath uses this instead of the backend
 /// directly. Three layers:
 ///
 /// 1. **moka LRU** — hot chunks stay in memory. Weight-based: tracks
@@ -475,11 +437,11 @@ impl ChunkCache {
             // the cache unconditionally — means a single bit-flip
             // propagates to every subsequent GetPath until restart.
             //
-            // Round 4 Z5: if verify fails, INVALIDATE the LRU entry.
-            // Before this, corrupt bytes stuck in the cache forever —
-            // every subsequent get_verified for this hash returned the
-            // same error. Invalidating forces the next call to re-fetch
-            // from the backend (which might have intact bytes).
+            // If verify fails, INVALIDATE the LRU entry. Otherwise corrupt
+            // bytes would stick in the cache forever — every subsequent
+            // get_verified for this hash would return the same error.
+            // Invalidating forces the next call to re-fetch from the
+            // backend (which might have intact bytes).
             match Self::verify(hash, bytes) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -591,7 +553,7 @@ impl ChunkCache {
         // remove is tiny, and a caller in that window awaits an
         // already-complete Shared (instant return).
         //
-        // Round 4 Z33 note: if THIS awaiter is cancelled between
+        // Cancellation edge case: if THIS awaiter is cancelled between
         // `shared.await` and here, the inflight entry isn't removed.
         // This is SELF-HEALING: the Shared future already completed,
         // so the next caller to hit `entry().or_insert_with()` gets
@@ -751,9 +713,8 @@ mod cache_tests {
 
         // Delete from backend. Second get MUST come from LRU or fail.
         backend.corrupt_for_test(&hash, Bytes::from_static(b"DELETED"));
-        // Actually corrupt_for_test overwrites — let me use something
-        // that would fail verify if it reached the backend.
-        // Already done: "DELETED" ≠ good data → verify would fail.
+        // Overwrite backend with garbage. If the second get reaches the
+        // backend (no LRU hit), BLAKE3 verify fails → test fails.
 
         let second = cache.get_verified(&hash).await.unwrap();
         assert_eq!(second, data, "LRU hit should skip backend");
@@ -812,10 +773,10 @@ mod cache_tests {
         assert!(matches!(second, Err(ChunkError::NotFound(_))));
     }
 
-    /// Round 4 Z5: corrupt bytes in the LRU must be INVALIDATED on
-    /// verify failure. Before this, a bit-flip in cached bytes would
-    /// stick forever — every subsequent get_verified returned the
-    /// same error. Invalidating forces a re-fetch from the backend.
+    /// Corrupt bytes in the LRU must be INVALIDATED on verify failure.
+    /// Otherwise a bit-flip in cached bytes would stick forever — every
+    /// subsequent get_verified would return the same error. Invalidating
+    /// forces a re-fetch from the backend.
     #[tokio::test]
     async fn lru_invalidated_on_corrupt_hit() {
         let (backend, cache) = make_cache();
@@ -835,7 +796,7 @@ mod cache_tests {
         cache.lru.run_pending_tasks().await;
 
         // First call: LRU hit → verify fails → Err(Corrupt). This
-        // ALSO invalidates the entry (Z5 fix).
+        // ALSO invalidates the entry.
         let first = cache.get_verified(&hash).await;
         assert!(
             matches!(first, Err(ChunkError::Corrupt { .. })),
@@ -844,9 +805,9 @@ mod cache_tests {
 
         // THE KEY ASSERTION: second call should SUCCEED (entry was
         // invalidated → cache miss → re-fetch from backend → good
-        // data). Before Z5, this would return the SAME error.
+        // data). Without invalidation, this would return the SAME error.
         let second = cache.get_verified(&hash).await.expect(
-            "Z5: second call should succeed — LRU entry should have \
+            "second call should succeed — LRU entry should have \
              been invalidated on the first verify failure",
         );
         assert_eq!(

@@ -51,7 +51,7 @@ pub mod sweep;
 /// (non-blocking) — second caller gets "already running".
 pub const GC_LOCK_ID: i64 = 0x724F_4743_0001;
 
-/// PG advisory lock ID for the mark-vs-PutPath race. Round 4 Z2.
+/// PG advisory lock ID for the mark-vs-PutPath race.
 ///
 /// PutPath takes this SHARED (`pg_advisory_lock_shared`) around
 /// the placeholder insert → complete_manifest window. Mark takes
@@ -86,7 +86,7 @@ pub struct GcStats {
     /// Total bytes of chunks marked deleted (for storage savings estimate).
     pub bytes_freed: u64,
     /// Paths skipped because a new narinfo referenced them after
-    /// mark (Z2 hybrid race window — a PutPath completed BETWEEN
+    /// mark (mark-vs-sweep race window — a PutPath completed BETWEEN
     /// mark and sweep with this path in its references). Sweep's
     /// per-path re-check catches these and skips the delete.
     /// Metric for alerting if this is frequent.
@@ -174,9 +174,9 @@ pub(super) async fn decrement_and_enqueue(
     // Enqueue S3 keys. Only if we have a chunk backend (inline store
     // has no S3 keys to delete).
     //
-    // Round 4 Z18: batched via unnest — one RTT per manifest instead
-    // of per-chunk. A manifest with 1000 chunks went from 1000 INSERTs
-    // (~1s at 1ms RTT) to 1 (~1ms). Significant for large sweeps.
+    // Batched via unnest — one RTT per manifest instead of per-chunk.
+    // A manifest with 1000 chunks would otherwise need 1000 INSERTs
+    // (~1s at 1ms RTT); batched it's ~1ms. Significant for large sweeps.
     if let Some(backend) = backend {
         let mut keys: Vec<String> = Vec::with_capacity(zeroed.len());
         let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(zeroed.len());

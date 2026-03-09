@@ -3,7 +3,7 @@
 use super::*;
 
 // ===========================================================================
-// QueryPathFromHashPart + AddSignatures (phase2c E2)
+// QueryPathFromHashPart + AddSignatures
 // ===========================================================================
 
 use rio_proto::types::{AddSignaturesRequest, QueryPathFromHashPartRequest};

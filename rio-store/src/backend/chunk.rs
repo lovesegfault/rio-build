@@ -49,7 +49,7 @@ pub trait ChunkBackend: Send + Sync {
     /// manifest is corrupt). Caller propagates as an error, not a retry.
     ///
     /// Backends do NOT verify BLAKE3 on read — that's the caller's job
-    /// (C4's `ChunkCache::get_verified`). Layered this way so the cache
+    /// (see `ChunkCache::get_verified`). Layered this way so the cache
     /// verifies exactly once regardless of whether the bytes came from
     /// the backend or the in-process LRU.
     async fn get(&self, hash: &[u8; 32]) -> anyhow::Result<Option<Bytes>>;
@@ -59,8 +59,8 @@ pub trait ChunkBackend: Send + Sync {
     ///
     /// PutPath calls this BEFORE uploading to skip chunks that already
     /// exist (the dedup fast-path). For the memory backend it's a HashMap
-    /// lookup loop; for S3 it's a batch of HeadObject calls (C3 might
-    /// switch to checking the `chunks` PG table instead — faster than S3).
+    /// lookup loop; for S3 it's a batch of HeadObject calls. (PutPath uses
+    /// the PG `chunks` table instead for dedup — one RTT vs N HeadObject calls.)
     async fn exists_batch(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<bool>>;
 
     /// Delete a chunk. Used by the GC drain task (pending_s3_deletes).
@@ -105,11 +105,11 @@ fn chunk_key(hash: &[u8; 32]) -> String {
 
 /// Validate a chunk key before Path::join or S3 DeleteObject.
 ///
-/// Round 4 Z17: keys come from pending_s3_deletes which WE wrote via
-/// key_for, but defense-in-depth: if a corrupted row or somehow an
-/// injected key got into the table, Path::join would resolve `..` etc.
-/// Reject non-conforming keys; drain increments attempts → stuck →
-/// operator alert. Shape: `{2 hex chars}/{64 hex chars}`.
+/// Keys come from pending_s3_deletes which we wrote via key_for, but
+/// defense-in-depth: if a corrupted row or injected key got into the
+/// table, Path::join would resolve `..` etc. Reject non-conforming
+/// keys; drain increments attempts → stuck → operator alert.
+/// Shape: `{2 hex chars}/{64 hex chars}`.
 fn validate_chunk_key(key: &str) -> anyhow::Result<()> {
     let Some((prefix, hex)) = key.split_once('/') else {
         anyhow::bail!("invalid chunk key {key:?}: missing '/'");
@@ -149,7 +149,7 @@ impl MemoryChunkBackend {
     }
 
     /// Test helper: get a count of stored chunks. For dedup-ratio
-    /// assertions in C3's PutPath tests.
+    /// assertions in chunked PutPath tests.
     pub fn len(&self) -> usize {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -158,8 +158,8 @@ impl MemoryChunkBackend {
         self.len() == 0
     }
 
-    /// Test helper: corrupt a stored chunk's bytes. For C4's BLAKE3-verify
-    /// test — overwrite with garbage, then assert `get_verified` returns Err.
+    /// Test helper: corrupt a stored chunk's bytes. For BLAKE3-verify
+    /// tests — overwrite with garbage, then assert `get_verified` returns Err.
     pub fn corrupt_for_test(&self, hash: &[u8; 32], garbage: Bytes) {
         self.inner
             .write()
@@ -330,15 +330,8 @@ impl ChunkBackend for FilesystemChunkBackend {
     }
 
     async fn delete_by_key(&self, key: &str) -> anyhow::Result<()> {
-        // Round 4 Z17: validate key format before Path::join. The
-        // key comes from pending_s3_deletes which WE wrote (via
-        // key_for), but defense-in-depth: if a corrupted row or
-        // SQL injection somehow got "../etc/passwd" into the table,
-        // Path::join would resolve it. Reject non-conforming keys;
-        // drain increments attempts → stuck row → alert.
-        //
-        // chunk_key format is `{aa}/{64 hex chars}` where aa is
-        // the first 2 hex chars of the blake3 hash.
+        // Validate key format before Path::join. Defense-in-depth
+        // against corrupted/injected rows in pending_s3_deletes.
         validate_chunk_key(key)?;
 
         // key is the relative path from key_for. Rejoin to base_dir.
@@ -454,9 +447,10 @@ impl ChunkBackend for S3ChunkBackend {
         // would work but be antisocial (100 chunks = 100 simultaneous
         // requests; S3 can handle it but the caller's network might not).
         //
-        // NOTE: C3 likely replaces this with a PG query against the
-        // `chunks` table — one roundtrip instead of N. This impl is
-        // correct but not the final story for production.
+        // NOTE: PutPath does NOT use this — it checks PG `chunks`
+        // refcounts (metadata::find_missing_chunks, cas.rs:do_upload)
+        // for one RTT instead of N HeadObject calls. This S3
+        // exists_batch is kept for trait completeness.
         //
         // Chunked into batches of 16, each batch awaited concurrently via
         // join_all. Simpler than pulling in futures-util just for buffered().
@@ -555,8 +549,7 @@ mod tests {
         assert_eq!(&chunk_key(&HASH_B)[..2], "ff");
     }
 
-    /// Round 4 Z17: validate_chunk_key rejects malformed keys
-    /// before Path::join can resolve them.
+    /// validate_chunk_key rejects malformed keys before Path::join.
     #[test]
     fn validate_chunk_key_accepts_wellformed() {
         // Round-trip: chunk_key output always validates.
@@ -812,12 +805,9 @@ mod tests {
         let r2 = mock!(Client::head_object)
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let r3 = mock!(Client::head_object).then_output(|| HeadObjectOutput::builder().build());
-        // MatchAny: we don't control which mock matches which call (they
-        // race via buffered), but the OUTPUT order from buffered is
-        // deterministic. Actually — this is subtle. buffered() preserves
-        // the order futures were CREATED, not the order they COMPLETE.
-        // The mock framework matches sequentially though... let me use
-        // Sequential and rely on buffered's ordering guarantee.
+        // Sequential mode: buffered() preserves the order futures were
+        // CREATED (not the order they COMPLETE), so output[i] corresponds
+        // to input[i] regardless of which mock fires first.
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&r1, &r2, &r3]);
         let backend = make_s3_backend(client);
 

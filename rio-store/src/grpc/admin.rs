@@ -66,10 +66,10 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         let req = request.into_inner();
-        // Round 4 Z21: proto3 `optional uint32` — None = unset (use
-        // default 2h), Some(0) = explicit zero grace. Prior code
-        // treated 0 as "use default" → impossible to request zero
-        // grace (useful for tests + pre-shutdown GC).
+        // proto3 `optional uint32`: None = unset (use default 2h),
+        // Some(0) = explicit zero grace (useful for tests + pre-shutdown GC).
+        // Distinguishing these matters — treating 0 as "use default"
+        // would make zero-grace impossible to request.
         let grace_hours = req.grace_period_hours.unwrap_or(2);
 
         info!(
@@ -142,15 +142,15 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             // lock_conn held for the whole GC; explicit unlock at
             // the end via gc_unlock.
             //
-            // Round 4 Z7: scopeguard detaches on ANY exit not going
-            // through gc_unlock — including task cancellation (client
-            // drops the stream → tonic may abort this tokio::spawn) and
-            // panics. detach() removes the connection from the pool;
-            // dropping the detached connection closes it → PG releases
-            // the session-scoped lock. Before this, cancel/panic left
-            // the connection in the pool with the lock held → next
-            // TriggerGC would get "already running" until sqlx recycled
-            // that pooled connection (possibly hours).
+            // scopeguard detaches on ANY exit not going through gc_unlock —
+            // including task cancellation (client drops the stream → tonic
+            // may abort this tokio::spawn) and panics. detach() removes the
+            // connection from the pool; dropping the detached connection
+            // closes it → PG releases the session-scoped lock.
+            //
+            // Without this, cancel/panic would leave the connection in the
+            // pool with the lock held → next TriggerGC gets "already running"
+            // until sqlx recycles that pooled connection (possibly hours).
             //
             // gc_unlock DEFUSES the scopeguard (ScopeGuard::into_inner)
             // and explicitly unlocks + returns conn to pool (cheaper
@@ -175,7 +175,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             }
 
             // --- Mark phase ---
-            // Z2 hybrid: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
+            // Mark-vs-PutPath lock: take GC_MARK_LOCK_ID EXCLUSIVE for the mark
             // CTE only (~1s for typical store). PutPath holds this
             // SHARED around placeholder→complete, so mark blocks until
             // no PutPath is mid-write. This guarantees the reference
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(count.0, 0, "gc_roots empty after unpin");
     }
 
-    /// X19: concurrent TriggerGC calls are serialized via advisory
+    /// Concurrent TriggerGC calls are serialized via advisory
     /// lock. Second call returns immediately with "already running".
     #[tokio::test]
     async fn trigger_gc_advisory_lock_serializes() {

@@ -1,7 +1,7 @@
 //! ed25519 narinfo signing.
 //!
 //! Signatures are computed at PutPath time and stored in
-//! `narinfo.signatures`. The binary-cache HTTP server (B3) serves them
+//! `narinfo.signatures`. The binary-cache HTTP server (cache_server.rs) serves them
 //! as `Sig:` lines — it never touches the private key. This means:
 // r[impl store.signing.fingerprint]
 //! - Key rotation doesn't require re-serving anything (paths signed

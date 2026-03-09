@@ -137,7 +137,7 @@ mod tests {
         )
         .await?;
 
-        // Now the actual G1 path: insert + lookup.
+        // The content_index roundtrip: insert + lookup.
         insert(&db.pool, &nar_hash, &sp_hash).await?;
 
         let found = lookup(&db.pool, &nar_hash).await?.expect("should find");

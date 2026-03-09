@@ -70,10 +70,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_path_resurrected_total",
-        "Paths skipped by sweep because a new referrer appeared after mark (Z2 race window)"
+        "Paths skipped by sweep because a new referrer appeared between mark and sweep (race window)"
     );
-    // Round 4 Z19: 5 store metrics were emitted but not described.
-    // s3_requests_total description updated to include delete_object.
     describe_counter!(
         "rio_store_hmac_rejected_total",
         "PutPath rejections by HMAC assignment-token check (labeled by reason)"

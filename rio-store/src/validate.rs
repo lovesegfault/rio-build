@@ -6,8 +6,8 @@
 // r[impl sec.drv.validate]
 //!
 //! The streaming `HashingReader` path is test-only — grpc.rs now buffers
-//! the full NAR and uses `from_bytes` (see grpc.rs:~517 comment re: avoiding
-//! the double-Vec peak).
+//! the full NAR and uses `from_bytes` (see `put_path_impl` — avoids the
+//! double-Vec peak).
 
 use sha2::{Digest, Sha256};
 
@@ -17,8 +17,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 #[cfg(test)]
 use tokio::io::{AsyncRead, ReadBuf};
-
-// PathInfo validation is done at the gRPC boundary
 
 // ---------------------------------------------------------------------------
 // NarDigest

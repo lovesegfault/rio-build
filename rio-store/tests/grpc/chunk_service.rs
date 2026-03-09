@@ -3,7 +3,7 @@
 use super::*;
 
 // ===========================================================================
-// ChunkService (phase2c C6)
+// ChunkService
 // ===========================================================================
 
 use rio_proto::ChunkServiceClient;
@@ -226,10 +226,10 @@ async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
     Ok(())
 }
 
-/// A2: prove StoreService and ChunkService ACTUALLY share one cache.
+/// Prove StoreService and ChunkService ACTUALLY share one cache.
 ///
-/// A previous API (since removed) created a private cache per service,
-/// so the two had DIFFERENT moka LRUs. That passed incidentally: both
+/// If StoreService and ChunkService each had their own ChunkCache,
+/// the two would have DIFFERENT moka LRUs. That would pass incidentally: both
 /// miss → both hit the shared MemoryChunkBackend → same data. But
 /// "warmed by GetPath is hot for GetChunk" wasn't really tested.
 ///

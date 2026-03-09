@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_store::describe_metrics();
 
-    // Connect to PostgreSQL. Round 4 Z6: redact password before logging.
+    // Connect to PostgreSQL. URL is logged with password redacted.
     info!(
         url = %rio_common::config::redact_db_url(&cfg.database_url),
         "connecting to PostgreSQL"
@@ -396,14 +396,14 @@ mod tests {
         assert_eq!(d.listen_addr, "0.0.0.0:9002");
         assert_eq!(d.metrics_addr.to_string(), "0.0.0.0:9092");
         assert!(d.database_url.is_empty());
-        // Phase3a: chunk backend off by default (backward-compat).
+        // Chunk backend off by default for backward-compat with pre-chunking configs.
         assert!(matches!(d.chunk_backend, ChunkBackendKind::Inline));
         // Matches ChunkCache::DEFAULT_CACHE_CAPACITY_BYTES. If that
         // constant changes, update this — the test catches drift.
         assert_eq!(d.chunk_cache_capacity_bytes, 2 * 1024 * 1024 * 1024);
         assert!(d.signing_key_path.is_none());
         assert!(d.cache_http_addr.is_none());
-        // Phase3b: plaintext health for K8s probes when mTLS on.
+        // Plaintext health listener for K8s probes when mTLS is on the main port.
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9102");
         assert!(!d.tls.is_configured());
     }

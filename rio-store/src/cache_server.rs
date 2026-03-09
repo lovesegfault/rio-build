@@ -130,7 +130,7 @@ async fn narinfo(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Reuse E2's query_by_hash_part — same LIKE prefix lookup.
+    // Reuse query_by_hash_part (same LIKE prefix lookup as QueryPathFromHashPart).
     let info = match metadata::query_by_hash_part(&state.pool, hash_part).await {
         Ok(Some(info)) => info,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -140,8 +140,8 @@ async fn narinfo(
         }
     };
 
-    // Build the narinfo text. NarInfoBuilder (from B1's discovery) keeps
-    // field validation centralized — we don't hand-format here.
+    // Build the narinfo text. NarInfoBuilder keeps field validation
+    // centralized — we don't hand-format here.
     //
     // URL: nar/{nixbase32(nar_hash)}.nar.zst — the nar_hash identifies
     // the CONTENT (multiple paths with the same content share a URL,
@@ -702,7 +702,7 @@ mod tests {
         }
     }
 
-    /// A4: streaming response has NO Content-Length header.
+    /// Streaming response has NO Content-Length header.
     ///
     /// The buffered version COULD set it (compressed bytes in hand
     /// before responding). The streaming version CAN'T (compressed

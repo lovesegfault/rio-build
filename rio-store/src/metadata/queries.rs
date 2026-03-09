@@ -76,8 +76,7 @@ pub async fn get_manifest(pool: &PgPool, store_path: &str) -> Result<Option<Mani
                 })?;
 
             // Convert Manifest → Vec<([u8;32], u32)> for the enum variant.
-            // ManifestKind predates Manifest (E1 vs C1) so the representation
-            // is slightly different; this is one allocation, cheap.
+            // ManifestKind uses tuples; Manifest uses a struct — one cheap conversion.
             let entries: Vec<([u8; 32], u32)> = manifest
                 .entries
                 .into_iter()

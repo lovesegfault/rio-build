@@ -574,7 +574,7 @@ async fn test_find_missing_paths_rejects_oversized_batch() -> TestResult {
 
 /// A connection-level failure (PoolClosed) must surface as UNAVAILABLE
 /// (retriable), NOT Internal. This is the key value-add of MetadataError:
-/// before C4, a transient PG hiccup looked identical to a corrupt database.
+/// before typed errors, a transient PG hiccup looked identical to a corrupt database.
 ///
 /// Secondary: the message must not leak sqlx/Postgres internals. Server
 /// logs the full error; client sees a generic summary.
@@ -598,7 +598,7 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
     assert_eq!(
         status.code(),
         tonic::Code::Unavailable,
-        "connection-level failures must be retriable (was Internal before C4)"
+        "connection-level failures must be retriable (UNAVAILABLE, not Internal)"
     );
     // Belt-and-suspenders: no substring from common sqlx errors.
     assert!(!status.message().to_lowercase().contains("sqlx"));
@@ -612,10 +612,7 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
 // for a race between query_path_info and get_manifest (both filter on
 // manifests.status='complete'). Not normally reachable; no test.
 //
-// Phase 2c: the old test_get_path_backend_blob_missing is gone. That test
-// exercised the scenario where nar_blobs had a complete row but the S3/fs
-// backend had lost the blob (crash between backend.put and complete_upload).
-// With inline storage, the NAR lives in the SAME transaction that flips
-// status to complete — that race no longer exists. The chunked path (C3)
-// reintroduces a similar race (PG manifest present, S3 chunk missing); a
-// test for that lands with C3.
+// The inline-storage path has no "blob-missing" race: the NAR lives in
+// the SAME transaction that flips status to complete. The chunked-path
+// equivalent (PG manifest present, S3 chunk missing) is covered by
+// tests/grpc/reassembly.rs::test_chunked_getpath_missing_chunk_data_loss.
