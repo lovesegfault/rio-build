@@ -176,6 +176,12 @@ async fn main() -> anyhow::Result<()> {
     let _root_guard = tracing::info_span!("gateway", component = "gateway").entered();
     info!(version = env!("CARGO_PKG_VERSION"), "starting rio-gateway");
 
+    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Lets main()
+    // return normally so atexit handlers (LLVM coverage profraw flush,
+    // tracing shutdown) fire. Health server gets serve_with_shutdown;
+    // the SSH server.run() is wrapped in a select! below.
+    let shutdown = rio_common::signal::shutdown_signal();
+
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_gateway::describe_metrics();
 
@@ -211,11 +217,12 @@ async fn main() -> anyhow::Result<()> {
         >>()
         .await;
     let health_addr = cfg.health_addr;
+    let health_shutdown = shutdown.clone();
     rio_common::task::spawn_monitored("health-server", async move {
         info!(addr = %health_addr, "starting gRPC health server");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(health_service)
-            .serve(health_addr)
+            .serve_with_shutdown(health_addr, health_shutdown.cancelled_owned())
             .await
         {
             tracing::error!(error = %e, "health server failed");
@@ -236,7 +243,15 @@ async fn main() -> anyhow::Result<()> {
         "rio-gateway ready"
     );
 
-    server.run(host_key, cfg.listen_addr).await?;
+    // Race the SSH server against shutdown. Dropping the run() future
+    // cancels the accept loop; per-session tasks die at process exit.
+    // Clean enough for graceful shutdown + coverage flush.
+    tokio::select! {
+        r = server.run(host_key, cfg.listen_addr) => r?,
+        _ = shutdown.cancelled() => {
+            info!("gateway shut down cleanly");
+        }
+    }
 
     Ok(())
 }
