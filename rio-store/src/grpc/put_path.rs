@@ -39,20 +39,35 @@ async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
     }
 }
 
+/// Extract the subject CN from a DER-encoded X509 certificate.
+/// Returns None if parse fails or no CN found.
+fn cert_cn(der: &[u8]) -> Option<String> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(String::from)
+}
+
 impl StoreServiceImpl {
     /// Verify the `x-rio-assignment-token` metadata header.
     ///
     /// Returns:
     /// - `Ok(None)` if verifier disabled (dev mode) → no check
-    /// - `Ok(None)` if mTLS bypass (gateway cert CN match) → no check
+    /// - `Ok(None)` if mTLS bypass (cert CN = "rio-gateway") → no check
     /// - `Ok(Some(claims))` if token valid → caller checks path ∈ claims
     /// - `Err(PERMISSION_DENIED)` if token missing/invalid/expired
     ///
     /// mTLS bypass: `request.peer_certs()` returns the client's TLS
     /// cert chain (only set when ServerTlsConfig has client_ca_root).
-    /// If the first cert's subject CN is "rio-gateway" → bypass.
+    /// If the FIRST cert's subject CN is "rio-gateway" → bypass.
     /// This means: to upload without a token, you need a CA-signed
-    /// gateway cert. mTLS + HMAC together = defense in depth.
+    /// cert with CN=rio-gateway. mTLS + HMAC together = defense in
+    /// depth; a compromised worker cert (CN=rio-worker) does NOT
+    /// bypass — it must present a valid token restricting it to the
+    /// scheduler-assigned output paths.
     fn verify_assignment_token<T>(
         &self,
         request: &Request<T>,
@@ -62,26 +77,14 @@ impl StoreServiceImpl {
             return Ok(None);
         };
 
-        // mTLS bypass: check peer cert CN. tonic's peer_certs()
-        // gives the DER-encoded chain; we'd need to parse it to
-        // read CN. For now, a simpler heuristic: if ANY peer cert
-        // is present, the caller is mTLS-authenticated — and in
-        // our cert-manager setup, only gateway/worker/scheduler/
-        // controller get certs. A compromised worker could still
-        // upload with its own cert... but it ALSO has a valid
-        // assignment token (scheduler gave it one). So the bypass
-        // is really for the GATEWAY specifically.
-        //
-        // Proper CN parsing would need x509-parser crate. For now,
-        // we check: has peer_certs AND no token → assume gateway
-        // (it's the only mTLS client without tokens). A worker
-        // WITH an mTLS cert still provides its token.
-        //
-        // TODO(phase4): proper CN parsing for strict gateway-only
-        // bypass. Current heuristic is safe because workers always
-        // SEND tokens (B4 makes them), so they never hit the
-        // bypass path.
-        let has_peer_certs = request.peer_certs().is_some();
+        // mTLS bypass: parse first peer cert's CN. Only bypass
+        // for CN=rio-gateway. Previously: ANY peer cert + no token
+        // → bypass. That defeated the entire HMAC threat model: a
+        // compromised worker omits the token → uploads arbitrary
+        // paths → backdoored libc injection. (X1 fix)
+        let peer_cn = request
+            .peer_certs()
+            .and_then(|certs| certs.first().and_then(|c| cert_cn(c.as_ref())));
 
         let token = request
             .metadata()
@@ -101,21 +104,40 @@ impl StoreServiceImpl {
                     Status::permission_denied(format!("assignment token: {e}"))
                 })
             }
-            None if has_peer_certs => {
-                // mTLS client without token = gateway. Bypass.
-                // See the TODO above for the CN-parsing caveat.
-                debug!("PutPath: mTLS client without token, bypassing HMAC (gateway)");
-                Ok(None)
-            }
             None => {
-                // No mTLS, no token, verifier enabled → reject.
-                // This is the "random curl hitting the store"
-                // case (or a misconfigured worker).
-                metrics::counter!("rio_store_hmac_rejected_total", "reason" => "missing_token")
-                    .increment(1);
-                Err(Status::permission_denied(
-                    "assignment token required (x-rio-assignment-token header)",
-                ))
+                match peer_cn.as_deref() {
+                    Some("rio-gateway") => {
+                        // Gateway-specific bypass. Track for visibility.
+                        debug!("PutPath: CN=rio-gateway, bypassing HMAC");
+                        metrics::counter!("rio_store_hmac_bypass_total", "cn" => "rio-gateway")
+                            .increment(1);
+                        Ok(None)
+                    }
+                    Some(other_cn) => {
+                        // mTLS client with NON-gateway CN (worker,
+                        // controller) and no token → REJECT. This is
+                        // the X1 threat model: compromised worker
+                        // skipping its token to upload arbitrary paths.
+                        warn!(cn = %other_cn,
+                              "PutPath: mTLS client with non-gateway CN and no token, rejecting");
+                        metrics::counter!("rio_store_hmac_rejected_total",
+                                         "reason" => "non_gateway_cn_no_token")
+                        .increment(1);
+                        Err(Status::permission_denied(format!(
+                            "assignment token required (CN={other_cn} is not rio-gateway)"
+                        )))
+                    }
+                    None => {
+                        // No mTLS (or cert parse failed), no token,
+                        // verifier enabled → reject.
+                        metrics::counter!("rio_store_hmac_rejected_total",
+                                         "reason" => "missing_token")
+                        .increment(1);
+                        Err(Status::permission_denied(
+                            "assignment token required (x-rio-assignment-token header)",
+                        ))
+                    }
+                }
             }
         }
     }
@@ -497,5 +519,62 @@ impl StoreServiceImpl {
         metrics::histogram!("rio_store_put_path_duration_seconds")
             .record(start.elapsed().as_secs_f64());
         Ok(Response::new(PutPathResponse { created: true }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// X1 CN parsing: verify cert_cn extracts the CN correctly.
+    /// Uses rcgen to build an in-memory cert (test-only dep).
+    fn make_cert_with_cn(cn: &str) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params.distinguished_name = {
+            let mut dn = rcgen::DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, cn);
+            dn
+        };
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn cert_cn_parses_gateway() {
+        let der = make_cert_with_cn("rio-gateway");
+        assert_eq!(cert_cn(&der), Some("rio-gateway".into()));
+    }
+
+    #[test]
+    fn cert_cn_parses_worker() {
+        let der = make_cert_with_cn("rio-worker");
+        // CN=rio-worker → returned as-is. verify_assignment_token
+        // will reject this in the None-token path (X1 fix).
+        assert_eq!(cert_cn(&der), Some("rio-worker".into()));
+    }
+
+    #[test]
+    fn cert_cn_no_cn_returns_none() {
+        // A cert with no CN (only SANs, which is actually the
+        // modern best practice) → cert_cn returns None. The
+        // verify_assignment_token None-token+None-CN path rejects
+        // (no bypass for unidentified clients).
+        //
+        // rcgen defaults a CN="rcgen self signed cert" if not
+        // explicitly overridden — set an empty DN to simulate
+        // a SAN-only cert.
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let der = cert.der();
+
+        assert_eq!(cert_cn(der), None, "cert without CN → None");
+    }
+
+    #[test]
+    fn cert_cn_garbage_der_returns_none() {
+        assert_eq!(cert_cn(b"not a cert"), None);
     }
 }

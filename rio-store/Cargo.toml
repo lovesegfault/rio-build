@@ -84,6 +84,11 @@ clap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 
+# TLS cert parsing for CN-based HMAC bypass on PutPath. tonic's
+# peer_certs() gives DER bytes; we parse to read subject CN.
+# Only CN=rio-gateway bypasses HMAC (not any mTLS client).
+x509-parser = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -94,6 +99,8 @@ serde = { workspace = true }
 [dev-dependencies]
 rio-test-support = { workspace = true }
 tempfile = { workspace = true }
+# In-memory cert generation for cert_cn() unit tests (CN parsing).
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 aws-smithy-mocks = "0.2"

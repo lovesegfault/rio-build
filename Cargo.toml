@@ -197,6 +197,9 @@ hmac = "0.12"
 # — real deployments use cert-manager. rcgen's in-memory API lets
 # tests build a CA + client/server certs without touching disk.
 rcgen = "0.14"
+# Parse TLS client certs for CN-based HMAC bypass (rio-store PutPath).
+# Already a transitive dep (via rustls pki chain); direct for API.
+x509-parser = "0.18"
 
 # Encoding
 hex = "0.4"
