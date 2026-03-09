@@ -198,12 +198,15 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                 }))
             }
             Err(e) => {
-                // FK violation (path not in narinfo) or connection
-                // error. Surface as NotFound or Internal based on
-                // the error type. sqlx doesn't expose FK-violation
-                // cleanly, so just check the message.
-                let msg = e.to_string();
-                if msg.contains("foreign key") || msg.contains("violates") {
+                // FK violation (path not in narinfo) → NotFound.
+                // Anything else → Internal. Use SQLSTATE 23503
+                // (foreign_key_violation) — stable across locales
+                // and PG versions, unlike string matching.
+                let is_fk_violation = e
+                    .as_database_error()
+                    .and_then(|d| d.code())
+                    .is_some_and(|c| c == "23503");
+                if is_fk_violation {
                     Ok(Response::new(PinPathResponse {
                         success: false,
                         message: format!("path not in store: {}", req.store_path),
@@ -237,5 +240,93 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             success: true,
             message: String::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_proto::StoreAdminService;
+    use rio_test_support::TestDb;
+
+    /// PinPath for a path NOT in narinfo → FK violation → success=
+    /// false with "path not in store" message. Verifies the SQLSTATE
+    /// 23503 check (replacing the old string-match on "foreign key",
+    /// which is locale/version-dependent).
+    #[tokio::test]
+    async fn pin_path_fk_violation_returns_not_found() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // Pin a path that doesn't exist in narinfo. The FK to
+        // narinfo.store_path_hash will reject with SQLSTATE 23503.
+        let req = Request::new(PinPathRequest {
+            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-doesnt-exist".into(),
+            source: "test".into(),
+        });
+        let resp = svc.pin_path(req).await.expect("returns Ok(response)");
+        let resp = resp.into_inner();
+        assert!(!resp.success, "FK violation → success=false");
+        assert!(
+            resp.message.contains("path not in store"),
+            "message should say path not in store, got: {}",
+            resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_path_roundtrip() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // Seed narinfo so the FK passes.
+        let path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-exists";
+        use sha2::Digest;
+        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        sqlx::query(
+            "INSERT INTO narinfo (store_path_hash, store_path, nar_hash, nar_size) \
+             VALUES ($1, $2, $3, 42)",
+        )
+        .bind(&hash)
+        .bind(path)
+        .bind(vec![0u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Pin.
+        let resp = svc
+            .pin_path(Request::new(PinPathRequest {
+                store_path: path.into(),
+                source: "test-roundtrip".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success, "pin should succeed");
+
+        // Verify gc_roots has the row.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gc_roots")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1, "gc_roots has 1 row");
+
+        // Unpin.
+        let resp = svc
+            .unpin_path(Request::new(PinPathRequest {
+                store_path: path.into(),
+                source: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success, "unpin should succeed");
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM gc_roots")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "gc_roots empty after unpin");
     }
 }
