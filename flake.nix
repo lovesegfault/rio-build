@@ -378,12 +378,15 @@
                 # directly (a file). lcov consumers downstream (lcov --summary
                 # in the dev shell) need updating to $out/lcov.info.
                 #
-                # --branch: enable branch coverage (-Z coverage-options=
-                # branch under the hood, nightly-gated). RUSTC_BOOTSTRAP
-                # unlocks on stable. Matches rio-workspace-cov so unit +
-                # VM lcovs merge with consistent BRDA record structure.
-                cargoLlvmCovExtraArgs = "--branch --lcov --output-path $out/lcov.info";
-                RUSTC_BOOTSTRAP = "1";
+                # NO --branch here: cargo-llvm-cov's `llvm-cov export` step
+                # segfaults with branch coverage across 20+ test binaries
+                # (observed: SIGSEGV at 15GB RSS, not OOM — llvm-cov bug
+                # with large branch datasets). VM coverage (nix/coverage.nix)
+                # DOES use branch (only 5 objects per export), so combined
+                # reports in coverage-full still have branch data from the
+                # VM-test contribution. Unit-test-only reports (coverage-html)
+                # show line/function only.
+                cargoLlvmCovExtraArgs = "--lcov --output-path $out/lcov.info";
                 # cargoNextest runs tests in checkPhase (vs cargoLlvmCov
                 # which used buildPhase), so nativeCheckInputs is correct
                 # here — matching the plain `nextest` check above.
@@ -809,7 +812,7 @@
                 --output-file $TMPDIR/cleaned.lcov
               cd ${commonArgs.src}
               ${pkgs.lcov}/bin/genhtml $TMPDIR/cleaned.lcov \
-                --branch-coverage --output-directory $out
+                --output-directory $out
             '';
           }
           # 10-minute nightly fuzz runs — NOT in checks, explicitly invoked
