@@ -443,6 +443,13 @@ impl DagActor {
                     // either the worker is about to upload them
                     // (expected) or just did (output). Both cases:
                     // don't race the upload.
+                    //
+                    // Dedup via HashSet: the same drv can appear in
+                    // multiple builds (shared dependency) → same
+                    // expected_output_paths would be duplicated
+                    // N× in the roots list. The store's mark CTE
+                    // handles dups correctly, but it's wasted
+                    // network + CTE work.
                     let roots: Vec<String> = self
                         .dag
                         .iter_nodes()
@@ -453,6 +460,8 @@ impl DagActor {
                                 .chain(s.output_paths.iter())
                                 .cloned()
                         })
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
                         .collect();
                     let _ = reply.send(roots);
                 }
