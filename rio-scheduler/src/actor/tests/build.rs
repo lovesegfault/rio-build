@@ -4,9 +4,9 @@
 use super::*;
 
 /// WatchBuild on an already-terminal build must immediately send the
-/// terminal event. Previously it just subscribed — if the original
-/// BuildCompleted was sent to zero receivers (e.g., submit subscriber
-/// disconnected before completion), a late WatchBuild would hang forever.
+/// terminal event. Without re-send: if the original BuildCompleted was
+/// sent to zero receivers (e.g., submit subscriber disconnected before
+/// completion), a late WatchBuild would hang forever.
 #[tokio::test]
 async fn test_watch_build_after_completion_receives_terminal_event() -> TestResult {
     let (_db, handle, _task, _stream_rx) =
@@ -97,7 +97,7 @@ async fn test_terminal_build_cleanup_after_delay() -> TestResult {
 }
 
 /// CancelBuild on an active build should clean up derivations and emit
-/// BuildCancelled event. Previously untested.
+/// BuildCancelled event.
 #[tokio::test]
 async fn test_cancel_build_active_drains_derivations() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -274,7 +274,7 @@ async fn test_emit_build_event_filters_log_from_persister() -> TestResult {
     );
 
     // Bytes decode back to the same event (proves encode is right
-    // — C5's read_event_log will decode these).
+    // — read_event_log in db.rs will decode these).
     use prost::Message;
     let decoded = rio_proto::types::BuildEvent::decode(&received[0].2[..])?;
     assert!(matches!(decoded.event, Some(Event::Cancelled(_))));

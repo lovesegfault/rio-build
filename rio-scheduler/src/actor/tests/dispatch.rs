@@ -176,7 +176,8 @@ async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
 }
 
 /// Per-build BuildOptions (max_silent_time, build_timeout) must propagate
-/// to the worker via WorkAssignment. Previously sent all-zeros defaults.
+/// to the worker via WorkAssignment. Regression guard: without
+/// propagation, all-zeros defaults would be sent.
 #[tokio::test]
 async fn test_build_options_propagated_to_worker() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
@@ -220,7 +221,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
     Ok(())
 }
 
-/// Interactive builds get a priority boost (D5: +1e9 instead of the old
+/// Interactive builds get a priority boost (+1e9 instead of the old
 /// push_front). After a dependency completes, an Interactive build's
 /// newly-ready derivation dispatches BEFORE already-queued Scheduled work.
 ///
@@ -367,7 +368,7 @@ async fn test_generation_starts_at_one_not_zero() -> TestResult {
 }
 
 // -----------------------------------------------------------------------------
-// B3: PrefetchHint before WorkAssignment
+// PrefetchHint before WorkAssignment
 // -----------------------------------------------------------------------------
 
 /// PrefetchHint arrives BEFORE the WorkAssignment on the stream.
@@ -617,7 +618,7 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
 /// between loads), but it exercises the dispatch.rs load-once path.
 ///
 /// The REAL torn-read test (concurrent lease fetch_add racing with
-/// dispatch) lands in C2 with the lease task. This is the structural
+/// dispatch) lives with the lease task. This is the structural
 /// precursor: proves the single load is what gets used throughout
 /// send_assignment.
 #[tokio::test]
@@ -637,7 +638,7 @@ async fn test_generation_single_load_within_assignment() -> TestResult {
     // once for the field), a concurrent writer could split them —
     // token says "-1", field says 2. No writer here, so this asserts
     // STRUCTURAL consistency (same local used for both), not concurrent
-    // safety (C2's job).
+    // safety (that's the lease task's job).
     assert_eq!(a1.generation, a2.generation);
     let expected_suffix = format!("-{}", a1.generation);
     assert!(
@@ -653,7 +654,7 @@ async fn test_generation_single_load_within_assignment() -> TestResult {
     Ok(())
 }
 
-/// X9: dispatch pins input-closure paths; terminal unpins.
+/// Dispatch pins input-closure paths; terminal unpins.
 /// Verifies the end-to-end pin → unpin lifecycle via scheduler_
 /// live_pins row count.
 #[tokio::test]
@@ -714,7 +715,7 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
         sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-parent'")
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(count, 1, "parent dispatch should pin its 1 input path (X9)");
+    assert_eq!(count, 1, "parent dispatch should pin its 1 input path");
 
     // Complete parent → unpin.
     complete_success_empty(&handle, "w-x9", "x9-parent").await?;
@@ -724,7 +725,7 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
         sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-parent'")
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(count, 0, "completion should unpin (X9)");
+    assert_eq!(count, 0, "completion should unpin");
 
     Ok(())
 }

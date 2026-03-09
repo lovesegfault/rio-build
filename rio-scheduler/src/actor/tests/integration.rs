@@ -154,8 +154,8 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
 // -----------------------------------------------------------------------
 
 /// Verify that DB failures during completion are logged but do not block
-/// the in-memory state machine. This is the policy decided in Group 4:
-/// DB writes are best-effort; the actor must not stall on DB unavailability.
+/// the in-memory state machine. DB writes are best-effort; the actor
+/// must not stall on DB unavailability.
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn test_db_failure_during_completion_logged() -> TestResult {
@@ -463,7 +463,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
 ///
 /// This tests the actor-side half of the log pipeline. The ring buffer
 /// (LogBuffers) is written directly by the gRPC recv task, not tested here —
-/// see logs.rs tests. The end-to-end gRPC wire test is in C10.
+/// see logs.rs tests. The end-to-end gRPC wire test is in grpc/tests.rs.
 ///
 /// Uses `setup()` (no worker): we send ForwardLogBatch directly to the actor,
 /// not via the gRPC BuildExecution stream. With no worker, no dispatch happens,

@@ -96,9 +96,9 @@ impl DagActor {
     ///   worker — it just disconnected, clearly something is wrong
     ///   there)
     /// - Poison detection (3 distinct failed workers → poisoned).
-    ///   Previously worker disconnect DIDN'T feed poison detection,
-    ///   so a derivation that crashed 3 workers in a row would
-    ///   loop forever (each crash = reassign = fresh attempt).
+    ///   If worker disconnect didn't feed poison detection, a
+    ///   derivation that crashed 3 workers in a row would loop
+    ///   forever (each crash = reassign = fresh attempt).
     ///
     /// `None` for callers that don't have a specific lost worker
     /// (none currently, but keeps the signature extensible).
@@ -111,8 +111,8 @@ impl DagActor {
             // Track the lost worker (in-mem + PG) + check poison
             // threshold BEFORE reset_to_ready — poison_and_cascade
             // expects Assigned/Running, not Ready. Without the
-            // threshold check (X6 fix), 3 sequential disconnects
-            // leave failed_workers={w1,w2,w3} with status=Ready →
+            // threshold check, 3 sequential disconnects leave
+            // failed_workers={w1,w2,w3} with status=Ready →
             // best_worker excludes all 3 → deferred forever.
             let should_poison = if let Some(worker_id) = lost_worker {
                 self.record_failure_and_check_poison(drv_hash, worker_id)
@@ -154,7 +154,7 @@ impl DagActor {
     /// assignments. `force=true` additionally reassigns in-flight.
     ///
     /// Returns `accepted=false` only for unknown worker_id. That's not
-    /// an error — the worker's preStop (D3) calls this AFTER receiving
+    /// an error — the worker's preStop calls this AFTER receiving
     /// SIGTERM, which may race with the BuildExecution stream closing
     /// (SIGTERM → select! break → stream drop → WorkerDisconnected →
     /// entry removed). In that race, drain is a no-op: the disconnect
@@ -196,7 +196,7 @@ impl DagActor {
                 force,
                 "worker draining"
             );
-            // E1's active_workers counts `is_registered() && !draining` —
+            // ClusterStatus.active_workers counts `is_registered() && !draining` —
             // but the gauge tracks is_registered() only (drain doesn't
             // decrement it; disconnect does). That's intentional: a
             // draining worker is still connected, still heartbeating,
@@ -560,7 +560,7 @@ impl DagActor {
             // reset_from_poison (in-mem) clears failed_workers +
             // retry_count; PG must match. Without this, crash after
             // reset → recovery loads stale failed_workers (3 workers)
-            // → immediately excluded from dispatch. (X13 fix)
+            // → immediately excluded from dispatch.
             if let Err(e) = self.db.clear_failed_workers_and_retry(&drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_workers clear");
             }

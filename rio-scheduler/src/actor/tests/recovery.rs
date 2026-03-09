@@ -138,8 +138,8 @@ async fn test_recovery_failure_degrades_to_empty_dag() -> TestResult {
     Ok(())
 }
 
-/// X4 regression: transient-failure retry must write Ready to PG,
-/// not Failed. Crash in backoff window with PG=Failed → recovery
+/// Transient-failure retry must write Ready to PG, not Failed.
+/// Crash in backoff window with PG=Failed → recovery
 /// loads it but only enqueues Ready-status drvs → hang forever.
 ///
 /// Test: seed PG with a Failed-status derivation (simulating the
@@ -175,8 +175,8 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     .await?;
     barrier(&handle).await;
 
-    // PG should show Ready (NOT Failed). This proves X4 fix: the
-    // transient-retry path now persists the FINAL in-mem state.
+    // PG should show Ready (NOT Failed) — the transient-retry path
+    // must persist the FINAL in-mem state, not the intermediate Failed.
     let (status,): (String,) =
         sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'x4-drv'")
             .fetch_one(&db.pool)
@@ -189,8 +189,8 @@ async fn test_transient_retry_pg_status_is_ready() -> TestResult {
     Ok(())
 }
 
-/// X5 regression: recovery must check build completion for builds
-/// whose derivations are ALL terminal. Crash between "last drv →
+/// Recovery must check build completion for builds whose derivations
+/// are ALL terminal. Crash between "last drv →
 /// Completed" and "build → Succeeded" → recovery loads build as
 /// Active with 0 non-terminal derivations → without the sweep,
 /// check_build_completion never fires → Active forever.
@@ -220,15 +220,15 @@ async fn test_recovery_completes_all_terminal_build() -> TestResult {
     handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle).await;
 
-    // X5 fix: the post-recovery sweep should fire check_build_
-    // completion for the build. With 0 recovered derivations
-    // (all terminal, filtered by db.rs:537), total=0, completed=0,
-    // failed=0 → all_completed → complete_build → Succeeded.
+    // The post-recovery sweep should fire check_build_completion
+    // for the build. With 0 recovered derivations (all terminal,
+    // filtered by TERMINAL_STATUSES), total=0, completed=0, failed=0
+    // → all_completed → complete_build → Succeeded.
     let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
-        "build with all-terminal drvs should be Succeeded after recovery (X5 fix)"
+        "build with all-terminal drvs should be Succeeded after recovery"
     );
 
     Ok(())
@@ -272,8 +272,8 @@ async fn merge_chain(
     Ok(rx.await??)
 }
 
-/// C4 regression: orphan-completion (outputs in store, worker didn't
-/// reconnect) must fire check_build_completion. Without this, if the
+/// Orphan-completion (outputs in store, worker didn't reconnect)
+/// must fire check_build_completion. Without this, if the
 /// orphan-completed drv was the LAST outstanding one, the build stays
 /// Active forever — no other completion will trigger the check.
 ///
@@ -364,19 +364,19 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
     assert_eq!(
         status.state,
         rio_proto::types::BuildState::Succeeded as i32,
-        "build should be Succeeded after orphan completion (C4 fix)"
+        "build should be Succeeded after orphan completion"
     );
 
     Ok(())
 }
 
-/// Y2: orphan-completion must unpin scheduler_live_pins.
+/// Orphan-completion must unpin scheduler_live_pins.
 ///
 /// Scenario: old scheduler dispatches drv → pins inputs → crashes.
 /// Worker finishes. New scheduler recovers → sweep_stale_live_pins
 /// KEEPS the pin (drv is Assigned in PG, non-terminal). Then
 /// ReconcileAssignments fires → orphan completion → drv Completed.
-/// Without Y2, pins leak until NEXT restart's sweep.
+/// Without the unpin, pins leak until NEXT restart's sweep.
 ///
 /// Same setup as test_orphan_completion_fires_build_completion but
 /// additionally seeds a scheduler_live_pins row (simulating the
@@ -462,7 +462,7 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
         .expect("drv exists");
     assert_eq!(post.status, DerivationStatus::Completed);
 
-    // Y2: pin should be GONE. Without the unpin in the orphan-
+    // Pin should be GONE. Without the unpin in the orphan-
     // completion branch, this would be 1 (leaked until next
     // scheduler restart).
     let pins_after_orphan: i64 =
@@ -471,22 +471,22 @@ async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
             .await?;
     assert_eq!(
         pins_after_orphan, 0,
-        "Y2: orphan completion should unpin (was {pins_after_orphan}, expected 0)"
+        "orphan completion should unpin (was {pins_after_orphan}, expected 0)"
     );
 
     Ok(())
 }
 
-/// Round 4 Z3: phantom-Assigned after crash-during-dispatch.
+/// Phantom-Assigned after crash-during-dispatch.
 ///
 /// Scenario: scheduler persists PG=Assigned+worker, crashes BEFORE
 /// try_send (the actual channel send to the worker). On restart,
-/// worker reconnects (heartbeat → in self.workers). Old
-/// reconcile_assignments saw "worker present, leave it" → drv
-/// stuck forever (worker never got it, no running_since →
-/// backstop timeout won't fire).
+/// worker reconnects (heartbeat → in self.workers). Without the
+/// running_builds cross-check, reconcile_assignments sees "worker
+/// present, leave it" → drv stuck forever (worker never got it,
+/// no running_since → backstop timeout won't fire).
 ///
-/// Z3 fix: cross-check worker.running_builds even when worker is
+/// The fix: cross-check worker.running_builds even when worker is
 /// present. If drv NOT in the worker's heartbeat, reconcile it
 /// (store-check → Completed, or reset → Ready).
 #[tokio::test]
@@ -539,8 +539,8 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
         "drv should be Assigned after recovery"
     );
 
-    // ReconcileAssignments → Z3 fix: worker present BUT drv not
-    // in running_builds → reconcile. No store client here, so
+    // ReconcileAssignments: worker present BUT drv not in
+    // running_builds → reconcile. No store client here, so
     // store-check fails → reset to Ready (not Completed).
     handle
         .send_unchecked(ActorCommand::ReconcileAssignments)
@@ -548,9 +548,9 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
     barrier(&handle).await;
 
     // THE KEY ASSERTION: drv should be Ready (or re-dispatched).
-    // Before Z3, it would stay Assigned forever — worker present
-    // meant "leave it, completion will arrive", but the worker
-    // never had it so no completion ever comes.
+    // Without the running_builds cross-check, it would stay Assigned
+    // forever — worker present meant "leave it, completion will
+    // arrive", but the worker never had it so no completion comes.
     let post = handle
         .debug_query_derivation("phantom-drv")
         .await?
@@ -576,10 +576,10 @@ async fn test_phantom_assigned_reconciled_when_worker_present() -> TestResult {
             .fetch_one(&sched_db.pool)
             .await?;
     // retry_count was 0 before recovery. reset_to_ready bumps it.
-    // If Z3 reconciled → retry_count >= 1. If stuck → still 0.
+    // If reconciled → retry_count >= 1. If stuck → still 0.
     assert!(
         retry_count >= 1,
-        "Z3: phantom Assigned should be reset (retry_count bumped), got {retry_count}"
+        "phantom Assigned should be reset (retry_count bumped), got {retry_count}"
     );
 
     Ok(())

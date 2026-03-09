@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 
 use crate::MIGRATOR;
 
-/// T6: End-to-end BuildExecution bidirectional stream.
+/// End-to-end BuildExecution bidirectional stream.
 ///
 /// Spins up an in-process WorkerServiceServer backed by a real actor,
 /// connects a mock worker via gRPC, sends WorkerRegister + Heartbeat,
@@ -394,8 +394,9 @@ async fn test_submit_build_rejects_oversized_drv_content() {
 }
 
 /// SubmitBuild with an unrecognized priority_class should be rejected
-/// at the gRPC boundary (PriorityClass::FromStr). Previously this leaked
-/// as a PostgreSQL CHECK constraint violation in Status::internal.
+/// at the gRPC boundary (PriorityClass::FromStr). Without gRPC-level
+/// validation, this leaks as a PostgreSQL CHECK constraint violation
+/// in Status::internal.
 #[tokio::test]
 async fn test_submit_build_rejects_invalid_priority_class() {
     let db = TestDb::new(&MIGRATOR).await;
@@ -683,7 +684,7 @@ async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
 }
 
 // ===========================================================================
-// C5: since_sequence replay (PG event log + subscribe-first dedup)
+// since_sequence replay (PG event log + subscribe-first dedup)
 // ===========================================================================
 
 /// Minimal BuildEvent for replay tests. Prost-encoded (same as

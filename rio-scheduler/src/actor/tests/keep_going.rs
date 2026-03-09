@@ -180,9 +180,9 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
 
 /// When a new build depends on an already-poisoned derivation (from a
 /// prior build), compute_initial_states must mark the new node
-/// DependencyFailed immediately. Previously it went to Queued and hung
-/// forever (never Ready, never cascaded since cascade only runs on
-/// *transition to* Poisoned).
+/// DependencyFailed immediately. Without this check, it would go to
+/// Queued and hang forever (never Ready, never cascaded since cascade
+/// only runs on *transition to* Poisoned).
 #[tokio::test]
 async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult {
     let (_db, handle, _task, _stream_rx) =

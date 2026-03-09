@@ -188,18 +188,18 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
     Ok(())
 }
 
-/// Round 4 Z1: When check_cached_outputs fails with StoreUnavailable,
-/// the build row must be cleanly deleted — no orphan left in PG.
+/// When check_cached_outputs fails with StoreUnavailable, the build
+/// row must be cleanly deleted — no orphan left in PG.
 ///
-/// Before the reorder, check_cached_outputs ran AFTER persist_merge_to_db
-/// + transition_build(Active). cleanup_failed_merge called delete_build
-/// which FK-failed silently because build_derivations rows existed
-/// (no ON DELETE CASCADE). On failover, recovery would resurrect the
-/// orphan build and run it — client got StoreUnavailable but the build
-/// silently executed later.
+/// If check_cached_outputs ran AFTER persist_merge_to_db +
+/// transition_build(Active), cleanup_failed_merge's delete_build
+/// would FK-fail silently because build_derivations rows existed.
+/// On failover, recovery would resurrect the orphan build and run
+/// it — client got StoreUnavailable but the build silently
+/// executed later.
 ///
-/// After the reorder, check_cached_outputs runs BEFORE persist so the
-/// rollback is in-memory only. Migration 008 also adds CASCADE as
+/// check_cached_outputs runs BEFORE persist so the rollback is
+/// in-memory only. Migration 008 also adds CASCADE as
 /// defense-in-depth.
 #[tokio::test]
 async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
@@ -252,9 +252,8 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
     assert!(matches!(reply, Err(ActorError::StoreUnavailable)));
 
     // === The actual assertion: NO orphan build rows in PG ===
-    // Before round 4, the tripped build would have an orphan row
-    // (delete_build FK-failed silently). Now cleanup_failed_merge
-    // succeeds because check_cached_outputs runs before persist.
+    // cleanup_failed_merge succeeds because check_cached_outputs
+    // runs before persist (rollback is in-memory only).
     let tripped_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM builds WHERE build_id = $1)")
             .bind(trip_id)

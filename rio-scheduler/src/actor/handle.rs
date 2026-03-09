@@ -54,7 +54,7 @@ impl ActorHandle {
         size_classes: Vec<crate::assignment::SizeClassConfig>,
     ) -> Self {
         // Non-K8s default: always leader, generation stays at 1.
-        // For K8s deployments main.rs calls spawn_with_lease().
+        // For K8s deployments main.rs calls spawn_with_leader().
         Self::spawn_with_leader(
             db,
             store_client,

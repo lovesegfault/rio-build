@@ -1,7 +1,7 @@
 use super::*;
 
 // -----------------------------------------------------------------------
-// Group 1: Worker-Scheduler wiring
+// Worker-Scheduler wiring
 // -----------------------------------------------------------------------
 
 /// Baseline: when a worker connects (stream) and sends a heartbeat with
@@ -65,16 +65,16 @@ async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
 }
 
 // -----------------------------------------------------------------------
-// Group 2: State machine integrity
+// State machine integrity
 // -----------------------------------------------------------------------
 
 /// When a worker disconnects while a derivation is Running, the derivation
 /// should transition Running -> Failed -> Ready (through the state machine),
 /// and retry_count should be incremented.
 ///
-/// Before fix: the direct `state.status = Ready` assignment bypassed the
-/// state machine (Running -> Ready is not a valid transition) and did NOT
-/// increment retry_count.
+/// Regression guard: a direct `state.status = Ready` assignment would
+/// bypass the state machine (Running -> Ready is not a valid transition)
+/// and NOT increment retry_count.
 #[tokio::test]
 async fn test_worker_disconnect_running_derivation() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
@@ -134,7 +134,7 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
 }
 
 // -----------------------------------------------------------------------
-// Group 4: Silent failures
+// Silent failures
 // -----------------------------------------------------------------------
 
 /// A completion with InfrastructureFailure status should transition the
@@ -202,7 +202,7 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Send completion with extreme timestamps that would overflow i64 subtraction.
-    // Pre-fix: stop.seconds - start.seconds = i64::MAX - i64::MIN overflows (panic in debug).
+    // Without saturating-sub: stop.seconds - start.seconds = i64::MAX - i64::MIN overflows (panic in debug).
     handle
         .send_unchecked(ActorCommand::ProcessCompletion {
             worker_id: "test-worker".into(),
@@ -245,7 +245,7 @@ async fn test_completion_with_extreme_timestamps() -> TestResult {
 }
 
 // -----------------------------------------------------------------------
-// Group 6: Feature completions
+// Feature completions
 // -----------------------------------------------------------------------
 
 /// Interactive (IFD) builds should jump to the front of the ready queue.

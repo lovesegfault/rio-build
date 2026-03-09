@@ -3,7 +3,7 @@
 //! `helpers` is `pub(crate)` so grpc.rs tests can import `make_test_node` and
 //! `setup_actor` via `crate::actor::tests::{make_test_node, setup_actor}`.
 
-#![allow(dead_code)] // Helpers used progressively across Group 1-10 TDD tests
+#![allow(dead_code)] // Helpers used by multiple test submodules
 
 // Bring actor types into this module's scope so submodules see them via `use super::*;`.
 pub(crate) use super::*;

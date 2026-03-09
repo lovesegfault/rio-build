@@ -1,6 +1,6 @@
 //! Build duration estimation from historical data.
 //!
-//! Feeds critical-path priority (D4) and size-class routing (D7).
+//! Feeds critical-path priority and size-class routing.
 //! The estimate is a HINT — a wrong estimate means suboptimal scheduling
 //! (short job waits behind long job), not incorrectness. So we err on the
 // r[impl sched.estimate.fallback-chain]
@@ -14,9 +14,9 @@
 //!    of the same package usually take similar time)
 //! 3. Default: 30 seconds (configurable constant)
 //!
-//! Closure-size-as-proxy (scheduler.md fallback 2): now wired via
-//! `input_srcs_nar_size` from the gateway (J1+J2). "A derivation
-//! with 10GB of sources probably takes longer than one with 100MB."
+//! Closure-size-as-proxy (scheduler.md fallback 2): wired via
+//! `input_srcs_nar_size` from the gateway. "A derivation with 10GB
+//! of sources probably takes longer than one with 100MB."
 //! Slots between the pname fallback and the 30s default.
 //!
 //! # Refresh, not live
@@ -96,7 +96,7 @@ impl Estimator {
     /// `system` is required (every derivation has one). But it only
     /// matters for fallback #1; fallback #2 ignores it.
     ///
-    /// `input_srcs_nar_size` from the proto (J1). 0 = no-signal
+    /// `input_srcs_nar_size` from the proto. 0 = no-signal
     /// (empty srcs, or gateway's batch QueryPathInfo failed).
     pub fn estimate(&self, pname: Option<&str>, system: &str, input_srcs_nar_size: u64) -> f64 {
         // Fallbacks #1, #2: history-based. Require pname. If None,
@@ -142,10 +142,10 @@ impl Estimator {
         DEFAULT_DURATION_SECS
     }
 
-    /// Look up peak memory for size-class bumping (D7).
+    /// Look up peak memory for size-class bumping.
     ///
     /// `None` means no history OR no memory data (VmHWM not wired yet).
-    /// D7 treats `None` as "no bump" — duration-based classification only.
+    /// Treated as "no bump" — duration-based classification only.
     pub fn peak_memory(&self, pname: Option<&str>, system: &str) -> Option<f64> {
         let pname = pname?;
         self.history

@@ -67,7 +67,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     Ok(())
 }
 
-/// T1: Heartbeat timeout deregisters worker and reassigns its builds.
+/// Heartbeat timeout deregisters worker and reassigns its builds.
 /// Instead of advancing time (PG timeout issue), we send Tick commands
 /// after manipulating the worker's last_heartbeat via multiple Tick cycles
 /// without heartbeats. Actually simpler: send WorkerDisconnected directly
@@ -105,7 +105,7 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
 // ===========================================================================
 
 /// A poisoned derivation is reset to Created after POISON_TTL elapses and
-/// a Tick is processed. Covers actor/worker.rs:178-201 (poison-expiry loop)
+/// a Tick is processed. Covers the poison-expiry loop in handle_tick
 /// and state/mod.rs:reset_from_poison.
 #[tokio::test]
 async fn test_tick_expires_poisoned_derivation() -> TestResult {
@@ -156,9 +156,9 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     Ok(())
 }
 
-/// X6 regression: 3 sequential worker disconnects with the same
-/// derivation must poison it (not leave it Ready-but-undispatchable
-/// because best_worker excludes all 3 failed workers).
+/// 3 sequential worker disconnects with the same derivation must
+/// poison it (not leave it Ready-but-undispatchable because
+/// best_worker excludes all 3 failed workers).
 #[tokio::test]
 async fn test_three_worker_disconnects_poisons() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -178,7 +178,7 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
             "worker {i} should get x6-drv"
         );
 
-        // Disconnect. reassign_derivations runs → X6 fix checks
+        // Disconnect. reassign_derivations runs → checks
         // POISON_THRESHOLD. For i<2: reset to Ready + next worker
         // gets it. For i==2: poison.
         handle
@@ -192,9 +192,9 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
         drop(rx);
     }
 
-    // After 3 disconnects: drv should be Poisoned (X6 fix).
-    // Without the fix: Ready with failed_workers={w0,w1,w2}, never
-    // dispatchable.
+    // After 3 disconnects: drv should be Poisoned. Without the
+    // poison check in reassign_derivations: Ready with
+    // failed_workers={w0,w1,w2}, never dispatchable.
     let info = handle
         .debug_query_derivation("x6-drv")
         .await?
@@ -202,7 +202,7 @@ async fn test_three_worker_disconnects_poisons() -> TestResult {
     assert_eq!(
         info.status,
         DerivationStatus::Poisoned,
-        "3 worker disconnects should poison (X6 fix); got {:?}",
+        "3 worker disconnects should poison; got {:?}",
         info.status
     );
 

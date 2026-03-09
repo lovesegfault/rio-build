@@ -91,7 +91,7 @@ pub enum ActorCommand {
         /// WorkerState for assignment scoring.
         bloom: Option<rio_common::bloom::BloomFilter>,
         /// Size-class from worker config (e.g. "small", "large"). gRPC
-        /// maps empty-string → None. Stored on WorkerState for D7's
+        /// maps empty-string → None. Stored on WorkerState for the
         /// classify() → best_worker() filter.
         size_class: Option<String>,
     },
@@ -231,11 +231,10 @@ pub enum ActorCommand {
     /// poison tests that need to drive multiple completion cycles
     /// without waiting for real backoff durations.
     ///
-    /// Previously those tests relied on immediate re-dispatch after
-    /// failure (the Phase 2a "retry immediately" behavior). With
-    /// Phase 3b backoff + failed_workers exclusion, dispatch won't
-    /// re-assign immediately. This helper lets tests control the
-    /// state machine directly.
+    /// With backoff + failed_workers exclusion, dispatch won't
+    /// re-assign immediately after a failure. This helper lets tests
+    /// control the state machine directly instead of waiting for
+    /// real backoff durations.
     #[cfg(test)]
     DebugForceAssign {
         drv_hash: String,
@@ -277,9 +276,8 @@ pub struct ClusterSnapshot {
     /// heartbeat-only) and draining.
     pub total_workers: u32,
     /// `is_registered() && !draining`. The dispatchable population.
-    /// E2 adds the draining flag; until then this equals registered.
     pub active_workers: u32,
-    /// `draining` flag set. 0 until E2.
+    /// `draining` flag set.
     pub draining_workers: u32,
     /// `BuildState::Pending` — merged but not yet active.
     pub pending_builds: u32,
@@ -356,7 +354,7 @@ impl BackpressureReader {
 
 /// Read-only view of the leader generation counter.
 ///
-/// Same pattern as [`BackpressureReader`]: the lease task (C2) is the
+/// Same pattern as [`BackpressureReader`]: the lease task is the
 /// sole writer (via `fetch_add` on the inner Arc it holds directly);
 /// everyone else observes. `HeartbeatResponse.generation` and
 /// `WorkAssignment.generation` both read from here — workers compare
@@ -364,7 +362,7 @@ impl BackpressureReader {
 ///
 /// `Acquire` not `Relaxed`: the generation is a fence. When the lease
 /// task acquires leadership and increments, it also sets
-/// `is_leader=true` (C2). A reader seeing the new generation should
+/// `is_leader=true`. A reader seeing the new generation should
 /// also see the new leader state. Relaxed would be fine in practice
 /// (the atomic itself has no reordering peers here) but Acquire makes
 /// the pairing with the lease task's Release store explicit.

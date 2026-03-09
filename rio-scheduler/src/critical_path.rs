@@ -81,15 +81,11 @@ pub fn compute_initial(
     // In-degree = number of PARENTS in the new set. Leaves (in-degree
     // 0) go first. Kahn's algorithm.
     //
-    // Why parents-in-new-set, not children? Priority flows UP from
-    // children to parents. We need children processed first. A node's
-    // "dependencies" for topo-sort purposes are its children (we need
-    // their priority before computing ours). In-degree counts how many
-    // of our children-in-new-set haven't been processed yet... wait,
-    // no. Kahn's: in-degree counts incoming edges. We want children
-    // processed before parents, so edges point child→parent (data
-    // flow). A node's in-degree = number of children in the new set.
-    // When all children are processed (in-degree = 0), process the node.
+    // Priority flows UP from children to parents, so we need children
+    // processed first. For Kahn's algorithm, edges point child→parent
+    // (data flow). A node's in-degree = number of children in the new
+    // set. When all children are processed (in-degree = 0), process
+    // the node.
     let mut in_degree: HashMap<DrvHash, usize> = HashMap::new();
     for hash in newly_inserted {
         let children_in_new = dag
@@ -375,12 +371,6 @@ mod tests {
         compute_initial(&mut dag, &test_estimator(), &merge1.newly_inserted);
         assert_eq!(dag.node("a").unwrap().priority, 30.0);
 
-        // Second merge: c depends on a. c=30. a was 30; now c's
-        // priority = 30+30=60, and a is unchanged (no new children).
-        // But wait — c is a's PARENT, not child. a's priority stays 30.
-        // c's priority = 30 (c) + 30 (a) = 60.
-        //
-        // Actually the interesting case is new CHILD. Let me fix:
         // Second merge: b depends on c (new). c=30. Now b has a child
         // with priority 30. b was 20; now 20+30=50. a should propagate:
         // 10+50=60.

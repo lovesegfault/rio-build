@@ -190,7 +190,7 @@ pub struct DerivationState {
     pub assigned_size_class: Option<String>,
     /// ATerm-serialized .drv content, inlined by the gateway for
     /// nodes that will actually dispatch (outputs missing from store).
-    /// Empty = worker fetches from store via GetPath (the pre-D8
+    /// Empty = worker fetches from store via GetPath (fallback
     /// path, still works). Forwarded verbatim into WorkAssignment.
     /// ≤256 KB bound enforced at gRPC ingress.
     pub drv_content: Vec<u8>,
@@ -203,8 +203,8 @@ pub struct DerivationState {
     /// Realized output store paths (filled on completion).
     pub output_paths: Vec<String>,
     /// Expected output paths (from the proto node at merge time).
-    /// Used for: cache-check (merge.rs), transfer-cost scoring (D6),
-    /// and as the closure approximation for locality (children's
+    /// Used for: cache-check (merge.rs), transfer-cost scoring, and
+    /// as the closure approximation for locality (children's
     /// expected_output_paths = parent's inputs).
     pub expected_output_paths: Vec<String>,
     /// Estimated build duration (from Estimator). Set at merge time;
@@ -213,7 +213,7 @@ pub struct DerivationState {
     /// change the OPTIMAL schedule mid-execution — what's queued is
     /// queued).
     pub est_duration: f64,
-    /// Sum of input_srcs nar_sizes from the proto (J1). Passed to
+    /// Sum of input_srcs nar_sizes from the proto. Passed to
     /// `Estimator::estimate()` for the closure-size-as-proxy fallback
     /// when there's no `build_history` entry. 0 = no-signal (empty
     /// srcs, or gateway's QueryPathInfo batch failed).
@@ -226,8 +226,8 @@ pub struct DerivationState {
     /// Critical-path priority: `est_duration + max(children's priority)`.
     /// Bottom-up: leaves have `priority = est_duration`; roots have
     /// the sum along the longest path. Higher = more urgent (dispatch
-    /// first). Recomputed incrementally on completion (D4) via
-    /// ancestor-walk. D5 uses this for BinaryHeap ordering.
+    /// first). Recomputed incrementally on completion via
+    /// ancestor-walk. The ready queue uses this for BinaryHeap ordering.
     pub priority: f64,
     /// Database UUID (set after insertion).
     pub db_id: Option<Uuid>,
@@ -315,7 +315,7 @@ impl DerivationState {
     /// poisoned forever until a new build re-merges it.
     ///
     /// `drv_content` is empty — worker fetches from store via
-    /// GetPath (the pre-D8 path, still supported in executor).
+    /// GetPath (fallback path, still supported in executor).
     ///
     /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
     /// happen (it was validated at merge time before persist) but

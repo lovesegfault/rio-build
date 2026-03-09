@@ -96,28 +96,17 @@ impl ReadyQueue {
     ///
     /// Different from the old `push_back`/`push_front` dedup: that
     /// was "ignore if present". This is "update priority if present".
-    /// The D4 critical-path machinery can change a node's priority
+    /// The critical-path machinery can change a node's priority
     /// after it's already queued.
     pub fn push(&mut self, hash: DrvHash, priority: f64) {
-        if self.members.contains(&hash) {
-            // Already present — mark the OLD entry as removed (we
-            // can't find it in the heap to edit it). The new entry
-            // goes in with the new priority. The old entry's hash is
-            // in `removed`, so pop() skips it... but wait, the NEW
-            // entry has the same hash. pop() would skip it too.
-            //
-            // Fix: don't add to removed; just push again. pop()
-            // will see two entries for the same hash. The FIRST one
-            // popped (higher priority) is returned; members.remove()
-            // marks the hash as gone; the SECOND one pops later and
-            // is skipped (not in members). This works because pop()
-            // checks members, not removed, for the final gate.
-            //
-            // Actually, let me re-check the pop logic. It needs to
-            // be: skip if (in removed) OR (not in members). Let me
-            // simplify: just use members. removed is redundant if
-            // we check members in pop.
-        }
+        // Already-present case: just push again without touching
+        // `removed`. pop() sees two entries for the same hash; the
+        // FIRST popped (higher priority) wins and removes the hash
+        // from `members`; the SECOND is later skipped because it's
+        // no longer in `members`. The `members` check in pop()
+        // handles dedup — `removed` is only for explicit
+        // cancellation.
+        //
         // Insert returns true if newly added. Either way we push.
         self.members.insert(hash.clone());
         self.seq = self.seq.wrapping_add(1);

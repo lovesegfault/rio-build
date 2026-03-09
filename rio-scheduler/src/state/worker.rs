@@ -227,10 +227,9 @@ mod tests {
     }
 
     /// Features: all-match. Derivation needing [kvm, big-parallel]
-    /// dispatches only to workers with BOTH. Previously features
-    /// was hardcoded to Vec::new() in worker heartbeat — this test
-    /// proves the scheduler side correctly honors them now that
-    /// they flow through.
+    /// dispatches only to workers with BOTH. This test proves the
+    /// scheduler side correctly honors features when they flow
+    /// through from the worker heartbeat.
     #[test]
     fn can_build_features_all_match() {
         let w = registered_worker(vec!["x86_64-linux"], vec!["kvm", "big-parallel"]);
@@ -269,7 +268,7 @@ mod tests {
         assert!(d1.as_secs_f64() > 7.0 && d1.as_secs_f64() < 13.0);
     }
 
-    /// X20 regression: backoff_max_secs = infinity (e.g., from a
+    /// Regression: backoff_max_secs = infinity (e.g., from a
     /// misconfigured TOML that had "inf" literally) must not panic
     /// in Duration::from_secs_f64. The 1-year clamp catches it.
     #[test]

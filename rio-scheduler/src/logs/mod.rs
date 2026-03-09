@@ -52,7 +52,7 @@ type Line = (u64, Vec<u8>);
 ///
 /// `drv_path` (not `drv_hash`) because that's what `BuildLogBatch` carries.
 /// A derivation is built exactly once even if N builds want it (DAG merging),
-/// so one ring buffer per drv_path is correct — the S3 flush (C8) writes one
+/// so one ring buffer per drv_path is correct — the S3 flush writes one
 /// blob and N `build_logs` PG rows (one per interested build, same s3_key).
 pub struct LogBuffers {
     buffers: DashMap<String, VecDeque<Line>>,
@@ -98,7 +98,7 @@ impl LogBuffers {
 
     /// Drain all lines for a derivation, removing the buffer entry.
     ///
-    /// Called on completion flush (C8). Returns `None` if the buffer doesn't
+    /// Called on completion flush. Returns `None` if the buffer doesn't
     /// exist (never logged anything, or already drained).
     ///
     /// Returns `(line_count, total_bytes, lines_in_order)`. `line_count` may
@@ -122,7 +122,7 @@ impl LogBuffers {
 
     /// Read lines with line number ≥ `since`, non-consuming.
     ///
-    /// For `AdminService.GetBuildLogs` (C9) — lets a late-joining dashboard
+    /// For `AdminService.GetBuildLogs` — lets a late-joining dashboard
     /// client catch up from the ring buffer without blocking on S3.
     ///
     /// Returns `(line_number, line_bytes)` pairs. Empty vec if the buffer

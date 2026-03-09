@@ -322,7 +322,7 @@ impl SchedulerDb {
     }
 
     // -----------------------------------------------------------------------
-    // X9: scheduler_live_pins — auto-pin live-build input closure
+    // scheduler_live_pins — auto-pin live-build input closure
     //
     // Scheduler+store share PG (same migrations/ dir). Scheduler writes
     // directly to scheduler_live_pins; store's gc/mark.rs seeds from it.
@@ -540,9 +540,9 @@ impl SchedulerDb {
     }
 
     /// Delete the in-progress assignment for a derivation.
-    /// Round 4 Z15: called from dispatch.rs on try_send failure to
-    /// clean up the PG row that insert_assignment wrote (no worker
-    /// ever got the assignment, so the row is misleading on recovery).
+    /// Called from dispatch.rs on try_send failure to clean up the
+    /// PG row that insert_assignment wrote (no worker ever got the
+    /// assignment, so the row is misleading on recovery).
     ///
     /// Only deletes `pending`/`acknowledged` rows — terminal rows
     /// are audit-valuable even for stale derivations.
@@ -603,11 +603,10 @@ impl SchedulerDb {
     /// type-complexity lint, and naming it documents the field order
     /// at the one place where it's easy to mix up (3 f64-ish fields).
     ///
-    /// 5-tuple as of I3 (cpu added). Estimator::refresh signature
-    /// changes to match. The estimator doesn't USE cpu_cores yet
-    /// (size-class routing bumps on memory only, not cpu) but reading
-    /// it now means future cpu-bump logic is a pure-estimator change,
-    /// no DB roundtrip.
+    /// 5-tuple (cpu included). Estimator::refresh signature matches.
+    /// The estimator doesn't USE cpu_cores yet (size-class routing
+    /// bumps on memory only, not cpu) but reading it now means future
+    /// cpu-bump logic is a pure-estimator change, no DB roundtrip.
     ///
     /// The estimator loads this into a HashMap at startup and refreshes
     /// on Tick (every 60s). A full table scan is fine: even 10k distinct
@@ -789,12 +788,12 @@ impl SchedulerDb {
     ///
     /// PG: any arithmetic with NULL yields NULL; COALESCE picks first non-NULL.
     ///
-    /// # Phase2c memory correction
+    /// # Historical memory data
     ///
-    /// Prior to I2 the worker sent VmHWM of nix-daemon (~10MB
+    /// Older worker versions sent VmHWM of nix-daemon (~10MB
     /// regardless of builder memory). cgroup memory.peak fixes that.
-    /// Existing build_history rows have the WRONG memory values. With
-    /// EMA alpha=0.3, ~10 completions per (pname,system) washes the
+    /// If existing build_history rows have wrong memory values, EMA
+    /// alpha=0.3 means ~10 completions per (pname,system) washes the
     /// bad data out (0.7^10 ≈ 2.8% of the old value remains). No
     /// migration needed — time heals it.
     pub async fn update_build_history(
@@ -1292,7 +1291,7 @@ mod tests {
         Ok(())
     }
 
-    /// D3's estimator reads `ema_peak_memory_bytes` for D7's memory-bump
+    /// The estimator reads `ema_peak_memory_bytes` for memory-bump
     /// classify(). Verify the write→read roundtrip works end to end.
     #[tokio::test]
     async fn test_build_history_memory_roundtrip_read() -> anyhow::Result<()> {
@@ -1321,8 +1320,8 @@ mod tests {
             "peak mem: {:?}",
             row.3
         );
-        // I3: cpu_cores round-trips too. Verifies the new column is
-        // in both the INSERT and the SELECT.
+        // cpu_cores round-trips too. Verifies the column is in both
+        // the INSERT and the SELECT.
         assert!(
             row.4.is_some_and(|c| (c - 4.5).abs() < 0.001),
             "peak cpu cores: {:?}",
@@ -1331,7 +1330,7 @@ mod tests {
         Ok(())
     }
 
-    /// I3: cpu_cores uses the same COALESCE(blend, new, old) pattern as
+    /// cpu_cores uses the same COALESCE(blend, new, old) pattern as
     /// memory. A build that exits in <1s (before the 1Hz poller
     /// samples) reports 0.0 → None → column unchanged. The next real
     /// build blends properly. Same "no signal doesn't drag" semantics.

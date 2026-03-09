@@ -37,10 +37,10 @@ async fn test_transient_retry_different_worker() -> TestResult {
     )
     .await?;
 
-    // Should be retried: retry_count=1. Phase 3b: backoff_until
-    // is set so the derivation stays Ready (not immediately re-
-    // dispatched). failed_workers contains first_worker so when
-    // backoff elapses, retry goes to the OTHER worker.
+    // Should be retried: retry_count=1. backoff_until is set so
+    // the derivation stays Ready (not immediately re-dispatched).
+    // failed_workers contains first_worker so when backoff elapses,
+    // retry goes to the OTHER worker.
     let info2 = handle
         .debug_query_derivation("retry-hash")
         .await?
@@ -50,11 +50,10 @@ async fn test_transient_retry_different_worker() -> TestResult {
         "transient failure should increment retry_count"
     );
     // Status: Ready with backoff_until set. NOT Assigned — backoff
-    // blocks immediate re-dispatch (that was the Phase 2a bug where
-    // a 5s backoff was computed but never used). If it IS Assigned,
-    // dispatch raced us between complete_failure and query — still
-    // fine for the test, the worker must be different (failed_
-    // workers exclusion).
+    // blocks immediate re-dispatch. If it IS Assigned, dispatch
+    // raced us between complete_failure and query — still fine for
+    // the test, the worker must be different (failed_workers
+    // exclusion).
     match info2.status {
         DerivationStatus::Ready => {
             // Backoff active: assigned_worker cleared.
@@ -81,13 +80,10 @@ async fn test_transient_retry_different_worker() -> TestResult {
 /// max_retries` branch, distinct from POISON_THRESHOLD 3-distinct-
 /// workers).
 ///
-/// Phase 3b update: uses `debug_force_assign` between failures.
-/// Previously relied on immediate re-dispatch, but backoff_until
-/// + failed_workers exclusion now prevent the same worker from
-/// getting the derivation back immediately (which is the CORRECT
-/// behavior — same-worker-retry was a bug). The test drives the
-/// state machine directly to test the completion handler's
-/// max_retries logic, not dispatch.
+/// Uses `debug_force_assign` between failures to bypass backoff_until
+/// and failed_workers exclusion (which correctly prevent immediate
+/// same-worker retry). The test drives the state machine directly to
+/// test the completion handler's max_retries logic, not dispatch.
 #[tokio::test]
 async fn test_transient_failure_max_retries_poisons() -> TestResult {
     let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux", 1).await?;
@@ -134,7 +130,7 @@ async fn test_transient_failure_max_retries_poisons() -> TestResult {
     Ok(())
 }
 
-/// T4: Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
+/// Derivation poisoned after POISON_THRESHOLD (3) distinct worker failures.
 #[tokio::test]
 async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     let (_db, handle, _task) = setup().await;
@@ -153,11 +149,11 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
 
     // Send TransientFailure from 3 DISTINCT workers. After the 3rd, poison.
     //
-    // debug_force_assign between failures: Phase 3b's backoff_until
-    // prevents immediate re-dispatch after each failure. The test
-    // drives the assignment directly — we're testing the poison-
-    // threshold logic (3 distinct failed_workers → poisoned), not
-    // dispatch timing.
+    // debug_force_assign between failures: backoff_until prevents
+    // immediate re-dispatch after each failure. The test drives
+    // the assignment directly — we're testing the poison-threshold
+    // logic (3 distinct failed_workers → poisoned), not dispatch
+    // timing.
     for (i, worker) in ["poison-w1", "poison-w2", "poison-w3"].iter().enumerate() {
         if i > 0 {
             // After the first failure, dispatch won't re-assign
@@ -198,7 +194,7 @@ async fn test_poison_threshold_after_distinct_workers() -> TestResult {
     Ok(())
 }
 
-/// T5: Completing a child releases its parent to Ready in a dependency chain.
+/// Completing a child releases its parent to Ready in a dependency chain.
 #[tokio::test]
 async fn test_dependency_chain_releases_parent() -> TestResult {
     let (_db, handle, _task, mut stream_rx) =
@@ -257,7 +253,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     Ok(())
 }
 
-/// T9: Duplicate ProcessCompletion is an idempotent no-op.
+/// Duplicate ProcessCompletion is an idempotent no-op.
 #[tokio::test]
 async fn test_duplicate_completion_idempotent() -> TestResult {
     let (_db, handle, _task, _stream_rx) =

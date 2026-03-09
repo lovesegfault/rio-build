@@ -158,7 +158,7 @@ pub fn describe_metrics() {
         "BuildEvents dropped from PG persister (channel backpressure). \
          Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
     );
-    // Round 4 Z19: 8 scheduler metrics were emitted but not described.
+    // The following metrics are emitted from actor internals.
     describe_counter!(
         "rio_scheduler_backstop_timeouts_total",
         "Derivations reset to Ready after running-since exceeded backstop (worker went silent)"

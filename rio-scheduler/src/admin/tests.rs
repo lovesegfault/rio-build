@@ -10,8 +10,8 @@ use tokio_stream::StreamExt;
 /// Set up `AdminServiceImpl` with a live actor but no S3.
 ///
 /// The GetBuildLogs tests don't exercise the actor (they hit ring
-/// buffer or S3 directly), but the constructor needs a handle since
-/// E1. `setup_actor` gives a real actor backed by the same PG — no
+/// buffer or S3 directly), but the constructor needs a handle.
+/// `setup_actor` gives a real actor backed by the same PG — no
 /// mocks needed. The `_task` keeps the actor task alive; dropping
 /// the returned tuple drops the handle → channel closes → actor
 /// shuts down cleanly.
@@ -233,9 +233,9 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
 async fn stubs_return_unimplemented() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
 
-    // ClusterStatus (E1), DrainWorker (E2), TriggerGC (Phase 3b)
-    // are no longer stubs. TriggerGC is tested separately (proxy
-    // to store); here we just confirm the remaining stubs.
+    // ClusterStatus, DrainWorker, TriggerGC are no longer stubs.
+    // TriggerGC is tested separately (proxy to store); here we just
+    // confirm the remaining stubs.
     assert_eq!(
         svc.list_workers(Request::new(ListWorkersRequest::default()))
             .await
@@ -320,7 +320,7 @@ fn gunzip_and_chunk_since_filtering() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
-// ClusterStatus (E1)
+// ClusterStatus
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -381,7 +381,7 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
         resp.active_workers, 1,
         "only 'full' is registered (stream+heartbeat); 'stream-only' has no heartbeat"
     );
-    assert_eq!(resp.draining_workers, 0, "E2 adds draining; 0 until then");
+    assert_eq!(resp.draining_workers, 0, "no workers draining");
     Ok(())
 }
 
@@ -470,7 +470,7 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
-// DrainWorker (E2)
+// DrainWorker
 // -----------------------------------------------------------------------
 
 #[tokio::test]

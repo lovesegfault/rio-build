@@ -271,8 +271,8 @@ impl DagActor {
             // subscribed so there's at least one.
             //
             // This re-send uses seq == last_seq. With PG replay
-            // active (C5), the gRPC bridge dedups seq ≤ last_seq
-            // from broadcast — so this event is SKIPPED there. That's
+            // active, the gRPC bridge dedups seq ≤ last_seq from
+            // broadcast — so this event is SKIPPED there. That's
             // fine: PG replay already delivered the real terminal
             // event (emit_build_event persisted it). This re-send is
             // now a safety net for when PG replay FAILS (store down)
@@ -325,9 +325,9 @@ impl DagActor {
     }
 
     pub(super) async fn complete_build(&mut self, build_id: Uuid) -> Result<(), ActorError> {
-        // Round 4 Z4: skip all side effects if transition was rejected
-        // (already terminal). Before this, a double-complete would emit
-        // a spurious BuildCompleted event + metric + cleanup schedule.
+        // Skip all side effects if transition was rejected (already
+        // terminal). Otherwise a double-complete would emit a spurious
+        // BuildCompleted event + metric + cleanup schedule.
         if self
             .transition_build(build_id, BuildState::Succeeded)
             .await?
@@ -377,7 +377,7 @@ impl DagActor {
             })
             .unwrap_or_default();
 
-        // Round 4 Z4: skip side effects on Rejected (already terminal).
+        // Skip side effects on Rejected (already terminal).
         if self.transition_build(build_id, BuildState::Failed).await? == TransitionOutcome::Rejected
         {
             debug!(build_id = %build_id, "transition_build_to_failed: rejected (already terminal), skipping side effects");
@@ -404,13 +404,11 @@ impl DagActor {
     /// in-memory state machine rejected the transition (e.g., already
     /// terminal → Succeeded would double-complete).
     ///
-    /// Round 4 Z4: prior to this, rejection returned `Ok(())`
-    /// indistinguishably from success. Callers (complete_build,
-    /// transition_build_to_failed) would then emit spurious
-    /// BuildCompleted events + metrics + schedule cleanup. Combined
-    /// with Z1 (orphan builds) + Z16 (0-derivation builds complete
-    /// trivially), a resurrected orphan would emit a spurious
-    /// BuildCompleted with empty output_paths to the gateway.
+    /// Callers (complete_build, transition_build_to_failed) check
+    /// the outcome and skip side effects on Rejected — otherwise a
+    /// double-complete or resurrected orphan build would emit a
+    /// spurious BuildCompleted event (with empty output_paths) to
+    /// the gateway.
     pub(super) async fn transition_build(
         &mut self,
         build_id: Uuid,

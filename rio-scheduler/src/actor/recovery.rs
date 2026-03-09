@@ -230,25 +230,26 @@ impl DagActor {
             self.push_ready(hash);
         }
 
-        // --- Check for all-complete builds (X5 fix) ---
+        // --- Check for all-complete builds ---
         // A crash between "last drv → Completed" and "build →
         // Succeeded" leaves the build Active in PG with all its
         // derivations terminal. Recovery loads the build (Active)
         // but loads 0 non-terminal derivations for it (all filtered
-        // by db.rs:537). Without this sweep, check_build_completion
-        // never fires → build stays Active forever.
+        // by TERMINAL_STATUSES). Without this sweep,
+        // check_build_completion never fires → build stays Active
+        // forever.
         //
         // update_build_counts recomputes completed/failed from DAG.
         // For a build with 0 recovered derivations: total=0,
         // completed=0, failed=0 → all_completed (0>=0), failed==0
         // → complete_build(). The build goes Succeeded and the
         // terminal-cleanup timer is scheduled as normal.
-        // Round 4 Z16: track which builds have ZERO build_derivations
-        // rows in PG — those are orphans (Z1 pre-fix victims or crash
-        // during merge BEFORE persist). The X5 case (all derivations
-        // terminal) has non-empty build_derivations; we just filter
-        // them out at :122. bd_rows is the flat list from PG; count
-        // per-build to distinguish.
+        // Track which builds have ZERO build_derivations rows in PG
+        // — those are orphans (crash during merge BEFORE persist, or
+        // stale rows from a failed rollback). The all-terminal case
+        // above has non-empty build_derivations; we just filter them
+        // out in load_nonterminal_derivations. bd_rows is the flat
+        // list from PG; count per-build to distinguish.
         let mut bd_counts: HashMap<Uuid, usize> = HashMap::new();
         for (build_id, _) in &bd_rows {
             *bd_counts.entry(*build_id).or_insert(0) += 1;
@@ -256,8 +257,8 @@ impl DagActor {
 
         let build_ids_to_check: Vec<Uuid> = self.builds.keys().copied().collect();
         for build_id in build_ids_to_check {
-            // Z16: zero PG links → orphan. Skip completion check.
-            // Z4 (TransitionOutcome::Rejected) also guards against
+            // Zero PG links → orphan. Skip completion check.
+            // TransitionOutcome::Rejected also guards against
             // spurious events for already-terminal builds, but this
             // catches Active orphans that would emit a spurious
             // BuildCompleted with empty output_paths.
@@ -299,7 +300,7 @@ impl DagActor {
     pub(super) async fn handle_leader_acquired(&mut self) {
         match self.recover_from_pg().await {
             Ok(()) => {
-                // X9 stale-pin cleanup: crash-between-pin-and-unpin
+                // Stale-pin cleanup: crash-between-pin-and-unpin
                 // (scheduler crashed after dispatch pin but before
                 // completion unpin) leaves rows in scheduler_live_
                 // pins for terminal drvs. Sweep them — they're
@@ -386,9 +387,9 @@ impl DagActor {
                     // and try_send). No running_since → backstop won't
                     // fire → stuck forever without this check.
                     //
-                    // Round 4 Z3: before this check, phantom-Assigned
-                    // derivations were skipped entirely because the
-                    // worker reconnected. Now we reconcile them.
+                    // Without this check, phantom-Assigned derivations
+                    // would be skipped entirely because the worker
+                    // reconnected. This cross-check reconciles them.
                     let hash: DrvHash = h.into();
                     if self
                         .workers
@@ -482,7 +483,7 @@ impl DagActor {
                 }
                 self.persist_status(&drv_hash, DerivationStatus::Completed, None)
                     .await;
-                // Y2: terminal → unpin. Without this, the pins
+                // Terminal → unpin. Without this, the pins
                 // (written at original dispatch before the crash)
                 // leak until next restart's sweep_stale_live_pins.
                 // sweep_stale_live_pins ran BEFORE reconcile (the
@@ -518,8 +519,8 @@ impl DagActor {
                 }
             } else {
                 // Worker died mid-build. Record the failure (in-mem
-                // + PG) + check poison threshold (X6 fix — same
-                // helper as reassign_derivations).
+                // + PG) + check poison threshold (same helper as
+                // reassign_derivations).
                 let should_poison = if let Some(w) = &worker_id {
                     self.record_failure_and_check_poison(&drv_hash, w).await
                 } else {

@@ -32,8 +32,8 @@ pub struct SchedulerGrpc {
     log_buffers: Arc<LogBuffers>,
     /// PG pool for WatchBuild's event-log replay. `Option` so
     /// `new_for_tests` can skip it (None → broadcast-only, no
-    /// replay, pre-C5 behavior). Production always sets it —
-    /// main.rs already has the pool for the DB handle.
+    /// replay). Production always sets it — main.rs already has
+    /// the pool for the DB handle.
     pool: Option<sqlx::PgPool>,
 }
 
@@ -72,7 +72,7 @@ impl SchedulerGrpc {
         }
     }
 
-    /// Access the shared log ring buffers. Exposed for `AdminService` (C9).
+    /// Access the shared log ring buffers. Exposed for `AdminService`.
     pub fn log_buffers(&self) -> Arc<LogBuffers> {
         self.log_buffers.clone()
     }
@@ -302,9 +302,9 @@ impl SchedulerService for SchedulerGrpc {
                 return Err(Status::invalid_argument("node drv_hash must be non-empty"));
             }
             // Structural validation: drv_path must parse as a valid
-            // /nix/store/{32-char-nixbase32}-{name}.drv path. Previously
-            // only checked !is_empty() — a garbage path like "/tmp/evil"
-            // would become a DAG key. StorePath::parse catches: missing
+            // /nix/store/{32-char-nixbase32}-{name}.drv path. Checking
+            // only !is_empty() would let a garbage path like "/tmp/evil"
+            // become a DAG key. StorePath::parse catches: missing
             // /nix/store/ prefix, bad hash length, bad nixbase32 chars,
             // path traversal, oversized names.
             match rio_nix::store_path::StorePath::parse(&node.drv_path) {
@@ -722,9 +722,9 @@ impl WorkerService for SchedulerGrpc {
         // actor event loop during reconciliation with no backpressure signal.
         const MAX_HEARTBEAT_FEATURES: usize = 64;
         const MAX_HEARTBEAT_RUNNING_BUILDS: usize = 1000;
-        // Round 4 Z13: systems was unbounded. A worker advertising
-        // thousands of systems is buggy or hostile. 16 covers native
-        // + linux-builder + the four cross-arch targets × two OSes.
+        // A worker advertising thousands of systems is buggy or
+        // hostile. 16 covers native + linux-builder + the four
+        // cross-arch targets × two OSes.
         const MAX_HEARTBEAT_SYSTEMS: usize = 16;
         rio_common::grpc::check_bound("systems", req.systems.len(), MAX_HEARTBEAT_SYSTEMS)?;
         rio_common::grpc::check_bound(
@@ -789,7 +789,7 @@ impl WorkerService for SchedulerGrpc {
         Ok(Response::new(rio_proto::types::HeartbeatResponse {
             accepted: true,
             // Same Arc<AtomicU64> the actor reads for WorkAssignment.generation
-            // (dispatch.rs single-load). Lease task (C2) writes on each
+            // (dispatch.rs single-load). The lease task writes on each
             // leadership acquisition. Non-K8s mode: stays at 1.
             generation: self.actor.leader_generation(),
         }))
@@ -797,7 +797,7 @@ impl WorkerService for SchedulerGrpc {
 }
 
 // ---------------------------------------------------------------------------
-// T6: BuildExecution bidirectional stream e2e (8.8)
+// BuildExecution bidirectional stream e2e
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

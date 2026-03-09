@@ -248,12 +248,11 @@ impl DagActor {
             && let Some(pname) = &state.pname
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
         {
-            // Round 4 Z12: convert to seconds FIRST, then subtract.
-            // Previous version did saturating_sub on nanos separately,
-            // which underflows when stop.nanos < start.nanos (e.g.,
-            // start=10.900s, stop=11.100s → real diff 0.2s, but old
-            // code gave 1s+0ns = 1.0s). Computing each timestamp as
-            // a single f64 in seconds and subtracting is correct.
+            // Convert to seconds FIRST, then subtract. Subtracting
+            // nanos separately underflows when stop.nanos < start.nanos
+            // (e.g., start=10.900s, stop=11.100s → real diff 0.2s, but
+            // separate-subtract gives 1s+0ns = 1.0s). Computing each
+            // timestamp as a single f64 in seconds is correct.
             let start_f = start.seconds as f64 + start.nanos as f64 / 1_000_000_000.0;
             let stop_f = stop.seconds as f64 + stop.nanos as f64 / 1_000_000_000.0;
             let duration_secs = stop_f - start_f;
@@ -363,10 +362,10 @@ impl DagActor {
         // (dirty-flag stop).
         //
         // Done BEFORE releasing downstream because the newly-ready
-        // nodes will be pushed to the queue (D5: by priority), and
-        // their priority is already correct from compute_initial at
-        // merge time. The ancestors that change are NOT newly-ready
-        // (they were already in the queue or beyond) — D5's lazy
+        // nodes will be pushed to the queue by priority, and their
+        // priority is already correct from compute_initial at merge
+        // time. The ancestors that change are NOT newly-ready (they
+        // were already in the queue or beyond) — the queue's lazy
         // invalidation handles re-pushing them if needed.
         //
         // Also emit the accuracy metric: how close was our estimate?
@@ -503,9 +502,6 @@ impl DagActor {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
             }
 
-            // After backoff, transition failed -> ready
-            // For simplicity in Phase 2a, we re-queue immediately with the backoff
-            // duration logged. A full implementation would use a timer.
             debug!(
                 drv_hash = %drv_hash,
                 retry_count = retry_count + 1,

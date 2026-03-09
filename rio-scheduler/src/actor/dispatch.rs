@@ -32,9 +32,9 @@ impl DagActor {
         }
 
         // Drain the queue, dispatching eligible derivations and deferring
-        // ineligible ones. Previously, `None => break` on the first ineligible
-        // derivation blocked all subsequent work (e.g., an aarch64 drv at
-        // queue head blocked all x86_64 dispatch).
+        // ineligible ones. Deferring (instead of breaking on the first
+        // ineligible derivation) prevents head-of-line blocking — an
+        // aarch64 drv at queue head must not block all x86_64 dispatch.
         let mut deferred: Vec<DrvHash> = Vec::new();
         let mut dispatched_any = true;
         // Track how many derivations WANTED each class but got deferred.
@@ -141,12 +141,11 @@ impl DagActor {
         // seeing rio_scheduler_class_queue_depth{class="large"}=50 knows
         // large workers are the bottleneck.
         //
-        // Round 4 Z14: zero out ALL configured classes first. The
-        // previous comment claimed "absence of the label means not
-        // bottlenecked" — but gauges PERSIST in Prometheus until
-        // overwritten. A class that was backed up (gauge=50) then
-        // cleared (no entries in class_deferred this pass) would STAY
-        // at 50 forever. Operators would see a phantom bottleneck.
+        // Zero out ALL configured classes first. Gauges PERSIST in
+        // Prometheus until overwritten — a class that was backed up
+        // (gauge=50) then cleared (no entries in class_deferred this
+        // pass) would STAY at 50 forever without this zeroing.
+        // Operators would see a phantom bottleneck.
         for sc in &self.size_classes {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
         }
@@ -175,7 +174,7 @@ impl DagActor {
         };
 
         // No classification configured → single best_worker call with
-        // no filter. The fast path for pre-D7 deployments.
+        // no filter. Fast path for deployments without size-classes.
         let Some(target) = target_class else {
             let w = crate::assignment::best_worker(&self.workers, drv_state, &self.dag, None);
             return (w, None);
@@ -260,13 +259,13 @@ impl DagActor {
             state.assigned_worker = Some(worker_id.clone());
         }
 
-        // Single atomic load. The lease task (C2) may fetch_add the
+        // Single atomic load. The lease task may fetch_add the
         // generation between the DB insert and the WorkAssignment send
         // below (there's an await in between). Without this snapshot,
-        // dispatch.rs:229 and :258 would read DIFFERENT generations —
-        // the PG row says "assigned under gen N" but the worker
-        // receives "gen N+1." The worker then rejects its own
-        // assignment as stale. Loading once and reusing closes the tear.
+        // the two reads could see DIFFERENT generations — the PG row
+        // says "assigned under gen N" but the worker receives "gen
+        // N+1." The worker then rejects its own assignment as stale.
+        // Loading once and reusing closes the tear.
         //
         // Acquire pairs with the lease task's Release fetch_add. Sees
         // the generation AND any writes the lease task did before it
@@ -296,8 +295,8 @@ impl DagActor {
             worker.running_builds.insert(drv_hash.clone());
         }
 
-        // X9 auto-pin: write input-closure paths to scheduler_live_
-        // pins so GC's mark CTE protects them. Same closure
+        // Auto-pin: write input-closure paths to scheduler_live_pins
+        // so GC's mark CTE protects them. Same closure
         // approximation as send_prefetch_hint and best_worker
         // scoring (approx_input_closure). Best-effort: PG failure
         // logs + continues; 24h grace period is the fallback.
@@ -439,7 +438,7 @@ impl DagActor {
                         .increment(1);
                 }
 
-                // Round 4 Z15: also clean up PG state written above.
+                // Also clean up PG state written above.
                 // unpin: pin_live_inputs wrote scheduler_live_pins
                 // rows. Without unpinning, they leak until terminal
                 // cleanup (which never runs if this drv stays stuck).

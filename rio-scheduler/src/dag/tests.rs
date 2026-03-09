@@ -174,7 +174,7 @@ fn test_find_newly_ready() -> anyhow::Result<()> {
 }
 
 // -----------------------------------------------------------------------
-// Group 2: Cycle detection
+// Cycle detection
 // -----------------------------------------------------------------------
 
 /// A cyclic DAG should be rejected, with all newly-inserted nodes rolled back.
@@ -315,8 +315,8 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
     );
 
     // Step 2: merge B1 again with nodes {A, C} and cycle A->C->A — fails.
-    // Pre-fix: rollback would clear B1 from A even though B1 was already
-    // interested in A from step 1.
+    // Regression guard: rollback must not clear B1 from A even though
+    // B1 was already interested in A from step 1.
     let nodes_ac = vec![
         make_node("hashA", "x86_64-linux"),
         make_node("hashC", "x86_64-linux"),
@@ -482,7 +482,7 @@ fn test_cycle_detection_deep_chain_with_back_edge() {
 }
 
 // ---------------------------------------------------------------------------
-// D5: canonical() interning
+// canonical() interning
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -557,9 +557,10 @@ fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
         assert!(DrvHash::ptr_eq(h, &canon));
     }
 
-    // --- The ONE case D5 fixed: second merge of the same node. ---
-    // Before: interest_added held a fresh Arc (from proto string).
-    // After: exchanged via canonical() upfront, so it's ptr-equal.
+    // --- The key case: second merge of the same node. ---
+    // Without canonical() interning: interest_added holds a fresh
+    // Arc (from proto string). With it: exchanged via canonical()
+    // upfront, so it's ptr-equal.
     let b2 = Uuid::new_v4();
     let result2 = dag.merge(b2, &nodes, &edges)?;
     assert_eq!(result2.interest_added.len(), 2);

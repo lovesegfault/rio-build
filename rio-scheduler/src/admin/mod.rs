@@ -1,10 +1,10 @@
 //! AdminService gRPC implementation.
 //!
-//! `GetBuildLogs` (phase2b) and `ClusterStatus` (phase3a) are fully
-//! implemented. `DrainWorker` lands in E2. The remaining RPCs return
-//! `UNIMPLEMENTED` and will land in phase4 (dashboard). Stubbing them
-//! here means the tonic server wiring is already in place — adding each
-//! one later is a pure body-swap with no main.rs churn.
+//! `GetBuildLogs`, `ClusterStatus`, `DrainWorker`, and `TriggerGC`
+//! are fully implemented. The remaining RPCs return `UNIMPLEMENTED`
+//! and land in phase4 (dashboard). Stubbing them here means the
+//! tonic server wiring is already in place — adding each later is
+//! a pure body-swap with no main.rs churn.
 //!
 //! `GetBuildLogs` has two data sources (per `observability.md:44-50`):
 //!

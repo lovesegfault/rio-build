@@ -58,7 +58,7 @@ pub struct FlushRequest {
 }
 
 /// S3 log flusher. Owns no state except what's passed in — `Arc<LogBuffers>`
-/// is shared with `SchedulerGrpc` (writes), `AdminServiceImpl` (reads in C9),
+/// is shared with `SchedulerGrpc` (writes), `AdminServiceImpl` (reads),
 /// and the actor (nobody — actor doesn't touch buffers, just sends flush reqs).
 pub struct LogFlusher {
     s3: S3Client,

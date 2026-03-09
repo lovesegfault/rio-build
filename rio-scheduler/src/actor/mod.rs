@@ -94,7 +94,7 @@ pub struct DagActor {
     /// `merge.rs::check_cached_outputs`.
     cache_breaker: CacheCheckBreaker,
     /// Build duration estimator. Snapshot of `build_history`, refreshed
-    /// periodically on Tick. D4 (critical-path) and D7 (size-class) read
+    /// periodically on Tick. Critical-path and size-class routing read
     /// from this. Single-threaded actor owns it — no Arc/lock.
     estimator: Estimator,
     /// Tick counter for periodic tasks that run less often than every
@@ -609,7 +609,7 @@ impl DagActor {
     }
 
     /// Clone the generation counter as a read-only reader for
-    /// `ActorHandle::leader_generation()`. The lease task (C2) holds a
+    /// `ActorHandle::leader_generation()`. The lease task holds a
     /// direct `Arc<AtomicU64>` clone for writing — not through this
     /// reader. The reader type has no store/fetch_add methods, so
     /// handle consumers can't accidentally increment.
@@ -782,8 +782,8 @@ impl DagActor {
     /// Resolve drv_hash → drv_path, falling back to the hash string
     /// if the node isn't in the DAG. Used for `derivation_path`
     /// fields in BuildEvents — better to emit SOMETHING (the hash
-    /// is still a useful identifier) than empty. Round 4 D1: was
-    /// duplicated 3× (dispatch.rs + completion.rs ×2).
+    /// is still a useful identifier) than empty. Extracted from
+    /// three duplicate call sites (dispatch.rs + completion.rs ×2).
     pub(super) fn drv_path_or_hash_fallback(&self, drv_hash: &DrvHash) -> String {
         self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
             warn!(
@@ -795,7 +795,7 @@ impl DagActor {
     }
 
     /// Whether any interested build for this derivation is interactive (IFD).
-    /// Interactive derivations get a priority boost (D5).
+    /// Interactive derivations get a priority boost in the queue.
     fn should_prioritize(&self, drv_hash: &DrvHash) -> bool {
         self.get_interested_builds(drv_hash).iter().any(|build_id| {
             self.builds
@@ -856,7 +856,7 @@ impl DagActor {
     /// NOT called from `handle_transient_failure`: the derivation gets
     /// re-queued, a new worker builds it from scratch, and that worker's
     /// logs replace the partial ones. The ring buffer gets `discard()`ed
-    /// by the BuildExecution recv task on worker disconnect (future: C10).
+    /// by the BuildExecution recv task on worker disconnect.
     fn trigger_log_flush(&self, drv_hash: &DrvHash, interested_builds: Vec<Uuid>) {
         let Some(tx) = &self.log_flush_tx else {
             return;
