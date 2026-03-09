@@ -21,6 +21,7 @@
 //! 3. `dispatch_ready` gates on BOTH `is_leader` AND `recovery_complete`.
 //!    Standby merges DAGs (state warm) but doesn't dispatch until
 //!    recovery is done.
+// r[impl sched.recovery.gate-dispatch]
 //!
 //! # Failure mode: degrade, don't block
 //!

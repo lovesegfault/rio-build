@@ -267,6 +267,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // `nix build` fails with MiscFailure even though the build
     // itself completes fine on a worker. With reconnect: client
     // doesn't notice the scheduler blip (~15s failover).
+    // r[impl gw.reconnect.backoff]
     const MAX_RECONNECT: u32 = 5;
     let mut reconnect_attempts = 0u32;
 

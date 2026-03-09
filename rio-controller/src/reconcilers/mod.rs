@@ -47,6 +47,7 @@ pub struct Ctx {
     /// reporter); `publish` takes the object_ref per-call. So we
     /// hold one Recorder and pass the ref at publish time.
     pub recorder: kube::runtime::events::Recorder,
+    // r[impl ctrl.build.watch-by-uid]
     /// Tracks in-flight Build watch tasks, keyed by Build **uid**
     /// (NOT {ns}/{name}). uid is unique per K8s object lifetime:
     /// delete+recreate with the same name gets a FRESH uid. Keying

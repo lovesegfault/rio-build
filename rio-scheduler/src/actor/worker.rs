@@ -452,6 +452,7 @@ impl DagActor {
 
         // Check for poisoned derivations that should expire (24h TTL)
         // + backstop timeout for stuck-Running derivations.
+        // r[impl sched.backstop.timeout]
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
         // (drv_hash, drv_path, worker_id) for backstop-timed-out builds
         let mut backstop_timeouts: Vec<(DrvHash, String, WorkerId)> = Vec::new();
