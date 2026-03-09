@@ -153,6 +153,19 @@ async fn main() -> anyhow::Result<()> {
         "starting rio-scheduler"
     );
 
+    // Graceful shutdown: cancelled on SIGTERM/SIGINT. Cloned into each
+    // background loop; .cancelled_owned() for serve_with_shutdown.
+    // Enables atexit handlers (LLVM coverage profraw flush, tracing
+    // shutdown) by letting main() return normally.
+    //
+    // Shutdown chain for the actor: serve returns → SchedulerGrpc +
+    // AdminService drop their ActorHandle clones → tick-loop + lease-
+    // loop also break and drop theirs → all mpsc::Sender clones drop →
+    // actor's rx.recv() returns None → actor exits → drops
+    // event_persist_tx → event-persister also exits (channel-close).
+    // event_log::spawn doesn't need a token; it self-terminates.
+    let shutdown = rio_common::signal::shutdown_signal();
+
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_scheduler::describe_metrics();
 
@@ -336,7 +349,12 @@ async fn main() -> anyhow::Result<()> {
         // renewing while the actor handles LeaderAcquired.
         rio_common::task::spawn_monitored(
             "lease-loop",
-            rio_scheduler::lease::run_lease_loop(lease_cfg, lease_state, actor.clone()),
+            rio_scheduler::lease::run_lease_loop(
+                lease_cfg,
+                lease_state,
+                actor.clone(),
+                shutdown.clone(),
+            ),
         );
     }
 
@@ -382,6 +400,7 @@ async fn main() -> anyhow::Result<()> {
         // probes don't use Watch, but other tooling might).
         let reporter = health_reporter.clone();
         let is_leader = is_leader_for_health;
+        let health_shutdown = shutdown.clone();
         rio_common::task::spawn_monitored("health-toggle-loop", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             // `prev`: what we LAST set the reporter to. Starts
@@ -392,7 +411,13 @@ async fn main() -> anyhow::Result<()> {
             // true and false.
             let mut prev: Option<bool> = None;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = health_shutdown.cancelled() => {
+                        tracing::debug!("health-toggle-loop shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {}
+                }
                 let now = is_leader.load(std::sync::atomic::Ordering::Relaxed);
                 if prev != Some(now) {
                     if now {
@@ -430,10 +455,17 @@ async fn main() -> anyhow::Result<()> {
     // Start periodic tick task
     let tick_actor = actor.clone();
     let tick_interval = std::time::Duration::from_secs(cfg.tick_interval_secs);
+    let tick_shutdown = shutdown.clone();
     rio_common::task::spawn_monitored("tick-loop", async move {
         let mut interval = tokio::time::interval(tick_interval);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = tick_shutdown.cancelled() => {
+                    tracing::debug!("tick-loop shutting down");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
             // If the actor is dead (channel closed), stop ticking.
             if tick_actor
                 .try_send(rio_scheduler::actor::ActorCommand::Tick)
@@ -493,10 +525,11 @@ async fn main() -> anyhow::Result<()> {
         // concurrently with the main (blocking) serve() below.
         let health_addr = cfg.health_addr;
         info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
+        let health_plain_shutdown = shutdown.clone();
         rio_common::task::spawn_monitored("health-plaintext", async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(health_service_plain)
-                .serve(health_addr)
+                .serve_with_shutdown(health_addr, health_plain_shutdown.cancelled_owned())
                 .await
             {
                 tracing::error!(error = %e, "plaintext health server failed");
@@ -542,9 +575,10 @@ async fn main() -> anyhow::Result<()> {
                 .max_decoding_message_size(max_message_size)
                 .max_encoding_message_size(max_message_size),
         )
-        .serve(listen_addr)
+        .serve_with_shutdown(listen_addr, shutdown.cancelled_owned())
         .await?;
 
+    info!("scheduler shut down cleanly");
     Ok(())
 }
 

@@ -216,6 +216,7 @@ pub async fn run_lease_loop(
     cfg: LeaseConfig,
     state: LeaderState,
     actor: crate::actor::ActorHandle,
+    shutdown: rio_common::signal::Token,
 ) {
     // kube client from in-cluster config. If this fails (not in
     // a pod, or service account not mounted), log and exit the
@@ -256,7 +257,13 @@ pub async fn run_lease_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::debug!("lease loop shutting down");
+                break;
+            }
+            _ = interval.tick() => {}
+        }
 
         match lease.try_acquire_or_renew().await {
             Ok(lease_state) => {
