@@ -484,6 +484,14 @@ impl DagActor {
                             }
                         });
                     }
+                    // Immediate dispatch attempt after recovery. If
+                    // workers haven't reconnected yet, dispatch finds
+                    // no candidates → no-op. If they HAVE (workers
+                    // reconnect on scheduler restart faster than this
+                    // actor command is processed), dispatch fires
+                    // immediately instead of waiting ~10s for the
+                    // first heartbeat to trigger it.
+                    self.dispatch_ready().await;
                 }
                 ActorCommand::ReconcileAssignments => {
                     self.handle_reconcile_assignments().await;
