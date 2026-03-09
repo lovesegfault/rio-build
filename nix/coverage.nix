@@ -159,11 +159,9 @@ in
         # for the source view. --ignore-errors source: safety net
         # for any remaining build-time-generated paths that slip
         # through the regex (genhtml synthesizes a placeholder).
-        # --branch-coverage: show branch hit/miss (requires -Z
-        # coverage-options=branch in covArgs, see flake.nix).
         cd ${commonSrc}
         genhtml $out/lcov.info --output-directory $out/html \
-          --branch-coverage --ignore-errors source
+          --ignore-errors source
 
         # Summary to build log for quick inspection.
         echo "=== Combined Coverage Summary ==="
