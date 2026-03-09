@@ -38,6 +38,16 @@
 
 **PASS (Rust unit/integration coverage):** mTLS handshake (4 tests), HMAC sign/verify/tamper (10 tests), cancel registry (3 tests), failed_workers exclusion + retry backoff (updated poison tests), state recovery (2 tests), GC mark (5 tests), `__noChroot` validation (2 tests). 961 total tests, 126/126 tracey rules covered.
 
-**vm-phase3b:** iteration 2 — 7 test sections (T1-T3 mTLS, B1 HMAC, S1 state recovery, C1 GC TriggerGC, G1 `__noChroot`) via native NixOS worker VM + Nix-time PKI generation. k3s-dependent sections (E PDB/Events/NetPol, F controller WatchBuild, D FOD proxy) and timing-sensitive A (cancel) deferred to iteration 3. Iteration 2 additionally caught and fixed a **latent TLS SNI bug**: `load_client_tls` set `domain_name` globally via OnceLock, but gateway/worker connect to BOTH scheduler AND store — fixed domain_name would mismatch one of the two server certs. Fix: remove `domain_name` override; tonic derives SNI from URL host per-connection.
+**vm-phase3b:** iteration 3 — 9 test sections (T1-T3 mTLS, B1 HMAC, S1 state recovery, F1 Build CRD watch dedup, C1 GC dry-run, G1 `__noChroot`, C2 real GC sweep + PinPath). 4 VMs (added k8s node via `common.mkK3sNode`). F1 proved the Build reconciler watch dedup fix: `rio_controller_build_watch_spawns_total == 1` across multiple status-patch → reconcile cycles. C2 exercised the non-dry-run GC commit path + PinPath/UnpinPath round-trip.
+
+Iteration 2 had caught a **latent TLS SNI bug**: `load_client_tls` set `domain_name` globally via OnceLock, but gateway/worker connect to BOTH scheduler AND store — fixed domain_name would mismatch one of the two server certs. Fix: remove `domain_name` override; tonic derives SNI from URL host per-connection.
+
+**Validation-round bugs fixed (iteration 3):** Deep code review of Phase 3b code found 4 CRITICAL + 5 HIGH issues in areas NOT covered by iteration 2:
+- **C1** Build reconciler spawned duplicate watch tasks on every reconcile (each status patch triggered a re-reconcile → new `spawn_reconnect_watch`). Fixed via `Ctx.watching` DashMap dedup gate.
+- **C2** GC sweep-vs-PutPath TOCTOU for shared chunks: sweep's `FOR UPDATE OF manifests` locks manifest row, not chunk rows. PutPath for a different path sharing chunk X could run after sweep enqueued X → chunk gets S3-deleted while still referenced. Fixed via `pending_s3_deletes.blake3_hash` + drain re-check + upsert clears `deleted=false`.
+- **C3** Orphan scanner's DELETE had no status guard — upload completing between SELECT and DELETE got its valid narinfo reaped. Fixed via `WHERE EXISTS (... status='uploading')`.
+- **C4** Orphan-completion in recovery didn't call `check_build_completion` → if the orphan-completed drv was the LAST outstanding one, build stayed Active forever.
+- **H1-H5:** backstop timeout didn't persist `failed_worker` to PG; drain lacked `SKIP LOCKED` for multi-replica; gateway reconnect counter never reset on success; backstop block duplicated `reassign_derivations`; GC sweep/orphan had ~50 lines duplicated.
+- **M1-M5:** HMAC key CRLF not trimmed; `GcRoots` no dedup; Assigned-with-NULL-worker silently skipped; PinPath FK check via string match; backstop NaN never fires.
 
 **EKS smoke:** manual trigger (`infra/eks/smoke-test.sh`). Deploys, builds hello, kills worker, verifies reassign via metrics delta.
