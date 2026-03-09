@@ -74,15 +74,15 @@ patches:
 # preloaded (clear error vs pull timeout).
 images:
   - name: rio-scheduler
-    newTag: latest
+    newTag: dev
   - name: rio-store
-    newTag: latest
+    newTag: dev
   - name: rio-gateway
-    newTag: latest
+    newTag: dev
   - name: rio-controller
-    newTag: latest
+    newTag: dev
   - name: rio-worker
-    newTag: latest
+    newTag: dev
 
 # PG connection secret: generated from literals (dev creds,
 # matches postgres.yaml's CloudNativePG Cluster). In prod
