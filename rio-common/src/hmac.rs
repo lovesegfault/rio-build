@@ -108,7 +108,16 @@ fn load_key(path: Option<&std::path::Path>) -> Result<Option<Vec<u8>>, HmacError
     // care), but it means the scheduler's key file and the store's
     // key file must BOTH have or not-have the newline. Trimming
     // makes it forgiving.
-    let key = key.strip_suffix(b"\n").map(|s| s.to_vec()).unwrap_or(key);
+    //
+    // CRLF first, then LF: a Windows-edited key file has \r\n;
+    // stripping only \n would leave \r in the key → scheduler and
+    // store key mismatch → all uploads rejected with opaque
+    // InvalidSignature.
+    let key = key
+        .strip_suffix(b"\r\n")
+        .or_else(|| key.strip_suffix(b"\n"))
+        .map(|s| s.to_vec())
+        .unwrap_or(key);
     if key.is_empty() {
         return Err(HmacError::EmptyKey);
     }
@@ -384,6 +393,27 @@ mod tests {
         let verified = verifier
             .verify(&token)
             .expect("trailing newline trimmed → same key → verify succeeds");
+        assert_eq!(verified, claims);
+    }
+
+    #[test]
+    fn load_trims_trailing_crlf() {
+        // Windows-edited key file: CRLF line ending. Stripping only
+        // \n would leave \r in the key → mismatch with a Unix-edited
+        // key file (or a K8s Secret created from a literal).
+        let tmp_crlf = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp_crlf.path(), b"secret-key-32-bytes-long-here!!\r\n").unwrap();
+        let tmp_bare = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp_bare.path(), b"secret-key-32-bytes-long-here!!").unwrap();
+
+        let signer = HmacSigner::load(Some(tmp_crlf.path())).unwrap().unwrap();
+        let verifier = HmacVerifier::load(Some(tmp_bare.path())).unwrap().unwrap();
+
+        let claims = test_claims(3600);
+        let token = signer.sign(&claims);
+        let verified = verifier
+            .verify(&token)
+            .expect("CRLF trimmed → same key → verify succeeds");
         assert_eq!(verified, claims);
     }
 
