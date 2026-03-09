@@ -590,6 +590,17 @@ impl ChunkCache {
         // Remove-after means the window between fetch-complete and
         // remove is tiny, and a caller in that window awaits an
         // already-complete Shared (instant return).
+        //
+        // Round 4 Z33 note: if THIS awaiter is cancelled between
+        // `shared.await` and here, the inflight entry isn't removed.
+        // This is SELF-HEALING: the Shared future already completed,
+        // so the next caller to hit `entry().or_insert_with()` gets
+        // the completed Shared and awaits it instantly, then THAT
+        // caller's remove() fires. Worst case: ~100-byte map entry
+        // leaks until the next get for this hash. Acceptable; a
+        // scopeguard here would need careful Drop ordering with the
+        // Shared clone. TODO(phase4): scopeguard if leak becomes
+        // measurable under sustained cancellation.
         self.inflight.remove(hash);
 
         Ok(result)

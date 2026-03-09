@@ -261,8 +261,16 @@ impl Cache {
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            // Match foo.tmp-<hex> (the pattern used by fetch_and_extract).
-            if name_str.contains(".tmp-") {
+            // Match foo.tmp-<16 hex chars> EXACTLY (the pattern used
+            // by fetch_and_extract). Round 4 D5: previously matched
+            // any ".tmp-" substring — a legitimate store path named
+            // e.g. "rust-1.75.0-tmp-build" would be deleted. Require
+            // the suffix to be exactly 16 hex chars (tempfile's
+            // 8-byte random suffix, hex-encoded).
+            let is_stale_tmp = name_str.rsplit_once(".tmp-").is_some_and(|(_, suffix)| {
+                suffix.len() == 16 && suffix.chars().all(|c| c.is_ascii_hexdigit())
+            });
+            if is_stale_tmp {
                 let path = entry.path();
                 if let Err(e) = std::fs::remove_dir_all(&path) {
                     tracing::warn!(

@@ -779,6 +779,21 @@ impl DagActor {
         self.dag.node(drv_hash).map(|s| s.drv_path().to_string())
     }
 
+    /// Resolve drv_hash → drv_path, falling back to the hash string
+    /// if the node isn't in the DAG. Used for `derivation_path`
+    /// fields in BuildEvents — better to emit SOMETHING (the hash
+    /// is still a useful identifier) than empty. Round 4 D1: was
+    /// duplicated 3× (dispatch.rs + completion.rs ×2).
+    pub(super) fn drv_path_or_hash_fallback(&self, drv_hash: &DrvHash) -> String {
+        self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
+            warn!(
+                drv_hash = %drv_hash,
+                "drv_hash_to_path returned None; using hash as fallback"
+            );
+            drv_hash.to_string()
+        })
+    }
+
     /// Whether any interested build for this derivation is interactive (IFD).
     /// Interactive derivations get a priority boost (D5).
     fn should_prioritize(&self, drv_hash: &DrvHash) -> bool {

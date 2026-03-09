@@ -612,6 +612,16 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let mut seen: HashSet<String> = HashSet::new();
     all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
 
+    // Round 4 D4: also dedup EDGES. Multi-root builds with shared
+    // deps (e.g., both root1 and root2 depend on glibc) produce
+    // duplicate edges when each root's BFS walks the shared subgraph.
+    // Scheduler's MergeDag likely tolerates dups (DAG merge is
+    // idempotent) but sending 2× the edges wastes bytes and PG
+    // writes (derivation_edges has PRIMARY KEY (parent,child) so
+    // dups are ON CONFLICT DO NOTHING — but that's still an RTT).
+    let mut seen_edges: HashSet<(String, String)> = HashSet::new();
+    all_edges.retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
+
     // Validate BEFORE inlining: __noChroot check + early MAX_DAG_NODES.
     if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
         warn!(reason = %reason, "rejecting build: DAG validation failed");
@@ -750,6 +760,11 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // Deduplicate nodes
         let mut seen: HashSet<String> = HashSet::new();
         all_nodes.retain(|n| seen.insert(n.drv_path.clone()));
+
+        // Round 4 D4: also dedup edges (see comment at :614).
+        let mut seen_edges: HashSet<(String, String)> = HashSet::new();
+        all_edges
+            .retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
 
         // Validate BEFORE inlining: __noChroot check + early
         // MAX_DAG_NODES. On reject: STDERR_ERROR + per-path failure,

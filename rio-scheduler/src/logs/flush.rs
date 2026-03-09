@@ -204,16 +204,12 @@ impl LogFlusher {
     /// Errors are logged, not propagated. The flusher must never die on a
     /// transient S3/PG error — if it did, ALL future logs would be lost,
     /// not just this one derivation's. Failed flushes are retried on the
-    /// next periodic tick (the buffer is still there for on-completion
-    /// flushes that fail, thanks to the "no buffer" debug-log path in
-    /// `flush_final` being a no-op for a drained buffer... wait, no:
-    /// drain() already REMOVED the buffer. So a failed S3 PUT after
-    /// drain = lost log. This is a real risk).
-    ///
-    /// Mitigation: if the S3 PUT fails for a FINAL flush, re-insert the
-    /// lines back into the buffer. The next periodic tick will retry as a
-    /// snapshot. Not perfect (is_complete stays false), but better than
-    /// total loss.
+    /// next periodic tick for PERIODIC flushes (the buffer is still there).
+    /// For FINAL flushes, `drain()` already removed the buffer — a failed
+    /// S3 PUT after drain = lost log. This is an accepted risk (the
+    /// alternative — re-inserting on fail — was considered and rejected
+    /// as it complicates the buffer lifecycle for a rare edge case;
+    /// is_complete would stay false anyway).
     async fn upload_and_record(
         &self,
         req: FlushRequest,

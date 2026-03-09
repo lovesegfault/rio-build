@@ -339,13 +339,7 @@ impl DagActor {
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
-                            warn!(
-                                drv_hash = %drv_hash,
-                                "drv_hash_to_path returned None; using hash as fallback"
-                            );
-                            drv_hash.to_string()
-                        }),
+                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
                         status: Some(rio_proto::types::derivation_event::Status::Completed(
                             rio_proto::types::DerivationCompleted {
                                 output_paths: output_paths.clone(),
@@ -584,13 +578,7 @@ impl DagActor {
                 build_id,
                 rio_proto::types::build_event::Event::Derivation(
                     rio_proto::types::DerivationEvent {
-                        derivation_path: self.drv_hash_to_path(drv_hash).unwrap_or_else(|| {
-                            warn!(
-                                drv_hash = %drv_hash,
-                                "drv_hash_to_path returned None; using hash as fallback"
-                            );
-                            drv_hash.to_string()
-                        }),
+                        derivation_path: self.drv_path_or_hash_fallback(drv_hash),
                         status: Some(rio_proto::types::derivation_event::Status::Failed(
                             rio_proto::types::DerivationFailed {
                                 error_message: error_msg.to_string(),

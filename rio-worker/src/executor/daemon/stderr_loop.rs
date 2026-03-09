@@ -139,6 +139,57 @@ where
 
     let misc_fail = |m: &str| BuildResult::failure(BuildStatus::MiscFailure, m.to_string());
 
+    /// Outcome of handling one log line. `Continue` = keep reading.
+    /// `Break(r)` = exit the stderr loop with this result.
+    enum LineOutcome {
+        Continue,
+        Break(Result<Option<BuildResult>, wire::WireError>),
+    }
+
+    /// Round 4 D2: shared log-line handling for STDERR_NEXT and
+    /// STDERR_RESULT BuildLogLine. Both do: msg_count bound check,
+    /// batcher.add_line, and dispatch on AddLineResult. Was ~40
+    /// lines duplicated; now one helper.
+    async fn handle_log_line(
+        line: Vec<u8>,
+        msg_count: &mut u64,
+        batcher: &mut LogBatcher,
+        log_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> LineOutcome {
+        *msg_count += 1;
+        if *msg_count >= MAX_BUILD_STDERR_MESSAGES {
+            return LineOutcome::Break(Err(wire::WireError::Io(std::io::Error::other(
+                "exceeded maximum STDERR messages during build",
+            ))));
+        }
+        match batcher.add_line(line) {
+            AddLineResult::Buffered => LineOutcome::Continue,
+            AddLineResult::BatchReady(batch) => {
+                if send_batch(log_tx, batch).await {
+                    LineOutcome::Continue
+                } else {
+                    LineOutcome::Break(Ok(Some(BuildResult::failure(
+                        BuildStatus::MiscFailure,
+                        "log channel closed during build (scheduler stream gone)".to_string(),
+                    ))))
+                }
+            }
+            AddLineResult::LimitExceeded { reason } => {
+                // Flush what's buffered so client sees output up to
+                // the limit. Best-effort: channel-closed is moot,
+                // we're breaking with LogLimitExceeded anyway.
+                if batcher.has_pending() {
+                    let _ = send_batch(log_tx, batcher.flush()).await;
+                }
+                tracing::warn!(reason = %reason, "build log limit exceeded, aborting");
+                LineOutcome::Break(Ok(Some(BuildResult::failure(
+                    BuildStatus::LogLimitExceeded,
+                    reason,
+                ))))
+            }
+        }
+    }
+
     // Spawn the owned reader task. It reads one StderrMessage at a time and
     // pushes to `msg_tx`. Terminal messages (Last, Error, wire Err) break the
     // loop after being pushed, so the task returns the reader for the caller's
@@ -194,44 +245,16 @@ where
                     Some(Ok(StderrMessage::Last)) => break Ok(None),
                     Some(Ok(StderrMessage::Error(e))) => break Ok(Some(misc_fail(&e.message))),
                     Some(Ok(StderrMessage::Next(line))) => {
-                        msg_count += 1;
-                        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
-                            break Err(wire::WireError::Io(std::io::Error::other(
-                                "exceeded maximum STDERR messages during build",
-                            )));
-                        }
-                        match batcher.add_line(line.into_bytes()) {
-                            AddLineResult::Buffered => {}
-                            AddLineResult::BatchReady(batch) => {
-                                if !send_batch(log_tx, batch).await {
-                                    break Ok(Some(misc_fail(
-                                        "log channel closed during build (scheduler stream gone)",
-                                    )));
-                                }
-                            }
-                            AddLineResult::LimitExceeded { reason } => {
-                                // Flush whatever's already buffered so the client
-                                // sees output right up to the limit (don't drop
-                                // 63 lines on the floor just because line 64 spewed).
-                                // Best-effort: if the channel is closed, the
-                                // LogLimitExceeded failure below still reports.
-                                if batcher.has_pending() {
-                                    let _ = send_batch(log_tx, batcher.flush()).await;
-                                }
-                                tracing::warn!(
-                                    reason = %reason,
-                                    "build log limit exceeded, aborting"
-                                );
-                                // LogLimitExceeded is a Nix-native BuildStatus
-                                // (=11). Terminal, non-retryable — a retry on a
-                                // different worker would just spew the same
-                                // logs. The scheduler treats this like
-                                // PermanentFailure (no re-queue).
-                                break Ok(Some(BuildResult::failure(
-                                    BuildStatus::LogLimitExceeded,
-                                    reason,
-                                )));
-                            }
+                        match handle_log_line(
+                            line.into_bytes(),
+                            &mut msg_count,
+                            &mut batcher,
+                            log_tx,
+                        )
+                        .await
+                        {
+                            LineOutcome::Continue => {}
+                            LineOutcome::Break(r) => break r,
                         }
                     }
                     Some(Ok(StderrMessage::Read(_))) => {
@@ -258,31 +281,16 @@ where
                         let ResultField::String(line) = &fields[0] else {
                             unreachable!("match guard above proved String")
                         };
-                        msg_count += 1;
-                        if msg_count >= MAX_BUILD_STDERR_MESSAGES {
-                            break Err(wire::WireError::Io(std::io::Error::other(
-                                "exceeded maximum STDERR messages during build",
-                            )));
-                        }
-                        match batcher.add_line(line.clone().into_bytes()) {
-                            AddLineResult::Buffered => {}
-                            AddLineResult::BatchReady(batch) => {
-                                if !send_batch(log_tx, batch).await {
-                                    break Ok(Some(misc_fail(
-                                        "log channel closed during build (scheduler stream gone)",
-                                    )));
-                                }
-                            }
-                            AddLineResult::LimitExceeded { reason } => {
-                                if batcher.has_pending() {
-                                    let _ = send_batch(log_tx, batcher.flush()).await;
-                                }
-                                tracing::warn!(reason = %reason, "build log limit exceeded");
-                                break Ok(Some(BuildResult::failure(
-                                    BuildStatus::LogLimitExceeded,
-                                    reason,
-                                )));
-                            }
+                        match handle_log_line(
+                            line.clone().into_bytes(),
+                            &mut msg_count,
+                            &mut batcher,
+                            log_tx,
+                        )
+                        .await
+                        {
+                            LineOutcome::Continue => {}
+                            LineOutcome::Break(r) => break r,
                         }
                     }
                     // Other Result types (Progress, SetExpected, etc.) and
