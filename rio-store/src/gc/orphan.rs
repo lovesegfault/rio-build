@@ -53,18 +53,13 @@ pub async fn scan_once(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
 ) -> Result<u64, sqlx::Error> {
-    // Find stale uploading manifests. SELECT hash + chunk_list.
-    // `updated_at` is set on insert and on status flip; for
-    // never-completed uploads it's the insert time.
-    //
-    // LEFT JOIN manifest_data: inline uploads have no row there
-    // (chunk_list NULL → no chunk decrement, just CASCADE delete).
+    // Find stale uploading manifests. SELECT hash only — chunk_list
+    // is re-read INSIDE the tx (see X3 race below).
     let threshold_secs = STALE_THRESHOLD.as_secs() as i64;
-    let stale: Vec<(Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+    let stale: Vec<(Vec<u8>,)> = sqlx::query_as(
         r#"
-        SELECT m.store_path_hash, md.chunk_list
+        SELECT m.store_path_hash
           FROM manifests m
-          LEFT JOIN manifest_data md USING (store_path_hash)
          WHERE m.status = 'uploading'
            AND m.updated_at < now() - make_interval(secs => $1)
         "#,
@@ -79,10 +74,38 @@ pub async fn scan_once(
     }
 
     let mut reaped = 0u64;
-    for (store_path_hash, chunk_list) in stale {
+    for (store_path_hash,) in stale {
         // Single-path transaction (not batched — orphans are rare,
         // batching isn't worth the complexity).
         let mut tx = pool.begin().await?;
+
+        // Re-read chunk_list INSIDE the tx with FOR UPDATE (X3 fix).
+        // The outer SELECT above is OUTSIDE any tx. Multi-replica
+        // race: store-0 reaps correctly (outer chunk_list = C1).
+        // Worker re-uploads same path with NEW chunk_list C2 before
+        // store-1's iteration. store-1's status-guarded DELETE
+        // succeeds (fresh placeholder IS uploading + stale again)
+        // but decrements OLD C1 → corruption (C1 refcount negative,
+        // C2 orphaned forever). Reading chunk_list INSIDE the tx
+        // (with FOR UPDATE locking the manifest row) guarantees we
+        // decrement the chunk_list that we actually DELETE.
+        //
+        // The FOR UPDATE blocks any concurrent re-upload until this
+        // tx commits — same pattern as sweep.rs:64-76.
+        let chunk_list: Option<Vec<u8>> = sqlx::query_scalar(
+            r#"
+            SELECT md.chunk_list
+              FROM manifests m
+              LEFT JOIN manifest_data md USING (store_path_hash)
+             WHERE m.store_path_hash = $1
+               AND m.status = 'uploading'
+               FOR UPDATE OF m
+            "#,
+        )
+        .bind(&store_path_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
 
         // DELETE narinfo → CASCADE to manifests/manifest_data.
         //
@@ -93,6 +116,13 @@ pub async fn scan_once(
         // now-valid narinfo reaped. rows_affected()==0 catches both
         // "already gone" AND "completed since SELECT" (status flipped
         // → EXISTS false → no rows match).
+        //
+        // The FOR UPDATE above already locked the manifest row, so
+        // status can't have flipped since that SELECT — but the
+        // EXISTS guard is still needed for the case where the outer
+        // SELECT's row was reaped by another replica (FOR UPDATE
+        // returned 0 rows → chunk_list=None, this DELETE also
+        // returns 0 rows → skip).
         let deleted = sqlx::query(
             r#"
             DELETE FROM narinfo n
@@ -115,7 +145,9 @@ pub async fn scan_once(
         }
 
         // Chunk decrement + enqueue (if chunked). Same helper as
-        // sweep::sweep — see gc::decrement_and_enqueue.
+        // sweep::sweep — see gc::decrement_and_enqueue. chunk_list
+        // was read INSIDE the tx above (X3 fix) — it's the CURRENT
+        // value for the manifest we just deleted.
         if let Some(bytes) = chunk_list {
             super::decrement_and_enqueue(&mut tx, &bytes, chunk_backend).await?;
         }
