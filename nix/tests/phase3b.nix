@@ -93,6 +93,19 @@ let
           -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
           -out $out/client.crt -days 3650
 
+        # ── Gateway client cert (CN=rio-gateway for HMAC bypass) ────
+        # X1 fix: store's PutPath HMAC bypass requires CN=rio-gateway.
+        # The gateway connects to the store as a CLIENT (store's
+        # ServerTlsConfig with client_ca_root verifies this cert).
+        # Without CN=rio-gateway, PutPath rejects with "assignment
+        # token required (CN=... is not rio-gateway)".
+        openssl req -newkey rsa:2048 -nodes \
+          -keyout $out/gateway.key -out gateway.csr \
+          -subj "/CN=rio-gateway"
+        openssl x509 -req -in gateway.csr \
+          -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
+          -out $out/gateway.crt -days 3650
+
         # ── HMAC key (shared scheduler ↔ store secret) ──────────────
         # -hex emits lowercase hex + newline. load_key strips the
         # trailing \n (see rio-common/src/hmac.rs:105-111) so `echo`
@@ -221,57 +234,88 @@ let
     RIO_TLS__CA_PATH = "${pki}/ca.crt";
   };
 
+  # Gateway env: SEPARATE client cert with CN=rio-gateway (X1 fix).
+  # The gateway's TlsConfig is CLIENT-only (its server side is SSH
+  # port 2222, not gRPC). The store's PutPath HMAC bypass requires
+  # CN=rio-gateway. Without this, the gateway would use the shared
+  # controlTlsEnv (CN=control) → PutPath rejects with "assignment
+  # token required (CN=control is not rio-gateway)".
+  #
+  # No HMAC key — the gateway doesn't sign or verify tokens.
+  gatewayTlsEnv = {
+    RIO_TLS__CERT_PATH = "${pki}/gateway.crt";
+    RIO_TLS__KEY_PATH = "${pki}/gateway.key";
+    RIO_TLS__CA_PATH = "${pki}/ca.crt";
+  };
+
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase3b";
 
   nodes = {
-    control = common.mkControlNode {
-      hostName = "control";
-      memorySize = 2048;
-      extraServiceEnv = controlTlsEnv;
-      # V1: wire scheduler to k3s Lease. kubeconfig is copied from
-      # k8s VM at test time (see testScript's k3s bootstrap). Before
-      # that, scheduler starts in STANDBY (lease loop's kube client
-      # init fails on missing /etc/kube/config → graceful return →
-      # is_leader stays false → dispatch_ready early-returns).
-      # After kubeconfig copy + restart: lease acquired →
-      # LeaderAcquired fired → recover_from_pg runs → recovery_
-      # complete=true → dispatch unblocked.
-      #
-      # This is the FIX for S1 being hollow: always_leader() in
-      # the no-lease default sets recovery_complete=true from boot
-      # → recovery NEVER runs. With lease config, recovery is gated
-      # on lease acquisition → actually tested.
-      extraSchedulerConfig = {
-        lease = {
-          name = "rio-scheduler-lease";
-          namespace = "default";
-          kubeconfigPath = "/etc/kube/config";
-        };
+    control = {
+      # Wrap mkControlNode in imports so we can override rio-gateway
+      # env. NixOS module merge composes environment attrsets: the
+      # gateway gets controlTlsEnv (from mkControlNode's extra
+      # ServiceEnv) MERGED with gatewayTlsEnv — gatewayTlsEnv's
+      # RIO_TLS__CERT_PATH etc WIN due to same key (last writer).
+      imports = [
+        (common.mkControlNode {
+          hostName = "control";
+          memorySize = 2048;
+          extraServiceEnv = controlTlsEnv;
+          # V1: wire scheduler to k3s Lease. kubeconfig is copied from
+          # k8s VM at test time (see testScript's k3s bootstrap). Before
+          # that, scheduler starts in STANDBY (lease loop's kube client
+          # init fails on missing /etc/kube/config → graceful return →
+          # is_leader stays false → dispatch_ready early-returns).
+          # After kubeconfig copy + restart: lease acquired →
+          # LeaderAcquired fired → recover_from_pg runs → recovery_
+          # complete=true → dispatch unblocked.
+          #
+          # This is the FIX for S1 being hollow: always_leader() in
+          # the no-lease default sets recovery_complete=true from boot
+          # → recovery NEVER runs. With lease config, recovery is gated
+          # on lease acquisition → actually tested.
+          extraSchedulerConfig = {
+            lease = {
+              name = "rio-scheduler-lease";
+              namespace = "default";
+              kubeconfigPath = "/etc/kube/config";
+            };
+          };
+          # grpcurl: T1/T2/C1 (gRPC calls with/without TLS).
+          # grpc-health-probe: T2/T3 (health checks without needing
+          #   reflection or a protoset — it has grpc.health.v1 baked in).
+          # openssl: T1 fallback (s_client for raw TLS handshake check).
+          extraPackages = [
+            pkgs.grpcurl
+            pkgs.grpc-health-probe
+            pkgs.openssl
+          ];
+          # 9091/9092/9093: metrics (curl checks). 9101/9102: plaintext
+          # health ports (spawned by scheduler/store when TLS is on).
+          # 9190: gateway's health port (always spawned; gateway's main
+          # is SSH not gRPC). 9001/9002 already in base set (worker
+          # connects cross-VM via TLS).
+          extraFirewallPorts = [
+            9091
+            9092
+            9093
+            9101
+            9102
+            9190
+          ];
+        })
+      ];
+      # Gateway uses its OWN cert (CN=rio-gateway) for outbound
+      # mTLS. mkForce overrides the merged controlTlsEnv value
+      # (NixOS attrsOf merge would otherwise give "conflicting
+      # definitions" for same-key env vars).
+      systemd.services.rio-gateway.environment = {
+        RIO_TLS__CERT_PATH = pkgs.lib.mkForce gatewayTlsEnv.RIO_TLS__CERT_PATH;
+        RIO_TLS__KEY_PATH = pkgs.lib.mkForce gatewayTlsEnv.RIO_TLS__KEY_PATH;
       };
-      # grpcurl: T1/T2/C1 (gRPC calls with/without TLS).
-      # grpc-health-probe: T2/T3 (health checks without needing
-      #   reflection or a protoset — it has grpc.health.v1 baked in).
-      # openssl: T1 fallback (s_client for raw TLS handshake check).
-      extraPackages = [
-        pkgs.grpcurl
-        pkgs.grpc-health-probe
-        pkgs.openssl
-      ];
-      # 9091/9092/9093: metrics (curl checks). 9101/9102: plaintext
-      # health ports (spawned by scheduler/store when TLS is on).
-      # 9190: gateway's health port (always spawned; gateway's main
-      # is SSH not gRPC). 9001/9002 already in base set (worker
-      # connects cross-VM via TLS).
-      extraFirewallPorts = [
-        9091
-        9092
-        9093
-        9101
-        9102
-        9190
-      ];
     };
 
     worker = common.mkWorkerNode {
