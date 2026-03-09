@@ -369,3 +369,110 @@ async fn test_orphan_completion_fires_build_completion() -> TestResult {
 
     Ok(())
 }
+
+/// Y2: orphan-completion must unpin scheduler_live_pins.
+///
+/// Scenario: old scheduler dispatches drv → pins inputs → crashes.
+/// Worker finishes. New scheduler recovers → sweep_stale_live_pins
+/// KEEPS the pin (drv is Assigned in PG, non-terminal). Then
+/// ReconcileAssignments fires → orphan completion → drv Completed.
+/// Without Y2, pins leak until NEXT restart's sweep.
+///
+/// Same setup as test_orphan_completion_fires_build_completion but
+/// additionally seeds a scheduler_live_pins row (simulating the
+/// original dispatch's pin) and asserts it's gone after reconcile.
+#[tokio::test]
+async fn test_orphan_completion_unpins_live_inputs() -> TestResult {
+    use super::integration::{put_test_path, setup_inproc_store};
+
+    let sched_db = TestDb::new(&MIGRATOR).await;
+    let store_db = TestDb::new(&MIGRATOR).await;
+
+    let (mut store_client, _store_srv) = setup_inproc_store(store_db.pool.clone()).await?;
+    let out_path = test_store_path("y2-out");
+    put_test_path(&mut store_client, &out_path).await?;
+
+    // --- Phase 1: first "leader" writes build + drv ---
+    let build_id = Uuid::new_v4();
+    {
+        let (handle, task) = setup_actor(sched_db.pool.clone());
+        let mut node = make_test_node("y2-drv", "x86_64-linux");
+        node.expected_output_paths = vec![out_path.clone()];
+        let _rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate: drv Assigned to dead worker (simulates "dispatched
+    // before crash"). Also seed a scheduler_live_pins row
+    // (simulates dispatch's pin_live_inputs).
+    sqlx::query(
+        "UPDATE derivations SET status = 'assigned', \
+         assigned_worker_id = 'y2-dead-worker' WHERE drv_hash = 'y2-drv'",
+    )
+    .execute(&sched_db.pool)
+    .await?;
+
+    // Seed a pin (simulating what dispatch would have done). The
+    // input path doesn't need to exist in the store — scheduler_
+    // live_pins has no FK (migration 007: pins may be for paths
+    // not yet uploaded). SHA-256 of a fake input path.
+    let input_path = test_store_path("y2-fake-input");
+    let db = SchedulerDb::new(sched_db.pool.clone());
+    db.pin_live_inputs(&"y2-drv".into(), &[input_path.clone()])
+        .await?;
+
+    // Verify pin seeded.
+    let pins_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'y2-drv'")
+            .fetch_one(&sched_db.pool)
+            .await?;
+    assert_eq!(pins_before, 1, "pin should be seeded before recovery");
+
+    // --- Phase 2: fresh actor recovers + reconciles ---
+    let (handle, _task) = setup_actor_with_store(sched_db.pool.clone(), Some(store_client.clone()));
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // After LeaderAcquired, sweep_stale_live_pins ran — but the
+    // drv is Assigned (non-terminal) so the pin SURVIVES. This is
+    // the critical setup: the sweep CAN'T catch this case.
+    let pins_after_sweep: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'y2-drv'")
+            .fetch_one(&sched_db.pool)
+            .await?;
+    assert_eq!(
+        pins_after_sweep, 1,
+        "sweep should KEEP pin for non-terminal drv (this is the setup, not the bug)"
+    );
+
+    // ReconcileAssignments → worker not registered → store check →
+    // outputs present → orphan completion → Completed → unpin.
+    handle
+        .send_unchecked(ActorCommand::ReconcileAssignments)
+        .await?;
+    barrier(&handle).await;
+
+    // Drv should be Completed.
+    let post = handle
+        .debug_query_derivation("y2-drv")
+        .await?
+        .expect("drv exists");
+    assert_eq!(post.status, DerivationStatus::Completed);
+
+    // Y2: pin should be GONE. Without the unpin in the orphan-
+    // completion branch, this would be 1 (leaked until next
+    // scheduler restart).
+    let pins_after_orphan: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'y2-drv'")
+            .fetch_one(&sched_db.pool)
+            .await?;
+    assert_eq!(
+        pins_after_orphan, 0,
+        "Y2: orphan completion should unpin (was {pins_after_orphan}, expected 0)"
+    );
+
+    Ok(())
+}

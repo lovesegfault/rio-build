@@ -436,6 +436,13 @@ impl DagActor {
                 }
                 self.persist_status(&drv_hash, DerivationStatus::Completed, None)
                     .await;
+                // Y2: terminal → unpin. Without this, the pins
+                // (written at original dispatch before the crash)
+                // leak until next restart's sweep_stale_live_pins.
+                // sweep_stale_live_pins ran BEFORE reconcile (the
+                // drv was Assigned/Running in PG then — kept), so
+                // it won't catch this one.
+                self.unpin_best_effort(&drv_hash).await;
                 // Release parents (same find_newly_ready pattern as
                 // handle_success_completion). Partial re-implementation:
                 // DON'T emit BuildEvent (the build is recovered,
