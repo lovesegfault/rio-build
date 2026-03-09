@@ -120,7 +120,26 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         let is_real_uuid = status.build_id != "submitted";
         let is_terminal = matches!(status.phase.as_str(), "Succeeded" | "Failed" | "Cancelled");
 
-        if is_real_uuid && !is_terminal {
+        // X2 fix: orphaned sentinel check. If build_id=="submitted"
+        // AND no watch is running for this Build (watching doesn't
+        // contain the key), the previous apply's watch died before
+        // the first event (scheduler crashed between MergeDag and
+        // BuildStarted, OR the SubmitBuild stream dropped). No
+        // external trigger will unstick this — we can't WatchBuild(
+        // build_id="submitted"), that's not a real UUID.
+        //
+        // If watching DOES contain the key, the watch is still
+        // alive and trying (its reconnect loop) — let it work.
+        let orphaned_sentinel = !is_real_uuid && !ctx.watching.contains_key(&watch_key);
+
+        if orphaned_sentinel {
+            // Fall through to the "first apply" path below — we'll
+            // resubmit. The scheduler's idempotence (MergeDag on
+            // existing DAG is a no-op) means this is safe even if
+            // the original SubmitBuild DID succeed and we just lost
+            // the stream.
+            info!(build = %name, "orphaned 'submitted' sentinel with no watch; resubmitting");
+        } else if is_real_uuid && !is_terminal {
             // Dedup: if drain_stream already running for this Build,
             // don't spawn another. The running task will handle
             // status updates; this reconcile was triggered by its
@@ -156,10 +175,11 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 watch_key,
             );
             return Ok(Action::await_change());
+        } else {
+            // Sentinel with watch still alive, OR terminal.
+            debug!(build = %name, build_id = %status.build_id, "already submitted");
+            return Ok(Action::await_change());
         }
-
-        debug!(build = %name, build_id = %status.build_id, "already submitted");
-        return Ok(Action::await_change());
     }
 
     // ---- First apply: fetch .drv, build node, submit ----
@@ -270,6 +290,9 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             // since_seq=0 for initial connect — this IS the
             // SubmitBuild stream, it starts from the beginning.
             0,
+            // No known build_id yet — scheduler assigns it on
+            // MergeDag, first event carries it. (X11)
+            None,
             ctx.watching.clone(),
             watch_key,
         ),
@@ -299,17 +322,13 @@ fn spawn_reconnect_watch(
     watch_key: String,
 ) {
     rio_common::task::spawn_monitored("build-watch-reconnect", async move {
-        // Guard removes the watching entry on ANY exit (WatchBuild
-        // error below, drain_stream normal return, panic).
-        // drain_stream has its own guard, but we need one here too
-        // for the WatchBuild-fails-immediately path.
-        let _guard = scopeguard::guard((), {
-            let watching = watching.clone();
-            let watch_key = watch_key.clone();
-            move |()| {
-                watching.remove(&watch_key);
-            }
-        });
+        // No outer scopeguard here (X14 fix). drain_stream has its
+        // own guard (build.rs:~590) that removes the watching entry.
+        // A double guard (outer + inner) creates a race: inner drops
+        // → new reconcile inserts → outer drops stale removal. The
+        // ONLY exit path where drain_stream's guard doesn't run is
+        // WatchBuild-fails-immediately (Err branch below) — we
+        // handle that explicitly with watching.remove().
         match sched
             .watch_build(types::WatchBuildRequest {
                 build_id: build_id.clone(),
@@ -325,10 +344,17 @@ fn spawn_reconnect_watch(
                     resp.into_inner(),
                     scheduler_addr,
                     since_seq,
+                    // Pass known build_id (X11 fix): we HAVE it
+                    // (from CRD status). Without this, stream-
+                    // error-before-first-event → status.build_id
+                    // empty → drain_stream exits → status stale
+                    // until controller restart.
+                    Some(build_id),
                     watching,
                     watch_key,
                 )
                 .await;
+                // drain_stream's guard removed the entry on exit.
             }
             Err(e) => {
                 // Scheduler down, or build not found (recovery
@@ -338,6 +364,9 @@ fn spawn_reconnect_watch(
                 // retries.
                 warn!(build = %name, %build_id, error = %e,
                       "WatchBuild reconnect failed; status will stop updating");
+                // Manual cleanup for the WatchBuild-fails path.
+                // drain_stream never ran → its guard didn't fire.
+                watching.remove(&watch_key);
             }
         }
     });
@@ -345,6 +374,15 @@ fn spawn_reconnect_watch(
 
 async fn cleanup(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     let name = b.name_any();
+    let ns = b.namespace().unwrap_or_default();
+
+    // X15: remove watching entry so a delete-then-recreate with
+    // the same name isn't blocked by a stale entry. The in-flight
+    // drain_stream for the old Build will PATCH-fail on the deleted
+    // CRD and exit on its own (its own guard removes the entry too
+    // — this is idempotent, removing twice is a no-op).
+    let watch_key = format!("{ns}/{name}");
+    ctx.watching.remove(&watch_key);
 
     // Read build_id from status. If never submitted (empty) or
     // still the sentinel (watch never got the first event),
@@ -561,12 +599,22 @@ fn priority_to_class(p: i32) -> &'static str {
 /// (scheduler failover). Backoff-retry up to 5 attempts; WatchBuild
 /// with the LAST seq we saw (or start_seq on first reconnect).
 /// After max retries: log warn, exit — status stale.
+///
+/// `known_build_id`: if Some, initializes status.build_id directly
+/// (X11 fix). For the reconnect path, the caller already knows the
+/// build_id (from the CRD's persisted status). Passing it means the
+/// internal reconnect loop below can WatchBuild even if the stream
+/// errors before the first event. For the initial spawn (SubmitBuild
+/// stream), pass None — the first event carries the scheduler-assigned
+/// build_id.
+#[allow(clippy::too_many_arguments)]
 async fn drain_stream(
     name: String,
     api: Api<Build>,
     mut stream: tonic::Streaming<types::BuildEvent>,
     scheduler_addr: String,
     start_seq: u64,
+    known_build_id: Option<String>,
     watching: Arc<dashmap::DashMap<String, ()>>,
     watch_key: String,
 ) {
@@ -581,9 +629,17 @@ async fn drain_stream(
     // object each time (server-side apply merges), so this tracks
     // the "last known good" state. last_sequence initialized from
     // start_seq (0 for initial SubmitBuild stream, persisted seq
-    // for reconnects).
+    // for reconnects). build_id from known_build_id if reconnecting
+    // (X11 fix) — without this, reconnect + stream-error-before-
+    // first-event → status.build_id empty → exit at line 682 →
+    // status never updates.
+    //
+    // phase: "Pending" for initial spawn. For reconnect with a
+    // known build_id, we don't know the actual phase (CRD may have
+    // old value); Progress events (X12 fix) will bump to Building.
     let mut status = BuildStatus {
         phase: "Pending".into(),
+        build_id: known_build_id.unwrap_or_default(),
         last_sequence: start_seq as i64,
         ..Default::default()
     };
@@ -749,6 +805,14 @@ pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> bool {
             // might have missed on a reconnect race).
             status.total_derivations = p.total as i32;
             status.progress = format!("{}/{}", p.completed, p.total);
+            // X12: Progress only fires AFTER Started, so the build
+            // IS building. On reconnect with since_seq > Started's
+            // seq, we never see Started → phase stays Pending (set
+            // at drain_stream init). kubectl get build shows Pending
+            // for an actively-building job. This bump fixes it.
+            if status.phase == "Pending" {
+                status.phase = "Building".into();
+            }
             true
         }
         BuildEv::Completed(_) => {
