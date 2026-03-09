@@ -722,6 +722,11 @@ impl WorkerService for SchedulerGrpc {
         // actor event loop during reconciliation with no backpressure signal.
         const MAX_HEARTBEAT_FEATURES: usize = 64;
         const MAX_HEARTBEAT_RUNNING_BUILDS: usize = 1000;
+        // Round 4 Z13: systems was unbounded. A worker advertising
+        // thousands of systems is buggy or hostile. 16 covers native
+        // + linux-builder + the four cross-arch targets × two OSes.
+        const MAX_HEARTBEAT_SYSTEMS: usize = 16;
+        rio_common::grpc::check_bound("systems", req.systems.len(), MAX_HEARTBEAT_SYSTEMS)?;
         rio_common::grpc::check_bound(
             "supported_features",
             req.supported_features.len(),

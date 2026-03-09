@@ -539,6 +539,24 @@ impl SchedulerDb {
         Ok(row.0)
     }
 
+    /// Delete the in-progress assignment for a derivation.
+    /// Round 4 Z15: called from dispatch.rs on try_send failure to
+    /// clean up the PG row that insert_assignment wrote (no worker
+    /// ever got the assignment, so the row is misleading on recovery).
+    ///
+    /// Only deletes `pending`/`acknowledged` rows — terminal rows
+    /// are audit-valuable even for stale derivations.
+    pub async fn delete_latest_assignment(&self, derivation_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM assignments \
+             WHERE derivation_id = $1 AND status IN ('pending', 'acknowledged')",
+        )
+        .bind(derivation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Update an assignment status.
     pub async fn update_assignment_status(
         &self,

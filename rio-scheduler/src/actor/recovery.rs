@@ -242,8 +242,31 @@ impl DagActor {
         // completed=0, failed=0 → all_completed (0>=0), failed==0
         // → complete_build(). The build goes Succeeded and the
         // terminal-cleanup timer is scheduled as normal.
+        // Round 4 Z16: track which builds have ZERO build_derivations
+        // rows in PG — those are orphans (Z1 pre-fix victims or crash
+        // during merge BEFORE persist). The X5 case (all derivations
+        // terminal) has non-empty build_derivations; we just filter
+        // them out at :122. bd_rows is the flat list from PG; count
+        // per-build to distinguish.
+        let mut bd_counts: HashMap<Uuid, usize> = HashMap::new();
+        for (build_id, _) in &bd_rows {
+            *bd_counts.entry(*build_id).or_insert(0) += 1;
+        }
+
         let build_ids_to_check: Vec<Uuid> = self.builds.keys().copied().collect();
         for build_id in build_ids_to_check {
+            // Z16: zero PG links → orphan. Skip completion check.
+            // Z4 (TransitionOutcome::Rejected) also guards against
+            // spurious events for already-terminal builds, but this
+            // catches Active orphans that would emit a spurious
+            // BuildCompleted with empty output_paths.
+            if bd_counts.get(&build_id).copied().unwrap_or(0) == 0 {
+                warn!(
+                    build_id = %build_id,
+                    "recovery: Active build with ZERO build_derivations rows in PG — orphan, skipping"
+                );
+                continue;
+            }
             self.update_build_counts(build_id);
             self.check_build_completion(build_id).await;
         }

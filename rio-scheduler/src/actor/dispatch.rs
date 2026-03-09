@@ -141,9 +141,16 @@ impl DagActor {
         // seeing rio_scheduler_class_queue_depth{class="large"}=50 knows
         // large workers are the bottleneck.
         //
-        // Classes with zero deferred aren't reported (the map only has
-        // entries we incremented). That's fine — absence of the metric
-        // label means "not bottlenecked," which is the right signal.
+        // Round 4 Z14: zero out ALL configured classes first. The
+        // previous comment claimed "absence of the label means not
+        // bottlenecked" — but gauges PERSIST in Prometheus until
+        // overwritten. A class that was backed up (gauge=50) then
+        // cleared (no entries in class_deferred this pass) would STAY
+        // at 50 forever. Operators would see a phantom bottleneck.
+        for sc in &self.size_classes {
+            metrics::gauge!("rio_scheduler_class_queue_depth", "class" => sc.name.clone()).set(0.0);
+        }
+        // Now overwrite for classes that actually have deferrals.
         for (class, count) in class_deferred {
             metrics::gauge!("rio_scheduler_class_queue_depth", "class" => class).set(count as f64);
         }
@@ -431,6 +438,24 @@ impl DagActor {
                     metrics::counter!("rio_scheduler_transition_rejected_total", "to" => "ready_reset")
                         .increment(1);
                 }
+
+                // Round 4 Z15: also clean up PG state written above.
+                // unpin: pin_live_inputs wrote scheduler_live_pins
+                // rows. Without unpinning, they leak until terminal
+                // cleanup (which never runs if this drv stays stuck).
+                self.unpin_best_effort(drv_hash).await;
+                // delete assignment: insert_assignment wrote a
+                // 'pending' row. On recovery, this row is misleading
+                // (the worker never got the assignment). log-on-fail:
+                // this is best-effort cleanup.
+                if let Some(state) = self.dag.node(drv_hash)
+                    && let Some(db_id) = state.db_id
+                    && let Err(e) = self.db.delete_latest_assignment(db_id).await
+                {
+                    warn!(drv_hash = %drv_hash, error = %e,
+                          "delete_latest_assignment failed during try_send rollback");
+                }
+
                 return false;
             }
         }

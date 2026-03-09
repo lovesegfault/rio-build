@@ -158,4 +158,37 @@ pub fn describe_metrics() {
         "BuildEvents dropped from PG persister (channel backpressure). \
          Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
     );
+    // Round 4 Z19: 8 scheduler metrics were emitted but not described.
+    describe_counter!(
+        "rio_scheduler_backstop_timeouts_total",
+        "Derivations reset to Ready after running-since exceeded backstop (worker went silent)"
+    );
+    describe_counter!(
+        "rio_scheduler_recovery_total",
+        "Scheduler state recoveries from PG after LeaderAcquired"
+    );
+    describe_histogram!(
+        "rio_scheduler_recovery_duration_seconds",
+        "Time to reconstruct actor state from PG on LeaderAcquired"
+    );
+    describe_counter!(
+        "rio_scheduler_worker_disconnects_total",
+        "Worker stream disconnects (graceful and ungraceful; labeled by reason if available)"
+    );
+    describe_counter!(
+        "rio_scheduler_cancel_signals_total",
+        "CancelSignal messages sent to workers (build cancellation propagation)"
+    );
+    describe_counter!(
+        "rio_scheduler_lease_acquired_total",
+        "Successful K8s Lease acquisitions (leader elections won)"
+    );
+    describe_counter!(
+        "rio_scheduler_lease_lost_total",
+        "K8s Lease losses (stepped down, partition, or preempted)"
+    );
+    describe_counter!(
+        "rio_scheduler_estimator_refresh_total",
+        "Duration estimator refresh cycles (re-reads build_history EMAs)"
+    );
 }

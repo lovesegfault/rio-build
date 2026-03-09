@@ -248,8 +248,15 @@ impl DagActor {
             && let Some(pname) = &state.pname
             && let (Some(start), Some(stop)) = (&result.start_time, &result.stop_time)
         {
-            let duration_secs = stop.seconds.saturating_sub(start.seconds) as f64
-                + stop.nanos.saturating_sub(start.nanos) as f64 / 1_000_000_000.0;
+            // Round 4 Z12: convert to seconds FIRST, then subtract.
+            // Previous version did saturating_sub on nanos separately,
+            // which underflows when stop.nanos < start.nanos (e.g.,
+            // start=10.900s, stop=11.100s → real diff 0.2s, but old
+            // code gave 1s+0ns = 1.0s). Computing each timestamp as
+            // a single f64 in seconds and subtracting is correct.
+            let start_f = start.seconds as f64 + start.nanos as f64 / 1_000_000_000.0;
+            let stop_f = stop.seconds as f64 + stop.nanos as f64 / 1_000_000_000.0;
+            let duration_secs = stop_f - start_f;
             // Sanity bound: reject durations > 30 days (bogus worker timestamps)
             if duration_secs > 0.0 && duration_secs < 30.0 * 86400.0 {
                 // 0 → None: "no signal" must not drag the EMA toward

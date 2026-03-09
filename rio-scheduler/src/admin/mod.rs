@@ -455,7 +455,7 @@ impl AdminService for AdminServiceImpl {
 
         debug!(
             dry_run = req.dry_run,
-            grace_hours = req.grace_period_hours,
+            grace_hours = ?req.grace_period_hours,
             extra_roots = extra_count,
             "proxying TriggerGC to store with live-build roots"
         );
