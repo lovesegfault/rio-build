@@ -275,6 +275,24 @@ impl DagActor {
     pub(super) async fn handle_leader_acquired(&mut self) {
         match self.recover_from_pg().await {
             Ok(()) => {
+                // X9 stale-pin cleanup: crash-between-pin-and-unpin
+                // (scheduler crashed after dispatch pin but before
+                // completion unpin) leaves rows in scheduler_live_
+                // pins for terminal drvs. Sweep them — they're
+                // safe to remove (drv is terminal, inputs no longer
+                // in-use). Best-effort; grace period is fallback.
+                match self.db.sweep_stale_live_pins().await {
+                    Ok(n) if n > 0 => {
+                        info!(
+                            swept = n,
+                            "swept stale scheduler_live_pins (crash recovery)"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, "failed to sweep stale live pins (best-effort)");
+                    }
+                }
                 self.recovery_complete
                     .store(true, std::sync::atomic::Ordering::Release);
             }

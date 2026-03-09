@@ -103,6 +103,10 @@ impl DagActor {
             {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist Cancelled status");
             }
+            // X9 unpin: terminal (Cancelled) → release live-input pins.
+            if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
+                debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
+            }
         }
         if !to_cancel.is_empty() {
             info!(

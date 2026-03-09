@@ -4725,6 +4725,7 @@ dependencies = [
  "metrics",
  "moka",
  "proptest",
+ "rcgen",
  "rio-common",
  "rio-nix",
  "rio-proto",
@@ -4742,6 +4743,7 @@ dependencies = [
  "tonic-health",
  "tower",
  "tracing",
+ "x509-parser",
  "zstd",
 ]
 

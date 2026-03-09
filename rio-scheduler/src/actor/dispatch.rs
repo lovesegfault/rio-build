@@ -294,6 +294,22 @@ impl DagActor {
             worker.running_builds.insert(drv_hash.clone());
         }
 
+        // X9 auto-pin: write input-closure paths to scheduler_live_
+        // pins so GC's mark CTE protects them. Same closure
+        // approximation as send_prefetch_hint and best_worker
+        // scoring (approx_input_closure). Best-effort: PG failure
+        // logs + continues; 24h grace period is the fallback.
+        // Empty for leaf derivations → no-op.
+        {
+            let input_paths = crate::assignment::approx_input_closure(&self.dag, drv_hash);
+            if !input_paths.is_empty()
+                && let Err(e) = self.db.pin_live_inputs(drv_hash, &input_paths).await
+            {
+                debug!(drv_hash = %drv_hash, error = %e,
+                       "failed to pin live inputs (best-effort; grace period is fallback)");
+            }
+        }
+
         // PrefetchHint BEFORE WorkAssignment: the worker starts
         // warming its FUSE cache while still parsing the .drv
         // (which it fetches or extracts from drv_content below).

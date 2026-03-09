@@ -302,6 +302,84 @@ impl SchedulerDb {
         .await?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // X9: scheduler_live_pins — auto-pin live-build input closure
+    //
+    // Scheduler+store share PG (same migrations/ dir). Scheduler writes
+    // directly to scheduler_live_pins; store's gc/mark.rs seeds from it.
+    // Best-effort: PG failure during pin/unpin logs + continues (24h grace
+    // period is the fallback safety net).
+    // -----------------------------------------------------------------------
+
+    /// Pin a batch of store paths as live-build inputs for a drv.
+    /// SHA-256 each path for store_path_hash (matches narinfo keying).
+    /// ON CONFLICT DO NOTHING: re-pin is idempotent.
+    pub async fn pin_live_inputs(
+        &self,
+        drv_hash: &DrvHash,
+        store_paths: &[String],
+    ) -> Result<(), sqlx::Error> {
+        if store_paths.is_empty() {
+            return Ok(());
+        }
+        use sha2::Digest;
+        let hashes: Vec<Vec<u8>> = store_paths
+            .iter()
+            .map(|p| sha2::Sha256::digest(p.as_bytes()).to_vec())
+            .collect();
+
+        // Batch INSERT via UNNEST. Arrays are parallel (same length
+        // by construction: same source vec). ON CONFLICT DO NOTHING
+        // for idempotence — re-dispatching a drv (after reassign)
+        // shouldn't error.
+        sqlx::query(
+            r#"
+            INSERT INTO scheduler_live_pins (store_path_hash, drv_hash)
+            SELECT * FROM UNNEST($1::bytea[], $2::text[])
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&hashes)
+        .bind(vec![drv_hash.as_str(); hashes.len()])
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Unpin all live inputs for a drv. Called on terminal status.
+    /// Idempotent: unpinning a never-pinned drv = 0 rows deleted.
+    pub async fn unpin_live_inputs(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM scheduler_live_pins WHERE drv_hash = $1")
+            .bind(drv_hash.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Sweep stale pins: delete rows for derivations that are no
+    /// longer in non-terminal state. Called after recovery (handles
+    /// crash-between-pin-and-unpin — scheduler crashed after pin at
+    /// dispatch but before unpin at completion).
+    ///
+    /// The subquery matches load_nonterminal_derivations' filter:
+    /// a drv NOT in that set is terminal (or deleted entirely).
+    pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM scheduler_live_pins
+             WHERE drv_hash NOT IN (
+               SELECT drv_hash FROM derivations
+                WHERE status NOT IN ('completed', 'poisoned',
+                                     'dependency_failed', 'cancelled')
+             )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     // -----------------------------------------------------------------------
     // Build-derivation mapping
     // -----------------------------------------------------------------------

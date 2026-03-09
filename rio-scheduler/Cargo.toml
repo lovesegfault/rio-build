@@ -55,12 +55,14 @@ flate2 = { workspace = true }
 # phase2b: log ring buffer written from BuildExecution recv tasks
 dashmap = { workspace = true }
 serde = { workspace = true }
+# X9 auto-pin: SHA-256 store paths for scheduler_live_pins hashes.
+# Was dev-only; promoted to prod for db.rs pin_live_inputs.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rio-store = { workspace = true }
 rio-test-support = { workspace = true }
-sha2 = { workspace = true }
 tracing-test = "0.2"
 aws-smithy-mocks = "0.2"
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }

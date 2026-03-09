@@ -180,6 +180,11 @@ impl DagActor {
             error!(drv_hash = %drv_hash, error = %e, "failed to update derivation status in DB");
         }
 
+        // X9 unpin: terminal → release live-input pins. Best-effort.
+        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
+            debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
+        }
+
         // Update assignment (non-terminal progress write: log failure, don't block)
         if let Some(state) = self.dag.node(drv_hash)
             && let Some(db_id) = state.db_id
@@ -390,6 +395,11 @@ impl DagActor {
             error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
         }
 
+        // X9 unpin: terminal (Poisoned) → release live-input pins.
+        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
+            debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
+        }
+
         // Cascade: parents of a poisoned derivation can never complete.
         // Transition them to DependencyFailed so keepGoing builds terminate.
         self.cascade_dependency_failure(drv_hash).await;
@@ -525,6 +535,11 @@ impl DagActor {
             .await
         {
             error!(drv_hash = %drv_hash, error = %e, "failed to persist Poisoned status");
+        }
+
+        // X9 unpin: terminal (Poisoned) → release live-input pins.
+        if let Err(e) = self.db.unpin_live_inputs(drv_hash).await {
+            debug!(drv_hash = %drv_hash, error = %e, "failed to unpin live inputs (best-effort)");
         }
 
         // Cascade: parents of a poisoned derivation can never complete.

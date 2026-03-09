@@ -652,3 +652,79 @@ async fn test_generation_single_load_within_assignment() -> TestResult {
     );
     Ok(())
 }
+
+/// X9: dispatch pins input-closure paths; terminal unpins.
+/// Verifies the end-to-end pin → unpin lifecycle via scheduler_
+/// live_pins row count.
+#[tokio::test]
+async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
+    let (db, handle, _task, mut stream_rx) = setup_with_worker("w-x9", "x86_64-linux", 2).await?;
+
+    // Two-node chain: child (leaf, no inputs) + parent (depends
+    // on child). Parent's approx_input_closure = child's
+    // expected_output_paths. Dispatch of PARENT should pin those.
+    //
+    // make_test_node defaults expected_output_paths=vec![]; set
+    // explicitly so approx_input_closure has something to collect.
+    let build_id = Uuid::new_v4();
+    let child_out = test_store_path("x9-child-out");
+    let mut child = make_test_node("x9-child", "x86_64-linux");
+    child.expected_output_paths = vec![child_out.clone()];
+    let parent = make_test_node("x9-parent", "x86_64-linux");
+    let _rx = merge_dag(
+        &handle,
+        build_id,
+        vec![child, parent],
+        vec![make_test_edge("x9-parent", "x9-child")],
+        false,
+    )
+    .await?;
+
+    // Child dispatches first (leaf → Ready immediately).
+    let assignment_child = recv_assignment(&mut stream_rx).await;
+    assert!(assignment_child.drv_path.contains("x9-child"));
+
+    // Child is leaf → approx_input_closure empty → no pin.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-child'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(count, 0, "leaf drv (no inputs) should not pin anything");
+
+    // Complete child → parent becomes Ready → dispatched → pinned.
+    complete_success_empty(&handle, "w-x9", "x9-child").await?;
+    // Parent dispatch sends PrefetchHint FIRST (child has expected_
+    // output_paths set above), then Assignment. Drain both.
+    let assignment_parent = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        if let Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) = msg.msg {
+            break a;
+        }
+        // Else: PrefetchHint, skip.
+    };
+    assert!(assignment_parent.drv_path.contains("x9-parent"));
+    barrier(&handle).await;
+
+    // Parent's input-closure = child's expected_output_paths
+    // (1 path via make_test_node). Pin should be present.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-parent'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(count, 1, "parent dispatch should pin its 1 input path (X9)");
+
+    // Complete parent → unpin.
+    complete_success_empty(&handle, "w-x9", "x9-parent").await?;
+    barrier(&handle).await;
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-parent'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(count, 0, "completion should unpin (X9)");
+
+    Ok(())
+}
