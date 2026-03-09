@@ -277,6 +277,29 @@ async fn send_store_error<W: AsyncWrite + Unpin>(
 }
 
 /// If `path` is a `.drv`, parse the ATerm from NAR data and cache it.
+/// Round 4 Z24: cap drv_cache at MAX_TRANSITIVE_INPUTS. The cache
+/// is session-scoped; a client uploading 100k .drv files would
+/// consume ~100k * (avg drv size ~1KB parsed) = ~100MB per session.
+/// MAX_TRANSITIVE_INPUTS (10k) matches the BFS limit in
+/// translate::reconstruct_dag — a DAG bigger than that would be
+/// rejected anyway, so caching more .drvs is wasted.
+///
+/// Returns true if inserted, false if cap hit. Caller decides what
+/// to do (try_cache_drv logs + continues; resolve_derivation
+/// returns an error to the client).
+fn insert_drv_bounded(
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+    path: StorePath,
+    drv: Derivation,
+) -> bool {
+    if drv_cache.len() >= crate::translate::MAX_TRANSITIVE_INPUTS && !drv_cache.contains_key(&path)
+    {
+        return false;
+    }
+    drv_cache.insert(path, drv);
+    true
+}
+
 fn try_cache_drv(
     path: &StorePath,
     nar_data: &[u8],
@@ -287,8 +310,17 @@ fn try_cache_drv(
     }
     match Derivation::parse_from_nar(nar_data) {
         Ok(drv) => {
-            debug!(path = %path, "cached parsed derivation");
-            drv_cache.insert(path.clone(), drv);
+            if insert_drv_bounded(drv_cache, path.clone(), drv) {
+                debug!(path = %path, "cached parsed derivation");
+            } else {
+                // Log once-ish (every subsequent insert fails too).
+                // The upload itself succeeds; only the cache skip.
+                warn!(
+                    path = %path,
+                    cap = crate::translate::MAX_TRANSITIVE_INPUTS,
+                    "drv_cache at cap; not caching (upload still proceeds)"
+                );
+            }
         }
         Err(e) => {
             warn!(path = %path, error = %e, "failed to parse .drv from NAR");
@@ -314,7 +346,18 @@ pub(crate) async fn resolve_derivation(
     let drv = Derivation::parse_from_nar(&nar_data)
         .map_err(|e| anyhow::anyhow!("failed to parse .drv '{}': {e}", drv_path))?;
 
-    drv_cache.insert(drv_path.clone(), drv.clone());
+    // Round 4 Z24: bound drv_cache. resolve_derivation is called
+    // from BFS in translate::reconstruct_dag — cap hit means the
+    // DAG is too large (MAX_TRANSITIVE_INPUTS enforced by the BFS
+    // itself, but the cache could grow beyond that across multiple
+    // builds in one session). Error propagates as DAG failure.
+    if !insert_drv_bounded(drv_cache, drv_path.clone(), drv.clone()) {
+        return Err(anyhow::anyhow!(
+            "per-session derivation cache full ({} entries, cap {})",
+            drv_cache.len(),
+            crate::translate::MAX_TRANSITIVE_INPUTS
+        ));
+    }
     Ok(drv)
 }
 

@@ -243,6 +243,18 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 failed.error_message.clone(),
             ));
         }
+        // Round 4 Z22: Cancelled as first event (was missing; only
+        // handled in the loop at :150). Can happen if a WatchBuild
+        // reconnect arrives after the build was already cancelled —
+        // the scheduler replays from build_event_log and Cancelled
+        // is the first (and only) event past since_sequence.
+        if let Some(types::build_event::Event::Cancelled(ref cancelled)) = ev.event {
+            active_build_ids.remove(&build_id);
+            return Ok(BuildResult::failure(
+                BuildStatus::MiscFailure,
+                format!("build cancelled: {}", cancelled.reason),
+            ));
+        }
     }
 
     // Process remaining events, with reconnect on stream error.
@@ -419,6 +431,28 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // IFD detection: if we haven't seen wopBuildPathsWithResults on this session,
     // this is likely an IFD or build-hook request
     let is_ifd_hint = !*has_seen_build_paths_with_results;
+
+    // Round 4 Z23: check __noChroot on the BasicDerivation DIRECTLY.
+    // validate_dag (called below) checks drv_cache entries, but if the
+    // full drv isn't available (falls back to single_node_from_basic),
+    // the drv is never in the cache → __noChroot check is skipped. The
+    // BasicDerivation wire format DOES include env; we have it here.
+    //
+    // A malicious client could send __noChroot=1 via wopBuildDerivation
+    // (which sends an inline BasicDerivation, not a store path) to
+    // escape the sandbox. This catches it at the gateway.
+    if basic_drv
+        .env()
+        .get("__noChroot")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        warn!(drv_path = %drv_path_str, "rejecting __noChroot via inline BasicDerivation");
+        stderr_err!(
+            stderr,
+            "derivation requests __noChroot (sandbox escape) — not permitted"
+        );
+    }
 
     // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
     // The .drv should have been uploaded via wopAddToStoreNar before this call.

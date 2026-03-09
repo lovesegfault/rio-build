@@ -93,6 +93,13 @@ pub enum TlsError {
          — all three must be set or all unset"
     )]
     Incomplete { cert: bool, key: bool, ca: bool },
+
+    /// File exists but doesn't contain a PEM block. Catches empty
+    /// files, DER-format files (binary, no -----BEGIN), or plain
+    /// garbage. tonic/rustls would also fail, but their error
+    /// messages don't mention the path.
+    #[error("TLS file {path} doesn't contain a PEM block (no '-----BEGIN' marker)")]
+    Malformed { path: PathBuf },
 }
 
 /// Read a PEM file, returning the UTF-8 contents.
@@ -102,10 +109,19 @@ pub enum TlsError {
 /// surfaces I/O errors with the path attached (the default io::Error
 /// doesn't say WHICH file, which is infuriating with three paths).
 fn read_pem(path: &PathBuf) -> Result<String, TlsError> {
-    std::fs::read_to_string(path).map_err(|source| TlsError::Io {
+    let contents = std::fs::read_to_string(path).map_err(|source| TlsError::Io {
         path: path.clone(),
         source,
-    })
+    })?;
+    // Round 4 Z26: validate at least one PEM block exists.
+    // Catches: empty file, DER-format binary, wrong-file-pointed-
+    // at. tonic/rustls WOULD fail eventually but their errors
+    // don't mention the path — operator grep-and-squints for
+    // which of 3 paths is bad. This fails fast with the path.
+    if !contents.contains("-----BEGIN") {
+        return Err(TlsError::Malformed { path: path.clone() });
+    }
+    Ok(contents)
 }
 
 /// Build a server-side TLS config.
@@ -298,6 +314,43 @@ mod tests {
             cfg.is_configured(),
             "is_configured should be true for any path set — \
              the loader will catch partial config with an Err"
+        );
+    }
+
+    /// Round 4 Z26: empty/garbage PEM → Malformed error with path.
+    /// Catches empty mounted Secret, DER-format cert, wrong file.
+    #[test]
+    fn empty_pem_is_malformed() {
+        let empty = write_tmp("");
+        let cfg = TlsConfig {
+            cert_path: Some(empty.path().to_path_buf()),
+            key_path: Some(empty.path().to_path_buf()),
+            ca_path: Some(empty.path().to_path_buf()),
+        };
+        let err = load_server_tls(&cfg).unwrap_err();
+        match err {
+            TlsError::Malformed { path } => {
+                assert_eq!(path, empty.path());
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_pem_is_malformed() {
+        // Content without -----BEGIN → Malformed, not left for
+        // rustls to fail at handshake with a cryptic error.
+        let garbage = write_tmp("this is definitely not a PEM file");
+        let valid = write_tmp(DUMMY_PEM);
+        let cfg = TlsConfig {
+            cert_path: Some(valid.path().to_path_buf()),
+            key_path: Some(garbage.path().to_path_buf()),
+            ca_path: Some(valid.path().to_path_buf()),
+        };
+        let err = load_client_tls(&cfg).unwrap_err();
+        assert!(
+            matches!(err, TlsError::Malformed { .. }),
+            "garbage PEM should be Malformed, got {err:?}"
         );
     }
 }

@@ -584,6 +584,22 @@ pub(crate) fn sts_replicas_patch(replicas: i32) -> serde_json::Value {
 /// Edge: `queued=0` → desired=0 → clamped to min. Correct: empty
 /// queue means scale DOWN to min, not to zero.
 pub(crate) fn compute_desired(queued: u32, _active: u32, target: i32, min: i32, max: i32) -> i32 {
+    // Round 4 Z25: defensive min>max swap. The CRD's CEL validation
+    // enforces min ≤ max, but a CRD installed BEFORE the CEL was
+    // added (or edited with `--validate=false`) could have min>max.
+    // i32::clamp PANICS if min>max — the autoscaler dies silently.
+    // Swap with a warn so operator notices.
+    let (min, max) = if min > max {
+        tracing::warn!(
+            min,
+            max,
+            "compute_desired: min > max (pre-CEL CRD?); swapping"
+        );
+        (max, min)
+    } else {
+        (min, max)
+    };
+
     let target = target.max(1) as u32;
     // ceil division. clippy prefers the std method over the
     // (a + b - 1) / b idiom — same semantics, clearer intent.
@@ -857,6 +873,26 @@ mod tests {
             compute_desired(15, 100, 5, 1, 10),
             3,
             "active is logged-only"
+        );
+    }
+
+    /// Round 4 Z25: min > max would PANIC in i32::clamp. Defensive
+    /// swap prevents the autoscaler loop from dying silently on a
+    /// pre-CEL CRD (or a --validate=false edit).
+    #[test]
+    fn compute_desired_swaps_min_greater_than_max() {
+        // min=10, max=2 → swap to min=2, max=10. With queued=50,
+        // target=5 → desired=10 (at max).
+        assert_eq!(
+            compute_desired(50, 0, 5, 10, 2),
+            10,
+            "min>max swapped; clamped to original min (now max)"
+        );
+        // queued=0 → desired=0 → clamped to swapped min (original max=2).
+        assert_eq!(
+            compute_desired(0, 0, 5, 10, 2),
+            2,
+            "queued=0 → swapped min (original max)"
         );
     }
 

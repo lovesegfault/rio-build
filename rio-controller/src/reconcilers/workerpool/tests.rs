@@ -497,6 +497,31 @@ fn quantity_invalid_rejected() {
         parse_quantity_to_gb(""),
         Err(Error::InvalidSpec(_))
     ));
+    // Round 4 Z28: negative and non-finite rejected.
+    assert!(matches!(
+        parse_quantity_to_gb("-5Gi"),
+        Err(Error::InvalidSpec(_))
+    ));
+    assert!(matches!(
+        parse_quantity_to_gb("infGi"),
+        Err(Error::InvalidSpec(_))
+    ));
+}
+
+/// Round 4 Z28: decimal quantities (K8s Quantity allows them).
+/// Prior code parsed as u64 → rejected "1.5Gi" even though it's
+/// a valid K8s Quantity. f64 parse + floor-to-u64 accepts it.
+#[test]
+fn quantity_decimal_fraction() {
+    // 1.5 GiB = 1.5 * 1024^3 = 1610612736 bytes → 1 GB (floor).
+    assert_eq!(parse_quantity_to_gb("1.5Gi").unwrap(), 1);
+    // 2.5 GiB → 2 GB (floor).
+    assert_eq!(parse_quantity_to_gb("2.5Gi").unwrap(), 2);
+    // 0.5 GiB = 512 MiB → 0 GB (floor). Operator probably wants
+    // at least 1 GB but the spec says 0.5Gi so we honor it.
+    assert_eq!(parse_quantity_to_gb("0.5Gi").unwrap(), 0);
+    // 1.5Ti = 1536 GiB.
+    assert_eq!(parse_quantity_to_gb("1.5Ti").unwrap(), 1536);
 }
 
 #[test]

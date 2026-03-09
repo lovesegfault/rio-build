@@ -662,16 +662,31 @@ pub(super) fn parse_quantity_to_gb(q: &str) -> Result<u64> {
 
     for (suffix, mult) in SUFFIXES {
         if let Some(num) = q.strip_suffix(suffix) {
-            let n: u64 = num.trim().parse().map_err(|_| {
+            // Round 4 Z28: parse as f64 to accept decimal quantities
+            // like "1.5Gi" (K8s Quantity allows these). Compute in
+            // f64, then floor to u64 bytes before the GB division.
+            // "1.5Gi" → 1.5 * 1024^3 = 1610612736 bytes → 1 GB
+            // (floor of bytes/1024^3). Prior u64 parse rejected
+            // decimals entirely → CRD apply would fail for a valid
+            // K8s Quantity.
+            let n: f64 = num.trim().parse().map_err(|_| {
                 Error::InvalidSpec(format!(
                     "fuseCacheSize {q:?}: {num:?} before suffix is not a number"
                 ))
             })?;
-            let bytes = n
-                .checked_mul(*mult)
-                .ok_or_else(|| Error::InvalidSpec(format!("fuseCacheSize {q:?}: overflows u64")))?;
+            if n < 0.0 || !n.is_finite() {
+                return Err(Error::InvalidSpec(format!(
+                    "fuseCacheSize {q:?}: must be a non-negative finite number"
+                )));
+            }
+            let bytes_f = n * *mult as f64;
+            if bytes_f > u64::MAX as f64 {
+                return Err(Error::InvalidSpec(format!(
+                    "fuseCacheSize {q:?}: overflows u64"
+                )));
+            }
             // Integer division rounds down.
-            return Ok(bytes / (1024 * 1024 * 1024));
+            return Ok(bytes_f.floor() as u64 / (1024 * 1024 * 1024));
         }
     }
 

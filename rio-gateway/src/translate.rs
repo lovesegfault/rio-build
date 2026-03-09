@@ -30,7 +30,7 @@ const INLINE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 use crate::handler::{ClientOptions, resolve_derivation};
 
 /// Maximum number of transitive input derivations to resolve (DoS prevention).
-const MAX_TRANSITIVE_INPUTS: usize = 10_000;
+pub(crate) const MAX_TRANSITIVE_INPUTS: usize = 10_000;
 
 /// Reconstruct the full derivation DAG starting from a root derivation.
 ///

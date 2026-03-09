@@ -289,6 +289,12 @@ fn describe_metrics() {
         "WorkerPool replica counts. kind=actual|desired, pool=namespace/name. \
          Gap between actual and desired = StatefulSet rollout lag or stabilization window."
     );
+    // Round 4 Z19: build_watch_spawns was emitted but not described.
+    describe_counter!(
+        "rio_controller_build_watch_spawns_total",
+        "drain_stream tasks spawned (initial + reconnect). \
+         Should be ~1 per Build lifetime; high rate = reconnect churn (scheduler instability)."
+    );
 }
 
 /// Spawn a trivial /healthz server. Always 200 — reaching the

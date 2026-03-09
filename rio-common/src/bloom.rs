@@ -114,7 +114,27 @@ impl BloomFilter {
         let p = target_fpr.clamp(1e-9, 0.5);
 
         let ln2 = std::f64::consts::LN_2;
-        let m = (-(n * p.ln()) / (ln2 * ln2)).ceil() as u32;
+        // Round 4 Z27: compute m as f64, clamp to u32::MAX before
+        // casting. For n=1e9 items at p=1e-9, m ≈ 4.3e10 which
+        // silently wraps when cast to u32 (4.3e10 % 2^32 ≈ 3.4e8)
+        // → filter 100× smaller than requested → FPR way above
+        // target. Clamp makes the overflow VISIBLE (warn! log).
+        // num_bits stays u32 for wire compat — a u32::MAX-bit
+        // filter is 512 MiB, absurd for a heartbeat; operator
+        // should notice and reduce expected_items or raise FPR.
+        let m_f = (-(n * p.ln()) / (ln2 * ln2)).ceil();
+        let m = if m_f > u32::MAX as f64 {
+            tracing::warn!(
+                requested_bits = %m_f,
+                clamped_bits = u32::MAX,
+                expected_items,
+                target_fpr,
+                "bloom filter size overflows u32; clamping (FPR will be worse than requested)"
+            );
+            u32::MAX
+        } else {
+            m_f as u32
+        };
         // m can't be zero after the clamp (n ≥ 1, p ≤ 0.5 → -ln(p) > 0).
         // But be defensive: a zero-bit filter would divide by zero in
         // indices().
