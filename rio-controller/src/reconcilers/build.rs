@@ -104,7 +104,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // gets a FRESH uid. If we keyed by name, an old drain_stream's
     // scopeguard (for the deleted Build) would remove the NEW
     // Build's entry when it finally exits after stream-EOF → next
-    // reconcile spawns a duplicate (Y1). uid is apiserver-assigned
+    // reconcile spawns a duplicate. uid is apiserver-assigned
     // on create, always unique.
     let watch_key = b.uid().unwrap_or_default();
 
@@ -128,7 +128,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         let is_real_uuid = status.build_id != "submitted";
         let is_terminal = matches!(status.phase.as_str(), "Succeeded" | "Failed" | "Cancelled");
 
-        // X2 fix: orphaned sentinel check. If build_id=="submitted"
+        // Orphaned sentinel check. If build_id=="submitted"
         // AND no watch is running for this Build (watching doesn't
         // contain the key), the previous apply's watch died before
         // the first event (scheduler crashed between MergeDag and
@@ -143,7 +143,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         if orphaned_sentinel {
             // Fall through to the "first apply" path below — we'll
             // resubmit. SubmitBuild generates a FRESH build_id
-            // (grpc/mod.rs:353), so this is NOT a true no-op: the
+            // (see SchedulerService::submit_build), so this is NOT
+            // a true no-op: the
             // scheduler's MergeDag dedups derivation NODES by
             // drv_hash (no duplicate builds execute), but a zombie
             // build_id + PG builds row is created. It's reaped by
@@ -162,8 +163,8 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 return Ok(Action::await_change());
             }
             // Reconnect: WatchBuild + spawn fresh drain_stream.
-            // since_sequence from status.last_sequence (0 for
-            // pre-Phase-3b rows = replay all, safe default).
+            // since_sequence from status.last_sequence (0 = replay
+            // all, safe default for any row lacking a sequence).
             info!(
                 build = %name,
                 build_id = %status.build_id,
@@ -236,25 +237,23 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 
     let api: Api<Build> = Api::namespaced(ctx.client.clone(), &ns);
 
-    // ---- Sentinel patch BEFORE submit (Round 4 Z10) ----
+    // ---- Sentinel patch BEFORE submit ----
     // Set build_id="submitted" so the idempotence gate above skips
     // re-reconciles. This MUST land BEFORE submit_build so:
     //   (a) if sentinel patch fails → clean retry (no scheduler
     //       state to clean up)
     //   (b) if submit fails AFTER sentinel → orphaned-sentinel
-    //       resubmit path (line ~143 above) handles it cleanly
+    //       resubmit path above handles it cleanly
     //   (c) if a fast build's first event races this reconcile,
     //       the sentinel is already persisted before drain_stream
     //       can patch (prevents Pending/submitted overwrite of
     //       Building/<uuid>)
     //
-    // Prior to round 4, submit came first. If patch failed after
-    // submit, the stream was dropped (this function returns Err),
-    // but the scheduler had a live build. Next reconcile → build_id
-    // still empty → DOUBLE SUBMIT → zombie build (scheduler's
-    // MergeDag dedups derivations by hash, but still creates a PG
-    // builds row + broadcast channel — leaked until terminal
-    // cleanup or scheduler restart).
+    // If submit came first: patch-fail-after-submit drops the
+    // stream but leaves a live scheduler build. Next reconcile sees
+    // build_id empty → DOUBLE SUBMIT → zombie build (MergeDag
+    // dedups derivations by hash, but still creates a PG builds
+    // row + broadcast channel — leaked until terminal cleanup).
     patch_status(
         &api,
         &name,
@@ -268,10 +267,10 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 
     let stream = sched.submit_build(req).await?.into_inner();
 
-    // Round 4 Z11: K8s Event for the submit. Operators see this
-    // in `kubectl describe build <name>` before any scheduler
-    // events arrive. Best-effort (event publish failure logged,
-    // not propagated).
+    // K8s Event for the submit. Operators see this in
+    // `kubectl describe build <name>` before any scheduler events
+    // arrive. Best-effort (event publish failure logged, not
+    // propagated).
     ctx.publish_event(
         b.as_ref(),
         &kube::runtime::events::Event {
@@ -323,7 +322,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             // SubmitBuild stream, it starts from the beginning.
             0,
             // No known build_id yet — scheduler assigns it on
-            // MergeDag, first event carries it. (X11)
+            // MergeDag, first event carries it.
             None,
             ctx.watching.clone(),
             watch_key,
@@ -358,13 +357,13 @@ fn spawn_reconnect_watch(
     obj_ref: k8s_openapi::api::core::v1::ObjectReference,
 ) {
     rio_common::task::spawn_monitored("build-watch-reconnect", async move {
-        // No outer scopeguard here (X14 fix). drain_stream has its
-        // own guard (build.rs:~590) that removes the watching entry.
-        // A double guard (outer + inner) creates a race: inner drops
-        // → new reconcile inserts → outer drops stale removal. The
-        // ONLY exit path where drain_stream's guard doesn't run is
-        // WatchBuild-fails-immediately (Err branch below) — we
-        // handle that explicitly with watching.remove().
+        // No outer scopeguard here. drain_stream has its own guard
+        // that removes the watching entry. A double guard (outer +
+        // inner) creates a race: inner drops → new reconcile inserts
+        // → outer drops stale removal. The ONLY exit path where
+        // drain_stream's guard doesn't run is WatchBuild-fails-
+        // immediately (Err branch below) — we handle that explicitly
+        // with watching.remove().
         match sched
             .watch_build(types::WatchBuildRequest {
                 build_id: build_id.clone(),
@@ -380,11 +379,11 @@ fn spawn_reconnect_watch(
                     resp.into_inner(),
                     scheduler_addr,
                     since_seq,
-                    // Pass known build_id (X11 fix): we HAVE it
-                    // (from CRD status). Without this, stream-
-                    // error-before-first-event → status.build_id
-                    // empty → drain_stream exits → status stale
-                    // until controller restart.
+                    // Pass known build_id: we HAVE it (from CRD
+                    // status). Without this, stream-error-before-
+                    // first-event → status.build_id empty →
+                    // drain_stream exits → status stale until
+                    // controller restart.
                     Some(build_id),
                     watching,
                     watch_key,
@@ -413,14 +412,14 @@ fn spawn_reconnect_watch(
 async fn cleanup(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     let name = b.name_any();
 
-    // X15: remove watching entry so a never-exiting drain_stream
-    // (bug, hung stream) doesn't block a future reconcile. Keyed
-    // by uid: a delete-then-recreate gets a FRESH uid, so the old
+    // Remove watching entry so a never-exiting drain_stream (bug,
+    // hung stream) doesn't block a future reconcile. Keyed by uid:
+    // a delete-then-recreate gets a FRESH uid, so the old
     // drain_stream's guard removing the OLD uid doesn't touch the
-    // new Build's entry (Y1). Removing here is belt-and-suspenders:
-    // the old drain_stream will PATCH-fail on the deleted CRD and
-    // exit via its own guard eventually, but we don't know how
-    // long that takes.
+    // new Build's entry. Removing here is belt-and-suspenders: the
+    // old drain_stream will PATCH-fail on the deleted CRD and exit
+    // via its own guard eventually, but we don't know how long
+    // that takes.
     let watch_key = b.uid().unwrap_or_default();
     ctx.watching.remove(&watch_key);
 
@@ -486,9 +485,8 @@ pub fn error_policy(_b: Arc<Build>, err: &Error, _ctx: Arc<Ctx>) -> Action {
         }
         _ => {
             // warn! not debug! — a 30s silent retry loop at debug
-            // is invisible at INFO and cost us ~10min of vm-phase3a
-            // debugging once (workerpool.rs had the fix + this
-            // comment; build.rs never got it).
+            // is invisible at INFO and cost us ~10min of VM
+            // debugging once.
             warn!(error = %err, "Build reconcile failed; retrying");
             Action::requeue(Duration::from_secs(30))
         }
@@ -553,7 +551,7 @@ pub(crate) fn derivation_to_node(
     // pname from env (nix convention: derivations set `pname` or
     // `name`). The scheduler's estimator keys on (pname, system)
     // for duration prediction. Missing = empty = no history
-    // match = 30s default. Fine for phase3a.
+    // match = 30s default.
     let pname = drv
         .env()
         .get("pname")
@@ -640,13 +638,13 @@ fn priority_to_class(p: i32) -> &'static str {
 /// with the LAST seq we saw (or start_seq on first reconnect).
 /// After max retries: log warn, exit — status stale.
 ///
-/// `known_build_id`: if Some, initializes status.build_id directly
-/// (X11 fix). For the reconnect path, the caller already knows the
-/// build_id (from the CRD's persisted status). Passing it means the
-/// internal reconnect loop below can WatchBuild even if the stream
-/// errors before the first event. For the initial spawn (SubmitBuild
-/// stream), pass None — the first event carries the scheduler-assigned
-/// build_id.
+/// `known_build_id`: if Some, initializes status.build_id directly.
+/// For the reconnect path, the caller already knows the build_id
+/// (from the CRD's persisted status). Passing it means the internal
+/// reconnect loop below can WatchBuild even if the stream errors
+/// before the first event. For the initial spawn (SubmitBuild
+/// stream), pass None — the first event carries the scheduler-
+/// assigned build_id.
 #[allow(clippy::too_many_arguments)]
 async fn drain_stream(
     name: String,
@@ -657,10 +655,10 @@ async fn drain_stream(
     known_build_id: Option<String>,
     watching: Arc<dashmap::DashMap<String, ()>>,
     watch_key: String,
-    // Round 4 Z11: recorder + obj_ref for K8s Events. recorder
-    // is Clone (Arc-backed); obj_ref is an immutable snapshot of
-    // the Build's identity at spawn time (name/ns/uid don't change
-    // across the watch's lifetime even if spec is edited).
+    // recorder + obj_ref for K8s Events. recorder is Clone
+    // (Arc-backed); obj_ref is an immutable snapshot of the Build's
+    // identity at spawn time (name/ns/uid don't change across the
+    // watch's lifetime even if spec is edited).
     recorder: kube::runtime::events::Recorder,
     obj_ref: k8s_openapi::api::core::v1::ObjectReference,
 ) {
@@ -676,13 +674,13 @@ async fn drain_stream(
     // the "last known good" state. last_sequence initialized from
     // start_seq (0 for initial SubmitBuild stream, persisted seq
     // for reconnects). build_id from known_build_id if reconnecting
-    // (X11 fix) — without this, reconnect + stream-error-before-
-    // first-event → status.build_id empty → exit at line 682 →
-    // status never updates.
+    // — without this, reconnect + stream-error-before-first-event
+    // → status.build_id empty → early exit below → status never
+    // updates.
     //
     // phase: "Pending" for initial spawn. For reconnect with a
     // known build_id, we don't know the actual phase (CRD may have
-    // old value); Progress events (X12 fix) will bump to Building.
+    // old value); Progress events will bump to Building.
     let mut status = BuildStatus {
         phase: "Pending".into(),
         build_id: known_build_id.unwrap_or_default(),
@@ -720,10 +718,10 @@ async fn drain_stream(
                 let Some(inner) = ev.event else { continue };
                 let (should_patch, k8s_event) = apply_event(&mut status, inner);
 
-                // Round 4 Z11: publish K8s Event for meaningful
-                // transitions (Building/Succeeded/Failed/Cancelled).
-                // Operators see these in `kubectl describe build <name>`
-                // and `kubectl get events`. Best-effort — event-publish
+                // Publish K8s Event for meaningful transitions
+                // (Building/Succeeded/Failed/Cancelled). Operators
+                // see these in `kubectl describe build <name>` and
+                // `kubectl get events`. Best-effort — event-publish
                 // failure is logged, not propagated (events are
                 // observability, not correctness).
                 if let Some(info) = k8s_event {
@@ -910,8 +908,8 @@ pub(crate) fn apply_event(status: &mut BuildStatus, ev: BuildEv) -> (bool, Optio
             // might have missed on a reconnect race).
             status.total_derivations = p.total as i32;
             status.progress = format!("{}/{}", p.completed, p.total);
-            // X12: Progress only fires AFTER Started, so the build
-            // IS building. On reconnect with since_seq > Started's
+            // Progress only fires AFTER Started, so the build IS
+            // building. On reconnect with since_seq > Started's
             // seq, we never see Started → phase stays Pending (set
             // at drain_stream init). kubectl get build shows Pending
             // for an actively-building job. This bump fixes it.
@@ -1056,8 +1054,8 @@ mod tests {
     }
 
     /// apply_event: state events patch, Log/Derivation don't.
-    /// Also verifies Z11 K8s event emission: Started/Completed
-    /// return Some(K8sEventInfo), Progress/Log/Derivation return None.
+    /// Also verifies K8s event emission: Started/Completed return
+    /// Some(K8sEventInfo), Progress/Log/Derivation return None.
     /// Mirrors emit_build_event's Log filter — same "too chatty"
     /// rationale, different target (apiserver not PG).
     #[test]
@@ -1072,7 +1070,7 @@ mod tests {
             }),
         );
         assert!(patch);
-        assert!(ev.is_some(), "Started should emit K8s event (Z11)");
+        assert!(ev.is_some(), "Started should emit K8s event");
         assert_eq!(ev.as_ref().unwrap().reason, "Building");
         assert_eq!(status.phase, "Building");
         assert_eq!(status.total_derivations, 10);
@@ -1112,13 +1110,13 @@ mod tests {
             BuildEv::Completed(types::BuildCompleted::default()),
         );
         assert!(patch);
-        assert!(ev.is_some(), "Completed should emit K8s event (Z11)");
+        assert!(ev.is_some(), "Completed should emit K8s event");
         assert_eq!(ev.as_ref().unwrap().reason, "Succeeded");
         assert!(!ev.unwrap().is_warning);
         assert_eq!(status.phase, "Succeeded");
     }
 
-    /// Z11: Failed event emits a WARNING-type K8s event.
+    /// Failed event emits a WARNING-type K8s event.
     #[test]
     fn apply_event_failed_is_warning() {
         let mut status = BuildStatus::default();
@@ -1193,7 +1191,7 @@ mod tests {
         assert_eq!(conds.len(), 2);
     }
 
-    /// Y1: keying watching by uid (not {ns}/{name}) means an old
+    /// Keying watching by uid (not {ns}/{name}) means an old
     /// drain_stream's scopeguard removing the OLD uid doesn't touch
     /// a NEW Build's entry after delete+recreate with the same name.
     ///
@@ -1236,12 +1234,12 @@ mod tests {
         // no-op). New entry is UNTOUCHED.
         assert!(
             watching.contains_key(&new_uid),
-            "Y1: old scopeguard must NOT remove new uid's entry"
+            "uid keying: old scopeguard must NOT remove new uid's entry"
         );
         // If we keyed by {ns}/{name} and both Builds had the same
         // key "default/foo", this assertion would FAIL: the old
         // guard's remove("default/foo") would remove the NEW
         // entry → next reconcile sees !contains_key → spawns
-        // duplicate watch (C1 regression).
+        // duplicate watch.
     }
 }

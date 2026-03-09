@@ -58,7 +58,7 @@ use crate::crds::workerpool::WorkerPool;
 /// short scale-down would make them flaky under load spikes.
 const SCALE_DOWN_WINDOW: Duration = Duration::from_secs(600);
 
-/// Tunable timing. Defaults match the previous consts (30s each).
+/// Tunable timing. Defaults: 30s each.
 /// Configurable via `RIO_AUTOSCALER_*_SECS` env so VM tests can
 /// use 3s windows instead of waiting ~60s for a single scale-up.
 ///
@@ -140,9 +140,9 @@ pub struct Autoscaler {
     /// Timing knobs. `Copy` — passed by value into
     /// check_stabilization (3 Durations = 24 bytes).
     timing: ScalingTiming,
-    /// K8s Events recorder. Round 4 Z11: emit ScaledUp/ScaledDown
-    /// events on successful scale patches so operators see the
-    /// autoscaler's decisions in `kubectl describe workerpool`.
+    /// K8s Events recorder. Emits ScaledUp/ScaledDown events on
+    /// successful scale patches so operators see the autoscaler's
+    /// decisions in `kubectl describe workerpool`.
     recorder: kube::runtime::events::Recorder,
 }
 
@@ -220,10 +220,9 @@ impl Autoscaler {
         // autoscaler rescaling to min would fight that (STS
         // ping-pongs 0↔min every 3s poll → pods never terminate
         // → finalizer never removes itself → kubectl delete hangs
-        // forever). Found via G3 VM test with 3s poll interval —
-        // with the default 30s this is a ~30s stall, not an
-        // infinite loop (finalizer usually wins the race between
-        // polls), but still wrong.
+        // forever). With a fast poll interval this is infinite;
+        // with the default 30s it's a ~30s stall (finalizer usually
+        // wins the race between polls), but still wrong.
         for pool in &pools {
             if pool.metadata.deletion_timestamp.is_some() {
                 debug!(pool = %pool_key(pool), "skipping: pool is being deleted");
@@ -279,10 +278,6 @@ impl Autoscaler {
         // version bump — but an unrecognized value is an operator
         // error, not a "fall through to default." Skip this pool;
         // tick() surfaces the error via WorkerPool.status.conditions.
-        //
-        // Previously this field was never read. Operator setting
-        // `metric: "cpuUtilization"` expecting something would
-        // happen → silently scaled on queueDepth anyway.
         if pool.spec.autoscaling.metric != "queueDepth" {
             warn!(
                 pool = %key,
@@ -361,10 +356,10 @@ impl Autoscaler {
                             "direction" => direction.as_str())
                         .increment(1);
 
-                        // Round 4 Z11: emit K8s Event on scale.
-                        // Operators see ScaledUp/ScaledDown in
-                        // `kubectl describe workerpool <name>`.
-                        // Best-effort (event publish fail logged).
+                        // Emit K8s Event on scale. Operators see
+                        // ScaledUp/ScaledDown in `kubectl describe
+                        // workerpool <name>`. Best-effort (event
+                        // publish fail logged).
                         let event_reason = match direction {
                             Direction::Up => "ScaledUp",
                             Direction::Down => "ScaledDown",
@@ -443,10 +438,9 @@ impl Autoscaler {
         self.patch_status_partial(pool, Some(cond)).await;
     }
 
-    /// Patch a config-error condition. The CRD doc at
-    /// crds/workerpool.rs:199 promises "unknown metric is a
-    /// RECONCILE error (surfaces in .status.conditions)" —
-    /// this delivers it.
+    /// Patch a config-error condition. The Autoscaling.metric doc
+    /// promises "unknown metric is a RECONCILE error (surfaces in
+    /// .status.conditions)" — this delivers it.
     async fn patch_error_condition(&self, pool: &WorkerPool, err: &ScaleError) {
         let (reason, msg) = match err {
             ScaleError::UnknownMetric(m) => (
@@ -548,10 +542,7 @@ pub(crate) fn wp_status_patch(conditions: &[serde_json::Value]) -> serde_json::V
 ///
 /// apiVersion + kind are MANDATORY in SSA bodies: without them
 /// the apiserver returns 400 "apiVersion must be set". Same
-/// pattern as workerpool.rs's status patch and build.rs's
-/// patch_status — but previously forgotten here. vm-phase3a
-/// used `kubectl scale` directly, bypassing this path, so the
-/// missing fields were never caught against a real apiserver.
+/// pattern as the reconcilers' status patches.
 ///
 /// Extracted as a free fn so a unit test can assert the body
 /// shape without spinning up a full mock-apiserver + mock
@@ -584,11 +575,11 @@ pub(crate) fn sts_replicas_patch(replicas: i32) -> serde_json::Value {
 /// Edge: `queued=0` → desired=0 → clamped to min. Correct: empty
 /// queue means scale DOWN to min, not to zero.
 pub(crate) fn compute_desired(queued: u32, _active: u32, target: i32, min: i32, max: i32) -> i32 {
-    // Round 4 Z25: defensive min>max swap. The CRD's CEL validation
-    // enforces min ≤ max, but a CRD installed BEFORE the CEL was
-    // added (or edited with `--validate=false`) could have min>max.
-    // i32::clamp PANICS if min>max — the autoscaler dies silently.
-    // Swap with a warn so operator notices.
+    // Defensive min>max swap. The CRD's CEL validation enforces
+    // min ≤ max, but a CRD installed before the CEL rule existed
+    // (or edited with `--validate=false`) could have min>max.
+    // i32::clamp PANICS if min>max — the autoscaler would die
+    // silently. Swap with a warn so operator notices.
     let (min, max) = if min > max {
         tracing::warn!(
             min,
@@ -722,11 +713,10 @@ mod tests {
     // ---- sts_replicas_patch: SSA body shape ----
 
     /// SSA patches MUST carry apiVersion + kind, or the apiserver
-    /// returns 400 "apiVersion must be set". Previously the
-    /// autoscaler sent `{"spec":{"replicas":N}}` and silently
-    /// failed every scale (vm-phase3a used `kubectl scale` direct,
-    /// bypassing this path). This test is a tripwire: if someone
-    /// strips the GVK fields "for brevity," this breaks.
+    /// returns 400 "apiVersion must be set". A body like
+    /// `{"spec":{"replicas":N}}` silently fails every scale. This
+    /// test is a tripwire: if someone strips the GVK fields "for
+    /// brevity," this breaks.
     /// WorkerPool status patch needs apiVersion+kind (same SSA
     /// requirement as the STS replicas patch). Also verify it's a
     /// PARTIAL status: replicas/ready/desired absent (reconciler's
@@ -853,9 +843,9 @@ mod tests {
     #[test]
     fn compute_desired_no_wrap_at_high_queue() {
         // queued > i32::MAX — pathological, but in u32 range.
-        // Previously: raw as i32 wrapped negative → .clamp(min,max)
-        // returned min → autoscaler scaled DOWN under extreme load.
-        // Now: bounded to i32::MAX first, clamps to max.
+        // A naive `raw as i32` wraps negative → .clamp(min,max)
+        // returns min → autoscaler scales DOWN under extreme load.
+        // Bounding to i32::MAX first makes it clamp to max.
         let queued = u32::MAX; // > 4 billion
         let got = compute_desired(queued, 0, 1, 2, 100);
         assert_eq!(
@@ -876,9 +866,9 @@ mod tests {
         );
     }
 
-    /// Round 4 Z25: min > max would PANIC in i32::clamp. Defensive
-    /// swap prevents the autoscaler loop from dying silently on a
-    /// pre-CEL CRD (or a --validate=false edit).
+    /// min > max would PANIC in i32::clamp. Defensive swap prevents
+    /// the autoscaler loop from dying silently on a pre-CEL CRD (or
+    /// a --validate=false edit).
     #[test]
     fn compute_desired_swaps_min_greater_than_max() {
         // min=10, max=2 → swap to min=2, max=10. With queued=50,

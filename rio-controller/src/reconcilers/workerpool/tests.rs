@@ -292,7 +292,7 @@ fn statefulset_termination_grace() {
     assert_eq!(
         pod.termination_grace_period_seconds,
         Some(7200),
-        "2h for long nix builds (D3 drain sequence runs within this)"
+        "2h for long nix builds (worker drain sequence runs within this)"
     );
     assert_eq!(
         pod.automount_service_account_token,
@@ -330,9 +330,9 @@ fn statefulset_env_vars() {
         "50Gi parsed to 50 GB (binary → binary, integer)"
     );
     // systems + features: comma-sep strings. fixture wp has
-    // systems=["x86_64-linux"], features=["kvm"]. Previously
-    // these were SILENTLY DROPPED — CRD defined them, reconciler
-    // never passed them, worker hardcoded features=Vec::new().
+    // systems=["x86_64-linux"], features=["kvm"]. CRD defines
+    // them → reconciler passes them as env → worker's comma_vec
+    // deserialize splits them.
     assert_eq!(
         envs.get("RIO_SYSTEMS"),
         Some(&"x86_64-linux".into()),
@@ -341,7 +341,7 @@ fn statefulset_env_vars() {
     assert_eq!(
         envs.get("RIO_FEATURES"),
         Some(&"kvm".into()),
-        "features comma-joined (was silently dropped before)"
+        "features comma-joined → worker's comma_vec deserialize"
     );
 
     // RIO_WORKER_ID uses fieldRef, not value — check separately.
@@ -497,7 +497,7 @@ fn quantity_invalid_rejected() {
         parse_quantity_to_gb(""),
         Err(Error::InvalidSpec(_))
     ));
-    // Round 4 Z28: negative and non-finite rejected.
+    // Negative and non-finite rejected.
     assert!(matches!(
         parse_quantity_to_gb("-5Gi"),
         Err(Error::InvalidSpec(_))
@@ -508,9 +508,9 @@ fn quantity_invalid_rejected() {
     ));
 }
 
-/// Round 4 Z28: decimal quantities (K8s Quantity allows them).
-/// Prior code parsed as u64 → rejected "1.5Gi" even though it's
-/// a valid K8s Quantity. f64 parse + floor-to-u64 accepts it.
+/// Decimal quantities (K8s Quantity allows them). u64 parse would
+/// reject "1.5Gi" even though it's a valid K8s Quantity; f64 parse
+/// + floor-to-u64 accepts it.
 #[test]
 fn quantity_decimal_fraction() {
     // 1.5 GiB = 1.5 * 1024^3 = 1610612736 bytes → 1 GB (floor).

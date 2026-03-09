@@ -16,9 +16,8 @@ pub mod workerpool;
 // ----- schemars helpers for k8s-openapi passthrough types -----------
 //
 // k8s-openapi types (ResourceRequirements, Toleration, Condition)
-// don't impl JsonSchema. Previous approach was `#[schemars(with =
-// "serde_json::Value")]` — but that emits an EMPTY schema `{}`, which
-// the K8s apiserver REJECTS:
+// don't impl JsonSchema. `#[schemars(with = "serde_json::Value")]`
+// emits an EMPTY schema `{}`, which the K8s apiserver REJECTS:
 //   "Required value: must not be empty for specified object fields"
 //
 // These schema_with fns emit the minimum K8s accepts: `type: object`
@@ -43,8 +42,8 @@ pub(crate) fn any_object(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
 
 /// Schema for `Vec<K8sType>` or `Option<Vec<K8sType>>` fields
 /// (tolerations, conditions). Array of preserve-unknown objects.
-/// K8s REQUIRES `items.type` — the earlier empty-schema emitted
-/// `items: {}` which fails CRD validation.
+/// K8s REQUIRES `items.type` — an empty-schema `items: {}` fails
+/// CRD validation.
 pub(crate) fn any_object_array(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "array",

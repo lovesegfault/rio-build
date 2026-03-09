@@ -53,8 +53,8 @@ pub struct Ctx {
     /// delete+recreate with the same name gets a FRESH uid. Keying
     /// by name would let an old drain_stream's scopeguard remove
     /// the NEW Build's entry after a delete+recreate → next
-    /// reconcile spawns a duplicate watch (regressing the C1 fix
-    /// we built this map to prevent).
+    /// reconcile spawns a duplicate watch (the very problem this
+    /// map exists to prevent).
     ///
     /// Dedupes spawns across reconciles: drain_stream patches
     /// Build.status on each BuildEvent → K8s API server emits a

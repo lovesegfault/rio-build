@@ -59,9 +59,10 @@ pub struct BuildSpec {
     #[serde(default)]
     pub timeout_seconds: i64,
 
-    /// Tenant identifier for multi-tenancy (future). Currently
-    /// passed through to the scheduler but not enforced. String
-    /// not UUID — tenant naming is an operator concern.
+    /// Tenant identifier for multi-tenancy. Passed through to the
+    /// scheduler; not yet enforced. String not UUID — tenant naming
+    /// is an operator concern.
+    // TODO(phase4): enforcement (scheduler-side tenant isolation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }

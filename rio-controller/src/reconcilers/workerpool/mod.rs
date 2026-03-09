@@ -147,8 +147,8 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // ---- PodDisruptionBudget ----
     // maxUnavailable=1: at most one worker evicted at a time
     // during node drain. The evicting pod's builds get reassigned
-    // (via DrainWorker force — E2 preemption hook); the rest of
-    // the pool keeps working. ownerRef → GC on WorkerPool delete.
+    // (via DrainWorker force → preemption); the rest of the pool
+    // keeps working. ownerRef → GC on WorkerPool delete.
     let pdb = build_pdb(&wp, oref.clone());
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
     pdb_api
@@ -183,8 +183,8 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     };
     // For status.desired_replicas: read what's ACTUALLY on the STS
     // (autoscaler's last decision). Falls back to min on first
-    // create. Without this, kubectl's "Desired" column showed min
-    // forever regardless of autoscaler activity.
+    // create. Prevents kubectl's "Desired" column from showing min
+    // regardless of autoscaler activity.
     let current_replicas = existing
         .as_ref()
         .and_then(|s| s.spec.as_ref())
@@ -222,16 +222,15 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // apiVersion + kind are REQUIRED by server-side apply even
     // for status patches — apiserver uses them to resolve the
     // schema. Without them: 400 "apiVersion must be set in
-    // apply patch". (Same pattern as build.rs patch_status —
-    // that one learned this the hard way; this one forgot.)
+    // apply patch".
     //
     // Partial status: we patch ONLY replicas/ready/desired. The
     // autoscaler owns lastScaleTime + conditions via a separate
     // SSA field-manager ("rio-controller-autoscaler-status").
     // SSA merges field ownership — our patch here doesn't touch
     // lastScaleTime, so the autoscaler's value persists across
-    // our reconciles. Previously we set both to empty on EVERY
-    // reconcile, clobbering anything the autoscaler wrote.
+    // our reconciles. Setting them here would clobber the
+    // autoscaler's writes on every reconcile.
     let wp_api: Api<WorkerPool> = Api::namespaced(ctx.client.clone(), &ns);
     let ar = WorkerPool::api_resource();
     let status_patch = serde_json::json!({
@@ -241,8 +240,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
             "replicas": sts_status.replicas,
             "readyReplicas": sts_status.ready_replicas.unwrap_or(0),
             // What the autoscaler set on STS.spec.replicas (or min
-            // on first create). Previously hardcoded to min —
-            // kubectl's "Desired" column was always wrong.
+            // on first create).
             "desiredReplicas": current_replicas,
             // lastScaleTime + conditions: NOT here. Autoscaler owns.
         },
@@ -286,7 +284,7 @@ const DRAIN_MAX_WAIT: Duration = Duration::from_secs(7200 + 60);
 ///   1. DrainWorker each pod → scheduler marks them draining,
 ///      stops dispatching new work. In-flight builds continue.
 ///   2. Scale STS to 0 → K8s sends SIGTERM to each pod. The
-///      worker's D3 SIGTERM handler does `acquire_many` on its
+///      worker's SIGTERM handler does `acquire_many` on its
 ///      build semaphore → blocks until in-flight builds finish
 ///      → exits 0. terminationGracePeriodSeconds=7200 gives it
 ///      time.

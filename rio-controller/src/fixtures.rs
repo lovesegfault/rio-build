@@ -205,8 +205,7 @@ pub fn apply_ok_scenarios(
             "image": "x",
         },
     });
-    // PDB response: ignored like Service. Minimal shape that
-    // parses. Phase 3b adds per-pool PDB management (E2).
+    // PDB response: ignored like Service. Minimal shape that parses.
     let pdb_body = serde_json::json!({
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",

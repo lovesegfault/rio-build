@@ -162,10 +162,9 @@ async fn main() -> anyhow::Result<()> {
     let scheduler = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
 
     // ---- Health server ----
-    // AFTER kube + scheduler connect. Same reasoning as worker
-    // D4: liveness should pass only once the things we depend
-    // on are reachable. Before this line, pod is not-ready;
-    // after, /healthz returns 200.
+    // AFTER kube + scheduler connect: liveness should pass only
+    // once the things we depend on are reachable. Before this line,
+    // pod is not-ready; after, /healthz returns 200.
     //
     // Simple axum with always-200 /healthz. No readiness gate
     // beyond "process is up" — the controller has no "I'm
@@ -289,7 +288,6 @@ fn describe_metrics() {
         "WorkerPool replica counts. kind=actual|desired, pool=namespace/name. \
          Gap between actual and desired = StatefulSet rollout lag or stabilization window."
     );
-    // Round 4 Z19: build_watch_spawns was emitted but not described.
     describe_counter!(
         "rio_controller_build_watch_spawns_total",
         "drain_stream tasks spawned (initial + reconnect). \
@@ -301,15 +299,10 @@ fn describe_metrics() {
 /// handler proves the process is alive. No readiness distinction
 /// (controller has no "connected but not ready" state).
 ///
-/// Uses a tiny inline handler rather than a full axum Router —
-/// one route, no state, no middleware. hyper alone would be
-/// even lighter but axum is already in the workspace via rio-store.
-///
-/// Actually: we don't have axum in rio-controller's deps. Adding
-/// it for one /healthz endpoint is heavy. Use a raw TCP listener
-/// that speaks just enough HTTP to answer the probe. K8s
-/// livenessProbe sends `GET /healthz HTTP/1.1` and checks for
-/// `200` — that's all we need to match.
+/// Raw TCP listener speaking minimal HTTP — axum is not in
+/// rio-controller's deps and adding it for one /healthz endpoint
+/// is heavy. K8s livenessProbe sends `GET /healthz HTTP/1.1` and
+/// checks for `200` — that's all we need to match.
 fn spawn_health_server(addr: std::net::SocketAddr) {
     rio_common::task::spawn_monitored("health-server", async move {
         info!(addr = %addr, "starting HTTP health server");
