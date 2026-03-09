@@ -1,4 +1,5 @@
 //! keepGoing fail-fast vs keep-going semantics, and DependencyFailed cascade.
+// r[verify sched.build.keep-going]
 
 use super::*;
 

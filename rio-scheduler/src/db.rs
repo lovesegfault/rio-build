@@ -1124,6 +1124,7 @@ mod tests {
         Ok(())
     }
 
+    // r[verify sched.estimate.ema-alpha]
     /// EMA: first insert uses the duration directly; second update blends.
     /// ema = old * (1-ALPHA) + new * ALPHA = 10 * 0.7 + 20 * 0.3 = 13.
     #[tokio::test]

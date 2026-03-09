@@ -244,6 +244,7 @@ async fn test_idempotent_put_path() -> TestResult {
 /// raced after the first completed) or Aborted (if it raced into the
 /// in-progress window). Never: both created=true, or the loser's cleanup
 /// deleting the winner's placeholder.
+// r[verify store.put.idempotent]
 #[tokio::test]
 async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     let mut s = StoreSession::new().await?;

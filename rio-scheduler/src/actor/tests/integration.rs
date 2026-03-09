@@ -585,6 +585,7 @@ async fn test_forward_log_batch_unknown_drv_path_dropped() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.dedup]
 /// Two builds interested in the same derivation (DAG-merged) → ForwardLogBatch
 /// emits on BOTH broadcast channels. This is the "derivation built once, N
 /// builds care" case that makes DAG merging valuable.

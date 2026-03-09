@@ -282,6 +282,7 @@ mod tests {
         Ok(())
     }
 
+    // r[verify worker.daemon.timeout-wrap]
     /// Verify that DAEMON_SETUP_TIMEOUT is shorter than the default daemon
     /// build timeout. If setup timeout were longer, it would be pointless.
     #[test]

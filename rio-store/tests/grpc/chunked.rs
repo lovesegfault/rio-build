@@ -1,7 +1,9 @@
 //! Chunked CAS PutPath (FastCDC write-ahead flow).
+// r[verify store.put.wal-manifest]
 
 use super::*;
 
+// r[verify store.inline.threshold]
 /// Small NAR + chunked backend: should STILL go inline (under threshold).
 #[tokio::test]
 async fn test_chunked_small_nar_stays_inline() -> TestResult {

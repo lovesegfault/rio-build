@@ -688,3 +688,203 @@ async fn test_build_paths_first_event_failed_short_circuit() -> anyhow::Result<(
     h.finish().await;
     Ok(())
 }
+
+/// First event is Cancelled (no Started) → short-circuit failure.
+///
+/// This path hits submit_and_process_build's first-event peek for Cancelled
+/// (lines ~246-252 in handler/build.rs) — a reconnect arriving AFTER the build
+/// was already cancelled, where Cancelled is the first event past since_seq.
+/// For opcode 46, the BuildResult has MiscFailure + "build cancelled: <reason>".
+#[tokio::test]
+async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![ev(build_event::Event::Cancelled(
+            types::BuildCancelled {
+                reason: "early cancel".into(),
+            },
+        ))]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46, // wopBuildPathsWithResults — read back the BuildResult
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+    let _derived_path = wire::read_string(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    // BuildStatus::MiscFailure = 9
+    assert_eq!(status, 9, "first-event-Cancelled → MiscFailure");
+    assert!(
+        error_msg.contains("build cancelled") && error_msg.contains("early cancel"),
+        "error_msg: {error_msg}"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Empty event stream (scripted_events = Some(vec![])) → first peek gets
+/// Ok(None) → gateway returns Err("empty build event stream") → opcode 9
+/// sends STDERR_ERROR.
+#[tokio::test]
+async fn test_build_paths_empty_event_stream_failure() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        scripted_events: Some(vec![]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("empty"),
+        "expected 'empty build event stream', got: {}",
+        err.message
+    );
+    h.finish().await;
+    Ok(())
+}
+
+// ===========================================================================
+// Reconnect loop tests (gateway/src/handler/build.rs reconnect backoff)
+// ===========================================================================
+//
+// r[verify gw.reconnect.backoff]
+//
+// The exhausted test uses `start_paused = true` so tokio auto-advances
+// through the 1s/2s/4s/8s/16s backoff sleeps instantly. The success-case
+// test does NOT use paused time: it goes through real gRPC I/O (WatchBuild
+// creates a new stream + delivers events), and paused-time auto-advance
+// fires gRPC timeout wrappers prematurely while the TCP I/O is pending.
+// One 1s backoff is tolerable for one test.
+
+/// SubmitBuild stream errors mid-build (transport error after Started event)
+/// → gateway reconnects via WatchBuild → WatchBuild delivers Completed →
+/// client sees success. Verifies the full reconnect-and-resume happy path.
+///
+/// Runs with REAL time (not paused) — one 1s backoff. Paused time breaks
+/// this test: auto-advance fires gRPC timeouts while WatchBuild's stream
+/// TCP I/O is pending.
+#[tokio::test]
+async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_outcome(MockSchedulerOutcome {
+        // SubmitBuild: send Started, then inject a transport error.
+        // The gateway's first-event peek consumes Started, then
+        // process_build_events tries to read the next event and gets
+        // the Err → StreamProcessError::Transport → reconnect loop.
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            // This second event is never sent: error_after_n fires at seq=1.
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        error_after_n: Some((1, tonic::Code::Unavailable)),
+        // WatchBuild: deliver Completed. Gateway's process_build_events
+        // reads from this fresh stream after the reconnect.
+        watch_scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
+                output_paths: vec!["/nix/store/zzz-output".into()],
+            },
+        ))]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    // Drain stderr: we'll see a "reconnecting..." log line via STDERR_NEXT,
+    // then STDERR_LAST on successful completion.
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let saw_reconnect_log = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting")));
+    assert!(
+        saw_reconnect_log,
+        "expected 'reconnecting...' STDERR_NEXT log, got: {frames:?}"
+    );
+
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "success after reconnect");
+    h.finish().await;
+    Ok(())
+}
+
+/// SubmitBuild stream errors → gateway tries WatchBuild → WatchBuild fails
+/// every time (watch_fail_count > MAX_RECONNECT) → gateway gives up →
+/// MiscFailure with "reconnect exhausted".
+///
+/// Uses opcode 46 so we can read the BuildResult back (opcode 9 would
+/// send STDERR_ERROR; here we want the structured failure).
+#[tokio::test(start_paused = true)]
+async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let outcome = MockSchedulerOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Started(types::BuildStarted {
+                total_derivations: 1,
+                cached_derivations: 0,
+            })),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec![],
+            })),
+        ]),
+        error_after_n: Some((1, tonic::Code::Unavailable)),
+        // watch_fail_count > MAX_RECONNECT (5) → every WatchBuild attempt
+        // fails. The gateway's reconnect loop: process_build_events on
+        // dead stream → Transport err → attempt++ → backoff+watch_build →
+        // watch_build errs → next loop iter → dead stream errs again → ...
+        // After 5 attempts it gives up.
+        watch_scripted_events: None, // irrelevant — watch_fail_count blocks
+        ..Default::default()
+    };
+    // Set watch_fail_count AFTER Default because Default gives Arc::new(0).
+    outcome
+        .watch_fail_count
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+    h.scheduler.set_outcome(outcome);
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1);
+    let _derived_path = wire::read_string(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert_eq!(status, 9, "MiscFailure after reconnect exhausted");
+    assert!(
+        error_msg.contains("reconnect exhausted") || error_msg.contains("stream error"),
+        "error_msg: {error_msg}"
+    );
+
+    h.finish().await;
+    Ok(())
+}

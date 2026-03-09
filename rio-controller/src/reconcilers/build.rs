@@ -1134,6 +1134,35 @@ mod tests {
         assert!(ev.note.contains("oops"));
     }
 
+    /// Cancelled event sets phase, pushes a Cancelled condition with the
+    /// reason, and emits a NORMAL-type K8s event (not Warning — cancellation
+    /// is usually operator-initiated, not a failure).
+    #[test]
+    fn apply_event_cancelled_sets_condition() {
+        let mut status = BuildStatus::default();
+        let (patch, ev) = apply_event(
+            &mut status,
+            BuildEv::Cancelled(types::BuildCancelled {
+                reason: "user abort".into(),
+            }),
+        );
+        assert!(patch);
+        assert_eq!(status.phase, "Cancelled");
+
+        // Condition was pushed with the reason in message.
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].type_, "Cancelled");
+        assert_eq!(status.conditions[0].status, "True");
+        assert_eq!(status.conditions[0].reason, "BuildCancelled");
+        assert_eq!(status.conditions[0].message, "user abort");
+
+        // K8s event: reason=Cancelled, NOT a warning.
+        let ev = ev.expect("Cancelled should emit K8s event");
+        assert_eq!(ev.reason, "Cancelled");
+        assert!(!ev.is_warning, "Cancelled is Normal type, not Warning");
+        assert!(ev.note.contains("user abort"));
+    }
+
     /// derivation_to_node extracts pname/system/outputs from a
     /// parsed .drv. No store needed — feed ATerm directly.
     #[test]

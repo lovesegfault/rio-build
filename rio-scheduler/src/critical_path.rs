@@ -395,6 +395,7 @@ mod tests {
         );
     }
 
+    // r[verify sched.critical-path.incremental]
     #[test]
     fn update_ancestors_on_completion() {
         // a→b→c. c completes. b's priority should DROP (c no longer

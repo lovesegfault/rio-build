@@ -48,6 +48,11 @@ pub struct MockStore {
     /// If true, query_path_info returns Unavailable. For worker input-fetch
     /// error-path tests (distinguishing real gRPC errors from NotFound).
     pub fail_query_path_info: Arc<AtomicBool>,
+    /// If true, get_path returns Unavailable. For FUSE fetch error-path tests.
+    pub fail_get_path: Arc<AtomicBool>,
+    /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
+    /// For NAR parse error tests (FUSE fetch → EIO on parse failure).
+    pub get_path_garbage: Arc<AtomicBool>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
@@ -144,7 +149,36 @@ impl StoreService for MockStore {
         &self,
         request: Request<types::GetPathRequest>,
     ) -> Result<Response<Self::GetPathStream>, Status> {
+        if self.fail_get_path.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("mock: injected get_path failure"));
+        }
         let store_path = request.into_inner().store_path;
+        // Garbage mode: return a stream with valid PathInfo but garbage NAR
+        // bytes, so collect_nar_stream succeeds but nar::parse fails.
+        if self.get_path_garbage.load(Ordering::SeqCst) {
+            let entry = self.paths.read().unwrap().get(&store_path).cloned();
+            if let Some((info, _real_nar)) = entry {
+                let (tx, rx) = tokio::sync::mpsc::channel(4);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Ok(types::GetPathResponse {
+                            msg: Some(types::get_path_response::Msg::Info(info)),
+                        }))
+                        .await;
+                    let _ = tx
+                        .send(Ok(types::GetPathResponse {
+                            msg: Some(types::get_path_response::Msg::NarChunk(
+                                b"garbage-not-a-NAR".to_vec(),
+                            )),
+                        }))
+                        .await;
+                });
+                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                    rx,
+                )));
+            }
+            return Err(Status::not_found(format!("not found: {store_path}")));
+        }
         let entry = self.paths.read().unwrap().get(&store_path).cloned();
         match entry {
             Some((info, nar)) => {
@@ -317,6 +351,19 @@ pub struct MockSchedulerOutcome {
     /// then close the stream. Empty build_id / zero sequence are
     /// auto-populated so tests only need to set the `event` oneof.
     pub scripted_events: Option<Vec<types::BuildEvent>>,
+    /// Inject `Err(Status)` into the SubmitBuild stream after sending N
+    /// scripted events. Only applies in scripted mode. For gateway
+    /// reconnect-on-transport-error tests.
+    pub error_after_n: Option<(usize, tonic::Code)>,
+    /// If Some, WatchBuild returns a stream of these events (same
+    /// build_id/sequence auto-fill as SubmitBuild scripted mode).
+    /// For gateway reconnect tests: SubmitBuild stream errors →
+    /// gateway calls WatchBuild → this stream delivers the remainder.
+    pub watch_scripted_events: Option<Vec<types::BuildEvent>>,
+    /// How many times watch_build fails with Unavailable before
+    /// succeeding (or returning not_found if watch_scripted_events
+    /// is None). Decremented on each call. For reconnect-exhausted tests.
+    pub watch_fail_count: Arc<AtomicU32>,
 }
 
 /// Mock scheduler that records SubmitBuild + CancelBuild calls and has a
@@ -362,8 +409,21 @@ impl SchedulerService for MockScheduler {
 
         // Scripted mode: send events verbatim, auto-fill build_id/sequence, close.
         if let Some(events) = outcome.scripted_events {
+            let error_after_n = outcome.error_after_n;
+            let n_events = events.len();
             tokio::spawn(async move {
                 for (seq, mut ev) in events.into_iter().enumerate() {
+                    // Error injection: after sending N events, send an Err(Status)
+                    // into the stream. Gateway's process_build_events maps this
+                    // to StreamProcessError::Transport → triggers the reconnect loop.
+                    if let Some((n, code)) = error_after_n
+                        && seq == n
+                    {
+                        let _ = tx
+                            .send(Err(Status::new(code, "mock: injected stream error")))
+                            .await;
+                        return;
+                    }
                     if ev.build_id.is_empty() {
                         ev.build_id = build_id.clone();
                     }
@@ -373,6 +433,14 @@ impl SchedulerService for MockScheduler {
                     if tx.send(Ok(ev)).await.is_err() {
                         return;
                     }
+                }
+                // If error_after_n >= events.len(), fire after the last event.
+                if let Some((n, code)) = error_after_n
+                    && n >= n_events
+                {
+                    let _ = tx
+                        .send(Err(Status::new(code, "mock: injected stream error")))
+                        .await;
                 }
                 // tx drops → stream ends
             });
@@ -440,6 +508,43 @@ impl SchedulerService for MockScheduler {
         &self,
         _request: Request<types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
+        let outcome = self.outcome.read().unwrap().clone();
+
+        // Injected-failure countdown: decrement and return Unavailable while > 0.
+        // For reconnect-exhausted tests (gateway retries watch_build up to
+        // MAX_RECONNECT times before giving up).
+        if outcome
+            .watch_fail_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::unavailable("mock: injected watch_build failure"));
+        }
+
+        // Scripted WatchBuild stream — same auto-fill pattern as SubmitBuild.
+        if let Some(events) = outcome.watch_scripted_events {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            let build_id = "test-build-00000000-1111-2222-3333-444444444444".to_string();
+            tokio::spawn(async move {
+                for (seq, mut ev) in events.into_iter().enumerate() {
+                    if ev.build_id.is_empty() {
+                        ev.build_id = build_id.clone();
+                    }
+                    if ev.sequence == 0 {
+                        ev.sequence = seq as u64;
+                    }
+                    if tx.send(Ok(ev)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )));
+        }
+
         Err(Status::not_found("not implemented in mock"))
     }
 

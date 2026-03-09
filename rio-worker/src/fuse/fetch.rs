@@ -364,4 +364,196 @@ mod tests {
         let size = dir_size(Path::new("/nonexistent/rio-test-dir-size-xyz"));
         assert_eq!(size, 0);
     }
+
+    // ========================================================================
+    // fetch_extract_insert tests via prefetch_path_blocking
+    // ========================================================================
+    //
+    // fetch_extract_insert is module-private; we test it through
+    // prefetch_path_blocking (its public caller). prefetch is SYNC with
+    // internal block_on — it MUST be called from spawn_blocking to avoid
+    // nested-runtime panic (Cache methods use Handle::block_on internally).
+    //
+    // Multi-thread runtime required: spawn_blocking runs the closure on a
+    // separate thread pool; that thread's block_on needs a worker thread
+    // free on the main runtime to actually process the SQL/gRPC futures.
+
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use rio_test_support::fixtures::{make_nar, make_path_info, test_store_basename};
+    use rio_test_support::grpc::{MockStore, spawn_mock_store_with_client};
+
+    /// Harness: spawn MockStore + Cache in a tempdir. Returns everything the
+    /// tests need, including the runtime handle for prefetch's block_on calls.
+    async fn setup_fetch_harness() -> (
+        Arc<Cache>,
+        StoreServiceClient<Channel>,
+        MockStore,
+        tempfile::TempDir,
+        Handle,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = Arc::new(
+            Cache::new(dir.path().to_path_buf(), 10)
+                .await
+                .expect("Cache::new"),
+        );
+        let (store, client, server_handle) = spawn_mock_store_with_client()
+            .await
+            .expect("spawn mock store");
+        let rt = Handle::current();
+        (cache, client, store, dir, rt, server_handle)
+    }
+
+    /// Seed MockStore with a valid single-file NAR → prefetch fetches,
+    /// extracts to cache_dir, inserts into SQLite index → Ok(None) ("fetched").
+    /// Verify the extracted file exists on disk with the right contents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_success_roundtrip() {
+        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        // Seed: single-file NAR containing "hello". Basename must be a valid
+        // nixbase32 store path basename (32-char hash + name).
+        let basename = test_store_basename("fetchtest");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"hello");
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+
+        // Call prefetch via spawn_blocking — Cache methods use block_on
+        // internally, nested-runtime panics if called from async context.
+        let cache_cl = Arc::clone(&cache);
+        let client_cl = client.clone();
+        let basename_cl = basename.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache_cl, &client_cl, &rt, &basename_cl)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        // Ok(None) means "fetched successfully" (not skipped).
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) (fetched), got: {result:?}"
+        );
+
+        // The extracted NAR should be on disk: single-file NARs extract to a
+        // plain file (not a directory) at cache_dir/basename.
+        let local = dir.path().join(&basename);
+        assert!(local.exists(), "extracted path should exist: {local:?}");
+        let content = std::fs::read(&local).expect("read extracted file");
+        assert_eq!(content, b"hello");
+
+        // And the cache index should know about it.
+        // (Use spawn_blocking — cache.contains also uses block_on.)
+        let cache_cl = Arc::clone(&cache);
+        let basename_cl = basename.clone();
+        let contains = tokio::task::spawn_blocking(move || cache_cl.contains(&basename_cl))
+            .await
+            .expect("join")
+            .expect("contains query");
+        assert!(contains, "cache index should record the path");
+    }
+
+    /// MockStore has no seeded paths → GetPath returns NotFound → ENOENT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_not_found_returns_enoent() {
+        let (cache, client, _store, _dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("missing");
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache, &client, &rt, &basename)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        // fuser::Errno doesn't implement PartialEq — compare via .code().
+        let err = result.expect_err("expected Err(ENOENT)");
+        assert_eq!(
+            err.code(),
+            Errno::ENOENT.code(),
+            "expected ENOENT, got: {err:?}"
+        );
+    }
+
+    /// MockStore.fail_get_path = true → GetPath returns Unavailable → EIO.
+    /// Covers the `Err(e) => EIO` arm in fetch_extract_insert (non-NotFound
+    /// gRPC error).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_store_unavailable_returns_eio() {
+        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+        store.fail_get_path.store(true, Ordering::SeqCst);
+
+        let basename = test_store_basename("unavail");
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache, &client, &rt, &basename)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        let err = result.expect_err("expected Err(EIO)");
+        assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
+    }
+
+    /// MockStore.get_path_garbage = true → GetPath returns valid PathInfo
+    /// but garbage NAR bytes → nar::parse fails → EIO. Covers the NAR
+    /// parse-error arm in fetch_extract_insert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_nar_parse_error_returns_eio() {
+        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+
+        // Seed a valid PathInfo (so the MockStore lookup finds it) but
+        // enable garbage mode so the NAR bytes are malformed.
+        let basename = test_store_basename("garbage");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"real");
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+        store.get_path_garbage.store(true, Ordering::SeqCst);
+
+        let result = tokio::task::spawn_blocking(move || {
+            prefetch_path_blocking(&cache, &client, &rt, &basename)
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        let err = result.expect_err("expected Err(EIO) from NAR parse failure");
+        assert_eq!(err.code(), Errno::EIO.code(), "expected EIO, got: {err:?}");
+    }
+
+    /// Second prefetch of the same path returns PrefetchSkip::AlreadyCached
+    /// (fast path hits cache.get_path() → Some).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_prefetch_already_cached_skip() {
+        let (cache, client, store, _dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("twice");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"x");
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+
+        // First fetch: Ok(None) — actually fetched.
+        let (c1, cl1, r1, b1) = (
+            Arc::clone(&cache),
+            client.clone(),
+            rt.clone(),
+            basename.clone(),
+        );
+        let first =
+            tokio::task::spawn_blocking(move || prefetch_path_blocking(&c1, &cl1, &r1, &b1))
+                .await
+                .expect("join");
+        assert!(matches!(first, Ok(None)), "first fetch: {first:?}");
+
+        // Second fetch: Ok(Some(AlreadyCached)) — fast-path skip.
+        let (c2, cl2, r2, b2) = (Arc::clone(&cache), client.clone(), rt.clone(), basename);
+        let second =
+            tokio::task::spawn_blocking(move || prefetch_path_blocking(&c2, &cl2, &r2, &b2))
+                .await
+                .expect("join");
+        assert!(
+            matches!(second, Ok(Some(PrefetchSkip::AlreadyCached))),
+            "second fetch: {second:?}"
+        );
+    }
 }
