@@ -1116,4 +1116,202 @@ mod tests {
         assert_eq!(eager, streamed);
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Parser safety-bound tests: each MAX_* limit must return a typed
+    // error BEFORE allocating the oversized buffer. These tests write
+    // only the length prefix (not the actual oversized payload) — the
+    // check fires on the u64 read, well before read_padded_bytes.
+    // ------------------------------------------------------------------
+
+    /// Helper: build a NAR byte sequence from string tokens + an
+    /// oversized-length suffix. Used for bounds tests — tokens are
+    /// written normally, then a raw u64 > limit is appended.
+    fn nar_bytes_with_oversized_len(tokens: &[&str], oversized_len: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for t in tokens {
+            write_str(&mut buf, t).unwrap();
+        }
+        write_u64(&mut buf, oversized_len).unwrap();
+        buf
+    }
+
+    #[test]
+    fn parse_content_too_large_rejected() {
+        // ( type regular contents <len=MAX+1> — error before body read.
+        let buf = nar_bytes_with_oversized_len(
+            &[NAR_MAGIC, "(", "type", "regular", "contents"],
+            MAX_CONTENT_SIZE + 1,
+        );
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(err, NarError::ContentTooLarge(n) if n == MAX_CONTENT_SIZE + 1),
+            "expected ContentTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_name_too_long_rejected() {
+        // ( type directory entry ( name <len=MAX+1>
+        let buf = nar_bytes_with_oversized_len(
+            &[NAR_MAGIC, "(", "type", "directory", "entry", "(", "name"],
+            MAX_NAME_LEN + 1,
+        );
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(err, NarError::NameTooLong(n) if n == MAX_NAME_LEN + 1),
+            "expected NameTooLong, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_symlink_target_too_long_rejected() {
+        // ( type symlink target <len=MAX+1>
+        let buf = nar_bytes_with_oversized_len(
+            &[NAR_MAGIC, "(", "type", "symlink", "target"],
+            MAX_TARGET_LEN + 1,
+        );
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(err, NarError::TargetTooLong(n) if n == MAX_TARGET_LEN + 1),
+            "expected TargetTooLong, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_non_utf8_token_rejected() {
+        // The first token after magic is expect_str("(") — inject
+        // non-UTF-8 bytes where "(" should be. read_string's
+        // from_utf8 → UnexpectedToken.
+        let mut buf = Vec::new();
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_u64(&mut buf, 3).unwrap();
+        buf.extend_from_slice(&[0xff, 0xfe, 0xfd]); // invalid UTF-8
+        buf.extend_from_slice(&[0u8; 5]); // pad to 8
+
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::UnexpectedToken { expected, .. } if expected.contains("UTF-8")),
+            "expected UTF-8 error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_regular_unexpected_token_rejected() {
+        // ( type regular <garbage-token> — not executable/contents/)
+        let mut buf = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "regular", "garbage"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::UnexpectedToken { got, .. } if got == "garbage"),
+            "expected UnexpectedToken, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_directory_unexpected_token_rejected() {
+        // ( type directory <garbage-token> — not entry/)
+        let mut buf = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "directory", "nonsense"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::UnexpectedToken { got, .. } if got == "nonsense"),
+            "expected UnexpectedToken, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_entry_name_non_utf8_rejected() {
+        // ( type directory entry ( name <non-utf8-bytes>
+        let mut buf = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "directory", "entry", "(", "name"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        write_u64(&mut buf, 2).unwrap();
+        buf.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
+        buf.extend_from_slice(&[0u8; 6]); // pad to 8
+
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::UnexpectedToken { expected, .. } if expected.contains("UTF-8 name")),
+            "expected UTF-8 name error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_symlink_target_non_utf8_rejected() {
+        // ( type symlink target <non-utf8-bytes>
+        let mut buf = Vec::new();
+        for t in &[NAR_MAGIC, "(", "type", "symlink", "target"] {
+            write_str(&mut buf, t).unwrap();
+        }
+        write_u64(&mut buf, 2).unwrap();
+        buf.extend_from_slice(&[0xff, 0xfe]);
+        buf.extend_from_slice(&[0u8; 6]);
+
+        let err = parse(&mut Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(&err, NarError::UnexpectedToken { expected, .. } if expected.contains("UTF-8 target")),
+            "expected UTF-8 target error, got {err:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // dump_path error paths: non-UTF-8 filesystem names/targets.
+    // Linux allows arbitrary bytes in filenames — NAR format requires
+    // UTF-8 strings. These must fail loud, not silently mangle.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dump_path_non_utf8_dir_entry_name_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Create a file with a non-UTF-8 name inside the dir.
+        let bad_name = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, b'x']);
+        let bad_path = dir.path().join(bad_name);
+        std::fs::write(&bad_path, b"content").unwrap();
+
+        // Both eager and streaming must reject.
+        let err = dump_path(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, NarError::Io(e) if e.to_string().contains("not valid UTF-8")),
+            "dump_path: expected UTF-8 error, got {err:?}"
+        );
+
+        let mut sink = Vec::new();
+        let err = dump_path_streaming(dir.path(), &mut sink).unwrap_err();
+        assert!(
+            matches!(&err, NarError::Io(e) if e.to_string().contains("not valid UTF-8")),
+            "dump_path_streaming: expected UTF-8 error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dump_path_non_utf8_symlink_target_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let link_path = dir.path().join("badlink");
+
+        // Symlink to a non-UTF-8 target.
+        let bad_target = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, b'/', b't']);
+        std::os::unix::fs::symlink(bad_target, &link_path).unwrap();
+
+        let err = dump_path(&link_path).unwrap_err();
+        assert!(
+            matches!(&err, NarError::Io(e) if e.to_string().contains("not valid UTF-8")),
+            "dump_path: expected UTF-8 error, got {err:?}"
+        );
+
+        let mut sink = Vec::new();
+        let err = dump_path_streaming(&link_path, &mut sink).unwrap_err();
+        assert!(
+            matches!(&err, NarError::Io(e) if e.to_string().contains("not valid UTF-8")),
+            "dump_path_streaming: expected UTF-8 error, got {err:?}"
+        );
+    }
 }
