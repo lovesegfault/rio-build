@@ -377,6 +377,107 @@ rec {
   # tests (both are "control"; phase1a doesn't build so N/A there).
   # `testDrvFile` is baked at Nix-eval time (per-phase; can be either
   # a `./foo.nix` path literal or a `pkgs.writeText` derivation).
+  # k3s server node + rio-controller systemd service. Extracted
+  # from phase3a.nix for reuse in phase3b.nix (Build CRD section).
+  #
+  # Parameters:
+  #   controllerEnv: rio-controller systemd environment attrset
+  #     (RIO_SCHEDULER_ADDR, RIO_STORE_ADDR, KUBECONFIG, etc).
+  #     Must include at least KUBECONFIG.
+  #   manifests: services.k3s.manifests (auto-deploy; k3s applies
+  #     in filename order, use "00-" prefix for CRDs so they
+  #     establish before dependent CRs).
+  #   extraK3sImages: images to preload beyond airgap-images.
+  #     [] if no containerized rio components (e.g., phase3b uses
+  #     a native NixOS worker, no pod).
+  #
+  # Returns a NixOS module function ({ config, ... }: { ... }).
+  # The caller provides hostName="k8s" via nodes.k8s attribute.
+  mkK3sNode =
+    {
+      controllerEnv,
+      manifests,
+      extraK3sImages ? [ ],
+    }:
+    { config, ... }:
+    {
+      networking = {
+        hostName = "k8s";
+        # 6443 = k3s apiserver. 8472 = flannel VXLAN.
+        firewall.allowedTCPPorts = [ 6443 ];
+        firewall.allowedUDPPorts = [ 8472 ];
+      };
+
+      # k3s needs swap off (kubelet check). NixOS test VMs don't
+      # enable swap by default, but make it explicit.
+      swapDevices = [ ];
+
+      # FUSE kernel module — /dev/fuse must exist on the HOST for
+      # the hostPath CharDevice volume to mount.
+      boot.kernelModules = [ "fuse" ];
+
+      # cgroup v2 unified hierarchy (explicit — if it fell back
+      # to hybrid, worker's own_cgroup() parser fails).
+      boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
+
+      # containerd needs cgroup delegation to create pod cgroups.
+      # Without this: pods stuck in ContainerCreating.
+      systemd.services.k3s.serviceConfig.Delegate = "yes";
+
+      services.k3s = {
+        enable = true;
+        role = "server";
+        extraFlags = [
+          # eth1 = test vlan (inter-VM). eth0 = slirp (mgmt) —
+          # flannel doesn't work there (no broadcast).
+          "--flannel-iface"
+          "eth1"
+          # Disable unneeded components: ingress, K8s metrics.
+          "--disable"
+          "traefik"
+          "--disable"
+          "metrics-server"
+          # SAN: cross-VM clients (scheduler for Lease, phase3b
+          # controller) reach https://k8s:6443; cert must include
+          # `k8s` or TLS verification rejects.
+          "--tls-san"
+          "k8s"
+        ];
+        # Airgap: NixOS test VMs have no internet. Preload k3s's
+        # own pod images + any caller-provided ones.
+        images = [ config.services.k3s.package.airgap-images ] ++ extraK3sImages;
+        inherit manifests;
+      };
+
+      # rio-controller as systemd (not pod). Simpler for VM tests
+      # — no RBAC bootstrap ordering problem (k3s.yaml is
+      # cluster-admin). After=k3s but k3s "starts" before
+      # apiserver is ready; RestartSec handles the gap.
+      systemd.services.rio-controller = {
+        description = "rio-controller (K8s operator)";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "k3s.service" ];
+        requires = [ "k3s.service" ];
+        environment = controllerEnv;
+        serviceConfig = {
+          ExecStart = "${rio-workspace}/bin/rio-controller";
+          Restart = "on-failure";
+          RestartSec = 5;
+        };
+      };
+
+      environment.systemPackages = [
+        pkgs.curl
+        pkgs.kubectl
+      ];
+
+      virtualisation = {
+        memorySize = 4096;
+        cores = 8;
+        diskSize = 8192;
+      };
+    };
+
   mkBuildHelper =
     { gatewayHost, testDrvFile }:
     ''

@@ -204,155 +204,30 @@ pkgs.testers.runNixOSTest {
       extraPackages = [ pkgs.postgresql ];
     };
 
-    # k3s node. Layered as an import (like phase2b's Tempo) so we
-    # can add k3s + systemd controller on top without fighting
-    # mkControlNode's assumptions.
-    k8s =
-      { config, ... }:
-      {
-        networking = {
-          hostName = "k8s";
-          # 6443 = k3s apiserver (controller connects). 8472 =
-          # flannel VXLAN (inter-pod; not strictly needed with
-          # hostNetwork but harmless).
-          firewall.allowedTCPPorts = [ 6443 ];
-          firewall.allowedUDPPorts = [ 8472 ];
-        };
-
-        # k3s needs swap off (kubelet check). NixOS test VMs don't
-        # enable swap by default, but make it explicit.
-        swapDevices = [ ];
-
-        # FUSE kernel module — /dev/fuse must exist on the HOST
-        # for the hostPath CharDevice volume to mount. The
-        # NixOS default kernel has it but the module isn't
-        # always auto-loaded.
-        boot.kernelModules = [ "fuse" ];
-
-        # cgroup v2 unified hierarchy. NixOS defaults to this on
-        # modern systemd, but make it explicit — if it silently
-        # fell back to hybrid, the worker's own_cgroup() parser
-        # would fail with "multiple lines in /proc/self/cgroup".
-        boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
-
-        # k3s's kubelet needs cgroup delegation from systemd so
-        # containerd can create pod cgroups. On NixOS this is
-        # usually automatic (systemd 254+ does it), but the
-        # NixOS test VM's minimal config may strip it. Force it
-        # via k3s.service's slice.
-        #
-        # Without this: containerd can't write pod cgroups →
-        # pods stuck in ContainerCreating → test hangs.
-        systemd.services.k3s.serviceConfig.Delegate = "yes";
-
-        services.k3s = {
-          enable = true;
-          role = "server";
-          # eth1: NixOS test VMs have eth0=management (qemu user
-          # net, for test driver SSH), eth1=test vlan (inter-VM).
-          # flannel on eth0 doesn't work — it's a point-to-point
-          # slirp link with no broadcast. eth1 is the real vlan.
-          #
-          # --disable traefik: we don't need an ingress controller,
-          # and it's one less image to preload (airgap). Same for
-          # metrics-server (the autoscaler reads ClusterStatus,
-          # not K8s metrics).
-          extraFlags = [
-            "--flannel-iface"
-            "eth1"
-            "--disable"
-            "traefik"
-            "--disable"
-            "metrics-server"
-            # H1 lease smoke: scheduler on `control` VM needs to
-            # reach this apiserver as https://k8s:6443. The
-            # self-signed cert must include `k8s` as a SAN, or
-            # the kube-rs client's TLS verification rejects it.
-            # Without this: "tls: certificate is not valid for
-            # k8s, only 127.0.0.1, localhost, ...".
-            "--tls-san"
-            "k8s"
-          ];
-          # Airgap images: k3s's own pods (coredns, local-path-
-          # provisioner) + our worker. Without airgap-images, k3s
-          # tries to pull from docker.io — NixOS test VMs have no
-          # internet.
-          images = [
-            config.services.k3s.package.airgap-images
-            dockerImages.worker
-          ];
-          # Auto-deploy manifests: CRDs first (k3s applies in
-          # filename order, and we need CRDs established before
-          # the WorkerPool CR). "00-" prefix enforces ordering.
-          manifests = {
-            "00-rio-crds".source = crds;
-            "10-rio-workerpool".content = workerPoolCR;
-          };
-        };
-
-        # rio-controller as a systemd service on this node. Uses
-        # the k3s-generated kubeconfig (cluster-admin). Simpler
-        # than pod deployment for a VM test — no RBAC bootstrap
-        # ordering problem.
-        #
-        # After=k3s.service: controller needs the apiserver up.
-        # But k3s.service "starts" before the apiserver is READY
-        # (it forks k3s, which boots the apiserver async). The
-        # testScript's wait_until_succeeds handles the real
-        # readiness check; this just sequences systemd startup.
-        systemd.services.rio-controller = {
-          description = "rio-controller (K8s operator)";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "k3s.service" ];
-          requires = [ "k3s.service" ];
-          environment = {
-            KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
-            RIO_SCHEDULER_ADDR = "control:9001";
-            RIO_STORE_ADDR = "control:9002";
-            RIO_LOG_FORMAT = "pretty"; # human-readable in VM logs
-            # G3 autoscaler exercise: 3s windows instead of 30s.
-            # Defaults (30s poll × 30s up-window × 30s anti-flap)
-            # would mean ~60s to first scale — too long for a VM
-            # test. 3s each → ~9s, well within our queue-pressure
-            # window (5 builds × 15s sleep = ~75s total).
-            # Scale-DOWN stays at 600s (not configurable — see
-            # scaling.rs SCALE_DOWN_WINDOW comment).
-            RIO_AUTOSCALER_POLL_SECS = "3";
-            RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS = "3";
-            RIO_AUTOSCALER_MIN_INTERVAL_SECS = "3";
-          };
-          serviceConfig = {
-            ExecStart = "${rio-workspace}/bin/rio-controller";
-            Restart = "on-failure";
-            # k3s.yaml isn't there until k3s server writes it.
-            # Delay instead of a preStart loop — simpler.
-            RestartSec = 5;
-          };
-        };
-
-        # curl for metric scraping; kubectl is in k3s already but
-        # add the standalone one for nicer testScript ergonomics.
-        environment.systemPackages = [
-          pkgs.curl
-          pkgs.kubectl
-        ];
-
-        # 4GB / 8 cores: k3s (apiserver + etcd-lite + coredns +
-        # flannel) is ~1GB baseline. Worker pod needs ~1GB for
-        # the build + FUSE cache. Headroom for peak memory.
-        virtualisation = {
-          memorySize = 4096;
-          cores = 8;
-          diskSize = 8192;
-          # Same rationale as mkWorkerNode: worker pod's overlay
-          # uses /nix/store as a lower; overlayfs-on-overlayfs
-          # breaks. But actually — the POD'S /nix/store is from
-          # the container image, not the host's writable store.
-          # The hostPath we care about is /dev/fuse. Leave
-          # writableStore at default (true); the node's store
-          # isn't what the pod sees.
-        };
+    # k3s node with rio-controller. See common.mkK3sNode for
+    # the extracted boilerplate (flannel iface, cgroup config,
+    # airgap images, controller systemd unit).
+    k8s = common.mkK3sNode {
+      controllerEnv = {
+        KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
+        RIO_SCHEDULER_ADDR = "control:9001";
+        RIO_STORE_ADDR = "control:9002";
+        RIO_LOG_FORMAT = "pretty"; # human-readable in VM logs
+        # G3 autoscaler exercise: 3s windows instead of 30s.
+        # Defaults (30s poll × 30s up-window × 30s anti-flap)
+        # would mean ~60s to first scale — too long for a VM
+        # test. 3s each → ~9s, well within our queue-pressure
+        # window (5 builds × 15s sleep = ~75s total).
+        RIO_AUTOSCALER_POLL_SECS = "3";
+        RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS = "3";
+        RIO_AUTOSCALER_MIN_INTERVAL_SECS = "3";
       };
+      manifests = {
+        "00-rio-crds".source = crds;
+        "10-rio-workerpool".content = workerPoolCR;
+      };
+      extraK3sImages = [ dockerImages.worker ];
+    };
 
     client = common.mkClientNode { gatewayHost = "control"; };
   };
