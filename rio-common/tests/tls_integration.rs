@@ -54,12 +54,11 @@ impl TestPki {
 
         // Server leaf: CA-signed. SANs match how the test connects
         // (both DNS names and IP — `CertificateParams::new` takes
-        // strings and infers DNS vs IP). We don't set
-        // `ClientTlsConfig::domain_name` anymore (removed — it
-        // breaks multi-target clients); tonic derives SNI from the
-        // URL host. So tests binding 127.0.0.1 need 127.0.0.1 as a
-        // SAN; if we connected via `localhost:port` we'd need
-        // `localhost`. Include both for test flexibility.
+        // strings and infers DNS vs IP). `ClientTlsConfig::domain_name`
+        // is NOT set (it breaks multi-target clients); tonic derives
+        // SNI from the URL host. So tests binding 127.0.0.1 need
+        // 127.0.0.1 as a SAN; if we connected via `localhost:port`
+        // we'd need `localhost`. Include both for test flexibility.
         let server_key = rcgen::KeyPair::generate().unwrap();
         let server_params = rcgen::CertificateParams::new(
             server_sans
@@ -317,8 +316,8 @@ async fn mtls_wrong_ca_client_cert_rejected() {
 /// CLIENT rejects. Tests the other direction of mTLS: the client
 /// verifies the server too.
 ///
-/// We no longer set `ClientTlsConfig::domain_name` (it breaks
-/// multi-target clients). tonic derives SNI from the URL host.
+/// `ClientTlsConfig::domain_name` is not set (breaks multi-target
+/// clients). tonic derives SNI from the URL host.
 /// So to trigger a SAN mismatch: generate a cert with SAN=localhost
 /// only, then connect to 127.0.0.1 — SNI=127.0.0.1, cert has only
 /// localhost → rustls rejects.

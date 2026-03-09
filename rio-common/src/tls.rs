@@ -21,11 +21,11 @@
 //! populates SANs — include the SHORT name (how clients address)
 //! and the FQDN (for fully-qualified addressing).
 //!
-//! Previously set `domain_name` globally via OnceLock — BUG: gateway
-//! connects to BOTH scheduler and store with a SINGLE config; fixed
-//! `domain_name="rio-scheduler"` fails store handshake (store cert
-//! has SAN `rio-store` not `rio-scheduler`). Letting tonic derive
-//! from the URL is correct per-connection.
+//! `ClientTlsConfig::domain_name` must NOT be set: the gateway connects
+//! to BOTH scheduler and store with a SINGLE config; a fixed
+//! `domain_name="rio-scheduler"` would fail the store handshake (store
+//! cert has SAN `rio-store`). Letting tonic derive SNI from the URL is
+//! correct per-connection.
 //!
 //! # Health probes
 //!
@@ -113,11 +113,11 @@ fn read_pem(path: &PathBuf) -> Result<String, TlsError> {
         path: path.clone(),
         source,
     })?;
-    // Round 4 Z26: validate at least one PEM block exists.
-    // Catches: empty file, DER-format binary, wrong-file-pointed-
-    // at. tonic/rustls WOULD fail eventually but their errors
-    // don't mention the path — operator grep-and-squints for
-    // which of 3 paths is bad. This fails fast with the path.
+    // Validate at least one PEM block exists. Catches: empty file,
+    // DER-format binary, wrong-file-pointed-at. tonic/rustls WOULD
+    // fail eventually but their errors don't mention the path —
+    // operator grep-and-squints for which of 3 paths is bad. This
+    // fails fast with the path.
     if !contents.contains("-----BEGIN") {
         return Err(TlsError::Malformed { path: path.clone() });
     }
@@ -317,7 +317,7 @@ mod tests {
         );
     }
 
-    /// Round 4 Z26: empty/garbage PEM → Malformed error with path.
+    /// Empty/garbage PEM → Malformed error with path.
     /// Catches empty mounted Secret, DER-format cert, wrong file.
     #[test]
     fn empty_pem_is_malformed() {

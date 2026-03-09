@@ -19,9 +19,9 @@
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $vis:vis struct $name:ident) => {
         $(#[$meta])*
-        // Ord/PartialOrd: needed for BinaryHeap keys (phase2c D5).
-        // Lexicographic on the inner String — fine, only used as a
-        // tiebreak in the heap (priority then sequence then hash).
+        // Ord/PartialOrd: needed for BinaryHeap keys in the scheduler's
+        // priority queue. Lexicographic on the inner String — fine, only
+        // used as a tiebreak (priority then sequence then hash).
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
         $vis struct $name(String);
 

@@ -154,8 +154,8 @@ mod tests {
             "metadata timeout should be shorter than stream timeout"
         );
         // Stream timeout (300s) is shorter than any sane daemon build
-        // timeout — now lives in rio-worker Config.daemon_timeout_secs
-        // (default 7200s). The ordering invariant is enforced at
+        // timeout (rio-worker Config.daemon_timeout_secs, default
+        // 7200s). The ordering invariant is enforced at
         // rio-worker/src/executor/daemon.rs test_timeout_ordering.
     }
 }

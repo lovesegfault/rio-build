@@ -145,10 +145,9 @@ where
 /// expected `scheme://[user[:pass]@]host[...]` shape — better to
 /// over-redact than leak a password from an unusual format.
 ///
-/// Round 4 Z6: prior to this, rio-store's main.rs logged
-/// `cfg.database_url` verbatim at INFO, including the password.
-/// A `kubectl logs` grep (or log-aggregator misconfiguration)
-/// exposed the PG credentials.
+/// Without redaction, logging `cfg.database_url` at INFO exposes
+/// PG credentials to anyone who can read pod logs (`kubectl logs`,
+/// log aggregators).
 pub fn redact_db_url(url: &str) -> String {
     // Find scheme://. If absent, not a URL we recognize.
     let Some(scheme_end) = url.find("://") else {
@@ -552,7 +551,7 @@ mod tests {
         });
     }
 
-    // --- Z6: redact_db_url tests ---
+    // --- redact_db_url tests ---
 
     #[test]
     fn redact_db_url_basic() {

@@ -21,8 +21,8 @@
 //! have an assignment token. Two options: (a) long-lived gateway token
 //! with `expected_outputs: *`, (b) mTLS-based bypass where the store
 //! checks `request.peer_certs()` and skips HMAC for the gateway cert.
-//! We go with (b) — simpler, depends on T4 (mTLS). See `rio-store/src/
-//! grpc/put_path.rs` for the bypass logic.
+//! We go with (b) — simpler, relies on the mTLS identity. See
+//! `rio-store/src/grpc/put_path.rs` for the bypass logic.
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -35,7 +35,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// at dispatch time; the store verifies them on PutPath.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claims {
-    /// Worker the assignment was for. Not currently checked (the store
+    /// Worker the assignment was for. Not checked on verify (the store
     /// doesn't know which worker is calling — mTLS identifies the cert
     /// but not the pod name), but useful for audit logs.
     pub worker_id: String,

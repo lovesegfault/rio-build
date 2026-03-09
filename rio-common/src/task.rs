@@ -52,9 +52,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_monitored_normal_completion() -> anyhow::Result<()> {
-        let handle = spawn_monitored("test-normal", async {
-            // Normal completion
-        });
+        let handle = spawn_monitored("test-normal", async {});
         handle.await?;
         Ok(())
     }

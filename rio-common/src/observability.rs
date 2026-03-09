@@ -117,8 +117,8 @@ pub fn init_tracing(component: &'static str) -> anyhow::Result<OtelGuard> {
 
     // W3C TraceContext propagator for traceparent header inject/extract.
     // Registered globally even if otel_layer is None — the interceptor
-    // (C12) uses this to inject/extract regardless of whether spans are
-    // exported. Cheap: it's a stateless parser/formatter.
+    // (rio-proto::interceptor) uses this to inject/extract regardless of
+    // whether spans are exported. Cheap: it's a stateless parser/formatter.
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
@@ -156,7 +156,7 @@ where
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
 
-    // OTLP gRPC span exporter. 0.31 API: SpanExporter::builder().with_tonic().
+    // OTLP gRPC span exporter.
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint.clone())

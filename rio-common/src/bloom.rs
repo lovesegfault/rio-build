@@ -5,7 +5,7 @@
 //! The scheduler uses it for transfer-cost scoring: a worker that
 //! already has most of a derivation's inputs is a better candidate.
 //!
-//! # Why blake3 (user decision from planning)
+//! # Why blake3
 //!
 //! The bloom filter is a WIRE PROTOCOL: worker builds it, scheduler
 //! queries it. Both sides must compute the same bit indices for the
@@ -114,14 +114,14 @@ impl BloomFilter {
         let p = target_fpr.clamp(1e-9, 0.5);
 
         let ln2 = std::f64::consts::LN_2;
-        // Round 4 Z27: compute m as f64, clamp to u32::MAX before
-        // casting. For n=1e9 items at p=1e-9, m ≈ 4.3e10 which
-        // silently wraps when cast to u32 (4.3e10 % 2^32 ≈ 3.4e8)
-        // → filter 100× smaller than requested → FPR way above
-        // target. Clamp makes the overflow VISIBLE (warn! log).
-        // num_bits stays u32 for wire compat — a u32::MAX-bit
-        // filter is 512 MiB, absurd for a heartbeat; operator
-        // should notice and reduce expected_items or raise FPR.
+        // Compute m as f64, clamp to u32::MAX before casting. For
+        // n=1e9 items at p=1e-9, m ≈ 4.3e10 which silently wraps
+        // when cast to u32 (4.3e10 % 2^32 ≈ 3.4e8) → filter 100×
+        // smaller than requested → FPR way above target. Clamp
+        // makes the overflow VISIBLE (warn! log). num_bits stays
+        // u32 for wire compat — a u32::MAX-bit filter is 512 MiB,
+        // absurd for a heartbeat; operator should notice and reduce
+        // expected_items or raise FPR.
         let m_f = (-(n * p.ln()) / (ln2 * ln2)).ceil();
         let m = if m_f > u32::MAX as f64 {
             tracing::warn!(
