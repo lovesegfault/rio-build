@@ -108,6 +108,43 @@ impl DagActor {
         lost_worker: Option<&WorkerId>,
     ) {
         for drv_hash in drv_hashes {
+            // Track the lost worker + persist BEFORE deciding
+            // reset-vs-poison. failed_workers.len() is the poison
+            // decision input; it must reflect THIS failure.
+            if let Some(worker_id) = lost_worker {
+                if let Some(state) = self.dag.node_mut(drv_hash) {
+                    state.failed_workers.insert(worker_id.clone());
+                }
+                // Persist for recovery. best-effort — in-mem is
+                // authoritative, PG failure just means recovery
+                // misses this one worker-tracking entry.
+                if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
+                    error!(drv_hash = %drv_hash, error = %e,
+                           "failed to persist failed_worker");
+                }
+            }
+
+            // POISON_THRESHOLD check (X6 fix). 3 distinct worker
+            // failures → poison. Without this check here, 3
+            // sequential worker disconnects leave failed_workers=
+            // {w1,w2,w3} with status=Ready — best_worker (assignment
+            // .rs:186) excludes all 3 → deferred forever. Unlike
+            // handle_transient_failure which DOES check.
+            //
+            // poison_and_cascade expects Assigned/Running status
+            // (not Ready), so we check BEFORE reset_to_ready.
+            let should_poison = self
+                .dag
+                .node(drv_hash)
+                .map(|s| s.failed_workers.len() >= POISON_THRESHOLD)
+                .unwrap_or(false);
+            if should_poison {
+                info!(drv_hash = %drv_hash, lost_worker = ?lost_worker,
+                      "reassign: POISON_THRESHOLD reached, poisoning instead of retry");
+                self.poison_and_cascade(drv_hash).await;
+                continue;
+            }
+
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.reset_to_ready() {
                     warn!(
@@ -117,23 +154,7 @@ impl DagActor {
                     continue;
                 }
                 // Worker-loss mid-build is a failed attempt: count it.
-                // retry_count → poison threshold (3 different workers).
                 state.retry_count += 1;
-                // Track the lost worker. Feeds best_worker exclusion
-                // AND poison detection (failed_workers.len() >=
-                // POISON_THRESHOLD → poisoned in handle_transient_
-                // failure). A worker that crashes mid-build counts
-                // as a distinct-worker failure.
-                if let Some(worker_id) = lost_worker {
-                    state.failed_workers.insert(worker_id.clone());
-                    // Persist for recovery. best-effort — in-mem is
-                    // authoritative, PG failure just means recovery
-                    // misses this one worker-tracking entry.
-                    if let Err(e) = self.db.append_failed_worker(drv_hash, worker_id).await {
-                        error!(drv_hash = %drv_hash, error = %e,
-                               "failed to persist failed_worker");
-                    }
-                }
                 if let Err(e) = self.db.increment_retry_count(drv_hash).await {
                     error!(drv_hash = %drv_hash, error = %e, "failed to persist retry increment");
                 }
@@ -559,6 +580,13 @@ impl DagActor {
                 .await
             {
                 error!(drv_hash = %drv_hash, error = %e, "failed to persist poison reset");
+            }
+            // reset_from_poison (in-mem) clears failed_workers +
+            // retry_count; PG must match. Without this, crash after
+            // reset → recovery loads stale failed_workers (3 workers)
+            // → immediately excluded from dispatch. (X13 fix)
+            if let Err(e) = self.db.clear_failed_workers_and_retry(&drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_workers clear");
             }
         }
 

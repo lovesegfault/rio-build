@@ -155,3 +155,56 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     );
     Ok(())
 }
+
+/// X6 regression: 3 sequential worker disconnects with the same
+/// derivation must poison it (not leave it Ready-but-undispatchable
+/// because best_worker excludes all 3 failed workers).
+#[tokio::test]
+async fn test_three_worker_disconnects_poisons() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Connect 3 workers sequentially. Each gets the drv assigned,
+    // then disconnects.
+    let build_id = Uuid::new_v4();
+    let _evt_rx = merge_single_node(&handle, build_id, "x6-drv", PriorityClass::Scheduled).await?;
+
+    for i in 0..3 {
+        let worker_id = format!("w-x6-{i}");
+        let mut rx = connect_worker(&handle, &worker_id, "x86_64-linux", 1).await?;
+        // Receive assignment (proves drv dispatched to this worker).
+        let assignment = recv_assignment(&mut rx).await;
+        assert!(
+            assignment.drv_path.contains("x6-drv"),
+            "worker {i} should get x6-drv"
+        );
+
+        // Disconnect. reassign_derivations runs → X6 fix checks
+        // POISON_THRESHOLD. For i<2: reset to Ready + next worker
+        // gets it. For i==2: poison.
+        handle
+            .send_unchecked(ActorCommand::WorkerDisconnected {
+                worker_id: worker_id.clone().into(),
+            })
+            .await?;
+        barrier(&handle).await;
+
+        // Close stream (drop rx) to complete disconnect.
+        drop(rx);
+    }
+
+    // After 3 disconnects: drv should be Poisoned (X6 fix).
+    // Without the fix: Ready with failed_workers={w0,w1,w2}, never
+    // dispatchable.
+    let info = handle
+        .debug_query_derivation("x6-drv")
+        .await?
+        .expect("derivation exists");
+    assert_eq!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "3 worker disconnects should poison (X6 fix); got {:?}",
+        info.status
+    );
+
+    Ok(())
+}

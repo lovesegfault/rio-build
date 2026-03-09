@@ -282,6 +282,26 @@ impl SchedulerDb {
         .await?;
         Ok(())
     }
+
+    /// Clear `failed_workers` + `retry_count` for a derivation.
+    /// Called on poison-TTL expiry (reset_from_poison) so PG
+    /// matches in-mem. Without this, crash after poison-reset →
+    /// recovery loads stale failed_workers → immediately excluded
+    /// from dispatch (best_worker skips them).
+    pub async fn clear_failed_workers_and_retry(
+        &self,
+        drv_hash: &DrvHash,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations \
+             SET failed_workers = '{}', retry_count = 0, updated_at = now() \
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
     // -----------------------------------------------------------------------
     // Build-derivation mapping
     // -----------------------------------------------------------------------
