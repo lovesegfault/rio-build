@@ -74,4 +74,25 @@ Iteration 2 had caught a **latent TLS SNI bug**: `load_client_tls` set `domain_n
 - **V3** (VM test hollow): S1 recovered 0 rows (B1+S1-setup terminal before restart). Fixed: background 15s-sleep build before restart → PG has non-terminal row → recovery loads real data. PG query asserts ≥1 non-terminal.
 - **V4** (VM test hollow): B1 didn't prove HMAC verifier active (broken `load` → verifier=None → PutPath accepts all → B1 passes anyway). Fixed: assert `rio_store_hmac_bypass_total{cn="rio-gateway"}` ≥ 1 after seedBusybox — metric only increments when verifier non-None.
 
+**Validation-round-4 bugs fixed (iteration 6, 11 commits 8b22d05..914a413, 994→1016 tests):** Fresh deep review across all phases 1a-3b via 6 parallel audit agents. 2 CRITICAL + 9 HIGH + 17 MEDIUM bugs + 10 hollow VM assertions + doc drift.
+
+**CRITICAL:**
+- **Z1** `build_derivations` FK had NO `ON DELETE CASCADE`. `cleanup_failed_merge` called `delete_build` → FK violation silently caught by `warn!` → orphan Active build + rows. On failover, recovery resurrected and RAN it — client got StoreUnavailable but build silently executed later. Migration 008 adds CASCADE + `check_cached_outputs` moved BEFORE `persist_merge_to_db` (rollback is in-memory only). Compound with Z4+Z16: spurious BuildCompleted with empty output_paths.
+- **Z2** Mark-vs-PutPath race: P past grace → mark unreachable → PutPath Q (referencing P) completes → sweep deletes P → Q.references dangles. Hybrid fix: new `GC_MARK_LOCK_ID` (shared for PutPath, exclusive for mark — ~1s); sweep re-checks references per-path via GIN index (migration 008). `rio_store_gc_path_resurrected_total` metric.
+
+**HIGH:**
+- **Z3** Phantom-Assigned after crash-between-persist-and-try_send. Worker reconnects → `contains_key(w)` true → SKIP. No `running_since` → backstop won't fire → stuck forever. Fixed: cross-check `worker.running_builds` even when present.
+- **Z4** `transition_build` returned `Ok(())` on rejection → spurious events/metrics/cleanup. New `TransitionOutcome{Applied,Rejected}`; callers skip side-effects on Rejected.
+- **Z5** Corrupt LRU bytes never evicted → stuck forever. `lru.invalidate(hash)` on verify-fail.
+- **Z6** `info!(url = %cfg.database_url)` leaked PG password. `redact_db_url` helper (→ `***`).
+- **Z7** GC advisory lock leaked on task cancel (conn returned to pool, lock held until recycle). scopeguard detach.
+- **Z8** `verify_fod_hashes` hardcoded SHA256 → sha1/sha512 FODs false-rejected. `FodHashAlgo` dispatch + sha1 dep.
+- **Z9** FOD verify ran AFTER upload — bad output already in store. Local NAR hash via `dump_path_streaming` + `DigestWriter`, spawn_blocking, BEFORE upload.
+- **Z10** `submit_build` BEFORE sentinel patch → patch fail → stream dropped → resubmit zombie. Reordered.
+- **Z11** `publish_event` defined, ZERO callers. Wired in: `apply()` Submitted, `drain_stream` transitions (Started/Succeeded/Failed/Cancelled), `scaling.rs` ScaledUp/Down. `apply_event` returns `(bool, Option<K8sEventInfo>)`. Autoscaler takes recorder.
+
+**MEDIUM (selected):** Z12 duration nanos underflow, Z13 heartbeat systems bound, Z14 class_queue_depth gauge zeroed per-pass, Z15 try_send rollback also unpins+deletes assignment, Z17 chunk key validated before Path::join (path traversal), Z18 pending_s3_deletes INSERT batched via unnest, Z21 `grace_period_hours` proto3 optional (zero-grace now possible), Z23 `__noChroot` checked on inline BasicDerivation, Z25 `compute_desired` min>max swap (clamp panic), Z26 PEM validates `-----BEGIN` marker, Z27 bloom m overflow clamp+warn, Z28 quantity decimal fractions ("1.5Gi").
+
+**VM hollow fixes:** V5 narHash exact match vs local (phase1a), V11 stamp content grep (phase2a), V10 trace propagation gateway↔scheduler shared traceID (phase2b), V7 bigblob chunk delta (phase2c), V9 size_class baseline delta (phase2c), V8 prefetch_paths_sent (phase3a), B9 `kubectl get events` on Build CRD (phase3a), V12 T2 uses dedicated client cert CN=rio-worker (phase3b), V13 T3 NOT_SERVING probe during standby proves shared HealthReporter (phase3b), V14 C1 pathsScanned regex (phase3b).
+
 **EKS smoke:** manual trigger (`infra/eks/smoke-test.sh`). Deploys, builds hello, kills worker, verifies reassign via metrics delta.
