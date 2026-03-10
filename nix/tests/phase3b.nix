@@ -708,6 +708,29 @@ pkgs.testers.runNixOSTest {
         # (collectCoverage uses `systemctl stop` + verifies
         # profraw flush).
         control.succeed("systemctl kill -s KILL rio-scheduler")
+
+        # PG check BEFORE restart (not after recovery). At SIGKILL
+        # time the worker's gRPC stream is dead — it CANNOT report
+        # completion until the scheduler is back up. So the PG row
+        # is guaranteed non-terminal right now; this is the exact
+        # snapshot that load_nonterminal_derivations (db.rs:625)
+        # will read when recovery runs. Checking after recovery
+        # completes races with the build finishing on a slow CI run
+        # (worker reconnects → reports → status='completed' before
+        # the assert). Query the same TERMINAL_STATUSES filter
+        # recovery uses. Without the backgrounded slow build, all
+        # earlier drvs are terminal → 0 non-terminal rows → recovery
+        # runs through empty loops (hollow).
+        nonterminal_count = int(control.succeed(
+            "sudo -u postgres psql rio -tAc "
+            "\"SELECT COUNT(*) FROM derivations "
+            "WHERE status NOT IN "
+            "('completed','poisoned','dependency_failed','cancelled')\""
+        ).strip())
+        assert nonterminal_count >= 1, \
+            f"PG snapshot at crash time should have >=1 non-terminal drv (slow build in-flight), got {nonterminal_count}"
+        print(f"recovery data: PG has {nonterminal_count} non-terminal derivation(s) — recovery will load real data")
+
         control.succeed("systemctl start rio-scheduler")
         control.wait_for_unit("rio-scheduler.service")
         # Main port (TLS) listening again. wait_for_open_port just
@@ -727,23 +750,6 @@ pkgs.testers.runNixOSTest {
             "grep -q 'state recovery complete'",
             timeout=30
         )
-
-        # PG should have >=1 non-terminal derivation row — the slow
-        # build's drv was Running before the restart. Recovery's
-        # load_nonterminal_derivations (db.rs:625) reads this. Query
-        # the same TERMINAL_STATUSES filter recovery uses. Without
-        # the backgrounded slow build, all earlier drvs are terminal
-        # → 0 non-terminal rows → recovery runs through empty loops
-        # (hollow).
-        nonterminal_count = int(control.succeed(
-            "sudo -u postgres psql rio -tAc "
-            "\"SELECT COUNT(*) FROM derivations "
-            "WHERE status NOT IN "
-            "('completed','poisoned','dependency_failed','cancelled')\""
-        ).strip())
-        assert nonterminal_count >= 1, \
-            f"PG should have >=1 non-terminal drv (slow build in-flight), got {nonterminal_count}"
-        print(f"recovery data: PG has {nonterminal_count} non-terminal derivation(s) — recovery had real data to load")
 
         # Bonus: the recovery log itself should mention non-zero
         # derivations. tracing's pretty() format puts structured
