@@ -181,13 +181,15 @@ let
   # should load its derivation row from PG → `derivations=1` in
   # the recovery log.
   #
-  # 60s (not shorter): ReconcileAssignments cross-checks phantom-
+  # 90s (not shorter): ReconcileAssignments cross-checks phantom-
   # Assigned drvs that completed during scheduler downtime — worker
   # finishes a short build, reconnects with empty running_builds,
   # cross-check detects this → store-check → output present →
   # Completed. A shorter sleep would let the build finish during
-  # downtime; 60s outlives the full restart+recovery window (~40s
-  # worst case) so the build is still running at PG-check time.
+  # downtime. The PG check runs at SIGKILL (pre-restart), so it's
+  # already safe; but the queue-drain wait at end of the recovery
+  # subtest still needs margin for re-dispatch + remaining sleep.
+  # 90s gives ~50s headroom over restart+recovery (~40s worst case).
   testDrvFileRecoverySlow = pkgs.writeText "phase3b-recovery-slow.nix" ''
     { busybox }:
     derivation {
@@ -198,7 +200,7 @@ let
         "-c"
         '''
           set -ex
-          ''${busybox}/bin/busybox sleep 60
+          ''${busybox}/bin/busybox sleep 90
           ''${busybox}/bin/busybox mkdir -p $out
           ''${busybox}/bin/busybox echo "phase3b recovery-slow" > $out/stamp
         '''
@@ -689,7 +691,7 @@ pkgs.testers.runNixOSTest {
             "> /tmp/recovery-slow.log 2>&1 < /dev/null &"
         )
         # Poll for the build to be dispatched (Running). The slow
-        # build's 60s sleep starts once the worker receives the
+        # build's 90s sleep starts once the worker receives the
         # assignment → derivations.status='running' in PG.
         control.wait_until_succeeds(
             "curl -sf http://localhost:9091/metrics | "
@@ -701,7 +703,7 @@ pkgs.testers.runNixOSTest {
         # With graceful shutdown (serve_with_shutdown), SIGTERM
         # waits for in-flight streams to drain — the slow build's
         # BuildExecution stream keeps the scheduler alive until
-        # the 60s build completes → drv marked completed in PG →
+        # the 90s build completes → drv marked completed in PG →
         # the non-terminal-row check fails. We want "recovery from
         # abrupt CRASH with in-flight work" — SIGKILL simulates
         # that. Graceful shutdown is tested separately
@@ -802,15 +804,15 @@ pkgs.testers.runNixOSTest {
         # dispatched) or (b) is still running/retrying. Wait for
         # the queue to drain before the watch-dedup section —
         # otherwise its Build CRD would compete for the worker's
-        # maxBuilds=1 slot. Poll scheduler queued+running==0. 90s
-        # timeout: slow-build sleep + re-dispatch overhead +
-        # ReconcileAssignments delay in the worst case.
+        # maxBuilds=1 slot. Poll scheduler queued+running==0. 120s
+        # timeout: slow-build sleep remainder (up to ~90s) +
+        # re-dispatch overhead (~10s) + ReconcileAssignments delay.
         control.wait_until_succeeds(
             "curl -sf http://localhost:9091/metrics | "
             "awk '/^rio_scheduler_derivations_queued / {q=$2} "
             "/^rio_scheduler_derivations_running / {r=$2} "
             "END {exit !(q==0 && r==0)}'",
-            timeout=90
+            timeout=120
         )
         print(f"recovery PASS: scheduler restart → LEASE ACQUIRE → recovery loaded REAL rows → dispatch unblocked, built {out_recovery}")
 
