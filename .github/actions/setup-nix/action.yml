@@ -10,6 +10,10 @@ runs:
     # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
     - uses: NixOS/nix-installer-action@228d8a956062db04221c97c2794ea443194824aa
       with:
+        # Default is true; it writes a udev rule to /etc/udev/rules.d/
+        # which doesn't exist in ARC runner containers. We handle KVM
+        # ourselves: hostPath mount (arc.tf) + system-features below.
+        enable-kvm: false
         extra-conf: |
           substituters = https://rio-nix-cache.s3.us-west-2.amazonaws.com https://cache.nixos.org
           trusted-public-keys = rio-nix-cache:er1fTC0pPR1nSGU+qcYJPle1CW1xtTJul+gA/kUo0KI= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
