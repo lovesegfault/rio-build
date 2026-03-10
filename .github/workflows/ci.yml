@@ -141,10 +141,6 @@ jobs:
   # alls-green treats `skipped` as failure (GitHub branch protection
   # doesn't, which is a well-known footgun — a skipped required
   # check silently passes).
-  #
-  # vm-coverage is listed with allowed-failures: instrumented runs
-  # can flake on overhead; they're informational. Codecov still
-  # gets data from whichever ones succeed.
   ci-gate:
     name: CI gate
     if: always()
@@ -155,4 +151,3 @@ jobs:
       - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-failures: vm-coverage
