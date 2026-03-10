@@ -9,7 +9,6 @@ use super::*;
 pub struct DebugWorkerInfo {
     pub worker_id: String,
     pub is_registered: bool,
-    pub systems: Vec<String>,
     pub running_count: usize,
     pub running_builds: Vec<String>,
 }
@@ -18,8 +17,6 @@ pub struct DebugWorkerInfo {
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct DebugDerivationInfo {
-    pub drv_hash: String,
-    pub drv_path: String,
     pub status: DerivationStatus,
     pub retry_count: u32,
     pub assigned_worker: Option<String>,

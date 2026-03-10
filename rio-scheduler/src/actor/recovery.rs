@@ -85,18 +85,22 @@ impl DagActor {
         // Build db_id → drv_hash map for edge + build_derivation
         // resolution below. Also build DerivationState nodes.
         let mut id_to_hash: HashMap<Uuid, DrvHash> = HashMap::with_capacity(drv_rows.len());
-        for row in &drv_rows {
+        for row in drv_rows {
+            let derivation_id = row.derivation_id;
             let Ok(status) = row.status.parse::<DerivationStatus>() else {
                 warn!(drv_hash = %row.drv_hash, status = %row.status,
                       "unknown derivation status in PG, skipping row");
                 continue;
             };
-            let Ok(state) = DerivationState::from_recovery_row(row, status) else {
-                warn!(drv_hash = %row.drv_hash, "invalid drv_path in PG, skipping row");
-                continue;
+            let state = match DerivationState::from_recovery_row(row, status) {
+                Ok(s) => s,
+                Err((drv_hash, _)) => {
+                    warn!(drv_hash = %drv_hash, "invalid drv_path in PG, skipping row");
+                    continue;
+                }
             };
             let hash = state.drv_hash.clone();
-            id_to_hash.insert(row.derivation_id, hash.clone());
+            id_to_hash.insert(derivation_id, hash.clone());
             self.dag.insert_recovered_node(state);
         }
 
@@ -498,13 +502,13 @@ impl DagActor {
                 // ancestor priorities (full_sweep on next tick does
                 // it anyway).
                 let newly_ready = self.dag.find_newly_ready(&drv_hash);
-                for ready_hash in &newly_ready {
-                    if let Some(s) = self.dag.node_mut(ready_hash)
+                for ready_hash in newly_ready {
+                    if let Some(s) = self.dag.node_mut(&ready_hash)
                         && s.transition(DerivationStatus::Ready).is_ok()
                     {
-                        self.persist_status(ready_hash, DerivationStatus::Ready, None)
+                        self.persist_status(&ready_hash, DerivationStatus::Ready, None)
                             .await;
-                        self.push_ready(ready_hash.clone());
+                        self.push_ready(ready_hash);
                     }
                 }
 

@@ -293,20 +293,16 @@ impl DagActor {
     }
 
     pub(super) async fn check_build_completion(&mut self, build_id: Uuid) {
-        let (state, keep_going, total, completed, failed) = match self.builds.get(&build_id) {
-            Some(b) => (
-                b.state(),
-                b.keep_going,
-                b.derivation_hashes.len() as u32,
-                b.completed_count,
-                b.failed_count,
-            ),
-            None => return,
+        let Some(b) = self.builds.get(&build_id) else {
+            return;
         };
-
-        if state.is_terminal() {
+        if b.state().is_terminal() {
             return;
         }
+        let keep_going = b.keep_going;
+        let total = b.derivation_hashes.len() as u32;
+        let completed = b.completed_count;
+        let failed = b.failed_count;
 
         let all_completed = completed >= total;
         let all_resolved = (completed + failed) >= total;

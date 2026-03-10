@@ -596,8 +596,8 @@ impl WorkerService for SchedulerGrpc {
                                 "worker acknowledged assignment"
                             );
                         }
-                        rio_proto::types::worker_message::Msg::Completion(report) => {
-                            let drv_path = report.drv_path.clone();
+                        rio_proto::types::worker_message::Msg::Completion(mut report) => {
+                            let drv_path = std::mem::take(&mut report.drv_path);
                             // A CompletionReport with result: None is malformed, but
                             // we must not silently drop it — the derivation would hang
                             // in Running forever. Synthesize an InfrastructureFailure.

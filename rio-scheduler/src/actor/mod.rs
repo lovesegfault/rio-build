@@ -504,7 +504,6 @@ impl DagActor {
                         .map(|w| DebugWorkerInfo {
                             worker_id: w.worker_id.to_string(),
                             is_registered: w.is_registered(),
-                            systems: w.systems.clone(),
                             running_count: w.running_builds.len(),
                             running_builds: w
                                 .running_builds
@@ -518,8 +517,6 @@ impl DagActor {
                 #[cfg(test)]
                 ActorCommand::DebugQueryDerivation { drv_hash, reply } => {
                     let info = self.dag.node(&drv_hash).map(|s| DebugDerivationInfo {
-                        drv_hash: s.drv_hash.to_string(),
-                        drv_path: s.drv_path().to_string(),
                         status: s.status(),
                         retry_count: s.retry_count,
                         assigned_worker: s.assigned_worker.as_ref().map(|w| w.to_string()),

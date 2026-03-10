@@ -386,13 +386,13 @@ impl DagActor {
         // Release downstream: find newly ready derivations.
         // push_ready handles interactive boost via priority.
         let newly_ready = self.dag.find_newly_ready(drv_hash);
-        for ready_hash in &newly_ready {
-            if let Some(state) = self.dag.node_mut(ready_hash)
+        for ready_hash in newly_ready {
+            if let Some(state) = self.dag.node_mut(&ready_hash)
                 && state.transition(DerivationStatus::Ready).is_ok()
             {
-                self.persist_status(ready_hash, DerivationStatus::Ready, None)
+                self.persist_status(&ready_hash, DerivationStatus::Ready, None)
                     .await;
-                self.push_ready(ready_hash.clone());
+                self.push_ready(ready_hash);
             }
         }
 

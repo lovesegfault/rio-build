@@ -438,8 +438,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn gzip_lines_is_gunzip_roundtrippable() -> anyhow::Result<()> {
+    #[test]
+    fn gzip_lines_is_gunzip_roundtrippable() -> anyhow::Result<()> {
         let lines: Vec<Vec<u8>> = vec![b"hello".to_vec(), b"world".to_vec(), b"!".to_vec()];
         let gz = gzip_lines(&lines)?;
         // Magic bytes for gzip: 1f 8b.
@@ -452,8 +452,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn gzip_lines_empty_produces_valid_gzip() -> anyhow::Result<()> {
+    #[test]
+    fn gzip_lines_empty_produces_valid_gzip() -> anyhow::Result<()> {
         // Edge case: zero lines. Still want a valid (empty) gzip blob, not
         // an error — a silent build's log is empty, not absent.
         let gz = gzip_lines(&[])?;

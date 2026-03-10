@@ -319,35 +319,34 @@ impl DerivationState {
     ///
     /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
     /// happen (it was validated at merge time before persist) but
-    /// be defensive against PG corruption / manual edits.
+    /// be defensive against PG corruption / manual edits. On error,
+    /// returns `(drv_hash, err)` so the caller can log without
+    /// having cloned drv_hash up front.
     pub fn from_recovery_row(
-        row: &crate::db::RecoveryDerivationRow,
+        row: crate::db::RecoveryDerivationRow,
         status: DerivationStatus,
-    ) -> Result<Self, rio_nix::store_path::StorePathError> {
-        let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)?;
+    ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
+        let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)
+            .map_err(|e| (row.drv_hash.clone(), e))?;
         let now = Instant::now();
         Ok(Self {
-            drv_hash: row.drv_hash.as_str().into(),
+            drv_hash: row.drv_hash.into(),
             drv_path,
-            pname: row.pname.clone(),
-            system: row.system.clone(),
-            required_features: row.required_features.clone(),
-            output_names: row.output_names.clone(),
+            pname: row.pname,
+            system: row.system,
+            required_features: row.required_features,
+            output_names: row.output_names,
             is_fixed_output: row.is_fixed_output,
             status,
             interested_builds: HashSet::new(), // populated by build_derivations join
-            assigned_worker: row.assigned_worker_id.as_deref().map(Into::into),
+            assigned_worker: row.assigned_worker_id.map(Into::into),
             assigned_size_class: None, // lossy; misclassification detector skips None
             drv_content: Vec::new(),   // worker fetches from store
             retry_count: row.retry_count.max(0) as u32,
-            failed_workers: row
-                .failed_workers
-                .iter()
-                .map(|s| s.as_str().into())
-                .collect(),
+            failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
             poisoned_at: None, // poisoned rows not loaded; if one slips through, stays poisoned
             output_paths: Vec::new(), // completed rows not loaded
-            expected_output_paths: row.expected_output_paths.clone(),
+            expected_output_paths: row.expected_output_paths,
             est_duration: 0.0,      // recomputed by full_sweep
             input_srcs_nar_size: 0, // lossy; only used as estimator input (proxy)
             priority: 0.0,          // recomputed by full_sweep
