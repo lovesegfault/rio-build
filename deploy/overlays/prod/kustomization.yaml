@@ -47,8 +47,18 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value:
-          name: RIO_CHUNK_BACKEND
-          value: '{"kind":"s3","bucket":"PLACEHOLDER-SET-IN-GITOPS","prefix":"chunks/"}'
+          name: RIO_CHUNK_BACKEND__KIND
+          value: s3
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RIO_CHUNK_BACKEND__BUCKET
+          value: PLACEHOLDER-SET-IN-GITOPS
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: RIO_CHUNK_BACKEND__PREFIX
+          value: chunks/
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value:
