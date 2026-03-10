@@ -584,20 +584,6 @@ impl ChunkCache {
             })
         }
     }
-
-    /// Approximate entry count for test assertions.
-    ///
-    /// moka doesn't track hit/miss internally; we count via the
-    /// `rio_store_chunk_cache_{hits,misses}_total` counters. Dashboards
-    /// compute ratios at query time via PromQL `rate()` — we don't emit
-    /// a pre-computed ratio gauge (loses meaning when averaged across
-    /// instances; observability.md "Note on ratio metrics").
-    #[cfg(test)]
-    pub fn test_cache_len(&self) -> u64 {
-        // moka's entry_count is approximate (eventually consistent with
-        // pending eviction). Good enough for tests.
-        self.lru.entry_count()
-    }
 }
 
 // r[verify store.singleflight]
