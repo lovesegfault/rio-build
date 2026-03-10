@@ -849,8 +849,9 @@
           }
           # Per-test lcovs: coverage-vm-phase1a etc. Useful for
           # "why is X not covered" — inspect one VM test's
-          # contribution in isolation.
-          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "coverage-${n}" v) coverage.perTestLcov
+          # contribution in isolation. `or {}`: coverage is
+          # optionalAttrs isLinux → empty on Darwin → no attr error.
+          // pkgs.lib.mapAttrs' (n: v: pkgs.lib.nameValuePair "coverage-${n}" v) (coverage.perTestLcov or { })
           # Coverage-mode VM test runs: cov-vm-phase1a etc. Build
           # one to get the raw profraws at result/coverage/<node>/.
           # Used during smoke debugging.
