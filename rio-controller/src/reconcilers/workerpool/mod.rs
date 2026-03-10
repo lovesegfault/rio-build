@@ -138,7 +138,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
     svc_api
         .patch(
-            &svc.metadata.name.clone().expect("we set it"),
+            svc.metadata.name.as_deref().expect("we set it"),
             &PatchParams::apply(MANAGER).force(),
             &Patch::Apply(&svc),
         )
@@ -153,7 +153,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
     pdb_api
         .patch(
-            &pdb.metadata.name.clone().expect("we set it"),
+            pdb.metadata.name.as_deref().expect("we set it"),
             &PatchParams::apply(MANAGER).force(),
             &Patch::Apply(&pdb),
         )
@@ -176,11 +176,7 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // The extra GET is one round-trip per reconcile. Acceptable —
     // reconciles are driven by CR/STS changes, not a hot loop.
     let existing = sts_api.get_opt(&sts_name).await?;
-    let initial_replicas = if existing.is_none() {
-        Some(wp.spec.replicas.min)
-    } else {
-        None
-    };
+    let initial_replicas = existing.is_none().then_some(wp.spec.replicas.min);
     // For status.desired_replicas: read what's ACTUALLY on the STS
     // (autoscaler's last decision). Falls back to min on first
     // create. Prevents kubectl's "Desired" column from showing min

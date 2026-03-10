@@ -292,7 +292,6 @@ impl Autoscaler {
         // ---- Compute desired ----
         let desired = compute_desired(
             status.queued_derivations,
-            status.active_workers,
             pool.spec.autoscaling.target_value,
             pool.spec.replicas.min,
             pool.spec.replicas.max,
@@ -561,11 +560,9 @@ pub(crate) fn sts_replicas_patch(replicas: i32) -> serde_json::Value {
 /// we'd need if each handles `target` queued items. Clamped to
 /// `[min, max]`.
 ///
-/// `active_workers` is NOT directly in the formula — we use
-/// queued/target, not queued/active. Why: if active=0 (all
-/// workers crashed), we still want to scale up based on queue.
-/// queued/active would divide by zero. active_workers is logged
-/// for observability.
+/// We use queued/target, not queued/active. Why: if active=0 (all
+/// workers crashed), we still want to scale up based on queue;
+/// queued/active would divide by zero.
 ///
 /// Edge: `target=0` would divide-by-zero. CRD doesn't enforce
 /// `>0` (the CEL is on max_concurrent_builds, not target_value).
@@ -574,7 +571,7 @@ pub(crate) fn sts_replicas_patch(replicas: i32) -> serde_json::Value {
 ///
 /// Edge: `queued=0` → desired=0 → clamped to min. Correct: empty
 /// queue means scale DOWN to min, not to zero.
-pub(crate) fn compute_desired(queued: u32, _active: u32, target: i32, min: i32, max: i32) -> i32 {
+pub(crate) fn compute_desired(queued: u32, target: i32, min: i32, max: i32) -> i32 {
     // Defensive min>max swap. The CRD's CEL validation enforces
     // min ≤ max, but a CRD installed before the CEL rule existed
     // (or edited with `--validate=false`) could have min>max.
@@ -815,29 +812,25 @@ mod tests {
     #[test]
     fn compute_desired_basic() {
         // 15 queued, target 5 per worker → need 3 workers.
-        assert_eq!(compute_desired(15, 0, 5, 1, 10), 3);
+        assert_eq!(compute_desired(15, 5, 1, 10), 3);
         // 16 queued, target 5 → ceil(16/5) = 4.
-        assert_eq!(compute_desired(16, 0, 5, 1, 10), 4);
+        assert_eq!(compute_desired(16, 5, 1, 10), 4);
     }
 
     #[test]
     fn compute_desired_clamps() {
         // 100 queued, target 5 → 20, but max=10.
-        assert_eq!(compute_desired(100, 0, 5, 1, 10), 10);
+        assert_eq!(compute_desired(100, 5, 1, 10), 10);
         // 0 queued → 0, but min=2.
-        assert_eq!(
-            compute_desired(0, 0, 5, 2, 10),
-            2,
-            "empty queue → min, not 0"
-        );
+        assert_eq!(compute_desired(0, 5, 2, 10), 2, "empty queue → min, not 0");
     }
 
     #[test]
     fn compute_desired_target_zero_clamped() {
         // target=0 would div-by-zero. Clamped to 1. 5 queued → 5.
-        assert_eq!(compute_desired(5, 0, 0, 1, 10), 5);
+        assert_eq!(compute_desired(5, 0, 1, 10), 5);
         // Negative target (shouldn't happen via CRD, but be safe).
-        assert_eq!(compute_desired(5, 0, -3, 1, 10), 5);
+        assert_eq!(compute_desired(5, -3, 1, 10), 5);
     }
 
     #[test]
@@ -847,22 +840,10 @@ mod tests {
         // returns min → autoscaler scales DOWN under extreme load.
         // Bounding to i32::MAX first makes it clamp to max.
         let queued = u32::MAX; // > 4 billion
-        let got = compute_desired(queued, 0, 1, 2, 100);
+        let got = compute_desired(queued, 1, 2, 100);
         assert_eq!(
             got, 100,
             "high queue must clamp to max, not wrap negative → min"
-        );
-    }
-
-    #[test]
-    fn compute_desired_ignores_active() {
-        // active=0 (all crashed) doesn't break the formula. We
-        // scale on queued/target, not queued/active.
-        assert_eq!(compute_desired(15, 0, 5, 1, 10), 3);
-        assert_eq!(
-            compute_desired(15, 100, 5, 1, 10),
-            3,
-            "active is logged-only"
         );
     }
 
@@ -874,13 +855,13 @@ mod tests {
         // min=10, max=2 → swap to min=2, max=10. With queued=50,
         // target=5 → desired=10 (at max).
         assert_eq!(
-            compute_desired(50, 0, 5, 10, 2),
+            compute_desired(50, 5, 10, 2),
             10,
             "min>max swapped; clamped to original min (now max)"
         );
         // queued=0 → desired=0 → clamped to swapped min (original max=2).
         assert_eq!(
-            compute_desired(0, 0, 5, 10, 2),
+            compute_desired(0, 5, 10, 2),
             2,
             "queued=0 → swapped min (original max)"
         );
