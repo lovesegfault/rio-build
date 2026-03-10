@@ -207,8 +207,7 @@ mod tests {
         assert_eq!(server_version, PROTOCOL_VERSION);
 
         // Step 3 (>= 1.38): Client sends features
-        let client_features: Vec<String> = vec![];
-        wire::write_strings(&mut writer, &client_features).await?;
+        wire::write_strings(&mut writer, wire::NO_STRINGS).await?;
         writer.flush().await?;
 
         // Step 4: Client reads server features
@@ -322,8 +321,7 @@ mod tests {
         let _server_version = wire::read_u64(&mut reader).await?;
 
         // Feature exchange
-        let client_features: Vec<String> = vec![];
-        wire::write_strings(&mut writer, &client_features).await?;
+        wire::write_strings(&mut writer, wire::NO_STRINGS).await?;
         writer.flush().await?;
         let _server_features = wire::read_strings(&mut reader).await?;
 

@@ -25,26 +25,14 @@ pub enum DerivedPathError {
     DuplicateOutputName,
 }
 
-/// A validated, non-empty collection of output names, each guaranteed non-empty.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputNames {
-    names: Vec<String>,
-}
-
-impl OutputNames {
-    /// The output names.
-    pub fn names(&self) -> &[String] {
-        &self.names
-    }
-}
-
 /// Which outputs to build from a derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputSpec {
     /// Build all outputs (`!*`).
     All,
-    /// Build specific named outputs (`!out,dev`).
-    Names(OutputNames),
+    /// Build specific named outputs (`!out,dev`). Validated non-empty
+    /// and each name non-empty via [`OutputSpec::names`].
+    Names(Vec<String>),
 }
 
 impl OutputSpec {
@@ -58,7 +46,7 @@ impl OutputSpec {
         if unique.len() != names.len() {
             return Err(DerivedPathError::DuplicateOutputName);
         }
-        Ok(OutputSpec::Names(OutputNames { names }))
+        Ok(OutputSpec::Names(names))
     }
 }
 
@@ -111,7 +99,7 @@ impl std::fmt::Display for DerivedPath {
                 OutputSpec::All => write!(f, "{drv}!*"),
                 OutputSpec::Names(names) => {
                     write!(f, "{drv}!")?;
-                    for (i, name) in names.names().iter().enumerate() {
+                    for (i, name) in names.iter().enumerate() {
                         if i > 0 {
                             write!(f, ",")?;
                         }
@@ -170,11 +158,8 @@ mod tests {
             DerivedPath::Built { drv, outputs } => {
                 assert!(drv.is_derivation());
                 match &outputs {
-                    OutputSpec::Names(output_names) => {
-                        assert_eq!(
-                            output_names.names(),
-                            &["out".to_string(), "dev".to_string()]
-                        );
+                    OutputSpec::Names(names) => {
+                        assert_eq!(names, &["out".to_string(), "dev".to_string()]);
                     }
                     OutputSpec::All => panic!("expected Names"),
                 }
@@ -190,8 +175,8 @@ mod tests {
         let dp = DerivedPath::parse(&path_str)?;
         match dp {
             DerivedPath::Built { outputs, .. } => match &outputs {
-                OutputSpec::Names(output_names) => {
-                    assert_eq!(output_names.names(), &["out".to_string()]);
+                OutputSpec::Names(names) => {
+                    assert_eq!(names, &["out".to_string()]);
                 }
                 OutputSpec::All => panic!("expected Names"),
             },
@@ -258,7 +243,7 @@ mod tests {
             DerivedPath::Built { outputs, .. } => {
                 // "out!extra" is treated as a single output name (with ! in it)
                 match &outputs {
-                    OutputSpec::Names(names) => assert_eq!(names.names(), &["out!extra"]),
+                    OutputSpec::Names(names) => assert_eq!(names, &["out!extra"]),
                     OutputSpec::All => panic!("expected Names"),
                 }
             }
@@ -295,11 +280,8 @@ mod tests {
     fn output_spec_names_accepts_valid() -> anyhow::Result<()> {
         let spec = OutputSpec::names(vec!["out".to_string(), "dev".to_string()])?;
         match &spec {
-            OutputSpec::Names(output_names) => {
-                assert_eq!(
-                    output_names.names(),
-                    &["out".to_string(), "dev".to_string()]
-                );
+            OutputSpec::Names(names) => {
+                assert_eq!(names, &["out".to_string(), "dev".to_string()]);
             }
             OutputSpec::All => panic!("expected Names"),
         }

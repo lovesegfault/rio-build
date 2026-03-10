@@ -54,14 +54,7 @@ pub enum StorePathError {
 /// The 20-byte hash part of a Nix store path.
 #[must_use]
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct StorePathHash([u8; HASH_BYTES]);
-
-impl StorePathHash {
-    /// Access the raw hash bytes.
-    pub fn as_bytes(&self) -> &[u8; HASH_BYTES] {
-        &self.0
-    }
-}
+struct StorePathHash([u8; HASH_BYTES]);
 
 impl fmt::Debug for StorePathHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,11 +75,6 @@ pub struct StorePath {
 }
 
 impl StorePath {
-    /// The hash part of the store path.
-    pub fn hash(&self) -> &StorePathHash {
-        &self.hash
-    }
-
     /// The name component of the store path.
     pub fn name(&self) -> &str {
         &self.name
@@ -570,7 +558,7 @@ mod tests {
 
     /// Single test exercising all the string-like trait impls. These were
     /// 10× 3-line blocks at 0% each in lcov (Deref, AsRef, Borrow,
-    /// PartialEq×3, FromStr, Hash, StorePathHash::as_bytes + Debug).
+    /// PartialEq×3, FromStr, Hash, StorePathHash Debug).
     #[test]
     fn test_string_like_trait_impls() -> anyhow::Result<()> {
         let full = "/nix/store/7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y-hello-2.12.1";
@@ -596,10 +584,9 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert(p.clone());
         assert!(set.contains(full));
-        // StorePathHash::as_bytes
-        assert_eq!(p.hash().as_bytes().len(), 20);
-        // StorePathHash Debug shows the nixbase32-encoded hash
-        let dbg = format!("{:?}", p.hash());
+        // StorePathHash Debug shows the nixbase32-encoded hash (private field
+        // access ok — we're in the same module)
+        let dbg = format!("{:?}", p.hash);
         assert!(dbg.starts_with("StorePathHash("));
         assert!(dbg.contains("7rjj86p2cgcvwb5zrcvxl0nh2lq3b53y"));
         Ok(())

@@ -392,8 +392,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_padding_len() {
+    #[test]
+    fn test_padding_len() {
         assert_eq!(padding_len(0), 0);
         assert_eq!(padding_len(1), 7);
         assert_eq!(padding_len(7), 1);

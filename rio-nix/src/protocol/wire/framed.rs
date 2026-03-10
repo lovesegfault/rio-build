@@ -370,8 +370,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_framed_reader_max_total_clamped() {
+    #[test]
+    fn test_framed_reader_max_total_clamped() {
         // Verify that max_total is clamped to MAX_FRAMED_TOTAL
         let reader = FramedStreamReader::new(Cursor::new(Vec::<u8>::new()), u64::MAX);
         assert_eq!(reader.max_total, MAX_FRAMED_TOTAL);
