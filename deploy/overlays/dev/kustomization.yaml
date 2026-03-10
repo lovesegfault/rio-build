@@ -45,7 +45,8 @@ patches:
         value: ClusterIP
   # Gateway: auto-generated host key (persists for pod lifetime via
   # emptyDir, matches NixOS module's StateDirectory convention) +
-  # authorized_keys from Secret.
+  # authorized_keys from Secret (built by secretGenerator below from
+  # ssh/authorized_keys — see ssh/README.md for setup).
   - target:
       kind: Deployment
       name: rio-gateway
@@ -134,5 +135,13 @@ secretGenerator:
   - name: rio-postgres
     literals:
       - url=postgres://rio:rio@rio-pg-rw:5432/rio
+    options:
+      disableNameSuffixHash: true
+  # Gateway authorized_keys. File is .gitignore'd (per-user). If it's
+  # missing, `kustomize build` fails — loud error instead of a pod
+  # stuck in ContainerCreating. See ssh/README.md.
+  - name: rio-gateway-ssh
+    files:
+      - authorized_keys=ssh/authorized_keys
     options:
       disableNameSuffixHash: true
