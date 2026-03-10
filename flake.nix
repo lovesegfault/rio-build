@@ -149,6 +149,8 @@
                 ./migrations
                 # cargo-deny config (license + advisory policy)
                 ./deny.toml
+                # nextest config (CI profile with JUnit output, test groups)
+                ./.config/nextest.toml
               ];
             };
             strictDeps = true;
@@ -296,23 +298,64 @@
             # the check is hermetic (no network). Bump the flake inputs to
             # pick up new advisories.
             deny = craneLib.cargoDeny (commonArgs // { inherit cargoArtifacts; });
-            nextest = craneLib.cargoNextest (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-                cargoNextestExtraArgs = "--no-tests=warn";
-                nativeCheckInputs = with pkgs; [
-                  inputs.nix.packages.${system}.default
-                  openssh
-                  postgresql_18
-                ];
-                # Golden fixture paths. String interpolation puts them in
-                # the build closure so they're in the sandbox store; tests
-                # read the env var to find them (see golden/daemon.rs).
-                RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-                RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-              }
-            );
+            # Two-derivation nextest wrapper:
+            #   junit — runs nextest, ALWAYS succeeds, outputs junit.xml
+            #           + a `status` file containing the nextest exit code
+            #   gate  — fails iff status ≠ 0; this is the actual check
+            #
+            # Why: Nix discards $out on derivation failure. To preserve
+            # JUnit (which nextest writes even when tests fail), the test
+            # run itself must succeed as a derivation. The gate reads the
+            # captured exit code and fails, keeping CI pass/fail semantics.
+            #
+            # Workflow pattern (.github/workflows/ci.yml):
+            #   1. nix build .#...nextest.junit -o result-junit  (always succeeds)
+            #   2. nix build .#...nextest                        (fails if tests failed)
+            #   3. upload result-junit/junit.xml to Codecov      (runs always)
+            # `junit` is exposed via passthru — addressable without a
+            # separate top-level attr.
+            nextest =
+              let
+                junit = craneLib.cargoNextest (
+                  commonArgs
+                  // {
+                    inherit cargoArtifacts;
+                    pname = "rio-nextest-junit";
+                    # `--profile ci` enables retries + JUnit (.config/nextest.toml).
+                    # `--no-tests=warn`: workspace has leaf bins with no tests.
+                    cargoNextestExtraArgs = "--no-tests=warn --profile ci";
+                    nativeCheckInputs = with pkgs; [
+                      inputs.nix.packages.${system}.default
+                      openssh
+                      postgresql_18
+                    ];
+                    # Golden fixture paths (golden/daemon.rs reads these env vars).
+                    RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+                    RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+                    # Capture exit code, emit JUnit + status, always succeed.
+                    # nextest's --profile ci writes JUnit even on test failure
+                    # (path from .config/nextest.toml profile.ci.junit.path).
+                    checkPhaseCargoCommand = ''
+                      set +e
+                      cargoWithProfile nextest run \
+                        --no-tests=warn --profile ci \
+                        ''${cargoExtraArgs:-}
+                      echo $? > $out/status
+                      set -e
+                      cp target/nextest/ci/junit.xml $out/ 2>/dev/null || true
+                    '';
+                  }
+                );
+              in
+              pkgs.runCommand "rio-nextest" { passthru = { inherit junit; }; } ''
+                status=$(cat ${junit}/status)
+                if [ "$status" != "0" ]; then
+                  echo "nextest failed (exit $status); JUnit at ${junit}/junit.xml"
+                  exit "$status"
+                fi
+                mkdir -p $out
+                ln -s ${junit} $out/junit
+              '';
             doc = craneLib.cargoDoc (
               commonArgs
               // {
