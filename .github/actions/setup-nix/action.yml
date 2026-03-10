@@ -7,7 +7,8 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: DeterminateSystems/nix-installer-action@v21
+    # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
+    - uses: NixOS/nix-installer-action@228d8a956062db04221c97c2794ea443194824aa
       with:
         extra-conf: |
           substituters = https://rio-nix-cache.s3.us-west-2.amazonaws.com https://cache.nixos.org
