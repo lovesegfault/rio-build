@@ -60,11 +60,11 @@ in
       default = "";
       description = ''
         Extra TOML appended to `/etc/rio/store.toml`. figment reads
-        this with lower precedence than env vars. Use for nested
-        config that env vars can't express cleanly — specifically
-        the `[chunk_backend]` tagged enum (figment's env-var
-        provider doesn't have a good syntax for
-        `RIO_CHUNK_BACKEND__KIND=filesystem` + base_dir). Example:
+        this with lower precedence than env vars. Useful for nested
+        config — though the `[chunk_backend]` tagged enum also works
+        via env vars (`RIO_CHUNK_BACKEND__KIND=s3` +
+        `RIO_CHUNK_BACKEND__BUCKET=...`; the k8s overlays use that).
+        TOML is just more readable for multi-field sections. Example:
 
             extraConfig = ${"''"}
               [chunk_backend]
@@ -87,8 +87,6 @@ in
 
   config = lib.mkIf cfg.enable {
     # /etc/rio/store.toml < RIO_* env < CLI. Env vars above override.
-    # The chunk_backend tagged enum goes here — env var syntax for
-    # serde internally-tagged enums is awkward.
     environment.etc."rio/store.toml" = lib.mkIf (cfg.extraConfig != "") {
       text = cfg.extraConfig;
     };

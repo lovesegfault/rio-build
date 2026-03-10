@@ -76,8 +76,8 @@ pkgs.testers.runNixOSTest {
       };
       extraStoreConfig = {
         # [chunk_backend] via /etc/rio/store.toml (same figment
-        # pattern as scheduler size_classes). Env vars don't express
-        # serde internally-tagged enums cleanly.
+        # pattern as scheduler size_classes). Env vars also work
+        # (RIO_CHUNK_BACKEND__KIND=...) but TOML is cleaner here.
         #
         # /var/lib/rio/store is StateDirectory (systemd creates it
         # with proper ownership). FilesystemChunkBackend::new creates
