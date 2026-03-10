@@ -33,6 +33,21 @@
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Self-hosted binary cache push CLI. Pinned in flake.lock;
+    # included in githubActions.build so the first CI job pushes
+    # it to rio-nix-cache → subsequent jobs substitute from S3
+    # in-region (fast, no curl/GitHub-cache round-trip).
+    niks3 = {
+      url = "github:Mic92/niks3/v1.4.0";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        flake-parts.follows = "flake-parts";
+        treefmt-nix.follows = "treefmt-nix";
+        # process-compose isn't a dep of the package build path;
+        # leave it unfollowed rather than polluting our inputs.
+      };
+    };
   };
 
   outputs =
@@ -64,6 +79,10 @@
         gateway = ./nix/modules/gateway.nix;
         worker = ./nix/modules/worker.nix;
       };
+
+      # CI integration — see the perSystem githubActions definition.
+      # Linux-only CI runners, so hardcode x86_64-linux.
+      flake.githubActions = inputs.self.legacyPackages.x86_64-linux.githubActions;
 
       perSystem =
         {
@@ -571,8 +590,75 @@
               withVmTests = true;
             };
           };
+
+          # ──────────────────────────────────────────────────────────
+          # GitHub Actions integration
+          # ──────────────────────────────────────────────────────────
+          #
+          # Structured attrset consumed by .github/workflows/ci.yml.
+          # Keeps "what runs in CI" policy in Nix — the workflow is a
+          # thin consumer that evaluates this to generate matrices.
+          #
+          # matrix.<name>: attrsets where keys → GHA matrix entries and
+          #   values → derivations to build. Add/remove checks or VM
+          #   tests here; the workflow picks them up automatically.
+          # <single-shot-name>: derivations built by non-matrix jobs.
+          #
+          # CI runners are Linux-only (rio-ci + rio-ci-kvm). vmTests/
+          # coverage/fuzz.smoke are all optionalAttrs isLinux upstream,
+          # so this whole block is too — on Darwin it's {} (harmless,
+          # nobody consumes it there).
+          githubActions = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            matrix = {
+              # Cargo/static checks (rio-ci spot, no KVM). Excludes
+              # `build` (done by the build job) and `coverage` (superseded
+              # by coverage-unit + vm-coverage flags on Codecov).
+              checks = {
+                inherit (cargoChecks)
+                  clippy
+                  nextest
+                  doc
+                  deny
+                  tracey-validate
+                  ;
+                inherit (config.checks) pre-commit;
+              };
+              # Normal VM tests (rio-ci-kvm). Keys: vm-phase1a etc.
+              # Per-test red/green signal in the GHA UI.
+              vm-test = vmTests;
+              # Coverage-mode VM tests → per-test lcov (rio-ci-kvm).
+              # Same keys as vm-test by construction (both derive from
+              # mkVmTests); workflow reuses one matrix output for both.
+              # Values are sandbox-stripped lcov files ready for Codecov.
+              vm-coverage = coverage.perTestLcov;
+            };
+            # Primes BOTH dep caches (normal + coverage-instrumented)
+            # AND the niks3 CLI. First CI job pushes all three closures;
+            # downstream jobs substitute from S3 in-region.
+            build = pkgs.linkFarmFromDrvs "rio-ci-build" [
+              rio-workspace
+              rio-workspace-cov
+              inputs.niks3.packages.${system}.niks3
+            ];
+            # Exposed for `nix run .#githubActions.niks3 -- push ...`
+            # in the niks3-push composite action. Substituted from
+            # rio-nix-cache after the build job pushes it.
+            inherit (inputs.niks3.packages.${system}) niks3;
+            # All 30s fuzz smokes in one job (they share fuzz-build
+            # derivations; matrixing them would rebuild fuzz-build N×
+            # on cold cache).
+            fuzz-smoke = pkgs.linkFarmFromDrvs "rio-fuzz-smoke" (builtins.attrValues fuzz.smoke);
+            # Unit-test lcov, sandbox-path-stripped. Uploaded to
+            # Codecov with flag=unit.
+            coverage-unit = coverage.unitLcov;
+          };
         in
         {
+          # Exported via legacyPackages (free-form, not checked by
+          # `nix flake check`). The top-level `flake.githubActions`
+          # alias above makes it accessible as `.#githubActions.*`.
+          legacyPackages = { inherit githubActions; };
+
           # Import rust-overlay
           _module.args.pkgs = import nixpkgs {
             inherit system;

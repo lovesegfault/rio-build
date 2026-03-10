@@ -1,0 +1,31 @@
+name: Push to niks3
+description: Push Nix store paths to rio-nix-cache via OIDC-authenticated niks3
+inputs:
+  paths:
+    description: Store paths or result symlinks to push (space-separated glob)
+    default: './result*'
+runs:
+  using: composite
+  steps:
+    - name: Push store paths to niks3
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Bail silently if build produced nothing (e.g. failed early).
+        shopt -s nullglob
+        paths=(${{ inputs.paths }})
+        if [[ ${#paths[@]} -eq 0 ]]; then
+          echo "No result paths found, skipping cache push"
+          exit 0
+        fi
+
+        # Get OIDC token with niks3 as audience.
+        OIDC=$(curl -sSfH "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$NIKS3_URL" | jq -r .value)
+        echo "::add-mask::$OIDC"
+
+        # niks3 CLI via Nix — substituted from rio-nix-cache (S3,
+        # same region) after the `build` job pushes it. No curl,
+        # no GitHub cache service round-trip.
+        nix run .#githubActions.niks3 -- push \
+          --server-url "$NIKS3_URL" --auth-token "$OIDC" "${paths[@]}"
