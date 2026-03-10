@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     // false until the first heartbeat comes back accepted — that's the
     // right gate: a worker that can't heartbeat is not useful capacity.
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    rio_worker::health::spawn_health_server(cfg.health_addr, ready.clone());
+    rio_worker::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
     // Connect to gRPC services
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
@@ -236,8 +236,8 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_features = features;
     let heartbeat_max_builds = cfg.max_builds;
     let heartbeat_size_class = cfg.size_class.clone();
-    let heartbeat_running = running_builds.clone();
-    let heartbeat_ready = ready.clone();
+    let heartbeat_running = Arc::clone(&running_builds);
+    let heartbeat_ready = Arc::clone(&ready);
     let mut heartbeat_client = scheduler_client.clone();
     let heartbeat_handle = rio_common::task::spawn_monitored("heartbeat-loop", async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -313,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
         max_leaked_mounts: cfg.max_leaked_mounts,
         daemon_timeout: Duration::from_secs(cfg.daemon_timeout_secs),
         cgroup_parent,
-        cancel_registry: cancel_registry.clone(),
+        cancel_registry: Arc::clone(&cancel_registry),
         fod_proxy_url: cfg.fod_proxy_url,
     };
 
@@ -370,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
                         // called — impossible here (close happens in the
                         // drain path below, AFTER loop exit), so this is
                         // a bug. Break with a distinct reason.
-                        let permit = match build_semaphore.clone().acquire_owned().await {
+                        let permit = match Arc::clone(&build_semaphore).acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => {
                                 tracing::error!("semaphore closed mid-loop (bug)");
@@ -633,9 +633,9 @@ mod tests {
         let sem = Arc::new(Semaphore::new(MAX as usize));
 
         // Acquire 3 permits as "in-flight builds." Hold them.
-        let permit_a = sem.clone().acquire_owned().await.unwrap();
-        let permit_b = sem.clone().acquire_owned().await.unwrap();
-        let permit_c = sem.clone().acquire_owned().await.unwrap();
+        let permit_a = Arc::clone(&sem).acquire_owned().await.unwrap();
+        let permit_b = Arc::clone(&sem).acquire_owned().await.unwrap();
+        let permit_c = Arc::clone(&sem).acquire_owned().await.unwrap();
         assert_eq!(sem.available_permits(), 1, "1 of 4 free");
 
         // Drain: acquire_many (NO close — that was the bug). Spawn so
@@ -643,7 +643,7 @@ mod tests {
         //
         // acquire_many returns SemaphorePermit<'_> (borrows the sem)
         // which can't escape the task. Return just the discriminant.
-        let drain_sem = sem.clone();
+        let drain_sem = Arc::clone(&sem);
         let drain = tokio::spawn(async move { drain_sem.acquire_many(MAX).await.is_ok() });
 
         // Give drain a tick to reach the wait point.
@@ -682,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn drain_wait_close_is_a_footgun() {
         let sem = Arc::new(Semaphore::new(2));
-        let _held = sem.clone().acquire_owned().await.unwrap();
+        let _held = Arc::clone(&sem).acquire_owned().await.unwrap();
 
         sem.close();
         // 1 permit held, 1 available. acquire_many(2) would wait.

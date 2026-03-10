@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn leader_state_always_leader() {
         let gen_arc = Arc::new(AtomicU64::new(1));
-        let state = LeaderState::always_leader(gen_arc.clone());
+        let state = LeaderState::always_leader(Arc::clone(&gen_arc));
         assert!(
             state.is_leader.load(Ordering::Relaxed),
             "non-K8s mode: immediately leader"

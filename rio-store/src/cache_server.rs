@@ -433,7 +433,9 @@ mod tests {
     async fn setup() -> (Router, TestDb, Arc<MemoryChunkBackend>) {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend = Arc::new(MemoryChunkBackend::new());
-        let cache = Arc::new(ChunkCache::new(backend.clone() as Arc<dyn ChunkBackend>));
+        let cache = Arc::new(ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
         let state = Arc::new(CacheServerState {
             pool: db.pool.clone(),
             chunk_cache: Some(cache),

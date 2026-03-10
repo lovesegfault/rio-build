@@ -390,7 +390,7 @@ mod tests {
     /// use an Arc<Mutex<Vec>> that the `.match_requests` closure fills.
     fn mock_s3_capturing_puts() -> (S3Client, CapturedPuts) {
         let captured: CapturedPuts = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let cap = captured.clone();
+        let cap = Arc::clone(&captured);
         // match_requests gets the parsed request struct. We can read the key
         // directly, but the body is a ByteStream which needs async to drain.
         // aws-smithy-mocks' closure is sync. Workaround: the body for our
@@ -481,7 +481,7 @@ mod tests {
             "test-bucket".into(),
             "logs".into(),
             db.pool.clone(),
-            buffers.clone(),
+            Arc::clone(&buffers),
         );
 
         flusher
@@ -568,7 +568,7 @@ mod tests {
             "test-bucket".into(),
             "logs".into(),
             db.pool.clone(),
-            buffers.clone(),
+            Arc::clone(&buffers),
         );
 
         flusher.flush_periodic().await;
@@ -725,7 +725,7 @@ mod tests {
             "test-bucket".into(),
             "logs".into(),
             db.pool.clone(),
-            buffers.clone(),
+            Arc::clone(&buffers),
         );
 
         // First flush → S3 fails. Buffer is drained but upload fails → log

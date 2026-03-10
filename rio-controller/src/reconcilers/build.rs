@@ -185,7 +185,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 status.build_id.clone(),
                 status.last_sequence as u64,
                 ctx.scheduler_addr.clone(),
-                ctx.watching.clone(),
+                Arc::clone(&ctx.watching),
                 watch_key,
                 ctx.recorder.clone(),
                 b.object_ref(&()),
@@ -324,7 +324,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             // No known build_id yet — scheduler assigns it on
             // MergeDag, first event carries it.
             None,
-            ctx.watching.clone(),
+            Arc::clone(&ctx.watching),
             watch_key,
             ctx.recorder.clone(),
             obj_ref,
@@ -1239,7 +1239,7 @@ mod tests {
         // value, removes on drop. We DON'T drop it yet — it's
         // "in flight" (the stream hasn't EOF'd).
         let old_guard = {
-            let watching = watching.clone();
+            let watching = Arc::clone(&watching);
             let key = old_uid.clone();
             scopeguard::guard((), move |()| {
                 watching.remove(&key);

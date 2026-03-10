@@ -605,7 +605,7 @@ mod cache_tests {
         let backend = Arc::new(MemoryChunkBackend::new());
         // Small capacity so eviction tests don't need GB of data.
         let cache =
-            ChunkCache::with_capacity(backend.clone() as Arc<dyn ChunkBackend>, 1024 * 1024);
+            ChunkCache::with_capacity(Arc::clone(&backend) as Arc<dyn ChunkBackend>, 1024 * 1024);
         (backend, cache)
     }
 

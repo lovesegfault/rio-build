@@ -443,8 +443,8 @@ mod tests {
         // DUPLICATE processing — that's the invariant.
         let pool_a = db.pool.clone();
         let pool_b = db.pool.clone();
-        let backend_a = backend.clone();
-        let backend_b = backend.clone();
+        let backend_a = Arc::clone(&backend);
+        let backend_b = Arc::clone(&backend);
 
         let (a, b) = tokio::join!(
             drain_once(&pool_a, &backend_a),

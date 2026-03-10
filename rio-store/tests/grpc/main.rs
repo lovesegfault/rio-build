@@ -82,7 +82,7 @@ impl StoreSession {
         let db = TestDb::new(&MIGRATOR).await;
         let backend = Arc::new(MemoryChunkBackend::new());
         let cache = Arc::new(rio_store::cas::ChunkCache::new(
-            backend.clone() as Arc<dyn ChunkBackend>
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
         ));
         let service = StoreServiceImpl::with_chunk_cache(db.pool.clone(), cache);
         let (client, server) = spawn_store_server(service).await?;

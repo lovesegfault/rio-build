@@ -531,7 +531,7 @@ impl Cache {
             e.into_inner()
         });
         match inflight.entry(store_path.to_string()) {
-            Entry::Occupied(e) => FetchClaim::WaitFor(e.get().clone()),
+            Entry::Occupied(e) => FetchClaim::WaitFor(Arc::clone(e.get())),
             Entry::Vacant(e) => {
                 e.insert(Arc::new(InflightEntry {
                     done: Mutex::new(false),
@@ -829,8 +829,8 @@ mod tests {
         // Two threads race to fetch the same path. Exactly one should get
         // Fetch; the other should WaitFor and be woken promptly by the
         // condvar notify, not time out.
-        let (c1, f1) = (cache.clone(), fetch_count.clone());
-        let (c2, f2) = (cache, fetch_count.clone());
+        let (c1, f1) = (Arc::clone(&cache), Arc::clone(&fetch_count));
+        let (c2, f2) = (cache, Arc::clone(&fetch_count));
 
         let t1 = std::thread::spawn(move || do_claim(&c1, &f1));
         let t2 = std::thread::spawn(move || do_claim(&c2, &f2));

@@ -254,15 +254,15 @@ pub async fn spawn_build_task(
     ctx.cancel_registry
         .write()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(drv_path.clone(), (cgroup_path, cancelled.clone()));
+        .insert(drv_path.clone(), (cgroup_path, Arc::clone(&cancelled)));
 
     // Clone state needed by spawned tasks ('static lifetime).
     let mut build_store_client = ctx.store_client.clone();
     let build_tx = ctx.stream_tx.clone();
-    let build_running = ctx.running_builds.clone();
-    let build_leaked_mounts = ctx.leaked_mounts.clone();
+    let build_running = Arc::clone(&ctx.running_builds);
+    let build_leaked_mounts = Arc::clone(&ctx.leaked_mounts);
     let build_drv_path = drv_path.clone();
-    let build_cancel_registry = ctx.cancel_registry.clone();
+    let build_cancel_registry = Arc::clone(&ctx.cancel_registry);
     let build_cancelled = cancelled;
     let build_env = executor::ExecutorEnv {
         fuse_mount_point: ctx.fuse_mount_point.clone(),
@@ -288,8 +288,8 @@ pub async fn spawn_build_task(
         // for both — they track "this build is in-flight."
         let cleanup_drv_path = build_drv_path.clone();
         let _running_guard = scopeguard::guard((), move |()| {
-            let rb = build_running.clone();
-            let reg = build_cancel_registry.clone();
+            let rb = Arc::clone(&build_running);
+            let reg = Arc::clone(&build_cancel_registry);
             let drv = cleanup_drv_path;
             // Cancel registry: synchronous (std::sync::RwLock), no
             // await needed. Remove here directly; the running_builds
@@ -551,7 +551,7 @@ mod tests {
 
         let registry = std::sync::RwLock::new(HashMap::from([(
             "/nix/store/test.drv".to_string(),
-            (cgroup_path.clone(), cancelled.clone()),
+            (cgroup_path.clone(), Arc::clone(&cancelled)),
         )]));
 
         let found = try_cancel_build(&registry, "/nix/store/test.drv");
@@ -586,7 +586,10 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let registry = std::sync::RwLock::new(HashMap::from([(
             "/nix/store/test.drv".to_string(),
-            (PathBuf::from("/nonexistent/cgroup/path"), cancelled.clone()),
+            (
+                PathBuf::from("/nonexistent/cgroup/path"),
+                Arc::clone(&cancelled),
+            ),
         )]));
 
         let found = try_cancel_build(&registry, "/nix/store/test.drv");

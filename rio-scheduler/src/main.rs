@@ -2,6 +2,8 @@
 //!
 //! Starts the gRPC server, connects to PostgreSQL, and spawns the DAG actor.
 
+use std::sync::Arc;
+
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -221,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 bucket.clone(),
                 cfg.log_s3_prefix.clone(),
                 pool.clone(),
-                log_buffers.clone(),
+                Arc::clone(&log_buffers),
             );
             let _flusher_handle = flusher.spawn(flush_rx);
             info!(bucket = %bucket, prefix = %cfg.log_s3_prefix, "log flusher spawned");
@@ -289,18 +291,18 @@ async fn main() -> anyhow::Result<()> {
                 holder = %cfg.holder_id,
                 "lease-based leader election enabled"
             );
-            rio_scheduler::lease::LeaderState::pending(generation.clone())
+            rio_scheduler::lease::LeaderState::pending(Arc::clone(&generation))
         }
         None => {
             info!("no RIO_LEASE_NAME set; running as sole leader (non-K8s mode)");
-            rio_scheduler::lease::LeaderState::always_leader(generation.clone())
+            rio_scheduler::lease::LeaderState::always_leader(Arc::clone(&generation))
         }
     };
     // Clone for the health toggle loop + lease loop BEFORE
     // moving into spawn. Both need the same shared Arcs the actor
     // gets; spawn_with_leader consumes the LeaderState.
-    let is_leader_for_health = leader.is_leader.clone();
-    let recovery_complete_for_lease = leader.recovery_complete.clone();
+    let is_leader_for_health = Arc::clone(&leader.is_leader);
+    let recovery_complete_for_lease = Arc::clone(&leader.recovery_complete);
 
     // Spawn the event-log persister. Bounded mpsc + single drain
     // task → FIFO write ordering (fire-and-forget spawns would
@@ -341,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
         // clone is cheap and shares the instance.)
         let lease_state = rio_scheduler::lease::LeaderState {
             generation,
-            is_leader: is_leader_for_health.clone(),
+            is_leader: Arc::clone(&is_leader_for_health),
             recovery_complete: recovery_complete_for_lease,
         };
         // Pass actor.clone() for fire-and-forget LeaderAcquired.
@@ -444,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
     // SEPARATE buffer — it's cfg(test) gated so prod can't accidentally
     // use it and silently break the pipeline.
     let grpc_service =
-        SchedulerGrpc::with_log_buffers(actor.clone(), log_buffers.clone(), pool.clone());
+        SchedulerGrpc::with_log_buffers(actor.clone(), Arc::clone(&log_buffers), pool.clone());
     let admin_service = AdminServiceImpl::new(
         log_buffers,
         admin_s3,

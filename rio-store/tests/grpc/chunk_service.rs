@@ -34,7 +34,9 @@ impl ChunkSession {
         // service warming. with_chunk_cache takes an Arc so callers
         // MUST decide sharing explicitly. test_shared_cache_warms_
         // across_services proves it works.
-        let cache = Arc::new(ChunkCache::new(backend.clone() as Arc<dyn ChunkBackend>));
+        let cache = Arc::new(ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
 
         let store_service = StoreServiceImpl::with_chunk_cache(db.pool.clone(), Arc::clone(&cache));
         let chunk_service = ChunkServiceImpl::new(db.pool.clone(), Some(cache));

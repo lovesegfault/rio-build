@@ -644,7 +644,7 @@ impl DagActor {
     /// Clone the shared backpressure flag as a read-only reader for wiring
     /// into ActorHandle. The actor keeps the writable Arc<AtomicBool>.
     pub(crate) fn backpressure_flag(&self) -> BackpressureReader {
-        BackpressureReader::new(self.backpressure_active.clone())
+        BackpressureReader::new(Arc::clone(&self.backpressure_active))
     }
 
     /// Clone the generation counter as a read-only reader for
@@ -653,7 +653,7 @@ impl DagActor {
     /// reader. The reader type has no store/fetch_add methods, so
     /// handle consumers can't accidentally increment.
     pub(crate) fn generation_reader(&self) -> GenerationReader {
-        GenerationReader::new(self.generation.clone())
+        GenerationReader::new(Arc::clone(&self.generation))
     }
 
     /// Inject the shared `is_leader` flag. The lease task writes;

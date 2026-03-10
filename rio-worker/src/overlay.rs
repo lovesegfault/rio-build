@@ -333,7 +333,7 @@ mod tests {
 
         // Scope so Drop runs at the closing brace.
         {
-            let _mount = OverlayMount::new_for_leak_test(counter.clone());
+            let _mount = OverlayMount::new_for_leak_test(Arc::clone(&counter));
             assert_eq!(
                 counter.load(Ordering::Relaxed),
                 0,
@@ -355,7 +355,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
 
         {
-            let mut mount = OverlayMount::new_for_leak_test(counter.clone());
+            let mut mount = OverlayMount::new_for_leak_test(Arc::clone(&counter));
             // Simulate successful explicit teardown.
             mount.mounted = false;
         }

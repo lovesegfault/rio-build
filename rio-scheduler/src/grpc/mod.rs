@@ -74,7 +74,7 @@ impl SchedulerGrpc {
 
     /// Access the shared log ring buffers. Exposed for `AdminService`.
     pub fn log_buffers(&self) -> Arc<LogBuffers> {
-        self.log_buffers.clone()
+        Arc::clone(&self.log_buffers)
     }
 
     /// Check if the actor is alive; return UNAVAILABLE if dead (panicked).
@@ -564,7 +564,7 @@ impl WorkerService for SchedulerGrpc {
 
         // Spawn a task to read worker messages and forward to the actor
         let actor_for_recv = self.actor.clone();
-        let log_buffers = self.log_buffers.clone();
+        let log_buffers = Arc::clone(&self.log_buffers);
         let worker_id_for_recv = worker_id.clone();
 
         rio_common::task::spawn_monitored("worker-stream-reader", async move {

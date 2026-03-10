@@ -298,7 +298,7 @@ pub async fn execute_build(
     let fuse_mp = fuse_mount_point.to_path_buf();
     let overlay_base = overlay_base_dir.to_path_buf();
     let build_id_owned = build_id.clone();
-    let leak_counter_owned = leak_counter.clone();
+    let leak_counter_owned = Arc::clone(leak_counter);
     let overlay_mount = tokio::task::spawn_blocking(move || {
         overlay::setup_overlay(&fuse_mp, &overlay_base, &build_id_owned, leak_counter_owned)
     })
@@ -493,7 +493,7 @@ pub async fn execute_build(
     // daemon.wait() below).
     let peak_cpu_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cpu_poll_path = build_cgroup.path().to_path_buf();
-    let cpu_poll_peak = peak_cpu_atomic.clone();
+    let cpu_poll_peak = Arc::clone(&peak_cpu_atomic);
     let cpu_poll = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         // First tick fires immediately — skip it, we want a 1s baseline.

@@ -123,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn readyz_tracks_flag() {
         let ready = Arc::new(AtomicBool::new(false));
-        let app = router(ready.clone());
+        let app = router(Arc::clone(&ready));
 
         // Before first heartbeat: NOT READY.
         let resp = app
