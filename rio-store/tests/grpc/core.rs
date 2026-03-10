@@ -31,12 +31,12 @@ async fn test_harness_smoke() -> TestResult {
 async fn test_put_path_cleanup_on_hash_mismatch() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    let store_path = "/nix/store/11111111111111111111111111111111-test-cleanup-path";
+    let store_path = test_store_path("test-cleanup-path");
     let good_nar = make_nar(b"correct content").0;
     let bad_nar = make_nar(b"wrong content").0;
 
     // Declare the hash of good_nar but send bad_nar — should fail validation
-    let info = make_path_info_for_nar(store_path, &good_nar);
+    let info = make_path_info_for_nar(&store_path, &good_nar);
     let result = put_path(&mut s.client, info.clone(), bad_nar).await;
     assert!(result.is_err(), "hash mismatch should be rejected");
 
@@ -69,9 +69,9 @@ async fn test_put_get_roundtrip() -> TestResult {
 
     let mut s = StoreSession::new().await?;
 
-    let store_path = "/nix/store/22222222222222222222222222222222-test-roundtrip-path";
+    let store_path = test_store_path("test-roundtrip-path");
     let nar = make_nar(b"roundtrip test content!").0;
-    let info = make_path_info_for_nar(store_path, &nar);
+    let info = make_path_info_for_nar(&store_path, &nar);
 
     // Put
     let created = put_path(&mut s.client, info.clone(), nar.clone())
@@ -83,7 +83,7 @@ async fn test_put_get_roundtrip() -> TestResult {
     let mut stream = s
         .client
         .get_path(GetPathRequest {
-            store_path: store_path.into(),
+            store_path: store_path.clone(),
         })
         .await
         .context("get should succeed")?
@@ -145,9 +145,9 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     let mut s = StoreSession::new().await?;
 
     // 1. Upload a valid NAR.
-    let store_path = "/nix/store/88888888888888888888888888888888-corruption-test";
+    let store_path = test_store_path("corruption-test");
     let good_nar = make_nar(b"valid content for corruption test").0;
-    let info = make_path_info_for_nar(store_path, &good_nar);
+    let info = make_path_info_for_nar(&store_path, &good_nar);
 
     let created = put_path(&mut s.client, info, good_nar)
         .await
@@ -164,7 +164,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
          WHERE store_path_hash = (SELECT store_path_hash FROM narinfo WHERE store_path = $2)",
     )
     .bind(&corrupt_data)
-    .bind(store_path)
+    .bind(&store_path)
     .execute(&s.db.pool)
     .await
     .context("corrupt inline_blob")?;
@@ -172,9 +172,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     // 3. GetPath — stream should deliver chunks then DATA_LOSS at the end.
     let mut stream = s
         .client
-        .get_path(GetPathRequest {
-            store_path: store_path.into(),
-        })
+        .get_path(GetPathRequest { store_path })
         .await
         .context("get_path call should succeed (error comes in stream)")?
         .into_inner();
@@ -223,9 +221,9 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
 async fn test_idempotent_put_path() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    let store_path = "/nix/store/33333333333333333333333333333333-test-idempotent-path";
+    let store_path = test_store_path("test-idempotent-path");
     let nar = make_nar(b"idempotent test").0;
-    let info = make_path_info_for_nar(store_path, &nar);
+    let info = make_path_info_for_nar(&store_path, &nar);
 
     // First put
     let created1 = put_path(&mut s.client, info.clone(), nar.clone())
@@ -255,9 +253,9 @@ async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     // Second client to the same server so we can send two concurrent streams.
     let mut client2 = s.client.clone();
 
-    let store_path = "/nix/store/55555555555555555555555555555555-concurrent-race";
+    let store_path = test_store_path("concurrent-race");
     let nar = make_nar(b"concurrent race test data").0;
-    let info = make_path_info_for_nar(store_path, &nar);
+    let info = make_path_info_for_nar(&store_path, &nar);
 
     // Launch both PutPath calls concurrently.
     let (r1, r2) = tokio::join!(
@@ -286,9 +284,7 @@ async fn test_concurrent_putpath_same_path_one_wins() -> TestResult {
     // The path must be readable after the race settles (winner's data intact).
     let qpi = s
         .client
-        .query_path_info(QueryPathInfoRequest {
-            store_path: store_path.into(),
-        })
+        .query_path_info(QueryPathInfoRequest { store_path })
         .await
         .context("path should be queryable after concurrent uploads")?;
     assert_eq!(qpi.into_inner().nar_size, nar.len() as u64);
@@ -308,10 +304,7 @@ async fn test_put_path_rejects_oversized_nar() -> TestResult {
     let mut s = StoreSession::new().await?;
 
     // Declare nar_size=100 in trailer but send 100_000 bytes.
-    let mut info = make_path_info_for_nar(
-        "/nix/store/44444444444444444444444444444444-oversized-test",
-        &[0u8; 100],
-    );
+    let mut info = make_path_info_for_nar(&test_store_path("oversized-test"), &[0u8; 100]);
     info.nar_size = 100; // trailer will claim 100; NAR is 100_000 → mismatch
 
     let oversized_data = vec![0u8; 100_000];
@@ -340,9 +333,9 @@ async fn test_put_path_rejects_oversized_nar() -> TestResult {
 async fn test_put_path_oversized_then_retry_succeeds() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    let store_path = "/nix/store/66666666666666666666666666666666-oversized-retry";
+    let store_path = test_store_path("oversized-retry");
     let real_nar = make_nar(b"retry test data").0;
-    let real_info = make_path_info_for_nar(store_path, &real_nar);
+    let real_info = make_path_info_for_nar(&store_path, &real_nar);
 
     // First attempt: lie about size, send oversized data → rejected.
     let mut bad_info = real_info.clone();
@@ -361,9 +354,7 @@ async fn test_put_path_oversized_then_retry_succeeds() -> TestResult {
     // Verify the path is queryable.
     let qpi = s
         .client
-        .query_path_info(QueryPathInfoRequest {
-            store_path: store_path.into(),
-        })
+        .query_path_info(QueryPathInfoRequest { store_path })
         .await
         .context("path should be queryable")?;
     assert_eq!(qpi.into_inner().nar_size, real_nar.len() as u64);
@@ -377,9 +368,9 @@ async fn test_put_path_oversized_then_retry_succeeds() -> TestResult {
 async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    let store_path = "/nix/store/77777777777777777777777777777777-dup-metadata";
+    let store_path = test_store_path("dup-metadata");
     let nar = make_nar(b"dup metadata test").0;
-    let info = make_path_info_for_nar(store_path, &nar);
+    let info = make_path_info_for_nar(&store_path, &nar);
 
     // First metadata must have empty hash (else the new hash-upfront guard
     // fires before we reach the dup-metadata check).
@@ -429,10 +420,7 @@ async fn test_put_path_rejects_duplicate_metadata() -> TestResult {
 async fn test_put_path_rejects_absurd_nar_size() -> TestResult {
     let mut s = StoreSession::new().await?;
 
-    let mut info = make_path_info_for_nar(
-        "/nix/store/55555555555555555555555555555555-absurd-size-test",
-        &[0u8; 10],
-    );
+    let mut info = make_path_info_for_nar(&test_store_path("absurd-size-test"), &[0u8; 10]);
     info.nar_size = u64::MAX; // trailer.nar_size > MAX_NAR_SIZE → rejected
 
     // Must be rejected promptly — no hang, no crash.
@@ -458,17 +446,13 @@ async fn test_put_path_rejects_excessive_references() -> TestResult {
     // PathInfo directly since ValidatedPathInfo can't hold 10,001 unparsed
     // string references (client-side TryFrom would reject first).
     let nar = make_nar(b"refs-test").0;
-    let base: PathInfo = make_path_info_for_nar(
-        "/nix/store/66666666666666666666666666666666-too-many-refs",
-        &nar,
-    )
-    .into();
+    let base: PathInfo = make_path_info_for_nar(&test_store_path("too-many-refs"), &nar).into();
     let info = PathInfo {
         // MAX_REFERENCES = 10_000; send 10_001 to trigger the check.
         // Each ref is a VALID store path (TryFrom would accept them); the
         // server's check_bound fires on COUNT, not on per-ref syntax.
         references: (0..10_001)
-            .map(|i| format!("/nix/store/{:032}-ref-{i}", i % 10))
+            .map(|i| test_store_path(&format!("ref-{i}")))
             .collect(),
         ..base
     };
@@ -492,11 +476,7 @@ async fn test_put_path_rejects_excessive_signatures() -> TestResult {
     let mut s = StoreSession::new().await?;
 
     let nar = make_nar(b"sigs-test").0;
-    let base: PathInfo = make_path_info_for_nar(
-        "/nix/store/88888888888888888888888888888888-too-many-sigs",
-        &nar,
-    )
-    .into();
+    let base: PathInfo = make_path_info_for_nar(&test_store_path("too-many-sigs"), &nar).into();
     let info = PathInfo {
         signatures: (0..rio_common::limits::MAX_SIGNATURES + 1)
             .map(|i| format!("cache-{i}:sig{i}"))
@@ -524,8 +504,7 @@ async fn test_put_path_rejects_malformed_reference() -> TestResult {
 
     // Testing SERVER-SIDE rejection: build raw PathInfo with a garbage ref.
     let nar = make_nar(b"refs-test").0;
-    let base: PathInfo =
-        make_path_info_for_nar("/nix/store/77777777777777777777777777777777-bad-ref", &nar).into();
+    let base: PathInfo = make_path_info_for_nar(&test_store_path("bad-ref"), &nar).into();
     let info = PathInfo {
         references: vec!["not-a-valid-store-path".into()],
         ..base
@@ -576,13 +555,7 @@ async fn test_find_missing_paths_rejects_oversized_batch() -> TestResult {
 
     // 10_001 paths (one over the limit).
     let paths: Vec<String> = (0..10_001)
-        .map(|i| {
-            format!(
-                "/nix/store/{:032}-path-{}",
-                i % 100_000_000_000_000_000_000_000_000_000_000u128,
-                i
-            )
-        })
+        .map(|i| test_store_path(&format!("path-{i}")))
         .collect();
 
     let result = s
@@ -622,7 +595,7 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
     let result = s
         .client
         .query_path_info(QueryPathInfoRequest {
-            store_path: "/nix/store/00000000000000000000000000000000-valid-name".into(),
+            store_path: test_store_path("valid-name"),
         })
         .await;
 
