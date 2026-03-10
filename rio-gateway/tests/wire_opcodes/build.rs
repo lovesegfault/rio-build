@@ -9,6 +9,12 @@
 
 use super::*;
 
+/// Minimal valid ATerm derivation text. One output ("out"), no inputs,
+/// trivial builder. Used by every test that needs reconstruct_dag to
+/// resolve a .drv. Tests choose their own store path; this is just the
+/// body.
+const TEST_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+
 // ===========================================================================
 // Build opcode tests
 // ===========================================================================
@@ -23,9 +29,9 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
     });
 
     // Seed a .drv in store so translate::reconstruct_dag can resolve it.
-    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store.seed_with_content(drv_path, drv_text.as_bytes());
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -55,9 +61,9 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
         ..Default::default()
     });
 
-    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store.seed_with_content(drv_path, drv_text.as_bytes());
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -93,9 +99,9 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyho
         ..Default::default()
     });
 
-    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let drv_path = "/nix/store/00000000000000000000000000000000-early-close.drv";
-    h.store.seed_with_content(drv_path, drv_text.as_bytes());
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -129,9 +135,9 @@ async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
         ..Default::default()
     });
 
-    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store.seed_with_content(drv_path, drv_text.as_bytes());
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
 
     let derived_path = format!("{drv_path}!out");
     wire_send!(&mut h.stream;
@@ -335,9 +341,9 @@ fn ev(e: build_event::Event) -> types::BuildEvent {
 /// Seed a minimal .drv and return its store path. Every scripted-event test
 /// needs this so translate::reconstruct_dag has something to resolve.
 fn seed_minimal_drv(h: &GatewaySession) -> &'static str {
-    let drv_text = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
     let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
-    h.store.seed_with_content(drv_path, drv_text.as_bytes());
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
     drv_path
 }
 

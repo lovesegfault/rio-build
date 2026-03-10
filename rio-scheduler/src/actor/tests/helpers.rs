@@ -27,9 +27,20 @@ pub(crate) fn setup_actor_with_store(
     pool: sqlx::PgPool,
     store_client: Option<StoreServiceClient<Channel>>,
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
+    setup_actor_configured(pool, store_client, |a| a)
+}
+
+/// Set up an actor with a configurator closure applied before spawn.
+/// For tests that need `.with_size_classes()` / `.with_event_persister()`
+/// etc — avoids reimplementing the full spawn boilerplate inline.
+pub(crate) fn setup_actor_configured(
+    pool: sqlx::PgPool,
+    store_client: Option<StoreServiceClient<Channel>>,
+    configure: impl FnOnce(DagActor) -> DagActor,
+) -> (ActorHandle, tokio::task::JoinHandle<()>) {
     let db = SchedulerDb::new(pool);
     let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = DagActor::new(db, store_client);
+    let actor = configure(DagActor::new(db, store_client));
     let backpressure = actor.backpressure_flag();
     let generation = actor.generation_reader();
     let self_tx = tx.downgrade();
@@ -332,8 +343,9 @@ async fn test_actor_is_alive_detection() {
 
     // Abort the actor task to simulate a panic/crash.
     task.abort();
-    // Give the abort time to propagate and the receiver to drop.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Await the JoinHandle — after abort() it returns Err(Cancelled)
+    // immediately once the task drops. No timed sleep needed.
+    let _ = task.await;
 
     // is_alive() should now report false (channel closed).
     assert!(

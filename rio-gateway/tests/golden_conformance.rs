@@ -40,8 +40,12 @@ use rio_test_support::grpc::{MockStore, spawn_mock_scheduler, spawn_mock_store};
 /// Spawns a MockStore + MockScheduler, connects gRPC clients, and runs
 /// `session::run_protocol` on a Cursor reader + duplex writer.
 async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Result<Vec<u8>> {
+    use rio_proto::StoreServiceServer;
+    use tonic::transport::Server;
+
     // Spawn mock gRPC servers for this store + a dummy scheduler
-    let store_addr = spawn_store_for(store).await?;
+    let router = Server::builder().add_service(StoreServiceServer::new(store));
+    let (store_addr, _store_handle) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let (_sched, sched_addr, _sched_handle) = spawn_mock_scheduler().await?;
 
     let mut store_client = rio_proto::client::connect_store(&store_addr.to_string()).await?;
@@ -69,26 +73,6 @@ async fn gateway_response(client_bytes: &[u8], store: MockStore) -> anyhow::Resu
 
     proto_task.await?;
     Ok(response)
-}
-
-/// Spawn a pre-populated MockStore and return its address.
-async fn spawn_store_for(store: MockStore) -> anyhow::Result<std::net::SocketAddr> {
-    use rio_proto::StoreServiceServer;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Server;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let incoming = TcpListenerStream::new(listener);
-        Server::builder()
-            .add_service(StoreServiceServer::new(store))
-            .serve_with_incoming(incoming)
-            .await
-            .expect("mock store server");
-    });
-    tokio::task::yield_now().await;
-    Ok(addr)
 }
 
 // ============================================================================

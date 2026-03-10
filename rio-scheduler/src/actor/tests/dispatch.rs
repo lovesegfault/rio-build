@@ -24,31 +24,20 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
     .execute(&db.pool)
     .await?;
 
-    // Actor with size_classes configured. setup_actor_with_store
-    // builds DagActor::new() directly, so we can't inject the config
-    // that way — build the actor inline with .with_size_classes().
-    let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None).with_size_classes(vec![
-        SizeClassConfig {
-            name: "small".into(),
-            cutoff_secs: 30.0,
-            mem_limit_bytes: u64::MAX,
-        },
-        SizeClassConfig {
-            name: "large".into(),
-            cutoff_secs: 3600.0,
-            mem_limit_bytes: u64::MAX,
-        },
-    ]);
-    let backpressure = actor.backpressure_flag();
-    let generation = actor.generation_reader();
-    let self_tx = tx.downgrade();
-    let _task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-    let handle = ActorHandle {
-        tx,
-        backpressure,
-        generation,
-    };
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+            },
+            SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+            },
+        ])
+    });
 
     // Connect TWO workers: one small (will NOT get the big build),
     // one large (will). Both idle with capacity.
