@@ -101,12 +101,11 @@ pub(super) async fn handle_query_path_info<R: AsyncRead + Unpin, W: AsyncWrite +
         Some(info) => {
             wire::write_bool(w, true).await?;
             // deriver: Option<StorePath> → empty string if None (wire convention)
-            wire::write_string(w, info.deriver.as_ref().map(|d| d.as_str()).unwrap_or("")).await?;
+            wire::write_string(w, info.deriver.as_deref().unwrap_or("")).await?;
             // narHash: [u8;32] → hex string
             wire::write_string(w, &hex::encode(info.nar_hash)).await?;
-            // references: Vec<StorePath> → Vec<&str> via Deref
-            let ref_strs: Vec<&str> = info.references.iter().map(|r| r.as_str()).collect();
-            wire::write_strings(w, &ref_strs).await?;
+            // references: Vec<StorePath> — StorePath: AsRef<str>
+            wire::write_strings(w, &info.references).await?;
             wire::write_u64(w, info.registration_time).await?;
             wire::write_u64(w, info.nar_size).await?;
             wire::write_bool(w, info.ultimate).await?;
@@ -609,9 +608,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         .map(|(_, dp)| dp.store_path().to_string())
         .collect();
 
-    let req = types::FindMissingPathsRequest {
-        store_paths: store_paths.clone(),
-    };
+    let req = types::FindMissingPathsRequest { store_paths };
     let missing_set: HashSet<String> = match tokio::time::timeout(
         DEFAULT_GRPC_TIMEOUT,
         store_client.find_missing_paths(req),
@@ -629,21 +626,21 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     let mut will_build = Vec::new();
     let mut unknown = Vec::new();
 
-    for (raw, dp) in &derived {
+    for (raw, dp) in derived {
         let sp_str = dp.store_path().to_string();
         if !missing_set.contains(&sp_str) {
             continue;
         }
-        match dp {
+        match &dp {
             DerivedPath::Built { drv, .. } => {
                 // For Built paths, walk the derivation to find outputs that need building.
                 // We report the raw DerivedPath string rather than resolving to outputs.
                 if let Err(e) = resolve_derivation(drv, store_client, drv_cache).await {
                     tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
                 }
-                will_build.push(raw.clone());
+                will_build.push(raw);
             }
-            DerivedPath::Opaque(_) => unknown.push(raw.clone()),
+            DerivedPath::Opaque(_) => unknown.push(raw),
         }
     }
 

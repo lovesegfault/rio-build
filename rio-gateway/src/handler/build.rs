@@ -211,15 +211,15 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         .await
         .map_err(|e| anyhow::anyhow!("build event stream error: {e}"))?;
 
-    let build_id = match &first {
-        Some(ev) => ev.build_id.clone(),
-        None => return Err(anyhow::anyhow!("empty build event stream")),
+    let Some(first) = first else {
+        return Err(anyhow::anyhow!("empty build event stream"));
     };
+    let build_id = first.build_id.clone();
 
     active_build_ids.insert(build_id.clone(), 0);
 
-    if let Some(ev) = &first {
-        if let Some(types::build_event::Event::Started(ref started)) = ev.event {
+    match &first.event {
+        Some(types::build_event::Event::Started(started)) => {
             debug!(
                 build_id = %build_id,
                 total = started.total_derivations,
@@ -227,29 +227,28 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 "build started"
             );
         }
-        if let Some(types::build_event::Event::Completed(_)) = ev.event {
+        Some(types::build_event::Event::Completed(_)) => {
             active_build_ids.remove(&build_id);
             return Ok(BuildResult::success());
         }
-        if let Some(types::build_event::Event::Failed(ref failed)) = ev.event {
+        Some(types::build_event::Event::Failed(failed)) => {
             active_build_ids.remove(&build_id);
             return Ok(BuildResult::failure(
                 BuildStatus::MiscFailure,
                 failed.error_message.clone(),
             ));
         }
-        // Handle Cancelled as first event (the loop body handles it,
-        // but the first-event peek above did not). Can happen if a
-        // WatchBuild reconnect arrives after the build was already
-        // cancelled — the scheduler replays from build_event_log and
-        // Cancelled is the first (and only) event past since_sequence.
-        if let Some(types::build_event::Event::Cancelled(ref cancelled)) = ev.event {
+        // Cancelled can be the first event on WatchBuild reconnect
+        // after the build was already cancelled — scheduler replays
+        // from build_event_log past since_sequence.
+        Some(types::build_event::Event::Cancelled(cancelled)) => {
             active_build_ids.remove(&build_id);
             return Ok(BuildResult::failure(
                 BuildStatus::MiscFailure,
                 format!("build cancelled: {}", cancelled.reason),
             ));
         }
+        _ => {}
     }
 
     // Process remaining events, with reconnect on stream error.
