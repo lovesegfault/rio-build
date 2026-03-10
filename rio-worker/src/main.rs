@@ -442,23 +442,28 @@ async fn main() -> anyhow::Result<()> {
     // umount_and_join() unmounts THEN joins the thread, ensuring
     // destroy() completes before main returns.
     //
-    // 5s timeout: if the FUSE mount is busy (overlay still stacked
-    // on top — shouldn't happen after drain but belt-and-suspenders)
-    // or the FUSE thread is stuck processing a slow request,
-    // umount_and_join() would block forever. This would wedge pod
-    // termination in k8s (SIGTERM never returns → SIGKILL after
-    // terminationGracePeriodSeconds). Better to abandon the graceful
-    // unmount and let process exit handle it (kernel unmounts on
-    // process death anyway; we just lose destroy() and its profraw).
-    let join_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || fuse_session.umount_and_join()),
-    )
-    .await;
-    match join_result {
-        Ok(Ok(Ok(()))) => tracing::debug!("FUSE session unmounted and joined"),
-        Ok(Ok(Err(e))) => tracing::warn!(error = %e, "FUSE umount/join failed"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "FUSE join task panicked"),
+    // Detached std::thread + channel-with-timeout: if the FUSE mount
+    // is busy (overlay stacked on top, or some process holds an open
+    // fd to it), umount_and_join() blocks forever in the FUSE thread
+    // join. Using tokio::spawn_blocking here would wedge the tokio
+    // Runtime::drop (it waits for blocking tasks) — we'd time out the
+    // future but the process would never exit. A std thread is
+    // independent of tokio's lifecycle: when main returns, the
+    // runtime drops cleanly, and the detached thread is killed by
+    // libc at process exit.
+    //
+    // 5s wait: generous for normal umount (<100ms) but bounded so
+    // k8s pod termination doesn't wedge. If we abandon, kernel
+    // unmounts on process death anyway — we just lose destroy().
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(fuse_session.umount_and_join());
+    });
+    // recv_timeout blocks the current async task — fine here, this
+    // is the last thing main() does and nothing else is scheduled.
+    match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(())) => tracing::debug!("FUSE session unmounted and joined"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "FUSE umount/join failed"),
         Err(_) => tracing::warn!(
             "FUSE umount/join timed out (5s); abandoning graceful unmount. \
              Mount may be busy — kernel will unmount on process exit."
