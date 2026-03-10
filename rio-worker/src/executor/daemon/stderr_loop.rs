@@ -281,7 +281,7 @@ where
                             unreachable!("match guard above proved String")
                         };
                         match handle_log_line(
-                            line.clone().into_bytes(),
+                            line.as_bytes().to_vec(),
                             &mut msg_count,
                             &mut batcher,
                             log_tx,

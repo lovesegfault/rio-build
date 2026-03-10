@@ -494,10 +494,9 @@ impl Cache {
             }
 
             // Remove from index
-            let store_path = entry.store_path.clone();
             self.runtime.block_on(async {
                 sqlx::query("DELETE FROM cached_paths WHERE store_path = ?1")
-                    .bind(&store_path)
+                    .bind(&entry.store_path)
                     .execute(pool)
                     .await
             })?;

@@ -147,18 +147,6 @@ impl BuildCgroup {
     ///
     /// `None` on read/parse failure (same caveat as memory_peak).
     ///
-    /// Format (cpu.stat excerpt):
-    /// ```text
-    /// usage_usec 123456789
-    /// user_usec 100000000
-    /// system_usec 23456789
-    /// ...
-    /// ```
-    pub fn cpu_usage_usec(&self) -> Option<u64> {
-        let content = fs::read_to_string(self.path.join("cpu.stat")).ok()?;
-        parse_cpu_stat_usage_usec(&content)
-    }
-
     /// Path to this cgroup. Exposed so the CPU polling task can
     /// clone it (the task outlives the borrowed `&BuildCgroup`
     /// across the `run_daemon_build` await).
@@ -497,8 +485,7 @@ fn parse_own_cgroup(content: &str) -> io::Result<PathBuf> {
 /// `pub(crate)`: the executor's CPU poll task reads `cpu.stat`
 /// directly by path (cloned from `BuildCgroup::path()`) and calls
 /// this to parse. It can't hold `&BuildCgroup` across the
-/// `run_daemon_build` await, so `BuildCgroup::cpu_usage_usec()`
-/// doesn't work for it. Exposing the parser is the simplest fix.
+/// `run_daemon_build` await; exposing the parser is the simplest fix.
 pub(crate) fn parse_cpu_stat_usage_usec(content: &str) -> Option<u64> {
     content
         .lines()
