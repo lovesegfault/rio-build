@@ -646,8 +646,8 @@ mod tests {
     // Filesystem backend
     // ------------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn fs_precreates_subdirs() -> anyhow::Result<()> {
+    #[test]
+    fn fs_precreates_subdirs() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let _backend = FilesystemChunkBackend::new(dir.path())?;
 

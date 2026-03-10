@@ -5,7 +5,6 @@
 //! (bootstrapped by `rio-test-support`), then exercise the full gRPC
 //! request/response path including streaming.
 
-use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Server};

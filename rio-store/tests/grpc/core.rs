@@ -10,11 +10,13 @@ async fn test_harness_smoke() -> TestResult {
     let result = s
         .client
         .query_path_info(QueryPathInfoRequest {
-            store_path: "/nix/store/00000000000000000000000000000000-does-not-exist".into(),
+            store_path: test_store_path("does-not-exist"),
         })
         .await;
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    assert_eq!(
+        result.expect_err("nonexistent path should fail").code(),
+        tonic::Code::NotFound
+    );
 
     Ok(())
 }
@@ -116,13 +118,14 @@ async fn test_get_path_nonexistent_returns_not_found() -> TestResult {
     let result = s
         .client
         .get_path(GetPathRequest {
-            store_path: "/nix/store/99999999999999999999999999999999-never-uploaded".into(),
+            store_path: test_store_path("never-uploaded"),
         })
         .await;
 
-    assert!(result.is_err(), "nonexistent path should fail GetPath");
     assert_eq!(
-        result.unwrap_err().code(),
+        result
+            .expect_err("nonexistent path should fail GetPath")
+            .code(),
         tonic::Code::NotFound,
         "should be NOT_FOUND"
     );
@@ -432,11 +435,10 @@ async fn test_put_path_rejects_absurd_nar_size() -> TestResult {
     );
     info.nar_size = u64::MAX; // trailer.nar_size > MAX_NAR_SIZE → rejected
 
-    let result = put_path(&mut s.client, info, vec![0u8; 10]).await;
-
     // Must be rejected promptly — no hang, no crash.
-    assert!(result.is_err(), "u64::MAX nar_size should be rejected");
-    let status = result.unwrap_err();
+    let status = put_path(&mut s.client, info, vec![0u8; 10])
+        .await
+        .expect_err("u64::MAX nar_size should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
         status.message().contains("exceeds maximum"),
@@ -471,9 +473,9 @@ async fn test_put_path_rejects_excessive_references() -> TestResult {
         ..base
     };
 
-    let result = put_path_raw(&mut s.client, info, nar).await;
-    assert!(result.is_err(), "10,001 references should be rejected");
-    let status = result.unwrap_err();
+    let status = put_path_raw(&mut s.client, info, nar)
+        .await
+        .expect_err("10,001 references should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
         status.message().contains("too many references"),
