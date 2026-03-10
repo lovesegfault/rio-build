@@ -433,42 +433,31 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    // Explicit unmount+join: BackgroundSession has NO Drop impl, so
-    // dropping it detaches the FUSE thread. Mount's Drop DOES umount
-    // (kernel sends DESTROY to the session), but the main thread
-    // races to exit() before the detached FUSE thread can process
-    // DESTROY → Filesystem::destroy() never runs → passthrough-
-    // failure stats lost, profraw never flushed for that code.
-    // umount_and_join() unmounts THEN joins the thread, ensuring
-    // destroy() completes before main returns.
+    // Dropping BackgroundSession:
+    //   - detaches the FUSE thread (BackgroundSession has NO Drop impl)
+    //   - drops the inner Mount, whose Drop DOES call fusermount -u
+    //     → kernel unmounts → sends DESTROY to the FUSE session
+    //     → detached FUSE thread processes DESTROY → Filesystem::destroy()
+    //       runs (flushes passthrough-failure stats, profraw)
+    //     → FUSE thread exits (but we're not joining it)
     //
-    // Detached std::thread + channel-with-timeout: if the FUSE mount
-    // is busy (overlay stacked on top, or some process holds an open
-    // fd to it), umount_and_join() blocks forever in the FUSE thread
-    // join. Using tokio::spawn_blocking here would wedge the tokio
-    // Runtime::drop (it waits for blocking tasks) — we'd time out the
-    // future but the process would never exit. A std thread is
-    // independent of tokio's lifecycle: when main returns, the
-    // runtime drops cleanly, and the detached thread is killed by
-    // libc at process exit.
+    // The race: main thread can reach libc exit() before the detached
+    // FUSE thread processes DESTROY → destroy() never runs → profraw
+    // lost for that code. The short sleep gives the FUSE thread time
+    // to process DESTROY in the common case. It's best-effort — if the
+    // mount is busy (fusermount fails EBUSY) or the FUSE thread is
+    // stuck on a slow request, destroy() won't run. That's fine:
+    // kernel unmounts on process death anyway (the fd closes), and
+    // the next worker instance can remount.
     //
-    // 5s wait: generous for normal umount (<100ms) but bounded so
-    // k8s pod termination doesn't wedge. If we abandon, kernel
-    // unmounts on process death anyway — we just lose destroy().
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done_tx.send(fuse_session.umount_and_join());
-    });
-    // recv_timeout blocks the current async task — fine here, this
-    // is the last thing main() does and nothing else is scheduled.
-    match done_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(())) => tracing::debug!("FUSE session unmounted and joined"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "FUSE umount/join failed"),
-        Err(_) => tracing::warn!(
-            "FUSE umount/join timed out (5s); abandoning graceful unmount. \
-             Mount may be busy — kernel will unmount on process exit."
-        ),
-    }
+    // Why not umount_and_join()? It takes self by value — if it
+    // blocks (busy mount → join never returns), there's no clean way
+    // to fall back to the Drop path without fuse_session ownership
+    // gymnastics. The Drop path is already correct for shutdown
+    // (mount cleaned up, process exits); it's only the profraw
+    // flush we're optimizing for, and a sleep is sufficient.
+    drop(fuse_session);
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     Ok(())
 }
