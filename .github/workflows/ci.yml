@@ -19,86 +19,77 @@ env:
   GHA: githubActions
 
 jobs:
-  # Fast matrix generator — the ONLY dependency for matrix jobs.
-  # ~1min total (checkout + nix-install + two nix evals). No
-  # workspace build on the critical path; each downstream job
-  # builds what it needs and pushes to cache opportunistically.
+  # Fast matrix generator — the ONLY dependency for every job.
+  # ~1min: checkout + nix-install + one nix eval. No workspace
+  # build on the critical path; each downstream job builds what
+  # it needs and pushes to cache opportunistically.
   gen-matrix:
     name: gen-matrix
     runs-on: rio-ci
     timeout-minutes: 60
     outputs:
-      checks: ${{ steps.matrix.outputs.checks }}
-      vm: ${{ steps.matrix.outputs.vm }}
+      checks: ${{ steps.gen.outputs.checks }}
+      fuzz-smoke: ${{ steps.gen.outputs.fuzz-smoke }}
+      vm-test: ${{ steps.gen.outputs.vm-test }}
+      coverage: ${{ steps.gen.outputs.coverage }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
       - name: Generate matrices from flake
-        id: matrix
+        id: gen
+        # One eval emits all four matrices as a JSON object; jq
+        # splits into per-matrix outputs. Adding a new matrix to
+        # flake.nix → add one `echo` line + one `outputs:` entry.
         run: |
           set -euo pipefail
-          checks=$(nix eval ".#${GHA}.matrix.checks" --json --apply builtins.attrNames)
-          vm=$(nix eval ".#${GHA}.matrix.vm-test" --json --apply builtins.attrNames)
-          echo "checks=$checks" >> "$GITHUB_OUTPUT"
-          echo "vm=$vm" >> "$GITHUB_OUTPUT"
-          echo "::notice::checks matrix: $checks"
-          echo "::notice::vm matrix: $vm"
+          all=$(nix eval ".#${GHA}.matrix" --json \
+            --apply 'builtins.mapAttrs (_: builtins.attrNames)')
+          echo "::notice::matrices: $all"
+          for m in checks fuzz-smoke vm-test coverage; do
+            echo "$m=$(jq -c --arg m "$m" '.[$m]' <<<"$all")" >> "$GITHUB_OUTPUT"
+          done
 
   checks:
-    name: check / ${{ matrix.check }}
+    name: check / ${{ matrix.name }}
     needs: gen-matrix
     runs-on: rio-ci
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        check: ${{ fromJSON(needs.gen-matrix.outputs.checks) }}
+        name: ${{ fromJSON(needs.gen-matrix.outputs.checks) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
-      - run: nix build ".#${GHA}.matrix.checks.${{ matrix.check }}" --print-build-logs
+      - run: nix build ".#${GHA}.matrix.checks.${{ matrix.name }}" --print-build-logs
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
-  # No needs — starts immediately. Fuzz builds (nightly rust,
-  # independent dep tree) don't share anything with cargo checks.
   fuzz-smoke:
-    name: fuzz-smoke
+    name: fuzz / ${{ matrix.name }}
+    needs: gen-matrix
     runs-on: rio-ci
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.gen-matrix.outputs.fuzz-smoke) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
-      - run: nix build ".#${GHA}.fuzz-smoke" --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
-
-  # No needs — starts immediately.
-  coverage-unit:
-    name: coverage / unit
-    runs-on: rio-ci
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/setup-nix
-      - run: nix build ".#${GHA}.coverage-unit" --print-build-logs
-      - uses: codecov/codecov-action@v5
-        with:
-          files: result
-          flags: unit
-          use_oidc: true
+      - run: nix build ".#${GHA}.matrix.fuzz-smoke.${{ matrix.name }}" --print-build-logs
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
   vm-test:
-    name: vm / ${{ matrix.test }}
+    name: vm / ${{ matrix.name }}
     needs: gen-matrix
     runs-on: rio-ci-kvm
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        test: ${{ fromJSON(needs.gen-matrix.outputs.vm) }}
+        name: ${{ fromJSON(needs.gen-matrix.outputs.vm-test) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
@@ -106,39 +97,43 @@ jobs:
           kvm: true
       - name: Verify KVM
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
-      - run: nix build ".#${GHA}.matrix.vm-test.${{ matrix.test }}" --print-build-logs
+      - run: nix build ".#${GHA}.matrix.vm-test.${{ matrix.name }}" --print-build-logs
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
-  vm-coverage:
-    name: coverage / ${{ matrix.test }}
+  coverage:
+    name: coverage / ${{ matrix.name }}
     needs: gen-matrix
-    runs-on: rio-ci-kvm
+    # Runner selection by naming convention: `vm-*` entries need
+    # KVM (instrumented VM tests → profraw → lcov). `unit` runs
+    # on spot. See flake.nix githubActions comment.
+    runs-on: ${{ startsWith(matrix.name, 'vm-') && 'rio-ci-kvm' || 'rio-ci' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        test: ${{ fromJSON(needs.gen-matrix.outputs.vm) }}
+        name: ${{ fromJSON(needs.gen-matrix.outputs.coverage) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
         with:
-          kvm: true
+          kvm: ${{ startsWith(matrix.name, 'vm-') }}
       - name: Verify KVM
+        if: startsWith(matrix.name, 'vm-')
         run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
-      - run: nix build ".#${GHA}.matrix.vm-coverage.${{ matrix.test }}" --print-build-logs
+      - run: nix build ".#${GHA}.matrix.coverage.${{ matrix.name }}" --print-build-logs
       - uses: codecov/codecov-action@v5
         with:
           files: result
-          flags: ${{ matrix.test }}
+          flags: ${{ matrix.name }}
           use_oidc: true
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
   # Single stable name for branch protection. Dynamic matrices
-  # mean individual entry names (e.g. "vm / vm-phase1a") change
-  # as tests are added/removed — marking them required would
-  # break. This job fans-in and succeeds iff every upstream did.
+  # mean individual entry names change as tests are added/removed —
+  # marking them required would break. This job fans-in and succeeds
+  # iff every upstream did.
   #
   # alls-green treats `skipped` as failure (GitHub branch protection
   # doesn't, which is a well-known footgun — a skipped required
@@ -146,7 +141,7 @@ jobs:
   ci-gate:
     name: CI gate
     if: always()
-    needs: [gen-matrix, checks, fuzz-smoke, coverage-unit, vm-test, vm-coverage]
+    needs: [gen-matrix, checks, fuzz-smoke, vm-test, coverage]
     runs-on: rio-ci
     timeout-minutes: 60
     steps:
