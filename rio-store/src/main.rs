@@ -483,6 +483,55 @@ mod tests {
         assert!(matches!(cfg.chunk_backend, ChunkBackendKind::Inline));
     }
 
+    /// Env-var tagged-enum parsing via the real rio_common::config::load
+    /// path (Serialized::defaults → Env::prefixed("RIO_").split("__") →
+    /// extract). The deploy overlays set chunk_backend this way —
+    /// regression guard for kustomization.yaml.
+    ///
+    /// The defaults layer serializes Inline as {kind: "inline"}; figment's
+    /// per-key merge must correctly replace it with {kind: "s3",
+    /// bucket: ..., prefix: ...} from the env layer. Half-merges (stale
+    /// kind, orphan fields) would fail tagged-enum deserialization.
+    ///
+    /// Jail: serializes env mutation under a global mutex. The closure's
+    /// Result<(), figment::Error> return type is figment's API (208-byte
+    /// error) — clippy allow is local to these tests.
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn chunk_backend_kind_env_s3() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "s3");
+            jail.set_env("RIO_CHUNK_BACKEND__BUCKET", "rio-chunks");
+            jail.set_env("RIO_CHUNK_BACKEND__PREFIX", "");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::S3 { bucket, prefix } => {
+                    assert_eq!(bucket, "rio-chunks");
+                    assert_eq!(prefix, "");
+                }
+                other => panic!("env vars must override default Inline; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn chunk_backend_kind_env_filesystem() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_CHUNK_BACKEND__KIND", "filesystem");
+            jail.set_env("RIO_CHUNK_BACKEND__BASE_DIR", "/var/lib/chunks");
+            let cfg: Config = rio_common::config::load("store", CliArgs::default()).unwrap();
+            match cfg.chunk_backend {
+                ChunkBackendKind::Filesystem { base_dir } => {
+                    assert_eq!(base_dir, PathBuf::from("/var/lib/chunks"));
+                }
+                other => panic!("expected Filesystem; got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
     #[test]
     fn cli_args_parse_help() {
         use clap::CommandFactory;
