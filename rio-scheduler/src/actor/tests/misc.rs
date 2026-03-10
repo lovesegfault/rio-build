@@ -19,23 +19,10 @@ fn spawn_actor_with_flags(
 ) -> (ActorHandle, tokio::task::JoinHandle<()>) {
     let leader_flag = Arc::new(AtomicBool::new(is_leader));
     let recovery_flag = Arc::new(AtomicBool::new(recovery_complete));
-
-    let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = DagActor::new(SchedulerDb::new(pool), None)
-        .with_leader_flag(leader_flag)
-        .with_recovery_flag(recovery_flag);
-    let backpressure = actor.backpressure_flag();
-    let generation = actor.generation_reader();
-    let self_tx = tx.downgrade();
-    let task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-    (
-        ActorHandle {
-            tx,
-            backpressure,
-            generation,
-        },
-        task,
-    )
+    setup_actor_configured(pool, None, |a| {
+        a.with_leader_flag(leader_flag)
+            .with_recovery_flag(recovery_flag)
+    })
 }
 
 // r[verify sched.recovery.gate-dispatch]
@@ -116,18 +103,9 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-scheduler-hmac-key-32bytes!".to_vec();
 
-    let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
-        .with_hmac_signer(HmacSigner::from_key(test_key.clone()));
-    let backpressure = actor.backpressure_flag();
-    let generation = actor.generation_reader();
-    let self_tx = tx.downgrade();
-    let _task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-    let handle = ActorHandle {
-        tx,
-        backpressure,
-        generation,
-    };
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
+    });
 
     let mut worker_rx = connect_worker(&handle, "hmac-w", "x86_64-linux", 1).await?;
 
@@ -179,18 +157,9 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-clamp-key-at-least-32-bytes!!".to_vec();
 
-    let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-    let actor = DagActor::new(SchedulerDb::new(db.pool.clone()), None)
-        .with_hmac_signer(HmacSigner::from_key(test_key.clone()));
-    let backpressure = actor.backpressure_flag();
-    let generation = actor.generation_reader();
-    let self_tx = tx.downgrade();
-    let _task = tokio::spawn(actor.run_with_self_tx(rx, self_tx));
-    let handle = ActorHandle {
-        tx,
-        backpressure,
-        generation,
-    };
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_hmac_signer(HmacSigner::from_key(test_key.clone()))
+    });
 
     let mut worker_rx = connect_worker(&handle, "clamp-w", "x86_64-linux", 1).await?;
 
