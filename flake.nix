@@ -600,19 +600,21 @@
           # thin consumer that evaluates this to generate matrices.
           #
           # matrix.<name>: attrsets where keys → GHA matrix entries and
-          #   values → derivations to build. Add/remove checks or VM
-          #   tests here; the workflow picks them up automatically.
-          # <single-shot-name>: derivations built by non-matrix jobs.
+          #   values → derivations to build. Add/remove entries here;
+          #   the workflow picks them up automatically via `nix eval`.
           #
-          # CI runners are Linux-only (rio-ci + rio-ci-kvm). vmTests/
-          # coverage/fuzz.smoke are all optionalAttrs isLinux upstream,
-          # so this whole block is too — on Darwin it's {} (harmless,
-          # nobody consumes it there).
+          # Runner selection by naming convention: entries with a `vm-`
+          # prefix run on `rio-ci-kvm` (bare-metal, /dev/kvm mounted);
+          # everything else on `rio-ci` (spot). This keeps the flake
+          # emitting simple name→drv maps without per-entry metadata.
+          #
+          # CI runners are Linux-only. vmTests/coverage/fuzz.smoke are
+          # all optionalAttrs isLinux upstream, so this whole block is
+          # too — on Darwin it's {} (harmless).
           githubActions = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             matrix = {
-              # Cargo/static checks (rio-ci spot, no KVM). Excludes
-              # `build` (done by the build job) and `coverage` (superseded
-              # by coverage-unit + vm-coverage flags on Codecov).
+              # Cargo/static checks. Excludes `coverage` (superseded by
+              # the coverage matrix below — Codecov merges flags).
               checks = {
                 inherit (cargoChecks)
                   clippy
@@ -623,27 +625,28 @@
                   ;
                 inherit (config.checks) pre-commit;
               };
-              # Normal VM tests (rio-ci-kvm). Keys: vm-phase1a etc.
-              # Per-test red/green signal in the GHA UI.
+              # 30s fuzz smokes, one matrix entry per target. Keys
+              # are fuzz-smoke-<target> (from nix/fuzz.nix). On a
+              # cold cache each entry rebuilds the shared fuzz-build
+              # derivation, but spot CPU is cheap and the cache fills
+              # after first green.
+              fuzz-smoke = fuzz.smoke;
+              # Normal VM tests. Keys: vm-phase1a etc. Per-test
+              # red/green signal in the GHA UI.
               vm-test = vmTests;
-              # Coverage-mode VM tests → per-test lcov (rio-ci-kvm).
-              # Same keys as vm-test by construction (both derive from
-              # mkVmTests); workflow reuses one matrix output for both.
-              # Values are sandbox-stripped lcov files ready for Codecov.
-              vm-coverage = coverage.perTestLcov;
+              # lcov-producing jobs, one per Codecov flag. `unit`
+              # runs on spot; `vm-*` need KVM (instrumented VM tests
+              # → profraw → lcov). Workflow picks runs-on by prefix.
+              coverage = {
+                unit = coverage.unitLcov;
+              }
+              // coverage.perTestLcov;
             };
             # niks3 CLI for cache pushes. niks3-push action builds
             # this via `nix build --print-out-paths` and includes
             # the store path in its push — so the first job to
             # complete uploads it to S3, subsequent jobs substitute.
             inherit (inputs.niks3.packages.${system}) niks3;
-            # All 30s fuzz smokes in one job (they share fuzz-build
-            # derivations; matrixing them would rebuild fuzz-build N×
-            # on cold cache).
-            fuzz-smoke = pkgs.linkFarmFromDrvs "rio-fuzz-smoke" (builtins.attrValues fuzz.smoke);
-            # Unit-test lcov, sandbox-path-stripped. Uploaded to
-            # Codecov with flag=unit.
-            coverage-unit = coverage.unitLcov;
           };
         in
         {
