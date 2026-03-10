@@ -24,8 +24,10 @@ runs:
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$NIKS3_URL" | jq -r .value)
         echo "::add-mask::$OIDC"
 
-        # niks3 CLI via Nix — substituted from rio-nix-cache (S3,
-        # same region) after the `build` job pushes it. No curl,
-        # no GitHub cache service round-trip.
-        nix run .#githubActions.niks3 -- push \
-          --server-url "$NIKS3_URL" --auth-token "$OIDC" "${paths[@]}"
+        # niks3 CLI via Nix — build (or substitute) and get the
+        # store path. Include it in the push so the first job to
+        # complete uploads it to S3; subsequent jobs cache-hit.
+        niks3=$(nix build .#githubActions.niks3 --no-link --print-out-paths)
+        "$niks3/bin/niks3" push \
+          --server-url "$NIKS3_URL" --auth-token "$OIDC" \
+          "${paths[@]}" "$niks3"
