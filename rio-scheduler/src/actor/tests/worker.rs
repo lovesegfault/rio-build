@@ -138,8 +138,10 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
         .expect("derivation exists");
     assert_eq!(pre.status, DerivationStatus::Poisoned);
 
-    // Wait past the cfg(test) POISON_TTL (100ms).
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait past the cfg(test) POISON_TTL (100ms). 3× margin for loaded
+    // CI hosts — poisoned_at is std::time::Instant (derivation.rs:202),
+    // which tokio paused time can't mock, so real sleep is the only option.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Tick processes the expiry.
     handle.send_unchecked(ActorCommand::Tick).await?;
