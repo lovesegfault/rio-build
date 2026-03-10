@@ -125,6 +125,7 @@ pub async fn compute_unreachable(
 mod tests {
     use super::*;
     use rio_test_support::TestDb;
+    use rio_test_support::fixtures::test_store_path;
 
     /// Minimal narinfo + manifest seeding. Tests need paths with
     /// known references to verify the CTE walks correctly.
@@ -167,7 +168,7 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         // Seed one path, old (past grace), no roots, no refs →
         // unreachable.
-        let hash = seed_path(&db.pool, "/nix/store/aaa-orphan", &[], 48).await;
+        let hash = seed_path(&db.pool, &test_store_path("orphan"), &[], 48).await;
 
         let unreachable = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
         assert_eq!(unreachable, vec![hash]);
@@ -177,7 +178,7 @@ mod tests {
     async fn grace_period_protects_recent() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         // Path created 1h ago, grace=2h → reachable (in grace).
-        let _hash = seed_path(&db.pool, "/nix/store/bbb-recent", &[], 1).await;
+        let _hash = seed_path(&db.pool, &test_store_path("recent"), &[], 1).await;
 
         let unreachable = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
         assert!(
@@ -190,14 +191,15 @@ mod tests {
     async fn extra_roots_protect_paths() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         // Old path, no other roots.
-        let _hash = seed_path(&db.pool, "/nix/store/ccc-live-build", &[], 48).await;
+        let live_build = test_store_path("live-build");
+        let _hash = seed_path(&db.pool, &live_build, &[], 48).await;
 
         // Without extra_roots: unreachable.
         let without = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
         assert_eq!(without.len(), 1);
 
         // WITH the path in extra_roots: reachable.
-        let with = compute_unreachable(&db.pool, 2, &["/nix/store/ccc-live-build".to_string()])
+        let with = compute_unreachable(&db.pool, 2, &[live_build])
             .await
             .unwrap();
         assert!(
@@ -211,21 +213,12 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         // Chain: root → middle → leaf. All old. Root is pinned.
         // middle + leaf should be reachable through references.
-        let _leaf = seed_path(&db.pool, "/nix/store/ddd-leaf", &[], 48).await;
-        let _middle = seed_path(
-            &db.pool,
-            "/nix/store/eee-middle",
-            &["/nix/store/ddd-leaf"],
-            48,
-        )
-        .await;
-        let root_hash = seed_path(
-            &db.pool,
-            "/nix/store/fff-root",
-            &["/nix/store/eee-middle"],
-            48,
-        )
-        .await;
+        let leaf = test_store_path("leaf");
+        let middle = test_store_path("middle");
+        let root = test_store_path("root");
+        let _leaf = seed_path(&db.pool, &leaf, &[], 48).await;
+        let _middle = seed_path(&db.pool, &middle, &[&leaf], 48).await;
+        let root_hash = seed_path(&db.pool, &root, &[&middle], 48).await;
 
         // Pin the root.
         sqlx::query("INSERT INTO gc_roots (store_path_hash, source) VALUES ($1, 'test')")
@@ -247,7 +240,7 @@ mod tests {
         // Old path, no gc_roots, not in extra_roots → would be
         // unreachable. But scheduler has it pinned as a live-build
         // input → protected via seed (e).
-        let hash = seed_path(&db.pool, "/nix/store/hhh-live-input", &[], 48).await;
+        let hash = seed_path(&db.pool, &test_store_path("live-input"), &[], 48).await;
 
         // Without pin: unreachable.
         let without = compute_unreachable(&db.pool, 2, &[]).await.unwrap();
