@@ -111,7 +111,7 @@ aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
 # For cache_server tests: Router::oneshot (ServiceExt trait).
 tower = { workspace = true, features = ["util"] }
-# For main.rs ChunkBackendKind TOML parsing tests. The production
-# code uses figment via rio_common::config::load (which doesn't
-# expose the Toml provider). dev-dep here for Toml::string in tests.
-figment = { workspace = true }
+# For main.rs ChunkBackendKind TOML + env-var parsing tests. The
+# production code uses figment via rio_common::config::load. dev-dep
+# here for Toml::string + Jail (env manipulation under global mutex).
+figment = { workspace = true, features = ["test"] }
