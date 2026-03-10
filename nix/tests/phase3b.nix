@@ -679,6 +679,22 @@ pkgs.testers.runNixOSTest {
             "grep -E 'rio_scheduler_recovery_total\\{outcome=\"success\"\\} [1-9]'"
         )
 
+        # Settle: wait for queued+running==0 BEFORE starting the slow
+        # build. The derivations_running gauge is Tick-updated (10s
+        # interval, worker.rs:604-623) — it can still show 1 from the
+        # previous HMAC build for up to 10s after completion. Without
+        # this baseline, the poll below would detect stale state and
+        # we'd SIGKILL before our slow build is even dispatched → PG
+        # has 0 non-terminal rows → assert fails. 30s timeout covers
+        # ≥2 Tick intervals.
+        control.wait_until_succeeds(
+            "curl -sf http://localhost:9091/metrics | "
+            "awk '/^rio_scheduler_derivations_queued / {q=$2} "
+            "/^rio_scheduler_derivations_running / {r=$2} "
+            "END {exit !(q==0 && r==0)}'",
+            timeout=30
+        )
+
         # Kick off a SLOW build in the background. nix-build returns
         # immediately with the `&`; the build runs on the worker. We
         # don't wait for completion — just need PG to have a non-
@@ -692,7 +708,9 @@ pkgs.testers.runNixOSTest {
         )
         # Poll for the build to be dispatched (Running). The slow
         # build's 90s sleep starts once the worker receives the
-        # assignment → derivations.status='running' in PG.
+        # assignment → derivations.status='running' in PG. Baseline
+        # is guaranteed 0 by the settle-wait above, so a nonzero
+        # reading here IS our slow build.
         control.wait_until_succeeds(
             "curl -sf http://localhost:9091/metrics | "
             "grep -E 'rio_scheduler_derivations_running [1-9]'",
