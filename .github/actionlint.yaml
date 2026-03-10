@@ -1,0 +1,5 @@
+self-hosted-runner:
+  # Runner labels from the rio-ci EKS cluster (see rio-infra).
+  labels:
+    - rio-ci        # spot, 0→20 runners, 4-16 vCPU
+    - rio-ci-kvm    # bare-metal, 0→4 runners, /dev/kvm mounted

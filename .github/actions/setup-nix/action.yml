@@ -1,0 +1,16 @@
+name: Setup Nix
+description: Install Nix with rio-nix-cache substituter config
+inputs:
+  kvm:
+    description: Add kvm/nixos-test system-features
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@v21
+      with:
+        extra-conf: |
+          substituters = https://rio-nix-cache.s3.us-west-2.amazonaws.com https://cache.nixos.org
+          trusted-public-keys = rio-nix-cache:er1fTC0pPR1nSGU+qcYJPle1CW1xtTJul+gA/kUo0KI= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+          max-jobs = auto
+          ${{ inputs.kvm == 'true' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}

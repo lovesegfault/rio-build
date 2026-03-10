@@ -1,0 +1,153 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC → niks3 + codecov
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel stale PR runs; never cancel pushes to main.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NIKS3_URL: http://niks3.niks3.svc.cluster.local:5751
+  # Flake attr prefix for CI targets. See flake.nix githubActions.
+  GHA: githubActions
+
+jobs:
+  build:
+    name: build workspace
+    runs-on: rio-ci
+    timeout-minutes: 30
+    outputs:
+      checks: ${{ steps.matrix.outputs.checks }}
+      vm: ${{ steps.matrix.outputs.vm }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+      - name: Generate matrices from flake
+        id: matrix
+        run: |
+          set -euo pipefail
+          checks=$(nix eval ".#${GHA}.matrix.checks" --json --apply builtins.attrNames)
+          vm=$(nix eval ".#${GHA}.matrix.vm-test" --json --apply builtins.attrNames)
+          echo "checks=$checks" >> "$GITHUB_OUTPUT"
+          echo "vm=$vm" >> "$GITHUB_OUTPUT"
+          echo "::notice::checks matrix: $checks"
+          echo "::notice::vm matrix: $vm"
+      - run: nix build ".#${GHA}.build" --print-build-logs
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+
+  checks:
+    name: check / ${{ matrix.check }}
+    needs: build
+    runs-on: rio-ci
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.build.outputs.checks) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+      - run: nix build ".#${GHA}.matrix.checks.${{ matrix.check }}" --print-build-logs
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    needs: build
+    runs-on: rio-ci
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+      - run: nix build ".#${GHA}.fuzz-smoke" --print-build-logs
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+
+  coverage-unit:
+    name: coverage / unit
+    needs: build
+    runs-on: rio-ci
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+      - run: nix build ".#${GHA}.coverage-unit" --print-build-logs
+      - uses: codecov/codecov-action@v5
+        with:
+          files: result
+          flags: unit
+          use_oidc: true
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+
+  vm-test:
+    name: vm / ${{ matrix.test }}
+    needs: build
+    runs-on: rio-ci-kvm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON(needs.build.outputs.vm) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          kvm: true
+      - name: Verify KVM
+        run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
+      - run: nix build ".#${GHA}.matrix.vm-test.${{ matrix.test }}" --print-build-logs
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+
+  vm-coverage:
+    name: coverage / ${{ matrix.test }}
+    needs: build
+    runs-on: rio-ci-kvm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON(needs.build.outputs.vm) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-nix
+        with:
+          kvm: true
+      - name: Verify KVM
+        run: '[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]]'
+      - run: nix build ".#${GHA}.matrix.vm-coverage.${{ matrix.test }}" --print-build-logs
+      - uses: codecov/codecov-action@v5
+        with:
+          files: result
+          flags: ${{ matrix.test }}
+          use_oidc: true
+      - uses: ./.github/actions/niks3-push
+        if: always() && !cancelled()
+
+  # Single stable name for branch protection. Dynamic matrices
+  # mean individual entry names (e.g. "vm / vm-phase1a") change
+  # as tests are added/removed — marking them required would
+  # break. This job fans-in and succeeds iff every upstream did.
+  # vm-coverage NOT listed: instrumented runs can flake on
+  # overhead; they're informational (Codecov still gets data).
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [build, checks, fuzz-smoke, coverage-unit, vm-test]
+    runs-on: rio-ci
+    timeout-minutes: 5
+    steps:
+      - name: Check all upstream jobs succeeded
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results" | jq .
+          echo "$results" | jq -e 'to_entries | all(.value.result == "success")'
