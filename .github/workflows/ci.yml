@@ -19,10 +19,14 @@ env:
   GHA: githubActions
 
 jobs:
-  build:
-    name: build workspace
+  # Fast matrix generator — the ONLY dependency for matrix jobs.
+  # ~1min total (checkout + nix-install + two nix evals). No
+  # workspace build on the critical path; each downstream job
+  # builds what it needs and pushes to cache opportunistically.
+  gen-matrix:
+    name: gen-matrix
     runs-on: rio-ci
-    timeout-minutes: 30
+    timeout-minutes: 10
     outputs:
       checks: ${{ steps.matrix.outputs.checks }}
       vm: ${{ steps.matrix.outputs.vm }}
@@ -39,19 +43,16 @@ jobs:
           echo "vm=$vm" >> "$GITHUB_OUTPUT"
           echo "::notice::checks matrix: $checks"
           echo "::notice::vm matrix: $vm"
-      - run: nix build ".#${GHA}.build" --print-build-logs
-      - uses: ./.github/actions/niks3-push
-        if: always() && !cancelled()
 
   checks:
     name: check / ${{ matrix.check }}
-    needs: build
+    needs: gen-matrix
     runs-on: rio-ci
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        check: ${{ fromJSON(needs.build.outputs.checks) }}
+        check: ${{ fromJSON(needs.gen-matrix.outputs.checks) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
@@ -59,11 +60,12 @@ jobs:
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
+  # No needs — starts immediately. Fuzz builds (nightly rust,
+  # independent dep tree) don't share anything with cargo checks.
   fuzz-smoke:
     name: fuzz-smoke
-    needs: build
     runs-on: rio-ci
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
@@ -71,11 +73,11 @@ jobs:
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
+  # No needs — starts immediately.
   coverage-unit:
     name: coverage / unit
-    needs: build
     runs-on: rio-ci
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
@@ -90,13 +92,13 @@ jobs:
 
   vm-test:
     name: vm / ${{ matrix.test }}
-    needs: build
+    needs: gen-matrix
     runs-on: rio-ci-kvm
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        test: ${{ fromJSON(needs.build.outputs.vm) }}
+        test: ${{ fromJSON(needs.gen-matrix.outputs.vm) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
@@ -110,13 +112,13 @@ jobs:
 
   vm-coverage:
     name: coverage / ${{ matrix.test }}
-    needs: build
+    needs: gen-matrix
     runs-on: rio-ci-kvm
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        test: ${{ fromJSON(needs.build.outputs.vm) }}
+        test: ${{ fromJSON(needs.gen-matrix.outputs.vm) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
@@ -144,7 +146,7 @@ jobs:
   ci-gate:
     name: CI gate
     if: always()
-    needs: [build, checks, fuzz-smoke, coverage-unit, vm-test, vm-coverage]
+    needs: [gen-matrix, checks, fuzz-smoke, coverage-unit, vm-test, vm-coverage]
     runs-on: rio-ci
     timeout-minutes: 5
     steps:

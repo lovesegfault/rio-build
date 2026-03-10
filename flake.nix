@@ -632,17 +632,10 @@
               # Values are sandbox-stripped lcov files ready for Codecov.
               vm-coverage = coverage.perTestLcov;
             };
-            # Primes BOTH dep caches (normal + coverage-instrumented)
-            # AND the niks3 CLI. First CI job pushes all three closures;
-            # downstream jobs substitute from S3 in-region.
-            build = pkgs.linkFarmFromDrvs "rio-ci-build" [
-              rio-workspace
-              rio-workspace-cov
-              inputs.niks3.packages.${system}.niks3
-            ];
-            # Exposed for `nix run .#githubActions.niks3 -- push ...`
-            # in the niks3-push composite action. Substituted from
-            # rio-nix-cache after the build job pushes it.
+            # niks3 CLI for cache pushes. niks3-push action builds
+            # this via `nix build --print-out-paths` and includes
+            # the store path in its push — so the first job to
+            # complete uploads it to S3, subsequent jobs substitute.
             inherit (inputs.niks3.packages.${system}) niks3;
             # All 30s fuzz smokes in one job (they share fuzz-build
             # derivations; matrixing them would rebuild fuzz-build N×
