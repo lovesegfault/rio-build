@@ -137,17 +137,22 @@ jobs:
   # mean individual entry names (e.g. "vm / vm-phase1a") change
   # as tests are added/removed — marking them required would
   # break. This job fans-in and succeeds iff every upstream did.
-  # vm-coverage NOT listed: instrumented runs can flake on
-  # overhead; they're informational (Codecov still gets data).
+  #
+  # alls-green treats `skipped` as failure (GitHub branch protection
+  # doesn't, which is a well-known footgun — a skipped required
+  # check silently passes).
+  #
+  # vm-coverage is listed with allowed-failures: instrumented runs
+  # can flake on overhead; they're informational. Codecov still
+  # gets data from whichever ones succeed.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [build, checks, fuzz-smoke, coverage-unit, vm-test]
+    needs: [build, checks, fuzz-smoke, coverage-unit, vm-test, vm-coverage]
     runs-on: rio-ci
     timeout-minutes: 5
     steps:
-      - name: Check all upstream jobs succeeded
-        run: |
-          results='${{ toJSON(needs) }}'
-          echo "$results" | jq .
-          echo "$results" | jq -e 'to_entries | all(.value.result == "success")'
+      - uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+          allowed-failures: vm-coverage
