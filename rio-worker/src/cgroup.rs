@@ -273,8 +273,9 @@ impl Drop for BuildCgroup {
 /// Fails if:
 /// - `/proc/self/cgroup` is cgroup v1 format (multiple lines)
 /// - the parent path doesn't exist or isn't a cgroup
-/// - we're at ns root AND remounting /sys/fs/cgroup rw fails
-///   (missing CAP_SYS_ADMIN or seccomp blocks mount(2))
+/// - we're at ns root AND either the rw remount fails (missing
+///   CAP_SYS_ADMIN / seccomp-blocked mount(2) / locked flags under
+///   userns) or the subsequent mkdir/move-self fails
 ///
 /// All mean cgroup v2 isn't properly set up. Hard error — startup fails.
 pub fn delegated_root() -> io::Result<PathBuf> {
@@ -300,18 +301,31 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         // privileged pods, even with CAP_SYS_ADMIN. Remount rw
         // so we can create sub-cgroups and write subtree_control.
         // CAP_SYS_ADMIN + RuntimeDefault seccomp permits mount(2).
-        // Idempotent: remounting an already-rw mount is a no-op.
+        //
+        // MS_REMOUNT | MS_BIND modifies only the per-mount-point
+        // flags — clears MS_RDONLY while preserving the superblock's
+        // nosuid/nodev/noexec. Safe on an already-rw mount (clears
+        // nothing it shouldn't). Plain MS_REMOUNT would strip those
+        // flags too (harmless for cgroup2fs, but less precise) and
+        // fails to clear RO if a runtime ever sets it via the
+        // bind-remount path instead of superblock.
+        //
+        // TODO(phase4): this path is unreachable under
+        // privileged=true (containerd mounts rw already). Exercise
+        // it in VM tests once the non-privileged + device-plugin
+        // setup (ADR-012) is wired.
         nix::mount::mount(
             None::<&str>,
             CGROUP_ROOT,
             None::<&str>,
-            nix::mount::MsFlags::MS_REMOUNT,
+            nix::mount::MsFlags::MS_REMOUNT | nix::mount::MsFlags::MS_BIND,
             None::<&str>,
         )
         .map_err(|e| {
             io::Error::other(format!(
                 "cannot remount {CGROUP_ROOT} rw: {e} \
-                 (needs CAP_SYS_ADMIN — check pod securityContext)"
+                 (needs CAP_SYS_ADMIN and a seccomp profile permitting \
+                 mount(2); also check AppArmor/SELinux if EACCES)"
             ))
         })?;
 
