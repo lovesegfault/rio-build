@@ -82,7 +82,7 @@ The workspace is split into 9 crates (`rio-common`, `rio-nix`, `rio-proto`, `rio
 
 Good first contributions:
 
-- **Current phase tasks** in [phases/phase3b.md](./phases/phase3b.md), or grep the codebase for `TODO(phase3b)` / `TODO(phase4)` markers
+- **Current phase tasks** in [phases/phase4a.md](./phases/phase4a.md), or grep the codebase for `TODO(phase4)` / `TODO(phase5)` markers
 - **Fuzzing targets** described in [verification.md](./verification.md) --- wire format parsers are security-critical
 - **Golden tests** --- add live-daemon conformance scenarios for new opcodes (see `rio-gateway/tests/golden/`)
 - **Documentation** --- improvements to this design book (typos, clarifications, missing details)

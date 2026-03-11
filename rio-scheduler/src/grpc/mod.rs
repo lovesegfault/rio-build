@@ -676,11 +676,11 @@ impl WorkerService for SchedulerGrpc {
                             // (peak mem + peak cpu) are fully covered
                             // by CompletionReport now.
                             //
-                            // TODO(phase4): live preemption/migration
+                            // TODO(phase5): live preemption/migration
                             // would want mid-build ResourceUsage to
                             // detect "this build is about to OOM, move
                             // it." That's when ProgressUpdate matters.
-                            // Not in scope.
+                            // Needs worker-side checkpoint support.
                         }
                     }
                 }

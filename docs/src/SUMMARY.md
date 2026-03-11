@@ -61,4 +61,7 @@
     - [Phase 3a: Operator + Worker Store](./phases/phase3a.md)
     - [Phase 3b: Production Hardening](./phases/phase3b.md)
   - [Phase 4: Production Hardness](./phases/phase4.md)
+    - [Phase 4a: Observability + Multi-Tenancy Foundation](./phases/phase4a.md)
+    - [Phase 4b: GC Correctness + Operational Tooling](./phases/phase4b.md)
+    - [Phase 4c: Adaptive Scheduling + Polish](./phases/phase4c.md)
   - [Phase 5: CA Early Cutoff + Advanced](./phases/phase5.md)

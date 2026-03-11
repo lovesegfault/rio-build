@@ -1,6 +1,6 @@
 # Implementation Phases
 
-rio-build is designed to be implemented incrementally across five phases (with Phases 1, 2, and 3 each having sub-phases), each delivering a usable milestone.
+rio-build is designed to be implemented incrementally across five phases (with Phases 1-4 each having sub-phases), each delivering a usable milestone.
 
 | Phase | Timeline | Goal |
 |-------|----------|------|
@@ -11,8 +11,10 @@ rio-build is designed to be implemented incrementally across five phases (with P
 | [Phase 2c](./phases/phase2c.md) | Months 9-12 | Chunked CAS, intelligent scheduling, binary cache, CA data model |
 | [Phase 3a](./phases/phase3a.md) | Months 12-15 | K8s operator, CRDs, FUSE-backed worker stores, deployment manifests |
 | [Phase 3b](./phases/phase3b.md) | Months 15-17 | Production hardening: RBAC, NetworkPolicy, EKS, K8s-aware retry, GC, FOD proxy |
-| [Phase 4](./phases/phase4.md) | Months 17-20 | Full observability, reliability hardening, CLI, Helm chart |
-| [Phase 5](./phases/phase5.md) | Months 21-26 | CA early cutoff, multi-tenancy, web dashboard |
+| [Phase 4a](./phases/phase4a.md) | Months 17-18 | Observability completion, multi-tenancy foundation, admin RPCs, poison persistence |
+| [Phase 4b](./phases/phase4b.md) | Months 18-20 | GC correctness (NAR refs scanner), per-tenant GC, rio-cli, Helm, rate limiting, FUSE circuit breaker |
+| [Phase 4c](./phases/phase4c.md) | Months 20-22 | SITA-E adaptive cutoffs, WorkerPoolSet CRD, VM tests, Grafana, rio-bench, doc sync |
+| [Phase 5](./phases/phase5.md) | Months 22-28 | CA early cutoff, multi-tenancy enforcement, web dashboard, chaos testing |
 
 > **Note on overlap:** Phase 1b and 2a overlap by one month (months 5-6). This reflects the expectation that early Phase 2a scaffolding (protobuf definitions, project structure) can begin before Phase 1b is fully complete.
 
