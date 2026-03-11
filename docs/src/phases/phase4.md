@@ -31,7 +31,7 @@ All Phase 4 schema changes land in a single `migrations/009_phase4.sql`, appende
 |---|---|---|
 | A | 4a | `tenants` table + FKs + indexes + pre-FK `NULL`-out of existing orphan `tenant_id` rows |
 | B | 4a | `derivations.poisoned_at TIMESTAMPTZ` |
-| C | 4b | `path_tenants` junction (many-to-many, union-of-retention-windows) |
+| C | 4b | `path_tenants` junction (no FK→narinfo per `scheduler_live_pins` precedent; `tenant_id ON DELETE CASCADE`). Drop unused `narinfo.tenant_id` column. |
 | D | 4c | `build_samples` (raw durations for SITA-E CDF) |
 
 ## Deferred to Phase 5
@@ -52,6 +52,27 @@ Explicitly out of Phase 4 scope:
 | Staggered scheduling (delay dispatch to cold workers until prefetch-warm) | In-process chunk cache + per-derivation prefetch absorb most thundering-herd. Revisit if mass cold-start (all pools scaling from 0) spikes S3 in production. |
 | Nix multi-version compatibility matrix + `cargo-mutants` | Testing infrastructure expansion; separate track. |
 
+## VM test `phase4.nix` section map
+
+`nix/tests/phase4.nix` is built incrementally across sub-phases (same pattern as migration 009):
+
+| Section | Sub-phase | Content |
+|---|---|---|
+| A | 4a | Tenant smoke: SSH key comment → `builds.tenant_id` resolved |
+| B | 4b | GC + references: NAR scanner populates `narinfo.references`; `path_tenants` retention windows |
+| C | 4b | Rate-limit trip |
+| D | 4b | `maxSilentTime` kill |
+| E | 4b | `rio-cli` smoke |
+| F | 4c | Cancel timing: metric + cgroup cleanup |
+| G | 4c | NetPol egress block |
+| H | 4c | `WorkerPoolSet` reconcile + cascade delete |
+| I | 4c | Security: binary cache auth 401→200, mTLS no-cert rejection |
+| J | 4c | 50-derivation load scenario |
+
+`nix/tests/phase4-fod.nix` is standalone (4c only).
+
 ## Milestone
 
-All three sub-phase milestones pass. `ci-fast` aggregate includes `vm-phase4` and `vm-phase4-fod`. Grafana dashboards render against a live cluster. `rio-cli status/workers/builds/gc` works against a Helm-deployed cluster.
+All three sub-phase milestones pass. `ci-fast` aggregate includes `vm-phase4` (all sections A–J) and `vm-phase4-fod`. Grafana dashboards render against the `vm-phase4` Prometheus. `rio-cli status/workers/builds/gc/cutoffs` works against the `vm-phase4` scheduler. `helm install --dry-run` renders without errors.
+
+**Manual post-phase verification:** Deploy the Helm chart to a real (non-VM) k8s cluster, seed a tenant, run `rio-cli status` — documented procedure in `docs/src/capacity-planning.md`, not in the CI gate.

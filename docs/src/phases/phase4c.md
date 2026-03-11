@@ -4,7 +4,7 @@
 
 **Implements:** [ADR-015](../decisions/015-size-class-routing.md) (`CutoffRebalancer` + `WorkerPoolSet` CRD), [Capacity Planning](../capacity-planning.md) (declarative size-class pools), [Verification](../verification.md) (criterion benchmarks + VM test matrix)
 
-> **Depends on Phase 4a/4b:** `CutoffRebalancer` writes to `build_samples` (needs migration 009 chain). `GetSizeClassStatus` RPC shares the admin-RPC pattern from 4a. VM tests exercise rate limiting (4b), GC automation (4b), and tenant smoke (4a).
+> **Depends on Phase 4a/4b:** `CutoffRebalancer` writes to `build_samples` (needs migration 009 chain). `GetSizeClassStatus` RPC follows the `ClusterSnapshot` ActorCommand pattern from 4a's `ListWorkers`. `rio-cli cutoffs`/`wps` subcommands extend the 4b `rio-cli` crate. `nix/tests/phase4.nix` was created in 4a (Section A) and extended in 4b (Sections B–E); 4c appends Sections F–J.
 
 ## Tasks
 
@@ -33,36 +33,36 @@
 - [ ] **Per-class autoscaler** (`rio-controller/src/scaling.rs` extension) — call `GetSizeClassStatus`, apply existing `compute_desired(queued, target, min, max)` per child pool. Separate SSA field manager `"rio-controller-wps-autoscaler"` (pattern at `scaling.rs:338`). Skip pools being deleted (skip-deleting guard at `scaling.rs:227-230`).
 - [ ] Wire third `Controller` in `main.rs` with `.owns(Api::<WorkerPool>::all(...))` + `tokio::join!` → `join3`.
 - [ ] RBAC: add `workerpoolsets` resource to `deploy/base/rbac.yaml`. Regenerate `deploy/base/crds.yaml`.
-- [ ] `rio-cli cutoffs` + `rio-cli wps` subcommands.
-- [ ] VM test: apply a `WorkerPoolSet` CR → controller creates 3 child `WorkerPool` CRs with correct `sizeClass` + ownerRef → delete WPS → children deleted via ownerRef GC cascade.
+- [ ] **Extend 4b `rio-cli` crate** with new subcommands: `cutoffs` (calls `GetSizeClassStatus`, prints table of `name | configured_cutoff | effective_cutoff | queued | running | samples`) and `wps` (kubectl-style `get`/`describe` via kube-rs, shows `WorkerPoolSet` CRs + child `WorkerPool` status). New `src/cutoffs.rs` + `src/wps.rs`, wire into `main.rs` clap dispatch.
 
 ### VM tests (D6: E + D in scope)
 
 - [ ] **phase3a section E (PDB)** — extend `nix/tests/phase3a.nix` (~25 lines). Assert controller-managed PDB `{pool}-pdb` exists with `maxUnavailable: 1` + ownerRef points to `WorkerPool`. Delete `WorkerPool` → PDB GC'd via ownerRef.
-- [ ] **`nix/tests/phase4.nix`** — new test file, 4 VMs (control + k8s + worker + client):
-  - Section A: tenant smoke (from 4a milestone).
-  - Section B: NetPol egress block — k3s bundled kube-router (current config doesn't `--disable-network-policy`). Assert `kubectl exec worker curl 169.254.169.254` → blocked, `curl 1.1.1.1:80` → blocked. If kube-router doesn't enforce: fallback to Calico with image preload. **NetPol ingress filtering SKIPPED** — scheduler/store aren't pods in this topology (systemd on `control` VM), so `podSelector` matches nothing. Document in test comment.
-  - Section C: GC schedule smoke + rate limit trip + `maxSilentTime` kill (all from 4b).
-  - Section D: A1 cancel timing — submit a slow build, cancel mid-run, assert `rio_scheduler_cancel_signals_total` increments AND worker's cgroup is gone within 5s.
-  - Section E: `rio-cli` smoke against the live scheduler (`status`, `workers`, `builds`, `gc --dry-run`).
-  - Section F: `WorkerPoolSet` full flow.
-  - Section G: load scenario — 50-derivation DAG, assert completion + Prometheus scrape shows `rio_scheduler_derivations_completed_total >= 50`.
+- [ ] **Pre-verify kube-router NetPol enforcement** before committing to the phase4 NetPol test design: add a one-off assertion to `vm-phase3a` (or run `nix-build-remote -- .#checks.x86_64-linux.vm-phase3a.driverInteractive` manually) that applies a deny-all egress `NetworkPolicy` and checks `kubectl exec {worker-pod} curl 1.1.1.1` is blocked. If kube-router **does** enforce → Section G below uses stock k3s. If it does **not** → Section G preloads `docker.io/calico/node` + `calico/cni` images and runs k3s with `--flannel-backend=none --disable-network-policy` then applies a Calico manifest. Decide this before writing Section G.
+- [ ] **Append to `nix/tests/phase4.nix`** (created in 4a, extended in 4b with Sections B–E):
+  - Section F: cancel timing — submit a slow build, `CancelBuild` mid-run, assert `rio_scheduler_cancel_signals_total` increments AND worker's cgroup is gone within 5s.
+  - Section G: NetPol egress block (design per pre-verify result above) — apply `deploy/overlays/prod/networkpolicy.yaml`, assert `kubectl exec {worker-pod} curl 169.254.169.254` → blocked, `curl 1.1.1.1:80` → blocked. **NetPol ingress filtering SKIPPED** — scheduler/store are systemd services on the `control` VM, not pods, so `podSelector` matches nothing. Documented in test comment + Phase 5 deferral.
+  - Section H: `WorkerPoolSet` full flow — apply WPS CR → controller creates 3 child `WorkerPool` CRs with correct `sizeClass` + ownerRef → delete WPS → children cascaded via ownerRef GC.
+  - Section I: security — (i) binary cache auth: unauthenticated `curl /{storePathHash}.narinfo` → 401, with Bearer token from `tenants` seed → 200; (ii) mTLS rejection: gRPC `QueryPathInfo` with no client cert → TLS handshake fails (connection refused at the transport layer, not a gRPC status).
+  - Section J: load scenario — 50-derivation DAG, assert completion + Prometheus scrape shows `rio_scheduler_derivations_completed_total >= 50`.
 - [ ] **`nix/tests/phase4-fod.nix`** — new test file (~200 lines). Squid as a k8s pod (tests the production `fod-proxy.yaml` manifest directly). Local HTTP origin (busybox httpd pod) for airgap-safe fetch. ConfigMap patch adds the local origin to the Squid allowlist. Assertions: FOD fetching allowlisted hostname → success + Squid access log shows the request; FOD fetching non-allowlisted → fails with `TCP_DENIED/403` in Squid log; non-FOD derivation → no `http_proxy` env set. New `dockerImages.squid` in `flake.nix` (~25 lines).
-- [ ] Add `vm-phase4` and `vm-phase4-fod` to the `ci-fast` aggregate.
+- [ ] Register `vm-phase4-fod` in `flake.nix`. Add both `vm-phase4` (registered in 4a) and `vm-phase4-fod` to the `ci-fast` aggregate.
 
 ### Grafana + benchmarks
 
 - [ ] **Grafana dashboard JSONs** (`deploy/grafana/`): Build Overview (active builds, completion rate, p50/p99 duration), Worker Utilization (per-class replicas, CPU/memory gauges, queue depth), Store Health (cache hit rate, GC sweep size, S3 latency), Scheduler (dispatch latency, ready-queue depth, backstop timeouts, cancel signals).
-- [ ] **`rio-bench` crate** — criterion benches. Synthetic DAG generators: linear(N), binary-tree(depth), shared-diamond(N, shared_fraction). Benches: SubmitBuild latency at N∈{1,10,100,1000}; dispatch throughput (derivations/sec through a mocked worker channel). Add `rio-bench` to `flake.nix` packages + a `nix run .#bench` alias.
+- [ ] **`rio-bench` crate** — `criterion` (add to `[workspace.dependencies]` as a dev-dep) benches. Synthetic DAG generators: linear(N), binary-tree(depth), shared-diamond(N, shared_fraction). Benches: SubmitBuild latency at N∈{1,10,100,1000}; dispatch throughput (derivations/sec through a mocked worker channel). Add `rio-bench` to `flake.nix` packages + a `nix run .#bench` alias.
 - [ ] Hydra comparison: documented manual procedure in `docs/src/capacity-planning.md` — equivalent hardware, same nixpkgs revision, wall-clock + CPU-seconds.
 
 ### Small deferrals + doc sync
 
 - [ ] **Custom seccomp profile** (`deploy/base/seccomp-rio-worker.json`) — `Localhost` profile denying `ptrace`, `bpf`, `setns`, `process_vm_readv`, `process_vm_writev` under `CAP_SYS_ADMIN`. Add `seccomp_profile: Option<SeccompProfileKind>` to `WorkerPoolSpec` (default `RuntimeDefault`, option for `Localhost` with path). Closes `security.md:53,173,175` Phase 4 tracking.
 - [ ] **`BuildStatus` fine-grained conditions** — wire `Scheduled`/`InputsResolved`/`Building` conditions in the Build reconciler's `drain_stream` event handler (`controller.md:30,43` deferral). `criticalPathRemaining` + `workers` fields in `BuildStatus` require a `BuildEvent` proto extension — include if straightforward, else defer the fields (not the conditions) to Phase 5.
-- [ ] **CN-list config + SAN check for HMAC bypass** — currently only `CN=rio-gateway` bypasses (Phase 3b X1 fix). Add `bypass_cns: Vec<String>` to store config + check SAN entries alongside CN. Allows multi-gateway deployments with distinct certs.
+- [ ] **CN-list config + SAN check for HMAC bypass** (`rio-store/src/grpc/put_path.rs:65-80`) — currently only `CN=rio-gateway` bypasses (Phase 3b X1 fix, hardcoded string compare). Add `hmac_bypass_cns: Vec<String>` to store config (default `["rio-gateway"]`). Extend the cert-parse block to also check `subjectAltName` (OID 2.5.29.17) DNS entries alongside CN — `x509-parser`'s `TbsCertificate::subject_alternative_name()` returns `Option<&ParsedExtension>`; match `GeneralName::DNSName` variants against the allowlist. Allows multi-gateway deployments with distinct certs.
 - [ ] **scopeguard for `cas.rs` inflight-leak** (`rio-store/src/cas.rs:564`) — wrap `inflight.insert` + remove in a scopeguard so a cancelled `get` future doesn't leak the in-flight marker. Theoretical today (the sustained-cancellation scenario hasn't been observed), but cheap to close.
 - [ ] **cgroup bind-remount test** (`rio-worker/src/cgroup.rs:301` TODO) — the rw-remount path is unreachable under `privileged: true` (containerd mounts rw already). Add a unit test that exercises it directly, or defer to a future non-privileged + device-plugin VM test (ADR-012). Low priority.
+- [ ] **`__noChroot` gateway pre-check** — `verification.md:69` lists this as Phase 4/5. Parse the derivation's env for `__noChroot = "1"` at `wopBuildDerivation`/`wopBuildPathsWithResults` time and reject with `STDERR_ERROR` before forwarding to the scheduler. nix-daemon's sandbox already enforces this at build time, but gateway-level rejection gives a faster, clearer error. Small addition to `rio-gateway/src/handler/opcodes_build.rs` — check `drv.env().get("__noChroot")` after ATerm parse.
+- [ ] **Cross-tenant AdminService isolation test** — `verification.md:63` lists "tenant A cannot query tenant B's builds via AdminService" as a Phase 4 security test. Add a unit test in `rio-scheduler/src/admin/tests.rs`: seed two tenants + two builds, call `ListBuilds` with tenant A's UUID filter → only tenant A's build returned. The 4a `ListBuilds` task already has "tenant filter"; this adds the **verification** that the filter actually isolates.
 - [ ] **Doc sync** — sweep all `> **Phase 4 deferral:**` blocks and update or remove:
   - `errors.md:75` — poison PG persistence IS done (migration 004 `failed_workers TEXT[]`). Only `poisoned_at` was in-memory until 4a.
   - `errors.md:87,97` — `ClearPoison` + per-build timeout implemented.
@@ -78,9 +78,10 @@
   - `challenges.md:73,100,138` — FUSE circuit breaker + WPS shipped. Staggered scheduling stays deferred.
   - `failure-modes.md:52` — FUSE timeout + breaker implemented.
   - `verification.md:10,83,94` — criterion benches wired (chunk 10). Multi-version Nix matrix + `cargo-mutants` + chaos harness stay deferred.
+  - `verification.md:68-73` — update the "Phase 4/5 deferral" block: `__noChroot` rejection implemented (this phase), mTLS rejection tested (Section I), FOD proxy tested (`phase4-fod.nix`), binary cache auth tested (Section I). Only JWT (Phase 5) remains.
   - `security.md:53,173,175` — custom seccomp implemented.
 - [ ] Update `docs/src/contributing.md:85` to reference `phase4c` / `TODO(phase5)`.
-- [ ] Add tracey `r[...]` markers for new behaviors: `sched.tenant.resolve`, `sched.rebalancer.sita-e`, `worker.refs.nar-scan`, `ctrl.wps.reconcile`, `ctrl.wps.autoscale`, `worker.circuit.fuse`, `worker.silence.kill`.
+- [ ] Add tracey `r[...]` markers + `r[impl]`/`r[verify]` annotations for **4c-specific** behaviors (4a/4b markers land in their own sub-phases): `sched.rebalancer.sita-e`, `sched.rebalancer.cpu-bump`, `ctrl.wps.reconcile`, `ctrl.wps.autoscale`, `ctrl.wps.cutoff-status`, `gw.reject.nochroot`, `store.hmac.san-bypass`, `worker.seccomp.localhost-profile`.
 - [ ] Mark all phase4 tasks `[x]` across `phase4a.md`/`phase4b.md`/`phase4c.md`.
 
 ## Carried-forward TODOs (resolved)

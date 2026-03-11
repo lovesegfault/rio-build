@@ -25,11 +25,11 @@
 - [ ] `SchedulerDb::resolve_tenant(name: &str) -> Result<Option<Uuid>>` — PG lookup by `tenant_name`.
 - [ ] Replace `parse::<Uuid>()` at `rio-scheduler/src/grpc/mod.rs:~364` with `resolve_tenant` call. Unknown tenant → `Status::invalid_argument("unknown tenant: {name}")`. Empty string → `None` (unauthenticated/single-tenant mode).
 - [ ] Change `BuildInfo.tenant_id` type from `Option<String>` to `Option<Uuid>` (`rio-scheduler/src/state/build.rs:91`) — scheduler was already parsing as UUID but storing the string.
-- [ ] **Gateway: capture tenant name from SSH key comment** — `PublicKey::comment()` (ssh-key crate preserves comments). Store on `ConnectionHandler`, plumb through `SessionContext.tenant_name: String`, pass to `build_submit_request` (`rio-gateway/src/translate.rs:544`).
+- [ ] **Gateway: capture tenant name from SSH key comment** — the comment lives in the **server-side `authorized_keys` entry**, NOT the client's key (the client sends raw key data only). Change `auth_publickey` (`rio-gateway/src/server.rs:205`) from `.any(|authorized| authorized.key_data() == key.key_data())` to `.find(...)` and call `.comment()` on the **matched authorized entry**. Store as `ConnectionHandler.tenant_name: Option<String>` (new field). Plumb through `channel_open_session` → `session::run()` spawn → `SessionContext::new()` (new `tenant_name: Option<String>` parameter + field) → `build_submit_request` (`rio-gateway/src/translate.rs:544`). Empty comment = `None` = single-tenant mode.
 - [ ] Add `tenant_name` to gateway log span fields (`observability.md:269` span-field row is currently marked Phase 4+).
 - [ ] **Binary cache auth middleware** (`rio-store/src/cache_server/auth.rs`) — Bearer token or netrc-compatible. See `docs/src/components/store.md:156` deferral block. Token→tenant mapping via `tenants` table. Unauthenticated access must be an explicit opt-in.
 - [ ] `ListTenants`/`CreateTenant` admin RPCs (`rio-proto/proto/admin.proto` + scheduler handler + db helpers).
-- [ ] `x-rio-tenant` gRPC metadata helper in `rio-proto` — scheduler writes resolved UUID to metadata for downstream propagation (span fields, future per-tenant filtering).
+- [ ] `tenant_id` span field on scheduler handlers — once `resolve_tenant` returns a UUID, attach it to the `SubmitBuild`/`WatchBuild`/`CancelBuild` handler spans (`observability.md:269`). No gRPC metadata helper needed in Phase 4 (no downstream consumer — store stays tenant-unaware per D4; worker doesn't need tenant for execution).
 
 ### Admin RPCs + poison persistence
 
@@ -39,7 +39,15 @@
 - [ ] **Implement `ListWorkers`** (`rio-scheduler/src/admin/mod.rs:406` stub) — new `ListWorkers` ActorCommand returning snapshot of `WorkerState` map. Response includes `worker_id`, `size_class`, `draining`, `running_builds.len()`, `connected_since`, `last_resources`.
 - [ ] **Implement `ListBuilds`** (`:413` stub) — PG query on `builds` with tenant filter. Paginated (`limit`, `cursor` by `submitted_at`).
 - [ ] **Implement `ClearPoison`** (`:567` stub) — `ClearPoison(drv_hash)` ActorCommand → removes from in-memory `poisoned` set + `db.clear_poison(drv_hash)`.
-- [ ] `ClusterStatus.store_size_bytes` via a slow-refresh background task (60s poll, `AtomicU64` read by the handler). NOT inline in the handler (`admin/mod.rs:353` TODO) — keeps `ClusterStatus` fast for the autoscaler's 30s poll.
+- [ ] `ClusterStatus.store_size_bytes` via a slow-refresh background task (60s poll, `AtomicU64` read by the handler). NOT inline in the handler (`admin/mod.rs:353` TODO) — keeps `ClusterStatus` fast for the autoscaler's 30s poll. **Source: direct PG query** (`SELECT COALESCE(SUM(nar_size), 0) FROM narinfo`) — scheduler already has a pool to the shared DB; no new store RPC needed. Follows the `scheduler_live_pins` cross-layer precedent.
+
+### VM test scaffolding
+
+- [ ] **Create `nix/tests/phase4.nix`** with Section A only (tenant smoke). Register as `vm-phase4` in `flake.nix` (`withMinCpu 4`, `k3sArgs` — same shape as `vm-phase3a`). Later sub-phases append sections B–J (see section map in `phase4.md`). Section A: SSH key with comment `team-test` → `SubmitBuild` → PG `builds` row has `tenant_id` matching a pre-seeded `tenants` row; second key with no comment → `tenant_id IS NULL`.
+
+### Tracey markers
+
+- [ ] Add spec `r[...]` markers + `r[impl]`/`r[verify]` annotations for 4a behaviors: `sched.tenant.resolve`, `gw.auth.tenant-from-key-comment`, `store.cache.auth-bearer`, `sched.admin.list-workers`, `sched.admin.list-builds`, `sched.admin.clear-poison`, `sched.poison.ttl-persist`, `sched.trace.assignment-traceparent`.
 
 ## Carried-forward TODOs (resolved)
 
@@ -57,4 +65,4 @@
 
 `nix develop -c cargo nextest run` passes with new tests for: metric name (assert the right counter increments), tenant resolution (known name → UUID row, unknown → `InvalidArgument`, empty → `None`), `ListWorkers` snapshot shape, `ClearPoison` clears both in-mem and PG.
 
-`vm-phase4` first section (tenant smoke) passes: SSH key with comment `team-test` → build row has `tenant_id` matching the pre-seeded `tenants` row.
+`nix-build-remote -- .#checks.x86_64-linux.vm-phase4` passes (Section A: tenant smoke).
