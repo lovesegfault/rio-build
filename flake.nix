@@ -316,7 +316,12 @@
             # separate top-level attr.
             nextest =
               let
-                junit = craneLib.cargoNextest (
+                # Base nextest derivation — crane's stock cargoNextest.
+                # The exit-code-capture wrap is applied via overrideAttrs
+                # below because cargoNextest hardcodes its own
+                # checkPhaseCargoCommand (passing one in args is silently
+                # overwritten by the //-merge order in crane's impl).
+                base = craneLib.cargoNextest (
                   commonArgs
                   // {
                     inherit cargoArtifacts;
@@ -332,20 +337,29 @@
                     # Golden fixture paths (golden/daemon.rs reads these env vars).
                     RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
                     RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-                    # Capture exit code, emit JUnit + status, always succeed.
-                    # nextest's --profile ci writes JUnit even on test failure
-                    # (path from .config/nextest.toml profile.ci.junit.path).
-                    checkPhaseCargoCommand = ''
-                      set +e
-                      cargoWithProfile nextest run \
-                        --no-tests=warn --profile ci \
-                        ''${cargoExtraArgs:-}
-                      echo $? > $out/status
-                      set -e
-                      cp target/nextest/ci/junit.xml $out/ 2>/dev/null || true
-                    '';
+                    # Force hermetic golden mode — the ARC runner's Nix
+                    # sandbox is disabled (non-privileged container can't
+                    # create user namespaces), so /nix/var/nix/db leaks
+                    # into the build. The test's filesystem-based
+                    # hermetic-detection sees the db, tries to symlink it,
+                    # daemon crashes on the locked/permission-denied file.
+                    RIO_GOLDEN_FORCE_HERMETIC = "1";
                   }
                 );
+                # Wrap checkPhase: capture nextest exit, emit JUnit +
+                # status, ALWAYS exit 0. nextest's --profile ci writes
+                # JUnit even on test failure.
+                junit = base.overrideAttrs (old: {
+                  checkPhase = ''
+                    runHook preCheck
+                    set +e
+                    ${old.checkPhaseCargoCommand or "cargoWithProfile nextest run --no-tests=warn --profile ci"}
+                    echo $? > $out/status
+                    set -e
+                    cp target/nextest/ci/junit.xml $out/ 2>/dev/null || true
+                    runHook postCheck
+                  '';
+                });
               in
               pkgs.runCommand "rio-nextest" { passthru = { inherit junit; }; } ''
                 status=$(cat ${junit}/status)
@@ -448,6 +462,8 @@
                 dontFixup = true;
                 RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
                 RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+                # See the nextest check above — same sandbox-detection bypass.
+                RIO_GOLDEN_FORCE_HERMETIC = "1";
               }
             );
           };

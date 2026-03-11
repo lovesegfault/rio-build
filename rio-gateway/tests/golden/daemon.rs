@@ -568,7 +568,13 @@ pub fn query_path_info_json(store_path: &str) -> StorePathEntry {
     // the daemon symlinks the real db and knows the REAL deriver/sigs,
     // so we must query via `nix path-info` to match. This condition
     // mirrors the linked_db check in start_local_daemon().
-    let hermetic = !std::path::Path::new("/nix/var/nix/db").exists();
+    //
+    // RIO_GOLDEN_FORCE_HERMETIC: escape hatch for CI environments where
+    // /nix/var/nix/db exists but is unusable (e.g. ARC runner containers
+    // with sandbox disabled — the db is visible but locked by the host
+    // daemon). flake.nix sets this in the nextest check derivation.
+    let hermetic = std::env::var_os("RIO_GOLDEN_FORCE_HERMETIC").is_some()
+        || !std::path::Path::new("/nix/var/nix/db").exists();
     let is_fixture = std::env::var("RIO_GOLDEN_TEST_PATH")
         .map(|p| p == store_path)
         .unwrap_or(false)
@@ -716,9 +722,11 @@ pub fn start_local_daemon() -> (String, DaemonGuard) {
 
     // Symlink real store state into the temp dir (skip daemon-socket and gc-socket).
     // In hermetic sandboxes this loop is a no-op (/nix/var/nix absent).
+    // RIO_GOLDEN_FORCE_HERMETIC skips symlinking — see query_path_info_json.
     let real_state = std::path::Path::new("/nix/var/nix");
+    let force_hermetic = std::env::var_os("RIO_GOLDEN_FORCE_HERMETIC").is_some();
     let mut linked_db = false;
-    if let Ok(entries) = std::fs::read_dir(real_state) {
+    if !force_hermetic && let Ok(entries) = std::fs::read_dir(real_state) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
