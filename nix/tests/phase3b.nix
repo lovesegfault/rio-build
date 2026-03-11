@@ -411,6 +411,14 @@ pkgs.testers.runNixOSTest {
     # k3s boots in parallel; wait for its kubeconfig.
     k8s.wait_for_unit("k3s.service")
     k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
+    # Airgap image import (services.k3s.images) is a separate oneshot
+    # — NOT part of k3s.service startup. On slow storage (ARC runner
+    # EBS), pods schedule before import completes → ErrImagePull on
+    # the pause container → kube-system noise + possible cascade.
+    k8s.wait_until_succeeds(
+        "k3s ctr images ls -q | grep -q pause",
+        timeout=120
+    )
     k8s.wait_until_succeeds("k3s kubectl get ns default", timeout=60)
 
     # Copy kubeconfig. Rewrite 127.0.0.1 → k8s (--tls-san k8s set

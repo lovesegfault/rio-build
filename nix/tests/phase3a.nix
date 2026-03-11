@@ -265,6 +265,15 @@ pkgs.testers.runNixOSTest {
     # fails on connect, RestartSec=5 retries. By the time we
     # check below, it should be up.
     k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
+    # Airgap image import (services.k3s.images) runs as a separate
+    # oneshot unit — NOT part of k3s.service startup. On slow
+    # storage (ARC runner EBS vs nixbuild.net NVMe), pods try to
+    # schedule before import completes → ErrImagePull on the pause
+    # container. Wait explicitly for the pause image to appear.
+    k8s.wait_until_succeeds(
+        "k3s ctr images ls -q | grep -q pause",
+        timeout=120
+    )
 
     # ── Lease leader election smoke ────────────────────────────────
     # The scheduler on `control` has lease config pointing at
