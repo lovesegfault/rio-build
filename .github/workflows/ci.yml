@@ -61,21 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
-      # nextest: build the `.junit` passthru first (always succeeds —
-      # runs tests, writes junit.xml + status file). The gate build
-      # below then reads status and fails if tests failed. This gets
-      # us JUnit even on test failure (Nix discards $out on non-zero
-      # exit, so a failing-derivation can't emit artifacts).
-      - name: Build JUnit (nextest only)
-        if: matrix.name == 'nextest'
-        run: nix build ".#${GHA}.matrix.checks.nextest.junit" -o result-junit --print-build-logs
       - run: nix build ".#${GHA}.matrix.checks.${{ matrix.name }}" --print-build-logs
-      - uses: codecov/codecov-action@v5
-        if: always() && matrix.name == 'nextest'
-        with:
-          report_type: test_results
-          files: result-junit/junit.xml
-          use_oidc: true
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
