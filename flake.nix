@@ -321,6 +321,12 @@
                 # crashes. This env var bypasses detection; tests take
                 # the precompute-metadata path unconditionally.
                 RIO_GOLDEN_FORCE_HERMETIC = "1";
+                # Nix's log prefix wrapper (`rio-nextest> ...`) turns
+                # the progress bar into one-line-per-tick spam. `auto`
+                # should detect non-TTY but nix's stderr pipe confuses
+                # the heuristic. (`show-progress` is user-config-only,
+                # can't set it in .config/nextest.toml.)
+                NEXTEST_HIDE_PROGRESS_BAR = "1";
               }
             );
             doc = craneLib.cargoDoc (
@@ -415,8 +421,10 @@
                 dontFixup = true;
                 RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
                 RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-                # See the nextest check above — same sandbox-detection bypass.
+                # See the nextest check above — same sandbox-detection bypass
+                # and progress-bar suppression.
                 RIO_GOLDEN_FORCE_HERMETIC = "1";
+                NEXTEST_HIDE_PROGRESS_BAR = "1";
               }
             );
           };
