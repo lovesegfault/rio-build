@@ -52,6 +52,43 @@ fn cert_cn(der: &[u8]) -> Option<String> {
 }
 
 impl StoreServiceImpl {
+    /// Try to verify an `x-rio-oidc-token` metadata header.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if OIDC token is present and valid → caller skips HMAC
+    /// - `Ok(false)` if no OIDC token or no OIDC verifier → fall through to HMAC
+    /// - `Err(PERMISSION_DENIED)` if OIDC token is present but invalid
+    async fn try_verify_oidc_token<T>(&self, request: &Request<T>) -> Result<bool, Status> {
+        let Some(verifier) = &self.oidc_verifier else {
+            return Ok(false);
+        };
+
+        let Some(token) = request
+            .metadata()
+            .get("x-rio-oidc-token")
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok(false);
+        };
+
+        match verifier.verify(token).await {
+            Ok(claims) => {
+                debug!(
+                    issuer = %claims.issuer,
+                    subject = %claims.subject,
+                    "PutPath: OIDC token verified"
+                );
+                metrics::counter!("rio_store_oidc_accepted_total").increment(1);
+                Ok(true)
+            }
+            Err(e) => {
+                warn!(error = %e, "PutPath: OIDC token verification failed");
+                metrics::counter!("rio_store_oidc_rejected_total").increment(1);
+                Err(Status::permission_denied(format!("OIDC token: {e}")))
+            }
+        }
+    }
+
     /// Verify the `x-rio-assignment-token` metadata header.
     ///
     /// Returns:
@@ -157,13 +194,25 @@ impl StoreServiceImpl {
                 .record(start.elapsed().as_secs_f64());
         });
 
+        // Auth check BEFORE into_inner (need metadata access).
+        //
+        // Priority:
+        // 1. x-rio-oidc-token present + OIDC verifier configured → validate JWT,
+        //    no path restriction (external push from CI)
+        // 2. x-rio-assignment-token present + HMAC verifier configured → validate
+        //    HMAC, check expected_outputs (internal worker push)
+        // 3. mTLS CN=rio-gateway → accept, no path restriction
+        // 4. No verifier configured → accept (dev mode)
+        // 5. Verifier configured, no token → reject PERMISSION_DENIED
+        let oidc_authenticated = self.try_verify_oidc_token(&request).await?;
+
         // r[impl sec.boundary.grpc-hmac]
-        // HMAC token check BEFORE into_inner (need metadata access).
-        // If verifier=None (dev mode): no-op, claims stays None.
-        // If verifier=Some: token required + valid → claims Some,
-        // OR mTLS bypass (gateway cert) → claims None (no path
-        // restriction for gateway uploads).
-        let hmac_claims = self.verify_assignment_token(&request)?;
+        // HMAC token check. Skipped if OIDC already authenticated.
+        let hmac_claims = if oidc_authenticated {
+            None
+        } else {
+            self.verify_assignment_token(&request)?
+        };
 
         let mut stream = request.into_inner();
 

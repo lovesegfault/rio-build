@@ -44,6 +44,21 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
 | `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token verification on PutPath. Env: `RIO_HMAC_KEY_PATH`. Same file as scheduler. None = no token verification (dev mode). |
+| `oidc_providers` | list | `[]` | OIDC providers for external push authentication. Empty = OIDC disabled. See below. |
+
+`oidc_providers` TOML syntax (list of tables):
+
+```toml
+[[oidc_providers]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "rio-store"
+[oidc_providers.bound_claims]
+repository_owner = "myorg"
+```
+
+Each provider specifies an `issuer` (must match the JWT `iss` claim exactly), an `audience` (checked against `aud`), and optional `bound_claims` (string key-value pairs that must match in the token). JWKS keys are fetched from `{issuer}/.well-known/openid-configuration` and cached for 1 hour.
+
+When a `PutPath` request includes an `x-rio-oidc-token` metadata header and the token validates against a configured provider, the upload is accepted without HMAC or path restrictions. This enables external CI environments (GitHub Actions, GitLab CI) to push pre-built closures directly.
 
 `chunk_backend` TOML syntax (tagged enum):
 

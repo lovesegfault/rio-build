@@ -130,6 +130,8 @@ r[obs.metric.store]
 | `rio_store_chunk_cache_misses_total` | Counter | moka chunk cache misses |
 | `rio_store_hmac_rejected_total` | Counter | PutPath calls rejected by HMAC verifier (bad signature, expired, path not in `expected_outputs`). Alert if rate > 0: indicates misconfiguration or compromise attempt. |
 | `rio_store_hmac_bypass_total` | Counter | PutPath calls that skipped HMAC verification via mTLS CN bypass (labeled by `cn`). Expected `cn="rio-gateway"` only. |
+| `rio_store_oidc_accepted_total` | Counter | PutPath calls authenticated via OIDC token. |
+| `rio_store_oidc_rejected_total` | Counter | PutPath calls with invalid OIDC token (bad signature, expired, issuer mismatch, bound claim mismatch). Alert if rate > 0 alongside `hmac_rejected`: possible misconfiguration or attack. |
 | `rio_store_gc_path_resurrected_total` | Counter | Paths skipped by GC sweep because a reference appeared between mark and sweep (sweep's per-path reference re-check caught it). |
 | `rio_store_gc_chunk_resurrected_total` | Counter | S3 deletes skipped by the drain task because chunk refcount re-check found the chunk back in use (TOCTOU guard via `pending_s3_deletes.blake3_hash`). |
 | `rio_store_s3_deletes_pending` | Gauge | Rows in `pending_s3_deletes` with `attempts < 10`. Normal operation: near-zero. |
