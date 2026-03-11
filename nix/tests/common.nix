@@ -468,7 +468,12 @@ rec {
           "k8s"
         ];
         # Airgap: NixOS test VMs have no internet. Preload k3s's
-        # own pod images + any caller-provided ones.
+        # own pod images + any caller-provided ones. Note: `ctr
+        # images import` runs as a separate oneshot unit AFTER
+        # k3s.service starts — on slow storage (ARC runner EBS),
+        # pods may try to schedule before import completes and
+        # ErrImagePull. The testScript should wait for import via
+        # `k3s ctr images ls | grep -q pause` before proceeding.
         images = [ config.services.k3s.package.airgap-images ] ++ extraK3sImages;
         inherit manifests;
       };
