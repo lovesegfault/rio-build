@@ -77,6 +77,24 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 
 > **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 2h). See [store: GC](./components/store.md#two-phase-garbage-collection).
 
+## Push
+
+`rio-push` is a standalone CLI for pushing Nix store path closures to rio-store from external environments (CI/CD pipelines, developer workstations). It discovers the closure, deduplicates against the store via `FindMissingPaths`, and uploads missing paths concurrently.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `store_addr` | string | `localhost:9002` | rio-store gRPC endpoint |
+| `concurrency` | usize | `8` | Maximum concurrent uploads |
+| `oidc_token` | string | (unset) | OIDC JWT token for authentication. Env: `RIO_OIDC_TOKEN`. |
+
+TLS is configured via the standard `tls.*` parameters (see [TLS / mTLS](#tls--mtls)).
+
+Usage:
+
+```bash
+rio-push --store-addr rio-store:9002 --oidc-token "$ACTIONS_ID_TOKEN" /nix/store/...-hello-1.0
+```
+
 ## Worker
 
 | Parameter | Type | Default | Description |

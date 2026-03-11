@@ -87,6 +87,7 @@ The controller is a supervisor that manages the lifecycle of all other component
 - **[rio-store](./components/store.md)** --- Chunked CAS, binary cache server
 - **[rio-worker](./components/worker.md)** --- Build executor with FUSE store
 - **[rio-controller](./components/controller.md)** --- Kubernetes operator
+- **rio-push** --- CLI for pushing Nix store path closures to rio-store
 - **[rio-proto](./components/proto.md)** --- gRPC service definitions
 - **rio-nix** --- Nix protocol implementation library (wire primitives, ATerm, NAR, store paths)
 - **rio-common** --- shared utilities (limits, bloom filter, observability init)
@@ -95,6 +96,8 @@ The controller is a supervisor that manages the lifecycle of all other component
 ```mermaid
 flowchart TB
     Client["Nix Client"] -->|ssh-ng| GW["rio-gateway"]
+    CI["CI (GitHub Actions, etc.)"] -->|gRPC + OIDC| Push["rio-push"]
+    Push -->|gRPC| Store
     GW -->|gRPC| Sched["rio-scheduler"]
     GW -->|gRPC| Store["rio-store"]
     W0["worker-0"] -->|BuildExecution stream| Sched

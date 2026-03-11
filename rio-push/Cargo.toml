@@ -1,0 +1,49 @@
+[package]
+name = "rio-push"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Push Nix store path closures to rio-store"
+
+[[bin]]
+name = "rio-push"
+path = "src/main.rs"
+
+[dependencies]
+rio-common = { workspace = true }
+rio-nix = { workspace = true }
+rio-proto = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+# Direct rustls for CryptoProvider::install_default().
+rustls = { workspace = true }
+
+# Crypto
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+# Encoding
+hex = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Config
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

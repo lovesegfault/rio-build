@@ -1,6 +1,6 @@
 # Crate Structure
 
-## Workspace Layout (9 crates)
+## Workspace Layout (10 crates)
 
 ```
 rio-build/
@@ -10,6 +10,7 @@ rio-build/
 ├── rio-proto/           # Protobuf/gRPC definitions
 ├── rio-test-support/    # Test harness (ephemeral PG, mock gRPC, wire helpers)
 ├── rio-gateway/         # SSH server + Nix worker protocol frontend
+├── rio-push/            # CLI to push Nix store path closures to rio-store
 ├── rio-scheduler/       # DAG-aware build scheduler
 ├── rio-store/           # NAR content-addressable store
 ├── rio-worker/          # Build executor + FUSE store
@@ -34,6 +35,7 @@ graph TD
     rio-gateway["rio-gateway<br/>(SSH, protocol handler)"]
     rio-worker["rio-worker<br/>(executor, FUSE, overlay)"]
     rio-controller["rio-controller<br/>(k8s operator, CRDs, autoscale)"]
+    rio-push["rio-push<br/>(CLI, closure push)"]
 
     rio-proto --> rio-nix
     rio-proto -.->|dev| rio-common
@@ -65,6 +67,10 @@ graph TD
     rio-controller --> rio-nix
     rio-controller --> rio-proto
     rio-controller --> rio-common
+
+    rio-push --> rio-nix
+    rio-push --> rio-proto
+    rio-push --> rio-common
 ```
 
 Solid edges are prod dependencies; dashed are `[dev-dependencies]` only.
@@ -293,6 +299,16 @@ src/
         ├── mod.rs     # WorkerPool reconcile: ensure STS/SVC/CM + drain finalizer
         ├── builders.rs # STS/Service/ConfigMap object builders (labels, volumes, envFrom)
         └── tests.rs
+```
+
+### rio-push — Closure push CLI
+
+```
+src/
+├── lib.rs
+├── main.rs            # CLI config parsing, closure discovery, concurrent upload
+├── nix.rs             # NixPathInfo (nix path-info --json), discover_closure, dump_nar
+└── upload.rs          # FindMissingPaths RPC, PutPath with OIDC token injection
 ```
 
 ### rio-test-support — Test harness
