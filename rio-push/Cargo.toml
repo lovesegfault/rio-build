@@ -47,3 +47,10 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rio-store = { workspace = true }
+rio-test-support = { workspace = true }
+rio-proto = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+anyhow = { workspace = true }
