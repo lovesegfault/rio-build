@@ -298,78 +298,31 @@
             # the check is hermetic (no network). Bump the flake inputs to
             # pick up new advisories.
             deny = craneLib.cargoDeny (commonArgs // { inherit cargoArtifacts; });
-            # Two-derivation nextest wrapper:
-            #   junit — runs nextest, ALWAYS succeeds, outputs junit.xml
-            #           + a `status` file containing the nextest exit code
-            #   gate  — fails iff status ≠ 0; this is the actual check
-            #
-            # Why: Nix discards $out on derivation failure. To preserve
-            # JUnit (which nextest writes even when tests fail), the test
-            # run itself must succeed as a derivation. The gate reads the
-            # captured exit code and fails, keeping CI pass/fail semantics.
-            #
-            # Workflow pattern (.github/workflows/ci.yml):
-            #   1. nix build .#...nextest.junit -o result-junit  (always succeeds)
-            #   2. nix build .#...nextest                        (fails if tests failed)
-            #   3. upload result-junit/junit.xml to Codecov      (runs always)
-            # `junit` is exposed via passthru — addressable without a
-            # separate top-level attr.
-            nextest =
-              let
-                # Base nextest derivation — crane's stock cargoNextest.
-                # The exit-code-capture wrap is applied via overrideAttrs
-                # below because cargoNextest hardcodes its own
-                # checkPhaseCargoCommand (passing one in args is silently
-                # overwritten by the //-merge order in crane's impl).
-                base = craneLib.cargoNextest (
-                  commonArgs
-                  // {
-                    inherit cargoArtifacts;
-                    pname = "rio-nextest-junit";
-                    # `--profile ci` enables retries + JUnit (.config/nextest.toml).
-                    # `--no-tests=warn`: workspace has leaf bins with no tests.
-                    cargoNextestExtraArgs = "--no-tests=warn --profile ci";
-                    nativeCheckInputs = with pkgs; [
-                      inputs.nix.packages.${system}.default
-                      openssh
-                      postgresql_18
-                    ];
-                    # Golden fixture paths (golden/daemon.rs reads these env vars).
-                    RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
-                    RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
-                    # Force hermetic golden mode — the ARC runner's Nix
-                    # sandbox is disabled (non-privileged container can't
-                    # create user namespaces), so /nix/var/nix/db leaks
-                    # into the build. The test's filesystem-based
-                    # hermetic-detection sees the db, tries to symlink it,
-                    # daemon crashes on the locked/permission-denied file.
-                    RIO_GOLDEN_FORCE_HERMETIC = "1";
-                  }
-                );
-                # Wrap checkPhase: capture nextest exit, emit JUnit +
-                # status, ALWAYS exit 0. nextest's --profile ci writes
-                # JUnit even on test failure.
-                junit = base.overrideAttrs (old: {
-                  checkPhase = ''
-                    runHook preCheck
-                    set +e
-                    ${old.checkPhaseCargoCommand or "cargoWithProfile nextest run --no-tests=warn --profile ci"}
-                    echo $? > $out/status
-                    set -e
-                    cp target/nextest/ci/junit.xml $out/ 2>/dev/null || true
-                    runHook postCheck
-                  '';
-                });
-              in
-              pkgs.runCommand "rio-nextest" { passthru = { inherit junit; }; } ''
-                status=$(cat ${junit}/status)
-                if [ "$status" != "0" ]; then
-                  echo "nextest failed (exit $status); JUnit at ${junit}/junit.xml"
-                  exit "$status"
-                fi
-                mkdir -p $out
-                ln -s ${junit} $out/junit
-              '';
+            nextest = craneLib.cargoNextest (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                # `--profile ci` enables retries + test-groups (.config/nextest.toml).
+                # `--no-tests=warn`: workspace has leaf bins with no tests.
+                cargoNextestExtraArgs = "--no-tests=warn --profile ci";
+                nativeCheckInputs = with pkgs; [
+                  inputs.nix.packages.${system}.default
+                  openssh
+                  postgresql_18
+                ];
+                # Golden fixture paths (golden/daemon.rs reads these env vars).
+                RIO_GOLDEN_TEST_PATH = "${goldenTestPath}";
+                RIO_GOLDEN_CA_PATH = "${goldenCaPath}";
+                # Force hermetic golden mode — on builders where the Nix
+                # sandbox is disabled or relaxed (e.g. early ARC runner
+                # config), /nix/var/nix/db can leak into the build. The
+                # test's filesystem-based hermetic-detection then tries
+                # to symlink the host's locked Nix db → spawned daemon
+                # crashes. This env var bypasses detection; tests take
+                # the precompute-metadata path unconditionally.
+                RIO_GOLDEN_FORCE_HERMETIC = "1";
+              }
+            );
             doc = craneLib.cargoDoc (
               commonArgs
               // {
