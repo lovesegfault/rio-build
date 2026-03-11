@@ -70,9 +70,10 @@ jobs:
         if: matrix.name == 'nextest'
         run: nix build ".#${GHA}.matrix.checks.nextest.junit" -o result-junit --print-build-logs
       - run: nix build ".#${GHA}.matrix.checks.${{ matrix.name }}" --print-build-logs
-      - uses: codecov/test-results-action@v1
+      - uses: codecov/codecov-action@v5
         if: always() && matrix.name == 'nextest'
         with:
+          report_type: test_results
           files: result-junit/junit.xml
           use_oidc: true
       - uses: ./.github/actions/niks3-push
