@@ -139,7 +139,6 @@ jobs:
   # doesn't, which is a well-known footgun — a skipped required
   # check silently passes).
   ci-gate:
-    name: CI gate
     if: always()
     needs: [gen-matrix, checks, fuzz-smoke, vm-test, coverage]
     runs-on: rio-ci
