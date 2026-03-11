@@ -145,6 +145,12 @@ jobs:
     runs-on: rio-ci
     timeout-minutes: 60
     steps:
+      # alls-green shells out to `python` (not `python3`); ARC's stock
+      # image has python3 but not the bare `python` symlink that GH-
+      # hosted runners ship. setup-python adds it (~5s).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - uses: re-actors/alls-green@release/v1
         with:
           jobs: ${{ toJSON(needs) }}
