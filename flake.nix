@@ -769,6 +769,25 @@
 
                 # Spec-coverage: `tracey query validate`, `tracey web`
                 traceyPkg
+
+                # Deploy tooling for infra/eks/. Large closures (awscli2
+                # pulls python3 + botocore) but the user asked for
+                # everything-in-one-shell over a separate .#deploy.
+                # Scripts under infra/eks/ also carry nix-shell shebangs
+                # pointing at these same packages, so they work even if
+                # someone runs them outside `nix develop`.
+                awscli2
+                # opentofu, not terraform: HashiCorp's BSL license makes
+                # pkgs.terraform unfree in nixpkgs. tofu is a drop-in
+                # replacement — same HCL, same provider registry. Scripts
+                # under infra/eks/ invoke `tofu`, not `terraform`.
+                opentofu
+                kubectl
+                skopeo # nix build .#docker-* | skopeo copy docker-archive:... docker://ECR
+                kubernetes-helm
+                grpcurl # manual AdminService poking when rio-cli isn't enough
+                jq # deploy.sh parses Secrets Manager JSON + terraform output
+                openssl # openssl rand 32 → HMAC key
               ];
               shellEnv = {
                 RUST_BACKTRACE = "1";
