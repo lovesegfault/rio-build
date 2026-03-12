@@ -51,12 +51,18 @@ use rio_nix::store_path::nixbase32;
 use crate::cas::ChunkCache;
 use crate::metadata::{self, ManifestKind};
 
+pub mod auth;
+
 /// Shared state for all routes. Wrapped in Arc for axum's State extractor.
 pub struct CacheServerState {
     pub pool: PgPool,
     /// Chunk cache for NAR reassembly. `None` = inline-only store;
     /// chunked paths will 500 (same precondition as GetPath).
     pub chunk_cache: Option<Arc<ChunkCache>>,
+    /// When `true`, requests with no `Authorization` header pass
+    /// through (single-tenant mode). Default `false` — Bearer
+    /// token required via the `tenants.cache_token` column.
+    pub allow_unauthenticated: bool,
 }
 
 /// Build the axum Router. Caller spawns it with axum::serve.
@@ -64,6 +70,10 @@ pub struct CacheServerState {
 /// Separate from the spawn so tests can get the Router and use
 /// axum-test helpers without binding a real port.
 pub fn router(state: Arc<CacheServerState>) -> Router {
+    let auth = auth::CacheAuth {
+        pool: state.pool.clone(),
+        allow_unauthenticated: state.allow_unauthenticated,
+    };
     Router::new()
         .route("/nix-cache-info", get(nix_cache_info))
         // {hash}.narinfo — the hash is 32 nixbase32 chars (store-path
@@ -71,6 +81,10 @@ pub fn router(state: Arc<CacheServerState>) -> Router {
         // we strip the `.narinfo` suffix in the handler.
         .route("/{filename}", get(narinfo))
         .route("/nar/{filename}", get(nar))
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            auth::auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -439,6 +453,9 @@ mod tests {
         let state = Arc::new(CacheServerState {
             pool: db.pool.clone(),
             chunk_cache: Some(cache),
+            // Tests use allow_unauthenticated — auth is tested
+            // separately in auth.rs.
+            allow_unauthenticated: true,
         });
         (router(state), db, backend)
     }
