@@ -19,11 +19,56 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    # helm + kubernetes providers: for cert-manager and
+    # aws-load-balancer-controller helm_release (addons.tf).
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
   }
 }
 
 provider "aws" {
   region = var.region
+}
+
+# K8s/Helm providers use `exec` auth (not a cached token) so
+# `tofu plan` on a fresh clone doesn't try to contact a cluster
+# that doesn't exist yet. The exec block defers token fetch to
+# apply time, and the token is always fresh (15min EKS token
+# lifetime means a cached token would expire mid-apply anyway).
+#
+# `depends_on` at the resource level (in addons.tf) makes the
+# helm_releases wait for module.eks — the provider block itself
+# can't have depends_on.
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
+    }
+  }
+}
+
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
+  }
 }
 
 data "aws_availability_zones" "available" {
