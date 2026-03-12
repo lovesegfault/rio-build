@@ -11,21 +11,6 @@ pub mod translate;
 
 pub use server::{GatewayServer, load_authorized_keys, load_or_generate_host_key};
 
-/// Whether to emit `rio trace_id: {hex}` via `STDERR_NEXT` after
-/// SubmitBuild. Set once from config in `main()`; read by the
-/// build handler. Default `true` via `.unwrap_or(true)` at read
-/// sites — tests can set `false` via `RIO_EMIT_TRACE_ID=false`.
-///
-/// `OnceLock` not `AtomicBool` — write-once-read-many, no updates
-/// after startup. Unset = test code that didn't call `init_emit_trace_id`,
-/// which should still get the default (true).
-pub static EMIT_TRACE_ID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// Set [`EMIT_TRACE_ID`] from config. Call once from `main()`.
-pub fn init_emit_trace_id(enabled: bool) {
-    let _ = EMIT_TRACE_ID.set(enabled);
-}
-
 /// Register `# HELP` descriptions for all gateway metrics.
 ///
 /// Call from `main()` immediately after `init_metrics()`. Without this,

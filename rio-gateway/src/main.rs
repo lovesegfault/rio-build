@@ -41,11 +41,6 @@ struct Config {
     /// = plaintext (dev mode). The gateway's INCOMING connections
     /// are SSH — TLS doesn't apply there.
     tls: rio_common::tls::TlsConfig,
-    /// Emit `rio trace_id: {hex}` via STDERR_NEXT after SubmitBuild.
-    /// Gives operators a grep handle for Tempo when debugging a
-    /// user's build. Default true; tests set `RIO_EMIT_TRACE_ID=false`
-    /// (figment merges env on top of gateway.toml).
-    emit_trace_id: bool,
 }
 
 impl Default for Config {
@@ -68,7 +63,6 @@ impl Default for Config {
             // pattern keeps it discoverable without a doc lookup.
             health_addr: "0.0.0.0:9190".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
-            emit_trace_id: true,
         }
     }
 }
@@ -127,7 +121,6 @@ async fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let cfg: Config = rio_common::config::load("gateway", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("gateway")?;
-    rio_gateway::init_emit_trace_id(cfg.emit_trace_id);
 
     // Initialize the process-global client TLS config BEFORE any
     // connect_* call. None (TLS unconfigured) → plaintext. Some →

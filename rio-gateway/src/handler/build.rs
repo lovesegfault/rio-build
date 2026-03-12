@@ -219,13 +219,12 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     active_build_ids.insert(build_id.clone(), 0);
 
     // Emit trace_id to the client via STDERR_NEXT — gives operators a
-    // grep handle for Tempo when debugging a user's build. Gated behind
-    // emit_trace_id config (default true; tests set RIO_EMIT_TRACE_ID=false).
-    if *crate::EMIT_TRACE_ID.get().unwrap_or(&true) {
-        let trace_id = rio_proto::interceptor::current_trace_id_hex();
-        if !trace_id.is_empty() {
-            let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
-        }
+    // grep handle for Tempo when debugging a user's build. Empty-guard
+    // suppresses output when no OTel tracer is configured
+    // (current_trace_id_hex returns "" for TraceId::INVALID).
+    let trace_id = rio_proto::interceptor::current_trace_id_hex();
+    if !trace_id.is_empty() {
+        let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
     }
 
     match &first.event {
