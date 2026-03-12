@@ -47,7 +47,12 @@ pub async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
+        // RFC 7235 §2.1: auth-scheme is case-insensitive.
+        .and_then(|h| {
+            h.get(..7)
+                .filter(|p| p.eq_ignore_ascii_case("Bearer "))
+                .map(|_| &h[7..])
+        })
         .map(str::trim)
         .filter(|t| !t.is_empty());
 
@@ -350,5 +355,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// RFC 7235 §2.1: auth-scheme is case-insensitive. "bearer secret"
+    /// and "BEARER secret" must match. Fails closed without this (not a
+    /// security issue) — same usability class as the trim fix above.
+    #[tokio::test]
+    async fn bearer_scheme_case_insensitive() {
+        let db = TestDb::new(&MIGRATOR).await;
+        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(CacheAuth {
+            pool: db.pool.clone(),
+            allow_unauthenticated: false,
+        })
+        .await;
+
+        for scheme in ["bearer secret", "BEARER secret", "BeArEr secret"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::get("/test")
+                        .header(header::AUTHORIZATION, scheme)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "scheme {scheme:?} should auth"
+            );
+        }
     }
 }
