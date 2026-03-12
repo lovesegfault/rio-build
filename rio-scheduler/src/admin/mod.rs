@@ -564,11 +564,30 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "ClearPoison"))]
     async fn clear_poison(
         &self,
-        _request: Request<ClearPoisonRequest>,
+        request: Request<ClearPoisonRequest>,
     ) -> Result<Response<ClearPoisonResponse>, Status> {
-        Err(Status::unimplemented("ClearPoison: phase4 dashboard"))
+        rio_proto::interceptor::link_parent(&request);
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        if req.derivation_hash.is_empty() {
+            return Err(Status::invalid_argument("derivation_hash is required"));
+        }
+        let drv_hash: crate::state::DrvHash = req.derivation_hash.into();
+        let (tx, rx) = oneshot::channel();
+        self.actor
+            .send_unchecked(ActorCommand::ClearPoison {
+                drv_hash,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("actor channel closed"))?;
+        let cleared = rx
+            .await
+            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+        Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 
     #[instrument(skip(self, request), fields(rpc = "ListTenants"))]

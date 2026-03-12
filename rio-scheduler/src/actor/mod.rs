@@ -392,6 +392,10 @@ impl DagActor {
                 ActorCommand::ClusterSnapshot { reply } => {
                     let _ = reply.send(self.compute_cluster_snapshot());
                 }
+                ActorCommand::ClearPoison { drv_hash, reply } => {
+                    let cleared = self.handle_clear_poison(&drv_hash).await;
+                    let _ = reply.send(cleared);
+                }
                 ActorCommand::DrainWorker {
                     worker_id,
                     force,

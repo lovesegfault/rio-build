@@ -460,6 +460,37 @@ impl DagActor {
         }
     }
 
+    /// Clear poison state for a derivation (admin-initiated via
+    /// `AdminService.ClearPoison`). Returns `true` if cleared.
+    ///
+    /// In-mem: `reset_from_poison()` transitions Poisoned → Created,
+    /// clears `failed_workers`, zeros `retry_count`, nulls `poisoned_at`.
+    /// PG: `db.clear_poison()` mirrors the same. If PG fails after
+    /// in-mem succeeds, return `false` so the operator retries — better
+    /// than in-mem/PG drift (next recovery would restore Poisoned).
+    pub(super) async fn handle_clear_poison(&mut self, drv_hash: &DrvHash) -> bool {
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return false; // not found
+        };
+        if state.status() != DerivationStatus::Poisoned {
+            return false; // not poisoned
+        }
+        if let Err(e) = state.reset_from_poison() {
+            warn!(drv_hash = %drv_hash, error = %e, "ClearPoison: reset failed");
+            return false;
+        }
+        if let Err(e) = self.db.clear_poison(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e,
+                   "ClearPoison: PG clear failed (in-mem already reset; next recovery will restore Poisoned)");
+            return false;
+        }
+        info!(drv_hash = %drv_hash, "poison cleared by admin");
+        // Status is now Created — it'll re-resolve inputs on next
+        // submit (inputs may have changed). Don't push to ready queue
+        // here.
+        true
+    }
+
     pub(super) async fn handle_transient_failure(
         &mut self,
         drv_hash: &DrvHash,

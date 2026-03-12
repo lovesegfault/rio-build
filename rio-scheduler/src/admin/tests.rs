@@ -262,13 +262,24 @@ async fn stubs_return_unimplemented() -> anyhow::Result<()> {
         tonic::Code::Unavailable,
         "TriggerGC implemented but store unreachable in tests"
     );
+    // ClearPoison is now implemented. Default request has empty
+    // derivation_hash → InvalidArgument. Proves it's wired (no
+    // longer Unimplemented).
     assert_eq!(
         svc.clear_poison(Request::new(ClearPoisonRequest::default()))
             .await
             .unwrap_err()
             .code(),
-        tonic::Code::Unimplemented
+        tonic::Code::InvalidArgument
     );
+    // Non-empty but non-poisoned → cleared=false (not an error).
+    let resp = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "nonexistent-drv-hash".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!resp.cleared, "non-poisoned drv → cleared=false");
     Ok(())
 }
 

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::state::{BuildOptions, PriorityClass, WorkerId};
+use crate::state::{BuildOptions, DrvHash, PriorityClass, WorkerId};
 
 #[cfg(test)]
 use super::handle::{DebugDerivationInfo, DebugWorkerInfo};
@@ -199,6 +199,17 @@ pub enum ActorCommand {
     /// the store's mark phase — protects in-flight build outputs
     /// that may not be in narinfo yet (worker hasn't uploaded).
     GcRoots { reply: oneshot::Sender<Vec<String>> },
+
+    /// Clear poison state for a derivation: in-mem reset + PG clear.
+    /// Returns `true` if the derivation was poisoned and is now cleared.
+    /// `false` if not found or not in Poisoned status.
+    ///
+    /// `send_unchecked`: ClearPoison is operator-initiated, rare,
+    /// and should work even under saturation.
+    ClearPoison {
+        drv_hash: DrvHash,
+        reply: oneshot::Sender<bool>,
+    },
 
     /// Lease acquired: trigger state recovery from PG. Fire-and-
     /// forget (no reply) — the lease loop keeps renewing while
