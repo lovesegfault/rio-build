@@ -531,6 +531,22 @@ fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+fn cpu_fraction(delta_usec: u64, wall_usec: u64) -> f64 {
+    if wall_usec > 0 {
+        delta_usec as f64 / wall_usec as f64
+    } else {
+        0.0
+    }
+}
+
+/// `max = None` (cgroup `memory.max = "max"`) → 0.0 per obs spec.
+fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
+    match max {
+        Some(m) if m > 0 => current as f64 / m as f64,
+        _ => 0.0,
+    }
+}
+
 /// Background task that polls the worker's parent cgroup for CPU and
 /// memory utilization, emitting `rio_worker_cpu_fraction` and
 /// `rio_worker_memory_fraction` gauges every 15s.
@@ -552,26 +568,6 @@ fn read_single_u64(path: &Path) -> Option<u64> {
 /// cgroup files become unreadable mid-run (rare — would indicate the
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
-/// Pure fraction computation — extracted for unit testing.
-/// `mem_max = None` (cgroup `memory.max = "max"`) → 0.0 per obs spec.
-fn compute_fractions(
-    cpu_delta_usec: u64,
-    wall_delta_usec: u64,
-    mem_current: u64,
-    mem_max: Option<u64>,
-) -> (f64, f64) {
-    let cpu = if wall_delta_usec > 0 {
-        cpu_delta_usec as f64 / wall_delta_usec as f64
-    } else {
-        0.0
-    };
-    let mem = match mem_max {
-        Some(m) if m > 0 => mem_current as f64 / m as f64,
-        _ => 0.0,
-    };
-    (cpu, mem)
-}
-
 // r[impl obs.metric.worker-util]
 pub async fn utilization_reporter_loop(root: PathBuf) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -606,8 +602,7 @@ pub async fn utilization_reporter_loop(root: PathBuf) {
         if let (Some(last_usage), Some(now_usage)) = (last_usage_usec, now_usage) {
             let cpu_delta = now_usage.saturating_sub(last_usage);
             let wall_delta = now_instant.duration_since(last_instant).as_micros() as u64;
-            let (cpu, _) = compute_fractions(cpu_delta, wall_delta, 0, None);
-            metrics::gauge!("rio_worker_cpu_fraction").set(cpu);
+            metrics::gauge!("rio_worker_cpu_fraction").set(cpu_fraction(cpu_delta, wall_delta));
         }
         if let Some(nu) = now_usage {
             last_usage_usec = Some(nu);
@@ -617,8 +612,7 @@ pub async fn utilization_reporter_loop(root: PathBuf) {
         // Memory: always set if memory.current is readable (explicit 0.0
         // on unbounded max per obs spec — avoids stale-gauge persistence).
         if let Some(current) = mem_current {
-            let (_, mem) = compute_fractions(0, 1, current, mem_max);
-            metrics::gauge!("rio_worker_memory_fraction").set(mem);
+            metrics::gauge!("rio_worker_memory_fraction").set(mem_fraction(current, mem_max));
         }
     }
 }
@@ -714,37 +708,32 @@ mod tests {
 
     // r[verify obs.metric.worker-util]
     #[test]
-    fn compute_fractions_cpu_half_core() {
+    fn cpu_fraction_half_core() {
         // 500ms cpu usage over 1s wall → 0.5 (half a core).
-        let (cpu, _) = compute_fractions(500_000, 1_000_000, 0, Some(1));
-        assert_eq!(cpu, 0.5);
+        assert_eq!(cpu_fraction(500_000, 1_000_000), 0.5);
     }
 
     #[test]
-    fn compute_fractions_cpu_zero_wall_guard() {
+    fn cpu_fraction_zero_wall_guard() {
         // Div-by-zero guard: zero wall → 0.0 (not NaN/inf).
-        let (cpu, _) = compute_fractions(500, 0, 0, Some(1));
-        assert_eq!(cpu, 0.0);
+        assert_eq!(cpu_fraction(500, 0), 0.0);
     }
 
     #[test]
-    fn compute_fractions_mem_half() {
-        let (_, mem) = compute_fractions(0, 1, 512, Some(1024));
-        assert_eq!(mem, 0.5);
+    fn mem_fraction_half() {
+        assert_eq!(mem_fraction(512, Some(1024)), 0.5);
     }
 
     #[test]
-    fn compute_fractions_mem_unbounded_is_zero() {
+    fn mem_fraction_unbounded_is_zero() {
         // memory.max = "max" (None) → 0.0 per obs spec.
-        let (_, mem) = compute_fractions(0, 1, 999_999, None);
-        assert_eq!(mem, 0.0);
+        assert_eq!(mem_fraction(999_999, None), 0.0);
     }
 
     #[test]
-    fn compute_fractions_mem_zero_max_guard() {
+    fn mem_fraction_zero_max_guard() {
         // Div-by-zero guard: max=0 → 0.0 (not NaN/inf).
-        let (_, mem) = compute_fractions(0, 1, 999, Some(0));
-        assert_eq!(mem, 0.0);
+        assert_eq!(mem_fraction(999, Some(0)), 0.0);
     }
 
     // ---- filesystem (real /proc, real cgroup — Linux-only) ----------------
