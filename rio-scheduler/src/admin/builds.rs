@@ -105,7 +105,11 @@ fn row_to_proto(r: BuildListRow) -> BuildInfo {
         build_id: r.build_id,
         tenant_id: r.tenant_id.unwrap_or_default(),
         priority_class: r.priority_class,
-        state: build_state_from_str(&r.status) as i32,
+        state: r
+            .status
+            .parse::<crate::state::BuildState>()
+            .map(BuildState::from)
+            .unwrap_or(BuildState::Pending) as i32,
         total_derivations: r.total_derivations as u32,
         completed_derivations: r.completed_derivations as u32,
         cached_derivations: r.cached_derivations as u32,
@@ -117,16 +121,5 @@ fn row_to_proto(r: BuildListRow) -> BuildInfo {
         submitted_at: None,
         started_at: None,
         finished_at: None,
-    }
-}
-
-fn build_state_from_str(s: &str) -> BuildState {
-    match s {
-        "pending" => BuildState::Pending,
-        "active" => BuildState::Active,
-        "succeeded" => BuildState::Succeeded,
-        "failed" => BuildState::Failed,
-        "cancelled" => BuildState::Cancelled,
-        _ => BuildState::Pending,
     }
 }

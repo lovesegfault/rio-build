@@ -82,6 +82,18 @@ impl std::str::FromStr for BuildState {
     }
 }
 
+impl From<BuildState> for rio_proto::types::BuildState {
+    fn from(s: BuildState) -> Self {
+        match s {
+            BuildState::Pending => Self::Pending,
+            BuildState::Active => Self::Active,
+            BuildState::Succeeded => Self::Succeeded,
+            BuildState::Failed => Self::Failed,
+            BuildState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 /// In-memory state for a build request.
 #[derive(Debug, Clone)]
 pub struct BuildInfo {
