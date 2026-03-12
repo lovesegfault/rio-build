@@ -7,6 +7,18 @@ use tonic::Status;
 
 use crate::actor::{ActorCommand, ActorHandle, WorkerSnapshot};
 
+/// 2-bool → 3-state. `systems.is_empty()` = no heartbeat yet = not
+/// fully registered (stream-only or heartbeat-only) → "connecting".
+fn worker_status(s: &WorkerSnapshot) -> &'static str {
+    if s.draining {
+        "draining"
+    } else if s.systems.is_empty() {
+        "connecting"
+    } else {
+        "alive"
+    }
+}
+
 /// Query the actor for all workers, filter by status, convert to proto.
 pub(super) async fn list_workers(
     actor: &ActorHandle,
@@ -19,16 +31,11 @@ pub(super) async fn list_workers(
 
     let workers: Vec<WorkerInfo> = snapshots
         .into_iter()
+        // Empty filter = all. Known status = exact match. Unknown filter
+        // = all (lenient — operator typos shouldn't hide workers).
         .filter(|w| match status_filter {
             "" => true,
-            // "alive" = registered (has heartbeat, i.e. systems
-            // non-empty) and not draining. Unregistered workers
-            // (stream-only or heartbeat-only) show as neither alive
-            // nor draining — they're connecting.
-            "alive" => !w.systems.is_empty() && !w.draining,
-            "draining" => w.draining,
-            // Unknown filter → show all (lenient — operator typos
-            // shouldn't hide workers).
+            "alive" | "draining" | "connecting" => worker_status(w) == status_filter,
             _ => true,
         })
         .map(snapshot_to_proto)
@@ -49,15 +56,7 @@ fn snapshot_to_proto(s: WorkerSnapshot) -> WorkerInfo {
             .checked_sub(now_inst.saturating_duration_since(i))
             .map(prost_types::Timestamp::from)
     };
-    let status = if s.draining {
-        "draining"
-    } else if s.systems.is_empty() {
-        // systems empty = no heartbeat yet = not fully registered
-        "connecting"
-    } else {
-        "alive"
-    }
-    .to_string();
+    let status = worker_status(&s).to_string();
     WorkerInfo {
         worker_id: s.worker_id.to_string(),
         systems: s.systems,
