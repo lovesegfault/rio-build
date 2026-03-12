@@ -24,11 +24,12 @@ resource "aws_db_subnet_group" "rio" {
   subnet_ids = module.vpc.private_subnets
 }
 
-# Security group: inbound 5432 from the EKS cluster SG only.
-# The EKS module creates a "cluster security group" attached to all
-# managed-node-group nodes; pods (via VPC CNI) share that SG. So
-# "from the cluster SG" = "from any pod in the cluster", which is
-# what we want — scheduler and store pods can connect, nothing else.
+# Security group: inbound 5432 from the EKS node SG only.
+# node_security_group_id, NOT cluster_primary_security_group_id —
+# the cluster SG is attached to control-plane ENIs, not worker
+# nodes. Pods (via VPC CNI) inherit the NODE security group.
+# Using the wrong one = silent connection timeouts (no RST, the
+# SYN just drops).
 resource "aws_security_group" "aurora" {
   name   = "${var.cluster_name}-aurora"
   vpc_id = module.vpc.vpc_id
@@ -37,7 +38,7 @@ resource "aws_security_group" "aurora" {
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
-    security_groups = [module.eks.cluster_primary_security_group_id]
+    security_groups = [module.eks.node_security_group_id]
   }
 
   # No egress rule: Aurora initiates no outbound connections
