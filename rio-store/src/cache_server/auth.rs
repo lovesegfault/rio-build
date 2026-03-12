@@ -100,7 +100,10 @@ pub async fn auth_middleware(
                      or configure tenant cache_token values",
                 )
                     .into_response(),
-                Err(_) => unauthorized("missing Authorization header"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cache auth: token-existence check failed; falling back to 401");
+                    unauthorized("missing Authorization header")
+                }
             }
         }
     }
