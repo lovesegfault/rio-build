@@ -261,16 +261,6 @@ pkgs.testers.runNixOSTest {
     # init_tracing OTLP layer is wired, (b) gateway's
     # RIO_OTEL_ENDPOINT is read, (c) gateway spans (e.g., session
     # handling) actually fire.
-    #
-    # A stronger check would verify gateway+scheduler share a
-    # traceID (traceparent propagation through gRPC), but that
-    # requires careful handling of Tempo's response format and
-    # may depend on whether the gateway's root span is actually
-    # exported (it might be a server-side span without an
-    # incoming traceparent from ssh-ng, so each ssh-ng session
-    # creates its OWN trace, and the scheduler gets a child
-    # span via rio_proto::interceptor). TODO(phase4): revisit
-    # if trace propagation verification is needed for SLOs.
     control.wait_until_succeeds(
         "curl -sf 'http://localhost:3200/api/search?tags=service.name%3Dgateway&limit=1' | "
         "python3 -c 'import sys,json; d=json.load(sys.stdin); "
@@ -278,6 +268,40 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
     print("Trace export check: both scheduler AND gateway traces visible in Tempo")
+
+    # ── Trace linkage: gateway+scheduler share a traceID ─────────────
+    # Phase 4a plumbed per-assignment traceparent through WorkAssignment
+    # AND emits `rio trace_id: {hex}` via STDERR_NEXT after SubmitBuild.
+    # Extract that trace_id from the build output, then query Tempo
+    # /api/traces/{traceID} and assert the single trace contains spans
+    # from BOTH gateway and scheduler services — proving traceparent
+    # propagation through gRPC metadata works (inject_current in the
+    # gateway's SubmitBuild call → link_parent in the scheduler's handler).
+    #
+    # Worker spans aren't in this trace (workers don't have
+    # RIO_OTEL_ENDPOINT in this test topology); the WorkAssignment
+    # traceparent flow is covered by rio-proto interceptor unit tests.
+    import re
+    m = re.search(r"rio trace_id: ([0-9a-f]{32})", output)
+    assert m, f"expected 'rio trace_id: <hex>' in build output, got: {output[:500]}"
+    trace_id = m.group(1)
+    print(f"extracted trace_id: {trace_id}")
+
+    # Tempo's /api/traces/{id} returns the full trace. Assert both
+    # service names appear in the span list. Tempo may take a few
+    # seconds to ingest after the build completes — retry.
+    control.wait_until_succeeds(
+        f"curl -sf 'http://localhost:3200/api/traces/{trace_id}' | "
+        "python3 -c 'import sys,json; d=json.load(sys.stdin); "
+        "batches=d.get(\"batches\",[]); "
+        "svcs={b[\"resource\"][\"attributes\"][0][\"value\"][\"stringValue\"] "
+        "      for b in batches if b.get(\"resource\",{}).get(\"attributes\")}; "
+        "assert \"gateway\" in svcs, f\"no gateway spans in trace: {svcs}\"; "
+        "assert \"scheduler\" in svcs, f\"no scheduler spans in trace: {svcs}\"; "
+        "print(f\"trace has spans from services: {svcs}\")'",
+        timeout=30
+    )
+    print("Trace linkage verified: gateway+scheduler share trace_id via traceparent propagation")
 
     ${common.collectCoverage "control, worker1, worker2, client"}
   '';
