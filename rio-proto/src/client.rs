@@ -253,9 +253,10 @@ pub async fn query_path_info_opt(
     store_path: &str,
     timeout: Duration,
 ) -> Result<Option<ValidatedPathInfo>, tonic::Status> {
-    let req = QueryPathInfoRequest {
+    let mut req = tonic::Request::new(QueryPathInfoRequest {
         store_path: store_path.to_string(),
-    };
+    });
+    crate::interceptor::inject_current(req.metadata_mut());
     match tokio::time::timeout(timeout, client.query_path_info(req)).await {
         Ok(Ok(resp)) => {
             let validated = ValidatedPathInfo::try_from(resp.into_inner()).map_err(|e| {
@@ -282,9 +283,10 @@ pub async fn get_path_nar(
     timeout: Duration,
     max_nar_size: u64,
 ) -> Result<Option<(ValidatedPathInfo, Vec<u8>)>, NarCollectError> {
-    let req = GetPathRequest {
+    let mut req = tonic::Request::new(GetPathRequest {
         store_path: store_path.to_string(),
-    };
+    });
+    crate::interceptor::inject_current(req.metadata_mut());
     let fut = async {
         let mut stream = match client.get_path(req).await {
             Ok(resp) => resp.into_inner(),

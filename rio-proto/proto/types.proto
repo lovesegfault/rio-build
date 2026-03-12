@@ -285,6 +285,11 @@ message WorkAssignment {
                                           //  expected_outputs, expiry) — store verifies on PutPath
   uint64 generation = 7;                  // Leader election generation counter
   bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
+  // W3C traceparent for distributed tracing across the SSH boundary.
+  // ssh-ng has no gRPC metadata channel, so the scheduler injects its
+  // current span's traceparent here and the worker extracts it to
+  // parent the spawned build task's span. Empty = fresh root span.
+  string traceparent = 9;
 }
 
 // Build configuration options propagated from the client.
