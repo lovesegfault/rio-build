@@ -392,7 +392,7 @@ impl DagActor {
                 assignment_token,
                 generation,
                 is_fixed_output: state.is_fixed_output,
-                traceparent: String::new(),
+                traceparent: rio_proto::interceptor::current_traceparent(),
             };
 
             let msg = rio_proto::types::SchedulerMessage {

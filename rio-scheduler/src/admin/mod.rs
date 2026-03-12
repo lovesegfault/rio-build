@@ -352,11 +352,12 @@ impl AdminService for AdminServiceImpl {
     /// wants store size, it can query the store's /metrics directly.
     /// `TODO(phase4)`: add a best-effort store-size field populated
     /// via a separate slow-refresh background task, NOT inline here.
-    #[instrument(skip(self, _request), fields(rpc = "ClusterStatus"))]
+    #[instrument(skip(self, request), fields(rpc = "ClusterStatus"))]
     async fn cluster_status(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
 
         let (tx, rx) = oneshot::channel();
@@ -433,6 +434,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let mut req = request.into_inner();
 
@@ -530,6 +532,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<DrainWorkerRequest>,
     ) -> Result<Response<DrainWorkerResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
         let req = request.into_inner();
 

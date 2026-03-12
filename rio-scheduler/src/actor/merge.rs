@@ -477,13 +477,13 @@ impl DagActor {
         //
         // This call is ALSO the half-open probe: if the breaker is open, we
         // still make the call. Success → close; failure → stay open + reject.
+        let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: check_paths.clone(),
+        });
+        rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
         let resp = match tokio::time::timeout(
             rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            store_client
-                .clone()
-                .find_missing_paths(FindMissingPathsRequest {
-                    store_paths: check_paths.clone(),
-                }),
+            store_client.clone().find_missing_paths(fmp_req),
         )
         .await
         {

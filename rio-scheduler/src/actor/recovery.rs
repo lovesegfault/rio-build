@@ -440,12 +440,11 @@ impl DagActor {
                 // completion. Conservative: treat as incomplete.
                 false
             } else if let Some(client) = &mut self.store_client {
-                match client
-                    .find_missing_paths(FindMissingPathsRequest {
-                        store_paths: expected_outputs.clone(),
-                    })
-                    .await
-                {
+                let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
+                    store_paths: expected_outputs.clone(),
+                });
+                rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+                match client.find_missing_paths(fmp_req).await {
                     Ok(resp) => resp.into_inner().missing_paths.is_empty(),
                     Err(e) => {
                         warn!(drv_hash = %drv_hash, error = %e,
