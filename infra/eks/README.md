@@ -28,11 +28,17 @@ images, `deploy.sh` for manifests, `smoke-test.sh` for verification.
 
 ```bash
 export AWS_PROFILE=beme_sandbox
-cd infra/eks
 
-# Optional: cp terraform.tfvars.example terraform.tfvars && edit
-
+# ONE-TIME per AWS account: bootstrap the state bucket.
+# Skip if someone else already ran this (check: aws s3 ls | grep rio-tfstate).
+cd infra/bootstrap
 nix develop -c tofu init
+nix develop -c tofu apply         # ~5s, prints bucket name
+
+# Main infra
+cd ../eks
+# Optional: cp terraform.tfvars.example terraform.tfvars && edit
+nix develop -c tofu init -backend-config="bucket=$(tofu -chdir=../bootstrap output -raw bucket)"
 nix develop -c tofu apply         # ~20min (EKS ~12min, Aurora ~8min)
 
 # Configure kubectl
@@ -96,6 +102,11 @@ nix develop -c tofu destroy       # ~15min
 The S3 bucket has `force_destroy = true` so it deletes even with
 chunks in it. Aurora has `skip_final_snapshot = true`. Both are
 dev/test settings — flip them for anything you care about keeping.
+
+The state bucket (`infra/bootstrap`) is NOT destroyed by this —
+it's a per-account fixture. Destroy it separately (and manually
+empty it first — no `force_destroy` on state buckets, losing
+state orphans resources).
 
 ## Troubleshooting
 

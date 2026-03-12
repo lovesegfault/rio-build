@@ -1,0 +1,13 @@
+.terraform/
+.terraform.lock.hcl
+.terraform.tfstate.lock.info
+*.tfstate.backup
+
+# UNLIKE infra/eks: terraform.tfstate is NOT ignored here.
+# Bootstrap's state is tiny (one bucket + block config) and
+# committing it means anyone can `tofu destroy` the state
+# bucket later without hunting down the original applier's
+# laptop. The state bucket is itself a one-per-account
+# fixture, not a per-deployment resource.
+#
+# No secrets in this state — it's just a bucket name and ARN.
