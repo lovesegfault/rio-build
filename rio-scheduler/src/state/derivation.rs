@@ -388,9 +388,14 @@ impl DerivationState {
             .map_err(|e| (row.drv_hash.clone(), e))?;
         let now = Instant::now();
         // Convert PG-computed elapsed seconds back to an Instant.
-        // Clamp negative (clock skew → poisoned_at in the future) to 0
-        // → use now() as conservative (full TTL).
-        let elapsed = std::time::Duration::from_secs_f64(row.elapsed_secs.max(0.0));
+        // Clamp: negative/NaN → 0 (conservative full TTL), +inf → 1yr
+        // (poisoned_at = -infinity::timestamp would make from_secs_f64
+        // panic; 1yr ceiling makes checked_sub return None → now).
+        // Follows the `.max(0.0).min(MAX)` pattern from worker.rs:207.
+        const MAX_ELAPSED_SECS: f64 = 365.0 * 86400.0;
+        #[allow(clippy::manual_clamp)]
+        let clamped = row.elapsed_secs.max(0.0).min(MAX_ELAPSED_SECS);
+        let elapsed = std::time::Duration::from_secs_f64(clamped);
         let poisoned_at = now.checked_sub(elapsed).unwrap_or(now);
         Ok(Self {
             drv_hash: row.drv_hash.into(),
@@ -729,5 +734,27 @@ mod tests {
             err.0, "somehash",
             "error tuple returns drv_hash for logging"
         );
+    }
+
+    #[test]
+    fn test_from_poisoned_row_infinity_elapsed_does_not_panic() {
+        // poisoned_at = '-infinity'::timestamp in PG → EXTRACT returns
+        // +inf. from_secs_f64(+inf) panics. The clamp guards this
+        // (requires manual DB corruption, but a panic here bricks
+        // scheduler startup entirely — disproportionate).
+        let row = crate::db::PoisonedDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: "infhash".into(),
+            drv_path: rio_test_support::fixtures::test_drv_path("inf"),
+            pname: None,
+            system: "x86_64-linux".into(),
+            failed_workers: vec![],
+            elapsed_secs: f64::INFINITY,
+        };
+        let state = DerivationState::from_poisoned_row(row).unwrap();
+        // poisoned_at should be now (checked_sub(1yr) → None → now).
+        // TTL will expire immediately on next tick — correct behavior
+        // for a clearly-garbage timestamp.
+        assert!(state.poisoned_at.is_some());
     }
 }
