@@ -237,19 +237,33 @@ pkgs.testers.runNixOSTest {
 
     # ── Pre-seed the tenants table ────────────────────────────────────
     # -q suppresses the 'INSERT 0 1' status message that psql prints
-    # even with -t (tuples-only). Without -q, the output would be
-    # 'INSERT 0 1\n<uuid>' and .strip() only removes whitespace.
+    # even with -t (tuples-only) for INSERT…RETURNING. SELECT doesn't
+    # emit a command tag under -t, so -q is cosmetic there but used
+    # everywhere for consistency.
     tenant_uuid = control.succeed(
         "sudo -u postgres psql rio -qtAc "
         "\"INSERT INTO tenants (tenant_name) VALUES ('team-test') RETURNING tenant_id\""
     ).strip()
     control.log(f"seeded tenant team-test = {tenant_uuid}")
 
+    # Row-count check: COUNT(*) after each case. ORDER BY…LIMIT 1 alone
+    # can't distinguish Case 3's NULL row from a Case-2 leak (if
+    # rejection ever moved post-insert, it would also produce a NULL
+    # row since unknown-team never resolves to a UUID).
+    def build_count():
+        return int(control.succeed(
+            "sudo -u postgres psql rio -qtAc \"SELECT COUNT(*) FROM builds\""
+        ).strip())
+    initial_count = build_count()
+    control.log(f"initial builds count: {initial_count}")
+
     # ── Case 1: key comment 'team-test' → resolved UUID in builds ─────
     out = build_drv("/root/.ssh/id_team_test", "${testDrvKnown}")
     assert out.startswith("/nix/store/"), f"known-tenant build should succeed: {out!r}"
+    assert "phase4-known" in out, f"output path should contain drv marker: {out!r}"
+    assert build_count() == initial_count + 1, "case 1 should insert exactly one build"
     db_tenant = control.succeed(
-        "sudo -u postgres psql rio -tAc "
+        "sudo -u postgres psql rio -qtAc "
         "\"SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1\""
     ).strip()
     assert db_tenant == tenant_uuid, \
@@ -258,15 +272,19 @@ pkgs.testers.runNixOSTest {
 
     # ── Case 2: key comment 'unknown-team' → InvalidArgument ──────────
     out = build_drv("/root/.ssh/id_unknown", "${testDrvUnknown}", expect_fail=True)
-    assert "unknown tenant" in out, \
-        f"unknown-team should be rejected with 'unknown tenant' error, got: {out!r}"
-    print("Section A case 2 PASS: unknown tenant rejected")
+    assert "unknown tenant: unknown-team" in out, \
+        f"error should include the tenant name (proves comment was captured+propagated), got: {out!r}"
+    assert build_count() == initial_count + 1, \
+        "case 2 rejection is pre-insert: count unchanged"
+    print("Section A case 2 PASS: unknown tenant rejected pre-insert")
 
     # ── Case 3: empty comment → tenant_id IS NULL (single-tenant) ─────
     out = build_drv("/root/.ssh/id_anon", "${testDrvAnon}")
     assert out.startswith("/nix/store/"), f"anon build should succeed: {out!r}"
+    assert "phase4-anon" in out, f"output path should contain drv marker: {out!r}"
+    assert build_count() == initial_count + 2, "case 3 should insert one more build"
     db_tenant = control.succeed(
-        "sudo -u postgres psql rio -tAc "
+        "sudo -u postgres psql rio -qtAc "
         "\"SELECT COALESCE(tenant_id::text, 'NULL') FROM builds ORDER BY submitted_at DESC LIMIT 1\""
     ).strip()
     assert db_tenant == "NULL", \
