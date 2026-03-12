@@ -117,7 +117,7 @@ fn extract_traceparent(traceparent: &str) -> opentelemetry::Context {
 }
 
 /// Create a tracing span parented by the given W3C traceparent string.
-/// Bundles [`extract_traceparent`] + `OpenTelemetrySpanExt::set_parent`
+/// Bundles `extract_traceparent` + `OpenTelemetrySpanExt::set_parent`
 /// so callers (e.g., `rio-worker`) don't need `tracing-opentelemetry`
 /// as a direct dependency.
 ///
