@@ -497,12 +497,16 @@ impl DerivationState {
         Ok(())
     }
 
-    /// Poison TTL expiry. Transitions Poisoned -> Created and clears poison state.
+    /// Poison TTL expiry. Transitions Poisoned -> Created and clears poison
+    /// state. Also clears traceparent so the NEXT submitter's trace links
+    /// to the worker span (dedup-upgrade at `dag/mod.rs`) — same as
+    /// `from_poisoned_row` which sets "" on recovery.
     pub fn reset_from_poison(&mut self) -> Result<(), TransitionError> {
         self.transition(DerivationStatus::Created)?;
         self.poisoned_at = None;
         self.retry_count = 0;
         self.failed_workers.clear();
+        self.traceparent.clear();
         Ok(())
     }
 
@@ -709,12 +713,17 @@ mod tests {
         state.retry_count = 5;
         state.failed_workers.insert("w1".into());
         state.failed_workers.insert("w2".into());
+        state.traceparent = "00-aaaa-bbbb-01".into();
 
         assert!(state.reset_from_poison().is_ok());
         assert_eq!(state.status(), DerivationStatus::Created);
         assert!(state.poisoned_at.is_none());
         assert_eq!(state.retry_count, 0);
         assert!(state.failed_workers.is_empty());
+        // Cleared so the next submitter's dedup-upgrade fires (same as
+        // from_poisoned_row which sets "" — consistent across restart
+        // and live ClearPoison paths).
+        assert!(state.traceparent.is_empty());
 
         // Non-poisoned state rejected
         let mut state = DerivationState::try_from_node(&node)?;
