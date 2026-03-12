@@ -410,7 +410,8 @@ impl AdminService for AdminServiceImpl {
         let snap = self
             .actor
             .query_unchecked(|reply| ActorCommand::ClusterSnapshot { reply })
-            .await?;
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         // SystemTime::now() - elapsed → "start time in CURRENT wall-clock
         // terms." checked_sub: if elapsed > now (clock jumped way back),
@@ -497,7 +498,8 @@ impl AdminService for AdminServiceImpl {
         let mut extra_roots = self
             .actor
             .query_unchecked(|reply| ActorCommand::GcRoots { reply })
-            .await?;
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         // Merge with any client-provided extra_roots (unusual but
         // allowed — maybe the client has additional pins).
@@ -604,7 +606,8 @@ impl AdminService for AdminServiceImpl {
                 force,
                 reply,
             })
-            .await?;
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         Ok(Response::new(DrainWorkerResponse {
             accepted: result.accepted,
@@ -627,7 +630,8 @@ impl AdminService for AdminServiceImpl {
         let cleared = self
             .actor
             .query_unchecked(|reply| ActorCommand::ClearPoison { drv_hash, reply })
-            .await?;
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
         Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 

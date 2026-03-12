@@ -14,7 +14,8 @@ pub(super) async fn list_workers(
 ) -> Result<ListWorkersResponse, Status> {
     let snapshots = actor
         .query_unchecked(|reply| ActorCommand::ListWorkers { reply })
-        .await?;
+        .await
+        .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
     let workers: Vec<WorkerInfo> = snapshots
         .into_iter()
