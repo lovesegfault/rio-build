@@ -11,12 +11,16 @@ publish = false
 [dependencies]
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+# Health-aware balanced channel (client/balance.rs) probes
+# grpc.health.v1/Check on each pod IP to find the leader.
+tonic-health = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-stream = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 rio-nix = { workspace = true }
 tracing = { workspace = true }
 

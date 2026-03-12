@@ -4663,6 +4663,7 @@ name = "rio-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
@@ -4673,6 +4674,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",

@@ -6,6 +6,9 @@
 //! - NAR streaming: [`collect_nar_stream`] drains `GetPath` responses;
 //!   [`chunk_nar_for_put`] builds a lazy `PutPath` request stream.
 
+pub mod balance;
+pub use balance::BalancedChannel;
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -53,6 +56,13 @@ pub fn init_client_tls(cfg: Option<ClientTlsConfig>) {
     // just means another call raced us (main-only → shouldn't
     // happen) or tests re-init (first wins, fine).
     let _ = CLIENT_TLS.set(cfg);
+}
+
+/// Crate-internal accessor for the global TLS config. Used by
+/// `balance.rs` to build per-endpoint channels with a domain_name
+/// override (connect to pod IP, verify against service SAN).
+pub(crate) fn client_tls() -> Option<ClientTlsConfig> {
+    CLIENT_TLS.get().and_then(|o| o.as_ref()).cloned()
 }
 
 /// Connect to a gRPC endpoint at `host:port` and return a raw [`Channel`].
