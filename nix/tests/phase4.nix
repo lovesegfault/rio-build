@@ -236,8 +236,11 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
 
     # ── Pre-seed the tenants table ────────────────────────────────────
+    # -q suppresses the 'INSERT 0 1' status message that psql prints
+    # even with -t (tuples-only). Without -q, the output would be
+    # 'INSERT 0 1\n<uuid>' and .strip() only removes whitespace.
     tenant_uuid = control.succeed(
-        "sudo -u postgres psql rio -tAc "
+        "sudo -u postgres psql rio -qtAc "
         "\"INSERT INTO tenants (tenant_name) VALUES ('team-test') RETURNING tenant_id\""
     ).strip()
     control.log(f"seeded tenant team-test = {tenant_uuid}")
