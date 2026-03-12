@@ -77,21 +77,45 @@ aws ecr get-login-password --region "$AWS_REGION" \
 # gzip. -f oci: docker-v2s2 manifests don't carry zstd layer media
 # types, OCI does. ECR supports OCI since 2021, zstd since 2023.
 # Containerd on the EKS nodes pulls zstd layers natively.
+#
+# Pushes run in parallel. With 6 images at ~30s each, sequential is
+# ~3min; parallel is bounded by the slowest (~30-40s). ECR handles
+# concurrent pushes fine; skopeo's --retry-times covers transient
+# throttling. Each push's output goes to its own log file so the
+# terminal stays readable — interleaved skopeo progress bars are
+# illegible. Failures print their log.
 shopt -s nullglob
-pushed=0
-for f in "$out/images"/*.tar.zst; do
+images=( "$out/images"/*.tar.zst )
+(( ${#images[@]} > 0 )) || die "no images found in linkFarm — nix build silently produced nothing?"
+
+declare -A pids  # pid -> name
+for f in "${images[@]}"; do
   name=$(basename "$f" .tar.zst)
-  log "pushing rio-$name..."
+  log "pushing rio-$name (background)..."
   skopeo --policy "$POLICY" copy --retry-times 3 \
     --dest-compress-format zstd --dest-compress-level 6 -f oci \
     "docker-archive:$f" \
-    "docker://$ECR_REGISTRY/rio-$name:$tag"
-  pushed=$((pushed + 1))
+    "docker://$ECR_REGISTRY/rio-$name:$tag" \
+    >"$out/$name.log" 2>&1 &
+  pids[$!]=$name
 done
 
-(( pushed > 0 )) || die "no images found in linkFarm — nix build silently produced nothing?"
+# Wait for ALL pushes (not just the first failure) so every error
+# surfaces at once. bare `wait` returns 0 even if jobs failed —
+# must `wait $pid` individually to get each exit status.
+failed=()
+for pid in "${!pids[@]}"; do
+  if wait "$pid"; then
+    log "  rio-${pids[$pid]}: ok"
+  else
+    failed+=("${pids[$pid]}")
+    log "  rio-${pids[$pid]}: FAILED"
+    sed 's/^/    /' "$out/${pids[$pid]}.log" >&2
+  fi
+done
+(( ${#failed[@]} == 0 )) || die "${#failed[@]} push(es) failed: ${failed[*]}"
 
-log "done — pushed $pushed images, tag: $tag"
+log "done — pushed ${#images[@]} images, tag: $tag"
 # deploy.sh reads this file (gitignored). Flows the dirty suffix
 # through, and catches push-at-X-deploy-at-Y drift that the old
 # derive-from-HEAD approach would silently get wrong.
