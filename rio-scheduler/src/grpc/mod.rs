@@ -370,6 +370,7 @@ impl SchedulerService for SchedulerGrpc {
             build_cores: req.build_cores,
         };
 
+        // r[impl sched.tenant.resolve]
         // Tenant resolution: proto field carries tenant NAME (from gateway's
         // authorized_keys comment); resolve to UUID here via the tenants
         // table. Empty string → None (single-tenant mode). Unknown name →

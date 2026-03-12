@@ -390,6 +390,7 @@ impl SchedulerDb {
     /// matches in-mem. Without this, crash after poison-reset →
     /// recovery loads stale failed_workers → immediately excluded
     /// from dispatch (best_worker skips them).
+    // r[impl sched.poison.ttl-persist]
     /// Persist `poisoned_at = now()` for a derivation. Called from
     /// `poison_and_cascade` and `handle_permanent_failure` after
     /// `persist_status(.., Poisoned)`. Best-effort — status write

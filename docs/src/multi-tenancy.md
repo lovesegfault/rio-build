@@ -7,12 +7,12 @@ rio-build supports multi-tenant operation where multiple teams or projects share
 Tenants are identified via SSH key mapping. The gateway's `authorized_keys` file includes tenant annotations:
 
 ```
-# Format: <key-type> <public-key> <tenant-id>
+# Format: <key-type> <public-key> <tenant-name>
 ssh-ed25519 AAAA... team-infra
 ssh-ed25519 BBBB... team-platform
 ```
 
-Each SSH connection is associated with exactly one tenant.
+Each SSH connection is associated with exactly one tenant. See [`gw.auth.tenant-from-key-comment`](./components/gateway.md) for how the gateway extracts the tenant name from the `authorized_keys` entry comment, and [`sched.tenant.resolve`](./components/scheduler.md) for how the scheduler resolves the name to a UUID.
 
 ### Signed Tenant Tokens
 
@@ -67,7 +67,7 @@ Each tenant can have their own ed25519 signing key for narinfo signatures. This 
 
 ### GC Policies
 
-> **Phase 4 deferral:** GC itself is unimplemented (see `tracey query uncovered` → `store.gc.*`). Per-tenant GC policy parameters are stubbed.
+> **Phase 4b deferral:** GC is implemented (mark/sweep/drain all work). Per-tenant GC **policy** (retention windows via `path_tenants` junction table) ships in phase 4b.
 
 Garbage collection retention policies are configurable per tenant:
 

@@ -284,6 +284,7 @@ pub async fn spawn_build_task(
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
 
+    // r[impl sched.trace.assignment-traceparent]
     // Parent the spawned task's span by the traceparent from the assignment.
     // Closes the SSH-boundary tracing gap: scheduler injects its span's W3C
     // traceparent into the payload; we extract it here. Empty → fresh root.

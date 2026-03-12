@@ -460,6 +460,7 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.admin.clear-poison]
     /// Clear poison state for a derivation (admin-initiated via
     /// `AdminService.ClearPoison`). Returns `true` if cleared.
     ///

@@ -72,7 +72,7 @@ Only `TransientFailure` and `InfrastructureFailure` errors trigger retries. `Per
 
 ## Poison Derivation Tracking
 
-Derivations that consistently fail are marked as "poisoned" to prevent infinite retry loops. In-memory poison tracking (`failed_workers` HashSet per derivation) is **live**. PostgreSQL-backed persistence (surviving scheduler restart) is Phase 4.
+Derivations that consistently fail are marked as "poisoned" to prevent infinite retry loops. In-memory poison tracking (`failed_workers` HashSet per derivation) is **live**. PostgreSQL-backed `failed_workers TEXT[]` persistence exists (migration 004); `poisoned_at TIMESTAMPTZ` persistence (migration 009 Part B) means the 24h TTL survives scheduler restart. See [`sched.poison.ttl-persist`](./components/scheduler.md) for details.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -84,7 +84,7 @@ Poisoned derivations:
 - Are immediately reported as `CachedFailure` to all interested builds
 - Are NOT silently dropped --- the client receives an explicit error
 - Expire after `poisonTTL` so transient infrastructure issues self-heal
-- Can be manually cleared via `AdminService.ClearPoison(derivation_hash)` (Phase 4)
+- Can be manually cleared via `AdminService.ClearPoison(derivation_hash)` — see [`sched.admin.clear-poison`](./components/scheduler.md)
 
 **Per-worker tracking:** If a derivation fails only on a specific worker (e.g., hardware issue), the scheduler tracks per-worker failure counts separately. A derivation is only globally poisoned if it fails on `poisonThreshold` *different* workers.
 

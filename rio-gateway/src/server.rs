@@ -208,6 +208,7 @@ impl Handler for ConnectionHandler {
         Ok(Auth::reject())
     }
 
+    // r[impl gw.auth.tenant-from-key-comment]
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         // The comment lives in the SERVER-SIDE authorized_keys entry, not
         // the client's key (SSH key auth sends raw key data only). We
@@ -443,6 +444,7 @@ mod tests {
         Ok(())
     }
 
+    // r[verify gw.auth.tenant-from-key-comment]
     /// Key comments in authorized_keys lines are preserved by the parser
     /// and readable via `.comment()`. This is the mechanism for tenant
     /// name extraction in `auth_publickey`.

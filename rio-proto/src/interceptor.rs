@@ -337,6 +337,7 @@ mod tests {
         assert_eq!(current_traceparent(), "");
     }
 
+    // r[verify sched.trace.assignment-traceparent]
     /// `current_traceparent` + `extract_traceparent` roundtrip preserves trace_id.
     #[test]
     fn current_traceparent_roundtrip() {

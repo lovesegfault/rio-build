@@ -421,6 +421,7 @@ async fn test_submit_build_rejects_invalid_priority_class() {
     );
 }
 
+// r[verify sched.tenant.resolve]
 /// SubmitBuild with a tenant name not in the tenants table → InvalidArgument.
 /// Proto field carries tenant NAME (from gateway's authorized_keys comment);
 /// scheduler resolves to UUID via PG lookup.

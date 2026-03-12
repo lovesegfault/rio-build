@@ -88,6 +88,18 @@ r[sched.merge.toctou-serial]
 r[sched.completion.idempotent]
 > **Completion report idempotency:** A `CompletionReport` for an already-completed derivation is accepted and ignored (no-op). The actor's state machine treats `completed → completed` as an idempotent transition. This handles duplicate reports caused by worker retries during scheduler failover, network retransmissions, or race conditions with CA early cutoff.
 
+r[sched.tenant.resolve]
+
+The gateway sends the tenant **name** (not a UUID) in `SubmitBuildRequest.tenant_id` — captured from the server-side `authorized_keys` entry's comment field. The scheduler's `submit_build` handler resolves this to a UUID via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
+
+r[sched.poison.ttl-persist]
+
+`poisoned_at` is persisted to `derivations.poisoned_at TIMESTAMPTZ` when the poison threshold trips. Recovery loads poisoned rows via a separate `load_poisoned_derivations` query (since `TERMINAL_STATUSES` includes `"poisoned"` and `load_nonterminal_derivations` filters it out). The timestamp is converted back to `Instant` via PG-computed `EXTRACT(EPOCH FROM (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
+
+r[sched.admin.clear-poison]
+
+`AdminService.ClearPoison` resets both in-memory state (`reset_from_poison()`: Poisoned→Created, clear `failed_workers`, zero `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`). Returns `cleared=true` only if both succeed. If PG fails after in-mem reset, returns `false` so the operator retries — next recovery would restore Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a non-poisoned or non-existent derivation returns `cleared=false` without error.
+
 ## Multi-Build DAG Merging
 
 r[sched.merge.dedup]
@@ -410,7 +422,8 @@ CREATE TABLE derivations (
     CONSTRAINT derivations_drv_hash_uq UNIQUE (drv_hash)
 );
 CREATE INDEX derivations_status_idx ON derivations (status) WHERE status NOT IN ('completed', 'poisoned', 'dependency_failed');
--- TODO(phase4): CREATE INDEX derivations_tenant_idx ON derivations (tenant_id);  -- deferred with multi-tenancy
+-- Partial index: most rows NULL in single-tenant mode (migration 009 Part A).
+CREATE INDEX derivations_tenant_idx ON derivations (tenant_id) WHERE tenant_id IS NOT NULL;
 
 CREATE TABLE derivation_edges (
     parent_id   UUID NOT NULL REFERENCES derivations (derivation_id),

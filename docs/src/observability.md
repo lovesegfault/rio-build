@@ -233,7 +233,12 @@ The OTel `service.name` resource attribute is set automatically per component (g
 ### Trace Propagation
 
 r[obs.trace.w3c-traceparent]
-Trace context is propagated via gRPC metadata using the W3C `traceparent` header format. Injection and extraction are **manual**, not tonic interceptors: `rio_proto::interceptor::inject_current()` copies the current span's context into outgoing request metadata (client side), and `rio_proto::interceptor::link_parent()` stitches the `#[instrument]` span into the incoming parent (server side, first line of each handler). Manual is deliberate: tonic's `Interceptor` trait changes `connect_*` return types (62-callsite type churn), doesn't compose with server-side `#[instrument]`, and the explicit call makes propagation points greppable. The W3C `TraceContextPropagator` is registered globally in `init_tracing()` regardless of whether `RIO_OTEL_ENDPOINT` is set — propagation works even when spans aren't exported.
+
+Trace context is propagated via gRPC metadata using the W3C `traceparent` header format.
+
+r[sched.trace.assignment-traceparent]
+
+ssh-ng has no gRPC metadata channel, so the scheduler→worker hop cannot use `inject_current`/`link_parent`. Instead, the scheduler injects its current span's W3C traceparent directly into the `WorkAssignment.traceparent` proto field (`current_traceparent()` in `rio-proto::interceptor`). The worker extracts it via `span_from_traceparent()` and wraps the spawned build-executor future in `.instrument(span)`. Empty traceparent (no active span at dispatch time) → fresh root span. This closes the SSH-boundary tracing gap — Tempo now shows gateway→scheduler→worker→store as a single trace. Injection and extraction are **manual**, not tonic interceptors: `rio_proto::interceptor::inject_current()` copies the current span's context into outgoing request metadata (client side), and `rio_proto::interceptor::link_parent()` stitches the `#[instrument]` span into the incoming parent (server side, first line of each handler). Manual is deliberate: tonic's `Interceptor` trait changes `connect_*` return types (62-callsite type churn), doesn't compose with server-side `#[instrument]`, and the explicit call makes propagation points greppable. The W3C `TraceContextPropagator` is registered globally in `init_tracing()` regardless of whether `RIO_OTEL_ENDPOINT` is set — propagation works even when spans aren't exported.
 
 ## SLOs, SLIs, and Alerting
 

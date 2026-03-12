@@ -473,6 +473,12 @@ After DAG construction, the gateway optionally inlines the ATerm content of `.dr
 
 > **Session state:** Although the gateway is described as "stateless beyond the lifetime of a single SSH connection," each SSH channel does accumulate per-session state: the parsed `.drv` cache, the `wopSetOptions` configuration, and the `wopAddTempRoot` set. This state is connection-scoped and discarded when the SSH channel closes.
 
+## Authentication + Tenant Identity
+
+r[gw.auth.tenant-from-key-comment]
+
+The tenant name lives in the **server-side `authorized_keys` entry's comment field**, not the client's key (SSH key authentication sends raw key data only). During `auth_publickey`, the gateway matches the client's presented key against its loaded entries via `.find()`, then reads `.comment()` from the **matched entry** to get the tenant name. This is stored on the connection and passed through to `SubmitBuildRequest.tenant_id`. Empty comment = single-tenant mode (tenant name is empty string → scheduler treats as `None`).
+
 ## Connection Lifecycle
 
 r[gw.conn.lifecycle]
