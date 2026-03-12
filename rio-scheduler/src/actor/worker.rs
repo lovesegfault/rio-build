@@ -283,6 +283,9 @@ impl DagActor {
         }
     }
 
+    // 8 args — all independent heartbeat fields. A struct would add
+    // boilerplate at every call site for an internal-only method.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_heartbeat(
         &mut self,
         worker_id: &WorkerId,
@@ -290,11 +293,11 @@ impl DagActor {
         supported_features: Vec<String>,
         max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
-        // Grouped to stay under clippy's 7-arg limit. Both are
-        // optional heartbeat-carried hints with identical overwrite-
-        // unconditionally semantics (None clears stale). They're
-        // unpacked immediately below; the tuple is just transport.
+        // Grouped as a legacy of the 7-arg limit (now bypassed).
+        // Both are optional heartbeat-carried hints with identical
+        // overwrite-unconditionally semantics (None clears stale).
         (bloom, size_class): (Option<rio_common::bloom::BloomFilter>, Option<String>),
+        resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -369,6 +372,13 @@ impl DagActor {
         // becomes a wildcard worker that accepts any class. Same
         // don't-trust-stale reasoning as bloom.
         worker.size_class = size_class;
+        // resources: DON'T clobber with None. Prost makes message
+        // fields Option<T>; worker always populates, but if a future
+        // proto version omits it, keep the last-known reading for
+        // ListWorkers rather than flashing None.
+        if resources.is_some() {
+            worker.last_resources = resources;
+        }
 
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");

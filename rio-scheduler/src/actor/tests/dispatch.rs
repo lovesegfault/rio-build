@@ -50,6 +50,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: Some("small".into()),
             worker_id: "w-small".into(),
@@ -69,6 +70,7 @@ async fn test_size_class_routing_respects_classification() -> TestResult {
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: Some("large".into()),
             worker_id: "w-large".into(),
@@ -500,6 +502,7 @@ async fn test_prefetch_hint_bloom_filters() -> TestResult {
     bloom.insert(&out_a);
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             worker_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
@@ -565,6 +568,7 @@ async fn test_prefetch_hint_skipped_when_bloom_covers_all() -> TestResult {
     bloom.insert(&child_out);
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             worker_id: "w1".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],

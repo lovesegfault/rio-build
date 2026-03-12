@@ -332,6 +332,8 @@ mod tests {
             bloom: None,
             size_class: None,
             draining: false,
+            connected_since: Instant::now(),
+            last_resources: None,
         };
         // has_capacity needs stream_tx. Fake it.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);

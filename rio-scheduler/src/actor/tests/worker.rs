@@ -42,6 +42,7 @@ async fn test_heartbeat_does_not_clobber_fresh_assignment() -> TestResult {
     // race: worker sent heartbeat before receiving/acking the assignment.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: None,
             worker_id: "toctou-worker".into(),
@@ -272,6 +273,7 @@ async fn test_heartbeat_reports_unknown_build_warns() -> TestResult {
     // know" to be clearly distinguishable).
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: None,
             worker_id: "hb-worker".into(),

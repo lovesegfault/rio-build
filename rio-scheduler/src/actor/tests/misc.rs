@@ -39,6 +39,7 @@ async fn test_not_leader_does_not_dispatch() -> TestResult {
     // Extra heartbeat to trigger dispatch_ready.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             worker_id: "nl-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
@@ -69,6 +70,7 @@ async fn test_recovery_not_complete_does_not_dispatch() -> TestResult {
 
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             worker_id: "rc-worker".into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],

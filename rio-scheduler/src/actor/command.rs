@@ -94,6 +94,11 @@ pub enum ActorCommand {
         /// maps empty-string → None. Stored on WorkerState for the
         /// classify() → best_worker() filter.
         size_class: Option<String>,
+        /// ResourceUsage from the heartbeat. Prost generates Option for
+        /// message fields; worker always populates, so None is defensive
+        /// (shouldn't happen). Stored on WorkerState as `last_resources`
+        /// for `ListWorkers`.
+        resources: Option<rio_proto::types::ResourceUsage>,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
