@@ -5,7 +5,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 ## Prerequisites
 
 - Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see [ADR-012](./decisions/012-privileged-worker-pods.md)
-- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG)
+- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the connection string must include `?sslmode=require` (sqlx has `tls-rustls-aws-lc-rs` enabled for this)
 - S3-compatible object storage (AWS S3, MinIO, GCS with S3 compatibility)
 - `kubectl` configured for the target cluster
 
@@ -88,19 +88,29 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 After deployment:
 
 ```bash
-# 1. Verify gateway is reachable
-# (Service maps external port 22 → container port 2222; use the default SSH port externally)
-ssh -i ~/.ssh/rio_key rio-gateway.example.com
+# 1. Tenant bootstrap + cluster status. rio-cli is bundled in the
+#    scheduler image (/bin/rio-cli); the pod's RIO_TLS__* env gives
+#    it mTLS to localhost:9001 automatically.
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli create-tenant my-team
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli status
 
-# 2. Query a known store path
-nix path-info --store ssh-ng://rio-gateway.example.com /nix/store/...-hello
+# 2. SSH key with tenant-name comment. The gateway maps the
+#    authorized_keys comment field to tenant_name (server-side
+#    comment, not the client's key comment).
+ssh-keygen -t ed25519 -C my-team -f ~/.ssh/rio_key -N ''
+kubectl -n rio-system create secret generic rio-gateway-ssh \
+  --from-file=authorized_keys=~/.ssh/rio_key.pub \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n rio-system rollout restart deployment/rio-gateway
 
-# 3. Build a simple package
-nix build --store ssh-ng://rio-gateway.example.com nixpkgs#hello
+# 3. Build a simple package (Service maps external port 22 → container 2222)
+nix build --store "ssh-ng://rio@rio-gateway.example.com?ssh-key=$HOME/.ssh/rio_key" nixpkgs#hello
 
 # 4. Verify binary cache
 curl -s https://rio-cache.example.com/nix-cache-info
 ```
+
+For a complete scripted walkthrough against EKS, see `infra/eks/smoke-test.sh`.
 
 ## Production Considerations
 
