@@ -73,5 +73,6 @@ fn snapshot_to_proto(s: WorkerSnapshot) -> WorkerInfo {
         resources: s.last_resources,
         last_heartbeat: instant_to_ts(s.last_heartbeat),
         connected_since: instant_to_ts(s.connected_since),
+        size_class: s.size_class.unwrap_or_default(),
     }
 }

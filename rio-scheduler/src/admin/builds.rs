@@ -3,6 +3,7 @@
 use rio_proto::types::{BuildInfo, BuildState, ListBuildsResponse};
 use sqlx::PgPool;
 use tonic::Status;
+use uuid::Uuid;
 
 /// Query PG for builds with optional filters + offset pagination.
 ///
@@ -23,6 +24,7 @@ use tonic::Status;
 pub(super) async fn list_builds(
     pool: &PgPool,
     status_filter: &str,
+    tenant_filter: Option<Uuid>,
     limit: u32,
     offset: u32,
 ) -> Result<ListBuildsResponse, Status> {
@@ -33,9 +35,11 @@ pub(super) async fn list_builds(
     // Total count (for pagination UI).
     let total: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM builds b
-         WHERE ($1::text IS NULL OR b.status = $1)",
+         WHERE ($1::text IS NULL OR b.status = $1)
+           AND ($2::uuid IS NULL OR b.tenant_id = $2)",
     )
     .bind(status_opt)
+    .bind(tenant_filter)
     .fetch_one(pool)
     .await
     .map_err(|e| Status::internal(format!("list_builds count: {e}")))?;
@@ -64,12 +68,14 @@ pub(super) async fn list_builds(
         LEFT JOIN build_derivations bd USING (build_id)
         LEFT JOIN derivations d ON bd.derivation_id = d.derivation_id
         WHERE ($1::text IS NULL OR b.status = $1)
+          AND ($2::uuid IS NULL OR b.tenant_id = $2)
         GROUP BY b.build_id
-        ORDER BY b.submitted_at DESC
-        LIMIT $2 OFFSET $3
+        ORDER BY b.submitted_at DESC, b.build_id DESC
+        LIMIT $3 OFFSET $4
         "#,
     )
     .bind(status_opt)
+    .bind(tenant_filter)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)

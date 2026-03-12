@@ -659,12 +659,15 @@ message WorkerInfo {
   ResourceUsage resources = 7;
   google.protobuf.Timestamp last_heartbeat = 8;
   google.protobuf.Timestamp connected_since = 9;
+  string size_class = 10;                // empty = unknown/unclassified
 }
 
 message ListBuildsRequest {
   string status_filter = 1;              // Optional: "pending", "active", "succeeded", "failed", "cancelled"
   uint32 limit = 2;                      // Max results (default: 100)
   uint32 offset = 3;                     // Pagination offset
+  // Optional: filter by tenant NAME (scheduler resolves to UUID). Empty = all tenants.
+  string tenant_filter = 4;
 }
 
 message ListBuildsResponse {

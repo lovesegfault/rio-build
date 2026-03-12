@@ -460,9 +460,24 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<ListBuildsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
+        // Resolve tenant name → UUID (same pattern as grpc/mod.rs SubmitBuild).
+        let tenant_filter = if req.tenant_filter.is_empty() {
+            None
+        } else {
+            let db = crate::db::SchedulerDb::new(self.pool.clone());
+            Some(
+                db.resolve_tenant(&req.tenant_filter)
+                    .await
+                    .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!("unknown tenant: {}", req.tenant_filter))
+                    })?,
+            )
+        };
         let resp = builds::list_builds(
             &self.pool,
             &req.status_filter,
+            tenant_filter,
             if req.limit == 0 { 100 } else { req.limit },
             req.offset,
         )

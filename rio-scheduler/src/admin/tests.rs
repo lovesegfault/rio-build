@@ -864,6 +864,41 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
     assert_eq!(resp.builds.len(), 1);
     assert_eq!(resp.total_count, 3, "total_count unaffected by pagination");
 
+    // tenant_filter: seed a tenant + one build tagged with it.
+    let tenant_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name) VALUES ('filter-test') RETURNING tenant_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    sched_db
+        .insert_build(
+            uuid::Uuid::new_v4(),
+            Some(tenant_id),
+            PriorityClass::Scheduled,
+            false,
+            &BuildOptions::default(),
+        )
+        .await?;
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            tenant_filter: "filter-test".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 1, "only the tenant-tagged build");
+    assert_eq!(resp.total_count, 1);
+
+    // Unknown tenant → InvalidArgument.
+    let err = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            tenant_filter: "nonexistent-tenant".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
     Ok(())
 }
 
@@ -916,6 +951,10 @@ async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     assert_eq!(w.running_builds, 0);
     assert!(w.connected_since.is_some());
     assert!(w.last_heartbeat.is_some());
+    // size_class: connect_worker doesn't set it → empty string.
+    // (Proves the field is wired — a worker heartbeating with
+    // size_class="medium" would round-trip it here.)
+    assert_eq!(w.size_class, "");
 
     // filter=draining → only drain-worker.
     let resp = svc
