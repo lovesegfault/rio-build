@@ -181,7 +181,28 @@ impl SchedulerDb {
             .fetch_optional(&self.pool)
             .await
     }
+}
 
+/// Resolve a tenant name to its UUID, mapping errors to gRPC `Status`.
+/// Shared by `SubmitBuild` (grpc/mod.rs) and `ListBuilds` (admin/mod.rs).
+/// Empty name → `Ok(None)` (single-tenant mode; no PG roundtrip).
+/// Unknown name → `Status::invalid_argument`. PG error → `Status::internal`.
+pub async fn resolve_tenant_name_for_grpc(
+    pool: &sqlx::PgPool,
+    name: &str,
+) -> Result<Option<Uuid>, tonic::Status> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    SchedulerDb::new(pool.clone())
+        .resolve_tenant(name)
+        .await
+        .map_err(|e| tonic::Status::internal(format!("tenant lookup failed: {e}")))?
+        .ok_or_else(|| tonic::Status::invalid_argument(format!("unknown tenant: {name}")))
+        .map(Some)
+}
+
+impl SchedulerDb {
     /// List all tenants (for AdminService.ListTenants).
     pub async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
         sqlx::query_as(

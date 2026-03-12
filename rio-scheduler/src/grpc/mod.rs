@@ -381,15 +381,7 @@ impl SchedulerService for SchedulerGrpc {
             let pool = self.pool.as_ref().ok_or_else(|| {
                 Status::failed_precondition("tenant lookup requires database connection")
             })?;
-            let db = crate::db::SchedulerDb::new(pool.clone());
-            Some(
-                db.resolve_tenant(&req.tenant_id)
-                    .await
-                    .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
-                    .ok_or_else(|| {
-                        Status::invalid_argument(format!("unknown tenant: {}", req.tenant_id))
-                    })?,
-            )
+            crate::db::resolve_tenant_name_for_grpc(pool, &req.tenant_id).await?
         };
 
         // Capture the current span's traceparent BEFORE sending to the

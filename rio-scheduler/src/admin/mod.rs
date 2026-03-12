@@ -444,10 +444,6 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    // -----------------------------------------------------------------------
-    // Stubs — return UNIMPLEMENTED. Phase 4 (dashboard) implements these.
-    // -----------------------------------------------------------------------
-
     // r[impl sched.admin.list-workers]
     #[instrument(skip(self, request), fields(rpc = "ListWorkers"))]
     async fn list_workers(
@@ -468,20 +464,8 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<ListBuildsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
-        // Resolve tenant name → UUID (same pattern as grpc/mod.rs SubmitBuild).
-        let tenant_filter = if req.tenant_filter.is_empty() {
-            None
-        } else {
-            let db = crate::db::SchedulerDb::new(self.pool.clone());
-            Some(
-                db.resolve_tenant(&req.tenant_filter)
-                    .await
-                    .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
-                    .ok_or_else(|| {
-                        Status::invalid_argument(format!("unknown tenant: {}", req.tenant_filter))
-                    })?,
-            )
-        };
+        let tenant_filter =
+            crate::db::resolve_tenant_name_for_grpc(&self.pool, &req.tenant_filter).await?;
         let resp = builds::list_builds(
             &self.pool,
             &req.status_filter,
