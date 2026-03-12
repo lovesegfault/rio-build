@@ -163,21 +163,26 @@ pkgs.testers.runNixOSTest {
         "k3s kubectl get lease rio-scheduler-lease -n default "
         "-o jsonpath='{.spec.holderIdentity}' | grep -q control", timeout=30)
 
-    # ── THREE SSH keys with different comments ────────────────────────
-    # sshKeySetup from common.nix generates ONE key with -C empty.
-    # We need three: team-test (known tenant), unknown-team (not in
-    # tenants table), and comment-less (single-tenant mode).
-    client.succeed("mkdir -p /root/.ssh")
+    # ── Bootstrap SSH (creates id_ed25519 with empty comment) ─────────
+    # seedBusybox uses `nix copy --to 'ssh-ng://control'` which relies
+    # on the client's default IdentityFile (id_ed25519). sshKeySetup
+    # creates it with -C empty (single-tenant mode → no rejection).
+    ${common.sshKeySetup "control"}
+
+    # ── THREE additional SSH keys with different comments ─────────────
+    # For the tenant test cases. All three + id_ed25519 go in
+    # authorized_keys. Gateway matches by key_data, reads the MATCHED
+    # entry's comment.
     client.succeed("ssh-keygen -t ed25519 -N ''' -C 'team-test' -f /root/.ssh/id_team_test")
     client.succeed("ssh-keygen -t ed25519 -N ''' -C 'unknown-team' -f /root/.ssh/id_unknown")
     client.succeed("ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_anon")
 
-    # All three to authorized_keys. Order doesn't matter — gateway
-    # matches by key_data, reads the MATCHED entry's comment.
-    all_keys = client.succeed(
+    # All four to authorized_keys (id_ed25519 already there from
+    # sshKeySetup; append the three tenant keys).
+    tenant_keys = client.succeed(
         "cat /root/.ssh/id_team_test.pub /root/.ssh/id_unknown.pub /root/.ssh/id_anon.pub"
     )
-    control.succeed(f"cat > /var/lib/rio/gateway/authorized_keys << 'EOF'\n{all_keys}\nEOF")
+    control.succeed(f"cat >> /var/lib/rio/gateway/authorized_keys << 'EOF'\n{tenant_keys}\nEOF")
     control.succeed("systemctl restart rio-gateway")
     control.wait_for_unit("rio-gateway.service")
     control.wait_for_open_port(2222)
