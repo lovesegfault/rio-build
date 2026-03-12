@@ -311,6 +311,8 @@ impl Handler for ConnectionHandler {
                 match outbound_reader.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        metrics::counter!("rio_gateway_bytes_total", "direction" => "tx")
+                            .increment(n as u64);
                         let data = CryptoVec::from_slice(&buf[..n]);
                         if handle.data(channel_id, data).await.is_err() {
                             warn!(channel = ?channel_id, "response pump: SSH send failed");
@@ -356,6 +358,8 @@ impl Handler for ConnectionHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        metrics::counter!("rio_gateway_bytes_total", "direction" => "rx")
+            .increment(data.len() as u64);
         if let Some(session) = self.sessions.get(&channel) {
             if let Some(tx) = &session.client_tx {
                 debug!(channel = ?channel, len = data.len(), "forwarding client data to protocol");

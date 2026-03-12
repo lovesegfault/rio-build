@@ -231,6 +231,7 @@ fn fetch_extract_insert(
     })?;
     metrics::histogram!("rio_worker_fuse_fetch_duration_seconds")
         .record(fetch_start.elapsed().as_secs_f64());
+    metrics::counter!("rio_worker_fuse_fetch_bytes_total").increment(nar_data.len() as u64);
 
     // Parse and extract NAR to local disk
     let node = rio_nix::nar::parse(&mut io::Cursor::new(&nar_data)).map_err(|e| {

@@ -571,6 +571,8 @@ impl StoreServiceImpl {
         drop(mark_lock_conn);
 
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
+        // r[impl obs.metric.transfer-volume]
+        metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         // Duration recorded by _duration_guard on Drop.
         Ok(Response::new(PutPathResponse { created: true }))
     }

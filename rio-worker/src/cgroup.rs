@@ -531,6 +531,79 @@ fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Background task that polls the worker's parent cgroup for CPU and
+/// memory utilization, emitting `rio_worker_cpu_fraction` and
+/// `rio_worker_memory_fraction` gauges every 15s.
+///
+/// `root` is the PARENT cgroup (what `delegated_root()` returns) —
+/// this captures the whole worker's tree: rio-worker process + all
+/// per-build sub-cgroups + all nix-daemon subprocesses.
+///
+/// CPU fraction: delta `cpu.stat usage_usec` / interval µs. 1.0 = one
+/// core fully utilized; >1.0 on multi-core. Directly comparable to
+/// cgroup `cpu.max` limits.
+///
+/// Memory fraction: `memory.current` / `memory.max`. If `memory.max`
+/// is `"max"` (unbounded — no cgroup memory limit), the fraction is
+/// reported as 0.0 (gauge stays at default; can't compute saturation
+/// without a limit).
+///
+/// Spawned from `main.rs` after `delegated_root()` returns. If the
+/// cgroup files become unreadable mid-run (rare — would indicate the
+/// cgroup was removed out from under us), the gauge simply stops
+/// updating; no crash.
+// r[impl obs.metric.worker-util]
+pub async fn spawn_utilization_reporter(root: PathBuf) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+    let cpu_stat_path = root.join("cpu.stat");
+    let mem_current_path = root.join("memory.current");
+    let mem_max_path = root.join("memory.max");
+
+    let mut last_usage_usec = fs::read_to_string(&cpu_stat_path)
+        .ok()
+        .and_then(|c| parse_cpu_stat_usage_usec(&c));
+    let mut last_instant = std::time::Instant::now();
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        // CPU: delta usage_usec / wall-clock delta µs.
+        if let Some(now_usage) = fs::read_to_string(&cpu_stat_path)
+            .ok()
+            .and_then(|c| parse_cpu_stat_usage_usec(&c))
+        {
+            let now_instant = std::time::Instant::now();
+            if let Some(last_usage) = last_usage_usec {
+                let delta_usage = now_usage.saturating_sub(last_usage);
+                let delta_wall_usec = now_instant.duration_since(last_instant).as_micros() as u64;
+                if delta_wall_usec > 0 {
+                    let fraction = delta_usage as f64 / delta_wall_usec as f64;
+                    metrics::gauge!("rio_worker_cpu_fraction").set(fraction);
+                }
+            }
+            last_usage_usec = Some(now_usage);
+            last_instant = now_instant;
+        }
+
+        // Memory: current / max. "max" (literal string) = unbounded → skip.
+        if let Some(current) = read_single_u64(&mem_current_path) {
+            let max = fs::read_to_string(&mem_max_path).ok().and_then(|s| {
+                let s = s.trim();
+                if s == "max" {
+                    None
+                } else {
+                    s.parse::<u64>().ok()
+                }
+            });
+            if let Some(max) = max
+                && max > 0
+            {
+                metrics::gauge!("rio_worker_memory_fraction").set(current as f64 / max as f64);
+            }
+        }
+    }
+}
+
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.
 use nix::libc;
 

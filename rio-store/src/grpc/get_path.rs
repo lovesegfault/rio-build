@@ -82,6 +82,7 @@ impl StoreServiceImpl {
 
         let expected_hash = info.nar_hash;
         let expected_size = info.nar_size;
+        metrics::counter!("rio_store_get_path_bytes_total").increment(expected_size);
         // Clone for the spawned task. Arc-clone is cheap; the cache
         // itself (moka + DashMap) is shared.
         let cache = self.chunk_cache.clone();

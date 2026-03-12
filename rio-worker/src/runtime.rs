@@ -214,7 +214,6 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
 /// Returns after spawning — does NOT block on build completion. The build runs
 /// in its own tokio task holding `permit`; it reports completion via
 /// `ctx.stream_tx` and drops the permit on exit (success, failure, or panic).
-// r[impl sched.trace.assignment-traceparent]
 #[tracing::instrument(skip_all, fields(drv_path = %assignment.drv_path))]
 pub async fn spawn_build_task(
     assignment: WorkAssignment,

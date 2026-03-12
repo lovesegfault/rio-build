@@ -162,6 +162,7 @@ async fn upload_output(
         {
             Ok((nar_hash, nar_size)) => {
                 metrics::counter!("rio_worker_uploads_total", "status" => "success").increment(1);
+                metrics::counter!("rio_worker_upload_bytes_total").increment(nar_size);
                 tracing::info!(
                     store_path = %store_path,
                     nar_size,

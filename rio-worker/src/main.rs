@@ -123,6 +123,13 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cgroup delegation required: {e}"))?;
     info!(cgroup = %cgroup_parent.display(), "cgroup v2 subtree ready");
 
+    // Background utilization reporter: polls parent cgroup cpu.stat +
+    // memory.current/max every 15s → rio_worker_{cpu,memory}_fraction gauges.
+    // Fire-and-forget — runs for the worker's lifetime.
+    tokio::spawn(rio_worker::cgroup::spawn_utilization_reporter(
+        cgroup_parent.clone(),
+    ));
+
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
     // seconds if scheduler DNS is slow to resolve). Readiness stays

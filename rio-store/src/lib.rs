@@ -45,6 +45,14 @@ pub fn describe_metrics() {
     describe_counter!("rio_store_put_path_total", "Total PutPath operations");
     describe_histogram!("rio_store_put_path_duration_seconds", "PutPath latency");
     describe_counter!(
+        "rio_store_put_path_bytes_total",
+        "Bytes accepted via PutPath (nar_size on success)"
+    );
+    describe_counter!(
+        "rio_store_get_path_bytes_total",
+        "Bytes served via GetPath (nar_size on stream start)"
+    );
+    describe_counter!(
         "rio_store_integrity_failures_total",
         "GetPath content integrity check failures (bitrot/corruption)"
     );
