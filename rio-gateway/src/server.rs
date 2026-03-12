@@ -146,6 +146,7 @@ impl russh::server::Server for GatewayServer {
             scheduler_client: self.scheduler_client.clone(),
             authorized_keys: Arc::clone(&self.authorized_keys),
             sessions: HashMap::new(),
+            tenant_name: String::new(),
         }
     }
 }
@@ -179,6 +180,11 @@ pub struct ConnectionHandler {
     authorized_keys: Arc<Vec<PublicKey>>,
     /// Active protocol sessions, indexed by channel ID.
     sessions: HashMap<ChannelId, ChannelSession>,
+    /// Tenant name from the matched `authorized_keys` entry's comment
+    /// field. Set in `auth_publickey` when a key matches. Passed to
+    /// the scheduler as `SubmitBuildRequest.tenant_id` which resolves
+    /// it to a UUID via the `tenants` table. Empty = single-tenant mode.
+    tenant_name: String,
 }
 
 impl Drop for ConnectionHandler {
@@ -203,16 +209,22 @@ impl Handler for ConnectionHandler {
     }
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        let key_matches = self
+        // The comment lives in the SERVER-SIDE authorized_keys entry, not
+        // the client's key (SSH key auth sends raw key data only). We
+        // match the client's key against our loaded entries, then read
+        // .comment() from the MATCHED entry.
+        let matched = self
             .authorized_keys
             .iter()
-            .any(|authorized| authorized.key_data() == key.key_data());
+            .find(|authorized| authorized.key_data() == key.key_data());
 
-        if key_matches {
+        if let Some(matched) = matched {
+            self.tenant_name = matched.comment().to_string();
             metrics::counter!("rio_gateway_connections_total", "result" => "accepted").increment(1);
             info!(
                 user = user,
                 peer = ?self.peer_addr,
+                tenant = %self.tenant_name,
                 "SSH public key authentication accepted"
             );
             Ok(Auth::Accept)
@@ -283,6 +295,7 @@ impl Handler for ConnectionHandler {
         // Task: run the protocol handler with gRPC clients
         let mut store_client = self.store_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
+        let tenant_name = self.tenant_name.clone();
         let proto_task = rio_common::task::spawn_monitored(
             "proto-task",
             async move {
@@ -293,6 +306,7 @@ impl Handler for ConnectionHandler {
                     &mut writer,
                     &mut store_client,
                     &mut scheduler_client,
+                    tenant_name,
                 )
                 .await
                 {
@@ -426,6 +440,45 @@ mod tests {
 
         let keys = load_authorized_keys(tmp.path()).expect("should load");
         assert_eq!(keys.len(), 2);
+        Ok(())
+    }
+
+    /// Key comments in authorized_keys lines are preserved by the parser
+    /// and readable via `.comment()`. This is the mechanism for tenant
+    /// name extraction in `auth_publickey`.
+    #[test]
+    fn test_load_authorized_keys_preserves_comment() -> anyhow::Result<()> {
+        let key_base = make_valid_pubkey_line()?;
+        let tmp = tempfile::NamedTempFile::new()?;
+        // OpenSSH authorized_keys format: <type> <base64> <comment>
+        std::fs::write(tmp.path(), format!("{key_base} team-infra\n"))?;
+
+        let keys = load_authorized_keys(tmp.path()).expect("should load");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].comment(),
+            "team-infra",
+            "comment field should be preserved from the authorized_keys line"
+        );
+        Ok(())
+    }
+
+    /// Key with NO comment → empty comment string. This is the
+    /// single-tenant mode case: empty tenant_name → scheduler gets
+    /// empty string → tenant_id=None.
+    #[test]
+    fn test_load_authorized_keys_no_comment_is_empty() -> anyhow::Result<()> {
+        let key_base = make_valid_pubkey_line()?;
+        let tmp = tempfile::NamedTempFile::new()?;
+        std::fs::write(tmp.path(), format!("{key_base}\n"))?;
+
+        let keys = load_authorized_keys(tmp.path()).expect("should load");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].comment(),
+            "",
+            "no comment → empty string (single-tenant mode)"
+        );
         Ok(())
     }
 
