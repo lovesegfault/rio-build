@@ -119,6 +119,17 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update", "patch"]
+  # pod-deletion-cost annotation: leader PATCHes its own Pod's
+  # metadata.annotations so K8s kills the standby first during
+  # RollingUpdate. Namespace-wide `patch pods` (not resourceNames-
+  # scoped) because the pod name is dynamic (Deployment-generated).
+  # The code only patches cfg.holder_id = HOSTNAME = our own pod.
+  # `get` is needed by kube-rs's Api::patch (it GETs first for
+  # resourceVersion on some patch types; Merge doesn't strictly
+  # need it but the client does a GET-before-PATCH anyway).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

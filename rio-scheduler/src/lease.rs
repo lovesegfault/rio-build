@@ -47,6 +47,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::serde_json::json;
+use kube::api::{Api, Patch, PatchParams};
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use tracing::{debug, info, warn};
 
@@ -232,6 +235,10 @@ pub async fn run_lease_loop(
         }
     };
 
+    // Clone for pod-deletion-cost patching. LeaseLock::new takes
+    // ownership (no public accessor to get it back out).
+    let pod_patch_client = client.clone();
+
     let lease = LeaseLock::new(
         client,
         &cfg.namespace,
@@ -296,6 +303,24 @@ pub async fn run_lease_loop(
                     // but metrics are less brittle for VM grep.
                     metrics::counter!("rio_scheduler_lease_acquired_total").increment(1);
 
+                    // r[impl sched.lease.deletion-cost]
+                    // Annotate our own Pod with pod-deletion-cost=1.
+                    // K8s's ReplicaSet controller sorts by this when
+                    // picking which pod to kill during scale-down
+                    // (incl. RollingUpdate). Leader gets the higher
+                    // cost → k8s kills the standby first → no
+                    // leadership churn on rollout. Fire-and-forget:
+                    // the lease loop MUST NOT block (see below).
+                    // Patch failure is non-fatal — without the
+                    // annotation, k8s picks arbitrarily (rollout
+                    // still works, just with possible double-churn).
+                    spawn_patch_deletion_cost(
+                        pod_patch_client.clone(),
+                        cfg.namespace.clone(),
+                        cfg.holder_id.clone(),
+                        1,
+                    );
+
                     // Fire-and-forget LeaderAcquired. The actor
                     // runs recovery then sets recovery_complete.
                     // send_unchecked bypasses backpressure — this
@@ -339,6 +364,15 @@ pub async fn run_lease_loop(
                         "lost leadership (another replica acquired)"
                     );
                     metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
+
+                    // Clear deletion cost — we're standby now, K8s
+                    // should prefer to kill us over the new leader.
+                    spawn_patch_deletion_cost(
+                        pod_patch_client.clone(),
+                        cfg.namespace.clone(),
+                        cfg.holder_id.clone(),
+                        0,
+                    );
                 }
                 // else: steady state (still leading, renewed; or
                 // still standby, someone else holds). No log —
@@ -382,6 +416,54 @@ pub async fn run_lease_loop(
         }
     }
     debug!("lease loop exited");
+}
+
+// r[impl sched.lease.deletion-cost]
+/// Fire-and-forget PATCH on our own Pod's `controller.kubernetes.io/
+/// pod-deletion-cost` annotation. K8s's ReplicaSet controller sorts
+/// pods by this value (ascending) when deciding which to evict during
+/// scale-down --- including RollingUpdate surge reconciliation. Leader
+/// sets cost=1, standby sets cost=0, k8s kills the standby first.
+///
+/// `tokio::spawn` because the lease loop MUST NOT block. A slow
+/// apiserver PATCH (>15s) would stall the renew tick, the lease
+/// expires, another replica acquires — dual-leader. Same constraint
+/// as the LeaderAcquired actor send (see `run_lease_loop`).
+///
+/// Merge patch (not Apply): we only touch one annotation key; Apply
+/// would need a fieldManager and a fuller object shape. Merge is
+/// `kubectl annotate --overwrite` semantics.
+fn spawn_patch_deletion_cost(client: kube::Client, namespace: String, pod_name: String, cost: i32) {
+    tokio::spawn(async move {
+        let pods: Api<Pod> = Api::namespaced(client, &namespace);
+        // The annotation value is a string (all k8s annotations are),
+        // parsed as int32 by the ReplicaSet controller. Invalid
+        // values sort as 0.
+        let patch = json!({
+            "metadata": {
+                "annotations": {
+                    "controller.kubernetes.io/pod-deletion-cost": cost.to_string()
+                }
+            }
+        });
+        match pods
+            .patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => debug!(%pod_name, cost, "patched pod-deletion-cost"),
+            Err(e) => {
+                // Non-fatal: rollout still works, k8s just picks
+                // arbitrarily. RBAC missing `patch pods` is the
+                // likely cause — 403 Forbidden. VM tests don't
+                // catch this (k3s admin kubeconfig bypasses RBAC).
+                warn!(
+                    %pod_name, cost, error = %e,
+                    "failed to patch pod-deletion-cost (rollout still works, \
+                     k8s will pick arbitrarily during scale-down)"
+                );
+            }
+        }
+    });
 }
 
 // r[verify sched.lease.k8s-lease]
