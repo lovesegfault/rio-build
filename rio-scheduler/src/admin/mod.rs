@@ -656,14 +656,16 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<CreateTenantResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
-        if req.tenant_name.trim().is_empty() {
+        // Trim once, use for BOTH validation and storage. Read paths
+        // trim (gateway server.rs:223, cache auth.rs:51) so storing
+        // untrimmed " team-a " makes WHERE tenant_name = 'team-a'
+        // never match — invisible-whitespace debugging session.
+        let tenant_name = req.tenant_name.trim();
+        if tenant_name.is_empty() {
             return Err(Status::invalid_argument("tenant_name is required"));
         }
-        if req
-            .cache_token
-            .as_deref()
-            .is_some_and(|t| t.trim().is_empty())
-        {
+        let cache_token = req.cache_token.as_deref().map(str::trim);
+        if cache_token.is_some_and(str::is_empty) {
             return Err(Status::invalid_argument(
                 "cache_token must not be empty string (omit field for no-cache-auth)",
             ));
@@ -690,17 +692,16 @@ impl AdminService for AdminServiceImpl {
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let row = db
             .create_tenant(
-                &req.tenant_name,
+                tenant_name,
                 gc_retention_hours,
                 gc_max_store_bytes,
-                req.cache_token.as_deref(),
+                cache_token,
             )
             .await
             .map_err(|e| Status::internal(format!("db: {e}")))?
             .ok_or_else(|| {
                 Status::already_exists(format!(
-                    "tenant '{}' already exists (or cache_token collision)",
-                    req.tenant_name
+                    "tenant '{tenant_name}' already exists (or cache_token collision)"
                 ))
             })?;
         Ok(Response::new(CreateTenantResponse {

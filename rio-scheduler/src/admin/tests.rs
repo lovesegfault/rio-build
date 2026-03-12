@@ -749,7 +749,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 // r[verify sched.admin.create-tenant]
 #[tokio::test]
 async fn test_create_and_list_tenants() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc_default().await;
+    let (svc, _actor, _task, db) = setup_svc_default().await;
 
     // Initially empty.
     let resp = svc.list_tenants(Request::new(())).await?.into_inner();
@@ -828,6 +828,30 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
         }))
         .await;
     assert_eq!(ws_tok.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Surrounding whitespace is TRIMMED before storage. Read paths
+    // trim (gateway comment().trim(), cache auth str::trim), so an
+    // untrimmed PG row makes WHERE tenant_name = 'team-trim' never
+    // match — invisible-whitespace 'unknown tenant' bug.
+    let trimmed = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "  team-trim  ".into(),
+            cache_token: Some("  trim-secret  ".into()),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        trimmed.tenant.as_ref().unwrap().tenant_name,
+        "team-trim",
+        "stored tenant_name must be trimmed"
+    );
+    // cache_token isn't returned (has_cache_token bool only) — verify PG directly.
+    let stored_tok: Option<String> =
+        sqlx::query_scalar("SELECT cache_token FROM tenants WHERE tenant_name = 'team-trim'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored_tok.as_deref(), Some("trim-secret"));
 
     // gc_retention_hours > i32::MAX → InvalidArgument (was silently
     // wrapping to negative via `as i32` and storing in PG INTEGER).
