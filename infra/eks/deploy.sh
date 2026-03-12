@@ -11,8 +11,8 @@
 #
 # Prerequisites:
 #   - `tofu apply` completed (run from infra/eks/)
-#   - `nix run .#push-images` completed (RIO_IMAGE_TAG set OR we
-#     derive it from git HEAD)
+#   - `./infra/eks/push-images.sh` completed (RIO_IMAGE_TAG set OR
+#     we derive it from git HEAD)
 #   - kubectl configured (`$(tofu output -raw kubeconfig_command)`)
 #   - AWS_PROFILE set
 #
@@ -49,7 +49,7 @@ REGION=$(tf region)
 # If the derived SHA isn't in ECR, the pods will ImagePullBackOff
 # with a clear "manifest not found" — easy to diagnose.
 export RIO_IMAGE_TAG=${RIO_IMAGE_TAG:-$(git rev-parse --short=12 HEAD)}
-log "using image tag: $RIO_IMAGE_TAG (ensure 'nix run .#push-images' has pushed it)"
+log "using image tag: $RIO_IMAGE_TAG (ensure push-images.sh has pushed it)"
 
 # --- Namespace (cert-manager Certificate CRs need it to exist
 # before apply, and the Secrets below go into it) ---

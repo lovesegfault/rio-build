@@ -850,13 +850,6 @@
               }) dockerImages
             );
 
-            # `nix run .#push-images` — builds all 5 images (closure deps
-            # of writeShellApplication) and skopeo-copies to ECR with a
-            # git-SHA tag. Exposed as a package (not `apps.*`) because
-            # packages work with `nix run` AND `nix build` (the latter is
-            # useful for inspecting the generated script without running).
-            push-images = import ./nix/push-images.nix { inherit pkgs dockerImages; };
-
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML
             # documents (WorkerPool + Build) to $out. Kustomize
