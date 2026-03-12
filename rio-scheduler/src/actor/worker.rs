@@ -251,7 +251,7 @@ impl DagActor {
                         count = to_reassign.len(),
                         "sent CancelSignal for force-drain (preemption)"
                     );
-                    metrics::counter!("rio_scheduler_cancel_signals_sent_total")
+                    metrics::counter!("rio_scheduler_cancel_signals_total")
                         .increment(to_reassign.len() as u64);
                 }
             }
