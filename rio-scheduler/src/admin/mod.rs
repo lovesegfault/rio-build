@@ -455,7 +455,7 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         let tenant_filter =
-            crate::db::resolve_tenant_name_for_grpc(&self.pool, &req.tenant_filter).await?;
+            crate::grpc::resolve_tenant_name(&self.pool, &req.tenant_filter).await?;
         let resp = builds::list_builds(
             &self.pool,
             &req.status_filter,

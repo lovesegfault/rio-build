@@ -143,6 +143,29 @@ impl SchedulerGrpc {
     }
 }
 
+/// Resolve a tenant name to its UUID, mapping errors to gRPC `Status`.
+/// Shared by `SubmitBuild` (here) and `ListBuilds` (admin/mod.rs).
+///
+/// The gateway sends the tenant NAME (from the `authorized_keys` entry's
+/// comment field); the scheduler resolves it here. Empty name → `Ok(None)`
+/// (single-tenant mode; no PG roundtrip). Unknown name →
+/// `Status::invalid_argument`. PG error → `Status::internal`.
+pub(crate) async fn resolve_tenant_name(
+    pool: &sqlx::PgPool,
+    name: &str,
+) -> Result<Option<Uuid>, Status> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
+        .ok_or_else(|| Status::invalid_argument(format!("unknown tenant: {name}")))
+        .map(Some)
+}
+
 /// Parameters for PG-backed event replay on WatchBuild.
 ///
 /// Set only when `since < last_seq` (gap exists) AND a pool is
@@ -381,7 +404,7 @@ impl SchedulerService for SchedulerGrpc {
             let pool = self.pool.as_ref().ok_or_else(|| {
                 Status::failed_precondition("tenant lookup requires database connection")
             })?;
-            crate::db::resolve_tenant_name_for_grpc(pool, &req.tenant_id).await?
+            resolve_tenant_name(pool, &req.tenant_id).await?
         };
 
         // Capture the current span's traceparent BEFORE sending to the
