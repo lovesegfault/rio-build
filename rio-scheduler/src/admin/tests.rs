@@ -1137,12 +1137,10 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
         .into_inner();
     assert!(resp.cleared, "happy path → cleared=true");
 
-    // In-mem: reset to Created.
-    let post = actor
-        .debug_query_derivation("poison-me")
-        .await?
-        .expect("still exists");
-    assert_eq!(post.status, crate::state::DerivationStatus::Created);
+    // In-mem: node removed from DAG (next submit re-inserts it fresh
+    // with full proto fields — see Dag::remove_node rationale).
+    let post = actor.debug_query_derivation("poison-me").await?;
+    assert!(post.is_none(), "node removed from DAG on ClearPoison");
 
     // PG: poisoned_at cleared.
     let pg_poisoned: Option<f64> = sqlx::query_scalar(

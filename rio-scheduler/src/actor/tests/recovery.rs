@@ -1005,3 +1005,99 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
 
     Ok(())
 }
+
+/// Regression: a ClearPoison on a recovered poisoned node must remove it
+/// from the DAG so a resubmit inserts it fresh with full proto fields.
+///
+/// Before the fix, `reset_from_poison` left the node in Created with stub
+/// fields from `from_poisoned_row` (`output_names: []`,
+/// `expected_output_paths: []`). `dag.merge()` on an existing node only
+/// touches `interested_builds` + `traceparent`, and `compute_initial_states`
+/// only iterates `newly_inserted` — so the resubmit's node never progressed
+/// past Created. Build counters stuck at `completed=0, failed=0, total=1`;
+/// `check_build_completion` never fired. Hard hang.
+#[tokio::test]
+async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: actor A poisons a derivation ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "zombie-w", "x86_64-linux", 1).await?;
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "zombie-drv",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        complete_failure(
+            &handle,
+            "zombie-w",
+            &test_drv_path("zombie-drv"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // --- Phase 2: fresh actor B recovers, operator clears poison,
+    //     user resubmits ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let mut worker_rx = connect_worker(&handle, "zombie-w2", "x86_64-linux", 1).await?;
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Precondition: recovery loaded the poisoned node.
+    let recovered = handle
+        .debug_query_derivation("zombie-drv")
+        .await?
+        .expect("poisoned drv recovered from PG");
+    assert_eq!(recovered.status, DerivationStatus::Poisoned);
+
+    // ClearPoison → node REMOVED (not reset-in-place).
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ClearPoison {
+            drv_hash: "zombie-drv".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rx.await?, "ClearPoison → cleared=true");
+
+    let post_clear = handle.debug_query_derivation("zombie-drv").await?;
+    assert!(
+        post_clear.is_none(),
+        "ClearPoison must remove the node so next merge treats it as newly-inserted"
+    );
+
+    // Resubmit — the bug's trigger. Node is newly-inserted → gets full
+    // proto fields → runs through compute_initial_states → dispatches.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "zombie-drv", PriorityClass::Scheduled).await?;
+
+    // The regression: before the fix, merge saw a stale Created stub,
+    // skipped compute_initial_states, and the node never dispatched.
+    // Assert it actually reaches the worker. recv_assignment has a 2s
+    // timeout and panics on non-Assignment — both are hang symptoms.
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, test_drv_path("zombie-drv"));
+
+    // And status progressed past Created.
+    let post_merge = handle
+        .debug_query_derivation("zombie-drv")
+        .await?
+        .expect("freshly inserted");
+    assert_ne!(
+        post_merge.status,
+        DerivationStatus::Created,
+        "node must progress past Created (compute_initial_states ran)"
+    );
+
+    Ok(())
+}

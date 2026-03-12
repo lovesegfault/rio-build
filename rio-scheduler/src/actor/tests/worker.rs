@@ -105,9 +105,10 @@ async fn test_heartbeat_timeout_via_tick_deregisters_worker() -> TestResult {
 // Poison-TTL expiry (POISON_TTL is cfg(test)-shadowed to 100ms in state/mod.rs)
 // ===========================================================================
 
-/// A poisoned derivation is reset to Created after POISON_TTL elapses and
-/// a Tick is processed. Covers the poison-expiry loop in handle_tick
-/// and state/mod.rs:reset_from_poison.
+/// A poisoned derivation is removed from the DAG after POISON_TTL elapses
+/// and a Tick is processed. Covers the poison-expiry loop in handle_tick.
+/// Removal (not in-place reset) means next submit re-inserts it fresh
+/// with full proto fields via `compute_initial_states`.
 #[tokio::test]
 async fn test_tick_expires_poisoned_derivation() -> TestResult {
     let (_db, handle, _task, _rx) =
@@ -147,14 +148,10 @@ async fn test_tick_expires_poisoned_derivation() -> TestResult {
     // Tick processes the expiry.
     handle.send_unchecked(ActorCommand::Tick).await?;
 
-    let post = handle
-        .debug_query_derivation("poison-ttl-hash")
-        .await?
-        .expect("derivation still exists");
-    assert_eq!(
-        post.status,
-        DerivationStatus::Created,
-        "poisoned derivation should be reset after TTL expiry"
+    let post = handle.debug_query_derivation("poison-ttl-hash").await?;
+    assert!(
+        post.is_none(),
+        "poisoned derivation should be removed from DAG after TTL expiry"
     );
     Ok(())
 }

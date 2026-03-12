@@ -176,8 +176,8 @@ pub struct DerivationState {
     pub output_names: Vec<String>,
     /// Whether this is a fixed-output derivation (fetchurl, etc.).
     pub is_fixed_output: bool,
-    /// Current state machine status. Private: mutate only via `transition()`,
-    /// `reset_to_ready()`, or `reset_from_poison()` to preserve invariants.
+    /// Current state machine status. Private: mutate only via `transition()`
+    /// or `reset_to_ready()` to preserve invariants.
     status: DerivationStatus,
     /// Set of build IDs interested in this derivation.
     pub interested_builds: HashSet<Uuid>,
@@ -497,19 +497,6 @@ impl DerivationState {
         Ok(())
     }
 
-    /// Poison TTL expiry. Transitions Poisoned -> Created and clears poison
-    /// state. Also clears traceparent so the NEXT submitter's trace links
-    /// to the worker span (dedup-upgrade at `dag/mod.rs`) — same as
-    /// `from_poisoned_row` which sets "" on recovery.
-    pub fn reset_from_poison(&mut self) -> Result<(), TransitionError> {
-        self.transition(DerivationStatus::Created)?;
-        self.poisoned_at = None;
-        self.retry_count = 0;
-        self.failed_workers.clear();
-        self.traceparent.clear();
-        Ok(())
-    }
-
     /// If Assigned, transition to Running (intermediate step — the
     /// state machine requires Running before Completed/Poisoned/
     /// Failed; Assigned→X directly is invalid for those). No-op if
@@ -700,35 +687,6 @@ mod tests {
         let mut state = DerivationState::try_from_node(&node)?;
         state.set_status_for_test(DerivationStatus::Completed);
         assert!(state.reset_to_ready().is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn test_reset_from_poison() -> anyhow::Result<()> {
-        let node = dummy_node();
-
-        let mut state = DerivationState::try_from_node(&node)?;
-        state.set_status_for_test(DerivationStatus::Poisoned);
-        state.poisoned_at = Some(Instant::now());
-        state.retry_count = 5;
-        state.failed_workers.insert("w1".into());
-        state.failed_workers.insert("w2".into());
-        state.traceparent = "00-aaaa-bbbb-01".into();
-
-        assert!(state.reset_from_poison().is_ok());
-        assert_eq!(state.status(), DerivationStatus::Created);
-        assert!(state.poisoned_at.is_none());
-        assert_eq!(state.retry_count, 0);
-        assert!(state.failed_workers.is_empty());
-        // Cleared so the next submitter's dedup-upgrade fires (same as
-        // from_poisoned_row which sets "" — consistent across restart
-        // and live ClearPoison paths).
-        assert!(state.traceparent.is_empty());
-
-        // Non-poisoned state rejected
-        let mut state = DerivationState::try_from_node(&node)?;
-        state.set_status_for_test(DerivationStatus::Running);
-        assert!(state.reset_from_poison().is_err());
         Ok(())
     }
 

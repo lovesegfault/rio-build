@@ -512,21 +512,34 @@ impl DerivationDag {
 
         let reaped = to_reap.len();
         for hash in to_reap {
-            if let Some(state) = self.nodes.remove(&hash) {
-                self.path_to_hash.remove(state.drv_path().as_str());
-            }
-            self.children.remove(&hash);
-            self.parents.remove(&hash);
-            // Also scrub this hash from other nodes' edge sets.
-            for children in self.children.values_mut() {
-                children.remove(&hash);
-            }
-            for parents in self.parents.values_mut() {
-                parents.remove(&hash);
-            }
+            self.remove_node(&hash);
         }
 
         reaped
+    }
+
+    /// Remove a single node and scrub all edge references to it.
+    ///
+    /// Used by poison-clear paths (admin ClearPoison, TTL expiry) so the
+    /// next merge treats the derivation as newly-inserted: it receives full
+    /// proto fields and flows through `compute_initial_states`. Resetting
+    /// status in-place instead would leave stub fields from
+    /// `from_poisoned_row` (empty `output_names`, empty
+    /// `expected_output_paths`) and `compute_initial_states` only iterates
+    /// `newly_inserted` — the node would sit in Created forever.
+    pub fn remove_node(&mut self, hash: &DrvHash) {
+        if let Some(state) = self.nodes.remove(hash) {
+            self.path_to_hash.remove(state.drv_path().as_str());
+        }
+        self.children.remove(hash);
+        self.parents.remove(hash);
+        // Also scrub this hash from other nodes' edge sets.
+        for children in self.children.values_mut() {
+            children.remove(hash);
+        }
+        for parents in self.parents.values_mut() {
+            parents.remove(hash);
+        }
     }
 
     /// Determine initial states for newly merged derivations.

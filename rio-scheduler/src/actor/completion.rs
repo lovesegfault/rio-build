@@ -464,9 +464,10 @@ impl DagActor {
     /// Clear poison state for a derivation (admin-initiated via
     /// `AdminService.ClearPoison`). Returns `true` if cleared.
     ///
-    /// In-mem: `reset_from_poison()` transitions Poisoned → Created,
-    /// clears `failed_workers`, zeros `retry_count`, nulls `poisoned_at`.
-    /// PG: `db.clear_poison()` mirrors the same.
+    /// In-mem: node removed from the DAG entirely — next submit re-inserts
+    /// it fresh with full proto fields and runs it through
+    /// `compute_initial_states`. PG: `db.clear_poison()` sets
+    /// status='created', NULLs `poisoned_at`/`retry_count`/`failed_workers`.
     ///
     /// PG first, in-mem second — if PG fails the operator's retry
     /// finds in-mem still Poisoned and can proceed. The previous
@@ -484,20 +485,14 @@ impl DagActor {
                    "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
             return false;
         }
-        // Single-threaded actor: status cannot have changed since the
-        // check above. reset_from_poison only fails on a non-Poisoned
-        // transition, which is unreachable here.
-        if let Some(state) = self.dag.node_mut(drv_hash)
-            && let Err(e) = state.reset_from_poison()
-        {
-            warn!(drv_hash = %drv_hash, error = %e,
-                  "ClearPoison: in-mem reset failed after PG clear (unreachable — status was checked)");
-            return false;
-        }
-        info!(drv_hash = %drv_hash, "poison cleared by admin");
-        // Status is now Created — it'll re-resolve inputs on next
-        // submit (inputs may have changed). Don't push to ready queue
-        // here.
+        // Remove from DAG so next merge treats it as newly-inserted.
+        // Resetting status in-place would strand stub fields from
+        // `from_poisoned_row` and `compute_initial_states` only iterates
+        // `newly_inserted` — node would sit in Created forever. Poisoned
+        // nodes have no interested builds (build already terminated) so
+        // removal here orphans no live build accounting.
+        self.dag.remove_node(drv_hash);
+        info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
         true
     }
 

@@ -557,21 +557,18 @@ impl DagActor {
         }
 
         for drv_hash in expired_poisons {
-            info!(drv_hash = %drv_hash, "poison TTL expired, resetting to created");
+            info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
             // PG first, in-mem second (same ordering as handle_clear_poison):
             // a PG blip here leaves in-mem still Poisoned, so the next
             // tick's expired_poisons scan retries. Previous order meant
-            // a blip left in-mem Created → scan never finds it again
+            // a blip left in-mem gone → scan never finds it again
             // → PG clear deferred to next scheduler restart.
             if let Err(e) = self.db.clear_poison(&drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;
             }
-            if let Some(state) = self.dag.node_mut(&drv_hash)
-                && let Err(e) = state.reset_from_poison()
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "poison reset failed");
-            }
+            // Remove (not reset) — same rationale as handle_clear_poison.
+            self.dag.remove_node(&drv_hash);
         }
 
         // build_event_log time-based sweep. Every 360 ticks (~1h at
