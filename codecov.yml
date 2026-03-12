@@ -1,0 +1,47 @@
+# Codecov configuration for rio-build.
+#
+# Nine coverage flags upload per PR (unit + vm-phase*), one per matrix
+# entry in the `coverage` job (.github/workflows/ci.yml). Paths in the
+# lcov files are already repo-relative — nix/coverage.nix strips the
+# sandbox prefix before upload, so no `fixes:` block is needed here.
+
+codecov:
+  # Wait for GitHub to report CI complete before posting the comment
+  # or status checks. ci-gate fans in all coverage jobs, so "CI done"
+  # is a reliable signal that all flags have uploaded. Avoids
+  # hardcoding a flag count that would go stale as vm-phase* grows.
+  notify:
+    wait_for_ci: true
+
+coverage:
+  status:
+    project:
+      default:
+        # Project coverage may drop by up to 0.5% vs base without
+        # failing the check. Absorbs VM-test measurement jitter
+        # (instrumented binaries under KVM aren't perfectly deterministic).
+        target: auto
+        threshold: 0.5%
+    patch:
+      default:
+        # Patch coverage must be within 2% of current project coverage.
+        # Lets a 3-line error-guard PR through even if the error branch
+        # is never exercised in tests, but still blocks under-tested
+        # feature work.
+        target: auto
+        threshold: 2%
+
+# Paths excluded from coverage math. These produce or support tests;
+# they should not themselves need coverage.
+ignore:
+  - "rio-test-support/**"  # PG bootstrap, gRPC harness, wire helpers
+  - "**/tests/**"          # integration tests drive coverage, don't need it
+  - "**/fuzz/**"           # fuzz targets (excluded from workspace anyway)
+
+comment:
+  # condensed_header drops the giant coverage-diff ASCII block;
+  # diff keeps the per-file patch-coverage table (the useful part).
+  layout: "condensed_header, diff"
+  # Only post/update the comment if coverage actually changed vs base.
+  # A docs-only PR that happens to rebuild coverage won't get a comment.
+  require_changes: true
