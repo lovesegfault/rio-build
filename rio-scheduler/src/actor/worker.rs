@@ -283,7 +283,7 @@ impl DagActor {
         }
     }
 
-    // 8 args — all independent heartbeat fields. A struct would add
+    // 9 args — all independent heartbeat fields. A struct would add
     // boilerplate at every call site for an internal-only method.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_heartbeat(
@@ -293,10 +293,8 @@ impl DagActor {
         supported_features: Vec<String>,
         max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
-        // Grouped as a legacy of the 7-arg limit (now bypassed).
-        // Both are optional heartbeat-carried hints with identical
-        // overwrite-unconditionally semantics (None clears stale).
-        (bloom, size_class): (Option<rio_common::bloom::BloomFilter>, Option<String>),
+        bloom: Option<rio_common::bloom::BloomFilter>,
+        size_class: Option<String>,
         resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.

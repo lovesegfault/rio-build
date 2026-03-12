@@ -362,7 +362,8 @@ impl DagActor {
                         supported_features,
                         max_builds,
                         running_builds,
-                        (bloom, size_class),
+                        bloom,
+                        size_class,
                         resources,
                     );
                     // Dispatch on heartbeat: new capacity may be available

@@ -221,7 +221,6 @@ mod tests {
         // roundtrip. A bare SdkTracerProvider (no exporter) gives real IDs
         // without any network.
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        use opentelemetry::trace::{Tracer, TracerProvider};
         let tracer = provider.tracer("test");
 
         // Create an OTel span directly (not via tracing — we want to
