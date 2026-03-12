@@ -925,3 +925,83 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
 
     Ok(())
 }
+
+/// Recovery loads a poisoned row whose PG `poisoned_at` is already past
+/// TTL. Recovery should clear it in PG and NOT insert it into the DAG.
+///
+/// Without the recovery.rs pre-filter, `from_poisoned_row` on a fresh
+/// k8s node (booted 1h ago) with elapsed=30h would do Instant::now()
+/// .checked_sub(30h) → None → unwrap_or(now) → poisoned_at=now →
+/// duration_since(now)=0 < POISON_TTL → FRESH 24h TTL for a derivation
+/// that should have expired 6h ago. PG's wall-clock elapsed_secs
+/// comparison is immune to node uptime.
+#[tokio::test]
+async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: actor A poisons a derivation, then we backdate PG ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "exp-poison-w", "x86_64-linux", 1).await?;
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "exp-poison",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        complete_failure(
+            &handle,
+            "exp-poison-w",
+            &test_drv_path("exp-poison"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate poisoned_at well past POISON_TTL (cfg(test) = 100ms, so
+    // 10s is 100× past). PG computes elapsed_secs = now() - poisoned_at
+    // at load time.
+    sqlx::query(
+        "UPDATE derivations SET poisoned_at = now() - interval '10 seconds' WHERE drv_hash = $1",
+    )
+    .bind("exp-poison")
+    .execute(&db.pool)
+    .await?;
+
+    // Precondition: PG still shows poisoned.
+    let (status, _): (String, bool) =
+        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
+            .bind("exp-poison")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "poisoned");
+
+    // --- Phase 2: fresh actor B recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Derivation NOT in the DAG — recovery filtered it.
+    let post = handle.debug_query_derivation("exp-poison").await?;
+    assert!(
+        post.is_none(),
+        "expired-at-load poison should be cleared, not reloaded into DAG"
+    );
+
+    // PG: clear_poison ran → status='created', poisoned_at NULL.
+    let (status, has_ts): (String, bool) =
+        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
+            .bind("exp-poison")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "created", "clear_poison sets status='created'");
+    assert!(!has_ts, "clear_poison NULLs poisoned_at");
+
+    Ok(())
+}

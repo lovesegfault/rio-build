@@ -116,7 +116,25 @@ impl DagActor {
                 "loaded poisoned derivations for TTL tracking"
             );
         }
+        let ttl_secs = crate::state::POISON_TTL.as_secs_f64();
         for row in poisoned_rows {
+            // Expired-at-load: clear in PG, don't insert. Avoids the
+            // from_poisoned_row Instant-arithmetic trap on fresh
+            // nodes — checked_sub(30h) on a node booted 1h ago returns
+            // None → unwrap_or(now) → poisoned_at=now → FRESH 24h TTL
+            // instead of immediate expiry. PG's elapsed_secs is wall-
+            // clock so the comparison here is correct regardless of
+            // node uptime.
+            if row.elapsed_secs > ttl_secs {
+                info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
+                      "poison already past TTL at recovery — clearing");
+                let hash: crate::state::DrvHash = row.drv_hash.into();
+                if let Err(e) = self.db.clear_poison(&hash).await {
+                    warn!(drv_hash = %hash, error = %e,
+                          "clear_poison for expired-at-load failed; next recovery will retry");
+                }
+                continue;
+            }
             let state = match DerivationState::from_poisoned_row(row) {
                 Ok(s) => s,
                 Err((drv_hash, _)) => {

@@ -390,8 +390,15 @@ impl DerivationState {
         // Convert PG-computed elapsed seconds back to an Instant.
         // Clamp: negative/NaN → 0 (conservative full TTL), +inf → 1yr
         // (poisoned_at = -infinity::timestamp would make from_secs_f64
-        // panic; 1yr ceiling makes checked_sub return None → now).
-        // Follows the `.max(0.0).min(MAX)` pattern from worker.rs:207.
+        // panic). Follows the `.max(0.0).min(MAX)` pattern from
+        // worker.rs:207.
+        //
+        // Note: recovery.rs filters out rows with elapsed_secs >
+        // POISON_TTL before calling this, so the checked_sub(elapsed)
+        // → None → unwrap_or(now) path only fires for still-valid
+        // poison on a recently-booted node — in which case treating
+        // poisoned_at as "now" is a conservative approximation (slight
+        // TTL extension from recovery time, bounded by node uptime).
         const MAX_ELAPSED_SECS: f64 = 365.0 * 86400.0;
         #[allow(clippy::manual_clamp)]
         let clamped = row.elapsed_secs.max(0.0).min(MAX_ELAPSED_SECS);
@@ -752,9 +759,10 @@ mod tests {
             elapsed_secs: f64::INFINITY,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();
-        // poisoned_at should be now (checked_sub(1yr) → None → now).
-        // TTL will expire immediately on next tick — correct behavior
-        // for a clearly-garbage timestamp.
+        // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →
+        // poisoned_at = now. This is a panic guard, not correctness
+        // — recovery.rs filters expired rows before calling here so
+        // a +inf elapsed would never reach this in practice.
         assert!(state.poisoned_at.is_some());
     }
 }
