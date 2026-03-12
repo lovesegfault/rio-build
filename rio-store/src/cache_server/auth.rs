@@ -48,6 +48,7 @@ pub async fn auth_middleware(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim)
         .filter(|t| !t.is_empty());
 
     match token {
@@ -282,5 +283,69 @@ mod tests {
             StatusCode::OK,
             "empty bearer must not authenticate"
         );
+    }
+
+    /// Same class as the empty-token bypass: "Bearer    " (trailing
+    /// whitespace). strip_prefix("Bearer ") → Some("   ") which passed
+    /// !is_empty() before the .map(str::trim) guard. Round-3 fix was
+    /// incomplete — it caught "" but not "   ".
+    #[tokio::test]
+    async fn whitespace_only_bearer_token_rejected_even_with_whitespace_cache_token() {
+        let db = TestDb::new(&MIGRATOR).await;
+        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('ws', '   ')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(CacheAuth {
+            pool: db.pool.clone(),
+            allow_unauthenticated: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/test")
+                    .header(header::AUTHORIZATION, "Bearer    ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "whitespace-only bearer must not authenticate"
+        );
+    }
+
+    /// "Bearer  secret" (double space) → strip_prefix → " secret"
+    /// (leading space). Without trim this would fail the PG lookup
+    /// for cache_token='secret'. With trim it matches. Not a security
+    /// issue (fails closed without trim), just a usability fix.
+    #[tokio::test]
+    async fn bearer_with_leading_whitespace_trimmed_and_matches() {
+        let db = TestDb::new(&MIGRATOR).await;
+        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('team-a', 'secret')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(CacheAuth {
+            pool: db.pool.clone(),
+            allow_unauthenticated: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/test")
+                    .header(header::AUTHORIZATION, "Bearer  secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

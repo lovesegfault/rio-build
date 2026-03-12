@@ -679,10 +679,14 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<CreateTenantResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
-        if req.tenant_name.is_empty() {
+        if req.tenant_name.trim().is_empty() {
             return Err(Status::invalid_argument("tenant_name is required"));
         }
-        if req.cache_token.as_deref() == Some("") {
+        if req
+            .cache_token
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
             return Err(Status::invalid_argument(
                 "cache_token must not be empty string (omit field for no-cache-auth)",
             ));

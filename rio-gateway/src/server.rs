@@ -220,7 +220,7 @@ impl Handler for ConnectionHandler {
             .find(|authorized| authorized.key_data() == key.key_data());
 
         if let Some(matched) = matched {
-            self.tenant_name = matched.comment().to_string();
+            self.tenant_name = matched.comment().trim().to_string();
             metrics::counter!("rio_gateway_connections_total", "result" => "accepted").increment(1);
             info!(
                 user = user,

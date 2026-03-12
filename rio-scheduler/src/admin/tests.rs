@@ -786,6 +786,37 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
         .await;
     assert_eq!(empty.unwrap_err().code(), tonic::Code::InvalidArgument);
 
+    // Whitespace-only name → InvalidArgument (same as empty).
+    let ws_name = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "   ".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(ws_name.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Empty cache_token → InvalidArgument (round-3 fix; this test was
+    // missing — the validation existed but was never exercised).
+    let empty_tok = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-gamma".into(),
+            cache_token: Some("".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(empty_tok.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Whitespace-only cache_token → InvalidArgument (round-4 fix;
+    // same bypass class as empty-token, just with "   " instead of "").
+    let ws_tok = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-delta".into(),
+            cache_token: Some("   ".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(ws_tok.unwrap_err().code(), tonic::Code::InvalidArgument);
+
     // Tenant with defaults (no optionals).
     let defaults = svc
         .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
