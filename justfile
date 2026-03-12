@@ -75,21 +75,27 @@ _eks-out NAME:
 # Init infra/eks backend (bucket from account ID or .env.local)
 eks-init: (_tfstate-init "infra/eks")
 
+# tofu apply (prompts for confirmation)
 eks-apply: eks-init
     tofu -chdir=infra/eks apply
 
+# tofu apply -auto-approve
 eks-apply-auto: eks-init
     tofu -chdir=infra/eks apply -auto-approve
 
+# Configure kubectl for the EKS cluster
 eks-kubeconfig:
     $(just _eks-out kubeconfig_command)
 
+# Build docker images + push to ECR (zstd layers, git-SHA tag)
 eks-push:
     ./infra/eks/push-images.sh
 
+# Render kustomize overlay + kubectl apply
 eks-deploy:
     ./infra/eks/deploy.sh
 
+# End-to-end smoke test (builds nixpkgs#hello, kills a worker, asserts reassign)
 eks-smoke:
     ./infra/eks/smoke-test.sh
 
