@@ -86,7 +86,7 @@ pub fn current_trace_id_hex() -> String {
 ///
 /// ssh-ng has no gRPC metadata channel, so the scheduler injects its
 /// current span's traceparent directly into the `WorkAssignment` proto
-/// message. The worker then parses this string via [`extract_traceparent`]
+/// message. The worker then parses this string via [`span_from_traceparent`]
 /// and parents its build-task span accordingly.
 ///
 /// Returns an empty string if no span is active or no propagator is
@@ -107,7 +107,7 @@ pub fn current_traceparent() -> String {
 /// `WorkAssignment.traceparent`). Pairs with [`current_traceparent`].
 ///
 /// Empty/malformed traceparent → returns a no-op Context (fresh root).
-pub fn extract_traceparent(traceparent: &str) -> opentelemetry::Context {
+fn extract_traceparent(traceparent: &str) -> opentelemetry::Context {
     if traceparent.is_empty() {
         return opentelemetry::Context::new();
     }
