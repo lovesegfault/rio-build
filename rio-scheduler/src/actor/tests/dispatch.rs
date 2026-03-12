@@ -355,6 +355,97 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     Ok(())
 }
 
+/// Dedup upgrade: if the existing node has traceparent="" (from
+/// recovery or poison-reset), a live submitter's traceparent REPLACES
+/// it. Recovery isn't a "submitter" — without this, a user's
+/// STDERR_NEXT trace_id after failover never finds the worker span.
+#[tokio::test]
+async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let (stream_tx, mut stream_rx) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "upgrade-worker".into(),
+            stream_tx,
+        })
+        .await?;
+    // Zero capacity so we can merge twice before dispatch.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            worker_id: "upgrade-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 0,
+            running_builds: vec![],
+            bloom: None,
+            size_class: None,
+            resources: None,
+        })
+        .await?;
+
+    // First merge with EMPTY traceparent (simulates recovery:
+    // from_recovery_row/from_poisoned_row set traceparent="").
+    let (r1, rr1) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node("upgrade-hash", "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: String::new(),
+            },
+            reply: r1,
+        })
+        .await?;
+    let _ = rr1.await??;
+
+    // Second merge with a REAL traceparent — dedup hit, should upgrade.
+    let live_tp = "00-33333333333333333333333333333333-3333333333333333-01";
+    let (r2, rr2) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node("upgrade-hash", "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: live_tp.to_string(),
+            },
+            reply: r2,
+        })
+        .await?;
+    let _ = rr2.await??;
+
+    // Give capacity → dispatch.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            worker_id: "upgrade-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 1,
+            running_builds: vec![],
+            bloom: None,
+            size_class: None,
+            resources: None,
+        })
+        .await?;
+
+    let assignment = recv_assignment(&mut stream_rx).await;
+    assert_eq!(
+        assignment.traceparent, live_tp,
+        "empty traceparent (recovery) should be upgraded by first live submitter"
+    );
+    drop(db);
+    Ok(())
+}
+
 /// Interactive builds get a priority boost (+1e9 instead of the old
 /// push_front). After a dependency completes, an Interactive build's
 /// newly-ready derivation dispatches BEFORE already-queued Scheduled work.

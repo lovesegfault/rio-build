@@ -185,6 +185,13 @@ impl DerivationDag {
                 if existing.interested_builds.insert(build_id) {
                     interest_added.push(drv_hash);
                 }
+                // First submitter's traceparent wins — but recovery/
+                // poison-reset set "", which isn't a submitter. Upgrade
+                // an empty traceparent so a user submitting after
+                // failover gets their trace linked to the worker span.
+                if existing.traceparent.is_empty() && !submitter_traceparent.is_empty() {
+                    existing.traceparent = submitter_traceparent.to_string();
+                }
             } else {
                 // New node. try_from_node validates drv_path: StorePath::parse.
                 // Invalid paths fail the whole merge (the actor rolls back
