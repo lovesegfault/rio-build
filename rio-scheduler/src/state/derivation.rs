@@ -404,7 +404,7 @@ impl DerivationState {
             est_duration: 0.0,
             input_srcs_nar_size: 0,
             priority: 0.0,
-            db_id: None,
+            db_id: Some(row.derivation_id),
             ready_at: None,
             running_since: None,
             backoff_until: None,

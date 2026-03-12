@@ -74,9 +74,6 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 const EMA_ALPHA: f64 = 0.3;
 
-/// Row from `load_nonterminal_builds`. FromRow for named-column
-/// mapping (tuples at this arity are error-prone).
-///
 /// Row from `list_tenants` / `create_tenant`. `has_cache_token`
 /// is a projection (`cache_token IS NOT NULL`) — the token itself
 /// is never returned. `created_at` is cast to text (`::text`) in
@@ -92,6 +89,9 @@ pub struct TenantRow {
     pub created_at: String,
 }
 
+/// Row from `load_nonterminal_builds`. FromRow for named-column
+/// mapping (tuples at this arity are error-prone).
+///
 /// `options_json`: `Option<Json<BuildOptions>>` because the column
 /// is NULLable (rows from before migration 004). Caller unwraps
 /// with `.map(|j| j.0).unwrap_or_default()`.
@@ -111,6 +111,7 @@ pub struct RecoveryBuildRow {
 /// an `Instant` via `Instant::now() - Duration::from_secs_f64(elapsed)`.
 #[derive(Debug, sqlx::FromRow)]
 pub struct PoisonedDerivationRow {
+    pub derivation_id: Uuid,
     pub drv_hash: String,
     pub drv_path: String,
     pub pname: Option<String>,
@@ -385,11 +386,6 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Clear `failed_workers` + `retry_count` for a derivation.
-    /// Called on poison-TTL expiry (reset_from_poison) so PG
-    /// matches in-mem. Without this, crash after poison-reset →
-    /// recovery loads stale failed_workers → immediately excluded
-    /// from dispatch (best_worker skips them).
     // r[impl sched.poison.ttl-persist]
     /// Persist `poisoned_at = now()` for a derivation. Called from
     /// `poison_and_cascade` and `handle_permanent_failure` after
@@ -397,24 +393,26 @@ impl SchedulerDb {
     /// already happened; missing poisoned_at means recovery won't
     /// load it (same as pre-009 behavior).
     pub async fn set_poisoned_at(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE derivations SET poisoned_at = now() WHERE drv_hash = $1")
-            .bind(drv_hash.as_bytes())
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
+        sqlx::query(
+            "UPDATE derivations SET poisoned_at = now(), updated_at = now() WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
     /// Clear poison state: NULL `poisoned_at`, empty `failed_workers`,
     /// zero `retry_count`, status='created'. Used by ClearPoison admin
-    /// RPC + TTL expiry in `handle_tick`. Combines what
-    /// `clear_failed_workers_and_retry` did plus the new poisoned_at clear.
+    /// RPC + TTL expiry in `handle_tick`.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE derivations
-             SET poisoned_at = NULL, failed_workers = '{}', retry_count = 0, status = 'created'
+             SET poisoned_at = NULL, failed_workers = '{}', retry_count = 0,
+                 status = 'created', updated_at = now()
              WHERE drv_hash = $1",
         )
-        .bind(drv_hash.as_bytes())
+        .bind(drv_hash.as_str())
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -435,7 +433,7 @@ impl SchedulerDb {
     ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT drv_hash, drv_path, pname, system,
+            SELECT derivation_id, drv_hash, drv_path, pname, system,
                    failed_workers,
                    EXTRACT(EPOCH FROM (now() - poisoned_at))::float8 AS elapsed_secs
             FROM derivations
@@ -444,21 +442,6 @@ impl SchedulerDb {
         )
         .fetch_all(&self.pool)
         .await
-    }
-
-    pub async fn clear_failed_workers_and_retry(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE derivations \
-             SET failed_workers = '{}', retry_count = 0, updated_at = now() \
-             WHERE drv_hash = $1",
-        )
-        .bind(drv_hash.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1529,6 +1512,56 @@ mod tests {
             "Some×Some blends: expected {expected}, got {cpu:?}"
         );
 
+        Ok(())
+    }
+
+    // r[verify sched.poison.ttl-persist]
+    /// Roundtrip: set_poisoned_at → load_poisoned_derivations → clear_poison.
+    /// Catches the `.as_bytes()` vs `.as_str()` binding regression — PG rejects
+    /// BYTEA against a TEXT column, but call sites swallow the error as best-effort.
+    #[tokio::test]
+    async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+        let drv_hash: DrvHash = "poison-rt-hash".into();
+        let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
+
+        // load_poisoned_derivations filters on status='poisoned' AND
+        // poisoned_at IS NOT NULL. set_poisoned_at only touches poisoned_at;
+        // status must be set separately (actors do this via persist_status).
+        sqlx::query("UPDATE derivations SET status='poisoned' WHERE drv_hash=$1")
+            .bind(drv_hash.as_str())
+            .execute(&test_db.pool)
+            .await?;
+        db.set_poisoned_at(&drv_hash).await?;
+
+        let rows = db.load_poisoned_derivations().await?;
+        assert_eq!(rows.len(), 1, "set_poisoned_at should make row loadable");
+        assert_eq!(rows[0].drv_hash, drv_hash.as_str());
+        assert_ne!(rows[0].derivation_id, Uuid::nil());
+        assert!(
+            rows[0].elapsed_secs >= 0.0 && rows[0].elapsed_secs < 5.0,
+            "elapsed should be ~0s, got {}",
+            rows[0].elapsed_secs
+        );
+
+        // clear_poison → no longer loadable; status reset to 'created'.
+        db.clear_poison(&drv_hash).await?;
+        let rows = db.load_poisoned_derivations().await?;
+        assert!(
+            rows.is_empty(),
+            "clear_poison should remove from poisoned set"
+        );
+
+        let (status, poisoned_at): (String, Option<f64>) = sqlx::query_as(
+            "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 \
+             FROM derivations WHERE drv_hash=$1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(status, "created");
+        assert!(poisoned_at.is_none());
         Ok(())
     }
 }

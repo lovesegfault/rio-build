@@ -566,8 +566,7 @@ impl DagActor {
                 continue;
             }
             // clear_poison does: status='created', poisoned_at=NULL,
-            // failed_workers='{}', retry_count=0. One PG roundtrip
-            // instead of persist_status + clear_failed_workers_and_retry.
+            // failed_workers='{}', retry_count=0 — one PG roundtrip.
             // Without this, crash after in-mem reset → recovery loads
             // stale Poisoned + failed_workers → stuck.
             if let Err(e) = self.db.clear_poison(&drv_hash).await {
