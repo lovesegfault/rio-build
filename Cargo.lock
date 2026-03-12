@@ -4538,6 +4538,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rio-common",
+ "rio-proto",
+ "rustls 0.23.37",
+ "serde",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "rio-common"
 version = "0.1.0"
 dependencies = [

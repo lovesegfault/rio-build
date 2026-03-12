@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "rio-cli",
   "rio-common",
   "rio-controller",
   "rio-gateway",
