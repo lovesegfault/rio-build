@@ -112,14 +112,18 @@ else
 fi
 
 # --- SSH authorized_keys Secret ---
-# Empty placeholder if not set — smoke-test.sh will replace it
-# with a real key. Creating it here means the gateway pod can
-# start (volumeMount doesn't fail on missing Secret) and smoke-test
-# just rolls it out.
+# The gateway refuses to start with zero valid keys ("server would
+# reject all SSH connections"). Generate a throwaway ed25519 key
+# whose private half is immediately discarded — syntactically
+# valid so the gateway starts, useless for auth so it's harmless.
+# smoke-test.sh replaces this with a real key + tenant comment.
 if ! kubectl -n "$NS" get secret rio-gateway-ssh >/dev/null 2>&1; then
-  log "creating placeholder rio-gateway-ssh Secret (smoke-test.sh replaces it)"
+  log "creating placeholder rio-gateway-ssh Secret (throwaway key, smoke-test.sh replaces it)"
+  placeholder=$(mktemp -d)
+  ssh-keygen -t ed25519 -C deploy-placeholder -f "$placeholder/key" -N '' -q
   kubectl -n "$NS" create secret generic rio-gateway-ssh \
-    --from-literal=authorized_keys=""
+    --from-file=authorized_keys="$placeholder/key.pub"
+  rm -rf "$placeholder"
 fi
 
 # --- Wait for cert-manager (terraform installs it, but Ready takes
