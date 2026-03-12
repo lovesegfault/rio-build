@@ -64,6 +64,23 @@ pub fn inject_current(metadata: &mut MetadataMap) {
     });
 }
 
+/// Returns the current span's trace_id as a 32-char lowercase hex string,
+/// or empty if no span is active or the trace context is invalid.
+///
+/// Used by the gateway to emit `rio trace_id: {hex}` to the Nix client via
+/// `STDERR_NEXT` — gives operators a grep handle for Tempo.
+pub fn current_trace_id_hex() -> String {
+    use opentelemetry::trace::TraceContextExt;
+    let cx = tracing::Span::current().context();
+    let trace_id = cx.span().span_context().trace_id();
+    if trace_id == opentelemetry::trace::TraceId::INVALID {
+        String::new()
+    } else {
+        // TraceId's Display impl is lowercase hex (32 chars for a 128-bit ID).
+        format!("{trace_id:032x}")
+    }
+}
+
 /// Returns the current span's W3C traceparent as a string, for embedding
 /// in non-gRPC payloads (e.g., [`WorkAssignment.traceparent`]).
 ///
