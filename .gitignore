@@ -8,6 +8,10 @@ result-*
 # Per-user env (AWS_PROFILE etc) — see .env.local.example
 .env.local
 
+# Written by infra/eks/push-images.sh, read by deploy.sh. Carries
+# the dirty suffix (if any) between push and deploy.
+.rio-image-tag
+
 # Pre-commit hooks
 .pre-commit-config.yaml
 

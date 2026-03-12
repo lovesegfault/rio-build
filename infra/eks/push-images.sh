@@ -8,8 +8,11 @@
 # Reads ECR_REGISTRY + AWS_REGION from tofu outputs (same pattern
 # as deploy.sh). No manual exports needed.
 #
-# Output: prints `RIO_IMAGE_TAG=<sha>` on the last line so
-# deploy.sh can `eval $(... | tail -1)` if chained.
+# Writes the resolved tag to .rio-image-tag at the repo root —
+# deploy.sh reads it from there (not from `git rev-parse`, so a
+# dirty push's suffix flows through, and a push-at-X-deploy-at-Y
+# mismatch errors loudly instead of silently deploying the wrong
+# tag). Also prints RIO_IMAGE_TAG= on stdout for shell chaining.
 
 set -euo pipefail
 
@@ -31,13 +34,26 @@ tf() { tofu -chdir="$TF_DIR" output -raw "$1" 2>/dev/null \
 ECR_REGISTRY=$(tf ecr_registry)
 AWS_REGION=$(tf region)
 
-# Dirty-tree check. ECR tags are immutable — pushing with
-# uncommitted changes means the SHA doesn't match the image.
-if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
-  die "git tree is dirty — commit or stash before pushing (immutable ECR tags, SHA must be canonical)"
+# Tag is git short-SHA, plus a -dirty-${diffhash} suffix if the
+# tree has uncommitted changes. ECR tags are immutable, so the tag
+# name must uniquely identify the content: a bare SHA on a dirty
+# tree would be a lie (and a second dirty push at the same SHA
+# would fail "tag exists"). Hashing `git diff HEAD` makes the
+# suffix deterministic — same dirty state → same tag → re-push is
+# a no-op, not a conflict. `diff HEAD` (not bare `diff`) includes
+# staged changes too.
+sha=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)
+if git -C "$REPO_ROOT" diff --quiet HEAD; then
+  tag="$sha"
+else
+  # Untracked files aren't in `git diff` — a new file that changes
+  # the build wouldn't change the hash. `git status --porcelain`
+  # lists them; folding it into the hash covers that case.
+  diffhash=$( { git -C "$REPO_ROOT" diff HEAD; git -C "$REPO_ROOT" status --porcelain; } \
+              | sha256sum | cut -c1-8 )
+  tag="${sha}-dirty-${diffhash}"
+  log "dirty tree — tagging $tag"
 fi
-
-tag=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)
 
 # Build the linkFarm aggregate. Out-link goes to a tmpdir so we
 # don't clobber ./result (which might be pointing at something
@@ -76,4 +92,8 @@ done
 (( pushed > 0 )) || die "no images found in linkFarm — nix build silently produced nothing?"
 
 log "done — pushed $pushed images, tag: $tag"
+# deploy.sh reads this file (gitignored). Flows the dirty suffix
+# through, and catches push-at-X-deploy-at-Y drift that the old
+# derive-from-HEAD approach would silently get wrong.
+echo "$tag" > "$REPO_ROOT/.rio-image-tag"
 echo "RIO_IMAGE_TAG=$tag"

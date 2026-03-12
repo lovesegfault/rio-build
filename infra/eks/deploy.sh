@@ -45,11 +45,29 @@ DB_ENDPOINT=$(tf db_endpoint)
 DB_SECRET_ARN=$(tf db_secret_arn)
 REGION=$(tf region)
 
-# Image tag: from env (set by push-images) or derive from HEAD.
-# If the derived SHA isn't in ECR, the pods will ImagePullBackOff
-# with a clear "manifest not found" — easy to diagnose.
-export RIO_IMAGE_TAG=${RIO_IMAGE_TAG:-$(git rev-parse --short=12 HEAD)}
-log "using image tag: $RIO_IMAGE_TAG (ensure push-images.sh has pushed it)"
+# Image tag resolution, in order:
+#   1. RIO_IMAGE_TAG env (explicit override)
+#   2. .rio-image-tag file written by push-images.sh — carries
+#      the dirty suffix if there was one, and catches drift:
+#      push at commit X, then you commit, then deploy — the
+#      file still says X's tag, which is correct (X is what's
+#      in ECR). The old derive-from-HEAD approach would use
+#      the new HEAD and deploy a tag that doesn't exist.
+#   3. git rev-parse HEAD — fallback for "I know the SHA is in
+#      ECR from a previous push" without the file.
+# If the resolved tag isn't in ECR, pods ImagePullBackOff with
+# "manifest not found" — easy to diagnose.
+TAG_FILE="$REPO_ROOT/.rio-image-tag"
+if [[ -n "${RIO_IMAGE_TAG:-}" ]]; then
+  log "image tag from env: $RIO_IMAGE_TAG"
+elif [[ -f "$TAG_FILE" ]]; then
+  RIO_IMAGE_TAG=$(<"$TAG_FILE")
+  log "image tag from $TAG_FILE: $RIO_IMAGE_TAG"
+else
+  RIO_IMAGE_TAG=$(git rev-parse --short=12 HEAD)
+  log "image tag derived from HEAD: $RIO_IMAGE_TAG (no .rio-image-tag — run push-images.sh?)"
+fi
+export RIO_IMAGE_TAG
 
 # --- Namespace (cert-manager Certificate CRs need it to exist
 # before apply, and the Secrets below go into it) ---
