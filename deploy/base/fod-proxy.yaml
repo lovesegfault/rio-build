@@ -100,10 +100,10 @@ spec:
         runAsGroup: 31
       containers:
         - name: squid
-          # ubuntu/squid is the canonical image. Pinning to a
-          # specific tag avoids surprise upgrades. :5.7 is the
-          # version in Ubuntu 22.04 — stable, well-tested.
-          image: ubuntu/squid:5.7-22.04_beta
+          # ubuntu/squid is the canonical image. 5.2-22.04_beta:
+          # the only non-edge 22.04 tag that exists ("5.7-22.04"
+          # was never published — 22.04 shipped squid 5.2).
+          image: ubuntu/squid:5.2-22.04_beta
           ports:
             - name: proxy
               containerPort: 3128
