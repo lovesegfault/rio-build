@@ -203,6 +203,13 @@ mod tests {
     use super::*;
     use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider};
 
+    /// Register the W3C propagator (normally done by init_tracing;
+    /// tests don't go through that).
+    fn register_propagator() {
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    }
+
     /// Round-trip: inject current → extract → same trace_id.
     ///
     /// This test has to set up a local tracer provider because the global
@@ -211,10 +218,7 @@ mod tests {
     /// init_tracing; tests don't go through that).
     #[test]
     fn inject_then_extract_roundtrips_trace_id() {
-        // Register the propagator (normally done by init_tracing).
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
 
         // Build a non-no-op tracer. The default global tracer is a noop
         // that generates all-zero trace IDs; we need real IDs to assert
@@ -273,9 +277,7 @@ mod tests {
     /// injection for invalid contexts.
     #[test]
     fn inject_current_no_active_span_is_noop() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
 
         let mut metadata = MetadataMap::new();
         // No span entered — `Span::current()` returns the noop span with
@@ -297,9 +299,7 @@ mod tests {
     /// parent).
     #[test]
     fn link_parent_no_header_is_noop() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
 
         let req: tonic::Request<()> = tonic::Request::new(());
         // No traceparent header in metadata.
@@ -330,9 +330,7 @@ mod tests {
     /// The worker treats empty as "fresh root span".
     #[test]
     fn current_traceparent_no_span_is_empty() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
         assert_eq!(current_traceparent(), "");
     }
 
@@ -340,9 +338,7 @@ mod tests {
     /// `current_traceparent` + `extract_traceparent` roundtrip preserves trace_id.
     #[test]
     fn current_traceparent_roundtrip() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let tracer = provider.tracer("test");
 
@@ -376,9 +372,7 @@ mod tests {
     /// `extract_traceparent` with empty string returns a no-op Context.
     #[test]
     fn extract_traceparent_empty_is_noop() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
         let cx = extract_traceparent("");
         assert_eq!(
             cx.span().span_context().trace_id(),

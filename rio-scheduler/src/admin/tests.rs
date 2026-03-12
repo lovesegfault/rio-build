@@ -44,6 +44,17 @@ async fn setup_svc(
     (svc, actor, task, db)
 }
 
+/// `setup_svc` with the common defaults (empty log buffers, no S3).
+async fn setup_svc_default() -> (
+    AdminServiceImpl,
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+    TestDb,
+) {
+    let buffers = Arc::new(LogBuffers::new());
+    setup_svc(buffers, None).await
+}
+
 fn mk_batch(drv_path: &str, first_line: u64, lines: &[&[u8]]) -> BuildLogBatch {
     BuildLogBatch {
         derivation_path: drv_path.to_string(),
@@ -216,7 +227,7 @@ async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
         .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -234,7 +245,7 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     // All phase4a RPCs are wired (no remaining stubs). This test proves
     // each returns a non-Unimplemented error or success — NOT full
@@ -340,7 +351,7 @@ fn gunzip_and_chunk_since_filtering() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cluster_status_empty() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let resp = svc.cluster_status(Request::new(())).await?.into_inner();
 
@@ -372,7 +383,7 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
 async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
     use crate::actor::tests::connect_worker;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Stream-only worker (no heartbeat) → total=1, active=0.
     // is_registered() requires BOTH stream_tx AND system; this has
@@ -405,7 +416,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Worker with max_builds=1: will accept exactly one assignment,
     // leaving the second derivation in ready_queue.
@@ -456,7 +467,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
 async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
     // Set up, then drop the handle + abort the task → actor channel closes.
     // check_actor_alive() catches this before the oneshot would hang.
-    let (svc, actor, task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, task, _db) = setup_svc_default().await;
     drop(actor);
     task.abort();
     // Give tokio a tick to process the abort.
@@ -490,7 +501,7 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn drain_worker_empty_id_invalid() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
         .drain_worker(Request::new(DrainWorkerRequest {
@@ -512,7 +523,7 @@ async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
     // break → stream drop → actor removes entry → preStop's drain
     // call arrives to an empty slot). The worker proceeds as if
     // drain succeeded — nothing to wait for.
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let resp = svc
         .drain_worker(Request::new(DrainWorkerRequest {
@@ -532,7 +543,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Worker with max_builds=4: plenty of capacity.
     let mut worker_rx = connect_worker(&actor, "w1", "x86_64-linux", 4).await?;
@@ -595,7 +606,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
     // Ring buffer empty → forces S3 fallback → build_id parse.
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
         .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -622,7 +633,7 @@ async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
 /// Client should retry.
 #[tokio::test]
 async fn test_trigger_gc_store_unreachable() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc.trigger_gc(Request::new(GcRequest::default())).await;
 
@@ -646,7 +657,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Two workers: w1 gets the first dispatch, then we force-drain it.
     // The reassigned drv should go to w2 on the next dispatch.
@@ -738,7 +749,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 // r[verify sched.admin.create-tenant]
 #[tokio::test]
 async fn test_create_and_list_tenants() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     // Initially empty.
     let resp = svc.list_tenants(Request::new(())).await?.into_inner();
@@ -854,7 +865,7 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
 // r[verify sched.admin.list-builds]
 #[tokio::test]
 async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
-    let (svc, _actor, _task, db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, db) = setup_svc_default().await;
     let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
 
     // Seed 3 builds directly via db helper (bypasses the actor).
@@ -981,7 +992,7 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
 async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     use crate::actor::tests::connect_worker;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Fully registered worker.
     let _rx1 = connect_worker(&actor, "alive-worker", "x86_64-linux", 4).await?;
@@ -1052,7 +1063,7 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
     use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, db) = setup_svc_default().await;
     let mut worker_rx = connect_worker(&actor, "poison-w", "x86_64-linux", 1).await?;
 
     // Merge → dispatches to worker.
@@ -1133,7 +1144,7 @@ async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyho
     use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, db) = setup_svc_default().await;
     let mut worker_rx = connect_worker(&actor, "pg-blip-w", "x86_64-linux", 1).await?;
 
     let _ev = merge_single_node(
