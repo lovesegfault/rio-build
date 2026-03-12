@@ -6,6 +6,7 @@ set dotenv-filename := ".env.local"
 # own `set shell` — settings do NOT inherit into modules, so forget
 # that line in a new module and you silently lose pipefail.
 mod eks
+mod dev
 
 default:
     @just --list --list-submodules

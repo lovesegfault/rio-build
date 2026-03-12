@@ -139,9 +139,10 @@ secretGenerator:
       - url=postgres://rio:rio@rio-pg-rw:5432/rio
     options:
       disableNameSuffixHash: true
-  # Gateway authorized_keys. File is .gitignore'd (per-user). If it's
-  # missing, `kustomize build` fails — loud error instead of a pod
-  # stuck in ContainerCreating. See ssh/README.md.
+  # Gateway authorized_keys. File is .gitignore'd (per-user); `just
+  # dev apply` materializes it from RIO_SSH_PUBKEY (.env.local). Raw
+  # `kustomize build` without it fails — loud, intentional. See
+  # ssh/README.md.
   - name: rio-gateway-ssh
     files:
       - authorized_keys=ssh/authorized_keys

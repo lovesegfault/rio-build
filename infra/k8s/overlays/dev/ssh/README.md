@@ -1,28 +1,38 @@
 # Dev overlay gateway SSH setup
 
-The gateway requires an `authorized_keys` file listing SSH public keys
-allowed to connect via `ssh-ng://`. This is **per-user** — do NOT commit
-your key.
-
-## Quick setup
-
 ```sh
-cp ~/.ssh/id_ed25519.pub infra/k8s/overlays/dev/ssh/authorized_keys
-kubectl apply -k infra/k8s/overlays/dev/
+just dev apply
 ```
 
-## How it works
+That's it. The recipe reads `RIO_SSH_PUBKEY` from `.env.local`
+(default `~/.ssh/id_ed25519.pub`), validates it, strips the comment,
+writes it here, and runs `kubectl apply -k`.
 
-`kustomization.yaml`'s `secretGenerator` reads `ssh/authorized_keys` and
-creates the `rio-gateway-ssh` Secret at build time. If the file is missing,
-`kustomize build` fails loudly (better than a pod stuck in
-`ContainerCreating` on a missing Secret).
+## Why the comment is stripped
 
-`ssh/authorized_keys` is `.gitignore`'d — everyone uses their own key.
+The gateway maps the authorized_keys comment → `tenant_name`
+(`rio-gateway/src/server.rs:211`). The scheduler resolves that against
+the `tenants` table — unknown name → `InvalidArgument` at build submit.
+Your key's default comment is `user@hostname`, and there's no such
+tenant. Empty comment → single-tenant mode → builds just work.
+
+To opt into a tenant, set `RIO_SSH_TENANT` in `.env.local` and create
+the tenant first:
+
+```sh
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli create-tenant my-team
+```
+
+## Raw `kubectl apply -k` fails without the key file
+
+Intentional. `kustomization.yaml`'s `secretGenerator` reads
+`ssh/authorized_keys`; if missing, `kustomize build` errors out —
+better than a pod stuck in `ContainerCreating`. The file is
+`.gitignore`'d (per-user).
 
 ## Host key
 
-The gateway auto-generates an ed25519 host key at first start and saves it
-to an emptyDir volume (persists across container restarts, not pod
-rescheduling). You'll get a host-key-changed warning if the pod is
-rescheduled — fine for dev.
+The gateway auto-generates an ed25519 host key at first start and saves
+it to an emptyDir volume (persists across container restarts, not pod
+rescheduling). You'll get a host-key-changed warning on reschedule —
+fine for dev.
