@@ -58,9 +58,15 @@ pkgs.writeShellApplication {
     # The image tarballs are Nix store paths. writeShellApplication
     # interpolates them at build time — no `nix build` at runtime.
     # Each push is ~30s (layer upload); total ~3min for 5 images.
+    #
+    # --insecure-policy: skopeo enforces signature verification by
+    # default and refuses to run without a policy.json at
+    # /etc/containers/ or ~/.config/containers/. We're pushing our
+    # own just-built images to our own ECR — no signatures to
+    # verify. The flag skips the policy check entirely.
     ${pkgs.lib.concatMapStringsSep "\n" (img: ''
       echo "pushing rio-${img}..." >&2
-      skopeo copy --retry-times 3 \
+      skopeo --insecure-policy copy --retry-times 3 \
         docker-archive:${dockerImages.${img}} \
         "docker://$ECR_REGISTRY/rio-${img}:$tag"
     '') images}
