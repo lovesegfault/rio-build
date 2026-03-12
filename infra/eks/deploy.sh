@@ -28,6 +28,9 @@ NS=rio-system
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 TF_DIR="$REPO_ROOT/infra/eks"
 
+# shellcheck source=infra/lib/ssh-key.sh
+source "$REPO_ROOT/infra/lib/ssh-key.sh"
+
 log() { echo "[deploy] $*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
@@ -130,18 +133,23 @@ else
 fi
 
 # --- SSH authorized_keys Secret ---
-# The gateway refuses to start with zero valid keys ("server would
-# reject all SSH connections"). Generate a throwaway ed25519 key
-# whose private half is immediately discarded — syntactically
-# valid so the gateway starts, useless for auth so it's harmless.
-# smoke-test.sh replaces this with a real key + tenant comment.
+# Key from RIO_SSH_PUBKEY (.env.local, default ~/.ssh/id_ed25519.pub)
+# with the comment stripped → single-tenant mode (scheduler skips
+# tenant lookup on empty name). Set RIO_SSH_TENANT to keep a comment;
+# that tenant must then exist (`kubectl exec deploy/rio-scheduler --
+# rio-cli create-tenant <name>`). smoke-test.sh replaces this Secret
+# with its own tenant-tagged key for the automated flow.
+#
+# Capture-then-create: if validation fails, set -e aborts before any
+# kubectl call. A pipe would race (kubectl might read empty stdin
+# before pipefail kills the line).
 if ! kubectl -n "$NS" get secret rio-gateway-ssh >/dev/null 2>&1; then
-  log "creating placeholder rio-gateway-ssh Secret (throwaway key, smoke-test.sh replaces it)"
-  placeholder=$(mktemp -d)
-  ssh-keygen -t ed25519 -C deploy-placeholder -f "$placeholder/key" -N '' -q
+  log "installing SSH authorized_keys from ${RIO_SSH_PUBKEY:-~/.ssh/id_ed25519.pub}"
+  AUTHORIZED_KEYS=$(rio_authorized_keys)
   kubectl -n "$NS" create secret generic rio-gateway-ssh \
-    --from-file=authorized_keys="$placeholder/key.pub"
-  rm -rf "$placeholder"
+    --from-file=authorized_keys=/dev/stdin <<<"$AUTHORIZED_KEYS"
+else
+  log "rio-gateway-ssh Secret already exists, skipping"
 fi
 
 # --- Wait for cert-manager (terraform installs it, but Ready takes
