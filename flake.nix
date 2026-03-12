@@ -788,6 +788,8 @@
                 grpcurl # manual AdminService poking when rio-cli isn't enough
                 jq # deploy.sh parses Secrets Manager JSON + terraform output
                 openssl # openssl rand 32 → HMAC key
+                git # push-images.sh dirty-tree check + rev-parse for image tag
+                just # deploy workflow recipes (see justfile at repo root)
               ];
               shellEnv = {
                 RUST_BACKTRACE = "1";
