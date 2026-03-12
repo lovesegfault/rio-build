@@ -351,8 +351,12 @@ rec {
   # Interpolate as `${common.sshKeySetup "control"}` in testScript.
   # The `gatewayHost` arg is the Python variable name for the gateway
   # node (phase1a: `gateway`, all others: `control`).
+  # -C "" sets an empty key comment. Without it, ssh-keygen defaults
+  # to `user@host` which (since phase4a commit 2.3) the gateway treats
+  # as a tenant name → scheduler rejects as "unknown tenant". Empty
+  # comment = single-tenant mode (tenant_id = NULL).
   sshKeySetup = gatewayHost: ''
-    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
+    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_ed25519")
     pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
     ${gatewayHost}.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
     ${gatewayHost}.succeed("systemctl restart rio-gateway.service")
