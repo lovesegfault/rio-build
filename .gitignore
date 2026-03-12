@@ -5,6 +5,9 @@ result-*
 # Ignore automatically generated direnv output
 .direnv
 
+# Per-user env (AWS_PROFILE etc) — see .env.local.example
+.env.local
+
 # Pre-commit hooks
 .pre-commit-config.yaml
 
