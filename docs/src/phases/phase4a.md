@@ -67,4 +67,4 @@
 
 `nix-build-remote -- .#checks.x86_64-linux.vm-phase4` passes (Section A: tenant smoke).
 
-**Status: COMPLETE** — 27 commits on `phase-4a-dev` (03cba43..dbc6c8d). 1124 nextest tests (+18), tracey 141 rules (141 covered, 114 verified — up from 131/108). ci-fast output: `/nix/store/xxj4fi5fla3yv0ivyfhpv16fhi4xsmxi-rio-ci-fast`.
+**Status: COMPLETE (round 2)** — 37 commits on `phase-4a-dev`. 1127 nextest tests (+21), tracey 141 rules (141 covered, 116 verified — up from 131/108). ci-fast output: `/nix/store/swff0hz6isn1w1ybs1wj5vwnw68wj12z-rio-ci-fast`. Round 2 (post-completion validation, 08f2058..07e0167) fixed: `set_poisoned_at`/`clear_poison` BYTEA-vs-TEXT binding bug that silently broke poison persistence, missing `WorkerInfo.size_class` + `ListBuilds` tenant filter proto fields, `tenant_id` span field on SubmitBuild, observability gaps (TriggerGC inject_current, backstop cancel_signals), `TenantInfo.created_at` now populated via epoch extract. Added `r[verify]` tests for ClearPoison happy path + poison recovery.
