@@ -35,7 +35,7 @@ direnv allow
 # ONE-TIME per AWS account: S3 state bucket. Idempotent — detects
 # whether state already exists in S3; if not, does the first-time
 # dance (local apply → create bucket → migrate state to S3).
-just aws-bootstrap                # ~5s if already set up
+just eks-bootstrap                # ~5s if already set up
 
 # Full bring-up: apply (prompts) → kubeconfig → push → deploy
 just eks-up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
@@ -55,7 +55,7 @@ just eks-smoke                    # ~5min — builds nixpkgs#hello, kills a work
 
 ### State backend configuration
 
-Both `infra/bootstrap` and `infra/eks` store state in the same S3
+Both `infra/eks/bootstrap` and `infra/eks` store state in the same S3
 bucket (bootstrap is self-referential — it manages the bucket it
 stores its own state in). Bucket name and region are passed via
 `-backend-config` by the justfile, so nothing account-specific is
@@ -66,7 +66,7 @@ committed. Defaults:
 | bucket | `rio-tfstate-${account_id}` (from `aws sts`) | `RIO_TFSTATE_BUCKET` |
 | region | `us-east-2` | `RIO_TFSTATE_REGION` |
 
-Running in a fresh AWS account just works: `just aws-bootstrap`
+Running in a fresh AWS account just works: `just eks-bootstrap`
 computes the bucket name, creates it, migrates state into it.
 Everything downstream reads the same computed name.
 
@@ -112,7 +112,7 @@ The S3 bucket has `force_destroy = true` so it deletes even with
 chunks in it. Aurora has `skip_final_snapshot = true`. Both are
 dev/test settings — flip them for anything you care about keeping.
 
-The state bucket (`infra/bootstrap`) is NOT destroyed by this —
+The state bucket (`infra/eks/bootstrap`) is NOT destroyed by this —
 it's a per-account fixture. Destroy it separately (and manually
 empty it first — no `force_destroy` on state buckets, losing
 state orphans resources).

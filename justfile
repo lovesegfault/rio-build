@@ -7,7 +7,7 @@ default:
     @just --list
 
 # ── State backend ────────────────────────────────────────────────────
-# Both infra/bootstrap and infra/eks store state in the same S3
+# Both infra/eks/bootstrap and infra/eks store state in the same S3
 # bucket (bootstrap is self-referential — it manages the bucket
 # it stores its own state in). Bucket + region are passed via
 # -backend-config so nothing account-specific is committed.
@@ -32,7 +32,7 @@ _tfstate-init DIR:
       -backend-config="bucket=$(just _tfstate-bucket)" \
       -backend-config="region=$(just _tfstate-region)"
 
-# ── AWS bootstrap (S3 state bucket — once per account) ──────────────
+# ── EKS bootstrap (S3 state bucket — once per account) ──────────────
 # Self-referential: state lives in the bucket this creates. The
 # chicken-and-egg is solved by detecting whether the state object
 # exists in S3: if not, init with -backend=false (local state),
@@ -40,25 +40,25 @@ _tfstate-init DIR:
 # — first run does the dance, subsequent runs are a normal apply.
 
 # Create/update the S3 state bucket (handles first-time setup)
-aws-bootstrap:
+eks-bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
     bucket="$(just _tfstate-bucket)"
     region="$(just _tfstate-region)"
     if aws s3api head-object --bucket "$bucket" --key bootstrap/terraform.tfstate >/dev/null 2>&1; then
       echo "[bootstrap] state exists at s3://$bucket/bootstrap/ — normal apply"
-      just _tfstate-init infra/bootstrap
-      tofu -chdir=infra/bootstrap apply -var="bucket_name=$bucket" -var="region=$region"
+      just _tfstate-init infra/eks/bootstrap
+      tofu -chdir=infra/eks/bootstrap apply -var="bucket_name=$bucket" -var="region=$region"
     else
       echo "[bootstrap] no state in S3 — first-time setup (local apply → migrate)"
       # -backend=false: skip S3 backend, use local state. -reconfigure
       # clears any previous .terraform/ that might point at S3.
-      tofu -chdir=infra/bootstrap init -backend=false -reconfigure
-      tofu -chdir=infra/bootstrap apply -var="bucket_name=$bucket" -var="region=$region"
+      tofu -chdir=infra/eks/bootstrap init -backend=false -reconfigure
+      tofu -chdir=infra/eks/bootstrap apply -var="bucket_name=$bucket" -var="region=$region"
       echo "[bootstrap] bucket created — migrating local state → S3"
-      tofu -chdir=infra/bootstrap init -migrate-state -force-copy \
+      tofu -chdir=infra/eks/bootstrap init -migrate-state -force-copy \
         -backend-config="bucket=$bucket" -backend-config="region=$region"
-      rm -f infra/bootstrap/terraform.tfstate infra/bootstrap/terraform.tfstate.backup
+      rm -f infra/eks/bootstrap/terraform.tfstate infra/eks/bootstrap/terraform.tfstate.backup
       echo "[bootstrap] done — state at s3://$bucket/bootstrap/terraform.tfstate"
     fi
 

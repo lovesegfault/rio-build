@@ -1,7 +1,7 @@
 # Bootstrap: the S3 bucket that holds terraform state for infra/eks
 # AND for this module itself (self-referential).
 #
-# Chicken-and-egg solved by `just aws-bootstrap`: it checks whether
+# Chicken-and-egg solved by `just eks-bootstrap`: it checks whether
 # the state object already exists in S3. If not (first time), it
 # inits with -backend=false (local state), applies to create the
 # bucket, then migrates local → S3. If yes, normal init + apply.

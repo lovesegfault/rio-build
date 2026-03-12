@@ -1,5 +1,5 @@
 # S3 remote state backend. The bucket must exist BEFORE
-# `tofu init` — create it via infra/bootstrap/ first.
+# `tofu init` — create it via `just eks-bootstrap` first.
 #
 # use_lockfile = true: native S3 state locking (OpenTofu ≥1.6,
 # Terraform ≥1.10). Uses S3's conditional-write support — no
