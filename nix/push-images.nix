@@ -1,4 +1,4 @@
-# `nix run .#push-images` — build all 5 docker images and skopeo-copy
+# `nix run .#push-images` — build all docker images and skopeo-copy
 # them to ECR, tagged with the current git short SHA.
 #
 # Prereqs:
@@ -20,6 +20,7 @@ let
     "store"
     "controller"
     "worker"
+    "fod-proxy"
   ];
 in
 pkgs.writeShellApplication {
@@ -47,7 +48,7 @@ pkgs.writeShellApplication {
     fi
 
     tag=$(git rev-parse --short=12 HEAD)
-    echo "pushing 5 images with tag $tag to $ECR_REGISTRY" >&2
+    echo "pushing ${toString (builtins.length images)} images with tag $tag to $ECR_REGISTRY" >&2
 
     # skopeo login: ECR auth tokens expire after 12h. Fresh token each
     # run — cheap (single API call) and never hits the "denied: Your
@@ -72,7 +73,7 @@ pkgs.writeShellApplication {
     '') images}
 
     echo >&2
-    echo "pushed all 5 images, tag: $tag" >&2
+    echo "pushed all ${toString (builtins.length images)} images, tag: $tag" >&2
     echo "RIO_IMAGE_TAG=$tag"
   '';
 }

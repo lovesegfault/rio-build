@@ -3,7 +3,7 @@
 # git-SHA tag.
 
 locals {
-  rio_images = ["gateway", "scheduler", "store", "controller", "worker"]
+  rio_images = ["gateway", "scheduler", "store", "controller", "worker", "fod-proxy"]
 }
 
 resource "aws_ecr_repository" "rio" {

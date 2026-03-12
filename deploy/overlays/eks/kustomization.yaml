@@ -204,3 +204,6 @@ images:
   - name: rio-controller
     newName: ${ECR_REGISTRY}/rio-controller
     newTag: ${RIO_IMAGE_TAG}
+  - name: rio-fod-proxy
+    newName: ${ECR_REGISTRY}/rio-fod-proxy
+    newTag: ${RIO_IMAGE_TAG}

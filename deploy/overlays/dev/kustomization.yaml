@@ -127,6 +127,8 @@ images:
     newTag: dev
   - name: rio-worker
     newTag: dev
+  - name: rio-fod-proxy
+    newTag: dev
 
 # PG connection secret: generated from literals (dev creds,
 # matches postgres.yaml's CloudNativePG Cluster). In prod

@@ -840,6 +840,7 @@
             docker-store = dockerImages.store;
             docker-worker = dockerImages.worker;
             docker-controller = dockerImages.controller;
+            docker-fod-proxy = dockerImages.fod-proxy;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList (name: drv: {
                 name = "${name}.tar.gz";

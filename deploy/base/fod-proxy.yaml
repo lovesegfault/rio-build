@@ -100,10 +100,11 @@ spec:
         runAsGroup: 31
       containers:
         - name: squid
-          # ubuntu/squid is the canonical image. 5.2-22.04_beta:
-          # the only non-edge 22.04 tag that exists ("5.7-22.04"
-          # was never published — 22.04 shipped squid 5.2).
-          image: ubuntu/squid:5.2-22.04_beta
+          # Nix-built (nix/docker.nix), pushed to ECR with the rest.
+          # Previously ubuntu/squid:5.7-22.04_beta — tag never existed,
+          # ImagePullBackOff in production. Third-party tags can vanish;
+          # ours can't (ECR IMMUTABLE).
+          image: rio-fod-proxy:latest
           ports:
             - name: proxy
               containerPort: 3128
