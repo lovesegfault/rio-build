@@ -457,8 +457,9 @@ impl AdminService for AdminServiceImpl {
         let req = request.into_inner();
         let tenant_filter =
             crate::grpc::resolve_tenant_name(&self.pool, &req.tenant_filter).await?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp = builds::list_builds(
-            &self.pool,
+            &db,
             &req.status_filter,
             tenant_filter,
             if req.limit == 0 { 100 } else { req.limit },

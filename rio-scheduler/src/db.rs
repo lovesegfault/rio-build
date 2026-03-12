@@ -74,6 +74,23 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 const EMA_ALPHA: f64 = 0.3;
 
+/// Row from `list_builds`. 4-table join (builds / build_derivations /
+/// derivations / assignments). `cached_derivations` heuristic:
+/// "completed with no assignment row" — a cache-hit derivation
+/// transitions directly to Completed at merge time without ever being
+/// dispatched.
+#[derive(Debug, sqlx::FromRow)]
+pub struct BuildListRow {
+    pub build_id: String,
+    pub tenant_id: Option<String>,
+    pub priority_class: String,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub total_derivations: i64,
+    pub completed_derivations: i64,
+    pub cached_derivations: i64,
+}
+
 /// Row from `list_tenants` / `create_tenant`. `has_cache_token`
 /// is a projection (`cache_token IS NOT NULL`) — the token itself
 /// is never returned. `created_at` is epoch seconds via
@@ -169,6 +186,64 @@ impl SchedulerDb {
     // -----------------------------------------------------------------------
     // Tenant operations
     // -----------------------------------------------------------------------
+
+    /// List builds with optional status/tenant filters + offset pagination
+    /// (for AdminService.ListBuilds). Returns `(total_count, page_rows)`.
+    ///
+    /// `status_opt`: `None` = no filter, `Some(s)` = `b.status = s`.
+    /// `limit` is taken as-is — caller clamps.
+    pub async fn list_builds(
+        &self,
+        status_opt: Option<&str>,
+        tenant_filter: Option<Uuid>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM builds b
+             WHERE ($1::text IS NULL OR b.status = $1)
+               AND ($2::uuid IS NULL OR b.tenant_id = $2)",
+        )
+        .bind(status_opt)
+        .bind(tenant_filter)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows: Vec<BuildListRow> = sqlx::query_as(
+            r#"
+            SELECT
+                b.build_id::text,
+                b.tenant_id::text,
+                b.priority_class,
+                b.status,
+                b.error_summary,
+                COALESCE(COUNT(bd.derivation_id), 0)::bigint AS total_derivations,
+                COALESCE(COUNT(*) FILTER (WHERE d.status = 'completed'), 0)::bigint
+                    AS completed_derivations,
+                COALESCE(COUNT(*) FILTER (
+                    WHERE d.status = 'completed'
+                      AND NOT EXISTS (SELECT 1 FROM assignments a
+                                      WHERE a.derivation_id = d.derivation_id)
+                ), 0)::bigint AS cached_derivations
+            FROM builds b
+            LEFT JOIN build_derivations bd USING (build_id)
+            LEFT JOIN derivations d ON bd.derivation_id = d.derivation_id
+            WHERE ($1::text IS NULL OR b.status = $1)
+              AND ($2::uuid IS NULL OR b.tenant_id = $2)
+            GROUP BY b.build_id
+            ORDER BY b.submitted_at DESC, b.build_id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(status_opt)
+        .bind(tenant_filter)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((total, rows))
+    }
 
     /// List all tenants (for AdminService.ListTenants).
     pub async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
