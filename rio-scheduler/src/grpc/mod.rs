@@ -5,6 +5,7 @@
 // r[impl proto.stream.bidi]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +36,11 @@ pub struct SchedulerGrpc {
     /// replay). Production always sets it — main.rs already has
     /// the pool for the DB handle.
     pool: Option<sqlx::PgPool>,
+    /// Shared with the lease loop. When false (standby), all
+    /// handlers return UNAVAILABLE immediately — clients with
+    /// a health-aware balanced channel route to the leader
+    /// instead. Tests default to `true` (always-leader).
+    is_leader: Arc<AtomicBool>,
 }
 
 impl SchedulerGrpc {
@@ -51,6 +57,7 @@ impl SchedulerGrpc {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
             pool: None,
+            is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -62,6 +69,7 @@ impl SchedulerGrpc {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
             pool: Some(pool),
+            is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -75,11 +83,13 @@ impl SchedulerGrpc {
         actor: ActorHandle,
         log_buffers: Arc<LogBuffers>,
         pool: sqlx::PgPool,
+        is_leader: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor,
             log_buffers,
             pool: Some(pool),
+            is_leader,
         }
     }
 
@@ -94,6 +104,26 @@ impl SchedulerGrpc {
             return Err(Status::unavailable(
                 "scheduler actor is unavailable (panicked or exited)",
             ));
+        }
+        Ok(())
+    }
+
+    // r[impl sched.grpc.leader-guard]
+    /// Return UNAVAILABLE when this replica is not the leader.
+    /// Called at the top of every handler, before any actor
+    /// interaction. Standby replicas keep the gRPC server up
+    /// (so the process is Ready from K8s's PoV) but refuse all
+    /// RPCs — clients with a health-aware balanced channel see
+    /// NOT_SERVING from grpc.health.v1 and route elsewhere.
+    ///
+    /// A bare `Status::unavailable` (not `Status::failed_precondition`)
+    /// because tonic's p2c balancer ejects endpoints on
+    /// UNAVAILABLE-at-connection but NOT on RPC-level errors;
+    /// clients retry on UNAVAILABLE by convention (health-aware
+    /// balancer has already removed us, so retry goes to leader).
+    fn ensure_leader(&self) -> Result<(), Status> {
+        if !self.is_leader.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("not leader (standby replica)"));
         }
         Ok(())
     }
@@ -314,6 +344,7 @@ impl SchedulerService for SchedulerGrpc {
         // link_parent stitches it to the client's trace_id. Everything
         // below (actor calls, DB writes, store RPCs) inherits this span.
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 
@@ -459,6 +490,7 @@ impl SchedulerService for SchedulerGrpc {
         request: Request<rio_proto::types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -501,6 +533,7 @@ impl SchedulerService for SchedulerGrpc {
         request: Request<rio_proto::types::QueryBuildRequest>,
     ) -> Result<Response<rio_proto::types::BuildStatus>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -522,6 +555,7 @@ impl SchedulerService for SchedulerGrpc {
         request: Request<rio_proto::types::CancelBuildRequest>,
     ) -> Result<Response<rio_proto::types::CancelBuildResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -556,6 +590,7 @@ impl WorkerService for SchedulerGrpc {
         request: Request<tonic::Streaming<rio_proto::types::WorkerMessage>>,
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let mut stream = request.into_inner();
 
@@ -754,6 +789,7 @@ impl WorkerService for SchedulerGrpc {
         request: Request<rio_proto::types::HeartbeatRequest>,
     ) -> Result<Response<rio_proto::types::HeartbeatResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 

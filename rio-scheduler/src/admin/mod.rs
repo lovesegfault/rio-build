@@ -18,6 +18,7 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
@@ -82,6 +83,9 @@ pub struct AdminServiceImpl {
     /// until the first refresh fires. Keeps `ClusterStatus` fast
     /// (it's on the autoscaler's 30s poll path).
     store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with the lease loop (same Arc as `SchedulerGrpc`).
+    /// Admin RPCs mutate state via the actor — standby must refuse.
+    is_leader: Arc<AtomicBool>,
 }
 
 /// Spawn a background task that refreshes `store_size_bytes` every 60s
@@ -130,6 +134,7 @@ impl AdminServiceImpl {
         actor: ActorHandle,
         store_addr: String,
         store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
+        is_leader: Arc<AtomicBool>,
     ) -> Self {
         Self {
             log_buffers,
@@ -139,6 +144,7 @@ impl AdminServiceImpl {
             started_at: Instant::now(),
             store_addr,
             store_size_bytes,
+            is_leader,
         }
     }
 
@@ -150,6 +156,18 @@ impl AdminServiceImpl {
             return Err(Status::unavailable(
                 "scheduler actor not running (internal error)",
             ));
+        }
+        Ok(())
+    }
+
+    // r[impl sched.grpc.leader-guard]
+    /// Same as `SchedulerGrpc::ensure_leader`. Admin RPCs mutate
+    /// state (DrainWorker, ClearPoison, CreateTenant, TriggerGC)
+    /// or reflect actor state (ClusterStatus, ListWorkers) —
+    /// standby has no actor authority and its view is stale.
+    fn ensure_leader(&self) -> Result<(), Status> {
+        if !self.is_leader.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("not leader (standby replica)"));
         }
         Ok(())
     }
@@ -319,6 +337,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetBuildLogsRequest>,
     ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         let req = request.into_inner();
 
         // Validate: need at least derivation_path. build_id is needed only
@@ -403,6 +422,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<()>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
 
         // send_unchecked: autoscaler MUST get a reading under saturation.
@@ -442,6 +462,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let resp = workers::list_workers(&self.actor, &req.status_filter).await?;
@@ -454,6 +475,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListBuildsRequest>,
     ) -> Result<Response<ListBuildsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         let req = request.into_inner();
         let tenant_filter =
             crate::grpc::resolve_tenant_name(&self.pool, &req.tenant_filter).await?;
@@ -490,6 +512,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let mut req = request.into_inner();
 
@@ -588,6 +611,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<DrainWorkerRequest>,
     ) -> Result<Response<DrainWorkerResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 
@@ -622,6 +646,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ClearPoisonRequest>,
     ) -> Result<Response<ClearPoisonResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         if req.derivation_hash.is_empty() {
@@ -643,6 +668,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<()>,
     ) -> Result<Response<ListTenantsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let rows = db
             .list_tenants()
@@ -660,6 +686,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<CreateTenantResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         let req = request.into_inner();
         // Trim once, use for BOTH validation and storage. Read paths
         // trim (gateway server.rs:223, cache auth.rs:51) so storing

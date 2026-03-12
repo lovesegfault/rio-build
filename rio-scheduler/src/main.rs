@@ -302,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
     // moving into spawn. Both need the same shared Arcs the actor
     // gets; spawn_with_leader consumes the LeaderState.
     let is_leader_for_health = Arc::clone(&leader.is_leader);
+    let is_leader_for_grpc = Arc::clone(&leader.is_leader);
     let recovery_complete_for_lease = Arc::clone(&leader.recovery_complete);
 
     // Spawn the event-log persister. Bounded mpsc + single drain
@@ -450,8 +451,12 @@ async fn main() -> anyhow::Result<()> {
     // (on completion). The test-only new_for_tests() constructor makes a
     // SEPARATE buffer — it's cfg(test) gated so prod can't accidentally
     // use it and silently break the pipeline.
-    let grpc_service =
-        SchedulerGrpc::with_log_buffers(actor.clone(), Arc::clone(&log_buffers), pool.clone());
+    let grpc_service = SchedulerGrpc::with_log_buffers(
+        actor.clone(),
+        Arc::clone(&log_buffers),
+        pool.clone(),
+        Arc::clone(&is_leader_for_grpc),
+    );
 
     // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll
     // on the shared DB. Keeps ClusterStatus fast (autoscaler's 30s path).
@@ -465,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
         actor.clone(),
         cfg.store_addr.clone(),
         store_size_bytes,
+        is_leader_for_grpc,
     );
 
     // Start periodic tick task

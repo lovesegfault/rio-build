@@ -40,6 +40,7 @@ async fn setup_svc(
         // fast, never listened on) not a timeout-prone addr.
         "127.0.0.1:1".into(),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
     (svc, actor, task, db)
 }
@@ -184,6 +185,7 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         actor,
         "127.0.0.1:1".into(),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     let resp = svc

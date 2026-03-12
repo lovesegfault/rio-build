@@ -502,6 +502,9 @@ r[sched.lease.generation-fence]
 r[sched.lease.graceful-release]
 On graceful shutdown (SIGTERM), if the lease loop was leading, it calls `step_down()` to release the lease immediately before the process exits. This is an optimization, not a correctness requirement: without it, the next replica waits up to `lease_ttl` (15s) for TTL expiry. With it, the next replica acquires on its first poll (~1s). The `step_down()` call is an async K8s PATCH; `main()` awaits the lease-loop's `JoinHandle` after `serve_with_shutdown` returns, ensuring the PATCH lands before process exit. If `step_down()` fails (apiserver unreachable), the loop logs a warning and TTL expiry is the fallback.
 
+r[sched.grpc.leader-guard]
+Every gRPC handler (SchedulerService, WorkerService, AdminService) checks `is_leader` at entry and returns `UNAVAILABLE` ("not leader") when false. This decouples K8s readiness from leadership: both pods are Ready (process up, gRPC listening), but only the leader serves RPCs. Clients with a health-aware balanced channel discover the leader via `grpc.health.v1/Check` (which reports NOT_SERVING on the standby) and route accordingly. A client that hits the standby anyway (race during failover, or a per-call connect via the ClusterIP Service) gets UNAVAILABLE, which by gRPC convention is retryable --- on the health-aware balancer, the retry goes to the leader.
+
 **Deployment strategy interaction:** The scheduler's readiness probe gates on `is_leader`, so at most one pod is ever Ready. This makes `RollingUpdate` deadlock: Kubernetes won't terminate the old leader (the only Ready pod) until a new pod is Ready, but new pods can't be Ready until they hold the lease, which the old leader holds. The deployment uses `strategy.type: Recreate` --- terminate all old pods first, then create new. Combined with `step_down()`, rollout downtime is a few seconds.
 
 ## Incremental Critical-Path Maintenance
