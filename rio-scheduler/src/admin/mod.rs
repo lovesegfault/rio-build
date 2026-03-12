@@ -540,9 +540,12 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| Status::unavailable(format!("store admin connect failed: {e}")))?;
 
         // Step 3: proxy the call. The store's stream becomes OUR
-        // stream — we wrap it in a forwarding task.
+        // stream — we wrap it in a forwarding task. inject_current
+        // so the store's link_parent can stitch the trace chain.
+        let mut tonic_req = tonic::Request::new(req);
+        rio_proto::interceptor::inject_current(tonic_req.metadata_mut());
         let store_stream = store_admin
-            .trigger_gc(req)
+            .trigger_gc(tonic_req)
             .await
             .map_err(|e| Status::internal(format!("store TriggerGC failed: {e}")))?
             .into_inner();

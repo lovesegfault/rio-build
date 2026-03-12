@@ -281,7 +281,7 @@ pub(crate) fn bridge_build_events(
 impl SchedulerService for SchedulerGrpc {
     type SubmitBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
 
-    #[instrument(skip(self, request), fields(rpc = "SubmitBuild", build_id = tracing::field::Empty))]
+    #[instrument(skip(self, request), fields(rpc = "SubmitBuild", build_id = tracing::field::Empty, tenant_id = tracing::field::Empty))]
     async fn submit_build(
         &self,
         request: Request<rio_proto::types::SubmitBuildRequest>,
@@ -413,9 +413,12 @@ impl SchedulerService for SchedulerGrpc {
         };
 
         let bcast = self.send_and_await(cmd, reply_rx).await?;
-        // Record build_id on the span (declared Empty in #[instrument]).
-        // Per observability.md:204 this is a required structured-log field.
+        // Record build_id + tenant_id on the span (declared Empty in #[instrument]).
+        // Per observability.md these are required structured-log fields.
         tracing::Span::current().record("build_id", build_id.to_string());
+        if let Some(tid) = tenant_id {
+            tracing::Span::current().record("tenant_id", tracing::field::display(tid));
+        }
         info!(build_id = %build_id, "build submitted");
         // No replay: fresh build, MergeDag subscribed BEFORE seq=1
         // (Started) was emitted. last_seq=0, no gap. Pure broadcast.

@@ -545,6 +545,7 @@ impl DagActor {
                         },
                     )),
                 });
+                metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
             }
             // Remove from worker's running set (we're taking it back).
             if let Some(worker) = self.workers.get_mut(worker_id) {

@@ -286,7 +286,7 @@ Conditionally present:
 |-------|------|--------------|
 | `trace_id` | string | Only when `RIO_OTEL_ENDPOINT` is set AND the log is emitted within an active span. The default JSON fmt layer does NOT include trace/span IDs — they come from the OTel layer's span context. |
 | `span_id` | string | Same condition as `trace_id`. |
-| `tenant_id` *(Phase 4+)* | string | Tenant identifier — currently plumbed through `SubmitBuild` and persisted to `builds` table, but NOT yet recorded as a span field on any log line. |
+| `tenant_id` *(Phase 4+)* | string | Tenant identifier. Gateway records `tenant` (name) on the session span (`session.rs`). Scheduler records `tenant_id` (UUID) on the `SubmitBuild` span after `resolve_tenant` succeeds. Persisted to `builds.tenant_id`. |
 
 Optional fields may be added per component as `tracing` span fields. All fields use snake_case. Missing context fields (e.g., `build_id` outside a build context) are omitted rather than set to empty strings.
 
