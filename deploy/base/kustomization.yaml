@@ -19,6 +19,13 @@ resources:
   - scheduler.yaml
   - gateway.yaml
   - controller.yaml
+  # FOD forward proxy (Squid). Workers route FOD fetches through
+  # this if WorkerPool.spec.fodProxyUrl is set. Included in base
+  # (not cherry-picked from prod) because kustomize's load
+  # restrictor rejects `../../base/fod-proxy.yaml` references
+  # from overlay dirs. The Squid pod is harmless if unused —
+  # ~50MB, idle, no traffic unless a WorkerPool points at it.
+  - fod-proxy.yaml
 
 # All resources get this label. Dashboards filter on it;
 # `kubectl get all -l app.kubernetes.io/part-of=rio-build`

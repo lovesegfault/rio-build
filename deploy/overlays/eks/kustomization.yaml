@@ -1,22 +1,20 @@
-# EKS overlay: IRSA + NLB annotations on top of prod.
+# EKS overlay: IRSA + NLB + ECR + secrets on top of prod.
 #
-# Prerequisites:
-#   - EKS cluster with OIDC provider configured
-#   - IAM role for rio-store SA with S3 GetObject/PutObject/
-#     DeleteObject/ListBucket on the chunk bucket
-#   - cert-manager installed in the cluster
-#   - STORE_IAM_ROLE_ARN env var set when running kustomize
-#     (envsubst or sed before apply)
+# This overlay uses ${VAR} placeholders for cluster-specific values
+# (ECR registry, IAM role ARN, S3 bucket, image tag). kustomize
+# doesn't do env-var interpolation natively. infra/eks/deploy.sh
+# copies this overlay to a tmpdir, sed-replaces the ${VARS}, and
+# runs `kubectl apply -k` on the copy.
 #
-# Usage:
-#   export STORE_IAM_ROLE_ARN=arn:aws:iam::ACCOUNT:role/rio-store
-#   kubectl apply -k deploy/overlays/eks  # after envsubst
+# Prerequisites (infra/eks/deploy.sh handles all of these):
+#   - tofu apply completed (cluster + Aurora + ECR + bastion)
+#   - nix run .#push-images completed (images in ECR)
+#   - Secrets generated: rio-postgres, rio-gateway-ssh, rio-hmac,
+#     rio-signing-key (deploy.sh creates them from tofu outputs +
+#     openssl rand + nix-store --generate-binary-cache-key)
 #
 # IMDSv2 hop limit: NOT a manifest setting — it's on the EC2
-# launch template. See infra/eks/main.tf's worker nodegroup
-# metadata_options block, or:
-#   aws ec2 modify-instance-metadata-options \
-#     --instance-id i-... --http-put-response-hop-limit 1
+# launch template (infra/eks/main.tf worker nodegroup metadata_options).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -26,16 +24,10 @@ resources:
 
 patches:
   # IRSA: annotate the store SA with the IAM role ARN. The EKS
-  # pod-identity-webhook sees this and projects an AWS token
-  # into the pod at /var/run/secrets/eks.amazonaws.com/. aws-sdk
-  # picks it up automatically (default credential chain includes
+  # pod-identity-webhook sees this and projects an AWS token at
+  # /var/run/secrets/eks.amazonaws.com/. aws-sdk picks it up
+  # automatically (default credential chain includes
   # "WebIdentityToken" at that path).
-  #
-  # ${STORE_IAM_ROLE_ARN}: shell var substitution BEFORE apply.
-  # kustomize doesn't natively do env-var interpolation; use
-  # `envsubst < overlays/eks/kustomization.yaml | kubectl apply -f -`
-  # or a sed pipeline. GitOps tools (Argo) have their own
-  # substitution mechanisms.
   - target:
       kind: ServiceAccount
       name: rio-store
@@ -50,28 +42,20 @@ patches:
   #
   # type: external → hand this Service to aws-lbc instead of the
   # legacy in-tree cloud-provider-aws. Without this, aws-lbc
-  # ignores the Service entirely (legacy provider handles it,
-  # badly — classic NLB, instance targeting, no listener attrs).
+  # ignores the Service entirely.
   #
   # nlb-target-type: ip routes directly to pod IPs (no kube-proxy
-  # hop, source IP preserved). Requires aws-lbc + VPC CNI (pods
-  # get routable VPC IPs — default on EKS).
+  # hop, source IP preserved). Requires aws-lbc + VPC CNI.
   #
   # scheme: internal. Gateway access via SSM bastion tunnel
-  # (infra/eks/bastion.tf + smoke-test.sh). Internet-facing is
-  # a site-specific overlay patch.
+  # (infra/eks/bastion.tf + smoke-test.sh).
   #
-  # listener-attributes.TCP-22: NLB TCP idle timeout. Default is
-  # 350s — too short for long nix builds. 3600s = 1h; builds
-  # longer than that re-send STDERR_NEXT keepalives (nix-daemon
-  # does this anyway). This is the aws-lbc way to set it; the
-  # old base's `aws-load-balancer-connection-idle-timeout` was
-  # ALB-only legacy syntax that aws-lbc silently ignored.
+  # listener-attributes.TCP-22: NLB TCP idle timeout. 3600s = 1h;
+  # builds longer than that re-send STDERR_NEXT keepalives anyway.
   #
-  # Patch seeds /metadata/annotations with the first entry (base
-  # has no annotations block at all → `op: add` on a member path
-  # under a nonexistent object fails). Subsequent `op: add` entries
-  # add keys into the now-existing map.
+  # First entry seeds /metadata/annotations (base has no annotations
+  # block → `op: add` on a member path under a nonexistent parent
+  # fails per RFC 6902). Subsequent entries add keys into the map.
   - target:
       kind: Service
       name: rio-gateway
@@ -89,3 +73,134 @@ patches:
       - op: add
         path: /metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-listener-attributes.TCP-22
         value: tcp.idle_timeout.seconds=3600
+
+  # Gateway SSH: mount the host key + authorized_keys Secret.
+  # Base doesn't do this (deployment.md:84 warns about it — without
+  # a mount, the gateway auto-generates an ephemeral host key on
+  # each startup, which breaks known_hosts on every restart).
+  #
+  # Host key persists via an emptyDir — survives container restarts
+  # (same pod), regenerates on pod reschedule (acceptable for dev;
+  # prod with 2 replicas should use a real Secret with a fixed key
+  # so both replicas present the same host key). authorized_keys
+  # from a Secret that smoke-test.sh creates.
+  - target:
+      kind: Deployment
+      name: rio-gateway
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rio-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                env:
+                  - name: RIO_HOST_KEY
+                    value: /var/lib/rio/gateway/host_key
+                  - name: RIO_AUTHORIZED_KEYS
+                    value: /etc/rio/ssh/authorized_keys
+                volumeMounts:
+                  - name: gateway-state
+                    mountPath: /var/lib/rio/gateway
+                  - name: gateway-ssh
+                    mountPath: /etc/rio/ssh
+                    readOnly: true
+            volumes:
+              - name: gateway-state
+                emptyDir: {}
+              - name: gateway-ssh
+                secret:
+                  secretName: rio-gateway-ssh
+
+  # Replace prod's PLACEHOLDER-SET-IN-GITOPS with the real bucket.
+  # prod sets these to placeholder values (line ~50 in its
+  # kustomization) via `op: add` — they're already in the container
+  # env list when this overlay sees them. `op: replace` targets the
+  # env entry by index, which is fragile (env ordering could shift).
+  # Instead: strategic merge by name — merges on the `name` key,
+  # replacing `value`.
+  - target:
+      kind: Deployment
+      name: rio-store
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rio-store
+      spec:
+        template:
+          spec:
+            containers:
+              - name: store
+                env:
+                  - name: RIO_CHUNK_BACKEND__BUCKET
+                    value: ${RIO_CHUNK_BUCKET}
+                  - name: RIO_LOG_S3_BUCKET
+                    value: ${RIO_CHUNK_BUCKET}
+                  # HMAC key for assignment-token signing. Same file
+                  # both scheduler and store (shared secret).
+                  - name: RIO_HMAC_KEY_PATH
+                    value: /etc/rio/hmac/key
+                  # NAR signing key (ed25519, nix secret-key format).
+                  - name: RIO_SIGNING_KEY_PATH
+                    value: /etc/rio/signing/key
+                volumeMounts:
+                  - name: hmac
+                    mountPath: /etc/rio/hmac
+                    readOnly: true
+                  - name: signing
+                    mountPath: /etc/rio/signing
+                    readOnly: true
+            volumes:
+              - name: hmac
+                secret:
+                  secretName: rio-hmac
+              - name: signing
+                secret:
+                  secretName: rio-signing-key
+
+  # Scheduler gets the same HMAC key (signs assignments, store verifies).
+  - target:
+      kind: Deployment
+      name: rio-scheduler
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: rio-scheduler
+      spec:
+        template:
+          spec:
+            containers:
+              - name: scheduler
+                env:
+                  - name: RIO_HMAC_KEY_PATH
+                    value: /etc/rio/hmac/key
+                volumeMounts:
+                  - name: hmac
+                    mountPath: /etc/rio/hmac
+                    readOnly: true
+            volumes:
+              - name: hmac
+                secret:
+                  secretName: rio-hmac
+
+# ECR image references. prod sets newTag: SET-IN-CI — this overlay
+# replaces both name and tag with the real ECR paths. push-images
+# tags with git SHA; deploy.sh substitutes RIO_IMAGE_TAG.
+images:
+  - name: rio-scheduler
+    newName: ${ECR_REGISTRY}/rio-scheduler
+    newTag: ${RIO_IMAGE_TAG}
+  - name: rio-store
+    newName: ${ECR_REGISTRY}/rio-store
+    newTag: ${RIO_IMAGE_TAG}
+  - name: rio-gateway
+    newName: ${ECR_REGISTRY}/rio-gateway
+    newTag: ${RIO_IMAGE_TAG}
+  - name: rio-controller
+    newName: ${ECR_REGISTRY}/rio-controller
+    newTag: ${RIO_IMAGE_TAG}

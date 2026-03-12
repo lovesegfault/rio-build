@@ -23,20 +23,15 @@ resources:
   # ClusterIssuer in here is cluster-scoped; everything else
   # lands in rio-system.
   - cert-manager.yaml
-  # FOD forward proxy (Squid). Workers route FOD fetches through
-  # this; the allowlist restricts to known source hosts. Only in
-  # prod overlay — dev doesn't need it (NetworkPolicy isn't
-  # enforced there anyway). Set WorkerPool.spec.fodProxyUrl to
-  # http://rio-fod-proxy:3128 to enable.
-  - ../../base/fod-proxy.yaml
-
-# Strategic merge patches: TLS Secret mounts + RIO_TLS__* env +
-# probe retarget to plaintext health port. One patch file with
-# multiple YAML docs (one per Deployment).
-patchesStrategicMerge:
-  - tls-mounts.yaml
+  # fod-proxy is in base now (kustomize's load restrictor rejected
+  # the old ../../base/fod-proxy.yaml path-traversal reference).
 
 patches:
+  # TLS Secret mounts + RIO_TLS__* env + probe retarget to plaintext
+  # health port. One patch file with multiple YAML docs (one per
+  # Deployment). `path:` form is the non-deprecated replacement for
+  # the old `patchesStrategicMerge` (kustomize v5+ warns on it).
+  - path: tls-mounts.yaml
   # S3 chunk backend. AWS creds via IRSA (the ServiceAccount
   # annotation for role assumption is cluster-specific — not
   # here). NO hardcoded keys.
