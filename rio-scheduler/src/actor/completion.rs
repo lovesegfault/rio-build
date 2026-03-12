@@ -444,6 +444,9 @@ impl DagActor {
 
         self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
             .await;
+        if let Err(e) = self.db.set_poisoned_at(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist poisoned_at");
+        }
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
@@ -554,6 +557,9 @@ impl DagActor {
 
         self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
             .await;
+        if let Err(e) = self.db.set_poisoned_at(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist poisoned_at");
+        }
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.

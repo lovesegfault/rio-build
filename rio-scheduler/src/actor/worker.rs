@@ -555,14 +555,13 @@ impl DagActor {
                 warn!(drv_hash = %drv_hash, error = %e, "poison reset failed");
                 continue;
             }
-            self.persist_status(&drv_hash, DerivationStatus::Created, None)
-                .await;
-            // reset_from_poison (in-mem) clears failed_workers +
-            // retry_count; PG must match. Without this, crash after
-            // reset → recovery loads stale failed_workers (3 workers)
-            // → immediately excluded from dispatch.
-            if let Err(e) = self.db.clear_failed_workers_and_retry(&drv_hash).await {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_workers clear");
+            // clear_poison does: status='created', poisoned_at=NULL,
+            // failed_workers='{}', retry_count=0. One PG roundtrip
+            // instead of persist_status + clear_failed_workers_and_retry.
+            // Without this, crash after in-mem reset → recovery loads
+            // stale Poisoned + failed_workers → stuck.
+            if let Err(e) = self.db.clear_poison(&drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
             }
         }
 

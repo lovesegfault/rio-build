@@ -40,3 +40,12 @@ ALTER TABLE derivations
 -- mode). No point indexing NULLs for a tenant-filtered WHERE clause.
 CREATE INDEX builds_tenant_idx ON builds (tenant_id) WHERE tenant_id IS NOT NULL;
 CREATE INDEX derivations_tenant_idx ON derivations (tenant_id) WHERE tenant_id IS NOT NULL;
+
+-- ── Part B: poison persistence (phase 4a) ──────────────────────────
+
+-- poisoned_at was previously in-memory only (state.poisoned_at =
+-- Some(Instant::now()) in poison_and_cascade/handle_permanent_failure)
+-- so TTL reset on scheduler restart. Now persisted and reloaded via
+-- a separate load_poisoned_derivations query (since 'poisoned' is in
+-- TERMINAL_STATUSES and load_nonterminal_derivations filters it out).
+ALTER TABLE derivations ADD COLUMN poisoned_at TIMESTAMPTZ;

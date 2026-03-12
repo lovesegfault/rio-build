@@ -366,6 +366,51 @@ impl DerivationState {
         })
     }
 
+    /// Construct from a `PoisonedDerivationRow` during recovery.
+    /// Minimal — poisoned rows aren't dispatched, just TTL-tracked.
+    /// `elapsed_secs` comes from PG's `EXTRACT(EPOCH FROM (now() -
+    /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
+    /// Duration::from_secs_f64(elapsed)` — approximate but good enough
+    /// for a 24h TTL.
+    pub fn from_poisoned_row(
+        row: crate::db::PoisonedDerivationRow,
+    ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
+        let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)
+            .map_err(|e| (row.drv_hash.clone(), e))?;
+        let now = Instant::now();
+        // Convert PG-computed elapsed seconds back to an Instant.
+        // Clamp negative (clock skew → poisoned_at in the future) to 0
+        // → use now() as conservative (full TTL).
+        let elapsed = std::time::Duration::from_secs_f64(row.elapsed_secs.max(0.0));
+        let poisoned_at = now.checked_sub(elapsed).unwrap_or(now);
+        Ok(Self {
+            drv_hash: row.drv_hash.into(),
+            drv_path,
+            pname: row.pname,
+            system: row.system,
+            required_features: Vec::new(),
+            output_names: Vec::new(),
+            is_fixed_output: false,
+            status: DerivationStatus::Poisoned,
+            interested_builds: HashSet::new(),
+            assigned_worker: None,
+            assigned_size_class: None,
+            drv_content: Vec::new(),
+            retry_count: 0,
+            failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
+            poisoned_at: Some(poisoned_at),
+            output_paths: Vec::new(),
+            expected_output_paths: Vec::new(),
+            est_duration: 0.0,
+            input_srcs_nar_size: 0,
+            priority: 0.0,
+            db_id: None,
+            ready_at: None,
+            running_since: None,
+            backoff_until: None,
+        })
+    }
+
     /// Store path of the .drv file (read-only; DAG owns the reverse index).
     ///
     /// Callers using `&str` auto-deref via `StorePath::Deref<Target=str>`.

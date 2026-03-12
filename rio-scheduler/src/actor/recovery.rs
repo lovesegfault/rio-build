@@ -104,6 +104,29 @@ impl DagActor {
             self.dag.insert_recovered_node(state);
         }
 
+        // --- Load poisoned derivations (separate query) ---
+        // TERMINAL_STATUSES includes "poisoned" so load_nonterminal_
+        // derivations skips them. But the TTL check in handle_tick
+        // needs them in the DAG with their poisoned_at set. Without
+        // this, poison TTL resets on scheduler restart.
+        let poisoned_rows = self.db.load_poisoned_derivations().await?;
+        if !poisoned_rows.is_empty() {
+            info!(
+                count = poisoned_rows.len(),
+                "loaded poisoned derivations for TTL tracking"
+            );
+        }
+        for row in poisoned_rows {
+            let state = match DerivationState::from_poisoned_row(row) {
+                Ok(s) => s,
+                Err((drv_hash, _)) => {
+                    warn!(drv_hash = %drv_hash, "invalid poisoned drv_path in PG, skipping");
+                    continue;
+                }
+            };
+            self.dag.insert_recovered_node(state);
+        }
+
         // --- Load edges + add to DAG ---
         let drv_ids: Vec<Uuid> = id_to_hash.keys().copied().collect();
         let edge_rows = self.db.load_edges_for_derivations(&drv_ids).await?;

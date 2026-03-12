@@ -105,6 +105,20 @@ pub struct RecoveryBuildRow {
     pub options_json: Option<sqlx::types::Json<crate::state::BuildOptions>>,
 }
 
+/// Row from `load_poisoned_derivations`. Minimal — poisoned rows
+/// aren't dispatched, just TTL-tracked. `elapsed_secs` is computed
+/// PG-side (`now() - poisoned_at`) so the caller can reconstruct
+/// an `Instant` via `Instant::now() - Duration::from_secs_f64(elapsed)`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PoisonedDerivationRow {
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub pname: Option<String>,
+    pub system: String,
+    pub failed_workers: Vec<String>,
+    pub elapsed_secs: f64,
+}
+
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
 /// columns from `batch_upsert_derivations` plus live-state fields
 /// (retry_count, assigned_worker_id, failed_workers).
@@ -376,6 +390,61 @@ impl SchedulerDb {
     /// matches in-mem. Without this, crash after poison-reset →
     /// recovery loads stale failed_workers → immediately excluded
     /// from dispatch (best_worker skips them).
+    /// Persist `poisoned_at = now()` for a derivation. Called from
+    /// `poison_and_cascade` and `handle_permanent_failure` after
+    /// `persist_status(.., Poisoned)`. Best-effort — status write
+    /// already happened; missing poisoned_at means recovery won't
+    /// load it (same as pre-009 behavior).
+    pub async fn set_poisoned_at(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE derivations SET poisoned_at = now() WHERE drv_hash = $1")
+            .bind(drv_hash.as_bytes())
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+    }
+
+    /// Clear poison state: NULL `poisoned_at`, empty `failed_workers`,
+    /// zero `retry_count`, status='created'. Used by ClearPoison admin
+    /// RPC + TTL expiry in `handle_tick`. Combines what
+    /// `clear_failed_workers_and_retry` did plus the new poisoned_at clear.
+    pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_workers = '{}', retry_count = 0, status = 'created'
+             WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_bytes())
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// Load poisoned derivations with their `poisoned_at` timestamps
+    /// for recovery. Separate from `load_nonterminal_derivations`
+    /// because `TERMINAL_STATUSES` includes `"poisoned"`. Rows with
+    /// `poisoned_at IS NULL` are pre-009 orphans — skip them (they'll
+    /// be overwritten by a fresh submit; same as pre-009 behavior).
+    ///
+    /// Returns minimal fields — poisoned rows aren't dispatched, just
+    /// TTL-tracked. The `failed_workers` count matters for display;
+    /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
+    /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
+    pub async fn load_poisoned_derivations(
+        &self,
+    ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT drv_hash, drv_path, pname, system,
+                   failed_workers,
+                   EXTRACT(EPOCH FROM (now() - poisoned_at))::float8 AS elapsed_secs
+            FROM derivations
+            WHERE status = 'poisoned' AND poisoned_at IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn clear_failed_workers_and_retry(
         &self,
         drv_hash: &DrvHash,
