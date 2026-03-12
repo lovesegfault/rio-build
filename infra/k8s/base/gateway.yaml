@@ -44,6 +44,15 @@ spec:
               value: "0.0.0.0:2222"
             - name: RIO_SCHEDULER_ADDR
               value: "rio-scheduler:9001"
+            # Headless Service for health-aware balanced routing.
+            # Gateway DNS-resolves this to pod IPs, probes
+            # grpc.health.v1 on each, routes to the leader.
+            # scheduler_addr above is still used — it's the TLS
+            # verify domain (cert SAN is "rio-scheduler").
+            - name: RIO_SCHEDULER_BALANCE_HOST
+              value: "rio-scheduler-headless"
+            - name: RIO_SCHEDULER_BALANCE_PORT
+              value: "9001"
             - name: RIO_STORE_ADDR
               value: "rio-store:9002"
             # SSH host key: overlays mount a Secret. Without it
