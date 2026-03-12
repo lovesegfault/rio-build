@@ -13,7 +13,7 @@ name = "rio-store"
 path = "src/main.rs"
 
 [dependencies]
-rio-common = { workspace = true }
+rio-common = { workspace = true, features = ["oidc"] }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 

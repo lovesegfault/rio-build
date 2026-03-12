@@ -1,0 +1,31 @@
+version: "0.5"
+
+processes:
+  postgres:
+    command: |
+      if [ ! -d "$PGDATA" ]; then
+        mkdir -p "$PGDATA"
+        initdb --username="$PGUSER" --pwfile=<(printf "%s\n" "$PGPASS") --locale=C.UTF-8 --encoding=UTF8
+
+        cat >> "$PGDATA/postgresql.conf" <<EOF
+      port = $PGPORT
+      listen_addresses = '$PGLISTEN'
+      unix_socket_directories = '$PGHOST'
+      EOF
+
+        echo "CREATE DATABASE ${PGUSER:-$(id -nu)};" | postgres --single -E postgres
+        echo "CREATE DATABASE rio_dev WITH OWNER = rio;" | postgres --single -E postgres
+      fi
+      exec postgres
+    readiness_probe:
+      exec:
+        command: pg_isready -h $PGHOST -p $PGPORT -U $PGUSER
+      initial_delay_seconds: 2
+      period_seconds: 1
+      timeout_seconds: 2
+
+  rio-store:
+    command: cargo run -p rio-store -- --listen-addr 127.0.0.1:9002
+    depends_on:
+      postgres:
+        condition: process_healthy

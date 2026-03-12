@@ -5,6 +5,7 @@ members = [
   "rio-gateway",
   "rio-nix",
   "rio-proto",
+  "rio-push",
   "rio-scheduler",
   "rio-store",
   "rio-test-support",
@@ -203,6 +204,14 @@ x509-parser = "0.18"
 
 # Encoding
 hex = "0.4"
+
+# JWT validation (OIDC). jsonwebtoken provides decode + JWKS-based
+# verification; reqwest fetches /.well-known/openid-configuration.
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+] }
 
 # Error handling
 thiserror = "2"

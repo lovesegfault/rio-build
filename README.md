@@ -75,6 +75,7 @@ rio-build is a **build execution backend**, not a CI system. Out of scope: Nix e
 | `rio-gateway` | SSH server + Nix worker protocol frontend |
 | `rio-scheduler` | DAG scheduler, critical-path priority, size-class routing |
 | `rio-store` | Chunked CAS, narinfo signing, binary-cache HTTP server |
+| `rio-push` | CLI for pushing Nix store path closures to rio-store |
 | `rio-worker` | Build executor, FUSE store, overlayfs isolation, cgroup metering |
 | `rio-controller` | Kubernetes operator (WorkerPool/Build CRDs, autoscaler) |
 | `rio-test-support` | Ephemeral PostgreSQL bootstrap, mock gRPC, wire helpers |

@@ -134,6 +134,12 @@ pub struct StoreServiceImpl {
     ///
     /// None = accept all callers (dev mode, same as pre-Phase-3b).
     hmac_verifier: Option<Arc<rio_common::hmac::HmacVerifier>>,
+    /// OIDC token verifier for external push authentication (e.g.,
+    /// GitHub Actions). When Some, PutPath accepts JWT tokens via
+    /// `x-rio-oidc-token` metadata as an alternative to HMAC.
+    /// OIDC-authenticated pushes have no path restriction (unlike
+    /// HMAC tokens with `expected_outputs`).
+    oidc_verifier: Option<Arc<rio_common::oidc::OidcVerifier>>,
 }
 
 impl StoreServiceImpl {
@@ -148,6 +154,7 @@ impl StoreServiceImpl {
             chunk_cache: None,
             signer: None,
             hmac_verifier: None,
+            oidc_verifier: None,
         }
     }
 
@@ -172,6 +179,7 @@ impl StoreServiceImpl {
             chunk_cache: Some(cache),
             signer: None,
             hmac_verifier: None,
+            oidc_verifier: None,
         }
     }
 
@@ -179,6 +187,13 @@ impl StoreServiceImpl {
     /// Builder-style — chains after `new()` or `with_chunk_cache()`.
     pub fn with_hmac_verifier(mut self, verifier: rio_common::hmac::HmacVerifier) -> Self {
         self.hmac_verifier = Some(Arc::new(verifier));
+        self
+    }
+
+    /// Enable OIDC token verification on PutPath.
+    /// Builder-style — chains after `new()` or `with_chunk_cache()`.
+    pub fn with_oidc_verifier(mut self, verifier: Arc<rio_common::oidc::OidcVerifier>) -> Self {
+        self.oidc_verifier = Some(verifier);
         self
     }
 

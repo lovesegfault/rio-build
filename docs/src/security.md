@@ -44,6 +44,26 @@ Inter-component gRPC traffic is authenticated with mTLS and, for write-path RPCs
 
 > **TLS SNI:** `load_client_tls` does **not** set a fixed `domain_name` on the `ClientTlsConfig`. tonic derives the SNI server name from the connect URL's host per-connection. A global `domain_name` override would break multi-service clients (gateway/worker connect to both scheduler and store, each with a different cert SAN).
 
+#### OIDC Authentication for External Push
+
+r[sec.boundary.grpc-oidc]
+
+`rio-push` enables external CI environments (GitHub Actions, GitLab CI) to push pre-built store path closures to rio-store without mTLS certificates or HMAC assignment tokens. Authentication uses OIDC JWT tokens:
+
+- The CI environment obtains an OIDC token from its identity provider (e.g., `$ACTIONS_ID_TOKEN_REQUEST_URL` in GitHub Actions).
+- `rio-push` sends the token in the `x-rio-oidc-token` gRPC metadata header with each `PutPath` call.
+- rio-store validates the token: signature (via JWKS), expiry, audience, issuer, and bound claims.
+- OIDC-authenticated pushes have **no path restriction** (unlike HMAC tokens with `expected_outputs`), since the caller controls what to push. Access is scoped by the provider's bound claims (e.g., `repository_owner`).
+
+**PutPath auth priority:** (1) OIDC verifier configured + `x-rio-oidc-token` present -> validate JWT, no path restriction, (2) HMAC verifier not configured -> accept (dev mode), (3) `x-rio-assignment-token` present -> verify HMAC + path-check, (4) mTLS CN=rio-gateway -> accept, (5) otherwise -> reject. **Note:** configuring `oidc_providers` without `hmac_key_path` leaves dev-mode fallthrough active for requests without an OIDC token.
+
+**Threat mitigations:**
+- **Token theft:** OIDC tokens are short-lived (typically 5--15 min). Bound claims (`repository_owner`, `repository`) limit blast radius.
+- **Key rotation:** On signature verification failure, rio-store force-refreshes the JWKS cache once before rejecting (handles key rotation without downtime).
+- **Issuer spoofing:** Only explicitly configured issuers are accepted. Unknown issuers are rejected before JWKS fetch.
+
+See `rio-common/src/oidc.rs` for the verifier, `rio-store/src/grpc/put_path.rs` for the auth flow.
+
 ### Boundary 3: Worker → Nix Sandbox
 
 - **Auth**: None (sandbox is a purity mechanism, NOT a security boundary)

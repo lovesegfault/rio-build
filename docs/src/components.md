@@ -17,5 +17,6 @@ Supporting crates (see [Crate Structure](./crate-structure.md) for details):
 | Crate | Role |
 |-------|------|
 | [`rio-nix`](./crate-structure.md#rio-nix--nix-protocol-and-data-types) | Nix wire protocol, derivation parsing, NAR, store paths (from scratch, MIT/Apache-2.0) |
+| [`rio-push`](./crate-structure.md#rio-push--closure-push-cli) | CLI for pushing Nix store path closures to rio-store (OIDC or mTLS auth) |
 | `rio-cli` | Command-line interface for operators (Phase 4, not yet built) |
 | [`rio-common`](./crate-structure.md#rio-common--shared-utilities) | Shared utilities: config, observability, error types |

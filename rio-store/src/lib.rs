@@ -80,6 +80,14 @@ pub fn describe_metrics() {
         "rio_store_hmac_bypass_total",
         "PutPath HMAC checks bypassed via mTLS cert CN=rio-gateway (labeled by cn)"
     );
+    describe_counter!(
+        "rio_store_oidc_accepted_total",
+        "PutPath calls authenticated via valid OIDC token"
+    );
+    describe_counter!(
+        "rio_store_oidc_rejected_total",
+        "PutPath calls with invalid OIDC token (signature, expiry, audience, issuer, or bound claim mismatch)"
+    );
     describe_gauge!(
         "rio_store_s3_deletes_pending",
         "Rows in pending_s3_deletes awaiting drain"

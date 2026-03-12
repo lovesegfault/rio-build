@@ -44,6 +44,21 @@ Precedence (highest to lowest): CLI flags > environment variables > config file 
 | `chunk_cache_capacity_bytes` | u64 | 2147483648 (2 GiB) | moka LRU capacity for chunk reads (shared across all services). |
 | `signing_key_path` | path | (unset) | ed25519 narinfo signing key (Nix secret-key format). None = signing disabled. |
 | `hmac_key_path` | path | (unset) | HMAC-SHA256 key file for assignment token verification on PutPath. Env: `RIO_HMAC_KEY_PATH`. Same file as scheduler. None = no token verification (dev mode). |
+| `oidc_providers` | list | `[]` | OIDC providers for external push authentication. Empty = OIDC disabled. See below. |
+
+`oidc_providers` TOML syntax (list of tables):
+
+```toml
+[[oidc_providers]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "rio-store"
+[oidc_providers.bound_claims]
+repository_owner = "myorg"
+```
+
+Each provider specifies an `issuer` (must match the JWT `iss` claim exactly), an `audience` (checked against `aud`), and optional `bound_claims` (string key-value pairs that must match in the token). JWKS keys are fetched from `{issuer}/.well-known/openid-configuration` and cached for 1 hour.
+
+When a `PutPath` request includes an `x-rio-oidc-token` metadata header and the token validates against a configured provider, the upload is accepted without HMAC or path restrictions. This enables external CI environments (GitHub Actions, GitLab CI) to push pre-built closures directly.
 
 `chunk_backend` TOML syntax (tagged enum):
 
@@ -61,6 +76,24 @@ chunk_backend = { kind = "s3", bucket = "rio-chunks", prefix = "" }
 > **Compile-time constants (not configurable):** `INLINE_THRESHOLD` = 256 KiB, `CHUNK_MIN` = 16 KiB, `CHUNK_AVG` = 64 KiB, `CHUNK_MAX` = 256 KiB. These live in `rio-store/src/cas.rs` and `chunker.rs`. BLAKE3-verify-on-read and SHA-256-verify-on-put are always on (no config toggle).
 
 > **GC configuration:** GC is triggered via `StoreAdminService.TriggerGC` (or proxied through scheduler `AdminService.TriggerGC` which adds live-build roots). `GcRequest.grace_period_hours` defaults to **2h**. The orphan scanner and S3 drain task are spawned in `main.rs` with compile-time constants (`DRAIN_INTERVAL = 30s`, orphan stale threshold = 2h). See [store: GC](./components/store.md#two-phase-garbage-collection).
+
+## Push
+
+`rio-push` is a standalone CLI for pushing Nix store path closures to rio-store from external environments (CI/CD pipelines, developer workstations). It discovers the closure, deduplicates against the store via `FindMissingPaths`, and uploads missing paths concurrently.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `store_addr` | string | `localhost:9002` | rio-store gRPC endpoint |
+| `concurrency` | usize | `8` | Maximum concurrent uploads |
+| `oidc_token` | string | (unset) | OIDC JWT token for authentication. Env: `RIO_OIDC_TOKEN`. |
+
+TLS is configured via the standard `tls.*` parameters (see [TLS / mTLS](#tls--mtls)).
+
+Usage:
+
+```bash
+rio-push --store-addr rio-store:9002 --oidc-token "$ACTIONS_ID_TOKEN" /nix/store/...-hello-1.0
+```
 
 ## Worker
 

@@ -1,6 +1,8 @@
 {
   description = "rio-build - Nix build orchestration";
 
+  nixConfig.allow-import-from-derivation = true;
+
   inputs = {
     nix = {
       url = "github:NixOS/Nix/2.33.3";
@@ -48,6 +50,7 @@
         # leave it unfollowed rather than polluting our inputs.
       };
     };
+
   };
 
   outputs =
@@ -765,6 +768,9 @@
 
                 # Spec-coverage: `tracey query validate`, `tracey web`
                 traceyPkg
+
+                # Process orchestration (postgres + rio-store)
+                process-compose
               ];
               shellEnv = {
                 RUST_BACKTRACE = "1";

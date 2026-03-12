@@ -20,3 +20,6 @@ docs/book/
 
 # tracey daemon state (unix socket, cache)
 .tracey/
+
+# Local dev state (postgres data, etc.)
+.data/

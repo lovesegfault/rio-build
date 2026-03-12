@@ -84,6 +84,11 @@ struct Config {
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
     hmac_key_path: Option<PathBuf>,
+    /// OIDC providers for external push authentication (e.g., GitHub
+    /// Actions). Each provider specifies an issuer, audience, and
+    /// optional bound claims. Empty = OIDC disabled.
+    #[serde(default)]
+    oidc_providers: Vec<rio_common::oidc::OidcProvider>,
 }
 
 impl Default for Config {
@@ -104,6 +109,7 @@ impl Default for Config {
             health_addr: "0.0.0.0:9102".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
+            oidc_providers: vec![],
         }
     }
 }
@@ -269,6 +275,12 @@ async fn main() -> anyhow::Result<()> {
         Some(v) => store_service.with_hmac_verifier(v),
         None => store_service,
     };
+    let oidc_verifier = rio_common::oidc::OidcVerifier::new(cfg.oidc_providers)
+        .map_err(|e| anyhow::anyhow!("OIDC provider config: {e}"))?;
+    let store_service = match oidc_verifier {
+        Some(v) => store_service.with_oidc_verifier(v),
+        None => store_service,
+    };
 
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
@@ -406,6 +418,7 @@ mod tests {
         // Plaintext health listener for K8s probes when mTLS is on the main port.
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9102");
         assert!(!d.tls.is_configured());
+        assert!(d.oidc_providers.is_empty());
     }
 
     /// TOML parsing for the tagged enum via figment (what main.rs
