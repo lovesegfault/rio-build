@@ -596,7 +596,8 @@ message FindMissingChunksResponse {
 // ---------------------------------------------------------------------------
 
 message SubmitBuildRequest {
-  string tenant_id = 1;                  // Tenant identifier (from SSH key mapping)
+  reserved 1;
+  reserved "tenant_id";
   string priority_class = 2;             // "ci", "interactive", or "scheduled"
   repeated DerivationNode nodes = 3;     // All derivations in the DAG
   repeated DerivationEdge edges = 4;     // Dependency edges
@@ -604,6 +605,10 @@ message SubmitBuildRequest {
   uint64 build_timeout = 6;              // Client build option
   uint64 build_cores = 7;               // Client build option
   bool keep_going = 8;                   // Continue on failure
+  // Tenant name (from gateway's authorized_keys comment); scheduler
+  // resolves to UUID via tenants table — see r[sched.tenant.resolve].
+  // Empty string = single-tenant mode.
+  string tenant_name = 9;
 }
 
 message WatchBuildRequest {

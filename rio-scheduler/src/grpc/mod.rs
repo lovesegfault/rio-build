@@ -398,13 +398,13 @@ impl SchedulerService for SchedulerGrpc {
         // authorized_keys comment); resolve to UUID here via the tenants
         // table. Empty string → None (single-tenant mode). Unknown name →
         // InvalidArgument. Keeps gateway PG-free (stateless N-replica HA).
-        let tenant_id = if req.tenant_id.is_empty() {
+        let tenant_id = if req.tenant_name.is_empty() {
             None
         } else {
             let pool = self.pool.as_ref().ok_or_else(|| {
                 Status::failed_precondition("tenant lookup requires database connection")
             })?;
-            resolve_tenant_name(pool, &req.tenant_id).await?
+            resolve_tenant_name(pool, &req.tenant_name).await?
         };
 
         // Capture the current span's traceparent BEFORE sending to the

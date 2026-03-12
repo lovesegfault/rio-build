@@ -72,7 +72,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
 
     // Submit a build via SchedulerService.
     let submit_req = rio_proto::types::SubmitBuildRequest {
-        tenant_id: String::new(),
+        tenant_name: String::new(),
         priority_class: "scheduled".into(),
         nodes: vec![make_test_node("e2e-hash", "x86_64-linux")],
         edges: vec![],
@@ -434,7 +434,7 @@ async fn test_submit_build_rejects_unknown_tenant() {
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
-        tenant_id: "nonexistent-team".into(),
+        tenant_name: "nonexistent-team".into(),
         ..Default::default()
     });
 
@@ -473,7 +473,7 @@ async fn test_submit_build_resolves_known_tenant() {
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("resolve-tenant-drv", "x86_64-linux")],
         edges: vec![],
-        tenant_id: "team-alpha".into(),
+        tenant_name: "team-alpha".into(),
         ..Default::default()
     });
 
@@ -492,26 +492,26 @@ async fn test_submit_build_resolves_known_tenant() {
     assert_eq!(db_tenant, Some(tenant_uuid));
 }
 
-/// SubmitBuild with empty tenant_id (single-tenant mode) → None, no PG lookup.
+/// SubmitBuild with empty tenant_name (single-tenant mode) → None, no PG lookup.
 /// This is the common case and must work even without a pool.
 #[tokio::test]
 async fn test_submit_build_empty_tenant_is_none() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    // Intentionally pool-less to assert no PG hit for empty tenant_id.
+    // Intentionally pool-less to assert no PG hit for empty tenant_name.
     let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("no-tenant-drv", "x86_64-linux")],
         edges: vec![],
-        tenant_id: String::new(), // empty = single-tenant mode
+        tenant_name: String::new(), // empty = single-tenant mode
         ..Default::default()
     });
 
     let result = grpc.submit_build(req).await;
     assert!(
         result.is_ok(),
-        "empty tenant_id should succeed without PG: {result:?}"
+        "empty tenant_name should succeed without PG: {result:?}"
     );
 
     // Verify tenant_id is NULL in the build row.
@@ -705,7 +705,7 @@ async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
     let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mk_req = |tag: &str| rio_proto::types::SubmitBuildRequest {
-        tenant_id: String::new(),
+        tenant_name: String::new(),
         priority_class: String::new(),
         nodes: vec![make_test_node(tag, "x86_64-linux")],
         edges: vec![],

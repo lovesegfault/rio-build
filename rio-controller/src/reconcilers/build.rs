@@ -224,7 +224,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // the tenants table. Unknown name → scheduler rejects with
     // InvalidArgument and we surface that in a Condition. Empty = untenanted.
     let req = types::SubmitBuildRequest {
-        tenant_id: b.spec.tenant.clone().unwrap_or_default(),
+        tenant_name: b.spec.tenant.clone().unwrap_or_default(),
         priority_class: priority_to_class(b.spec.priority).to_string(),
         nodes: vec![node],
         edges: vec![],

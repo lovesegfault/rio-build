@@ -182,7 +182,7 @@ pub struct ConnectionHandler {
     sessions: HashMap<ChannelId, ChannelSession>,
     /// Tenant name from the matched `authorized_keys` entry's comment
     /// field. Set in `auth_publickey` when a key matches. Passed to
-    /// the scheduler as `SubmitBuildRequest.tenant_id` which resolves
+    /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
     /// it to a UUID via the `tenants` table. Empty = single-tenant mode.
     tenant_name: String,
 }
@@ -467,7 +467,7 @@ mod tests {
 
     /// Key with NO comment → empty comment string. This is the
     /// single-tenant mode case: empty tenant_name → scheduler gets
-    /// empty string → tenant_id=None.
+    /// empty string → scheduler resolves tenant_id=None.
     #[test]
     fn test_load_authorized_keys_no_comment_is_empty() -> anyhow::Result<()> {
         let key_base = make_valid_pubkey_line()?;

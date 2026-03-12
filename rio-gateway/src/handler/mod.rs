@@ -97,7 +97,7 @@ pub struct SessionContext {
     /// Active build IDs for scheduler failover: build_id → last_sequence.
     pub active_build_ids: HashMap<String, u64>,
     /// Tenant name from the matched `authorized_keys` entry's comment.
-    /// Sent in `SubmitBuildRequest.tenant_id`; scheduler resolves to UUID.
+    /// Sent in `SubmitBuildRequest.tenant_name`; scheduler resolves to UUID.
     /// Empty = single-tenant mode.
     pub tenant_name: String,
 }
