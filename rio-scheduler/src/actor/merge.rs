@@ -263,15 +263,35 @@ impl DagActor {
             }
         }
 
-        // Also handle nodes that already existed and are already completed
+        // Also handle nodes that already existed. A pre-existing Completed
+        // node counts as cached; a pre-existing Poisoned/DependencyFailed
+        // node must set first_dep_failed so handle_derivation_failure
+        // fires below. Without the failure arm, a single-node resubmit of
+        // a still-poisoned derivation (within TTL, no ClearPoison yet)
+        // leaves the build Active with completed=0, failed=0, total=1 —
+        // check_build_completion never fires.
         for node in &nodes {
-            if !newly_inserted.contains(node.drv_hash.as_str())
-                && let Some(state) = self.dag.node(&node.drv_hash)
-                && state.status() == DerivationStatus::Completed
-            {
-                cached_count += 1;
-                metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
-                    .increment(1);
+            if newly_inserted.contains(node.drv_hash.as_str()) {
+                continue;
+            }
+            let Some(state) = self.dag.node(&node.drv_hash) else {
+                continue;
+            };
+            match state.status() {
+                DerivationStatus::Completed => {
+                    cached_count += 1;
+                    metrics::counter!("rio_scheduler_cache_hits_total", "source" => "existing")
+                        .increment(1);
+                }
+                DerivationStatus::Poisoned | DerivationStatus::DependencyFailed => {
+                    first_dep_failed.get_or_insert_with(|| node.drv_hash.as_str().into());
+                    debug!(
+                        drv_hash = %node.drv_hash,
+                        status = ?state.status(),
+                        "pre-existing node already failed; build will fail fast"
+                    );
+                }
+                _ => {}
             }
         }
 
