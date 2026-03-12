@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use rio_push::nix;
 use rio_push::upload;
@@ -60,6 +60,7 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Err = a provider is already installed (benign in tests / multi-init).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = CliArgs::parse();
@@ -132,9 +133,11 @@ async fn main() -> anyhow::Result<()> {
     let oidc_token: Option<Arc<str>> = cfg.oidc_token.map(|t| Arc::from(t.as_str()));
 
     let mut handles = Vec::with_capacity(missing.len());
+    let mut errors = 0u64;
     for path in &missing {
         let Some(npi) = closure_map.get(path.as_str()) else {
-            warn!(path, "missing path not found in closure (skipping)");
+            error!(path, "missing path not found in closure (skipping)");
+            errors += 1;
             continue;
         };
 
@@ -142,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 error!(path, error = %e, "failed to validate path info");
+                errors += 1;
                 continue;
             }
         };
@@ -183,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut created = 0u64;
     let mut existed = 0u64;
-    let mut errors = 0u64;
+    // errors was initialized before the loop to catch pre-spawn failures.
     let mut uploaded_bytes = 0u64;
 
     for handle in handles {

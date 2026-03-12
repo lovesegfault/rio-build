@@ -5,6 +5,7 @@
 //! available in the dev shell and in any environment with a Nix installation.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use base64::Engine;
@@ -13,6 +14,12 @@ use rio_nix::store_path::StorePath;
 use rio_proto::validated::ValidatedPathInfo;
 use serde::Deserialize;
 use tracing::debug;
+
+/// Timeout for `nix path-info` (closure discovery can be slow for large closures).
+const PATH_INFO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Timeout for `nix store dump-path` (generous for large NARs).
+const DUMP_NAR_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Path metadata from `nix path-info --json`.
 ///
@@ -97,16 +104,18 @@ pub async fn discover_closure(paths: &[String]) -> anyhow::Result<Vec<NixPathInf
     }
 
     let mut cmd = tokio::process::Command::new("nix");
-    cmd.arg("path-info")
+    cmd.arg("--extra-experimental-features")
+        .arg("nix-command")
+        .arg("path-info")
         .arg("--recursive")
         .arg("--json")
         .arg("--")
         .args(paths);
 
     debug!(?paths, "running nix path-info --recursive --json");
-    let output = cmd
-        .output()
+    let output = tokio::time::timeout(PATH_INFO_TIMEOUT, cmd.output())
         .await
+        .context("`nix path-info` timed out")?
         .context("failed to run `nix path-info`")?;
 
     if !output.status.success() {
@@ -133,12 +142,16 @@ pub async fn discover_closure(paths: &[String]) -> anyhow::Result<Vec<NixPathInf
 /// Dump a store path as a NAR by running `nix store dump-path`.
 pub async fn dump_nar(store_path: &str) -> anyhow::Result<Vec<u8>> {
     let mut cmd = tokio::process::Command::new("nix");
-    cmd.arg("store").arg("dump-path").arg(store_path);
+    cmd.arg("--extra-experimental-features")
+        .arg("nix-command")
+        .arg("store")
+        .arg("dump-path")
+        .arg(store_path);
 
     debug!(store_path, "running nix store dump-path");
-    let output = cmd
-        .output()
+    let output = tokio::time::timeout(DUMP_NAR_TIMEOUT, cmd.output())
         .await
+        .context("`nix store dump-path` timed out")?
         .context("failed to run `nix store dump-path`")?;
 
     if !output.status.success() {
