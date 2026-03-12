@@ -23,7 +23,7 @@ use std::time::{Instant, SystemTime};
 use aws_sdk_s3::Client as S3Client;
 use flate2::read::GzDecoder;
 use sqlx::PgPool;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument};
@@ -405,21 +405,12 @@ impl AdminService for AdminServiceImpl {
         rio_proto::interceptor::link_parent(&request);
         self.check_actor_alive()?;
 
-        let (tx, rx) = oneshot::channel();
         // send_unchecked: autoscaler MUST get a reading under saturation.
         // See ActorCommand::ClusterSnapshot doc for rationale.
-        self.actor
-            .send_unchecked(ActorCommand::ClusterSnapshot { reply: tx })
-            .await
-            .map_err(|_| Status::unavailable("actor channel closed"))?;
-
-        // rx.await fails only if the actor dropped the oneshot::Sender
-        // without replying — which means the actor task panicked mid-
-        // handler (impossible for ClusterSnapshot, it's a pure read
-        // with no .await points, but be robust anyway).
-        let snap = rx
-            .await
-            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+        let snap = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::ClusterSnapshot { reply })
+            .await?;
 
         // SystemTime::now() - elapsed → "start time in CURRENT wall-clock
         // terms." checked_sub: if elapsed > now (clock jumped way back),
@@ -503,14 +494,10 @@ impl AdminService for AdminServiceImpl {
         // Step 1: collect extra_roots from the actor. send_unchecked
         // bypasses backpressure — GC is operator-initiated, rare,
         // and should work even when the scheduler is saturated.
-        let (tx, rx) = oneshot::channel();
-        self.actor
-            .send_unchecked(ActorCommand::GcRoots { reply: tx })
-            .await
-            .map_err(|e| Status::internal(format!("actor send failed: {e}")))?;
-        let mut extra_roots = rx
-            .await
-            .map_err(|_| Status::internal("actor GcRoots reply dropped"))?;
+        let mut extra_roots = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::GcRoots { reply })
+            .await?;
 
         // Merge with any client-provided extra_roots (unusual but
         // allowed — maybe the client has additional pins).
@@ -605,22 +592,19 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument("worker_id is required"));
         }
 
-        let (tx, rx) = oneshot::channel();
         // send_unchecked: drain MUST land even under backpressure. A
         // shutting-down worker accepting new assignments is a feedback
         // loop into MORE load — exactly what we don't want.
-        self.actor
-            .send_unchecked(ActorCommand::DrainWorker {
-                worker_id: req.worker_id.into(),
-                force: req.force,
-                reply: tx,
+        let worker_id = req.worker_id.into();
+        let force = req.force;
+        let result = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::DrainWorker {
+                worker_id,
+                force,
+                reply,
             })
-            .await
-            .map_err(|_| Status::unavailable("actor channel closed"))?;
-
-        let result = rx
-            .await
-            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+            .await?;
 
         Ok(Response::new(DrainWorkerResponse {
             accepted: result.accepted,
@@ -640,17 +624,10 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument("derivation_hash is required"));
         }
         let drv_hash: crate::state::DrvHash = req.derivation_hash.into();
-        let (tx, rx) = oneshot::channel();
-        self.actor
-            .send_unchecked(ActorCommand::ClearPoison {
-                drv_hash,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| Status::unavailable("actor channel closed"))?;
-        let cleared = rx
-            .await
-            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+        let cleared = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::ClearPoison { drv_hash, reply })
+            .await?;
         Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 

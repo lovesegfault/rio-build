@@ -3,7 +3,6 @@
 use std::time::{Instant, SystemTime};
 
 use rio_proto::types::{ListWorkersResponse, WorkerInfo};
-use tokio::sync::oneshot;
 use tonic::Status;
 
 use crate::actor::{ActorCommand, ActorHandle, WorkerSnapshot};
@@ -13,14 +12,9 @@ pub(super) async fn list_workers(
     actor: &ActorHandle,
     status_filter: &str,
 ) -> Result<ListWorkersResponse, Status> {
-    let (tx, rx) = oneshot::channel();
-    actor
-        .send_unchecked(ActorCommand::ListWorkers { reply: tx })
-        .await
-        .map_err(|_| Status::unavailable("actor channel closed"))?;
-    let snapshots = rx
-        .await
-        .map_err(|_| Status::unavailable("actor dropped reply"))?;
+    let snapshots = actor
+        .query_unchecked(|reply| ActorCommand::ListWorkers { reply })
+        .await?;
 
     let workers: Vec<WorkerInfo> = snapshots
         .into_iter()

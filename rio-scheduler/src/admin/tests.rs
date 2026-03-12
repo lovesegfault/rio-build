@@ -5,6 +5,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
 use rio_proto::types::BuildLogBatch;
 use rio_test_support::TestDb;
+use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 
 /// Set up `AdminServiceImpl` with a live actor but no S3.

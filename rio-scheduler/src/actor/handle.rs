@@ -182,6 +182,21 @@ impl ActorHandle {
         self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
     }
 
+    /// Send a command carrying a oneshot reply, await the reply, map
+    /// channel errors to `Status::unavailable`. For admin-RPC patterns
+    /// where the caller uses `send_unchecked` (bypass backpressure).
+    pub async fn query_unchecked<R>(
+        &self,
+        mk_cmd: impl FnOnce(oneshot::Sender<R>) -> ActorCommand,
+    ) -> Result<R, tonic::Status> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(mk_cmd(tx))
+            .await
+            .map_err(|_| tonic::Status::unavailable("actor channel closed"))?;
+        rx.await
+            .map_err(|_| tonic::Status::unavailable("actor dropped reply"))
+    }
+
     /// Test-only: query all worker states.
     #[cfg(test)]
     pub async fn debug_query_workers(&self) -> Result<Vec<DebugWorkerInfo>, ActorError> {
