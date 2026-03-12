@@ -553,7 +553,7 @@ fn read_single_u64(path: &Path) -> Option<u64> {
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
 // r[impl obs.metric.worker-util]
-pub async fn spawn_utilization_reporter(root: PathBuf) {
+pub async fn utilization_reporter_loop(root: PathBuf) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");
@@ -585,7 +585,8 @@ pub async fn spawn_utilization_reporter(root: PathBuf) {
             last_instant = now_instant;
         }
 
-        // Memory: current / max. "max" (literal string) = unbounded → skip.
+        // Memory: current / max. "max" (literal string) = unbounded → 0.0
+        // per obs spec (explicit 0.0 avoids stale-gauge persistence).
         if let Some(current) = read_single_u64(&mem_current_path) {
             let max = fs::read_to_string(&mem_max_path).ok().and_then(|s| {
                 let s = s.trim();
@@ -595,11 +596,11 @@ pub async fn spawn_utilization_reporter(root: PathBuf) {
                     s.parse::<u64>().ok()
                 }
             });
-            if let Some(max) = max
-                && max > 0
-            {
-                metrics::gauge!("rio_worker_memory_fraction").set(current as f64 / max as f64);
-            }
+            let fraction = match max {
+                Some(m) if m > 0 => current as f64 / m as f64,
+                _ => 0.0,
+            };
+            metrics::gauge!("rio_worker_memory_fraction").set(fraction);
         }
     }
 }

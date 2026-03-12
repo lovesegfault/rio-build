@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     // Background utilization reporter: polls parent cgroup cpu.stat +
     // memory.current/max every 15s → rio_worker_{cpu,memory}_fraction gauges.
     // Fire-and-forget — runs for the worker's lifetime.
-    tokio::spawn(rio_worker::cgroup::spawn_utilization_reporter(
+    tokio::spawn(rio_worker::cgroup::utilization_reporter_loop(
         cgroup_parent.clone(),
     ));
 
