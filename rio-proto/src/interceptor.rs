@@ -99,6 +99,19 @@ pub fn extract_traceparent(traceparent: &str) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|prop| prop.extract(&carrier))
 }
 
+/// Create a tracing span parented by the given W3C traceparent string.
+/// Bundles [`extract_traceparent`] + `OpenTelemetrySpanExt::set_parent`
+/// so callers (e.g., `rio-worker`) don't need `tracing-opentelemetry`
+/// as a direct dependency.
+///
+/// Empty traceparent → the span is a fresh root.
+pub fn span_from_traceparent(name: &'static str, traceparent: &str) -> tracing::Span {
+    let span = tracing::info_span!("span", otel.name = name);
+    let parent = extract_traceparent(traceparent);
+    let _ = span.set_parent(parent);
+    span
+}
+
 /// Extract a parent Context from incoming gRPC metadata and link the
 /// current span to it. Call this FIRST inside each `#[instrument]`ed
 /// server handler.

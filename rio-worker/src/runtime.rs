@@ -19,6 +19,8 @@ use rio_proto::types::{
     WorkAssignmentAck, WorkerMessage, worker_message,
 };
 
+use tracing::Instrument;
+
 use crate::{executor, fuse, log_stream};
 
 /// Handle to the FUSE cache's bloom filter. Extracted via
@@ -212,6 +214,8 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
 /// Returns after spawning — does NOT block on build completion. The build runs
 /// in its own tokio task holding `permit`; it reports completion via
 /// `ctx.stream_tx` and drops the permit on exit (success, failure, or panic).
+// r[impl sched.trace.assignment-traceparent]
+#[tracing::instrument(skip_all, fields(drv_path = %assignment.drv_path))]
 pub async fn spawn_build_task(
     assignment: WorkAssignment,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -219,6 +223,7 @@ pub async fn spawn_build_task(
 ) {
     let drv_path = assignment.drv_path.clone();
     let assignment_token = assignment.assignment_token.clone();
+    let traceparent = assignment.traceparent.clone();
 
     // Send ACK
     let ack = WorkerMessage {
@@ -280,7 +285,11 @@ pub async fn spawn_build_task(
     let panic_drv_path = drv_path.clone();
     let panic_token = assignment_token.clone();
 
-    let handle = rio_common::task::spawn_monitored("build-executor", async move {
+    // Parent the spawned task's span by the traceparent from the assignment.
+    // Closes the SSH-boundary tracing gap: scheduler injects its span's W3C
+    // traceparent into the payload; we extract it here. Empty → fresh root.
+    let build_span = rio_proto::interceptor::span_from_traceparent("build_executor", &traceparent);
+    let executor_future = async move {
         let _permit = permit; // Hold permit until build completes
 
         // Remove from running_builds + cancel_registry on task exit
@@ -398,7 +407,9 @@ pub async fn spawn_build_task(
         if let Err(e) = build_tx.send(msg).await {
             tracing::error!(error = %e, "failed to send completion report");
         }
-    });
+    };
+    let handle =
+        rio_common::task::spawn_monitored("build-executor", executor_future.instrument(build_span));
 
     // If the build task panics, send InfrastructureFailure so the scheduler
     // doesn't leave the derivation stuck in Running.
@@ -449,6 +460,7 @@ pub async fn spawn_build_task(
 /// SIGTERMs mid-prefetch, the tasks abort with the runtime — the
 /// partial fetch is in a .tmp-XXXX sibling dir (see fetch_extract_insert)
 /// which cache init cleans up on next start.
+#[tracing::instrument(skip_all, fields(count = prefetch.store_paths.len()))]
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
     cache: Arc<fuse::cache::Cache>,

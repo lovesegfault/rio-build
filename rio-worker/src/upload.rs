@@ -263,6 +263,7 @@ async fn do_upload_streaming(
     // (scheduler without hmac_signer, dev mode).
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mut req = tonic::Request::new(outbound);
+    rio_proto::interceptor::inject_current(req.metadata_mut());
     if !assignment_token.is_empty() {
         // parse() for AsciiMetadataValue — assignment tokens are
         // base64url.base64url, always ASCII. unwrap_or default
