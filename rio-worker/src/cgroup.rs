@@ -552,11 +552,6 @@ fn read_single_u64(path: &Path) -> Option<u64> {
 /// cgroup files become unreadable mid-run (rare — would indicate the
 /// cgroup was removed out from under us), the gauge simply stops
 /// updating; no crash.
-// r[impl obs.metric.worker-util]
-pub async fn utilization_reporter_loop(root: PathBuf) {
-    utilization_reporter_loop_inner(root).await;
-}
-
 /// Pure fraction computation — extracted for unit testing.
 /// `mem_max = None` (cgroup `memory.max = "max"`) → 0.0 per obs spec.
 fn compute_fractions(
@@ -577,7 +572,8 @@ fn compute_fractions(
     (cpu, mem)
 }
 
-async fn utilization_reporter_loop_inner(root: PathBuf) {
+// r[impl obs.metric.worker-util]
+pub async fn utilization_reporter_loop(root: PathBuf) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");
@@ -611,9 +607,7 @@ async fn utilization_reporter_loop_inner(root: PathBuf) {
             let cpu_delta = now_usage.saturating_sub(last_usage);
             let wall_delta = now_instant.duration_since(last_instant).as_micros() as u64;
             let (cpu, _) = compute_fractions(cpu_delta, wall_delta, 0, None);
-            if wall_delta > 0 {
-                metrics::gauge!("rio_worker_cpu_fraction").set(cpu);
-            }
+            metrics::gauge!("rio_worker_cpu_fraction").set(cpu);
         }
         if let Some(nu) = now_usage {
             last_usage_usec = Some(nu);
