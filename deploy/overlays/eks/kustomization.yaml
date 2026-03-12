@@ -45,25 +45,47 @@ patches:
         value:
           eks.amazonaws.com/role-arn: ${STORE_IAM_ROLE_ARN}
 
-  # NLB target type: ip (not instance). Instance targeting routes
-  # through kube-proxy (extra hop, loses source IP unless you
-  # enable proxy protocol). ip targeting routes directly to pod
-  # IPs — fewer hops, source IP preserved. Requires the aws-load-
-  # balancer-controller (NOT the legacy in-tree provider).
+  # aws-load-balancer-controller annotations. Base has none (cloud-
+  # agnostic); this is the single place AWS LB behavior is set.
   #
-  # Scheme: internal by default. Most rio deployments front with
-  # a VPN or bastion; internet-facing NLB is a separate patch
-  # (add `-scheme: internet-facing` in a site-specific overlay).
+  # type: external → hand this Service to aws-lbc instead of the
+  # legacy in-tree cloud-provider-aws. Without this, aws-lbc
+  # ignores the Service entirely (legacy provider handles it,
+  # badly — classic NLB, instance targeting, no listener attrs).
+  #
+  # nlb-target-type: ip routes directly to pod IPs (no kube-proxy
+  # hop, source IP preserved). Requires aws-lbc + VPC CNI (pods
+  # get routable VPC IPs — default on EKS).
+  #
+  # scheme: internal. Gateway access via SSM bastion tunnel
+  # (infra/eks/bastion.tf + smoke-test.sh). Internet-facing is
+  # a site-specific overlay patch.
+  #
+  # listener-attributes.TCP-22: NLB TCP idle timeout. Default is
+  # 350s — too short for long nix builds. 3600s = 1h; builds
+  # longer than that re-send STDERR_NEXT keepalives (nix-daemon
+  # does this anyway). This is the aws-lbc way to set it; the
+  # old base's `aws-load-balancer-connection-idle-timeout` was
+  # ALB-only legacy syntax that aws-lbc silently ignored.
+  #
+  # Patch seeds /metadata/annotations with the first entry (base
+  # has no annotations block at all → `op: add` on a member path
+  # under a nonexistent object fails). Subsequent `op: add` entries
+  # add keys into the now-existing map.
   - target:
       kind: Service
       name: rio-gateway
     patch: |
       - op: add
-        path: /metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-type
-        value: external
+        path: /metadata/annotations
+        value:
+          service.beta.kubernetes.io/aws-load-balancer-type: external
       - op: add
         path: /metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-nlb-target-type
         value: ip
       - op: add
         path: /metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-scheme
         value: internal
+      - op: add
+        path: /metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-listener-attributes.TCP-22
+        value: tcp.idle_timeout.seconds=3600

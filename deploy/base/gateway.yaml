@@ -79,15 +79,12 @@ metadata:
   name: rio-gateway
   labels:
     app.kubernetes.io/name: rio-gateway
-  annotations:
-    # NLB not ALB: SSH is TCP, ALB is HTTP-only. NLB preserves
-    # source IP (useful for per-client rate limiting later).
-    service.beta.kubernetes.io/aws-load-balancer-type: nlb
-    # SSH sessions are long-lived (nix build can run hours).
-    # Default NLB idle timeout is 350s — too short. 3600s = 1h;
-    # builds longer than that re-send STDERR_NEXT keepalives
-    # anyway (nix-daemon does this).
-    service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout: "3600"
+  # No AWS LB annotations here — base is cloud-agnostic. The EKS overlay
+  # adds aws-load-balancer-controller annotations (type: external,
+  # nlb-target-type: ip, scheme, listener-attributes for idle timeout).
+  # Putting them here was wrong twice over: it leaked AWS specifics
+  # into base, and used the legacy in-tree-provider syntax that the
+  # aws-load-balancer-controller silently ignores.
 spec:
   type: LoadBalancer
   selector:
