@@ -35,23 +35,23 @@ direnv allow
 # ONE-TIME per AWS account: S3 state bucket. Idempotent — detects
 # whether state already exists in S3; if not, does the first-time
 # dance (local apply → create bucket → migrate state to S3).
-just eks-bootstrap                # ~5s if already set up
+just eks bootstrap                # ~5s if already set up
 
 # Full bring-up: apply (prompts) → kubeconfig → push → deploy
-just eks-up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
+just eks up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
 
 # Or piecewise:
-# just eks-apply                  # tofu apply (prompts)
-# just eks-kubeconfig             # aws eks update-kubeconfig
-# just eks-push                   # nix build + skopeo copy to ECR, zstd layers
-# just eks-deploy                 # render + kubectl apply
+# just eks apply                  # tofu apply (prompts)
+# just eks kubeconfig             # aws eks update-kubeconfig
+# just eks push                   # nix build + skopeo copy to ECR, zstd layers
+# just eks deploy                 # render + kubectl apply
 
 # Verify
 kubectl get nodes                 # should show 5 nodes Ready
-just eks-smoke                    # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
+just eks smoke                    # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
 ```
 
-`just eks-up-auto` skips the tofu apply prompt (`-auto-approve`).
+`just eks up-auto` skips the tofu apply prompt (`-auto-approve`).
 
 ### State backend configuration
 
@@ -66,7 +66,7 @@ committed. Defaults:
 | bucket | `rio-tfstate-${account_id}` (from `aws sts`) | `RIO_TFSTATE_BUCKET` |
 | region | `us-east-2` | `RIO_TFSTATE_REGION` |
 
-Running in a fresh AWS account just works: `just eks-bootstrap`
+Running in a fresh AWS account just works: `just eks bootstrap`
 computes the bucket name, creates it, migrates state into it.
 Everything downstream reads the same computed name.
 
@@ -76,7 +76,7 @@ The cluster stays up. To deploy a code change:
 
 ```bash
 git commit -am "..."
-just eks-push eks-deploy          # new SHA → new ECR tag → rollout
+just eks push eks deploy          # new SHA → new ECR tag → rollout
 ```
 
 To just bounce a pod without new code:
@@ -102,7 +102,7 @@ Scaling to 10 workers adds ~$1100/mo. Aurora at 2 ACU adds ~$130/mo.
 ## Teardown
 
 ```bash
-just eks-destroy                  # ~15min
+just eks destroy                  # ~15min
 ```
 
 This deletes WorkerPools first (their finalizers hold pods → NLB
@@ -124,7 +124,7 @@ The helm/kubernetes providers try to contact the cluster during plan.
 Run `tofu apply -target=module.eks` first, then full `tofu apply`.
 
 **Pods stuck ImagePullBackOff:**
-Either `just eks-push` wasn't run, or `RIO_IMAGE_TAG` doesn't match
+Either `just eks push` wasn't run, or `RIO_IMAGE_TAG` doesn't match
 what's in ECR. `aws ecr list-images --repository-name rio-scheduler`
 shows what's actually pushed.
 
