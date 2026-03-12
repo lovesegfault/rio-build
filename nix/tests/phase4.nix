@@ -210,7 +210,9 @@ pkgs.testers.runNixOSTest {
 
     def build_drv(identity_file, drv_path, expect_fail=False):
         """Build via ssh-ng using the given identity file (selects the
-        matching authorized_keys entry and thus the tenant)."""
+        matching authorized_keys entry and thus the tenant). Returns
+        the store path (last line of output, after SSH warnings +
+        build progress lines)."""
         cmd = (
             "nix-build --no-out-link "
             f"--store 'ssh-ng://root@control?ssh-key={identity_file}' "
@@ -220,7 +222,11 @@ pkgs.testers.runNixOSTest {
         try:
             if expect_fail:
                 return client.fail(cmd)
-            return client.succeed(cmd)
+            out = client.succeed(cmd)
+            # Last non-empty line is the store path. Earlier lines
+            # include SSH known_hosts warning + nix-build progress.
+            lines = [l.strip() for l in out.strip().split("\n") if l.strip()]
+            return lines[-1] if lines else ""
         except Exception:
             dump_logs()
             raise
@@ -237,7 +243,7 @@ pkgs.testers.runNixOSTest {
     control.log(f"seeded tenant team-test = {tenant_uuid}")
 
     # ── Case 1: key comment 'team-test' → resolved UUID in builds ─────
-    out = build_drv("/root/.ssh/id_team_test", "${testDrvKnown}").strip()
+    out = build_drv("/root/.ssh/id_team_test", "${testDrvKnown}")
     assert out.startswith("/nix/store/"), f"known-tenant build should succeed: {out!r}"
     db_tenant = control.succeed(
         "sudo -u postgres psql rio -tAc "
@@ -254,7 +260,7 @@ pkgs.testers.runNixOSTest {
     print("Section A case 2 PASS: unknown tenant rejected")
 
     # ── Case 3: empty comment → tenant_id IS NULL (single-tenant) ─────
-    out = build_drv("/root/.ssh/id_anon", "${testDrvAnon}").strip()
+    out = build_drv("/root/.ssh/id_anon", "${testDrvAnon}")
     assert out.startswith("/nix/store/"), f"anon build should succeed: {out!r}"
     db_tenant = control.succeed(
         "sudo -u postgres psql rio -tAc "
