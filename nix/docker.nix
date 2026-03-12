@@ -70,6 +70,11 @@ let
 in
 {
   gateway = mkImage { name = "gateway"; };
+  # Scheduler also carries rio-cli (admin client) — buildLayeredImage's
+  # `contents` symlinks rio-workspace/bin/* into /bin/, so `kubectl exec
+  # deploy/rio-scheduler -- rio-cli create-tenant foo` resolves via the
+  # default /bin in PATH. The pod's RIO_TLS__* env (from tls-mounts.yaml)
+  # gives rio-cli mTLS to localhost:9001 for free.
   scheduler = mkImage { name = "scheduler"; };
   store = mkImage { name = "store"; };
 
