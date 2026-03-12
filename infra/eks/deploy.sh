@@ -94,15 +94,18 @@ if ! kubectl -n "$NS" get secret rio-signing-key >/dev/null 2>&1; then
   log "generating NAR signing key"
   # nix-store --generate-binary-cache-key writes two files:
   # <name>.sec and <name>.pub. Format is `name:base64-seed`.
-  TMPDIR=$(mktemp -d)
-  trap 'rm -rf "$TMPDIR"' RETURN
+  # Do NOT name this TMPDIR — that's the env var mktemp itself reads,
+  # and the later `rm -rf` would leave it pointing at a deleted dir,
+  # breaking the RENDER=$(mktemp -d) below.
+  keytmp=$(mktemp -d)
+  trap 'rm -rf "$keytmp"' RETURN
   nix-store --generate-binary-cache-key "rio-${RIO_CHUNK_BUCKET}" \
-    "$TMPDIR/key.sec" "$TMPDIR/key.pub"
+    "$keytmp/key.sec" "$keytmp/key.pub"
   kubectl -n "$NS" create secret generic rio-signing-key \
-    --from-file=key="$TMPDIR/key.sec"
+    --from-file=key="$keytmp/key.sec"
   log "signing public key (add to nix.conf trusted-public-keys):"
-  cat "$TMPDIR/key.pub" >&2
-  rm -rf "$TMPDIR"
+  cat "$keytmp/key.pub" >&2
+  rm -rf "$keytmp"
   trap - RETURN
 else
   log "rio-signing-key Secret already exists, skipping generation"
