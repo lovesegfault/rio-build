@@ -554,6 +554,30 @@ fn read_single_u64(path: &Path) -> Option<u64> {
 /// updating; no crash.
 // r[impl obs.metric.worker-util]
 pub async fn utilization_reporter_loop(root: PathBuf) {
+    utilization_reporter_loop_inner(root).await;
+}
+
+/// Pure fraction computation — extracted for unit testing.
+/// `mem_max = None` (cgroup `memory.max = "max"`) → 0.0 per obs spec.
+fn compute_fractions(
+    cpu_delta_usec: u64,
+    wall_delta_usec: u64,
+    mem_current: u64,
+    mem_max: Option<u64>,
+) -> (f64, f64) {
+    let cpu = if wall_delta_usec > 0 {
+        cpu_delta_usec as f64 / wall_delta_usec as f64
+    } else {
+        0.0
+    };
+    let mem = match mem_max {
+        Some(m) if m > 0 => mem_current as f64 / m as f64,
+        _ => 0.0,
+    };
+    (cpu, mem)
+}
+
+async fn utilization_reporter_loop_inner(root: PathBuf) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");
@@ -567,40 +591,40 @@ pub async fn utilization_reporter_loop(root: PathBuf) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        // CPU: delta usage_usec / wall-clock delta µs.
-        if let Some(now_usage) = fs::read_to_string(&cpu_stat_path)
+        let now_usage = fs::read_to_string(&cpu_stat_path)
             .ok()
-            .and_then(|c| parse_cpu_stat_usage_usec(&c))
-        {
-            let now_instant = std::time::Instant::now();
-            if let Some(last_usage) = last_usage_usec {
-                let delta_usage = now_usage.saturating_sub(last_usage);
-                let delta_wall_usec = now_instant.duration_since(last_instant).as_micros() as u64;
-                if delta_wall_usec > 0 {
-                    let fraction = delta_usage as f64 / delta_wall_usec as f64;
-                    metrics::gauge!("rio_worker_cpu_fraction").set(fraction);
-                }
+            .and_then(|c| parse_cpu_stat_usage_usec(&c));
+        let now_instant = std::time::Instant::now();
+
+        let mem_current = read_single_u64(&mem_current_path);
+        let mem_max = fs::read_to_string(&mem_max_path).ok().and_then(|s| {
+            let s = s.trim();
+            if s == "max" {
+                None
+            } else {
+                s.parse::<u64>().ok()
             }
-            last_usage_usec = Some(now_usage);
+        });
+
+        // CPU: only set if we have BOTH a previous sample and a new reading.
+        if let (Some(last_usage), Some(now_usage)) = (last_usage_usec, now_usage) {
+            let cpu_delta = now_usage.saturating_sub(last_usage);
+            let wall_delta = now_instant.duration_since(last_instant).as_micros() as u64;
+            let (cpu, _) = compute_fractions(cpu_delta, wall_delta, 0, None);
+            if wall_delta > 0 {
+                metrics::gauge!("rio_worker_cpu_fraction").set(cpu);
+            }
+        }
+        if let Some(nu) = now_usage {
+            last_usage_usec = Some(nu);
             last_instant = now_instant;
         }
 
-        // Memory: current / max. "max" (literal string) = unbounded → 0.0
-        // per obs spec (explicit 0.0 avoids stale-gauge persistence).
-        if let Some(current) = read_single_u64(&mem_current_path) {
-            let max = fs::read_to_string(&mem_max_path).ok().and_then(|s| {
-                let s = s.trim();
-                if s == "max" {
-                    None
-                } else {
-                    s.parse::<u64>().ok()
-                }
-            });
-            let fraction = match max {
-                Some(m) if m > 0 => current as f64 / m as f64,
-                _ => 0.0,
-            };
-            metrics::gauge!("rio_worker_memory_fraction").set(fraction);
+        // Memory: always set if memory.current is readable (explicit 0.0
+        // on unbounded max per obs spec — avoids stale-gauge persistence).
+        if let Some(current) = mem_current {
+            let (_, mem) = compute_fractions(0, 1, current, mem_max);
+            metrics::gauge!("rio_worker_memory_fraction").set(mem);
         }
     }
 }
@@ -692,6 +716,41 @@ mod tests {
             Some(42),
             "space-delimited key match, not prefix match"
         );
+    }
+
+    // r[verify obs.metric.worker-util]
+    #[test]
+    fn compute_fractions_cpu_half_core() {
+        // 500ms cpu usage over 1s wall → 0.5 (half a core).
+        let (cpu, _) = compute_fractions(500_000, 1_000_000, 0, Some(1));
+        assert_eq!(cpu, 0.5);
+    }
+
+    #[test]
+    fn compute_fractions_cpu_zero_wall_guard() {
+        // Div-by-zero guard: zero wall → 0.0 (not NaN/inf).
+        let (cpu, _) = compute_fractions(500, 0, 0, Some(1));
+        assert_eq!(cpu, 0.0);
+    }
+
+    #[test]
+    fn compute_fractions_mem_half() {
+        let (_, mem) = compute_fractions(0, 1, 512, Some(1024));
+        assert_eq!(mem, 0.5);
+    }
+
+    #[test]
+    fn compute_fractions_mem_unbounded_is_zero() {
+        // memory.max = "max" (None) → 0.0 per obs spec.
+        let (_, mem) = compute_fractions(0, 1, 999_999, None);
+        assert_eq!(mem, 0.0);
+    }
+
+    #[test]
+    fn compute_fractions_mem_zero_max_guard() {
+        // Div-by-zero guard: max=0 → 0.0 (not NaN/inf).
+        let (_, mem) = compute_fractions(0, 1, 999, Some(0));
+        assert_eq!(mem, 0.0);
     }
 
     // ---- filesystem (real /proc, real cgroup — Linux-only) ----------------
