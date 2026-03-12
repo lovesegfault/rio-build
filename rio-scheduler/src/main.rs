@@ -450,7 +450,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll
     // on the shared DB. Keeps ClusterStatus fast (autoscaler's 30s path).
-    let store_size_bytes = rio_scheduler::admin::spawn_store_size_refresh(pool.clone());
+    let store_size_bytes =
+        rio_scheduler::admin::spawn_store_size_refresh(pool.clone(), shutdown.clone());
 
     let admin_service = AdminServiceImpl::new(
         log_buffers,

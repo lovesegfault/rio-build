@@ -1,10 +1,8 @@
 //! AdminService gRPC implementation.
 //!
-//! `GetBuildLogs`, `ClusterStatus`, `DrainWorker`, and `TriggerGC`
-//! are fully implemented. The remaining RPCs return `UNIMPLEMENTED`
-//! and land in phase4 (dashboard). Stubbing them here means the
-//! tonic server wiring is already in place — adding each later is
-//! a pure body-swap with no main.rs churn.
+//! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
+//! `ClusterStatus`, `DrainWorker`, `TriggerGC`, `ListWorkers`,
+//! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`.
 //!
 //! `GetBuildLogs` has two data sources (per `observability.md:44-50`):
 //!
@@ -90,11 +88,22 @@ pub struct AdminServiceImpl {
 /// via a PG query on the shared store DB. Scheduler already has the pool
 /// (same database as the store). Follows the `scheduler_live_pins`
 /// cross-layer precedent.
-pub fn spawn_store_size_refresh(pool: PgPool) -> Arc<std::sync::atomic::AtomicU64> {
+pub fn spawn_store_size_refresh(
+    pool: PgPool,
+    shutdown: rio_common::signal::Token,
+) -> Arc<std::sync::atomic::AtomicU64> {
     let size = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let size_clone = Arc::clone(&size);
     rio_common::task::spawn_monitored("store-size-refresh", async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("store-size-refresh shutting down");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
             match sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
             )
@@ -109,7 +118,6 @@ pub fn spawn_store_size_refresh(pool: PgPool) -> Arc<std::sync::atomic::AtomicU6
                     tracing::warn!(error = %e, "store_size refresh failed");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
     size
@@ -717,31 +725,12 @@ fn tenant_row_to_proto(row: crate::db::TenantRow) -> TenantInfo {
         tenant_name: row.tenant_name,
         gc_retention_hours: row.gc_retention_hours as u32,
         gc_max_store_bytes: row.gc_max_store_bytes.map(|b| b as u64),
-        // PG's TIMESTAMPTZ::text format is "YYYY-MM-DD HH:MM:SS.ssssss+TZ"
-        // which is NOT RFC3339 (space vs T). Convert via SystemTime parsing
-        // or just use a best-effort None — prost_types::Timestamp is Option
-        // in the proto. For now, parse the PG format directly.
-        created_at: parse_pg_timestamp(&row.created_at),
+        created_at: Some(prost_types::Timestamp {
+            seconds: row.created_at,
+            nanos: 0,
+        }),
         has_cache_token: row.has_cache_token,
     }
-}
-
-/// Parse PG's `TIMESTAMPTZ::text` output ("YYYY-MM-DD HH:MM:SS.ssssss+TZ")
-/// into a `prost_types::Timestamp`. Falls back to `None` on parse error.
-fn parse_pg_timestamp(s: &str) -> Option<prost_types::Timestamp> {
-    // PG ::text gives e.g. "2026-03-12 00:42:15.123456+00"
-    // Replace space with T for RFC3339-ish parsing, then use humantime
-    // or chrono. Since neither is a dep, do it manually: extract seconds
-    // since epoch via the first 19 chars + offset. This is good enough
-    // for a created_at display field; precision loss acceptable.
-    //
-    // Actually simplest: PG can output as epoch seconds. But we already
-    // have ::text. For now, return None — the UI can query PG directly
-    // if it needs created_at, and TenantInfo.created_at being None is
-    // documented as "not populated in phase 4a; use direct PG query".
-    // TODO(phase4b): add sqlx chrono feature OR cast to extract(epoch).
-    let _ = s;
-    None
 }
 
 /// Convert a Vec<Chunk> into a ReceiverStream. The chunks are already

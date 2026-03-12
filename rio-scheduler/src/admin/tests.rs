@@ -757,6 +757,10 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
     assert_eq!(t.gc_max_store_bytes, Some(100 * 1024 * 1024 * 1024));
     assert!(t.has_cache_token, "cache_token was set");
     assert!(!t.tenant_id.is_empty(), "UUID should be populated");
+    assert!(
+        t.created_at.is_some_and(|ts| ts.seconds > 0),
+        "created_at should be populated (epoch seconds via EXTRACT)"
+    );
 
     // List shows it.
     let resp = svc.list_tenants(Request::new(())).await?.into_inner();

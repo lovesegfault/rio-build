@@ -76,9 +76,8 @@ const EMA_ALPHA: f64 = 0.3;
 
 /// Row from `list_tenants` / `create_tenant`. `has_cache_token`
 /// is a projection (`cache_token IS NOT NULL`) — the token itself
-/// is never returned. `created_at` is cast to text (`::text`) in
-/// the SELECT to avoid a chrono dep — handler parses into
-/// `prost_types::Timestamp` via RFC3339.
+/// is never returned. `created_at` is epoch seconds via
+/// `EXTRACT(EPOCH FROM created_at)::bigint` — avoids a chrono dep.
 #[derive(Debug, sqlx::FromRow)]
 pub struct TenantRow {
     pub tenant_id: Uuid,
@@ -86,7 +85,7 @@ pub struct TenantRow {
     pub gc_retention_hours: i32,
     pub gc_max_store_bytes: Option<i64>,
     pub has_cache_token: bool,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
 /// Row from `load_nonterminal_builds`. FromRow for named-column
@@ -188,7 +187,8 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
-                   cache_token IS NOT NULL AS has_cache_token, created_at::text
+                   cache_token IS NOT NULL AS has_cache_token,
+                   EXTRACT(EPOCH FROM created_at)::bigint AS created_at
             FROM tenants ORDER BY created_at
             "#,
         )
@@ -211,7 +211,8 @@ impl SchedulerDb {
             VALUES ($1, COALESCE($2, 168), $3, $4)
             ON CONFLICT DO NOTHING
             RETURNING tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
-                      cache_token IS NOT NULL AS has_cache_token, created_at::text
+                      cache_token IS NOT NULL AS has_cache_token,
+                      EXTRACT(EPOCH FROM created_at)::bigint AS created_at
             "#,
         )
         .bind(name)
