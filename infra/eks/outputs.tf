@@ -37,3 +37,18 @@ output "region" {
   description = "AWS region (scripts read this so they don't have to hardcode it)"
   value       = var.region
 }
+
+output "db_endpoint" {
+  description = "Aurora cluster writer endpoint (hostname only, no port)"
+  value       = aws_rds_cluster.rio.endpoint
+}
+
+output "db_secret_arn" {
+  description = "Secrets Manager ARN for the Aurora master password (deploy.sh fetches this to build the connection string)"
+  value       = aws_rds_cluster.rio.master_user_secret[0].secret_arn
+}
+
+output "bastion_instance_id" {
+  description = "SSM bastion instance ID (smoke-test.sh uses this for the port-forward session)"
+  value       = aws_instance.bastion.id
+}
