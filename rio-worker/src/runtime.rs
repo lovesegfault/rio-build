@@ -19,7 +19,7 @@ use rio_proto::types::{
     WorkAssignmentAck, WorkerMessage, worker_message,
 };
 
-use tracing::Instrument;
+use tracing::{Instrument, instrument};
 
 use crate::{executor, fuse, log_stream};
 
@@ -214,7 +214,7 @@ pub fn try_cancel_build(registry: &CancelRegistry, drv_path: &str) -> bool {
 /// Returns after spawning — does NOT block on build completion. The build runs
 /// in its own tokio task holding `permit`; it reports completion via
 /// `ctx.stream_tx` and drops the permit on exit (success, failure, or panic).
-#[tracing::instrument(skip_all, fields(drv_path = %assignment.drv_path))]
+#[instrument(skip_all, fields(drv_path = %assignment.drv_path))]
 pub async fn spawn_build_task(
     assignment: WorkAssignment,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -460,7 +460,7 @@ pub async fn spawn_build_task(
 /// SIGTERMs mid-prefetch, the tasks abort with the runtime — the
 /// partial fetch is in a .tmp-XXXX sibling dir (see fetch_extract_insert)
 /// which cache init cleans up on next start.
-#[tracing::instrument(skip_all, fields(count = prefetch.store_paths.len()))]
+#[instrument(skip_all, fields(count = prefetch.store_paths.len()))]
 pub fn handle_prefetch_hint(
     prefetch: PrefetchHint,
     cache: Arc<fuse::cache::Cache>,

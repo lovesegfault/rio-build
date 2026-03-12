@@ -403,7 +403,7 @@ impl DagActor {
     /// Workers ARE in self.workers (survived): they'll send
     /// CompletionReport or heartbeat showing the build still
     /// running — normal handling resumes.
-    #[tracing::instrument(skip(self))]
+    #[instrument(skip(self))]
     pub(super) async fn handle_reconcile_assignments(&mut self) {
         // Collect (drv_hash, assigned_worker, expected_outputs)
         // for Assigned/Running with unknown workers. Clone before
