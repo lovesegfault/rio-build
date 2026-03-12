@@ -710,4 +710,24 @@ mod tests {
         assert!(state.reset_from_poison().is_err());
         Ok(())
     }
+
+    #[test]
+    fn test_from_poisoned_row_invalid_drv_path() {
+        // Malformed drv_path (not a store path) → Err((hash, StorePathError)).
+        // Covers the error branch that recovery.rs logs-and-skips.
+        let row = crate::db::PoisonedDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: "somehash".into(),
+            drv_path: "not-a-store-path".into(),
+            pname: None,
+            system: "x86_64-linux".into(),
+            failed_workers: vec![],
+            elapsed_secs: 100.0,
+        };
+        let err = DerivationState::from_poisoned_row(row).unwrap_err();
+        assert_eq!(
+            err.0, "somehash",
+            "error tuple returns drv_hash for logging"
+        );
+    }
 }
