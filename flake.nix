@@ -505,6 +505,10 @@
               # MIN_CPU than the count would suggest.
               vm-phase3a = withMinCpu 4 (import ./nix/tests/phase3a.nix k3sArgs);
               vm-phase3b = withMinCpu 4 (import ./nix/tests/phase3b.nix k3sArgs);
+              # phase4.nix starts with k3s topology from the start
+              # (Section A only in 4a; sections B–J appended in 4b/4c).
+              # Auto-included in ci-fast via builtins.attrValues vmTests.
+              vm-phase4 = withMinCpu 4 (import ./nix/tests/phase4.nix k3sArgs);
             };
 
           vmTests = mkVmTests {

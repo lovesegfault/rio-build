@@ -1,0 +1,264 @@
+# Phase 4a milestone validation: multi-tenancy foundation.
+#
+# Section A (this file, 4a): tenant resolution smoke.
+#   SSH key comment → gateway captures tenant NAME → scheduler
+#   resolves to UUID via `tenants` table → `builds.tenant_id` row
+#   has the resolved UUID. Unknown tenant → InvalidArgument.
+#   Empty comment → single-tenant mode (tenant_id IS NULL).
+#
+# Sections B–J appended in 4b/4c (see docs/src/phases/phase4.md
+# section map): GC references, rate-limit, maxSilentTime, rio-cli,
+# cancel-timing, NetPol, WorkerPoolSet, security, load scenario.
+#
+# Topology (3 VMs, k3s from the start — avoids a 4c refactor when
+# Sections G (NetPol) / H (WorkerPoolSet) need it):
+#   control — PG + store + scheduler + gateway (systemd, PLAINTEXT)
+#   k8s     — k3s + rio-controller systemd + worker-as-pod
+#   client  — nix client, ssh-ng to control's gateway
+#
+# PLAINTEXT (no mTLS/HMAC) for Section A: tenant resolution doesn't
+# depend on TLS, and the WorkerPool CRD uses `tlsSecretName` (a k8s
+# Secret mount), not direct env vars. Wiring TLS for the worker pod
+# is a separate concern that Section I (4c security: mTLS no-cert
+# rejection) will add via a k8s Secret.
+#
+# Three SSH keys with different comments on the client; all three
+# written to control's authorized_keys. The gateway captures the
+# MATCHED entry's comment as the tenant name.
+#
+# Run:
+#   NIXBUILDNET_REUSE_BUILD_FAILURES=false nix-build-remote --no-nom -- -L .#checks.x86_64-linux.vm-phase4
+{
+  pkgs,
+  rio-workspace,
+  rioModules,
+  dockerImages, # for airgap preload into k3s
+  crds, # auto-deployed via manifests
+  coverage ? false,
+}:
+let
+  common = import ./common.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      coverage
+      ;
+  };
+
+  # ── Test derivation ─────────────────────────────────────────────────
+  # Three distinct derivations (trivially different output) so each
+  # build creates a fresh `builds` row instead of DAG-dedup reusing
+  # the first build's result.
+  mkTestDrv =
+    marker:
+    pkgs.writeText "phase4-drv-${marker}.nix" ''
+      { busybox }:
+      derivation {
+        name = "phase4-${marker}";
+        builder = "''${busybox}/bin/sh";
+        args = [ "-c" "echo phase4-${marker} > $out" ];
+        system = "x86_64-linux";
+      }
+    '';
+  testDrvKnown = mkTestDrv "known";
+  testDrvUnknown = mkTestDrv "unknown";
+  testDrvAnon = mkTestDrv "anon";
+
+  # ── WorkerPool CR ───────────────────────────────────────────────────
+  # Same as phase3a. Applied via testScript AFTER airgap image import.
+  workerPoolCR = {
+    apiVersion = "rio.build/v1alpha1";
+    kind = "WorkerPool";
+    metadata = {
+      name = "default";
+      namespace = "default";
+    };
+    spec = {
+      replicas = {
+        min = 1;
+        max = 1;
+      };
+      autoscaling = {
+        metric = "queueDepth";
+        targetValue = 2;
+      };
+      image = "rio-worker:dev";
+      maxConcurrentBuilds = 1;
+      fuseCacheSize = "5Gi";
+      sizeClass = "";
+      systems = [ "x86_64-linux" ];
+      features = [ ];
+      privileged = true;
+      hostNetwork = true;
+      imagePullPolicy = "IfNotPresent";
+    };
+  };
+  workerPoolCRFile = pkgs.writeText "workerpool.json" (builtins.toJSON workerPoolCR);
+
+in
+pkgs.testers.runNixOSTest {
+  name = "rio-phase4";
+  # k3s startup (~60s) + airgap import (~30s) + worker pod ready (~90s)
+  # + 3 build cases (~30s each). Wide margin for CI jitter.
+  globalTimeout = 900;
+
+  nodes = {
+    control = common.mkControlNode {
+      hostName = "control";
+      memorySize = 2048;
+      extraFirewallPorts = [
+        9091
+        9092
+      ];
+      extraSchedulerConfig = {
+        tickIntervalSecs = 2;
+        lease = {
+          name = "rio-scheduler-lease";
+          namespace = "default";
+          kubeconfigPath = "/etc/kube/config";
+        };
+      };
+      extraPackages = [ pkgs.postgresql ];
+    };
+
+    k8s = common.mkK3sNode {
+      controllerEnv = {
+        KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
+        RIO_SCHEDULER_ADDR = "control:9001";
+        RIO_STORE_ADDR = "control:9002";
+        RIO_LOG_FORMAT = "pretty";
+      };
+      manifests = {
+        "00-rio-crds".source = crds;
+      };
+      extraK3sImages = [ dockerImages.worker ];
+    };
+
+    client = common.mkClientNode { gatewayHost = "control"; };
+  };
+
+  testScript = ''
+    start_all()
+    ${common.waitForControlPlane "control"}
+
+    # ── k3s bootstrap (same sequence as phase3a) ──────────────────────
+    k8s.wait_for_unit("k3s.service")
+    k8s.wait_for_file("/etc/rancher/k3s/k3s.yaml")
+    # Airgap race fix (commit 51dde5a): k3s starts before images
+    # imported → pods schedule before pause container available →
+    # ErrImagePull. Wait for the pause image explicitly.
+    k8s.wait_until_succeeds("k3s ctr images ls -q | grep -q pause", timeout=120)
+
+    # Kubeconfig copy (127.0.0.1 → k8s) + scheduler restart → lease
+    kubeconfig = k8s.succeed("cat /etc/rancher/k3s/k3s.yaml").replace("127.0.0.1", "k8s")
+    control.succeed("mkdir -p /etc/kube")
+    control.succeed("cat > /etc/kube/config << 'KUBEEOF'\n" + kubeconfig + "\nKUBEEOF")
+    control.succeed("chmod 600 /etc/kube/config")
+    control.succeed("systemctl restart rio-scheduler")
+    control.wait_for_unit("rio-scheduler.service")
+    control.wait_for_open_port(9001)
+
+    k8s.wait_until_succeeds(
+        "k3s kubectl get lease rio-scheduler-lease -n default "
+        "-o jsonpath='{.spec.holderIdentity}' | grep -q control", timeout=30)
+
+    # ── THREE SSH keys with different comments ────────────────────────
+    # sshKeySetup from common.nix generates ONE key with -C empty.
+    # We need three: team-test (known tenant), unknown-team (not in
+    # tenants table), and comment-less (single-tenant mode).
+    client.succeed("mkdir -p /root/.ssh")
+    client.succeed("ssh-keygen -t ed25519 -N ''' -C 'team-test' -f /root/.ssh/id_team_test")
+    client.succeed("ssh-keygen -t ed25519 -N ''' -C 'unknown-team' -f /root/.ssh/id_unknown")
+    client.succeed("ssh-keygen -t ed25519 -N ''' -C ''' -f /root/.ssh/id_anon")
+
+    # All three to authorized_keys. Order doesn't matter — gateway
+    # matches by key_data, reads the MATCHED entry's comment.
+    all_keys = client.succeed(
+        "cat /root/.ssh/id_team_test.pub /root/.ssh/id_unknown.pub /root/.ssh/id_anon.pub"
+    )
+    control.succeed(f"cat > /var/lib/rio/gateway/authorized_keys << 'EOF'\n{all_keys}\nEOF")
+    control.succeed("systemctl restart rio-gateway")
+    control.wait_for_unit("rio-gateway.service")
+    control.wait_for_open_port(2222)
+
+    # ── Worker pod ready (phase3a sequence) ───────────────────────────
+    k8s.wait_until_succeeds("k3s ctr images ls -q | grep -q 'rio-worker:dev'", timeout=120)
+    k8s.succeed("k3s kubectl apply -f ${workerPoolCRFile}")
+    k8s.wait_until_succeeds(
+        "k3s kubectl wait --for=condition=Established crd/workerpools.rio.build --timeout=60s")
+    k8s.wait_for_unit("rio-controller.service")
+    k8s.wait_until_succeeds("k3s kubectl get statefulset default-workers -o name", timeout=60)
+    k8s.wait_until_succeeds(
+        "k3s kubectl wait --for=condition=Ready pod/default-workers-0 --timeout=150s",
+        timeout=180)
+    control.wait_until_succeeds(
+        "curl -sf http://localhost:9091/metrics | grep -E 'rio_scheduler_workers_active 1'",
+        timeout=60)
+
+    ${common.seedBusybox "control"}
+
+    def dump_logs():
+        k8s.execute("journalctl -u rio-controller --no-pager -n 100 >&2")
+        k8s.execute("k3s kubectl logs default-workers-0 --tail=100 >&2 || true")
+        control.execute("journalctl -u rio-scheduler -u rio-gateway --no-pager -n 100 >&2")
+
+    def build_drv(identity_file, drv_path, expect_fail=False):
+        """Build via ssh-ng using the given identity file (selects the
+        matching authorized_keys entry and thus the tenant)."""
+        cmd = (
+            "nix-build --no-out-link "
+            f"--store 'ssh-ng://root@control?ssh-key={identity_file}' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            f"{drv_path} 2>&1"
+        )
+        try:
+            if expect_fail:
+                return client.fail(cmd)
+            return client.succeed(cmd)
+        except Exception:
+            dump_logs()
+            raise
+
+    # ══════════════════════════════════════════════════════════════════
+    # Section A: tenant resolution smoke
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── Pre-seed the tenants table ────────────────────────────────────
+    tenant_uuid = control.succeed(
+        "sudo -u postgres psql rio -tAc "
+        "\"INSERT INTO tenants (tenant_name) VALUES ('team-test') RETURNING tenant_id\""
+    ).strip()
+    control.log(f"seeded tenant team-test = {tenant_uuid}")
+
+    # ── Case 1: key comment 'team-test' → resolved UUID in builds ─────
+    out = build_drv("/root/.ssh/id_team_test", "${testDrvKnown}").strip()
+    assert out.startswith("/nix/store/"), f"known-tenant build should succeed: {out!r}"
+    db_tenant = control.succeed(
+        "sudo -u postgres psql rio -tAc "
+        "\"SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1\""
+    ).strip()
+    assert db_tenant == tenant_uuid, \
+        f"builds.tenant_id should match seeded UUID: expected {tenant_uuid}, got {db_tenant!r}"
+    print(f"Section A case 1 PASS: known tenant resolved to {db_tenant}")
+
+    # ── Case 2: key comment 'unknown-team' → InvalidArgument ──────────
+    out = build_drv("/root/.ssh/id_unknown", "${testDrvUnknown}", expect_fail=True)
+    assert "unknown tenant" in out, \
+        f"unknown-team should be rejected with 'unknown tenant' error, got: {out!r}"
+    print("Section A case 2 PASS: unknown tenant rejected")
+
+    # ── Case 3: empty comment → tenant_id IS NULL (single-tenant) ─────
+    out = build_drv("/root/.ssh/id_anon", "${testDrvAnon}").strip()
+    assert out.startswith("/nix/store/"), f"anon build should succeed: {out!r}"
+    db_tenant = control.succeed(
+        "sudo -u postgres psql rio -tAc "
+        "\"SELECT COALESCE(tenant_id::text, 'NULL') FROM builds ORDER BY submitted_at DESC LIMIT 1\""
+    ).strip()
+    assert db_tenant == "NULL", \
+        f"empty-comment key → tenant_id IS NULL, got {db_tenant!r}"
+    print("Section A case 3 PASS: empty comment = single-tenant mode (NULL)")
+
+    ${common.collectCoverage "control, k8s"}
+  '';
+}
