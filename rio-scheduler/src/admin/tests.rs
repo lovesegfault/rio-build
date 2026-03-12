@@ -232,11 +232,12 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn stubs_return_unimplemented() -> anyhow::Result<()> {
+async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
 
-    // ClusterStatus, DrainWorker, TriggerGC, ListWorkers, ClearPoison,
-    // ListTenants, CreateTenant are no longer stubs. Remaining: ListBuilds.
+    // All phase4a RPCs are wired (no remaining stubs). This test proves
+    // each returns a non-Unimplemented error or success — NOT full
+    // behavior coverage (see dedicated tests below).
 
     // ListWorkers is implemented — no workers → empty list, not error.
     let lw = svc
@@ -926,6 +927,90 @@ async fn test_list_workers_with_filter() -> anyhow::Result<()> {
     assert_eq!(resp.workers.len(), 1);
     assert_eq!(resp.workers[0].worker_id, "drain-worker");
     assert_eq!(resp.workers[0].status, "draining");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ClearPoison happy path
+// ---------------------------------------------------------------------------
+
+// r[verify sched.admin.clear-poison]
+/// Poison a derivation via PermanentFailure, then ClearPoison it.
+/// Verifies cleared=true, in-mem status reset, PG poisoned_at cleared.
+#[tokio::test]
+async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
+    use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
+    use crate::state::PriorityClass;
+
+    let (svc, actor, _task, db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let mut worker_rx = connect_worker(&actor, "poison-w", "x86_64-linux", 1).await?;
+
+    // Merge → dispatches to worker.
+    let _ev = merge_single_node(
+        &actor,
+        uuid::Uuid::new_v4(),
+        "poison-me",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = worker_rx.recv().await.expect("assignment");
+
+    // PermanentFailure → poisoned (both in-mem and PG).
+    complete_failure(
+        &actor,
+        "poison-w",
+        &test_drv_path("poison-me"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "test permanent failure",
+    )
+    .await?;
+
+    // Verify poisoned (barrier via debug_query).
+    let pre = actor
+        .debug_query_derivation("poison-me")
+        .await?
+        .expect("exists");
+    assert_eq!(pre.status, crate::state::DerivationStatus::Poisoned);
+    // PG should have poisoned_at set (the as_bytes() bug would break this).
+    let pg_poisoned: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations WHERE drv_hash=$1",
+    )
+    .bind("poison-me")
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_poisoned.is_some(),
+        "poisoned_at should be persisted to PG"
+    );
+
+    // ClearPoison via RPC.
+    let resp = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "poison-me".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(resp.cleared, "happy path → cleared=true");
+
+    // In-mem: reset to Created.
+    let post = actor
+        .debug_query_derivation("poison-me")
+        .await?
+        .expect("still exists");
+    assert_eq!(post.status, crate::state::DerivationStatus::Created);
+
+    // PG: poisoned_at cleared.
+    let pg_poisoned: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations WHERE drv_hash=$1",
+    )
+    .bind("poison-me")
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_poisoned.is_none(),
+        "clear_poison should NULL poisoned_at"
+    );
 
     Ok(())
 }

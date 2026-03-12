@@ -852,3 +852,75 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
 
     Ok(())
 }
+
+// r[verify sched.poison.ttl-persist]
+/// Poison a derivation on actor A, drop A, spawn actor B on the same PG,
+/// send LeaderAcquired → recover_from_pg should load the poisoned derivation
+/// with Poisoned status for TTL tracking. Without migration 009's poisoned_at
+/// persistence, poison TTL would reset on every scheduler restart.
+#[tokio::test]
+async fn test_recovery_loads_poisoned_derivations() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: actor A poisons a derivation ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "poison-rec-w", "x86_64-linux", 1).await?;
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "poison-rec",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        complete_failure(
+            &handle,
+            "poison-rec-w",
+            &test_drv_path("poison-rec"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        // Barrier: ensure persist_status + set_poisoned_at hit PG.
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Verify PG has it poisoned + poisoned_at set (precondition).
+    let (status, has_ts): (String, bool) =
+        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
+            .bind("poison-rec")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "poisoned", "PG status should be poisoned");
+    assert!(
+        has_ts,
+        "PG poisoned_at should be set (the as_bytes bug broke this)"
+    );
+
+    // --- Phase 2: fresh actor B recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    // Before recovery: DAG is empty.
+    let pre = handle.debug_query_derivation("poison-rec").await?;
+    assert!(pre.is_none(), "fresh actor has empty DAG");
+
+    // LeaderAcquired → recover_from_pg loads poisoned derivations.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // After recovery: derivation is back in the DAG with Poisoned status.
+    let post = handle
+        .debug_query_derivation("poison-rec")
+        .await?
+        .expect("poisoned drv should be recovered for TTL tracking");
+    assert_eq!(
+        post.status,
+        DerivationStatus::Poisoned,
+        "recovered with Poisoned status — handle_tick will TTL-check it"
+    );
+
+    Ok(())
+}
