@@ -104,16 +104,15 @@ pub fn spawn_store_size_refresh(
                 }
                 _ = interval.tick() => {}
             }
-            match sqlx::query_scalar::<_, Option<i64>>(
+            match sqlx::query_scalar::<_, i64>(
                 "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
             )
             .fetch_one(&pool)
             .await
             {
-                Ok(Some(bytes)) if bytes >= 0 => {
-                    size_clone.store(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(bytes) => {
+                    size_clone.store(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                Ok(_) => {} // empty store → keep 0
                 Err(e) => {
                     tracing::warn!(error = %e, "store_size refresh failed");
                 }
@@ -682,6 +681,11 @@ impl AdminService for AdminServiceImpl {
         let req = request.into_inner();
         if req.tenant_name.is_empty() {
             return Err(Status::invalid_argument("tenant_name is required"));
+        }
+        if req.cache_token.as_deref() == Some("") {
+            return Err(Status::invalid_argument(
+                "cache_token must not be empty string (omit field for no-cache-auth)",
+            ));
         }
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let row = db

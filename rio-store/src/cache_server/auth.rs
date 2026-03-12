@@ -47,7 +47,8 @@ pub async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .filter(|t| !t.is_empty());
 
     match token {
         Some(t) => {
@@ -120,7 +121,7 @@ mod tests {
     use rio_test_support::TestDb;
     use tower::ServiceExt;
 
-    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+    use crate::MIGRATOR;
 
     async fn test_router(auth: CacheAuth) -> Router {
         Router::new()
@@ -242,5 +243,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// "Bearer " (trailing space, empty token) must NOT authenticate
+    /// even if a tenant has cache_token=''. Regression: strip_prefix
+    /// yields Some("") which would match WHERE cache_token = '' without
+    /// the .filter(!is_empty) guard.
+    #[tokio::test]
+    async fn empty_bearer_token_rejected_even_with_empty_string_cache_token() {
+        let db = TestDb::new(&MIGRATOR).await;
+        // Seed a tenant with cache_token='' (operator mistake — e.g.,
+        // grpcurl JSON sends "" thinking it means "no cache access").
+        // CreateTenant now rejects this, but defend at the auth layer
+        // too in case the row was written via direct SQL.
+        sqlx::query("INSERT INTO tenants (tenant_name, cache_token) VALUES ('misconfigured', '')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(CacheAuth {
+            pool: db.pool.clone(),
+            allow_unauthenticated: false,
+        })
+        .await;
+
+        let resp = app
+            .oneshot(
+                HttpRequest::get("/test")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Empty token → treated as no-header → 401 (tokens exist).
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "empty bearer must not authenticate"
+        );
     }
 }
