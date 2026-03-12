@@ -87,8 +87,9 @@ impl std::str::FromStr for BuildState {
 pub struct BuildInfo {
     /// Unique build ID.
     pub build_id: Uuid,
-    /// Tenant ID. Reserved for Phase 4 multi-tenancy.
-    pub tenant_id: Option<String>,
+    /// Tenant UUID resolved from name by the gRPC handler. `None` =
+    /// single-tenant mode (gateway sent empty string).
+    pub tenant_id: Option<Uuid>,
     /// Priority class. Interactive gets INTERACTIVE_BOOST (+1e9) in the ready queue.
     pub priority_class: PriorityClass,
     /// Current build state. Private: use `state()` to read, `transition()` to mutate.
@@ -118,7 +119,7 @@ impl BuildInfo {
     /// Construct a new BuildInfo in the Pending state with zeroed counts.
     pub fn new_pending(
         build_id: Uuid,
-        tenant_id: Option<String>,
+        tenant_id: Option<Uuid>,
         priority_class: PriorityClass,
         keep_going: bool,
         options: BuildOptions,

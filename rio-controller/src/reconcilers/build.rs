@@ -220,10 +220,9 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // outputs aren't already in store; if they are, instant
     // success).
     //
-    // tenant: CRD uses string, scheduler wants UUID string.
-    // Pass through as-is — if it's not a valid UUID the
-    // scheduler rejects with InvalidArgument and we surface that
-    // in a Condition. Empty = untenanted.
+    // tenant: CRD uses tenant NAME, scheduler resolves to UUID via
+    // the tenants table. Unknown name → scheduler rejects with
+    // InvalidArgument and we surface that in a Condition. Empty = untenanted.
     let req = types::SubmitBuildRequest {
         tenant_id: b.spec.tenant.clone().unwrap_or_default(),
         priority_class: priority_to_class(b.spec.priority).to_string(),

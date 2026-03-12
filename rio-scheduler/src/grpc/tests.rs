@@ -421,30 +421,105 @@ async fn test_submit_build_rejects_invalid_priority_class() {
     );
 }
 
-/// SubmitBuild with a non-empty tenant_id that's not a valid UUID should
-/// be rejected at the gRPC boundary, not leak as a PostgreSQL cast error.
+/// SubmitBuild with a tenant name not in the tenants table → InvalidArgument.
+/// Proto field carries tenant NAME (from gateway's authorized_keys comment);
+/// scheduler resolves to UUID via PG lookup.
 #[tokio::test]
-async fn test_submit_build_rejects_invalid_tenant_id() {
+async fn test_submit_build_rejects_unknown_tenant() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
-        tenant_id: "customer-foo".into(), // not a UUID
+        tenant_id: "nonexistent-team".into(),
         ..Default::default()
     });
 
     let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "invalid tenant_id should be rejected");
+    assert!(result.is_err(), "unknown tenant should be rejected");
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
-        status.message().contains("tenant_id"),
-        "error should mention tenant_id: {}",
+        status.message().contains("unknown tenant"),
+        "error should mention 'unknown tenant': {}",
         status.message()
     );
+    assert!(
+        status.message().contains("nonexistent-team"),
+        "error should include the tenant name: {}",
+        status.message()
+    );
+}
+
+/// SubmitBuild with a tenant name that IS in the tenants table → resolves
+/// to the UUID and the build is submitted successfully.
+#[tokio::test]
+async fn test_submit_build_resolves_known_tenant() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    // Seed the tenants table.
+    let tenant_uuid: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
+            .bind("team-alpha")
+            .fetch_one(&db.pool)
+            .await
+            .expect("tenant insert");
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("resolve-tenant-drv", "x86_64-linux")],
+        edges: vec![],
+        tenant_id: "team-alpha".into(),
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(
+        result.is_ok(),
+        "known tenant should be accepted: {result:?}"
+    );
+
+    // Verify the build row has the resolved UUID.
+    let db_tenant: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("build lookup");
+    assert_eq!(db_tenant, Some(tenant_uuid));
+}
+
+/// SubmitBuild with empty tenant_id (single-tenant mode) → None, no PG lookup.
+/// This is the common case and must work even without a pool.
+#[tokio::test]
+async fn test_submit_build_empty_tenant_is_none() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    // Intentionally pool-less to assert no PG hit for empty tenant_id.
+    let grpc = SchedulerGrpc::new_for_tests(handle);
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("no-tenant-drv", "x86_64-linux")],
+        edges: vec![],
+        tenant_id: String::new(), // empty = single-tenant mode
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(
+        result.is_ok(),
+        "empty tenant_id should succeed without PG: {result:?}"
+    );
+
+    // Verify tenant_id is NULL in the build row.
+    let db_tenant: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("build lookup");
+    assert_eq!(db_tenant, None);
 }
 
 /// SubmitBuild with more edges than MAX_DAG_EDGES should be rejected

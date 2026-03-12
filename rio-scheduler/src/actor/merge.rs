@@ -31,13 +31,7 @@ impl DagActor {
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
         self.db
-            .insert_build(
-                build_id,
-                tenant_id.as_deref(),
-                priority_class,
-                keep_going,
-                &options,
-            )
+            .insert_build(build_id, tenant_id, priority_class, keep_going, &options)
             .await?;
 
         // === Step 2: DAG merge (BEFORE in-memory map inserts) ========

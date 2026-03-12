@@ -54,6 +54,17 @@ impl SchedulerGrpc {
         }
     }
 
+    /// Test constructor with a PG pool for tenant-resolution tests.
+    /// Like `new_for_tests` but with a pool so `resolve_tenant` works.
+    #[cfg(test)]
+    pub fn new_for_tests_with_pool(actor: ActorHandle, pool: sqlx::PgPool) -> Self {
+        Self {
+            actor,
+            log_buffers: Arc::new(LogBuffers::new()),
+            pool: Some(pool),
+        }
+    }
+
     /// Create with an externally-owned `LogBuffers`. Production `main.rs`
     /// uses this so the LogFlusher (separate task) drains the SAME buffers
     /// that the BuildExecution recv task writes to.
@@ -359,22 +370,30 @@ impl SchedulerService for SchedulerGrpc {
             build_cores: req.build_cores,
         };
 
+        // Tenant resolution: proto field carries tenant NAME (from gateway's
+        // authorized_keys comment); resolve to UUID here via the tenants
+        // table. Empty string → None (single-tenant mode). Unknown name →
+        // InvalidArgument. Keeps gateway PG-free (stateless N-replica HA).
+        let tenant_id = if req.tenant_id.is_empty() {
+            None
+        } else {
+            let pool = self.pool.as_ref().ok_or_else(|| {
+                Status::failed_precondition("tenant lookup requires database connection")
+            })?;
+            let db = crate::db::SchedulerDb::new(pool.clone());
+            Some(
+                db.resolve_tenant(&req.tenant_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!("unknown tenant: {}", req.tenant_id))
+                    })?,
+            )
+        };
+
         let req = MergeDagRequest {
             build_id,
-            tenant_id: if req.tenant_id.is_empty() {
-                None
-            } else {
-                // Parse at the boundary: a malformed UUID (e.g., "customer-foo")
-                // would otherwise leak as a PostgreSQL text-to-uuid cast error.
-                Some(
-                    req.tenant_id
-                        .parse::<uuid::Uuid>()
-                        .map_err(|e| {
-                            Status::invalid_argument(format!("invalid tenant_id UUID: {e}"))
-                        })?
-                        .to_string(),
-                )
-            },
+            tenant_id,
             priority_class: if req.priority_class.is_empty() {
                 crate::state::PriorityClass::default()
             } else {

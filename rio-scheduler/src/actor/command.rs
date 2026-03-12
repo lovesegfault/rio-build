@@ -18,7 +18,7 @@ use super::handle::{DebugDerivationInfo, DebugWorkerInfo};
 #[derive(Debug)]
 pub struct MergeDagRequest {
     pub build_id: Uuid,
-    pub tenant_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
     pub priority_class: PriorityClass,
     pub nodes: Vec<rio_proto::types::DerivationNode>,
     pub edges: Vec<rio_proto::types::DerivationEdge>,

@@ -83,7 +83,7 @@ const EMA_ALPHA: f64 = 0.3;
 #[derive(Debug, sqlx::FromRow)]
 pub struct RecoveryBuildRow {
     pub build_id: Uuid,
-    pub tenant_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
     pub status: String,
     pub priority_class: String,
     pub keep_going: bool,
@@ -138,6 +138,22 @@ impl SchedulerDb {
     }
 
     // -----------------------------------------------------------------------
+    // Tenant operations
+    // -----------------------------------------------------------------------
+
+    /// Resolve a tenant name to its UUID. `Ok(None)` = unknown tenant.
+    ///
+    /// The gateway sends the tenant NAME (from the `authorized_keys` entry's
+    /// comment field); the scheduler resolves it here. Empty string = single-
+    /// tenant mode (caller passes `None` directly, doesn't call this).
+    pub async fn resolve_tenant(&self, name: &str) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    // -----------------------------------------------------------------------
     // Build operations
     // -----------------------------------------------------------------------
 
@@ -150,7 +166,7 @@ impl SchedulerDb {
     pub async fn insert_build(
         &self,
         build_id: Uuid,
-        tenant_id: Option<&str>,
+        tenant_id: Option<Uuid>,
         priority_class: crate::state::PriorityClass,
         keep_going: bool,
         options: &crate::state::BuildOptions,
@@ -160,7 +176,7 @@ impl SchedulerDb {
             INSERT INTO builds
                 (build_id, tenant_id, requestor, status, priority_class,
                  keep_going, options_json)
-            VALUES ($1, $2::uuid, '', 'pending', $3, $4, $5)
+            VALUES ($1, $2, '', 'pending', $3, $4, $5)
             "#,
         )
         .bind(build_id)
@@ -645,7 +661,7 @@ impl SchedulerDb {
     pub async fn load_nonterminal_builds(&self) -> Result<Vec<RecoveryBuildRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT build_id, tenant_id::text, status, priority_class,
+            SELECT build_id, tenant_id, status, priority_class,
                    keep_going, options_json
             FROM builds
             WHERE status IN ('pending', 'active')
