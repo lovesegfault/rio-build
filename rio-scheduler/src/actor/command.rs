@@ -200,6 +200,14 @@ pub enum ActorCommand {
     /// that may not be in narinfo yet (worker hasn't uploaded).
     GcRoots { reply: oneshot::Sender<Vec<String>> },
 
+    /// Snapshot all workers for `AdminService.ListWorkers`.
+    /// O(workers) scan; acceptable for dashboard polling.
+    /// `send_unchecked`: same rationale as `ClusterSnapshot` —
+    /// dashboard needs a reading even (especially) under saturation.
+    ListWorkers {
+        reply: oneshot::Sender<Vec<WorkerSnapshot>>,
+    },
+
     /// Clear poison state for a derivation: in-mem reset + PG clear.
     /// Returns `true` if the derivation was poisoned and is now cleared.
     /// `false` if not found or not in Poisoned status.
@@ -286,6 +294,23 @@ pub struct DrainResult {
     /// this is 0 (reassigned). The worker's preStop hook uses this to
     /// decide whether to wait.
     pub running_builds: u32,
+}
+
+/// Point-in-time worker snapshot for `AdminService.ListWorkers`.
+/// Internal (not proto) — `admin.rs` translates to `WorkerInfo`.
+/// `Instant` fields are converted to wall-clock `SystemTime` there.
+#[derive(Debug, Clone)]
+pub struct WorkerSnapshot {
+    pub worker_id: WorkerId,
+    pub systems: Vec<String>,
+    pub supported_features: Vec<String>,
+    pub max_builds: u32,
+    pub running_builds: u32,
+    pub draining: bool,
+    pub size_class: Option<String>,
+    pub connected_since: std::time::Instant,
+    pub last_heartbeat: std::time::Instant,
+    pub last_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

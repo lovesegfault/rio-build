@@ -96,6 +96,10 @@ r[sched.poison.ttl-persist]
 
 `poisoned_at` is persisted to `derivations.poisoned_at TIMESTAMPTZ` when the poison threshold trips. Recovery loads poisoned rows via a separate `load_poisoned_derivations` query (since `TERMINAL_STATUSES` includes `"poisoned"` and `load_nonterminal_derivations` filters it out). The timestamp is converted back to `Instant` via PG-computed `EXTRACT(EPOCH FROM (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 
+r[sched.admin.list-workers]
+
+`AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `max_builds`, `running_builds`, `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
+
 r[sched.admin.clear-poison]
 
 `AdminService.ClearPoison` resets both in-memory state (`reset_from_poison()`: Poisoned→Created, clear `failed_workers`, zero `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`). Returns `cleared=true` only if both succeed. If PG fails after in-mem reset, returns `false` so the operator retries — next recovery would restore Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a non-poisoned or non-existent derivation returns `cleared=false` without error.

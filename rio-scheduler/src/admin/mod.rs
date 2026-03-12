@@ -41,6 +41,8 @@ use rio_proto::types::{
 use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
+mod workers;
+
 /// Chunk size for streaming S3-fetched log lines back to the client.
 /// The whole log is gunzipped into memory first (we need to do line
 /// splitting on decompressed data), then re-chunked for the gRPC stream.
@@ -403,11 +405,17 @@ impl AdminService for AdminServiceImpl {
     // Stubs — return UNIMPLEMENTED. Phase 4 (dashboard) implements these.
     // -----------------------------------------------------------------------
 
+    // r[impl sched.admin.list-workers]
+    #[instrument(skip(self, request), fields(rpc = "ListWorkers"))]
     async fn list_workers(
         &self,
-        _request: Request<ListWorkersRequest>,
+        request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
-        Err(Status::unimplemented("ListWorkers: phase4 dashboard"))
+        rio_proto::interceptor::link_parent(&request);
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        let resp = workers::list_workers(&self.actor, &req.status_filter).await?;
+        Ok(Response::new(resp))
     }
 
     async fn list_builds(
