@@ -27,15 +27,10 @@ resource "helm_release" "cert_manager" {
   create_namespace = true
 
   # CRDs via the chart (not a separate `kubectl apply -f crds.yaml`
-  # step). `installCRDs` is deprecated in newer cert-manager charts
-  # in favor of `crds.enabled` — using both for forward compat,
-  # the chart ignores whichever it doesn't recognize.
+  # step). cert-manager v1.15+ uses `crds.enabled`; the deprecated
+  # `installCRDs` is an ERROR (not ignored) when set alongside it.
   set {
     name  = "crds.enabled"
-    value = "true"
-  }
-  set {
-    name  = "installCRDs"
     value = "true"
   }
 
