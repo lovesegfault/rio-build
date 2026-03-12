@@ -101,15 +101,20 @@ struct BuildListRow {
 }
 
 fn row_to_proto(r: BuildListRow) -> BuildInfo {
+    let state = r
+        .status
+        .parse::<crate::state::BuildState>()
+        .map(BuildState::from)
+        .unwrap_or_else(|_| {
+            tracing::warn!(status = %r.status, build_id = %r.build_id,
+                "unknown build status from PG — rendering as Pending");
+            BuildState::Pending
+        }) as i32;
     BuildInfo {
         build_id: r.build_id,
         tenant_id: r.tenant_id.unwrap_or_default(),
         priority_class: r.priority_class,
-        state: r
-            .status
-            .parse::<crate::state::BuildState>()
-            .map(BuildState::from)
-            .unwrap_or(BuildState::Pending) as i32,
+        state,
         total_derivations: r.total_derivations as u32,
         completed_derivations: r.completed_derivations as u32,
         cached_derivations: r.cached_derivations as u32,

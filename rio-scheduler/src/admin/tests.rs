@@ -817,6 +817,19 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
         .await;
     assert_eq!(ws_tok.unwrap_err().code(), tonic::Code::InvalidArgument);
 
+    // gc_retention_hours > i32::MAX → InvalidArgument (was silently
+    // wrapping to negative via `as i32` and storing in PG INTEGER).
+    let oor = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-oor".into(),
+            gc_retention_hours: Some(u32::MAX),
+            ..Default::default()
+        }))
+        .await;
+    let err = oor.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("out of range"));
+
     // Tenant with defaults (no optionals).
     let defaults = svc
         .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {

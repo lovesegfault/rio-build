@@ -691,12 +691,31 @@ impl AdminService for AdminServiceImpl {
                 "cache_token must not be empty string (omit field for no-cache-auth)",
             ));
         }
+        // u32→i32 / u64→i64 would wrap to negative for out-of-range
+        // values (PG stores INTEGER/BIGINT signed). GC with negative
+        // retention is undefined downstream.
+        let gc_retention_hours = req
+            .gc_retention_hours
+            .map(|h| {
+                i32::try_from(h).map_err(|_| {
+                    Status::invalid_argument("gc_retention_hours out of range (max 2^31-1)")
+                })
+            })
+            .transpose()?;
+        let gc_max_store_bytes = req
+            .gc_max_store_bytes
+            .map(|b| {
+                i64::try_from(b).map_err(|_| {
+                    Status::invalid_argument("gc_max_store_bytes out of range (max 2^63-1)")
+                })
+            })
+            .transpose()?;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let row = db
             .create_tenant(
                 &req.tenant_name,
-                req.gc_retention_hours.map(|h| h as i32),
-                req.gc_max_store_bytes.map(|b| b as i64),
+                gc_retention_hours,
+                gc_max_store_bytes,
                 req.cache_token.as_deref(),
             )
             .await
