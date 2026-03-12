@@ -20,6 +20,15 @@ spec:
   # Lease → is_leader=true → readiness passes → traffic flows.
   # ~15s failover (Lease TTL).
   replicas: 2
+  # maxUnavailable: 1 is load-bearing. The default (25% of 2) rounds
+  # DOWN to 0, meaning the controller wants 2/2 Ready before scaling
+  # down the old RS. But the standby is NEVER Ready (readinessProbe
+  # gates on is_leader, by design). Result: rolling updates deadlock
+  # — old RS stays at 1, new RS stays at 2, forever. With 1, the
+  # controller accepts 1/2 Ready (the normal state) and proceeds.
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: rio-scheduler
