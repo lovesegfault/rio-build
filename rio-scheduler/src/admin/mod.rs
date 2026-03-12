@@ -655,6 +655,7 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 
+    // r[impl sched.admin.list-tenants]
     #[instrument(skip(self, request), fields(rpc = "ListTenants"))]
     async fn list_tenants(
         &self,
@@ -671,6 +672,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
+    // r[impl sched.admin.create-tenant]
     #[instrument(skip(self, request), fields(rpc = "CreateTenant"))]
     async fn create_tenant(
         &self,

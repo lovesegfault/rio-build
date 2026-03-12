@@ -733,6 +733,8 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 // Tenant RPCs: ListTenants, CreateTenant
 // ---------------------------------------------------------------------------
 
+// r[verify sched.admin.list-tenants]
+// r[verify sched.admin.create-tenant]
 #[tokio::test]
 async fn test_create_and_list_tenants() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
@@ -867,6 +869,25 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
         .into_inner();
     assert_eq!(resp.builds.len(), 1);
     assert_eq!(resp.total_count, 3, "total_count unaffected by pagination");
+
+    // Pagination: offset past end → empty page, total still correct.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            limit: 10,
+            offset: 99,
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert!(
+        resp.builds.is_empty(),
+        "offset >= total_count → empty page, got {} builds",
+        resp.builds.len()
+    );
+    assert_eq!(
+        resp.total_count, 3,
+        "total_count unaffected by offset-past-end"
+    );
 
     // tenant_filter: seed a tenant + one build tagged with it.
     let tenant_id: uuid::Uuid = sqlx::query_scalar(
