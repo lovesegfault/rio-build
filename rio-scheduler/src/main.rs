@@ -336,7 +336,12 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the lease loop (if configured). AFTER actor spawn so
     // the actor's generation is already the shared Arc — when the
     // lease acquires and increments, the actor sees it.
-    if let Some(lease_cfg) = lease_cfg {
+    // Capture the handle: the lease loop calls step_down() on
+    // shutdown (graceful release, saves ~15s on rollouts). That's
+    // an async K8s API call that needs time to complete — if we
+    // drop the handle and let main() race to exit, the process
+    // dies before the PATCH lands and we're back to TTL expiry.
+    let lease_loop = lease_cfg.map(|lease_cfg| {
         // Reconstruct LeaderState from the SAME Arcs. We moved
         // the original into spawn_with_leader; clone the
         // underlying atomics back out. (They're Arc<Atomic*>;
@@ -357,8 +362,8 @@ async fn main() -> anyhow::Result<()> {
                 actor.clone(),
                 shutdown.clone(),
             ),
-        );
-    }
+        )
+    });
 
     // grpc.health.v1.Health. SERVING iff is_leader. K8s Service
     // routes only to SERVING pods → only to the leader. Standby
@@ -571,6 +576,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .serve_with_shutdown(listen_addr, shutdown.cancelled_owned())
         .await?;
+
+    // Wait for step_down() to complete. serve_with_shutdown has
+    // already returned (cancel token fired), so the lease loop has
+    // seen the same signal and is on its way out — this join is
+    // quick (one K8s PATCH). Ignore the JoinError: it's only set
+    // if the lease task panicked, which spawn_monitored already
+    // logged, and we're shutting down regardless.
+    if let Some(h) = lease_loop {
+        let _ = h.await;
+    }
 
     info!("scheduler shut down cleanly");
     Ok(())

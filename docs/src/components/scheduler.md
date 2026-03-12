@@ -499,6 +499,11 @@ r[sched.lease.generation-fence]
 
 > **Optional hardening (Phase 4+):** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
 
+r[sched.lease.graceful-release]
+On graceful shutdown (SIGTERM), if the lease loop was leading, it calls `step_down()` to release the lease immediately before the process exits. This is an optimization, not a correctness requirement: without it, the next replica waits up to `lease_ttl` (15s) for TTL expiry. With it, the next replica acquires on its first poll (~1s). The `step_down()` call is an async K8s PATCH; `main()` awaits the lease-loop's `JoinHandle` after `serve_with_shutdown` returns, ensuring the PATCH lands before process exit. If `step_down()` fails (apiserver unreachable), the loop logs a warning and TTL expiry is the fallback.
+
+**Deployment strategy interaction:** The scheduler's readiness probe gates on `is_leader`, so at most one pod is ever Ready. This makes `RollingUpdate` deadlock: Kubernetes won't terminate the old leader (the only Ready pod) until a new pod is Ready, but new pods can't be Ready until they hold the lease, which the old leader holds. The deployment uses `strategy.type: Recreate` --- terminate all old pods first, then create new. Combined with `step_down()`, rollout downtime is a few seconds.
+
 ## Incremental Critical-Path Maintenance
 
 r[sched.critical-path.incremental]

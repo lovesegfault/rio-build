@@ -18,17 +18,27 @@ spec:
   # !is_leader) → Service excludes it → all client traffic
   # hits the leader. On leader death: standby acquires the
   # Lease → is_leader=true → readiness passes → traffic flows.
-  # ~15s failover (Lease TTL).
+  # ~1s failover (step_down on SIGTERM; 15s Lease TTL is the
+  # fallback for crash death).
   replicas: 2
-  # maxUnavailable: 1 is load-bearing. The default (25% of 2) rounds
-  # DOWN to 0, meaning the controller wants 2/2 Ready before scaling
-  # down the old RS. But the standby is NEVER Ready (readinessProbe
-  # gates on is_leader, by design). Result: rolling updates deadlock
-  # — old RS stays at 1, new RS stays at 2, forever. With 1, the
-  # controller accepts 1/2 Ready (the normal state) and proceeds.
+  # Recreate, not RollingUpdate. readinessProbe gates on is_leader
+  # (by design — it's how the Service routes to the active
+  # replica). That means at most 1 pod is EVER Ready. RollingUpdate
+  # requires (replicas - maxUnavailable) Ready at all times, and
+  # even with maxUnavailable: 1 that's 1 Ready minimum — which
+  # means k8s won't terminate the old leader (only Ready pod)
+  # until a new pod is Ready, but new pods can't be Ready until
+  # they acquire the lease, which the old leader holds. Deadlock.
+  # commit 6250327 tried maxUnavailable: 1 but that only lets k8s
+  # kill the old STANDBY, not the leader.
+  #
+  # Recreate terminates all old pods first. step_down() on SIGTERM
+  # (rio-scheduler/src/lease.rs) releases the lease immediately so
+  # the new pod acquires on its first poll. Rollout downtime:
+  # grace period + pod start + 1 poll ≈ a few seconds. Acceptable
+  # for a deliberate deploy; the standby is for UNPLANNED failover.
   strategy:
-    rollingUpdate:
-      maxUnavailable: 1
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: rio-scheduler

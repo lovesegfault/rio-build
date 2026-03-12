@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Lease TTL. After this much time without renewal, another
 /// replica can acquire.
@@ -258,10 +258,7 @@ pub async fn run_lease_loop(
 
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => {
-                tracing::debug!("lease loop shutting down");
-                break;
-            }
+            _ = shutdown.cancelled() => break,
             _ = interval.tick() => {}
         }
 
@@ -330,9 +327,7 @@ pub async fn run_lease_loop(
                 } else if !now_leading && was_leading {
                     // ---- Lose transition ----
                     // Someone else acquired (we couldn't renew in
-                    // time, or `step_down()` was called — we don't
-                    // call that, but future graceful shutdown
-                    // might). Stop dispatching. Generation is the
+                    // time). Stop dispatching. Generation is the
                     // NEW leader's job to increment.
                     state.is_leader.store(false, Ordering::Relaxed);
                     // Clear recovery_complete: if we re-acquire,
@@ -367,6 +362,26 @@ pub async fn run_lease_loop(
             }
         }
     }
+
+    // r[impl sched.lease.graceful-release]
+    // Graceful release: on shutdown, release the lease so the next
+    // replica acquires immediately (~1s poll) instead of waiting
+    // for TTL expiry (15s). This isn't a correctness fix — the
+    // Recreate deployment strategy already unblocks rollouts —
+    // but it shaves 15s off every deploy. step_down() errors if
+    // we're not actually the holder (ReleaseLockWhenNotLeading),
+    // so gate on was_leading. Any other error is also non-fatal:
+    // we're shutting down regardless, and TTL expiry is the
+    // fallback.
+    if was_leading {
+        match lease.step_down().await {
+            Ok(()) => info!("released lease on shutdown"),
+            Err(e) => {
+                warn!(error = %e, "step_down failed; lease will expire in {}s", LEASE_TTL.as_secs())
+            }
+        }
+    }
+    debug!("lease loop exited");
 }
 
 // r[verify sched.lease.k8s-lease]
