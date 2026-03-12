@@ -52,30 +52,32 @@ fn cert_cn(der: &[u8]) -> Option<String> {
 }
 
 impl StoreServiceImpl {
+    // r[impl sec.boundary.grpc-oidc]
     /// Try to verify an `x-rio-oidc-token` metadata header.
     ///
     /// Returns:
-    /// - `Ok(true)` if OIDC token is present and valid → caller skips HMAC
-    /// - `Ok(false)` if no OIDC token or no OIDC verifier → fall through to HMAC
+    /// - `Ok(true)` if OIDC token is present and valid -> caller skips HMAC
+    /// - `Ok(false)` if no OIDC token or no OIDC verifier -> fall through to HMAC
     /// - `Err(PERMISSION_DENIED)` if OIDC token is present but invalid
     async fn try_verify_oidc_token<T>(&self, request: &Request<T>) -> Result<bool, Status> {
         let Some(verifier) = &self.oidc_verifier else {
             return Ok(false);
         };
 
-        let Some(token) = request
-            .metadata()
-            .get("x-rio-oidc-token")
-            .and_then(|v| v.to_str().ok())
-        else {
+        // Split absent vs present-but-unparseable: the first falls through
+        // to HMAC, the second must fail-closed (C2).
+        let Some(raw) = request.metadata().get("x-rio-oidc-token") else {
             return Ok(false);
         };
+        let token = raw
+            .to_str()
+            .map_err(|_| Status::permission_denied("x-rio-oidc-token header is not valid ASCII"))?;
 
         match verifier.verify(token).await {
             Ok(claims) => {
                 debug!(
-                    issuer = %claims.issuer,
-                    subject = %claims.subject,
+                    issuer = %claims.issuer(),
+                    subject = %claims.subject(),
                     "PutPath: OIDC token verified"
                 );
                 metrics::counter!("rio_store_oidc_accepted_total").increment(1);

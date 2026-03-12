@@ -275,7 +275,8 @@ async fn main() -> anyhow::Result<()> {
         Some(v) => store_service.with_hmac_verifier(v),
         None => store_service,
     };
-    let oidc_verifier = rio_common::oidc::OidcVerifier::new(cfg.oidc_providers);
+    let oidc_verifier = rio_common::oidc::OidcVerifier::new(cfg.oidc_providers)
+        .map_err(|e| anyhow::anyhow!("OIDC provider config: {e}"))?;
     let store_service = match oidc_verifier {
         Some(v) => store_service.with_oidc_verifier(v),
         None => store_service,
