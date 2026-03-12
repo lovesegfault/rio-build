@@ -2,8 +2,8 @@
 #
 # Usage:
 #   nix build .#docker-gateway      # single image tarball at result
-#   nix build .#dockerImages        # all 4 at result/{gateway,scheduler,store,worker}.tar.gz
-#   docker load < result/gateway.tar.gz
+#   nix build .#dockerImages        # all 6 at result/{gateway,scheduler,store,controller,worker,fod-proxy}.tar.zst
+#   docker load < result/gateway.tar.zst
 #   docker run rio-gateway:dev --help
 #
 # buildLayeredImage stratifies by popularity — the Nix store closure of each
@@ -17,6 +17,25 @@
 { pkgs, rio-workspace }:
 let
   inherit (pkgs) lib dockerTools;
+
+  # zstd tarballs instead of gzip: ~3x faster to compress, ~4x faster
+  # to decompress, smaller output. Both skopeo (docker-archive:
+  # transport, magic-byte detect) and k3s airgap import (wharfie
+  # SupportedExtensions whitelist) handle .tar.zst natively.
+  #
+  # nixpkgs' compressor arg is a fixed lookup key (none/gz/zstd) —
+  # no level knob. But `zstd` reads ZSTD_CLEVEL from env, and
+  # buildLayeredImage is a runCommand whose attrs become builder
+  # env. overrideAttrs threads it through.
+  #
+  # Level 6: ~2MB window. Do NOT crank this + --long: wharfie's
+  # zstd decoder on k3s nodes caps at 32MB, exceeding that OOMs
+  # the VM test airgap import.
+  buildZstd =
+    args:
+    (dockerTools.buildLayeredImage (args // { compressor = "zstd"; })).overrideAttrs {
+      ZSTD_CLEVEL = "6";
+    };
 
   # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
   # tzdata so log timestamps aren't UTC-only.
@@ -32,7 +51,7 @@ let
       extraEnv ? [ ],
       extraCommands ? "",
     }:
-    dockerTools.buildLayeredImage {
+    buildZstd {
       name = "rio-${name}";
       inherit extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
@@ -93,7 +112,7 @@ in
   # operators can edit the allowlist without rebuilding.
   #
   # Can't use mkImage — that's built around rio-workspace binaries.
-  fod-proxy = dockerTools.buildLayeredImage {
+  fod-proxy = buildZstd {
     name = "rio-fod-proxy";
     tag = "dev";
     maxLayers = 20;

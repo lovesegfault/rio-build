@@ -843,7 +843,7 @@
             docker-fod-proxy = dockerImages.fod-proxy;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList (name: drv: {
-                name = "${name}.tar.gz";
+                name = "${name}.tar.zst";
                 path = drv;
               }) dockerImages
             );
