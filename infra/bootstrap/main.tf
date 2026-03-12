@@ -1,21 +1,21 @@
-# Bootstrap: the S3 bucket that holds terraform state for infra/eks.
+# Bootstrap: the S3 bucket that holds terraform state for infra/eks
+# AND for this module itself (self-referential).
 #
-# Chicken-and-egg: infra/eks's backend needs this bucket to exist
-# BEFORE `tofu init`. This module creates it. Run ONCE per AWS
-# account; its own state is tiny (one bucket) and lives locally
-# by design — commit terraform.tfstate for this module only so
-# anyone can `tofu destroy` it later without the original applier.
+# Chicken-and-egg solved by `just aws-bootstrap`: it checks whether
+# the state object already exists in S3. If not (first time), it
+# inits with -backend=false (local state), applies to create the
+# bucket, then migrates local → S3. If yes, normal init + apply.
+# Idempotent from any machine, nothing state-like is committed.
 #
 # OpenTofu ≥1.6 (and Terraform ≥1.10) support native S3 state
 # locking via the bucket's own object lock — no DynamoDB table
-# needed. We enable versioning + object lock here; the backend
-# config in infra/eks/backend.tf sets `use_lockfile = true`.
+# needed. We enable versioning + object lock here; both backend
+# blocks (here and in infra/eks/backend.tf) set `use_lockfile = true`.
 #
-# Usage:
-#   cd infra/bootstrap
-#   AWS_PROFILE=beme_sandbox tofu init
-#   AWS_PROFILE=beme_sandbox tofu apply
-#   # → prints the bucket name; paste into infra/eks/backend.tf
+# bucket_name and region are REQUIRED vars, always passed by the
+# justfile (computed from sts, or RIO_TFSTATE_* in .env.local).
+# No defaults here — single source of truth in the justfile, so
+# backend config and the created bucket can't drift apart.
 
 terraform {
   required_version = ">= 1.6"
@@ -25,33 +25,35 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # Self-referential: this bucket IS aws_s3_bucket.state below.
+  # bucket + region are passed via -backend-config (justfile
+  # computes rio-tfstate-${account_id} from sts, or reads
+  # RIO_TFSTATE_BUCKET / RIO_TFSTATE_REGION from .env.local).
+  # See header comment for first-time-setup bootstrap dance.
+  backend "s3" {
+    key          = "bootstrap/terraform.tfstate"
+    use_lockfile = true
+  }
 }
 
+# No defaults: justfile always passes these (sts-computed, or
+# RIO_TFSTATE_* from .env.local). See header comment.
 variable "region" {
-  type    = string
-  default = "us-east-2"
+  type = string
 }
 
 variable "bucket_name" {
-  description = "State bucket name. Must be globally unique. Default includes account ID to avoid collisions."
+  description = "State bucket name. Must be globally unique."
   type        = string
-  default     = ""
 }
 
 provider "aws" {
   region = var.region
 }
 
-data "aws_caller_identity" "current" {}
-
-locals {
-  # Account ID in the name: two people bootstrapping in different
-  # accounts with the same naming convention won't collide.
-  bucket = var.bucket_name != "" ? var.bucket_name : "rio-tfstate-${data.aws_caller_identity.current.account_id}"
-}
-
 resource "aws_s3_bucket" "state" {
-  bucket = local.bucket
+  bucket = var.bucket_name
 
   # object_lock_enabled must be set at creation time — can't toggle
   # it later. Native S3 locking (no DynamoDB) requires it.
@@ -85,20 +87,6 @@ resource "aws_s3_bucket_public_access_block" "state" {
 }
 
 output "bucket" {
-  description = "State bucket name — set `bucket = \"<this>\"` in infra/eks/backend.tf"
+  description = "State bucket name (just eks-init computes this from account ID, but the output is handy for verification)"
   value       = aws_s3_bucket.state.bucket
-}
-
-output "backend_config" {
-  description = "Ready-to-paste backend block"
-  value       = <<-EOT
-    terraform {
-      backend "s3" {
-        bucket       = "${aws_s3_bucket.state.bucket}"
-        key          = "eks/terraform.tfstate"
-        region       = "${var.region}"
-        use_lockfile = true
-      }
-    }
-  EOT
 }

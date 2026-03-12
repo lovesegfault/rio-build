@@ -13,17 +13,12 @@
 # terraform.tfstate file.
 
 terraform {
+  # bucket + region via -backend-config — `just eks-init` computes
+  # rio-tfstate-${account_id} from sts (or RIO_TFSTATE_BUCKET /
+  # RIO_TFSTATE_REGION from .env.local). Keeps this file free of
+  # account-specific literals.
   backend "s3" {
-    # Set this after running infra/bootstrap. The bucket name
-    # defaults to rio-tfstate-<account-id> there; paste the
-    # output here. tofu init will prompt if this is empty.
-    #
-    # Alternative: `tofu init -backend-config=bucket=<name>` to
-    # pass it on the command line (keeps this file generic).
-    bucket = ""
-
     key          = "eks/terraform.tfstate"
-    region       = "us-east-2"
     use_lockfile = true
   }
 }

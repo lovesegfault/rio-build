@@ -32,9 +32,10 @@ by the justfile at the repo root — `just --list` for the menu.
 cp .env.local.example .env.local  # edit AWS_PROFILE if not beme_sandbox
 direnv allow
 
-# ONE-TIME per AWS account: S3 state bucket.
-# Skip if someone else already ran this (check: aws s3 ls | grep rio-tfstate).
-just aws-bootstrap                # ~5s
+# ONE-TIME per AWS account: S3 state bucket. Idempotent — detects
+# whether state already exists in S3; if not, does the first-time
+# dance (local apply → create bucket → migrate state to S3).
+just aws-bootstrap                # ~5s if already set up
 
 # Full bring-up: apply (prompts) → kubeconfig → push → deploy
 just eks-up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
@@ -52,13 +53,22 @@ just eks-smoke                    # ~5min — builds nixpkgs#hello, kills a work
 
 `just eks-up-auto` skips the tofu apply prompt (`-auto-approve`).
 
-### What `eks-init` does with the backend bucket
+### State backend configuration
 
-`just eks-init` reads the state bucket name from `infra/bootstrap`'s
-output on each run — no committed `backend.hcl`, no manual
-`-backend-config` typing. The `-reconfigure` flag skips tofu's
-spurious "backend changed, migrate?" prompt (tofu can't tell the
-dynamically-read value is the same as last time).
+Both `infra/bootstrap` and `infra/eks` store state in the same S3
+bucket (bootstrap is self-referential — it manages the bucket it
+stores its own state in). Bucket name and region are passed via
+`-backend-config` by the justfile, so nothing account-specific is
+committed. Defaults:
+
+| Var | Default | Override in `.env.local` |
+|---|---|---|
+| bucket | `rio-tfstate-${account_id}` (from `aws sts`) | `RIO_TFSTATE_BUCKET` |
+| region | `us-east-2` | `RIO_TFSTATE_REGION` |
+
+Running in a fresh AWS account just works: `just aws-bootstrap`
+computes the bucket name, creates it, migrates state into it.
+Everything downstream reads the same computed name.
 
 ## Iterating
 
