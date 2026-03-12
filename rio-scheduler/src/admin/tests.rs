@@ -1109,3 +1109,79 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// ClearPoison ordering regression: PG clear must precede in-mem
+/// reset so that a PG failure leaves in-mem Poisoned for retry.
+/// The old order (in-mem first) left status=Created on PG blip →
+/// retry hit the not-poisoned guard → permanent no-op.
+#[tokio::test]
+async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyhow::Result<()> {
+    use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
+    use crate::state::PriorityClass;
+
+    let (svc, actor, _task, db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let mut worker_rx = connect_worker(&actor, "pg-blip-w", "x86_64-linux", 1).await?;
+
+    let _ev = merge_single_node(
+        &actor,
+        uuid::Uuid::new_v4(),
+        "pg-blip",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = worker_rx.recv().await.expect("assignment");
+    complete_failure(
+        &actor,
+        "pg-blip-w",
+        &test_drv_path("pg-blip"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "test",
+    )
+    .await?;
+
+    // Confirm poisoned.
+    let pre = actor
+        .debug_query_derivation("pg-blip")
+        .await?
+        .expect("exists");
+    assert_eq!(pre.status, crate::state::DerivationStatus::Poisoned);
+
+    // Simulate PG blip: close the pool. All subsequent queries fail.
+    db.pool.close().await;
+
+    // First attempt: PG fails → cleared=false, in-mem STILL Poisoned.
+    let resp1 = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "pg-blip".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!resp1.cleared, "PG failure → cleared=false");
+
+    let post1 = actor
+        .debug_query_derivation("pg-blip")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        post1.status,
+        crate::state::DerivationStatus::Poisoned,
+        "PG failure must leave in-mem Poisoned so retry can proceed"
+    );
+
+    // Second attempt with PG still down: same result (proves retry
+    // is still hitting the PG path, not the not-poisoned early-return).
+    let resp2 = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "pg-blip".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!resp2.cleared);
+    let post2 = actor
+        .debug_query_derivation("pg-blip")
+        .await?
+        .expect("exists");
+    assert_eq!(post2.status, crate::state::DerivationStatus::Poisoned);
+
+    Ok(())
+}

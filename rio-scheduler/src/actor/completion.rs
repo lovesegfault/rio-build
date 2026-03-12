@@ -466,23 +466,32 @@ impl DagActor {
     ///
     /// In-mem: `reset_from_poison()` transitions Poisoned → Created,
     /// clears `failed_workers`, zeros `retry_count`, nulls `poisoned_at`.
-    /// PG: `db.clear_poison()` mirrors the same. If PG fails after
-    /// in-mem succeeds, return `false` so the operator retries — better
-    /// than in-mem/PG drift (next recovery would restore Poisoned).
+    /// PG: `db.clear_poison()` mirrors the same.
+    ///
+    /// PG first, in-mem second — if PG fails the operator's retry
+    /// finds in-mem still Poisoned and can proceed. The previous
+    /// order (in-mem first) meant a PG blip left status=Created,
+    /// so retry hit the not-poisoned guard → permanent no-op until
+    /// scheduler restart.
     pub(super) async fn handle_clear_poison(&mut self, drv_hash: &DrvHash) -> bool {
-        let Some(state) = self.dag.node_mut(drv_hash) else {
-            return false; // not found
-        };
-        if state.status() != DerivationStatus::Poisoned {
-            return false; // not poisoned
-        }
-        if let Err(e) = state.reset_from_poison() {
-            warn!(drv_hash = %drv_hash, error = %e, "ClearPoison: reset failed");
-            return false;
+        match self.dag.node(drv_hash).map(|s| s.status()) {
+            None => return false, // not found
+            Some(s) if s != DerivationStatus::Poisoned => return false,
+            Some(_) => {}
         }
         if let Err(e) = self.db.clear_poison(drv_hash).await {
             error!(drv_hash = %drv_hash, error = %e,
-                   "ClearPoison: PG clear failed (in-mem already reset; next recovery will restore Poisoned)");
+                   "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
+            return false;
+        }
+        // Single-threaded actor: status cannot have changed since the
+        // check above. reset_from_poison only fails on a non-Poisoned
+        // transition, which is unreachable here.
+        if let Some(state) = self.dag.node_mut(drv_hash)
+            && let Err(e) = state.reset_from_poison()
+        {
+            warn!(drv_hash = %drv_hash, error = %e,
+                  "ClearPoison: in-mem reset failed after PG clear (unreachable — status was checked)");
             return false;
         }
         info!(drv_hash = %drv_hash, "poison cleared by admin");
