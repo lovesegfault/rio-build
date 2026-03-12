@@ -38,6 +38,7 @@ async fn setup_svc(
         // the proxy connect with a clear error. Use :1 (fails
         // fast, never listened on) not a timeout-prone addr.
         "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     (svc, actor, task, db)
 }
@@ -170,6 +171,7 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         db.pool.clone(),
         actor,
         "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
 
     let resp = svc
@@ -243,13 +245,13 @@ async fn stubs_return_unimplemented() -> anyhow::Result<()> {
         .into_inner();
     assert!(lw.workers.is_empty(), "no workers registered → empty list");
 
-    assert_eq!(
-        svc.list_builds(Request::new(ListBuildsRequest::default()))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
-    );
+    // ListBuilds is implemented — no builds → empty list, not error.
+    let lb = svc
+        .list_builds(Request::new(ListBuildsRequest::default()))
+        .await?
+        .into_inner();
+    assert!(lb.builds.is_empty(), "no builds → empty list");
+    assert_eq!(lb.total_count, 0);
     // TriggerGC: now implemented (proxy to store). Test separately.
     // With the test store_addr (127.0.0.1:1), proxy connect fails
     // with Unavailable (not Unimplemented) — proves it's wired.
@@ -349,7 +351,7 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
     assert_eq!(resp.running_derivations, 0);
     assert_eq!(
         resp.store_size_bytes, 0,
-        "scheduler doesn't track store size"
+        "store_size bg refresh not spawned in tests → stays at initial 0"
     );
 
     // uptime_since is "now minus elapsed since construction" → within
@@ -789,6 +791,77 @@ async fn test_create_and_list_tenants() -> anyhow::Result<()> {
     assert_eq!(t.gc_retention_hours, 168, "default 7 days");
     assert_eq!(t.gc_max_store_bytes, None);
     assert!(!t.has_cache_token);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ListBuilds
+// ---------------------------------------------------------------------------
+
+// r[verify sched.admin.list-builds]
+#[tokio::test]
+async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
+    let (svc, _actor, _task, db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    // Seed 3 builds directly via db helper (bypasses the actor).
+    use crate::state::{BuildOptions, PriorityClass};
+    for i in 0..3 {
+        sched_db
+            .insert_build(
+                uuid::Uuid::new_v4(),
+                None,
+                PriorityClass::Scheduled,
+                false,
+                &BuildOptions::default(),
+            )
+            .await?;
+        // Small sleep so submitted_at ordering is deterministic.
+        if i < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    // Transition one to succeeded.
+    let builds: Vec<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT build_id FROM builds ORDER BY submitted_at LIMIT 1")
+            .fetch_all(&db.pool)
+            .await?;
+    sqlx::query("UPDATE builds SET status = 'succeeded', finished_at = now() WHERE build_id = $1")
+        .bind(builds[0].0)
+        .execute(&db.pool)
+        .await?;
+
+    // No filter → 3 builds, total_count=3.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest::default()))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 3);
+    assert_eq!(resp.total_count, 3);
+
+    // filter=pending → 2.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            status_filter: "pending".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 2);
+    assert_eq!(resp.total_count, 2);
+
+    // Pagination: limit=1 offset=1 → 1 build (second-newest), total=3.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            limit: 1,
+            offset: 1,
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 1);
+    assert_eq!(resp.total_count, 3, "total_count unaffected by pagination");
 
     Ok(())
 }

@@ -41,6 +41,7 @@ use rio_proto::types::{
 use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
 
+mod builds;
 mod workers;
 
 /// Chunk size for streaming S3-fetched log lines back to the client.
@@ -77,6 +78,41 @@ pub struct AdminServiceImpl {
     /// `StoreAdminService.TriggerGC`. GC runs IN the store (it
     /// owns the chunk backend); scheduler contributes roots.
     store_addr: String,
+    /// Cached store size for `ClusterStatus.store_size_bytes`.
+    /// Updated by a 60s background task via
+    /// `SELECT COALESCE(SUM(nar_size), 0) FROM narinfo`. Default 0
+    /// until the first refresh fires. Keeps `ClusterStatus` fast
+    /// (it's on the autoscaler's 30s poll path).
+    store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Spawn a background task that refreshes `store_size_bytes` every 60s
+/// via a PG query on the shared store DB. Scheduler already has the pool
+/// (same database as the store). Follows the `scheduler_live_pins`
+/// cross-layer precedent.
+pub fn spawn_store_size_refresh(pool: PgPool) -> Arc<std::sync::atomic::AtomicU64> {
+    let size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let size_clone = Arc::clone(&size);
+    rio_common::task::spawn_monitored("store-size-refresh", async move {
+        loop {
+            match sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
+            )
+            .fetch_one(&pool)
+            .await
+            {
+                Ok(Some(bytes)) if bytes >= 0 => {
+                    size_clone.store(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(_) => {} // empty store → keep 0
+                Err(e) => {
+                    tracing::warn!(error = %e, "store_size refresh failed");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+    size
 }
 
 impl AdminServiceImpl {
@@ -86,6 +122,7 @@ impl AdminServiceImpl {
         pool: PgPool,
         actor: ActorHandle,
         store_addr: String,
+        store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             log_buffers,
@@ -94,6 +131,7 @@ impl AdminServiceImpl {
             actor,
             started_at: Instant::now(),
             store_addr,
+            store_size_bytes,
         }
     }
 
@@ -349,14 +387,9 @@ impl AdminService for AdminServiceImpl {
     /// `running_derivations` is secondary (for "scale-down is safe when
     /// queue=0 AND running is below capacity").
     ///
-    /// `store_size_bytes` is 0: the scheduler doesn't track store
-    /// size; that would be a store-service RPC and this endpoint is
-    /// on the autoscaler's hot path (30s poll). If the dashboard
-    /// wants store size, it can query the store's /metrics directly.
-    /// TODO(phase4a): add a best-effort store-size field populated
-    /// via a separate slow-refresh background task (Arc<AtomicU64>,
-    /// 60s PG poll), NOT inline here. Tracked as commit 3.4 in the
-    /// phase 4a plan alongside ListBuilds.
+    /// `store_size_bytes` is a cached value from the 60s background
+    /// refresh task — NOT a live PG query (this endpoint is on the
+    /// autoscaler's 30s hot path). See `spawn_store_size_refresh`.
     #[instrument(skip(self, request), fields(rpc = "ClusterStatus"))]
     async fn cluster_status(
         &self,
@@ -396,7 +429,9 @@ impl AdminService for AdminServiceImpl {
             active_builds: snap.active_builds,
             queued_derivations: snap.queued_derivations,
             running_derivations: snap.running_derivations,
-            store_size_bytes: 0,
+            store_size_bytes: self
+                .store_size_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
             uptime_since: Some(prost_types::Timestamp::from(uptime_since)),
         }))
     }
@@ -418,11 +453,21 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(resp))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "ListBuilds"))]
     async fn list_builds(
         &self,
-        _request: Request<ListBuildsRequest>,
+        request: Request<ListBuildsRequest>,
     ) -> Result<Response<ListBuildsResponse>, Status> {
-        Err(Status::unimplemented("ListBuilds: phase4 dashboard"))
+        rio_proto::interceptor::link_parent(&request);
+        let req = request.into_inner();
+        let resp = builds::list_builds(
+            &self.pool,
+            &req.status_filter,
+            if req.limit == 0 { 100 } else { req.limit },
+            req.offset,
+        )
+        .await?;
+        Ok(Response::new(resp))
     }
 
     /// Proxy to store's `StoreAdminService.TriggerGC` after

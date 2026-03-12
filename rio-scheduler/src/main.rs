@@ -447,12 +447,18 @@ async fn main() -> anyhow::Result<()> {
     // use it and silently break the pipeline.
     let grpc_service =
         SchedulerGrpc::with_log_buffers(actor.clone(), Arc::clone(&log_buffers), pool.clone());
+
+    // Background refresh for ClusterStatus.store_size_bytes — 60s PG poll
+    // on the shared DB. Keeps ClusterStatus fast (autoscaler's 30s path).
+    let store_size_bytes = rio_scheduler::admin::spawn_store_size_refresh(pool.clone());
+
     let admin_service = AdminServiceImpl::new(
         log_buffers,
         admin_s3,
         pool,
         actor.clone(),
         cfg.store_addr.clone(),
+        store_size_bytes,
     );
 
     // Start periodic tick task
