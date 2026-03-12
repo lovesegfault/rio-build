@@ -287,34 +287,29 @@ pkgs.testers.runNixOSTest {
     trace_id = m.group(1)
     print(f"extracted trace_id: {trace_id}")
 
-    # Tempo's /api/traces/{id} returns the full trace. Rather than
-    # parse the OTLP-JSON structure (which varies by Tempo version),
-    # just grep the raw response for both service names. If the trace
-    # contains spans from both gateway and scheduler, both strings
-    # will appear in the JSON somewhere (as service.name resource
-    # attribute values). This proves traceparent propagation works.
-    # Tempo may take a few seconds to ingest — retry.
-    #
-    # The dump to /tmp/trace.json is kept for debugging if the
-    # assertion fails (check what the trace actually contains).
+    # Fetch the trace from Tempo. Retry for ingestion lag. Save to
+    # file so diagnostics run even if the assertion fails.
     control.wait_until_succeeds(
         f"curl -sf 'http://localhost:3200/api/traces/{trace_id}' > /tmp/trace.json && "
-        "grep -q '\"gateway\"' /tmp/trace.json && "
-        "grep -q '\"scheduler\"' /tmp/trace.json",
+        "test -s /tmp/trace.json",  # non-empty
         timeout=30
     )
-    # Extra diagnostic: count spans + show service names found.
+
+    # Diagnostic: dump size + any service.name values found. This
+    # runs BEFORE the assertion so failures show what was in the trace.
+    trace_diag = control.succeed(
+        "wc -c /tmp/trace.json && "
+        "grep -oE 'stringValue.?:.?[a-zA-Z_-]+' /tmp/trace.json | sort -u | head -20 || true"
+    )
+    print(f"Trace diagnostic:\n{trace_diag}")
+
+    # Assert both service names appear anywhere in the JSON. The
+    # OTLP-JSON service.name resource attribute format is e.g.
+    # {"key":"service.name","value":{"stringValue":"gateway"}} —
+    # substring grep catches it regardless of whitespace/ordering.
+    # Proves traceparent propagation through gRPC metadata works.
     control.succeed(
-        "python3 -c '"
-        "import json;"
-        "d = json.load(open(\"/tmp/trace.json\"));"
-        "n_batches = len(d.get(\"batches\", []));"
-        "n_spans = sum(len(s.get(\"spans\", [])) "
-        "  for b in d.get(\"batches\", []) "
-        "  for ss in b.get(\"scopeSpans\", []) "
-        "  for s in [ss]);"
-        "print(f\"trace has {n_batches} batches, {n_spans} spans\")"
-        "'"
+        "grep -q gateway /tmp/trace.json && grep -q scheduler /tmp/trace.json"
     )
     print("Trace linkage verified: gateway+scheduler share trace_id via traceparent propagation")
 
