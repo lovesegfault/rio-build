@@ -579,13 +579,20 @@ impl DagActor {
         error_msg: &str,
         _worker_id: &WorkerId,
     ) {
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.ensure_running();
-            if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
-            }
-            state.poisoned_at = Some(Instant::now());
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        state.ensure_running();
+        if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+            // Stale PermanentFailure (e.g., drv already Completed on
+            // another worker after reassignment). Don't write Poisoned
+            // to PG or cascade — in-mem/PG drift + spurious cascade is
+            // worse than a missed failure event.
+            warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                  "handle_permanent_failure: ->Poisoned transition rejected, skipping");
+            return;
         }
+        state.poisoned_at = Some(Instant::now());
 
         self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
             .await;
