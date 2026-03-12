@@ -24,6 +24,12 @@ pub struct MergeDagRequest {
     pub edges: Vec<rio_proto::types::DerivationEdge>,
     pub options: BuildOptions,
     pub keep_going: bool,
+    /// W3C traceparent of the submitting gRPC handler's span. Span
+    /// context does NOT cross the mpsc channel to the actor task, so
+    /// we carry it as plain data. Stored on each newly-inserted
+    /// `DerivationState` so dispatch can embed it in `WorkAssignment`
+    /// regardless of which code path triggers dispatch.
+    pub traceparent: String,
 }
 
 /// Commands sent to the DAG actor.

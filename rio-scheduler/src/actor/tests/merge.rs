@@ -28,6 +28,7 @@ async fn test_merge_db_failure_rolls_back_memory() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -76,6 +77,7 @@ async fn test_check_cached_outputs_store_error_non_fatal() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -132,6 +134,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         };
@@ -228,6 +231,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         };

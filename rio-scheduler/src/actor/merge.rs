@@ -23,6 +23,7 @@ impl DagActor {
             edges,
             options,
             keep_going,
+            traceparent,
         } = req;
         // rio_scheduler_builds_total is incremented at terminal transition
         // (complete_build/transition_build_to_failed/handle_cancel_build)
@@ -39,7 +40,7 @@ impl DagActor {
         // DB build row exists, which we best-effort delete. This ordering
         // prevents the leak where a cyclic submission left permanent entries
         // in build_events/build_sequences/builds with no cleanup scheduled.
-        let merge_result = match self.dag.merge(build_id, &nodes, &edges) {
+        let merge_result = match self.dag.merge(build_id, &nodes, &edges, &traceparent) {
             Ok(r) => r,
             Err(e) => {
                 // Best-effort: clean up the orphan build row.

@@ -131,6 +131,7 @@ pub(crate) async fn merge_single_node(
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -159,6 +160,7 @@ pub(crate) async fn merge_dag(
                 edges,
                 options: BuildOptions::default(),
                 keep_going,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })

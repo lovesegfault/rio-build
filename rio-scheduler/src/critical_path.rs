@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn leaf_priority_equals_duration() {
         let mut dag = DerivationDag::new();
-        let merge = dag.merge(Uuid::new_v4(), &[node("a")], &[]).unwrap();
+        let merge = dag.merge(Uuid::new_v4(), &[node("a")], &[], "").unwrap();
 
         compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
 
@@ -316,6 +316,7 @@ mod tests {
                 Uuid::new_v4(),
                 &[node("a"), node("b"), node("c")],
                 &[edge("a", "b"), edge("b", "c")],
+                "",
             )
             .unwrap();
 
@@ -352,6 +353,7 @@ mod tests {
                     edge("b", "d"),
                     edge("c", "d"),
                 ],
+                "",
             )
             .unwrap();
 
@@ -366,7 +368,12 @@ mod tests {
         // First merge: a→b (a depends on b). b=20, a=10+20=30.
         let mut dag = DerivationDag::new();
         let merge1 = dag
-            .merge(Uuid::new_v4(), &[node("a"), node("b")], &[edge("a", "b")])
+            .merge(
+                Uuid::new_v4(),
+                &[node("a"), node("b")],
+                &[edge("a", "b")],
+                "",
+            )
             .unwrap();
         compute_initial(&mut dag, &test_estimator(), &merge1.newly_inserted);
         assert_eq!(dag.node("a").unwrap().priority, 30.0);
@@ -375,7 +382,7 @@ mod tests {
         // with priority 30. b was 20; now 20+30=50. a should propagate:
         // 10+50=60.
         let merge2 = dag
-            .merge(Uuid::new_v4(), &[node("c")], &[edge("b", "c")])
+            .merge(Uuid::new_v4(), &[node("c")], &[edge("b", "c")], "")
             .unwrap();
         compute_initial(&mut dag, &test_estimator(), &merge2.newly_inserted);
 
@@ -406,6 +413,7 @@ mod tests {
                 Uuid::new_v4(),
                 &[node("a"), node("b"), node("c")],
                 &[edge("a", "b"), edge("b", "c")],
+                "",
             )
             .unwrap();
         compute_initial(&mut dag, &test_estimator(), &merge.newly_inserted);
@@ -440,6 +448,7 @@ mod tests {
                 Uuid::new_v4(),
                 &[node("a"), node("b"), node("c"), node("d")],
                 &[edge("a", "b"), edge("a", "c"), edge("d", "a")],
+                "",
             )
             .unwrap();
         let est = Estimator::default(); // all 30s
@@ -474,6 +483,7 @@ mod tests {
                 Uuid::new_v4(),
                 &[node("a"), node("b"), node("c")],
                 &[edge("a", "b"), edge("b", "c")],
+                "",
             )
             .unwrap();
         let est = test_estimator();

@@ -265,6 +265,7 @@ async fn merge_chain(
                 edges,
                 options: Default::default(),
                 keep_going: true,
+                traceparent: String::new(),
             },
             reply: tx,
         })

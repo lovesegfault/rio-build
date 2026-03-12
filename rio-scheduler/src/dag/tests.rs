@@ -27,7 +27,7 @@ fn test_merge_empty_dag() -> anyhow::Result<()> {
     let nodes = vec![make_node("hash1", "x86_64-linux")];
     let edges = vec![];
 
-    let newly = dag.merge(build_id, &nodes, &edges)?.newly_inserted;
+    let newly = dag.merge(build_id, &nodes, &edges, "")?.newly_inserted;
     assert_eq!(newly.len(), 1);
     assert!(dag.nodes.contains_key("hash1"));
     assert!(dag.nodes["hash1"].interested_builds.contains(&build_id));
@@ -41,10 +41,10 @@ fn test_merge_dedup() -> anyhow::Result<()> {
     let build2 = Uuid::new_v4();
     let nodes = vec![make_node("hash1", "x86_64-linux")];
 
-    let newly1 = dag.merge(build1, &nodes, &[])?.newly_inserted;
+    let newly1 = dag.merge(build1, &nodes, &[], "")?.newly_inserted;
     assert_eq!(newly1.len(), 1);
 
-    let result2 = dag.merge(build2, &nodes, &[])?;
+    let result2 = dag.merge(build2, &nodes, &[], "")?;
     assert_eq!(result2.newly_inserted.len(), 0); // Already exists
     assert_eq!(result2.interest_added, vec!["hash1"]);
 
@@ -66,7 +66,7 @@ fn test_edges_and_deps() -> anyhow::Result<()> {
     // A depends on B and C
     let edges = vec![make_edge("hashA", "hashB"), make_edge("hashA", "hashC")];
 
-    dag.merge(build_id, &nodes, &edges)?;
+    dag.merge(build_id, &nodes, &edges, "")?;
 
     // A has deps, B and C don't
     assert!(!dag.all_deps_completed("hashA"));
@@ -90,7 +90,7 @@ fn test_initial_states() -> anyhow::Result<()> {
     ];
     let edges = vec![make_edge("hashA", "hashB")];
 
-    let newly = dag.merge(build_id, &nodes, &edges)?.newly_inserted;
+    let newly = dag.merge(build_id, &nodes, &edges, "")?.newly_inserted;
     let states = dag.compute_initial_states(&newly);
 
     // B has no deps -> Ready; A has dep on B -> Queued
@@ -111,7 +111,7 @@ fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
 
     // Build 1: just the leaf.
     let leaf_nodes = vec![make_node("leafP", "x86_64-linux")];
-    dag.merge(build1, &leaf_nodes, &[])?;
+    dag.merge(build1, &leaf_nodes, &[], "")?;
 
     // Poison it.
     dag.nodes
@@ -128,7 +128,7 @@ fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
         make_node("leafP", "x86_64-linux"),
     ];
     let edges = vec![make_edge("parentP", "leafP")];
-    let newly = dag.merge(build2, &parent_nodes, &edges)?.newly_inserted;
+    let newly = dag.merge(build2, &parent_nodes, &edges, "")?.newly_inserted;
 
     // Only parentP is newly inserted (leafP already existed).
     assert_eq!(newly, HashSet::from(["parentP".into()]));
@@ -156,7 +156,7 @@ fn test_find_newly_ready() -> anyhow::Result<()> {
     ];
     let edges = vec![make_edge("hashA", "hashB")];
 
-    dag.merge(build_id, &nodes, &edges)?;
+    dag.merge(build_id, &nodes, &edges, "")?;
 
     // Set B to completed, A to queued
     dag.nodes
@@ -193,7 +193,7 @@ fn test_merge_rejects_cycle() {
         make_edge("hashB", "hashA"), // cycle!
     ];
 
-    let result = dag.merge(build_id, &nodes, &edges);
+    let result = dag.merge(build_id, &nodes, &edges, "");
     assert!(result.is_err(), "cyclic DAG should be rejected");
     assert_eq!(
         dag.nodes.len(),
@@ -222,7 +222,7 @@ fn test_merge_rejects_indirect_cycle() {
         make_edge("hashC", "hashA"),
     ];
 
-    let result = dag.merge(build_id, &nodes, &edges);
+    let result = dag.merge(build_id, &nodes, &edges, "");
     assert!(result.is_err(), "indirect cycle should be rejected");
     assert_eq!(dag.nodes.len(), 0);
 }
@@ -239,11 +239,14 @@ fn test_merge_after_cycle_rollback() {
         make_node("hashB", "x86_64-linux"),
     ];
     let cyclic_edges = vec![make_edge("hashA", "hashB"), make_edge("hashB", "hashA")];
-    assert!(dag.merge(build_id, &cyclic_nodes, &cyclic_edges).is_err());
+    assert!(
+        dag.merge(build_id, &cyclic_nodes, &cyclic_edges, "")
+            .is_err()
+    );
 
     // Second: insert a valid DAG with the same nodes (should succeed)
     let valid_edges = vec![make_edge("hashA", "hashB")];
-    let result = dag.merge(build_id, &cyclic_nodes, &valid_edges);
+    let result = dag.merge(build_id, &cyclic_nodes, &valid_edges, "");
     assert!(
         result.is_ok(),
         "valid merge after rollback should succeed: {result:?}"
@@ -265,14 +268,14 @@ fn test_cycle_via_new_edge_between_existing_nodes() -> anyhow::Result<()> {
         make_node("hashB", "x86_64-linux"),
     ];
     let initial_edges = vec![make_edge("hashA", "hashB")];
-    dag.merge(build1, &nodes, &initial_edges)?;
+    dag.merge(build1, &nodes, &initial_edges, "")?;
     assert_eq!(dag.nodes.len(), 2);
 
     // Now merge the SAME nodes (no new inserts) with a B->A edge.
     // This creates a cycle via a new edge between two existing nodes.
     let build2 = Uuid::new_v4();
     let cycle_edge = vec![make_edge("hashB", "hashA")];
-    let result = dag.merge(build2, &nodes, &cycle_edge);
+    let result = dag.merge(build2, &nodes, &cycle_edge, "");
 
     assert!(
         result.is_err(),
@@ -304,7 +307,7 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
 
     // Step 1: merge B1 with node A only — succeeds. A.interested = {B1}.
     let nodes_a = vec![make_node("hashA", "x86_64-linux")];
-    dag.merge(b1, &nodes_a, &[])?;
+    dag.merge(b1, &nodes_a, &[], "")?;
     assert!(
         dag.nodes
             .get("hashA")
@@ -322,7 +325,7 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
         make_node("hashC", "x86_64-linux"),
     ];
     let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
-    let result = dag.merge(b1, &nodes_ac, &cycle_edges);
+    let result = dag.merge(b1, &nodes_ac, &cycle_edges, "");
     assert!(result.is_err(), "cycle should be rejected");
 
     // Step 3: A should STILL have B1 interest (was present before the
@@ -357,7 +360,7 @@ fn test_path_to_hash_consistency() -> anyhow::Result<()> {
         make_node("hashA", "x86_64-linux"),
         make_node("hashB", "x86_64-linux"),
     ];
-    dag.merge(b1, &nodes, &[])?;
+    dag.merge(b1, &nodes, &[], "")?;
     assert_eq!(dag.hash_for_path(&p_a).map(|h| h.as_str()), Some("hashA"));
     assert_eq!(dag.hash_for_path(&p_b).map(|h| h.as_str()), Some("hashB"));
     assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
@@ -368,7 +371,7 @@ fn test_path_to_hash_consistency() -> anyhow::Result<()> {
         make_node("hashC", "x86_64-linux"),
     ];
     let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
-    dag.merge(b1, &cycle_nodes, &cycle_edges).unwrap_err();
+    dag.merge(b1, &cycle_nodes, &cycle_edges, "").unwrap_err();
     assert_eq!(
         dag.hash_for_path(&p_c),
         None,
@@ -440,7 +443,7 @@ fn test_cycle_detection_deep_linear_chain_no_overflow() {
         .collect();
 
     // Must not panic (stack overflow) and must succeed (no cycle).
-    let result = dag.merge(build_id, &nodes, &edges);
+    let result = dag.merge(build_id, &nodes, &edges, "");
     assert!(result.is_ok(), "acyclic deep chain should merge");
     assert_eq!(dag.nodes.len(), DEPTH);
 }
@@ -476,7 +479,7 @@ fn test_cycle_detection_deep_chain_with_back_edge() {
         &format!("/nix/store/{:032}-n{}.drv", 0, 0),
     ));
 
-    let result = dag.merge(build_id, &nodes, &edges);
+    let result = dag.merge(build_id, &nodes, &edges, "");
     assert!(result.is_err(), "cycle at depth must be detected");
     assert_eq!(dag.nodes.len(), 0, "rollback must clear all nodes");
 }
@@ -489,7 +492,7 @@ fn test_cycle_detection_deep_chain_with_back_edge() {
 fn test_canonical_returns_pointer_equal_arc() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let nodes = vec![make_node("canon-hash", "x86_64-linux")];
-    dag.merge(Uuid::new_v4(), &nodes, &[])?;
+    dag.merge(Uuid::new_v4(), &nodes, &[], "")?;
 
     // Two calls to canonical() return ptr-equal clones — both are refcount
     // bumps of the same Arc stored as the key in `nodes`.
@@ -529,7 +532,7 @@ fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
         make_node("child", "x86_64-linux"),
     ];
     let edges = vec![make_edge("parent", "child")];
-    let result = dag.merge(b1, &nodes, &edges)?;
+    let result = dag.merge(b1, &nodes, &edges, "")?;
 
     let parent_canon = dag.canonical("parent").unwrap();
     let child_canon = dag.canonical("child").unwrap();
@@ -562,7 +565,7 @@ fn test_interning_invariant_across_maps() -> anyhow::Result<()> {
     // Arc (from proto string). With it: exchanged via canonical()
     // upfront, so it's ptr-equal.
     let b2 = Uuid::new_v4();
-    let result2 = dag.merge(b2, &nodes, &edges)?;
+    let result2 = dag.merge(b2, &nodes, &edges, "")?;
     assert_eq!(result2.interest_added.len(), 2);
     for h in &result2.interest_added {
         let canon = dag.canonical(h).unwrap();

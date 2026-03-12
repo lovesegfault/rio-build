@@ -180,6 +180,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
                     ..Default::default()
                 },
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -292,6 +293,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })

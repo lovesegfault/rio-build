@@ -157,6 +157,7 @@ impl DerivationDag {
         build_id: Uuid,
         nodes: &[rio_proto::types::DerivationNode],
         edges: &[rio_proto::types::DerivationEdge],
+        submitter_traceparent: &str,
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
@@ -197,6 +198,7 @@ impl DerivationDag {
                         source: e,
                     })?;
                 state.interested_builds.insert(build_id);
+                state.traceparent = submitter_traceparent.to_string();
                 // All three inserts clone the SAME Arc — they're mutually
                 // ptr-equal. This is what makes path_to_hash.get().cloned()
                 // canonical, which makes the edge-insert loop canonical, etc.

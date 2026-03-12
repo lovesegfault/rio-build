@@ -254,6 +254,13 @@ pub struct DerivationState {
     /// longer than expected is likely stuck (worker heartbeating
     /// but daemon wedged, or the worker's clock jumped).
     pub(crate) running_since: Option<Instant>,
+    /// W3C traceparent of the submitting gRPC handler's span, captured
+    /// at DAG-merge time. Embedded into `WorkAssignment.traceparent` at
+    /// dispatch so the worker's build span chains back to the gateway's
+    /// trace regardless of which code path (immediate merge, deferred
+    /// completion/heartbeat) triggers dispatch. Empty for recovered
+    /// derivations (no user trace). First submitter wins on dedup.
+    pub traceparent: String,
 }
 
 impl DerivationState {
@@ -295,6 +302,7 @@ impl DerivationState {
             ready_at: None,
             backoff_until: None,
             running_since: None,
+            traceparent: String::new(),
         })
     }
 
@@ -362,7 +370,8 @@ impl DerivationState {
             // (won't spuriously cancel) at the cost of a possibly
             // stale build running longer.
             running_since: (status == DerivationStatus::Running).then_some(now),
-            backoff_until: None, // any in-flight backoff is forgiven
+            backoff_until: None,        // any in-flight backoff is forgiven
+            traceparent: String::new(), // recovered: no user trace
         })
     }
 
@@ -408,6 +417,7 @@ impl DerivationState {
             ready_at: None,
             running_since: None,
             backoff_until: None,
+            traceparent: String::new(),
         })
     }
 

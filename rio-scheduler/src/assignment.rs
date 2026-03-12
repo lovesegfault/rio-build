@@ -436,6 +436,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             &[drv_proto.clone(), child_proto],
             &[make_edge("test-drv", "child")],
+            "",
         )
         .unwrap();
 
@@ -472,6 +473,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             &[drv_proto.clone(), child_proto],
             &[make_edge("test-drv", "child")],
+            "",
         )
         .unwrap();
 

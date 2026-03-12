@@ -392,6 +392,12 @@ impl SchedulerService for SchedulerGrpc {
             )
         };
 
+        // Capture the current span's traceparent BEFORE sending to the
+        // actor. Span context does not cross the mpsc channel boundary;
+        // the actor task's `handle_merge_dag` #[instrument] span is a
+        // fresh root. Carrying traceparent as plain data lets dispatch
+        // embed the gateway-linked trace in WorkAssignment.
+        let traceparent = rio_proto::interceptor::current_traceparent();
         let req = MergeDagRequest {
             build_id,
             tenant_id,
@@ -406,6 +412,7 @@ impl SchedulerService for SchedulerGrpc {
             edges: req.edges,
             options,
             keep_going: req.keep_going,
+            traceparent,
         };
         let cmd = ActorCommand::MergeDag {
             req,

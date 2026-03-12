@@ -191,6 +191,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
                     build_cores: 4,
                 },
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -209,6 +210,148 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
         "max_silent_time should propagate from build to worker"
     );
     assert_eq!(opts.build_cores, 4);
+    Ok(())
+}
+
+/// The submitter's W3C traceparent is carried through `MergeDagRequest` →
+/// stored on `DerivationState` → embedded in `WorkAssignment.traceparent`
+/// at dispatch. This gives gateway→scheduler→worker trace continuity
+/// despite the span context NOT crossing the mpsc channel to the actor.
+///
+/// Regression: before this fix, `dispatch.rs` called
+/// `current_traceparent()` which read the actor's ORPHAN span (a fresh
+/// root), so the worker's span belonged to a disjoint trace.
+// r[verify obs.trace.w3c-traceparent]
+// r[verify sched.trace.assignment-traceparent]
+#[tokio::test]
+async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
+    let (_db, handle, _task, mut stream_rx) =
+        setup_with_worker("trace-worker", "x86_64-linux", 1).await?;
+
+    // Known traceparent (W3C format: version-trace_id-span_id-flags).
+    // The exact bytes don't matter for this test — we just verify it
+    // flows through unchanged.
+    let known_tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    let build_id = Uuid::new_v4();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node("trace-hash", "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: known_tp.to_string(),
+            },
+            reply: reply_tx,
+        })
+        .await?;
+    let _rx = reply_rx.await??;
+
+    let assignment = recv_assignment(&mut stream_rx).await;
+    assert_eq!(
+        assignment.traceparent, known_tp,
+        "WorkAssignment.traceparent must match the submitter's traceparent, \
+         not the actor's orphan span"
+    );
+    Ok(())
+}
+
+/// Dedup: if a second submitter merges an already-present derivation,
+/// the FIRST submitter's traceparent is preserved on the state. The
+/// worker's span should chain back to whichever build first introduced
+/// the derivation (operationally: the trace that will have waited longest).
+#[tokio::test]
+async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult {
+    // Worker with 0 slots so nothing dispatches until we send a heartbeat
+    // with capacity (lets us merge TWICE before dispatch).
+    let (db, handle, _task) = setup().await;
+    let (stream_tx, mut stream_rx) = mpsc::channel(8);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "dedup-worker".into(),
+            stream_tx,
+        })
+        .await?;
+    // Heartbeat with max_builds=0: registered but no capacity yet.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            worker_id: "dedup-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 0,
+            running_builds: vec![],
+            bloom: None,
+            size_class: None,
+            resources: None,
+        })
+        .await?;
+
+    let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";
+    let tp_second = "00-22222222222222222222222222222222-2222222222222222-01";
+
+    // First submit with tp_first.
+    let (r1, rr1) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node("dedup-hash", "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: tp_first.to_string(),
+            },
+            reply: r1,
+        })
+        .await?;
+    let _ = rr1.await??;
+
+    // Second submit: SAME derivation, DIFFERENT traceparent (dedup hit).
+    let (r2, rr2) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id: Uuid::new_v4(),
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes: vec![make_test_node("dedup-hash", "x86_64-linux")],
+                edges: vec![],
+                options: BuildOptions::default(),
+                keep_going: false,
+                traceparent: tp_second.to_string(),
+            },
+            reply: r2,
+        })
+        .await?;
+    let _ = rr2.await??;
+
+    // Now give capacity: heartbeat with max_builds=1 triggers dispatch.
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            worker_id: "dedup-worker".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 1,
+            running_builds: vec![],
+            bloom: None,
+            size_class: None,
+            resources: None,
+        })
+        .await?;
+
+    let assignment = recv_assignment(&mut stream_rx).await;
+    assert_eq!(
+        assignment.traceparent, tp_first,
+        "first submitter's traceparent should win on dedup (existing state not overwritten)"
+    );
+    drop(db);
     Ok(())
 }
 
@@ -257,6 +400,7 @@ async fn test_interactive_priority_boost() -> TestResult {
                 edges: vec![make_test_edge("prioA", "prioB")],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
