@@ -152,12 +152,12 @@ data "aws_iam_policy_document" "rio_store_s3" {
       "s3:PutObject",
       "s3:DeleteObject",
     ]
-    resources = ["arn:aws:s3:::${var.chunk_bucket}/*"]
+    resources = ["${aws_s3_bucket.chunks.arn}/*"]
   }
   statement {
     effect    = "Allow"
     actions   = ["s3:ListBucket"]
-    resources = ["arn:aws:s3:::${var.chunk_bucket}"]
+    resources = [aws_s3_bucket.chunks.arn]
   }
 }
 

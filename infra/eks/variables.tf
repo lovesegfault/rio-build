@@ -48,7 +48,6 @@ variable "worker_max_size" {
   default     = 10
 }
 
-variable "chunk_bucket" {
-  description = "S3 bucket name for NAR chunk storage (must pre-exist)"
-  type        = string
-}
+# chunk_bucket var removed — now terraform-managed (s3.tf). Bucket name
+# is derived from cluster_name + random suffix (S3 bucket names are
+# global). Output: chunk_bucket_name.
