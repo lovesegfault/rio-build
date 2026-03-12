@@ -35,7 +35,7 @@
 
 - [ ] **`rio-cli` crate** — clap + tokio, talks to `AdminService` via `rio-proto::client::connect_admin`. Subcommands: `status` (ClusterStatus), `workers` (ListWorkers table), `builds` (ListBuilds with filters), `logs <build_id>` (GetBuildLogs), `gc [--dry-run]` (TriggerGC), `poison clear <drv_hash>` (ClearPoison), `tenants list|create`. Output: human-readable tables by default, `--json` flag for machine consumption.
 - [ ] `rio-cli` integration smoke tests against a live scheduler (rio-test-support ephemeral PG + scheduler).
-- [ ] **Helm chart** (`deploy/helm/rio-build/`) derived from the Kustomize base. `values.yaml` parameterizes: image tags, PostgreSQL/S3 connection, TLS secret names, size-class cutoffs, GC schedule. Templates: Deployment/StatefulSet per component, ServiceAccount + RBAC, NetworkPolicy, PDB, Secret/ConfigMap. `helm install --dry-run` CI check.
+- [ ] **Helm chart** (`infra/k8s/helm/rio-build/`) derived from the Kustomize base. `values.yaml` parameterizes: image tags, PostgreSQL/S3 connection, TLS secret names, size-class cutoffs, GC schedule. Templates: Deployment/StatefulSet per component, ServiceAccount + RBAC, NetworkPolicy, PDB, Secret/ConfigMap. `helm install --dry-run` CI check.
 - [ ] `rio-cli` + `dockerImages.rio-cli` added to `flake.nix` packages.
 
 ### Defensive hardening

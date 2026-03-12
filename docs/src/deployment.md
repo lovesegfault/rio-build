@@ -81,7 +81,7 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Database credentials (scheduler, store)
 - HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{worker_id, drv_hash, expected_outputs, expiry} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
-> **SSH key mounting:** The base manifests and shipped overlays (`deploy/overlays/dev`, `deploy/overlays/prod`) do **not** mount the SSH host key or authorized_keys Secret into the gateway container --- without a mount, the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production deployments must add a `volumeMount` patch to the gateway Deployment for the SSH key Secret.
+> **SSH key mounting:** The base manifests and shipped overlays (`infra/k8s/overlays/dev`, `infra/k8s/overlays/prod`) do **not** mount the SSH host key or authorized_keys Secret into the gateway container --- without a mount, the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production deployments must add a `volumeMount` patch to the gateway Deployment for the SSH key Secret.
 
 ## Verification
 

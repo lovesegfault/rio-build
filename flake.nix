@@ -854,12 +854,12 @@
             # binary (serde_yaml write-only) and dumps two YAML
             # documents (WorkerPool + Build) to $out. Kustomize
             # references this via `nix build .#crds` → result is a
-            # file, copy to deploy/base/crds.yaml and commit.
+            # file, copy to infra/k8s/base/crds.yaml and commit.
             #
             # NOT a derivation that the kustomize base depends on
             # directly (kustomize needs real files, not /nix/store
             # paths). It's a convenience for regeneration:
-            #   nix build .#crds && cp result deploy/base/crds.yaml
+            #   nix build .#crds && cp result infra/k8s/base/crds.yaml
             #
             # Why not auto-regenerate in CI: the committed YAML is
             # what operators `kubectl apply`. Regenerating on every

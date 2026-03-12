@@ -5,7 +5,7 @@
 # in dev or an external Secret in prod), S3 config (overlays).
 #
 # Regenerate crds.yaml after CRD changes:
-#   nix build .#crds && cp result deploy/base/crds.yaml
+#   nix build .#crds && cp result infra/k8s/base/crds.yaml
 # It's committed (not generated at apply time) because kustomize
 # needs real files to read — can't pipe from nix build.
 apiVersion: kustomize.config.k8s.io/v1beta1

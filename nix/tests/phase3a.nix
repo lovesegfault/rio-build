@@ -24,14 +24,14 @@
 # (RBAC first, then controller). As a systemd service with
 # KUBECONFIG=/etc/rancher/k3s/k3s.yaml, it has cluster-admin
 # (the node's own kubeconfig) — starts immediately after k3s.
-# Production uses the pod path (deploy/base/controller.yaml).
+# Production uses the pod path (infra/k8s/base/controller.yaml).
 #
 # Why hostNetwork + privileged on the worker pod: k3s pods
 # can't resolve `control` (CoreDNS doesn't know NixOS-test
 # VM hostnames). hostNetwork → pod uses node's /etc/hosts.
 # privileged → k3s's default seccomp blocks mount(2) even with
 # SYS_ADMIN cap. Both are VM-test concessions; production
-# (deploy/overlays/prod) uses the granular caps.
+# (infra/k8s/overlays/prod) uses the granular caps.
 #
 # Run interactively:
 #   nix build .#checks.x86_64-linux.vm-phase3a.driverInteractive

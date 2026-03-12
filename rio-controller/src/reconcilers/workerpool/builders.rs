@@ -335,7 +335,7 @@ fn build_pod_spec(
             ];
             // mTLS Secret mount. Only when spec.tlsSecretName is set.
             // The Secret's tls.crt/tls.key/ca.crt are cert-manager's
-            // standard output keys (see deploy/overlays/prod/
+            // standard output keys (see infra/k8s/overlays/prod/
             // cert-manager.yaml). Mounted at /etc/rio/tls/; env vars
             // below point the worker's TlsConfig there.
             if let Some(secret) = &wp.spec.tls_secret_name {
@@ -349,7 +349,7 @@ fn build_pod_spec(
                 });
             }
             // nix.conf ConfigMap mount. The `rio-nix-conf` ConfigMap
-            // (deploy/base/configmaps.yaml) overrides the compiled-
+            // (infra/k8s/base/configmaps.yaml) overrides the compiled-
             // in WORKER_NIX_CONF. Operators customize experimental-
             // features etc without image rebuild. setup_nix_conf in
             // the executor checks /etc/rio/nix.conf first.

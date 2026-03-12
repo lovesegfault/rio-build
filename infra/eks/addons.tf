@@ -1,5 +1,5 @@
 # Cluster addons installed via Helm: cert-manager + aws-load-balancer-
-# controller. Both are prerequisites for `kubectl apply -k deploy/
+# controller. Both are prerequisites for `kubectl apply -k infra/k8s/
 # overlays/eks` — cert-manager issues the mTLS certs (cert-manager.yaml
 # in the prod overlay has Certificate CRs), and aws-lbc provisions the
 # gateway NLB (service.beta.kubernetes.io/aws-load-balancer-type:

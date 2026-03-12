@@ -108,7 +108,7 @@ in
   # Built here (not pulled from Docker Hub) so it goes to our ECR
   # with the rest: same git-SHA immutable tag, can't disappear
   # from under us like ubuntu/squid:5.7-22.04_beta did. Config
-  # stays in the ConfigMap (deploy/base/fod-proxy.yaml) so
+  # stays in the ConfigMap (infra/k8s/base/fod-proxy.yaml) so
   # operators can edit the allowlist without rebuilding.
   #
   # Can't use mkImage — that's built around rio-workspace binaries.
