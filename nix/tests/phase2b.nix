@@ -273,32 +273,41 @@ pkgs.testers.runNixOSTest {
     # The gateway emits `rio trace_id: {hex}` after SubmitBuild — gives
     # operators a grep handle for Tempo. Assert it appears in output.
     #
-    # Full gateway→scheduler trace LINKAGE is verified at unit level:
-    # - current_traceparent_roundtrip (rio-proto interceptor tests)
-    # - test_submit_build_resolves_known_tenant exercises inject_current
-    #   → link_parent end-to-end through gRPC
-    # Tempo's /api/traces/{id} response format varies (resource attrs
-    # may not inline the way a grep-based VM check can reliably parse),
-    # so we don't assert on trace content here. The earlier
-    # service.name=gateway and service.name=scheduler search assertions
-    # (above) already prove both services export to Tempo with correct
-    # names.
+    # Full gateway→scheduler→worker trace LINKAGE is verified at:
+    # - Unit level: test_dispatch_carries_submitter_traceparent
+    #   (rio-scheduler/src/actor/tests/dispatch.rs) — known traceparent
+    #   through MergeDagRequest → DerivationState → WorkAssignment.
+    # - VM level: the span-count ≥3 assertion below.
     import re
     m = re.search(r"rio trace_id: ([0-9a-f]{32})", output)
     assert m, f"expected 'rio trace_id: <hex>' in build output, got: {output[:500]}"
     trace_id = m.group(1)
     print(f"extracted trace_id: {trace_id} (trace_id emission via STDERR_NEXT works)")
 
-    # Verify the trace exists in Tempo (proves the gateway's tracing
-    # span context is real/exported, not a noop). Don't assert on
-    # content — Tempo's OTLP-JSON format is version-dependent.
+    # Verify the trace has ≥3 spans — gateway, scheduler-gRPC-submit_build,
+    # worker-build_executor. This is the phase4a design goal
+    # (docs/src/phases/phase4a.md:20): gateway→scheduler→worker
+    # continuity via per-assignment traceparent.
+    #
+    # Tempo's /api/traces/{id} returns OTLP-JSON with
+    # batches[].scopeSpans[].spans[]. Sum span counts across all
+    # batches. Fall back to "instrumentationLibrarySpans" for older
+    # Tempo (pre-scope rename). If the assertion ever becomes flaky
+    # on Tempo schema drift, the unit test above is the canonical
+    # correctness guarantee.
     control.wait_until_succeeds(
         f"curl -sf 'http://localhost:3200/api/traces/{trace_id}' | "
-        "python3 -c 'import sys,json; d=json.load(sys.stdin); "
-        "assert len(d.get(\"batches\",[])) > 0, \"trace not found in Tempo\"'",
+        "python3 -c '"
+        "import sys,json; d=json.load(sys.stdin); "
+        "batches=d.get(\"batches\",[]); "
+        "assert len(batches)>0, \"trace not found in Tempo\"; "
+        "total=sum(len(ss.get(\"spans\",[])) "
+        "  for b in batches "
+        "  for ss in (b.get(\"scopeSpans\") or b.get(\"instrumentationLibrarySpans\") or [])); "
+        "assert total>=3, f\"expected >=3 spans (gateway+scheduler+worker), got {total}\"'",
         timeout=30
     )
-    print("trace_id found in Tempo — gateway span context is real + exported")
+    print(f"trace {trace_id} has >=3 spans — gateway→scheduler→worker chain verified")
 
     ${common.collectCoverage "control, worker1, worker2, client"}
   '';
