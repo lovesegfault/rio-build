@@ -713,3 +713,70 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     assert_eq!(status.queued_derivations, 0);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tenant RPCs: ListTenants, CreateTenant
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_create_and_list_tenants() -> anyhow::Result<()> {
+    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+
+    // Initially empty.
+    let resp = svc.list_tenants(Request::new(())).await?.into_inner();
+    assert!(resp.tenants.is_empty());
+
+    // Create a tenant.
+    let created = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-alpha".into(),
+            gc_retention_hours: Some(72),
+            gc_max_store_bytes: Some(100 * 1024 * 1024 * 1024),
+            cache_token: Some("secret-token".into()),
+        }))
+        .await?
+        .into_inner();
+    let t = created.tenant.expect("tenant should be set");
+    assert_eq!(t.tenant_name, "team-alpha");
+    assert_eq!(t.gc_retention_hours, 72);
+    assert_eq!(t.gc_max_store_bytes, Some(100 * 1024 * 1024 * 1024));
+    assert!(t.has_cache_token, "cache_token was set");
+    assert!(!t.tenant_id.is_empty(), "UUID should be populated");
+
+    // List shows it.
+    let resp = svc.list_tenants(Request::new(())).await?.into_inner();
+    assert_eq!(resp.tenants.len(), 1);
+    assert_eq!(resp.tenants[0].tenant_name, "team-alpha");
+
+    // Duplicate name → AlreadyExists.
+    let dup = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-alpha".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(dup.unwrap_err().code(), tonic::Code::AlreadyExists);
+
+    // Empty name → InvalidArgument.
+    let empty = svc
+        .create_tenant(Request::new(
+            rio_proto::types::CreateTenantRequest::default(),
+        ))
+        .await;
+    assert_eq!(empty.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Tenant with defaults (no optionals).
+    let defaults = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-beta".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    let t = defaults.tenant.expect("tenant should be set");
+    assert_eq!(t.gc_retention_hours, 168, "default 7 days");
+    assert_eq!(t.gc_max_store_bytes, None);
+    assert!(!t.has_cache_token);
+
+    Ok(())
+}

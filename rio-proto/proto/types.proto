@@ -750,3 +750,28 @@ message ClearPoisonRequest {
 message ClearPoisonResponse {
   bool cleared = 1;                      // true if the derivation was poisoned and is now cleared
 }
+
+// Tenant info for ListTenants/CreateTenant.
+message TenantInfo {
+  string tenant_id = 1;                  // UUID as string
+  string tenant_name = 2;
+  uint32 gc_retention_hours = 3;
+  optional uint64 gc_max_store_bytes = 4;
+  google.protobuf.Timestamp created_at = 5;
+  bool has_cache_token = 6;              // whether cache_token is set (don't leak the token itself)
+}
+
+message ListTenantsResponse {
+  repeated TenantInfo tenants = 1;
+}
+
+message CreateTenantRequest {
+  string tenant_name = 1;
+  optional uint32 gc_retention_hours = 2;
+  optional uint64 gc_max_store_bytes = 3;
+  optional string cache_token = 4;       // Bearer token for binary cache; NULL = no cache access
+}
+
+message CreateTenantResponse {
+  TenantInfo tenant = 1;
+}
