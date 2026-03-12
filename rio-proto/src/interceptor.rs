@@ -387,4 +387,32 @@ mod tests {
             "empty traceparent → fresh root (invalid trace_id in the no-op context)"
         );
     }
+
+    /// `current_trace_id_hex` with no active span returns empty string.
+    #[test]
+    fn current_trace_id_hex_no_span_is_empty() {
+        // No tracing span set up → TraceId::INVALID → empty string.
+        assert_eq!(current_trace_id_hex(), "");
+    }
+
+    /// `current_trace_id_hex` format: 32 lowercase hex chars.
+    /// Can't easily test the inside-span case without the full tracing-
+    /// opentelemetry bridge, but we CAN verify the format string by
+    /// checking what a known TraceId produces.
+    #[test]
+    fn current_trace_id_hex_format() {
+        use opentelemetry::trace::TraceId;
+        // TraceId from known bytes — verify the 32-hex-lowercase format.
+        let tid = TraceId::from_bytes([
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45,
+            0x67, 0x89,
+        ]);
+        let hex = format!("{tid:032x}");
+        assert_eq!(hex.len(), 32);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+        assert_eq!(hex, "abcdef0123456789abcdef0123456789");
+    }
 }
