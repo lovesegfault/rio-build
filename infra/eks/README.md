@@ -1,7 +1,8 @@
 # EKS deployment for rio-build
 
-One-shot bring-up: OpenTofu for infra, `nix run .#push-images` for
-images, `deploy.sh` for manifests, `smoke-test.sh` for verification.
+One-shot bring-up: OpenTofu for infra, `push-images.sh` for images,
+`deploy.sh` for manifests, `smoke-test.sh` for verification. Driven
+by the justfile at the repo root — `just --list` for the menu.
 
 ## What gets created
 
@@ -10,7 +11,7 @@ images, `deploy.sh` for manifests, `smoke-test.sh` for verification.
 | EKS cluster | 1.33, 2 nodegroups | system (3× m5.large) + workers (2-10× c6a.xlarge, tainted) |
 | Aurora PG | Serverless v2, 0.5-2 ACU | shared by scheduler + store, password in Secrets Manager |
 | S3 bucket | NAR chunk storage | name: `<cluster_name>-chunks-<random>` |
-| ECR repos | 5 (gateway/scheduler/store/controller/worker) | immutable tags, keep-last-10 lifecycle |
+| ECR repos | 6 (gateway/scheduler/store/controller/worker/fod-proxy) | immutable tags, keep-last-10 lifecycle |
 | cert-manager | helm_release | issues mTLS certs for intra-cluster gRPC |
 | aws-load-balancer-controller | helm_release + IRSA | provisions the gateway NLB |
 | SSM bastion | t3.micro, private subnet | tunnel to the internal NLB — no inbound SG rules |
@@ -27,35 +28,37 @@ images, `deploy.sh` for manifests, `smoke-test.sh` for verification.
 ## Bring-up
 
 ```bash
-export AWS_PROFILE=beme_sandbox
+# ONE-TIME per user: per-user env (AWS_PROFILE). Gitignored.
+cp .env.local.example .env.local  # edit AWS_PROFILE if not beme_sandbox
+direnv allow
 
-# ONE-TIME per AWS account: bootstrap the state bucket.
+# ONE-TIME per AWS account: S3 state bucket.
 # Skip if someone else already ran this (check: aws s3 ls | grep rio-tfstate).
-cd infra/bootstrap
-nix develop -c tofu init
-nix develop -c tofu apply         # ~5s, prints bucket name
+just aws-bootstrap                # ~5s
 
-# Main infra
-cd ../eks
-# Optional: cp terraform.tfvars.example terraform.tfvars && edit
-nix develop -c tofu init -backend-config="bucket=$(tofu -chdir=../bootstrap output -raw bucket)"
-nix develop -c tofu apply         # ~20min (EKS ~12min, Aurora ~8min)
+# Full bring-up: apply (prompts) → kubeconfig → push → deploy
+just eks-up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
 
-# Configure kubectl
-$(nix develop -c tofu output -raw kubeconfig_command)
+# Or piecewise:
+# just eks-apply                  # tofu apply (prompts)
+# just eks-kubeconfig             # aws eks update-kubeconfig
+# just eks-push                   # nix build + skopeo copy to ECR, zstd layers
+# just eks-deploy                 # render + kubectl apply
+
+# Verify
 kubectl get nodes                 # should show 5 nodes Ready
-
-# Push images
-cd ../..
-export ECR_REGISTRY=$(nix develop -c tofu -chdir=infra/eks output -raw ecr_registry)
-nix run .#push-images             # ~3min, prints RIO_IMAGE_TAG=<sha>
-
-# Deploy rio
-./infra/eks/deploy.sh             # ~2min
-
-# Smoke test
-./infra/eks/smoke-test.sh         # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
+just eks-smoke                    # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
 ```
+
+`just eks-up-auto` skips the tofu apply prompt (`-auto-approve`).
+
+### What `eks-init` does with the backend bucket
+
+`just eks-init` reads the state bucket name from `infra/bootstrap`'s
+output on each run — no committed `backend.hcl`, no manual
+`-backend-config` typing. The `-reconfigure` flag skips tofu's
+spurious "backend changed, migrate?" prompt (tofu can't tell the
+dynamically-read value is the same as last time).
 
 ## Iterating
 
@@ -63,8 +66,7 @@ The cluster stays up. To deploy a code change:
 
 ```bash
 git commit -am "..."
-nix run .#push-images             # new SHA → new ECR tag
-./infra/eks/deploy.sh             # rolls out the new tag
+just eks-push eks-deploy          # new SHA → new ECR tag → rollout
 ```
 
 To just bounce a pod without new code:
@@ -90,14 +92,11 @@ Scaling to 10 workers adds ~$1100/mo. Aurora at 2 ACU adds ~$130/mo.
 ## Teardown
 
 ```bash
-# Delete rio first — WorkerPool finalizers block terraform destroy
-# if pods are still running (the NLB won't delete with targets).
-kubectl -n rio-system delete workerpool --all --wait=true
-kubectl delete -k /tmp/rio-rendered-overlay  # or rerun deploy.sh's render step
-
-cd infra/eks
-nix develop -c tofu destroy       # ~15min
+just eks-destroy                  # ~15min
 ```
+
+This deletes WorkerPools first (their finalizers hold pods → NLB
+→ tofu destroy blocks), then `tofu -chdir=infra/eks destroy`.
 
 The S3 bucket has `force_destroy = true` so it deletes even with
 chunks in it. Aurora has `skip_final_snapshot = true`. Both are
@@ -115,9 +114,9 @@ The helm/kubernetes providers try to contact the cluster during plan.
 Run `tofu apply -target=module.eks` first, then full `tofu apply`.
 
 **Pods stuck ImagePullBackOff:**
-Either `nix run .#push-images` wasn't run, or `RIO_IMAGE_TAG`
-doesn't match what's in ECR. `aws ecr list-images --repository-name
-rio-scheduler` shows what's actually pushed.
+Either `just eks-push` wasn't run, or `RIO_IMAGE_TAG` doesn't match
+what's in ECR. `aws ecr list-images --repository-name rio-scheduler`
+shows what's actually pushed.
 
 **Scheduler/store CrashLoopBackOff with PG connection errors:**
 Check the rio-postgres Secret: `kubectl -n rio-system get secret
