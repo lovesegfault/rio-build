@@ -7,8 +7,8 @@ your key.
 ## Quick setup
 
 ```sh
-cp ~/.ssh/id_ed25519.pub deploy/overlays/dev/ssh/authorized_keys
-kubectl apply -k deploy/overlays/dev/
+cp ~/.ssh/id_ed25519.pub infra/k8s/overlays/dev/ssh/authorized_keys
+kubectl apply -k infra/k8s/overlays/dev/
 ```
 
 ## How it works

@@ -163,21 +163,21 @@ kubectl -n cert-manager wait --for=condition=Available \
 log "rendering overlay"
 RENDER=$(mktemp -d)
 trap 'rm -rf "$RENDER"' EXIT
-mkdir -p "$RENDER/deploy/overlays"
-ln -s "$REPO_ROOT/deploy/base" "$RENDER/deploy/base"
-ln -s "$REPO_ROOT/deploy/overlays/prod" "$RENDER/deploy/overlays/prod"
-mkdir "$RENDER/deploy/overlays/eks"
+mkdir -p "$RENDER/infra/k8s/overlays"
+ln -s "$REPO_ROOT/infra/k8s/base" "$RENDER/infra/k8s/base"
+ln -s "$REPO_ROOT/infra/k8s/overlays/prod" "$RENDER/infra/k8s/overlays/prod"
+mkdir "$RENDER/infra/k8s/overlays/eks"
 # sed-replace the 4 vars. `|` as delimiter because ARNs contain `:`.
 sed \
   -e "s|\${STORE_IAM_ROLE_ARN}|$STORE_IAM_ROLE_ARN|g" \
   -e "s|\${ECR_REGISTRY}|$ECR_REGISTRY|g" \
   -e "s|\${RIO_CHUNK_BUCKET}|$RIO_CHUNK_BUCKET|g" \
   -e "s|\${RIO_IMAGE_TAG}|$RIO_IMAGE_TAG|g" \
-  "$REPO_ROOT/deploy/overlays/eks/kustomization.yaml" \
-  > "$RENDER/deploy/overlays/eks/kustomization.yaml"
+  "$REPO_ROOT/infra/k8s/overlays/eks/kustomization.yaml" \
+  > "$RENDER/infra/k8s/overlays/eks/kustomization.yaml"
 
 log "applying manifests"
-kubectl apply -k "$RENDER/deploy/overlays/eks"
+kubectl apply -k "$RENDER/infra/k8s/overlays/eks"
 
 # --- Wait for rollout ---
 log "waiting for control-plane pods"
