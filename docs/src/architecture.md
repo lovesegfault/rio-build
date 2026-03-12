@@ -96,8 +96,8 @@ The controller is a supervisor that manages the lifecycle of all other component
 ```mermaid
 flowchart TB
     Client["Nix Client"] -->|ssh-ng| GW["rio-gateway"]
-    CI["CI (GitHub Actions, etc.)"] -->|gRPC + OIDC| Push["rio-push"]
-    Push -->|gRPC| Store
+    CI["CI (GitHub Actions, etc.)"] -->|invokes| Push["rio-push"]
+    Push -->|gRPC + OIDC| Store
     GW -->|gRPC| Sched["rio-scheduler"]
     GW -->|gRPC| Store["rio-store"]
     W0["worker-0"] -->|BuildExecution stream| Sched
