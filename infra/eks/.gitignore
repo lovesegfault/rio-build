@@ -1,0 +1,13 @@
+# Provider plugins (hundreds of MB). `tofu init` re-downloads.
+.terraform/
+
+# State. Local state is the default backend; should never be
+# committed (contains secrets in some outputs, and is a merge-
+# conflict nightmare). Use a remote backend (S3 + DynamoDB lock)
+# for shared use — see terraform.tfvars.example.
+*.tfstate
+*.tfstate.*
+
+# Variable files may contain secrets. Only the .example is tracked.
+*.tfvars
+!terraform.tfvars.example

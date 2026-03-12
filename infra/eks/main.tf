@@ -71,6 +71,26 @@ module "eks" {
   # for rio-store's S3 access (no static AWS keys in pods).
   enable_irsa = true
 
+  # Public endpoint for kubectl from outside the VPC. eks module v20
+  # default is unclear from docs — set explicitly. Private-only would
+  # require running kubectl from inside the VPC (bastion) or via an
+  # SSM tunnel to the API server, which is more friction than the
+  # cluster being a dev/test deployment warrants. Lock down with
+  # cluster_endpoint_public_access_cidrs if this bothers you.
+  cluster_endpoint_public_access = true
+
+  # API authentication mode. CONFIG_MAP = legacy aws-auth only.
+  # API_AND_CONFIG_MAP = both, for migration. API = access entries
+  # only (the new way, EKS 1.30+). API gives us `aws eks update-
+  # kubeconfig` working out of the box for the terraform caller
+  # without touching aws-auth.
+  authentication_mode = "API_AND_CONFIG_MAP"
+
+  # Grant the terraform caller cluster-admin. Without this, the
+  # helm_release in addons.tf (which uses the same AWS creds via
+  # the exec provider) would get Forbidden on every API call.
+  enable_cluster_creator_admin_permissions = true
+
   # Managed node groups. Two groups:
   # - system: scheduler/store/gateway/controller. m5.large, 3 nodes.
   # - workers: rio-worker pods. c6a.xlarge (compute-optimized),
