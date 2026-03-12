@@ -111,12 +111,14 @@ kind: Role
 metadata:
   name: rio-scheduler-lease
 rules:
-  # kube-leader-election: GET the Lease to check holder, CREATE
-  # if missing (first startup), UPDATE to renew/acquire. No
-  # `delete` — leases expire via TTL, never deleted.
+  # kube-leader-election renews via PATCH (strategic merge on
+  # spec.renewTime + holderIdentity), not UPDATE. The old verbs
+  # list was wrong — renew failed with 403 Forbidden every 5s
+  # on a real cluster. VM tests missed it: k3s control-plane
+  # runs as systemd with admin kubeconfig, bypassing RBAC.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update"]
+    verbs: ["get", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
