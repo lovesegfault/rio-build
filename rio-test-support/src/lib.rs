@@ -4,9 +4,11 @@
 //! - [`wire`]: Nix wire protocol client helpers (handshake, setOptions, stderr drain)
 //! - [`grpc`]: mock gRPC services and server spawn helpers
 //! - [`fixtures`]: NAR and PathInfo builders
+//! - [`kube_mock`]: scenario-driven mock kube::Client (tower-test)
 
 pub mod fixtures;
 pub mod grpc;
+pub mod kube_mock;
 pub mod pg;
 pub mod wire;
 

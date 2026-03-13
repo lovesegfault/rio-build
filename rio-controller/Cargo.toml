@@ -62,8 +62,8 @@ dashmap = { workspace = true }
 scopeguard = "1"
 
 [dev-dependencies]
-# tower-test mock::pair() for kube::Client fake API server.
-tower-test = { workspace = true }
+# ApiServerVerifier + Scenario (tower-test mock apiserver).
+rio-test-support = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

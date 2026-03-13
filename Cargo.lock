@@ -4601,6 +4601,7 @@ dependencies = [
  "rio-common",
  "rio-nix",
  "rio-proto",
+ "rio-test-support",
  "rustls 0.23.37",
  "schemars",
  "scopeguard",
@@ -4610,7 +4611,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tonic",
- "tower-test",
  "tracing",
 ]
 
@@ -4772,15 +4772,20 @@ name = "rio-test-support"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http 1.4.0",
+ "k8s-openapi",
+ "kube",
  "nix 0.31.2",
  "rio-nix",
  "rio-proto",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower-test",
 ]
 
 [[package]]
