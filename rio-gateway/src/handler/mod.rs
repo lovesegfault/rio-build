@@ -306,6 +306,14 @@ fn insert_drv_bounded(
     true
 }
 
+/// Maximum NAR size to buffer for `.drv` caching. Above this, the NAR
+/// streams directly to the store and [`try_cache_drv`] is skipped —
+/// `resolve_derivation` fetches from the store later during DAG
+/// reconstruction (one extra round-trip, correctness unchanged).
+/// 16 MiB covers observed outliers (`options.json.drv` ≈ 9.7MB) with
+/// headroom; typical `.drv` NARs are <10KB.
+pub(super) const DRV_NAR_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
+
 fn try_cache_drv(
     path: &StorePath,
     nar_data: &[u8],

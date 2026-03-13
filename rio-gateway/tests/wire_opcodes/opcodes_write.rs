@@ -152,6 +152,12 @@ async fn test_add_multiple_to_store_batch() -> anyhow::Result<()> {
 
 /// Regression: handler must reject truncated NAR (nar_size claims more bytes
 /// than remain in the framed stream) instead of panicking on slice OOB.
+///
+/// With streaming, the handler sends metadata to the store before the
+/// short read is detected — so `put_calls.len() == 1` but `nar_hash` is
+/// empty (trailer never sent). The store-side real implementation rejects
+/// incomplete streams; MockStore is lenient. The assertion here is that
+/// the client gets STDERR_ERROR, not that the store sees zero calls.
 #[tokio::test]
 async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -179,16 +185,123 @@ async fn test_add_multiple_to_store_truncated_nar() -> anyhow::Result<()> {
         framed: &inner,
     );
 
-    // Handler should send STDERR_ERROR (not crash).
+    // Handler should send STDERR_ERROR (not crash). The streaming read_exact
+    // hits EOF on the framed stream (sentinel consumed, but 100 bytes short).
     let err = drain_stderr_expecting_error(&mut h.stream).await?;
     assert!(
-        err.message.contains("truncated"),
-        "expected 'truncated' in error, got: {}",
+        err.message.contains("NAR read") || err.message.contains("eof"),
+        "expected NAR read/eof error, got: {}",
+        err.message
+    );
+    Ok(())
+}
+
+/// Mixed batch: one `.drv` entry (buffered, cached) + one non-`.drv` entry
+/// (streamed). Both must reach the store. Verifies the `.drv`-branch in
+/// `stream_one_entry` doesn't break batch processing.
+#[tokio::test]
+async fn test_add_multiple_to_store_mixed_drv_and_streaming() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let (nar_a, hash_a) = make_nar(b"regular-path-streamed");
+    let (nar_drv, hash_drv) = make_nar(b"Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])");
+
+    let test_path_drv = "/nix/store/33333333333333333333333333333333-test.drv";
+    let inner = wire_bytes![
+        u64: 2,
+        // Entry 1: .drv (buffered path)
+        string: test_path_drv,
+        string: "",
+        string: &hex::encode(hash_drv),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_drv.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_drv,
+        // Entry 2: non-.drv (streaming path)
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash_a),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar_a.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar_a,
+    ];
+
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let calls = h.store.put_calls.read().unwrap().clone();
+    assert_eq!(calls.len(), 2, "both entries should reach the store");
+    let paths: Vec<&str> = calls.iter().map(|c| c.store_path.as_str()).collect();
+    assert!(
+        paths.contains(&test_path_drv),
+        ".drv entry should be uploaded"
+    );
+    assert!(
+        paths.contains(&TEST_PATH_A),
+        "streamed entry should be uploaded"
+    );
+    // Both should have their declared hashes in the trailer.
+    for call in &calls {
+        assert_eq!(call.nar_hash.len(), 32, "nar_hash should be 32 bytes");
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Trailing data after num_paths entries: protocol error. The client sent
+/// more bytes than num_paths claimed. Handler must detect this at the
+/// drain-to-sentinel step and send STDERR_ERROR.
+#[tokio::test]
+async fn test_add_multiple_to_store_trailing_data() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    let (nar, hash) = make_nar(b"trailing");
+
+    let inner = wire_bytes![
+        u64: 1,                            // num_paths = 1
+        string: TEST_PATH_A,
+        string: "",
+        string: &hex::encode(hash),
+        strings: wire::NO_STRINGS,
+        u64: 0,
+        u64: nar.len() as u64,
+        bool: false,
+        strings: wire::NO_STRINGS,
+        string: "",
+        raw: &nar,
+        // Extra bytes past the declared entry count
+        raw: b"unexpected trailing garbage",
+    ];
+
+    wire_send!(&mut h.stream;
+        u64: 44,
+        bool: false,
+        bool: true,
+        framed: &inner,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("trailing data"),
+        "expected 'trailing data' error, got: {}",
         err.message
     );
 
-    // No PutPath calls should have been made.
-    assert_eq!(h.store.put_calls.read().unwrap().len(), 0);
+    // The one valid entry SHOULD have been uploaded before the trailing-data
+    // check (streaming processes entries as they arrive).
+    assert_eq!(h.store.put_calls.read().unwrap().len(), 1);
     Ok(())
 }
 

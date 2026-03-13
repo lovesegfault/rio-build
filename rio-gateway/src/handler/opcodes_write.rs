@@ -2,6 +2,7 @@
 
 use super::*;
 use rio_proto::validated::ValidatedPathInfo;
+use tokio::io::AsyncReadExt;
 
 /// Build a `ValidatedPathInfo` for a freshly-computed path (AddToStore/AddTextToStore).
 /// Uses defaults for fields not provided by the wire: deriver=None,
@@ -66,7 +67,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
 
     debug!(path = %path_str, nar_size = nar_size, "wopAddToStoreNar");
 
-    if nar_size > wire::MAX_FRAMED_TOTAL {
+    if nar_size > rio_common::limits::MAX_NAR_SIZE {
         stderr_err!(stderr, "nar_size {nar_size} exceeds maximum for {path_str}");
     }
 
@@ -80,11 +81,6 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         Err(e) => stderr_err!(stderr, "invalid narHash hex '{nar_hash_str}': {e}"),
     };
 
-    let nar_data = match wire::read_framed_stream(reader).await {
-        Ok(data) => data,
-        Err(e) => stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}"),
-    };
-
     // Build raw PathInfo and validate via TryFrom. This catches:
     //   - bad reference paths (wire gives us unvalidated strings)
     //   - nar_hash wrong length (hex-decode succeeded but result isn't 32 bytes)
@@ -96,7 +92,7 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         store_path: path_str.clone(),
         store_path_hash: Vec::new(),
         deriver: deriver_str,
-        nar_hash: nar_hash_bytes,
+        nar_hash: nar_hash_bytes.clone(),
         nar_size,
         references,
         registration_time,
@@ -109,17 +105,57 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
         Err(e) => stderr_err!(stderr, "wopAddToStoreNar for '{path_str}': {e}"),
     };
 
-    try_cache_drv(&path, &nar_data, drv_cache);
+    // Wrap reader in FramedStreamReader for the NAR bytes. max_total =
+    // nar_size (client-declared) — tighter bound than MAX_FRAMED_TOTAL;
+    // a lying client sending more than declared trips the reader's limit.
+    // After this point, ANY early return leaves the outer reader mid-frame
+    // — caller MUST drop the connection (which it does: stderr_err! → Err
+    // → session loop aborts).
+    let mut framed = wire::FramedStreamReader::new(&mut *reader, nar_size);
 
-    if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
-        return send_store_error(stderr, e).await;
+    // .drv files are small (typically <10KB, max ~10MB observed). Buffer
+    // them so try_cache_drv can parse the ATerm. Everything else streams.
+    if path.is_derivation() && nar_size <= DRV_NAR_BUFFER_LIMIT {
+        let mut nar_data = vec![0u8; nar_size as usize];
+        if let Err(e) = framed.read_exact(&mut nar_data).await {
+            stderr_err!(stderr, "failed to read framed NAR for '{path_str}': {e}");
+        }
+        try_cache_drv(&path, &nar_data, drv_cache);
+        if let Err(e) = grpc_put_path(store_client, info, nar_data).await {
+            return send_store_error(stderr, e).await;
+        }
+    } else {
+        if path.is_derivation() {
+            warn!(
+                path = %path, nar_size,
+                "oversize .drv NAR — streaming (not cached; resolve_derivation fetches from store later)"
+            );
+        }
+        if let Err(e) =
+            grpc_put_path_streaming(store_client, info, &mut framed, nar_size, nar_hash_bytes).await
+        {
+            return send_store_error(stderr, e).await;
+        }
+    }
+
+    // Drain to sentinel. After nar_size bytes, only the u64(0) frame
+    // terminator should remain — FramedStreamReader consumes it on the
+    // next read attempt and returns EOF (0 bytes).
+    let mut probe = [0u8; 1];
+    match framed.read(&mut probe).await {
+        Ok(0) => {}
+        Ok(_) => stderr_err!(
+            stderr,
+            "wopAddToStoreNar: trailing data after NAR for '{path_str}'"
+        ),
+        Err(e) => stderr_err!(stderr, "wopAddToStoreNar: frame sentinel read: {e}"),
     }
 
     stderr.finish().await?;
     Ok(())
 }
 
-/// Parse a single entry from the wopAddMultipleToStore reassembled byte stream.
+/// Stream a single entry from the wopAddMultipleToStore framed stream.
 ///
 /// Wire format (per Nix `Store::addMultipleToStore(Source &, ...)` in
 /// store-api.cc, called with protocol version 16):
@@ -134,22 +170,22 @@ pub(super) async fn handle_add_to_store_nar<R: AsyncRead + Unpin + Send, W: Asyn
 ///   ca: string (empty if none)
 ///   NAR: narSize plain bytes (NOT framed — `addToStore(info, source)` reads
 ///        narSize bytes directly from the already-framed outer stream)
-async fn parse_add_multiple_entry(
-    cursor: &mut std::io::Cursor<&[u8]>,
+async fn stream_one_entry<R: AsyncRead + Unpin>(
+    framed: &mut R,
     store_client: &mut StoreServiceClient<Channel>,
     drv_cache: &mut HashMap<StorePath, Derivation>,
 ) -> anyhow::Result<()> {
-    let path_str = wire::read_string(cursor).await?;
-    let deriver_str = wire::read_string(cursor).await?;
-    let nar_hash_str = wire::read_string(cursor).await?;
-    let references = wire::read_strings(cursor).await?;
-    let registration_time = wire::read_u64(cursor).await?;
-    let nar_size = wire::read_u64(cursor).await?;
-    let ultimate = wire::read_bool(cursor).await?;
-    let sigs = wire::read_strings(cursor).await?;
-    let ca_str = wire::read_string(cursor).await?;
+    let path_str = wire::read_string(framed).await?;
+    let deriver_str = wire::read_string(framed).await?;
+    let nar_hash_str = wire::read_string(framed).await?;
+    let references = wire::read_strings(framed).await?;
+    let registration_time = wire::read_u64(framed).await?;
+    let nar_size = wire::read_u64(framed).await?;
+    let ultimate = wire::read_bool(framed).await?;
+    let sigs = wire::read_strings(framed).await?;
+    let ca_str = wire::read_string(framed).await?;
 
-    debug!(path = %path_str, nar_size = nar_size, "wopAddMultipleToStore entry");
+    debug!(path = %path_str, nar_size, "wopAddMultipleToStore entry");
 
     let path = StorePath::parse(&path_str)
         .map_err(|e| anyhow::anyhow!("invalid store path '{path_str}': {e}"))?;
@@ -157,38 +193,18 @@ async fn parse_add_multiple_entry(
     let nar_hash_bytes = hex::decode(&nar_hash_str)
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': invalid narHash hex: {e}"))?;
 
-    // Read NAR data as narSize plain bytes (NOT a nested framed stream).
-    // The outer framed stream has already been reassembled; Nix's
-    // `addToStore(info, source)` reads narSize bytes directly.
     if nar_size > rio_common::limits::MAX_NAR_SIZE {
         return Err(anyhow::anyhow!(
             "entry '{path_str}': nar_size {nar_size} exceeds MAX_NAR_SIZE {}",
             rio_common::limits::MAX_NAR_SIZE
         ));
     }
-    let nar_size_usize = usize::try_from(nar_size)
-        .map_err(|_| anyhow::anyhow!("entry '{path_str}': nar_size {nar_size} overflows usize"))?;
-    let pos = cursor.position() as usize;
-    let buf = cursor.get_ref();
-    let end = pos.checked_add(nar_size_usize).ok_or_else(|| {
-        anyhow::anyhow!("entry '{path_str}': nar_size {nar_size} overflows offset")
-    })?;
-    if end > buf.len() {
-        return Err(anyhow::anyhow!(
-            "entry '{path_str}': truncated NAR (expected {nar_size} bytes, {} remaining)",
-            buf.len().saturating_sub(pos)
-        ));
-    }
-    let nar_data = buf[pos..end].to_vec();
-    cursor.set_position(end as u64);
-
-    try_cache_drv(&path, &nar_data, drv_cache);
 
     let raw_info = types::PathInfo {
         store_path: path_str.clone(),
         store_path_hash: Vec::new(),
         deriver: deriver_str,
-        nar_hash: nar_hash_bytes,
+        nar_hash: nar_hash_bytes.clone(),
         nar_size,
         references,
         registration_time,
@@ -199,9 +215,29 @@ async fn parse_add_multiple_entry(
     let info = ValidatedPathInfo::try_from(raw_info)
         .map_err(|e| anyhow::anyhow!("entry '{path_str}': {e}"))?;
 
-    grpc_put_path(store_client, info, nar_data)
-        .await
-        .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
+    // .drv files are small (typically <10KB, max ~10MB observed). Buffer
+    // them so try_cache_drv can parse the ATerm. Everything else streams.
+    if path.is_derivation() && nar_size <= DRV_NAR_BUFFER_LIMIT {
+        let mut nar_data = vec![0u8; nar_size as usize];
+        framed
+            .read_exact(&mut nar_data)
+            .await
+            .map_err(|e| anyhow::anyhow!("entry '{path_str}': NAR read: {e}"))?;
+        try_cache_drv(&path, &nar_data, drv_cache);
+        grpc_put_path(store_client, info, nar_data)
+            .await
+            .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
+    } else {
+        if path.is_derivation() {
+            warn!(
+                path = %path, nar_size,
+                "oversize .drv NAR — streaming (not cached; resolve_derivation fetches from store later)"
+            );
+        }
+        grpc_put_path_streaming(store_client, info, framed, nar_size, nar_hash_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("entry '{path_str}': store error: {e}"))?;
+    }
 
     Ok(())
 }
@@ -415,7 +451,7 @@ fn parse_cam_str(cam_str: &str) -> Result<(bool, bool, HashAlgo), CamParseError>
 ///   [framed stream (chunked, terminated by 0-length chunk):
 ///     num_paths: u64      ← count prefix INSIDE the framed stream
 ///     for i in 0..num_paths:
-///       ValidPathInfo (9 fields — see parse_add_multiple_entry)
+///       ValidPathInfo (9 fields — see stream_one_entry)
 ///       NAR data (narSize plain bytes, NOT nested-framed)
 ///   ]
 // r[impl gw.opcode.add-multiple.batch]
@@ -431,21 +467,17 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
     let _repair = wire::read_bool(reader).await?;
     let _dont_check_sigs = wire::read_bool(reader).await?;
 
-    debug!("wopAddMultipleToStore");
+    debug!("wopAddMultipleToStore (streaming)");
 
-    let stream_data = match wire::read_framed_stream(reader).await {
-        Ok(data) => data,
-        Err(e) => stderr_err!(
-            stderr,
-            "wopAddMultipleToStore: failed to read framed stream: {e}"
-        ),
-    };
-
-    let mut cursor = std::io::Cursor::new(stream_data.as_slice());
+    // FramedStreamReader de-frames on the fly. All wire::read_* primitives
+    // work on it directly (they take R: AsyncRead). After this point, ANY
+    // early return leaves the outer reader mid-frame — caller MUST drop the
+    // connection (which it does: stderr_err! → Err → session loop aborts).
+    let mut framed = wire::FramedStreamReader::new(&mut *reader, wire::MAX_FRAMED_TOTAL);
 
     // Count prefix: Nix `Store::addMultipleToStore(Source &)` reads this
     // first (`readNum<uint64_t>(source)`) before the per-entry loop.
-    let num_paths = match wire::read_u64(&mut cursor).await {
+    let num_paths = match wire::read_u64(&mut framed).await {
         Ok(n) => n,
         Err(e) => stderr_err!(
             stderr,
@@ -460,21 +492,32 @@ pub(super) async fn handle_add_multiple_to_store<R: AsyncRead + Unpin, W: AsyncW
         );
     }
 
-    debug!(
-        num_paths = num_paths,
-        "wopAddMultipleToStore: processing entries"
-    );
+    debug!(num_paths, "wopAddMultipleToStore: processing entries");
 
-    for _ in 0..num_paths {
-        if let Err(e) = parse_add_multiple_entry(&mut cursor, store_client, drv_cache).await {
+    for i in 0..num_paths {
+        if let Err(e) = stream_one_entry(&mut framed, store_client, drv_cache).await {
             stderr
                 .error(&StderrError::simple(
                     PROGRAM_NAME,
-                    format!("wopAddMultipleToStore entry failed: {e}"),
+                    format!("wopAddMultipleToStore entry {i}/{num_paths} failed: {e}"),
                 ))
                 .await?;
             return Err(e);
         }
+    }
+
+    // Drain to sentinel. After num_paths entries, only the u64(0) frame
+    // terminator should remain — FramedStreamReader consumes it on the
+    // next read attempt and returns EOF (0 bytes). If there's UNEXPECTED
+    // data, the client sent more than num_paths entries claimed.
+    let mut probe = [0u8; 1];
+    match framed.read(&mut probe).await {
+        Ok(0) => {}
+        Ok(_) => stderr_err!(
+            stderr,
+            "wopAddMultipleToStore: trailing data after {num_paths} entries"
+        ),
+        Err(e) => stderr_err!(stderr, "wopAddMultipleToStore: frame sentinel read: {e}"),
     }
 
     stderr.finish().await?;
