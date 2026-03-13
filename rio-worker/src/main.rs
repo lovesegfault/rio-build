@@ -148,22 +148,21 @@ async fn main() -> anyhow::Result<()> {
     //   and removes it; next heartbeat goes to the new leader.
     // - Single (non-K8s): plain connect. VM tests use this.
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
-    let (mut scheduler_client, _balance_guard) = if cfg.scheduler_balance_host.is_empty() {
-        info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
-        let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
-        (c, None)
-    } else {
-        info!(
-            host = %cfg.scheduler_balance_host,
-            port = cfg.scheduler_balance_port,
-            "scheduler: health-aware balanced mode"
-        );
-        let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
-            cfg.scheduler_balance_host.clone(),
-            cfg.scheduler_balance_port,
-        )
-        .await?;
-        (c, Some(bc))
+    let (mut scheduler_client, _balance_guard) = match cfg.scheduler_balance_host {
+        None => {
+            info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
+            let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
+            (c, None)
+        }
+        Some(host) => {
+            info!(%host, port = cfg.scheduler_balance_port, "scheduler: health-aware balanced mode");
+            let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
+                host,
+                cfg.scheduler_balance_port,
+            )
+            .await?;
+            (c, Some(bc))
+        }
     };
 
     info!(

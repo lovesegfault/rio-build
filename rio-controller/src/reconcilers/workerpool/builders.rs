@@ -20,6 +20,24 @@ use kube::api::ObjectMeta;
 use crate::crds::workerpool::WorkerPool;
 use crate::error::{Error, Result};
 
+/// Scheduler addresses injected into worker pod env. Bundled as
+/// a struct because threading 3+ `&str` params through
+/// `build_statefulset` → `build_pod_spec` → `build_container`
+/// is noisy, and these always travel together.
+#[derive(Clone)]
+pub(super) struct SchedulerAddrs {
+    /// ClusterIP Service `host:port` (`RIO_SCHEDULER_ADDR`).
+    /// Used for the DrainWorker one-shot at SIGTERM and as
+    /// the TLS verify domain's authority source.
+    pub addr: String,
+    /// Headless Service hostname (`RIO_SCHEDULER_BALANCE_HOST`).
+    /// `None` = env var NOT injected → worker's figment sees
+    /// `Option<String>::None` → single-channel fallback.
+    pub balance_host: Option<String>,
+    /// Headless Service port (`RIO_SCHEDULER_BALANCE_PORT`).
+    pub balance_port: u16,
+}
+
 /// Labels applied to the StatefulSet, Service, and pods.
 ///
 /// `rio.build/pool`: the WorkerPool name. The finalizer's
@@ -82,7 +100,7 @@ pub(super) fn build_headless_service(wp: &WorkerPool, oref: OwnerReference) -> S
 pub(super) fn build_statefulset(
     wp: &WorkerPool,
     oref: OwnerReference,
-    scheduler_addr: &str,
+    scheduler: &SchedulerAddrs,
     store_addr: &str,
     replicas: Option<i32>,
 ) -> Result<StatefulSet> {
@@ -128,7 +146,7 @@ pub(super) fn build_statefulset(
                 }),
                 spec: Some(build_pod_spec(
                     wp,
-                    scheduler_addr,
+                    scheduler,
                     store_addr,
                     cache_gb,
                     cache_quantity,
@@ -181,7 +199,7 @@ pub(super) fn build_pdb(wp: &WorkerPool, oref: OwnerReference) -> PodDisruptionB
 /// StatefulSet complexity and it's useful to test in isolation.
 fn build_pod_spec(
     wp: &WorkerPool,
-    scheduler_addr: &str,
+    scheduler: &SchedulerAddrs,
     store_addr: &str,
     cache_gb: u64,
     cache_quantity: Quantity,
@@ -210,7 +228,7 @@ fn build_pod_spec(
     let spread_enabled = wp.spec.topology_spread.unwrap_or(true);
 
     PodSpec {
-        containers: vec![build_container(wp, scheduler_addr, store_addr, cache_gb)],
+        containers: vec![build_container(wp, scheduler, store_addr, cache_gb)],
         // hostNetwork from spec. None → K8s default (false).
         // Some(false) → explicit false (same effect). Some(true)
         // → pod shares node netns. `filter`: PodSpec field is
@@ -423,7 +441,7 @@ fn build_pod_spec(
 /// The worker container.
 fn build_container(
     wp: &WorkerPool,
-    scheduler_addr: &str,
+    scheduler: &SchedulerAddrs,
     store_addr: &str,
     cache_gb: u64,
 ) -> Container {
@@ -436,19 +454,7 @@ fn build_container(
         // STS (only the CRD), so the spec has this knob.
         image_pull_policy: wp.spec.image_pull_policy.clone(),
         env: Some(vec![
-            env("RIO_SCHEDULER_ADDR", scheduler_addr),
-            // Headless Service for health-aware balanced routing.
-            // Worker DNS-resolves this to pod IPs, health-probes
-            // grpc.health.v1 on each, routes to the leader. On
-            // scheduler failover, BuildExecution reconnects via
-            // the balanced channel; running builds continue.
-            //
-            // Hardcoded: the headless Service name is fixed in
-            // infra/k8s/base/scheduler.yaml. If ctx.scheduler_addr
-            // ever becomes configurable per-deployment, this would
-            // need to be threaded through too. Today it isn't.
-            env("RIO_SCHEDULER_BALANCE_HOST", "rio-scheduler-headless"),
-            env("RIO_SCHEDULER_BALANCE_PORT", "9001"),
+            env("RIO_SCHEDULER_ADDR", &scheduler.addr),
             // From ctx.store_addr — NOT derived from scheduler_addr.
             // The kustomize base uses different Service names
             // (rio-scheduler vs rio-store); a port-replace would
@@ -483,6 +489,21 @@ fn build_container(
             // with a mutable Vec, which would need `let mut env_vec
             // = vec![...]; if tls { env_vec.push(...) }; Some(
             // env_vec)`). The Option::map pattern reads cleaner.
+            // Headless Service for health-aware balanced routing.
+            // Worker DNS-resolves this to pod IPs, health-probes
+            // grpc.health.v1, routes to the leader. On scheduler
+            // failover, BuildExecution reconnects via the balanced
+            // channel; running builds continue. NOT injected when
+            // None — worker's Option<String> stays None → single-
+            // channel fallback. Injecting an empty string would
+            // give Some("") which fails DNS resolve.
+            if let Some(host) = &scheduler.balance_host {
+                e.push(env("RIO_SCHEDULER_BALANCE_HOST", host));
+                e.push(env(
+                    "RIO_SCHEDULER_BALANCE_PORT",
+                    &scheduler.balance_port.to_string(),
+                ));
+            }
             if wp.spec.tls_secret_name.is_some() {
                 // Paths match the volume mount below and cert-
                 // manager's standard Secret key names.

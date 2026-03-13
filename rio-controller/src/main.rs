@@ -31,6 +31,12 @@ struct Config {
     /// rio-scheduler gRPC address. AdminService + SchedulerService
     /// on the same port. Required — no sensible default.
     scheduler_addr: String,
+    /// Headless Service host, passed to workers as
+    /// `RIO_SCHEDULER_BALANCE_HOST`. `None` (env unset) =
+    /// not injected → workers use single-channel fallback.
+    /// In K8s: set to `rio-scheduler-headless` via env.
+    scheduler_balance_host: Option<String>,
+    scheduler_balance_port: u16,
     /// rio-store gRPC address. Build reconciler fetches .drv
     /// content from here. Required for Build CRDs; WorkerPool-
     /// only deployments can leave it empty (Build reconciler
@@ -58,6 +64,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scheduler_addr: String::new(),
+            scheduler_balance_host: None,
+            scheduler_balance_port: 9001,
             store_addr: String::new(),
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
@@ -189,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
+        scheduler_balance_host: cfg.scheduler_balance_host.clone(),
+        scheduler_balance_port: cfg.scheduler_balance_port,
         store_addr: cfg.store_addr.clone(),
         recorder: recorder.clone(),
         watching: Arc::new(dashmap::DashMap::new()),

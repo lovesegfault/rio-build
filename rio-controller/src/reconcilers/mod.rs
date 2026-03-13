@@ -34,6 +34,12 @@ pub struct Ctx {
     /// SchedulerService (SubmitBuild, CancelBuild) are on the
     /// same port.
     pub scheduler_addr: String,
+    /// Headless Service host for workers' balanced channels.
+    /// `Some(host)` = injected as `RIO_SCHEDULER_BALANCE_HOST`
+    /// into worker pods. `None` = env var NOT injected → workers
+    /// fall back to single-channel (VM tests, single-replica).
+    pub scheduler_balance_host: Option<String>,
+    pub scheduler_balance_port: u16,
     /// rio-store gRPC address (e.g., "rio-store:9002"). The Build
     /// reconciler fetches .drv content from here to construct the
     /// DerivationNode. Same lazy-connect rationale as scheduler.

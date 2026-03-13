@@ -21,8 +21,8 @@ pub(crate) struct Config {
     pub(crate) scheduler_addr: String,
     /// Headless Service host for health-aware balanced routing.
     /// See rio-gateway's identical field for the full story.
-    /// Empty = single-channel fallback (VM tests, non-K8s).
-    pub(crate) scheduler_balance_host: String,
+    /// `None` (env unset) = single-channel fallback.
+    pub(crate) scheduler_balance_host: Option<String>,
     pub(crate) scheduler_balance_port: u16,
     pub(crate) store_addr: String,
     pub(crate) max_builds: u32,
@@ -93,7 +93,7 @@ impl Default for Config {
         Self {
             worker_id: String::new(),
             scheduler_addr: String::new(),
-            scheduler_balance_host: String::new(),
+            scheduler_balance_host: None,
             scheduler_balance_port: 9001,
             store_addr: String::new(),
             max_builds: 1,

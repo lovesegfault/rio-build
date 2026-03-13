@@ -43,6 +43,14 @@ fn test_wp() -> WorkerPool {
     wp
 }
 
+fn test_sched_addrs() -> SchedulerAddrs {
+    SchedulerAddrs {
+        addr: "sched:9001".into(),
+        balance_host: Some("sched-headless".into()),
+        balance_port: 9001,
+    }
+}
+
 /// Shorthand for tests: builds with default scheduler/store
 /// addrs and replicas=Some(min). Use `build_statefulset`
 /// directly for tests that care about those params.
@@ -50,7 +58,7 @@ fn test_sts(wp: &WorkerPool) -> StatefulSet {
     build_statefulset(
         wp,
         wp.controller_owner_ref(&()).unwrap(),
-        "sched:9001",
+        &test_sched_addrs(),
         "store:9002",
         Some(wp.spec.replicas.min),
     )
@@ -392,7 +400,7 @@ fn statefulset_replicas_omitted_when_none() {
     let sts = build_statefulset(
         &wp,
         wp.controller_owner_ref(&()).unwrap(),
-        "sched:9001",
+        &test_sched_addrs(),
         "store:9002",
         None,
     )
@@ -531,7 +539,7 @@ fn quantity_invalidspec_from_statefulset() {
     let result = build_statefulset(
         &wp,
         wp.controller_owner_ref(&()).unwrap(),
-        "sched:9001",
+        &test_sched_addrs(),
         "store:9002",
         Some(1),
     );
@@ -569,6 +577,8 @@ fn test_ctx(client: kube::Client) -> Arc<Ctx> {
         // never listened on) vs one that times out.
         scheduler_addr: "http://127.0.0.1:1".into(),
         store_addr: "http://127.0.0.1:1".into(),
+        scheduler_balance_host: None,
+        scheduler_balance_port: 9001,
         recorder,
         watching: Arc::new(dashmap::DashMap::new()),
     })

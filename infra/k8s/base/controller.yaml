@@ -46,6 +46,15 @@ spec:
             # doesn't kill the controller.
             - name: RIO_SCHEDULER_ADDR
               value: "rio-scheduler:9001"
+            # Passed through to worker pods as
+            # RIO_SCHEDULER_BALANCE_HOST. Workers DNS-resolve
+            # the headless Service, health-probe pod IPs,
+            # route to leader. Unset → workers fall back to
+            # single-channel (VM tests don't set this).
+            - name: RIO_SCHEDULER_BALANCE_HOST
+              value: "rio-scheduler-headless"
+            - name: RIO_SCHEDULER_BALANCE_PORT
+              value: "9001"
             - name: RIO_STORE_ADDR
               value: "rio-store:9002"
           # /healthz serves 200 once kube client + scheduler
