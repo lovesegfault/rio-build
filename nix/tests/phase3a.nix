@@ -335,6 +335,18 @@ pkgs.testers.runNixOSTest {
         timeout=30
     )
 
+    # leaseTransitions=0 on the create path. The in-house election
+    # code writes this field (the old kube-leader-election crate
+    # didn't always). Single-replica → create path only; the
+    # steal-path increment (transitions+1) is covered by
+    # election.rs::stale_observation_steals + the replace() unit
+    # tests. The 2-replica failover case that would exercise it
+    # end-to-end is TODO(phase4b) per scheduler.md.
+    k8s.succeed(
+        "k3s kubectl get lease rio-scheduler-lease -n default "
+        "-o jsonpath='{.spec.leaseTransitions}' | grep -qx 0"
+    )
+
     # Metric: rio_scheduler_lease_acquired_total proves the
     # ACQUIRE TRANSITION ran (not just "lease exists" — the
     # scheduler might have restarted between create and this
