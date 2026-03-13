@@ -17,7 +17,7 @@ use russh::{ChannelId, CryptoVec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
-use tracing::{Instrument, debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::session::run_protocol;
 
@@ -137,9 +137,10 @@ impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
-        metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
-        metrics::gauge!("rio_gateway_connections_active").increment(1.0);
-        info!(peer = ?peer_addr, "new SSH connection");
+        // TCP accept only — NLB health checks and kubelet liveness probes
+        // (bare connect+close, no SSH bytes) land here and drop ~200μs
+        // later. Defer logging/metrics to mark_real_connection(), called
+        // from the first auth_* callback.
         ConnectionHandler {
             peer_addr,
             store_client: self.store_client.clone(),
@@ -147,6 +148,7 @@ impl russh::server::Server for GatewayServer {
             authorized_keys: Arc::clone(&self.authorized_keys),
             sessions: HashMap::new(),
             tenant_name: String::new(),
+            auth_attempted: false,
         }
     }
 }
@@ -185,18 +187,40 @@ pub struct ConnectionHandler {
     /// the scheduler as `SubmitBuildRequest.tenant_name` which resolves
     /// it to a UUID via the `tenants` table. Empty = single-tenant mode.
     tenant_name: String,
+    /// Set on the first `auth_*` callback. Distinguishes real SSH
+    /// clients from TCP probes (NLB/kubelet health checks) — probes
+    /// close before any SSH bytes, so no auth callback ever fires.
+    auth_attempted: bool,
+}
+
+impl ConnectionHandler {
+    /// Idempotent. Call from every `auth_*` entry point — the first SSH
+    /// protocol event that distinguishes a real client from a TCP probe.
+    fn mark_real_connection(&mut self) {
+        if self.auth_attempted {
+            return;
+        }
+        self.auth_attempted = true;
+        metrics::counter!("rio_gateway_connections_total", "result" => "new").increment(1);
+        metrics::gauge!("rio_gateway_connections_active").increment(1.0);
+        info!(peer = ?self.peer_addr, "new SSH connection");
+    }
 }
 
 impl Drop for ConnectionHandler {
     fn drop(&mut self) {
-        metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
-        // Channel gauge decrement is handled by ChannelSession::Drop when
-        // the sessions HashMap is cleared.
-        debug!(
-            peer = ?self.peer_addr,
-            remaining_channels = self.sessions.len(),
-            "SSH connection handler dropped"
-        );
+        if self.auth_attempted {
+            metrics::gauge!("rio_gateway_connections_active").decrement(1.0);
+            // Channel gauge decrement is handled by ChannelSession::Drop
+            // when the sessions HashMap is cleared.
+            debug!(
+                peer = ?self.peer_addr,
+                remaining_channels = self.sessions.len(),
+                "SSH connection handler dropped"
+            );
+        } else {
+            trace!(peer = ?self.peer_addr, "TCP probe dropped (no SSH handshake)");
+        }
     }
 }
 
@@ -204,12 +228,14 @@ impl Handler for ConnectionHandler {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+        self.mark_real_connection();
         warn!(peer = ?self.peer_addr, "rejecting password authentication");
         Ok(Auth::reject())
     }
 
     // r[impl gw.auth.tenant-from-key-comment]
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+        self.mark_real_connection();
         // The comment lives in the SERVER-SIDE authorized_keys entry, not
         // the client's key (SSH key auth sends raw key data only). We
         // match the client's key against our loaded entries, then read
