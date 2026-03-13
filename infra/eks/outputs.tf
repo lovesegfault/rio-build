@@ -57,3 +57,8 @@ output "bastion_instance_id" {
   description = "SSM bastion instance ID (smoke-test.sh uses this for the port-forward session)"
   value       = aws_instance.bastion.id
 }
+
+output "karpenter_node_role_name" {
+  description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — `just eks deploy` passes as --set karpenter.nodeRoleName)"
+  value       = module.karpenter.node_iam_role_name
+}

@@ -69,7 +69,9 @@ Leaf certs. Shared settings:
   - PKCS8 (rustls requirement, see root CA comment).
   - dnsNames short form: tonic's SAN check uses :authority from URL —
     `rio-scheduler:9001` → authority `rio-scheduler`, so short name MUST
-    be in SANs.
+    be in SANs. `localhost` is there so in-pod tooling (rio-cli via
+    kubectl exec — see rio-cli/src/main.rs) can talk to the local
+    process with the same RIO_TLS__* env.
 */}}
 
 {{- range $component := list "scheduler" "store" "gateway" "controller" }}
@@ -99,6 +101,7 @@ spec:
     - {{ $svc }}.{{ $ns }}
     - {{ $svc }}.{{ $ns }}.svc
     - {{ $svc }}.{{ $ns }}.svc.cluster.local
+    - localhost
 {{- end }}
 
 ---

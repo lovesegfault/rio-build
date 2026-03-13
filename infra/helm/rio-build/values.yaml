@@ -227,6 +227,155 @@ fodProxy:
     limits: {memory: 256Mi}
 
 # ──────────────────────────────────────────────────────────────────────────
+# Karpenter NodePools + EC2NodeClass
+# ──────────────────────────────────────────────────────────────────────────
+# In the chart (not terraform) so `helm rollback` takes node config with
+# the rest, and because kubernetes_manifest has the plan-time GVK trap
+# (Karpenter CRDs don't exist until helm_release.karpenter applies).
+#
+# Requires helm_release.karpenter in terraform to have run (installs CRDs).
+# `just eks deploy` sets enabled=true + clusterName + nodeRoleName from
+# tofu outputs.
+karpenter:
+  enabled: false
+  clusterName: ""   # from tofu output cluster_name
+  nodeRoleName: ""  # from tofu output karpenter_node_role_name
+  # bottlerocket@latest: container-optimized, immutable root fs, smaller
+  # attack surface. Worker pods run privileged (FUSE); Bottlerocket allows.
+  amiAlias: bottlerocket@latest
+  # Bottlerocket data volume (/dev/xvdb — container images + emptyDir +
+  # logs). AMI default is ~20GB; worker pods request 25Gi ephemeral-
+  # storage (fuseCacheSize + headroom). Size for a few workers bin-packed
+  # on one node plus image layers. gp3 at 100Gi is ~$8/mo per node.
+  dataVolumeSize: 100Gi
+
+  # Three NodePools, one EC2NodeClass. Weighted priority: Karpenter tries
+  # high-weight first, falls through if pod doesn't fit or capacity is
+  # unavailable. Forward-compat with phase 4c: WorkerPoolSet creates pools
+  # with different resources → Karpenter bin-packs across the size range
+  # the NodePool requirements allow. No NodePool rework needed.
+  nodePools:
+    # Worker preferred: c6a/c7a (AMD EPYC compute-optimized). Tainted so
+    # ONLY worker pods (with the matching toleration) land here.
+    - name: rio-worker-preferred
+      weight: 100
+      labels:
+        rio.build/node-role: worker
+      taints:
+        - key: rio.build/worker
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: [c6a, c7a]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      # Ceiling: max=1000 workers * ~4 cpu/pod = 4000. Cost control — hard
+      # cap on what Karpenter will provision for this pool.
+      limits: {cpu: 4000}
+      consolidateAfter: 30s
+
+    # Worker fallback: m/r categories, any family. If c-capacity is
+    # unavailable (rare on-demand, common for spot) Karpenter falls
+    # through here.
+    - name: rio-worker-fallback
+      weight: 10
+      labels:
+        rio.build/node-role: worker
+      taints:
+        - key: rio.build/worker
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: [m, r]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["4"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 4000}
+      consolidateAfter: 30s
+
+    # General: untainted, for future gateway/scheduler HPA overflow.
+    # System nodegroup (min=3 max=5) handles today's load; this absorbs
+    # scale-up past that. Longer consolidateAfter because gateway/scheduler
+    # pods are connection-stateful (SSH sessions, gRPC streams) — don't churn.
+    - name: rio-general
+      weight: 50
+      labels:
+        rio.build/node-role: general
+      taints: []
+      requirements:
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: [m]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["4"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+      limits: {cpu: 500}
+      consolidateAfter: 5m
+
+# ──────────────────────────────────────────────────────────────────────────
+# Default WorkerPool
+# ──────────────────────────────────────────────────────────────────────────
+# One-size-fits-all baseline for phase 4b — phase 4c WorkerPoolSet
+# supersedes with per-size-class pools. When WPS lands, set enabled=false
+# here and apply a WPS CR instead.
+workerPool:
+  enabled: false
+  name: default
+  replicas:
+    # True scale-to-zero. rio-controller's 10-min SCALE_DOWN_WINDOW
+    # (scaling.rs:59) means queue must be quiet for 10 min before hitting 0.
+    # Then Karpenter consolidates the empty node ~30s later.
+    # Cold start on next build: ~30-60s (node boot) + ~20s (pod start).
+    min: 0
+    max: 1000
+  autoscaling:
+    metric: queueDepth
+    targetValue: 5   # scale up when queued / active_workers > 5
+  maxConcurrentBuilds: 2
+  fuseCacheSize: 20Gi
+  systems: [x86_64-linux]
+  features: []
+  sizeClass: ""   # unclassified — scheduler with size_classes configured
+                  # would reject this; phase 4b baseline doesn't configure
+                  # size_classes
+  image: rio-worker
+  # Phase 4b placeholder. Fits on c6a.large (2 vCPU / 4Gi) and up.
+  # Karpenter picks cheapest-fit — request, not node-size mandate.
+  # TODO(phase4c): WorkerPoolSet derives this from build_history per
+  # size class.
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+      ephemeral-storage: "25Gi"   # fuseCacheSize (20Gi) + headroom
+  # Device cgroup: /dev/fuse needs a device plugin for caps-only
+  # (smarter-device-manager). ADR-012 defers to phase 5; privileged
+  # bypasses device cgroup entirely. crds/workerpool.rs:145 says
+  # "Production on EKS/GKE with proper runtime config should NOT need
+  # this" — that proper config IS the device plugin.
+  privileged: true
+  # Pairs with the NodePool taint. Change NodePool taint/labels → change
+  # these too.
+  tolerations:
+    - key: rio.build/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    rio.build/node-role: worker
+
+# ──────────────────────────────────────────────────────────────────────────
 # Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.
 # Dev S3 (Rook) is NOT a subchart — operator-first-then-cluster lifecycle
 # doesn't fit; `just dev apply` installs it as separate helm releases.

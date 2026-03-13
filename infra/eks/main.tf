@@ -1,8 +1,9 @@
 # EKS cluster for rio-build.
 #
-# Managed control plane + 2 nodegroups (system + workers) + IRSA for
-# rio-store S3 access. IMDSv2 hop limit 1 on worker nodes (metadata
-# protection).
+# Managed control plane + system nodegroup + IRSA for rio-store S3 access.
+# Worker nodes are Karpenter-provisioned (karpenter.tf) — no managed
+# worker nodegroup. IMDSv2 hop limit 1 on Karpenter nodes (metadata
+# protection) via EC2NodeClass in the chart.
 #
 # Usage:
 #   AWS_PROFILE=beme_sandbox terraform init
@@ -106,6 +107,8 @@ module "vpc" {
   }
   private_subnet_tags = {
     "kubernetes.io/role/internal-elb" = "1"
+    # Karpenter EC2NodeClass subnetSelectorTerms matches on this.
+    "karpenter.sh/discovery" = var.cluster_name
   }
 }
 
@@ -148,10 +151,27 @@ module "eks" {
   # the exec provider) would get Forbidden on every API call.
   enable_cluster_creator_admin_permissions = true
 
-  # Managed node groups. Two groups:
-  # - system: scheduler/store/gateway/controller. m5.large, 3 nodes.
-  # - workers: rio-worker pods. c6a.xlarge (compute-optimized),
-  #   2-10 nodes, tainted so ONLY worker pods land there.
+  # eks-pod-identity-agent: required for module.karpenter's Pod
+  # Identity association (karpenter.tf). before_compute=true so the
+  # agent DaemonSet is running before any nodegroup pods start —
+  # otherwise the association doesn't take effect until agent restart.
+  addons = {
+    eks-pod-identity-agent = {
+      before_compute = true
+    }
+  }
+
+  # Discovery tag on the node security group. Karpenter's
+  # EC2NodeClass securityGroupSelectorTerms matches on this.
+  node_security_group_tags = {
+    "karpenter.sh/discovery" = var.cluster_name
+  }
+
+  # Managed node groups. System only — worker nodes are
+  # Karpenter-provisioned (karpenter.tf). rio-controller scales the
+  # WorkerPool STS by queue depth; Karpenter provisions nodes for
+  # Pending pods. Scale-to-zero: rio-controller's 10-min
+  # SCALE_DOWN_WINDOW → pods to 0 → Karpenter consolidates.
   eks_managed_node_groups = {
     system = {
       instance_types = [var.system_instance_type]
@@ -160,45 +180,14 @@ module "eks" {
       desired_size   = 3
 
       # No taint: system components (plus kube-system addons like
-      # CoreDNS) schedule here freely.
-    }
-
-    workers = {
-      instance_types = [var.worker_instance_type]
-      min_size       = var.worker_min_size
-      max_size       = var.worker_max_size
-      desired_size   = var.worker_min_size
-
-      # Taint so only pods with the matching toleration (set by
-      # the WorkerPool reconciler when spec.tolerations is
-      # configured) land here. Keeps kube-system pods off the
-      # worker nodes — they're for builds only.
+      # CoreDNS, Karpenter controller) schedule here freely.
       #
-      # eks module v21 tightened the type: taints is now
-      # map(object), not list. The map key is arbitrary (used for
-      # for_each stability inside the module), not the taint key.
-      taints = {
-        worker = {
-          key    = "rio.build/worker"
-          value  = "true"
-          effect = "NO_SCHEDULE"
-        }
-      }
-
+      # Label: Karpenter's nodeSelector (karpenter.tf) targets this.
+      # The eks.amazonaws.com/nodegroup label is name-prefixed by
+      # default (e.g. system-2026031219...) so we can't match it
+      # statically. EKS applies label updates in-place — no node churn.
       labels = {
-        "rio.build/node-role" = "worker"
-      }
-
-      # IMDSv2 hop limit 1: pod can't reach instance metadata.
-      # Container network adds a hop, so limit 1 means the
-      # instance itself can (kubelet needs it) but pods can't.
-      # Defense-in-depth: NetworkPolicy also blocks 169.254.
-      # 169.254, but this is belt-and-suspenders (and catches
-      # hostNetwork pods which bypass NetworkPolicy).
-      metadata_options = {
-        http_endpoint               = "enabled"
-        http_tokens                 = "required" # IMDSv2 only
-        http_put_response_hop_limit = 1
+        "rio.build/node-role" = "system"
       }
     }
   }

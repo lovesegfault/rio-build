@@ -59,6 +59,12 @@ Workers require a dedicated node pool with:
 - **`/dev/fuse` access:** Worker pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use a device plugin to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
 - **EKS addons:** `vpc-cni` and `kube-proxy` must be installed before node groups are created (they are daemonsets). `coredns` requires schedulable (untainted) nodes and should be installed after the system node group is ready.
 
+### Node autoscaling
+
+Worker pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller scales the WorkerPool StatefulSet replica count based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
+
+The EKS reference deployment (`infra/eks/`) uses Karpenter: the `workers` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on worker NodePools means Karpenter never evicts a node with a worker pod on it --- the 10-minute `SCALE_DOWN_WINDOW` in rio-controller scales pods away first, then Karpenter consolidates the empty node. Scale-to-zero is the default (`WorkerPool.spec.replicas.min: 0`): cold start from zero is ~50-80s (node boot + pod start).
+
 ## Key Configuration
 
 See [Configuration Reference](./configuration.md) for all parameters. The minimum required settings:

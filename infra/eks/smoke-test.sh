@@ -118,44 +118,18 @@ retry 6 5 nc -z localhost "$LOCAL_PORT" \
   || die "SSM tunnel never opened (check /tmp/ssm-session.log)"
 
 # ----------------------------------------------------------------
-# 4. WorkerPool with privileged: true + ECR image ref
+# 4. Wait for the chart's default WorkerPool to reconcile
 # ----------------------------------------------------------------
-ECR_REGISTRY=$(tf ecr_registry)
-RIO_IMAGE_TAG=${RIO_IMAGE_TAG:-$(git rev-parse --short=12 HEAD)}
-
-log "applying WorkerPool"
-cat <<EOF | kubectl apply -f -
-apiVersion: rio.build/v1alpha1
-kind: WorkerPool
-metadata:
-  name: smoke
-  namespace: $NS
-spec:
-  replicas: { min: 2, max: 4 }
-  autoscaling: { metric: queueDepth, targetValue: 5 }
-  maxConcurrentBuilds: 2
-  fuseCacheSize: 20Gi
-  systems: [x86_64-linux]
-  features: []
-  sizeClass: ""
-  image: $ECR_REGISTRY/rio-worker:$RIO_IMAGE_TAG
-  # privileged: device cgroup needs a device plugin (smarter-
-  # device-manager) for /dev/fuse via caps-only. ADR-012 defers
-  # that to phase5; privileged bypasses device cgroup entirely.
-  privileged: true
-  tolerations:
-    - key: rio.build/worker
-      operator: Equal
-      value: "true"
-      effect: NoSchedule
-  nodeSelector:
-    rio.build/node-role: worker
-EOF
-
-log "waiting for worker pods"
-kubectl -n "$NS" wait --for=condition=Ready pod \
-  -l rio.build/pool=smoke --timeout=300s \
-  || die "worker pods not Ready (check 'kubectl -n $NS describe pod -l rio.build/pool=smoke')"
+# `just eks deploy` applies a default WorkerPool (templates/
+# workerpool.yaml) with min=0 max=1000. At rest (no queue) it sits
+# at 0 replicas, so we can't wait for Ready yet — instead confirm
+# the CR exists and the controller reconciled it (status populated).
+POOL=default
+log "waiting for WorkerPool/$POOL reconcile"
+retry 12 5 bash -c '
+  kubectl -n '"$NS"' get workerpool '"$POOL"' \
+    -o jsonpath="{.status.desiredReplicas}" 2>/dev/null | grep -q .
+' || die "WorkerPool/$POOL not reconciled — check rio-controller logs"
 
 # ----------------------------------------------------------------
 # 5. Build nixpkgs#hello through the tunnel
@@ -165,7 +139,11 @@ kubectl -n "$NS" wait --for=condition=Ready pod \
 # run but fail on reruns after a gateway restart.
 STORE_URL="ssh-ng://rio@localhost:$LOCAL_PORT?ssh-key=$SSH_KEY"
 
-log "building nixpkgs#hello via $STORE_URL"
+# First build from a cold cluster: queue goes 0→1 → rio-controller
+# scales STS to 1 (next 30s poll) → pod Pending → Karpenter provisions
+# a node (~30-60s) → pod Running → build dispatched. ~2min before any
+# build output appears.
+log "building nixpkgs#hello via $STORE_URL (cold-start: ~2min before first output)"
 NIX_SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   nix build nixpkgs#hello --store "$STORE_URL" --no-link \
   || die "hello build failed"
@@ -201,12 +179,20 @@ NIX_SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
   nix build nixpkgs#cowsay --store "$STORE_URL" --no-link --rebuild &
 BUILD_PID=$!
 
-# Wait for dispatch. 10s is heuristic — the scheduler's tick
-# interval is 10s so one tick should get us there.
-sleep 10
+# Wait for the autoscaler to scale to >=2 before killing. With
+# min=0, killing the only worker would leave nothing to reassign
+# to until Karpenter cold-starts another node (~60s) — which the
+# scheduler's reassign timeout might not tolerate. Autoscaler poll
+# is 30s; give it 2 cycles.
+log "waiting for scale-up to >=2 workers"
+retry 12 10 bash -c '
+  ready=$(kubectl -n '"$NS"' get workerpool '"$POOL"' \
+    -o jsonpath="{.status.readyReplicas}" 2>/dev/null)
+  [[ "${ready:-0}" -ge 2 ]]
+' || die "WorkerPool never scaled to >=2 ready replicas"
 
 log "killing one worker pod"
-VICTIM=$(kubectl -n "$NS" get pod -l rio.build/pool=smoke \
+VICTIM=$(kubectl -n "$NS" get pod -l "rio.build/pool=$POOL" \
   -o jsonpath='{.items[0].metadata.name}')
 kubectl -n "$NS" delete pod "$VICTIM" --wait=false
 
@@ -224,4 +210,3 @@ log "after: $DISCONNECTS_AFTER"
 
 # ----------------------------------------------------------------
 log "SMOKE TEST PASSED"
-log "cleanup: kubectl -n $NS delete workerpool smoke"

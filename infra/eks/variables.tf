@@ -29,24 +29,10 @@ variable "system_instance_type" {
   default     = "m5.large"
 }
 
-variable "worker_instance_type" {
-  description = "Instance type for worker nodegroup (rio-worker pods, compute-heavy)"
-  type        = string
-  # c6a = AMD EPYC, compute-optimized. Good price/perf for nix builds.
-  default = "c6a.xlarge"
-}
-
-variable "worker_min_size" {
-  description = "Minimum worker nodes"
-  type        = number
-  default     = 2
-}
-
-variable "worker_max_size" {
-  description = "Maximum worker nodes (autoscaler ceiling)"
-  type        = number
-  default     = 10
-}
+# worker_instance_type / worker_min_size / worker_max_size removed —
+# worker nodes are Karpenter-provisioned (karpenter.tf). Instance
+# families are configured per-NodePool in the chart
+# (values.yaml karpenter.nodePools).
 
 # chunk_bucket var removed — now terraform-managed (s3.tf). Bucket name
 # is derived from cluster_name + random suffix (S3 bucket names are

@@ -112,8 +112,10 @@ deploy:
     db_arn=$(just eks::_tf-out db_secret_arn)
     db_host=$(just eks::_tf-out db_endpoint)
     region=$(just eks::_tf-out region)
+    cluster=$(just eks::_tf-out cluster_name)
+    node_role=$(just eks::_tf-out karpenter_node_role_name)
 
-    echo "[deploy] tag=$tag registry=$ecr"
+    echo "[deploy] tag=$tag registry=$ecr cluster=$cluster"
 
     # CRDs first, server-side apply (WorkerPool schema is ~15KB —
     # client-side apply bloats last-applied-configuration).
@@ -162,7 +164,11 @@ deploy:
         --set bootstrap.enabled=true \
         --set bootstrap.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$bootstrap_arn" \
         --set-json 'gateway.service.annotations={"service.beta.kubernetes.io/aws-load-balancer-type":"external","service.beta.kubernetes.io/aws-load-balancer-nlb-target-type":"ip","service.beta.kubernetes.io/aws-load-balancer-scheme":"internal","service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22":"tcp.idle_timeout.seconds=3600"}' \
-        --wait --timeout 5m
+        --set karpenter.enabled=true \
+        --set karpenter.clusterName="$cluster" \
+        --set karpenter.nodeRoleName="$node_role" \
+        --set workerPool.enabled=true \
+        --wait --timeout 10m
 
 # Rollback to a previous release (REV from `just eks history`; omit for previous)
 rollback REV="0":
@@ -189,7 +195,11 @@ up: (_up "apply")
 # Full bring-up, auto-approves apply
 up-auto: (_up "apply-auto")
 
-# WorkerPool finalizers hold pods → NLB → tofu destroy blocks.
+# WorkerPool finalizers hold pods → NLB → tofu destroy blocks. Karpenter
+# NodeClaims must also be deleted BEFORE tofu destroys helm_release.
+# karpenter — otherwise EC2 instances are orphaned (nothing left to
+# terminate them).
 destroy:
     kubectl -n rio-system delete workerpool --all --wait=true --ignore-not-found
+    kubectl delete nodeclaim --all --wait=true --ignore-not-found 2>/dev/null || true
     tofu -chdir=infra/eks destroy

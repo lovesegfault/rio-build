@@ -8,7 +8,8 @@ by the justfile at the repo root — `just --list` for the menu.
 
 | Component | Resource | Notes |
 |---|---|---|
-| EKS cluster | 1.33, 2 nodegroups | system (3× m5.large) + workers (2-10× c6a.xlarge, tainted) |
+| EKS cluster | 1.33, 1 nodegroup | system (3× m5.large, untainted) |
+| Karpenter | helm_release + Pod Identity + SQS | provisions worker nodes on-demand (c6a/c7a preferred, m/r fallback) |
 | Aurora PG | Serverless v2, 0.5-2 ACU | shared by scheduler + store, password in Secrets Manager |
 | S3 bucket | NAR chunk storage | name: `<cluster_name>-chunks-<random>` |
 | ECR repos | 7 (gateway/scheduler/store/controller/worker/fod-proxy/bootstrap) | immutable tags, keep-last-10 lifecycle |
@@ -47,7 +48,7 @@ just eks up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min
 # just eks deploy                 # render + kubectl apply
 
 # Verify
-kubectl get nodes                 # should show 5 nodes Ready
+kubectl get nodes                 # should show 3 system nodes Ready (workers scale from 0 on demand)
 just eks smoke                    # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
 ```
 
@@ -87,19 +88,30 @@ just eks push eks deploy
 Deploy history: `just eks history`. Rollback: `just eks rollback [REV]`
 (omit REV for previous).
 
+## Autoscaling
+
+Two layers, chained:
+
+1. **Pod layer** (`rio-controller/src/scaling.rs`): polls scheduler queue depth every 30s, SSA-patches the WorkerPool StatefulSet replica count between `spec.replicas.{min,max}`. Scale-up is immediate; scale-down requires 10 minutes of quiet (`SCALE_DOWN_WINDOW`).
+2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When pods scale to zero, empty nodes are consolidated after `consolidateAfter` (30s for workers, 5m for general).
+
+The chain: build submitted → queue depth > 0 → rio-controller scales STS to N → N pods Pending (no worker nodes exist) → Karpenter provisions node(s) → pods Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a worker mid-build — only consolidates after rio-controller has scaled the pods away.
+
+Three NodePools (weighted priority): `rio-worker-preferred` (c6a/c7a, weight 100), `rio-worker-fallback` (m/r-category, weight 10), `rio-general` (untainted, for future gateway/scheduler HPA overflow). One shared EC2NodeClass. Configured in `infra/helm/rio-build/values.yaml` under `karpenter.nodePools`.
+
 ## Cost (us-east-2, on-demand)
 
 | Item | ~USD/mo |
 |---|---|
 | EKS control plane | $73 (fixed) |
 | 3× m5.large (system) | ~$210 |
-| 2× c6a.xlarge (workers min) | ~$220 |
+| Karpenter worker nodes | $0 idle; ~$55/mo per c6a.large while building |
 | Aurora Serverless v2 @ 0.5 ACU | ~$44 |
 | NAT Gateway | ~$35 + data |
 | t3.micro bastion | ~$8 |
-| **Total (min workers, idle Aurora)** | **~$590/mo** |
+| **Total (idle, no builds)** | **~$370/mo** |
 
-Scaling to 10 workers adds ~$1100/mo. Aurora at 2 ACU adds ~$130/mo.
+Worker cost scales with build load. rio-controller's 10-min scale-down + Karpenter consolidation means an hour of intermittent builds ≈ 1h of node time. Aurora at 2 ACU adds ~$130/mo.
 
 ## Teardown
 
