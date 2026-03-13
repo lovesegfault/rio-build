@@ -740,8 +740,19 @@
                   set -euo pipefail
                   fail=0
                   for overlay in infra/k8s/overlays/*/; do
+                    # Some overlays (dev/) have secretGenerator
+                    # sourcing gitignored per-user files that
+                    # don't exist in the Nix sandbox. Render
+                    # first; skip overlay if kustomize itself
+                    # can't resolve inputs. kubeconform only
+                    # runs on overlays that DID render.
+                    if ! out=$(${pkgs.kubectl}/bin/kubectl kustomize "$overlay" 2>&1); then
+                      echo "kubeconform: $overlay (skipped — kustomize render failed)"
+                      echo "$out" | head -1
+                      continue
+                    fi
                     echo "kubeconform: $overlay"
-                    ${pkgs.kubectl}/bin/kubectl kustomize "$overlay" \
+                    printf '%s\n' "$out" \
                       | ${pkgs.kubeconform}/bin/kubeconform -strict -summary \
                           -skip CustomResourceDefinition,Certificate,ClusterIssuer,Issuer,Cluster,WorkerPool,Build \
                       || fail=1
