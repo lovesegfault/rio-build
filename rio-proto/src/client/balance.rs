@@ -324,7 +324,7 @@ pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// probe loop.
 ///
 /// Use `connect_scheduler` for single-endpoint connects (tests,
-/// controller's per-call pattern via the ClusterIP Service).
+/// local dev with a single scheduler replica).
 pub async fn connect_scheduler_balanced(
     host: String,
     port: u16,
@@ -359,6 +359,29 @@ pub async fn connect_worker_balanced(
     )
     .await?;
     let client = crate::WorkerServiceClient::new(bc.channel())
+        .max_decoding_message_size(crate::max_message_size())
+        .max_encoding_message_size(crate::max_message_size());
+    Ok((client, bc))
+}
+
+/// Like `connect_scheduler_balanced` but for `AdminServiceClient`.
+/// The controller's autoscaler uses this for `ClusterStatus` polling
+/// — AdminService is on the same port and the standby rejects with
+/// UNAVAILABLE just like SchedulerService (`rio-scheduler/src/admin/
+/// mod.rs` leader guard), so the same health probe applies.
+pub async fn connect_admin_balanced(
+    host: String,
+    port: u16,
+) -> anyhow::Result<(crate::AdminServiceClient<Channel>, BalancedChannel)> {
+    let bc = BalancedChannel::new(
+        host,
+        port,
+        SCHEDULER_HEALTH_SERVICE.into(),
+        SCHEDULER_TLS_DOMAIN.into(),
+        DEFAULT_PROBE_INTERVAL,
+    )
+    .await?;
+    let client = crate::AdminServiceClient::new(bc.channel())
         .max_decoding_message_size(crate::max_message_size())
         .max_encoding_message_size(crate::max_message_size());
     Ok((client, bc))
