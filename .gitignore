@@ -20,3 +20,7 @@ docs/book/
 
 # tracey daemon state (unix socket, cache)
 .tracey/
+
+# Local dev runtime state (postgres data, gateway keys)
+.data/
+*.qcow2

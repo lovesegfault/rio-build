@@ -1,0 +1,152 @@
+# Local dev stack: postgres + rio-store + rio-scheduler + rio-gateway
+#
+# Usage:
+#   nix develop
+#   process-compose up
+#
+# Then, in another terminal:
+#   # Test end-to-end:
+#   nix store info --store 'ssh-ng://localhost:2222'
+#   nix copy --to 'ssh-ng://localhost:2222' nixpkgs#hello
+#
+# Note: `nix eval --store 'ssh-ng://...'` with flake refs requires
+# `--eval-store auto` due to a Nix client bug (applies to any ssh-ng store,
+# not just rio-gateway).
+#
+# Controller is excluded (needs a K8s API server). Worker runs in a QEMU
+# microVM (rio-worker-vm, disabled by default — start from TUI or CLI).
+
+version: "0.5"
+
+processes:
+  postgres:
+    command: |
+      set -euo pipefail
+      pgdata=".data/postgres"
+      if [ ! -f "$pgdata/PG_VERSION" ]; then
+        initdb -D "$pgdata" --encoding=UTF8 --locale=C -U rio --auth=trust
+        cat >> "$pgdata/postgresql.conf" <<CONF
+      listen_addresses = '127.0.0.1'
+      port = 5432
+      unix_socket_directories = ''
+      fsync = off
+      synchronous_commit = off
+      full_page_writes = off
+      CONF
+      fi
+      exec postgres -D "$pgdata"
+    readiness_probe:
+      exec:
+        command: pg_isready -h 127.0.0.1 -p 5432
+      initial_delay_seconds: 2
+      period_seconds: 2
+    shutdown:
+      signal: 2 # SIGINT for clean postgres shutdown
+      timeout_seconds: 10
+
+  postgres-init:
+    command: |
+      set -euo pipefail
+      # Create the dev database if it doesn't exist yet.
+      if ! psql -h 127.0.0.1 -p 5432 -U rio -d postgres -tc \
+           "SELECT 1 FROM pg_database WHERE datname = 'rio_dev'" | grep -q 1; then
+        psql -h 127.0.0.1 -p 5432 -U rio -d postgres -c "CREATE DATABASE rio_dev"
+      fi
+    depends_on:
+      postgres:
+        condition: process_healthy
+
+  gateway-init:
+    command: |
+      set -euo pipefail
+      mkdir -p .data/gateway
+      if [ ! -f .data/gateway/authorized_keys ]; then
+        # Seed with the user's SSH public keys so the gateway accepts
+        # connections out of the box.
+        cat ~/.ssh/*.pub > .data/gateway/authorized_keys 2>/dev/null || true
+      fi
+    availability:
+      restart: "no"
+
+  rio-store:
+    command: cargo run -p rio-store
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+    environment:
+      - RIO_DATABASE_URL=postgres://rio@127.0.0.1:5432/rio_dev
+      - RIO_LISTEN_ADDR=127.0.0.1:9002
+      - RIO_LOG_FORMAT=pretty
+      - RIO_METRICS_ADDR=127.0.0.1:9092
+    readiness_probe:
+      exec:
+        command: nc -z 127.0.0.1 9002
+      initial_delay_seconds: 5
+      period_seconds: 5
+      failure_threshold: 100 # cargo compile can take minutes on cold build
+
+  rio-scheduler:
+    command: cargo run -p rio-scheduler
+    depends_on:
+      rio-store:
+        condition: process_healthy
+    environment:
+      - RIO_DATABASE_URL=postgres://rio@127.0.0.1:5432/rio_dev
+      - RIO_STORE_ADDR=127.0.0.1:9002
+      - RIO_LISTEN_ADDR=127.0.0.1:9001
+      - RIO_LOG_FORMAT=pretty
+      - RIO_METRICS_ADDR=127.0.0.1:9091
+    readiness_probe:
+      exec:
+        command: nc -z 127.0.0.1 9001
+      initial_delay_seconds: 5
+      period_seconds: 5
+      failure_threshold: 100
+
+  rio-gateway:
+    command: cargo run -p rio-gateway
+    depends_on:
+      rio-scheduler:
+        condition: process_healthy
+      gateway-init:
+        condition: process_completed_successfully
+    environment:
+      - RIO_SCHEDULER_ADDR=127.0.0.1:9001
+      - RIO_STORE_ADDR=127.0.0.1:9002
+      - RIO_LISTEN_ADDR=127.0.0.1:2222
+      - RIO_HOST_KEY=.data/gateway/host_key
+      - RIO_AUTHORIZED_KEYS=.data/gateway/authorized_keys
+      - RIO_LOG_FORMAT=pretty
+      - RIO_METRICS_ADDR=127.0.0.1:9090
+      - RUST_LOG=rio_gateway=info
+    readiness_probe:
+      exec:
+        command: nc -z 127.0.0.1 2222
+      initial_delay_seconds: 5
+      period_seconds: 5
+      failure_threshold: 100
+
+  # Worker in a QEMU microVM (needs KVM). Disabled by default — start from
+  # the process-compose TUI (select it, press 's') or via CLI.
+  rio-worker-vm:
+    command: |
+      set -euo pipefail
+      if [ ! -e /dev/kvm ]; then
+        echo "Worker VM requires KVM (/dev/kvm not found), skipping"
+        exit 0
+      fi
+      nix build .#worker-vm -o result-worker-vm --log-format bar-with-logs
+      exec result-worker-vm/bin/run-rio-worker-dev-vm
+    disabled: true
+    depends_on:
+      rio-scheduler:
+        condition: process_healthy
+    readiness_probe:
+      exec:
+        command: curl -sf http://127.0.0.1:9193/readyz
+      initial_delay_seconds: 30
+      period_seconds: 5
+      failure_threshold: 100 # VM boot + worker connecting to scheduler
+    shutdown:
+      signal: 2 # SIGINT for clean QEMU shutdown
+      timeout_seconds: 30
