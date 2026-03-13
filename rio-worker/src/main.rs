@@ -79,11 +79,18 @@ async fn main() -> anyhow::Result<()> {
     // A worker with zero systems is useless (scheduler's can_build
     // always false) — auto-detect is a sensible default, not a
     // silent fallback for misconfiguration.
-    let systems = if cfg.systems.is_empty() {
+    let mut systems = if cfg.systems.is_empty() {
         vec![detect_system()]
     } else {
         cfg.systems
     };
+    // Every nix-daemon supports builtin:fetchurl — it's handled
+    // internally, no real process forked. Bootstrap derivations
+    // (busybox, bootstrap-tools) have system="builtin"; without
+    // this, a cold store permanently stalls at the DAG leaves.
+    if !systems.iter().any(|s| s == "builtin") {
+        systems.push("builtin".to_string());
+    }
     // features: no auto-detect. Empty is valid (worker supports no
     // special features). Operator sets these explicitly in the CRD
     // — auto-detecting "kvm" by checking /dev/kvm exists would be

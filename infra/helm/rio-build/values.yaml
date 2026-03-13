@@ -272,9 +272,8 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      # Ceiling: max=1000 workers * ~4 cpu/pod = 4000. Cost control — hard
-      # cap on what Karpenter will provision for this pool.
-      limits: {cpu: 4000}
+      # Test ceiling. Production target: max=1000 workers * ~4 cpu/pod = 4000.
+      limits: {cpu: 256}
       consolidateAfter: 30s
 
     # Worker fallback: m/r categories, any family. If c-capacity is
@@ -298,7 +297,7 @@ karpenter:
         - key: karpenter.sh/capacity-type
           operator: In
           values: [on-demand]
-      limits: {cpu: 4000}
+      limits: {cpu: 256}
       consolidateAfter: 30s
 
     # General: untainted, for future gateway/scheduler HPA overflow.
@@ -333,12 +332,12 @@ workerPool:
   enabled: false
   name: default
   replicas:
-    # True scale-to-zero. rio-controller's 10-min SCALE_DOWN_WINDOW
-    # (scaling.rs:59) means queue must be quiet for 10 min before hitting 0.
-    # Then Karpenter consolidates the empty node ~30s later.
-    # Cold start on next build: ~30-60s (node boot) + ~20s (pod start).
-    min: 0
-    max: 1000
+    # min=2 for smoke-test worker-kill phase: need >=2 workers so killing
+    # one leaves another for immediate reassign. With min=0 and instant
+    # dispatch (no queue pressure), autoscaler never scales past 1.
+    # Production target: min=0 (scale-to-zero via SCALE_DOWN_WINDOW).
+    min: 2
+    max: 10
   autoscaling:
     metric: queueDepth
     targetValue: 5   # scale up when queued / active_workers > 5

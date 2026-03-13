@@ -152,6 +152,13 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
         .filter(|p| !missing_set.contains(p))
         .collect();
 
+    debug!(
+        queried = missing_set.len() + valid_strs.len(),
+        valid = valid_strs.len(),
+        missing = missing_set.len(),
+        "wopQueryValidPaths: result"
+    );
+
     stderr.finish().await?;
     wire::write_strings(stderr.inner_mut(), &valid_strs).await?;
     Ok(())
@@ -592,10 +599,10 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
     let raw_paths = wire::read_strings(reader).await?;
     debug!(count = raw_paths.len(), "wopQueryMissing");
 
-    let derived: Vec<(String, DerivedPath)> = raw_paths
+    let derived: Vec<DerivedPath> = raw_paths
         .into_iter()
         .filter_map(|s| match DerivedPath::parse(&s) {
-            Ok(dp) => Some((s, dp)),
+            Ok(dp) => Some(dp),
             Err(e) => {
                 warn!(path = %s, error = %e, "dropping unparseable DerivedPath in wopQueryMissing");
                 None
@@ -605,7 +612,7 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
 
     let store_paths: Vec<String> = derived
         .iter()
-        .map(|(_, dp)| dp.store_path().to_string())
+        .map(|dp| dp.store_path().to_string())
         .collect();
 
     let req = types::FindMissingPathsRequest { store_paths };
@@ -623,24 +630,27 @@ pub(super) async fn handle_query_missing<R: AsyncRead + Unpin, W: AsyncWrite + U
         ),
     };
 
+    // wopQueryMissing response is three StorePathSets (willBuild,
+    // willSubstitute, unknown) — plain store paths, NOT DerivedPath
+    // wire strings. For Built paths, report the .drv; echoing the raw
+    // `...drv!out` string makes the Nix client fail StorePath::parse
+    // on '!'.
     let mut will_build = Vec::new();
     let mut unknown = Vec::new();
 
-    for (raw, dp) in derived {
-        let sp_str = dp.store_path().to_string();
-        if !missing_set.contains(&sp_str) {
+    for dp in derived {
+        let sp = dp.store_path();
+        if !missing_set.contains(sp.as_str()) {
             continue;
         }
-        match &dp {
+        match dp {
             DerivedPath::Built { drv, .. } => {
-                // For Built paths, walk the derivation to find outputs that need building.
-                // We report the raw DerivedPath string rather than resolving to outputs.
-                if let Err(e) = resolve_derivation(drv, store_client, drv_cache).await {
+                if let Err(e) = resolve_derivation(&drv, store_client, drv_cache).await {
                     tracing::warn!(drv = %drv, error = %e, "failed to resolve derivation in wopQueryMissing");
                 }
-                will_build.push(raw);
+                will_build.push(drv.as_str().to_string());
             }
-            DerivedPath::Opaque(_) => unknown.push(raw),
+            DerivedPath::Opaque(path) => unknown.push(path.as_str().to_string()),
         }
     }
 
