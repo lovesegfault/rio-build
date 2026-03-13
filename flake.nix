@@ -1,6 +1,9 @@
 {
   description = "rio-build - Nix build orchestration";
 
+  # tracey's patched source derivation requires IFD during evaluation.
+  nixConfig.allow-import-from-derivation = true;
+
   inputs = {
     nix = {
       url = "github:NixOS/Nix/2.33.3";
@@ -760,6 +763,9 @@
                 # Integration test deps
                 postgresql_18
 
+                # Local dev stack (`process-compose up`)
+                process-compose
+
                 # Formatting (nix fmt also works, but direct treefmt is handy)
                 config.treefmt.build.wrapper
 
@@ -823,6 +829,18 @@
                 path = drv;
               }) dockerImages
             );
+
+            # Dev worker VM (QEMU + NixOS). Reuses nix/modules/worker.nix
+            # with SLiRP networking to reach the host's control plane.
+            # Run: result-worker-vm/bin/run-rio-worker-dev-vm
+            worker-vm =
+              (nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  ./nix/dev-worker-vm.nix
+                  { services.rio.package = rio-workspace; }
+                ];
+              }).config.system.build.vm;
 
             # CRD YAML for kustomize. runCommand invokes the crdgen
             # binary (serde_yaml write-only) and dumps two YAML
