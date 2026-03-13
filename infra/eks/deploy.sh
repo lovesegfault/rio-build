@@ -188,21 +188,18 @@ log "applying manifests"
 kubectl apply -k "$RENDER/infra/k8s/overlays/eks"
 
 # --- Wait for rollout ---
+# All four deployments use condition=Available. The scheduler used
+# to need a jsonpath wait for readyReplicas=1 (7b731ae) because its
+# readinessProbe gated on is_leader → at most 1 Ready → Available
+# (needs replicas - maxUnavailable Ready) was permanently false with
+# Recreate strategy. Now readiness = TCP (process up), both pods
+# Ready, RollingUpdate with maxUnavailable=1 → Available needs 1
+# Ready, we have 2.
 log "waiting for control-plane pods"
 kubectl -n "$NS" wait --for=condition=Available \
-  deployment/rio-store deployment/rio-gateway deployment/rio-controller \
+  deployment/rio-store deployment/rio-scheduler \
+  deployment/rio-gateway deployment/rio-controller \
   --timeout=300s \
   || die "control-plane deployments didn't become Available"
-
-# Scheduler is different: readinessProbe gates on is_leader (so the
-# Service routes only to the active replica). replicas=2 means
-# exactly 1 is ever Ready — the standby stays not-Ready by design.
-# The Available condition needs availableReplicas >= replicas -
-# MaxUnavailable, and for Recreate strategy MaxUnavailable is 0
-# (it only applies to RollingUpdate). So Available needs 2/2 Ready,
-# which is permanently false. Wait for 1 Ready explicitly instead.
-kubectl -n "$NS" wait deployment/rio-scheduler \
-  --for=jsonpath='{.status.readyReplicas}'=1 --timeout=300s \
-  || die "scheduler never elected a leader"
 
 log "done. Next: ./infra/eks/smoke-test.sh"

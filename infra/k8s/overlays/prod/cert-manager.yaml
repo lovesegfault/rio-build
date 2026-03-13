@@ -97,6 +97,12 @@ spec:
     - rio-scheduler.rio-system
     - rio-scheduler.rio-system.svc
     - rio-scheduler.rio-system.svc.cluster.local
+    # NOT adding rio-scheduler-headless: balanced-channel clients
+    # connect to pod IPs (https://10.42.x.y:9001) with a domain_name
+    # override pointing at "rio-scheduler" (the first SAN here).
+    # See rio-proto/src/client/balance.rs build_endpoint() — the
+    # connect URI's host is the IP, but rustls verifies against
+    # the override domain. No SAN change needed.
   issuerRef:
     kind: Issuer
     name: rio-ca-issuer

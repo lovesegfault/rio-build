@@ -2,8 +2,16 @@
 #
 # replicas=2 for HA. Leader election via K8s Lease means ONE
 # replica dispatches; the other merges DAGs (state warm) but
-# dispatch_ready early-returns until it acquires. Readiness
-# gates on is_leader → Service routes only to the leader.
+# dispatch_ready early-returns until it acquires.
+#
+# Readiness is DECOUPLED from leadership: both pods are Ready
+# (process up, gRPC listening) but only the leader serves RPCs
+# (r[sched.grpc.leader-guard]). Clients route via the headless
+# Service + health-aware balancer (rio-proto/src/client/balance.rs)
+# which probes grpc.health.v1 and only inserts SERVING endpoints.
+# The ClusterIP Service below is kept for per-call connects
+# (controller reconcilers, rio-cli, tests) — those get UNAVAILABLE
+# 50% of the time and retry, which is fine for non-hot-path.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -13,32 +21,26 @@ metadata:
     app.kubernetes.io/name: rio-scheduler
     app.kubernetes.io/component: scheduler
 spec:
-  # 2 replicas: one leader, one hot standby. The standby's
-  # readinessProbe fails (tonic-health NOT_SERVING when
-  # !is_leader) → Service excludes it → all client traffic
-  # hits the leader. On leader death: standby acquires the
-  # Lease → is_leader=true → readiness passes → traffic flows.
-  # ~1s failover (step_down on SIGTERM; 15s Lease TTL is the
-  # fallback for crash death).
+  # 2 replicas: one leader, one hot standby. Both are Ready
+  # (TCP probe = process up). The ClusterIP Service round-
+  # robins; the headless Service exposes both pod IPs so
+  # clients with a balanced channel can health-probe.
   replicas: 2
-  # Recreate, not RollingUpdate. readinessProbe gates on is_leader
-  # (by design — it's how the Service routes to the active
-  # replica). That means at most 1 pod is EVER Ready. RollingUpdate
-  # requires (replicas - maxUnavailable) Ready at all times, and
-  # even with maxUnavailable: 1 that's 1 Ready minimum — which
-  # means k8s won't terminate the old leader (only Ready pod)
-  # until a new pod is Ready, but new pods can't be Ready until
-  # they acquire the lease, which the old leader holds. Deadlock.
-  # commit 6250327 tried maxUnavailable: 1 but that only lets k8s
-  # kill the old STANDBY, not the leader.
-  #
-  # Recreate terminates all old pods first. step_down() on SIGTERM
-  # (rio-scheduler/src/lease.rs) releases the lease immediately so
-  # the new pod acquires on its first poll. Rollout downtime:
-  # grace period + pod start + 1 poll ≈ a few seconds. Acceptable
-  # for a deliberate deploy; the standby is for UNPLANNED failover.
+  # RollingUpdate works now that readiness ≠ leadership. Both
+  # pods Ready → Available condition true (replicas - maxUnavail
+  # = 2 - 1 = 1, and we have 2 Ready). pod-deletion-cost
+  # annotation (set by the leader on acquire, lease.rs) makes
+  # K8s kill the standby first, so:
+  #   1. surge: new pod comes up, becomes Ready, stays standby
+  #   2. scale-down: K8s picks lowest cost = old standby, kills it
+  #   3. repeat: new pod comes up, old leader step_down on SIGTERM,
+  #      new pod acquires, balanced-channel clients reroute in ~3s
+  # One leadership flip per rollout instead of two.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: rio-scheduler
@@ -120,16 +122,19 @@ spec:
                 secretKeyRef:
                   name: rio-postgres
                   key: url
-          # gRPC readiness: tonic-health reports SERVING only
-          # when is_leader=true (the health-toggle loop in
-          # main.rs). MUST specify the service name —
-          # set_not_serving::<S>() affects only the NAMED
-          # service, not empty-string "". The proto package is
-          # `rio.scheduler`, no `.v1` suffix.
+          # TCP readiness: "is the gRPC server listening." NOT
+          # gated on is_leader — that's the whole point of this
+          # design. Both pods Ready; clients route via health-
+          # aware balancer which DOES check is_leader (via
+          # grpc.health.v1 on the named service).
+          #
+          # The old gRPC-named-service probe is still WHAT THE
+          # BALANCER uses — just not what K8s uses. K8s only
+          # needs to know "pod is up"; the balancer knows "pod
+          # is leader."
           readinessProbe:
-            grpc:
+            tcpSocket:
               port: 9001
-              service: rio.scheduler.SchedulerService
             periodSeconds: 5
             failureThreshold: 3
           # Liveness: same check but LONGER threshold. A
@@ -175,6 +180,33 @@ metadata:
     app.kubernetes.io/name: rio-scheduler
 spec:
   type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rio-scheduler
+  ports:
+    - name: grpc
+      port: 9001
+      targetPort: grpc
+---
+# Headless Service: exposes pod IPs directly as DNS A records.
+# clusterIP: None → CoreDNS returns ALL matching pod IPs (TTL 5s
+# by default), not a single VIP. The balanced-channel clients
+# (gateway, worker) resolve this, probe each IP via grpc.health.v1,
+# and route to the SERVING one (= the leader).
+#
+# TLS note: clients connect to pod IPs (https://10.42.x.y:9001)
+# but the cert's SAN is "rio-scheduler" (the ClusterIP name).
+# ClientTlsConfig::domain_name() overrides the verify domain
+# independently of the connect URI — see balance.rs. So NO SAN
+# change needed in cert-manager.yaml. Adding "rio-scheduler-
+# headless" to dnsNames would also work but isn't necessary.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-scheduler-headless
+  labels:
+    app.kubernetes.io/name: rio-scheduler
+spec:
+  clusterIP: None
   selector:
     app.kubernetes.io/name: rio-scheduler
   ports:
