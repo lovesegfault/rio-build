@@ -31,6 +31,16 @@ struct Config {
     /// rio-scheduler gRPC address. AdminService + SchedulerService
     /// on the same port. Required — no sensible default.
     scheduler_addr: String,
+    /// Headless Service host. Used two ways:
+    ///   1. Passed to workers as `RIO_SCHEDULER_BALANCE_HOST`.
+    ///   2. Used by THIS process's autoscaler for leader-aware
+    ///      ClusterStatus polling. `None` → single-channel fallback
+    ///      via `scheduler_addr` (ClusterIP — round-robins to the
+    ///      standby ~50% of the time with replicas=2).
+    ///
+    /// In K8s: set to `rio-scheduler-headless` via env.
+    scheduler_balance_host: Option<String>,
+    scheduler_balance_port: u16,
     /// rio-store gRPC address. Build reconciler fetches .drv
     /// content from here. Required for Build CRDs; WorkerPool-
     /// only deployments can leave it empty (Build reconciler
@@ -58,6 +68,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scheduler_addr: String::new(),
+            scheduler_balance_host: None,
+            scheduler_balance_port: 9001,
             store_addr: String::new(),
             // 9094: gateway=9090, scheduler=9091, store=9092,
             // worker=9093. Controller is next.
@@ -155,11 +167,36 @@ async fn main() -> anyhow::Result<()> {
     // connects (health server spawned below). That's correct: a
     // controller that can't read ClusterStatus can't autoscale.
     //
+    // Balanced when scheduler_balance_host is set: the standby
+    // replica returns UNAVAILABLE on AdminService RPCs (leader
+    // guard), so polling via the ClusterIP Service fails ~50% of
+    // ticks. The balanced channel health-probes pod IPs and routes
+    // only to the leader. Guard held in _balance_guard for process
+    // lifetime — dropping it stops the probe loop.
+    //
     // The reconciler DOESN'T use this client — it patches K8s
     // objects only. The WorkerPool finalizer's cleanup() connects
-    // lazily per-call for DrainWorker.
-    info!(addr = %cfg.scheduler_addr, "connecting to scheduler");
-    let scheduler = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
+    // lazily per-call for DrainWorker (single-shot, retry on
+    // UNAVAILABLE is fine there).
+    let (scheduler, _balance_guard) = match &cfg.scheduler_balance_host {
+        None => {
+            info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
+            let c = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
+            (c, None)
+        }
+        Some(host) => {
+            info!(
+                %host, port = cfg.scheduler_balance_port,
+                "connecting to scheduler (health-aware balanced)"
+            );
+            let (c, bc) = rio_proto::client::balance::connect_admin_balanced(
+                host.clone(),
+                cfg.scheduler_balance_port,
+            )
+            .await?;
+            (c, Some(bc))
+        }
+    };
 
     // ---- Health server ----
     // AFTER kube + scheduler connect: liveness should pass only
@@ -189,6 +226,8 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
+        scheduler_balance_host: cfg.scheduler_balance_host.clone(),
+        scheduler_balance_port: cfg.scheduler_balance_port,
         store_addr: cfg.store_addr.clone(),
         recorder: recorder.clone(),
         watching: Arc::new(dashmap::DashMap::new()),

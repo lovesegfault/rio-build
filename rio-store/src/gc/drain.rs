@@ -106,8 +106,8 @@ pub async fn drain_once(
         // permanent S3 hole. Requires: drain delete + 2 PutPaths
         // for SAME chunk in ~milliseconds. GetPath's BLAKE3
         // verify catches the hole (NotFound, not silent
-        // corruption). TODO(phase4): xmax-based inserted-check
-        // in cas.rs upsert to close this.
+        // corruption). TODO(phase4b): xmax-based inserted-check
+        // in cas.rs upsert to close this (X18 drain race).
         if let Some(hash) = &blake3_hash {
             let still_dead: bool = sqlx::query_scalar(
                 "SELECT (deleted AND refcount = 0) FROM chunks WHERE blake3_hash = $1",

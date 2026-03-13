@@ -8,6 +8,10 @@
 #   memory.peak → build_history.ema_peak_memory_bytes end-to-end
 #   (cgroup memory.peak captures tree-wide footprint). Finalizer drain.
 #
+# r[verify obs.metric.controller]
+# Autoscaler section scrapes rio_controller_scaling_decisions_total
+# (exact name from the observability spec's controller metrics table).
+#
 # Topology (3 VMs):
 #   k8s     — k3s server + rio-controller (systemd, not pod).
 #             Worker runs AS A POD here. 4GB RAM, 8 cores
@@ -24,14 +28,16 @@
 # (RBAC first, then controller). As a systemd service with
 # KUBECONFIG=/etc/rancher/k3s/k3s.yaml, it has cluster-admin
 # (the node's own kubeconfig) — starts immediately after k3s.
-# Production uses the pod path (deploy/base/controller.yaml).
+# Production uses the pod path (infra/helm/rio-build/templates/controller.yaml).
+# phase4.nix exercises that via helmRendered — phase3a stays on systemd
+# until the helm path is proven green there.
 #
 # Why hostNetwork + privileged on the worker pod: k3s pods
 # can't resolve `control` (CoreDNS doesn't know NixOS-test
 # VM hostnames). hostNetwork → pod uses node's /etc/hosts.
 # privileged → k3s's default seccomp blocks mount(2) even with
 # SYS_ADMIN cap. Both are VM-test concessions; production
-# (deploy/overlays/prod) uses the granular caps.
+# (infra/k8s/overlays/prod) uses the granular caps.
 #
 # Run interactively:
 #   nix build .#checks.x86_64-linux.vm-phase3a.driverInteractive
@@ -44,6 +50,10 @@
   dockerImages, # for airgap preload into k3s
   crds, # nix build .#crds output — auto-deployed via manifests
   coverage ? false,
+  # nixhelm/system passed via k3sArgs for phase4's helm-render. Unused here
+  # (controller runs as systemd, no chart) but swallowed to avoid flake-side
+  # arg branching.
+  ...
 }:
 let
   common = import ./common.nix {
@@ -329,6 +339,18 @@ pkgs.testers.runNixOSTest {
         "k3s kubectl get lease rio-scheduler-lease -n default "
         "-o jsonpath='{.spec.holderIdentity}' | grep -q control",
         timeout=30
+    )
+
+    # leaseTransitions=0 on the create path. The in-house election
+    # code writes this field (the old kube-leader-election crate
+    # didn't always). Single-replica → create path only; the
+    # steal-path increment (transitions+1) is covered by
+    # election.rs::stale_observation_steals + the replace() unit
+    # tests. The 2-replica failover case that would exercise it
+    # end-to-end is TODO(phase4b) per scheduler.md.
+    k8s.succeed(
+        "k3s kubectl get lease rio-scheduler-lease -n default "
+        "-o jsonpath='{.spec.leaseTransitions}' | grep -qx 0"
     )
 
     # Metric: rio_scheduler_lease_acquired_total proves the

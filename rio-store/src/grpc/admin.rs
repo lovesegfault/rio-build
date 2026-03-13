@@ -65,6 +65,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         &self,
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         // proto3 `optional uint32`: None = unset (use default 2h),
         // Some(0) = explicit zero grace (useful for tests + pre-shutdown GC).
@@ -320,6 +321,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         &self,
         request: Request<PinPathRequest>,
     ) -> Result<Response<PinPathResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         // Compute store_path_hash from the path. narinfo keys on
         // SHA-256 of the store path string.
@@ -379,6 +381,7 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         &self,
         request: Request<PinPathRequest>,
     ) -> Result<Response<PinPathResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
         use sha2::Digest;
         let hash: Vec<u8> = sha2::Sha256::digest(req.store_path.as_bytes()).to_vec();

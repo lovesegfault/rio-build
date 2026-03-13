@@ -16,6 +16,18 @@ rio-proto = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 sha2 = { workspace = true }
+# kube_mock: scenario-driven mock apiserver via tower-test
+# mock::pair() wrapped as kube::Client. Shared by rio-controller
+# reconciler tests and rio-scheduler lease election tests.
+tower-test = { workspace = true }
+http = { workspace = true }
+kube = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["process", "signal"] }
+
+[dev-dependencies]
+# kube_mock's verifier_roundtrip test needs a concrete k8s type
+# (Pod) and serde_json for the response body fixture.
+k8s-openapi = { workspace = true }
+serde_json = { workspace = true }

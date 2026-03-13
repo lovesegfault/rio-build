@@ -1,0 +1,23 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+#
+# Most defaults are fine for beme_sandbox dev. Override here if
+# your account/region/naming differs.
+
+# region = "us-east-2"          # default
+
+# cluster_name = "rio-build"    # default. Must be lowercase,
+#                               # hyphens only, start with a letter
+#                               # (used in S3 bucket + RDS names).
+#                               # Change if you're deploying a
+#                               # second rio cluster in the same
+#                               # account.
+
+# kubernetes_version = "1.33"   # default. 1.33+ needed for
+#                               # hostUsers: false (ADR-012).
+
+# Node sizing. Bigger workers = fewer builds queueing, more idle
+# cost. c6a is AMD EPYC compute-optimized — good for nix builds.
+# system_instance_type  = "m5.large"
+# worker_instance_type  = "c6a.xlarge"
+# worker_min_size       = 2
+# worker_max_size       = 10

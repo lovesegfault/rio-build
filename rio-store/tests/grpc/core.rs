@@ -63,6 +63,10 @@ async fn test_put_path_cleanup_on_hash_mismatch() -> TestResult {
 // ---------------------------------------------------------------------------
 
 /// PutPath followed by GetPath should return the same NAR content.
+/// Also exercises the transfer-volume metric emission sites:
+/// `rio_store_put_path_bytes_total` at put_path.rs:575 and
+/// `rio_store_get_path_bytes_total` at get_path.rs:86.
+// r[verify obs.metric.transfer-volume]
 #[tokio::test]
 async fn test_put_get_roundtrip() -> TestResult {
     use rio_proto::types::{GetPathRequest, get_path_response};

@@ -70,6 +70,7 @@ r[obs.metric.gateway]
 | `rio_gateway_handshakes_total` | Counter | Protocol handshakes completed (labeled by result: success/rejected/failure) |
 | `rio_gateway_channels_active` | Gauge | Currently active SSH channels |
 | `rio_gateway_errors_total` | Counter | Protocol errors (labeled by type) |
+| `rio_gateway_bytes_total` | Counter | Bytes forwarded to/from SSH client (labeled by `direction`: `rx`/`tx`) |
 
 > **Note on `rio_gateway_connections_total`:** Incremented on TCP connection (`result=new`), then again on auth outcome (`result=accepted` or `result=rejected`). A single successful connection generates two increments. Use `result=accepted` + `result=rejected` for connection success/failure rates.
 
@@ -134,6 +135,8 @@ r[obs.metric.store]
 | `rio_store_gc_chunk_resurrected_total` | Counter | S3 deletes skipped by the drain task because chunk refcount re-check found the chunk back in use (TOCTOU guard via `pending_s3_deletes.blake3_hash`). |
 | `rio_store_s3_deletes_pending` | Gauge | Rows in `pending_s3_deletes` with `attempts < 10`. Normal operation: near-zero. |
 | `rio_store_s3_deletes_stuck` | Gauge | Rows in `pending_s3_deletes` with `attempts >= 10` (max retries exhausted). Alert if > 0: manual investigation needed. |
+| `rio_store_put_path_bytes_total` | Counter | Bytes accepted via PutPath (nar_size on success) |
+| `rio_store_get_path_bytes_total` | Counter | Bytes served via GetPath (nar_size on stream start) |
 
 ### Worker Metrics
 
@@ -150,8 +153,20 @@ r[obs.metric.worker]
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
 | `rio_worker_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
 | `rio_worker_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`error`/`malformed`/`panic`). Sustained high `already_cached` = scheduler bloom filter stale. |
+| `rio_worker_upload_bytes_total` | Counter | Bytes uploaded to store via PutPath (nar_size on success) |
+| `rio_worker_fuse_fetch_bytes_total` | Counter | Bytes fetched from store via FUSE cache misses |
+| `rio_worker_cpu_fraction` | Gauge | Worker cgroup CPU utilization: delta `cpu.stat usage_usec` / wall-clock µs. 1.0 = one core fully used; >1.0 on multi-core. Directly comparable to cgroup `cpu.max` limits. |
+| `rio_worker_memory_fraction` | Gauge | Worker cgroup memory utilization: `memory.current` / `memory.max`. 0.0 if `memory.max` is `"max"` (unbounded). |
 
 > **Note on ratio metrics:** For aggregatable cache metrics, use counter pairs (e.g., `rio_store_chunk_cache_hits_total` + `rio_store_chunk_cache_misses_total`) and compute ratios at query time with PromQL's `rate()`. Pre-computed gauge ratios lose meaning when averaged across instances. Exception: `rio_store_chunk_dedup_ratio` is a per-upload event gauge (last-written-wins, not averaged) — useful for eyeballing recent PutPath dedup effectiveness but NOT for cross-instance aggregation.
+
+r[obs.metric.transfer-volume]
+
+Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop: gateway (`rio_gateway_bytes_total{direction}`), store (`rio_store_{put,get}_path_bytes_total`), worker (`rio_worker_{upload,fuse_fetch}_bytes_total`). Summing these across the topology gives a full picture of data movement — e.g., `rate(rio_worker_fuse_fetch_bytes_total[5m])` vs `rate(rio_worker_upload_bytes_total[5m])` shows whether a worker is input-bound or output-bound.
+
+r[obs.metric.worker-util]
+
+Worker utilization gauges (`rio_worker_{cpu,memory}_fraction`) are polled from the worker's parent cgroup every 15s by `utilization_reporter_loop`. These capture the whole worker tree (rio-worker + per-build sub-cgroups + all subprocesses). CPU fraction >1.0 on multi-core is expected under full load. Memory fraction stays 0.0 if `memory.max` is unbounded — only meaningful when the pod has a memory limit configured.
 
 ### Controller Metrics
 
@@ -218,7 +233,12 @@ The OTel `service.name` resource attribute is set automatically per component (g
 ### Trace Propagation
 
 r[obs.trace.w3c-traceparent]
-Trace context is propagated via gRPC metadata using the W3C `traceparent` header format. Injection and extraction are **manual**, not tonic interceptors: `rio_proto::interceptor::inject_current()` copies the current span's context into outgoing request metadata (client side), and `rio_proto::interceptor::link_parent()` stitches the `#[instrument]` span into the incoming parent (server side, first line of each handler). Manual is deliberate: tonic's `Interceptor` trait changes `connect_*` return types (62-callsite type churn), doesn't compose with server-side `#[instrument]`, and the explicit call makes propagation points greppable. The W3C `TraceContextPropagator` is registered globally in `init_tracing()` regardless of whether `RIO_OTEL_ENDPOINT` is set — propagation works even when spans aren't exported.
+
+Trace context is propagated via gRPC metadata using the W3C `traceparent` header format.
+
+r[sched.trace.assignment-traceparent]
+
+ssh-ng has no gRPC metadata channel, so the scheduler→worker hop cannot use `inject_current`/`link_parent`. Span context also does not cross the scheduler's mpsc actor channel — calling `current_traceparent()` at dispatch time would capture an orphan actor span. Instead, the `SubmitBuild` gRPC handler captures `current_traceparent()` **after** `link_parent()` (so it's inside the gateway-linked span), and carries it as plain data: `MergeDagRequest.traceparent` → `DerivationState.traceparent` → `WorkAssignment.traceparent` at dispatch. The worker extracts it via `span_from_traceparent()` and wraps the spawned build-executor future in `.instrument(span)`. **First-submitter-wins on dedup:** when two builds merge the same derivation, the existing state's traceparent is preserved unless it is empty (recovery/poison-reset set `""`), in which case the first live submitter upgrades it. Traceparent is not persisted to PG — recovered derivations dispatched before any re-submit get a fresh worker root span. Empty traceparent → fresh root span. This closes the SSH-boundary tracing gap — Tempo shows gateway→scheduler→worker→store as a single trace for the common immediate-dispatch case. Injection and extraction are **manual**, not tonic interceptors: `rio_proto::interceptor::inject_current()` copies the current span's context into outgoing request metadata (client side), and `rio_proto::interceptor::link_parent()` stitches the `#[instrument]` span into the incoming parent (server side, first line of each handler). Manual is deliberate: tonic's `Interceptor` trait changes `connect_*` return types (62-callsite type churn), doesn't compose with server-side `#[instrument]`, and the explicit call makes propagation points greppable. The W3C `TraceContextPropagator` is registered globally in `init_tracing()` regardless of whether `RIO_OTEL_ENDPOINT` is set — propagation works even when spans aren't exported.
 
 ## SLOs, SLIs, and Alerting
 
@@ -266,7 +286,7 @@ Conditionally present:
 |-------|------|--------------|
 | `trace_id` | string | Only when `RIO_OTEL_ENDPOINT` is set AND the log is emitted within an active span. The default JSON fmt layer does NOT include trace/span IDs — they come from the OTel layer's span context. |
 | `span_id` | string | Same condition as `trace_id`. |
-| `tenant_id` *(Phase 4+)* | string | Tenant identifier — currently plumbed through `SubmitBuild` and persisted to `builds` table, but NOT yet recorded as a span field on any log line. |
+| `tenant_id` *(Phase 4+)* | string | Tenant identifier. Gateway records `tenant` (name) on the session span (`session.rs`). Scheduler records `tenant_id` (UUID) on the `SubmitBuild` span after `resolve_tenant` succeeds. Persisted to `builds.tenant_id`. |
 
 Optional fields may be added per component as `tracing` span fields. All fields use snake_case. Missing context fields (e.g., `build_id` outside a build context) are omitted rather than set to empty strings.
 

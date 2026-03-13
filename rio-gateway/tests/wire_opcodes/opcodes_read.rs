@@ -399,7 +399,12 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
         1,
         "missing Built .drv should be in willBuild"
     );
-    assert!(will_build[0].contains(drv_path));
+    // EXACT equality, not substring: willBuild is a StorePathSet. The
+    // response must be the plain .drv path, NOT the DerivedPath wire
+    // string ("...drv!out"). A .contains() check here previously masked
+    // a bug where the raw "!out" string was echoed back, making the Nix
+    // client fail StorePath::parse on '!'.
+    assert_eq!(will_build[0], drv_path);
     assert!(
         will_substitute.is_empty(),
         "no substituter support → willSubstitute empty"

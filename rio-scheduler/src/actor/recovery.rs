@@ -104,6 +104,47 @@ impl DagActor {
             self.dag.insert_recovered_node(state);
         }
 
+        // --- Load poisoned derivations (separate query) ---
+        // TERMINAL_STATUSES includes "poisoned" so load_nonterminal_
+        // derivations skips them. But the TTL check in handle_tick
+        // needs them in the DAG with their poisoned_at set. Without
+        // this, poison TTL resets on scheduler restart.
+        let poisoned_rows = self.db.load_poisoned_derivations().await?;
+        if !poisoned_rows.is_empty() {
+            info!(
+                count = poisoned_rows.len(),
+                "loaded poisoned derivations for TTL tracking"
+            );
+        }
+        let ttl_secs = crate::state::POISON_TTL.as_secs_f64();
+        for row in poisoned_rows {
+            // Expired-at-load: clear in PG, don't insert. Avoids the
+            // from_poisoned_row Instant-arithmetic trap on fresh
+            // nodes — checked_sub(30h) on a node booted 1h ago returns
+            // None → unwrap_or(now) → poisoned_at=now → FRESH 24h TTL
+            // instead of immediate expiry. PG's elapsed_secs is wall-
+            // clock so the comparison here is correct regardless of
+            // node uptime.
+            if row.elapsed_secs > ttl_secs {
+                info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
+                      "poison already past TTL at recovery — clearing");
+                let hash: crate::state::DrvHash = row.drv_hash.into();
+                if let Err(e) = self.db.clear_poison(&hash).await {
+                    warn!(drv_hash = %hash, error = %e,
+                          "clear_poison for expired-at-load failed; next recovery will retry");
+                }
+                continue;
+            }
+            let state = match DerivationState::from_poisoned_row(row) {
+                Ok(s) => s,
+                Err((drv_hash, _)) => {
+                    warn!(drv_hash = %drv_hash, "invalid poisoned drv_path in PG, skipping");
+                    continue;
+                }
+            };
+            self.dag.insert_recovered_node(state);
+        }
+
         // --- Load edges + add to DAG ---
         let drv_ids: Vec<Uuid> = id_to_hash.keys().copied().collect();
         let edge_rows = self.db.load_edges_for_derivations(&drv_ids).await?;
@@ -362,6 +403,7 @@ impl DagActor {
     /// Workers ARE in self.workers (survived): they'll send
     /// CompletionReport or heartbeat showing the build still
     /// running — normal handling resumes.
+    #[instrument(skip(self))]
     pub(super) async fn handle_reconcile_assignments(&mut self) {
         // Collect (drv_hash, assigned_worker, expected_outputs)
         // for Assigned/Running with unknown workers. Clone before
@@ -440,12 +482,11 @@ impl DagActor {
                 // completion. Conservative: treat as incomplete.
                 false
             } else if let Some(client) = &mut self.store_client {
-                match client
-                    .find_missing_paths(FindMissingPathsRequest {
-                        store_paths: expected_outputs.clone(),
-                    })
-                    .await
-                {
+                let mut fmp_req = tonic::Request::new(FindMissingPathsRequest {
+                    store_paths: expected_outputs.clone(),
+                });
+                rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
+                match client.find_missing_paths(fmp_req).await {
                     Ok(resp) => resp.into_inner().missing_paths.is_empty(),
                     Err(e) => {
                         warn!(drv_hash = %drv_hash, error = %e,

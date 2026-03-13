@@ -243,3 +243,49 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
     );
     Ok(())
 }
+
+/// Single-node resubmit of a still-Poisoned derivation (within TTL,
+/// no ClearPoison) must fail the build immediately.
+///
+/// Unlike the _prepoisoned_dep_ test above, there is no new dependent
+/// for compute_initial_states to mark DependencyFailed — the poisoned
+/// node IS the entire DAG. Before the fix, the existing-node loop only
+/// checked `== Completed`, so first_dep_failed stayed None and the build
+/// sat Active with completed=0, failed=0, total=1.
+#[tokio::test]
+async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
+    let (_db, handle, _task, _stream_rx) =
+        setup_with_worker("resub-poison-w", "x86_64-linux", 1).await?;
+
+    // Build 1: poison the leaf.
+    let build1 = Uuid::new_v4();
+    let _rx1 = merge_single_node(&handle, build1, "resub-poison", PriorityClass::Scheduled).await?;
+    complete_failure(
+        &handle,
+        "resub-poison-w",
+        &test_drv_path("resub-poison"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "permanent",
+    )
+    .await?;
+
+    let pre = handle
+        .debug_query_derivation("resub-poison")
+        .await?
+        .expect("exists");
+    assert_eq!(pre.status, DerivationStatus::Poisoned);
+
+    // Build 2: same single node, no dependents. The poisoned node
+    // is existing (not newly_inserted) — the merge-loop failure arm
+    // must catch it.
+    let build2 = Uuid::new_v4();
+    let _rx2 = merge_single_node(&handle, build2, "resub-poison", PriorityClass::Scheduled).await?;
+
+    let status = query_status(&handle, build2).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "single-node resubmit of a Poisoned derivation must fail fast, not hang Active"
+    );
+    Ok(())
+}

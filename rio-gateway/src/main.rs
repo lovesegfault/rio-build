@@ -23,6 +23,17 @@ use tracing::info;
 struct Config {
     listen_addr: std::net::SocketAddr,
     scheduler_addr: String,
+    /// Headless Service host for health-aware balanced routing.
+    /// `Some(host)` (K8s mode, multi-replica scheduler): DNS-
+    /// resolve `host`, probe grpc.health.v1 on each pod IP,
+    /// route to the SERVING (=leader) endpoint. `None` (env
+    /// unset): single-channel via `scheduler_addr` (VM tests,
+    /// non-K8s, single-replica scheduler).
+    ///
+    /// `scheduler_addr` is still required — it's the ClusterIP
+    /// Service, used as the TLS verify domain (the cert's SAN).
+    scheduler_balance_host: Option<String>,
+    scheduler_balance_port: u16,
     store_addr: String,
     host_key: std::path::PathBuf,
     authorized_keys: std::path::PathBuf,
@@ -53,6 +64,8 @@ impl Default for Config {
             // that names the field. The old /tmp/rio_* defaults were
             // footguns: silent key-generation in world-writable /tmp.
             scheduler_addr: String::new(),
+            scheduler_balance_host: None,
+            scheduler_balance_port: 9001,
             store_addr: String::new(),
             host_key: std::path::PathBuf::new(),
             authorized_keys: std::path::PathBuf::new(),
@@ -188,8 +201,36 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %cfg.store_addr, "connecting to store service");
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
 
-    info!(addr = %cfg.scheduler_addr, "connecting to scheduler service");
-    let scheduler_client = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
+    // Scheduler connection. Two modes:
+    // - Balanced (K8s): DNS-resolve headless Service, health-probe
+    //   each pod IP, route to the leader. The BalancedChannel guard
+    //   must live for process lifetime — dropping it stops the probe
+    //   loop. We box it into an Option and just hold it.
+    // - Single (non-K8s): plain connect to ClusterIP Service or a
+    //   fixed addr. VM tests and local dev use this.
+    //
+    // The branch is on Option, not on "am I in K8s." Explicit
+    // config (env unset → None), no magic detection.
+    let (scheduler_client, _balance_guard) = match cfg.scheduler_balance_host {
+        None => {
+            info!(addr = %cfg.scheduler_addr, "connecting to scheduler service (single-channel)");
+            let c = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
+            (c, None)
+        }
+        Some(host) => {
+            info!(
+                %host,
+                port = cfg.scheduler_balance_port,
+                "connecting to scheduler service (health-aware balanced)"
+            );
+            let (c, bc) = rio_proto::client::balance::connect_scheduler_balanced(
+                host,
+                cfg.scheduler_balance_port,
+            )
+            .await?;
+            (c, Some(bc))
+        }
+    };
 
     // gRPC health server. Dedicated tonic instance — the gateway's main
     // protocol is SSH (russh), no existing tonic server to attach to.

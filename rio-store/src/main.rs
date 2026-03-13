@@ -84,6 +84,11 @@ struct Config {
     /// SAME file as scheduler's `hmac_key_path`. Unset = accept
     /// all PutPath callers (dev mode).
     hmac_key_path: Option<PathBuf>,
+    /// Allow binary cache HTTP requests without `Authorization:
+    /// Bearer` header. Default `false` — Bearer token required
+    /// (mapped to tenant via `tenants.cache_token` column). Set
+    /// `true` explicitly for single-tenant/dev deployments.
+    cache_allow_unauthenticated: bool,
 }
 
 impl Default for Config {
@@ -104,6 +109,7 @@ impl Default for Config {
             health_addr: "0.0.0.0:9102".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
+            cache_allow_unauthenticated: false,
         }
     }
 }
@@ -305,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
             // Same Arc again. /nar/ reassembly hits the same moka
             // LRU as GetPath.
             chunk_cache: chunk_cache.clone(),
+            allow_unauthenticated: cfg.cache_allow_unauthenticated,
         });
         let router = cache_server::router(state);
         let http_shutdown = shutdown.clone();
@@ -406,6 +413,8 @@ mod tests {
         // Plaintext health listener for K8s probes when mTLS is on the main port.
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9102");
         assert!(!d.tls.is_configured());
+        // Binary cache auth required by default — fail loud on misconfigured deployments.
+        assert!(!d.cache_allow_unauthenticated);
     }
 
     /// TOML parsing for the tagged enum via figment (what main.rs

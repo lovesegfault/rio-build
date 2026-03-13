@@ -1,10 +1,8 @@
 //! AdminService gRPC implementation.
 //!
-//! `GetBuildLogs`, `ClusterStatus`, `DrainWorker`, and `TriggerGC`
-//! are fully implemented. The remaining RPCs return `UNIMPLEMENTED`
-//! and land in phase4 (dashboard). Stubbing them here means the
-//! tonic server wiring is already in place — adding each later is
-//! a pure body-swap with no main.rs churn.
+//! All RPCs are fully implemented as of phase4a: `GetBuildLogs`,
+//! `ClusterStatus`, `DrainWorker`, `TriggerGC`, `ListWorkers`,
+//! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`.
 //!
 //! `GetBuildLogs` has two data sources (per `observability.md:44-50`):
 //!
@@ -20,12 +18,13 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
 use flate2::read::GzDecoder;
 use sqlx::PgPool;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, instrument};
@@ -33,12 +32,16 @@ use tracing::{debug, instrument};
 use rio_proto::AdminService;
 use rio_proto::types::{
     BuildLogChunk, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-    DrainWorkerRequest, DrainWorkerResponse, GcProgress, GcRequest, GetBuildLogsRequest,
-    ListBuildsRequest, ListBuildsResponse, ListWorkersRequest, ListWorkersResponse,
+    CreateTenantRequest, CreateTenantResponse, DrainWorkerRequest, DrainWorkerResponse, GcProgress,
+    GcRequest, GetBuildLogsRequest, ListBuildsRequest, ListBuildsResponse, ListTenantsResponse,
+    ListWorkersRequest, ListWorkersResponse, TenantInfo,
 };
 
 use crate::actor::{ActorCommand, ActorHandle};
 use crate::logs::LogBuffers;
+
+mod builds;
+mod workers;
 
 /// Chunk size for streaming S3-fetched log lines back to the client.
 /// The whole log is gunzipped into memory first (we need to do line
@@ -74,6 +77,53 @@ pub struct AdminServiceImpl {
     /// `StoreAdminService.TriggerGC`. GC runs IN the store (it
     /// owns the chunk backend); scheduler contributes roots.
     store_addr: String,
+    /// Cached store size for `ClusterStatus.store_size_bytes`.
+    /// Updated by a 60s background task via
+    /// `SELECT COALESCE(SUM(nar_size), 0) FROM narinfo`. Default 0
+    /// until the first refresh fires. Keeps `ClusterStatus` fast
+    /// (it's on the autoscaler's 30s poll path).
+    store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with the lease loop (same Arc as `SchedulerGrpc`).
+    /// Admin RPCs mutate state via the actor — standby must refuse.
+    is_leader: Arc<AtomicBool>,
+}
+
+/// Spawn a background task that refreshes `store_size_bytes` every 60s
+/// via a PG query on the shared store DB. Scheduler already has the pool
+/// (same database as the store). Follows the `scheduler_live_pins`
+/// cross-layer precedent.
+pub fn spawn_store_size_refresh(
+    pool: PgPool,
+    shutdown: rio_common::signal::Token,
+) -> Arc<std::sync::atomic::AtomicU64> {
+    let size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let size_clone = Arc::clone(&size);
+    rio_common::task::spawn_monitored("store-size-refresh", async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::debug!("store-size-refresh shutting down");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+            match sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(SUM(nar_size), 0)::bigint FROM narinfo",
+            )
+            .fetch_one(&pool)
+            .await
+            {
+                Ok(bytes) => {
+                    size_clone.store(bytes.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "store_size refresh failed");
+                }
+            }
+        }
+    });
+    size
 }
 
 impl AdminServiceImpl {
@@ -83,6 +133,8 @@ impl AdminServiceImpl {
         pool: PgPool,
         actor: ActorHandle,
         store_addr: String,
+        store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
+        is_leader: Arc<AtomicBool>,
     ) -> Self {
         Self {
             log_buffers,
@@ -91,6 +143,8 @@ impl AdminServiceImpl {
             actor,
             started_at: Instant::now(),
             store_addr,
+            store_size_bytes,
+            is_leader,
         }
     }
 
@@ -102,6 +156,18 @@ impl AdminServiceImpl {
             return Err(Status::unavailable(
                 "scheduler actor not running (internal error)",
             ));
+        }
+        Ok(())
+    }
+
+    // r[impl sched.grpc.leader-guard]
+    /// Same as `SchedulerGrpc::ensure_leader`. Admin RPCs mutate
+    /// state (DrainWorker, ClearPoison, CreateTenant, TriggerGC)
+    /// or reflect actor state (ClusterStatus, ListWorkers) —
+    /// standby has no actor authority and its view is stale.
+    fn ensure_leader(&self) -> Result<(), Status> {
+        if !self.is_leader.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("not leader (standby replica)"));
         }
         Ok(())
     }
@@ -271,6 +337,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetBuildLogsRequest>,
     ) -> Result<Response<Self::GetBuildLogsStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         let req = request.into_inner();
 
         // Validate: need at least derivation_path. build_id is needed only
@@ -346,34 +413,25 @@ impl AdminService for AdminServiceImpl {
     /// `running_derivations` is secondary (for "scale-down is safe when
     /// queue=0 AND running is below capacity").
     ///
-    /// `store_size_bytes` is 0: the scheduler doesn't track store
-    /// size; that would be a store-service RPC and this endpoint is
-    /// on the autoscaler's hot path (30s poll). If the dashboard
-    /// wants store size, it can query the store's /metrics directly.
-    /// `TODO(phase4)`: add a best-effort store-size field populated
-    /// via a separate slow-refresh background task, NOT inline here.
-    #[instrument(skip(self, _request), fields(rpc = "ClusterStatus"))]
+    /// `store_size_bytes` is a cached value from the 60s background
+    /// refresh task — NOT a live PG query (this endpoint is on the
+    /// autoscaler's 30s hot path). See `spawn_store_size_refresh`.
+    #[instrument(skip(self, request), fields(rpc = "ClusterStatus"))]
     async fn cluster_status(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
 
-        let (tx, rx) = oneshot::channel();
         // send_unchecked: autoscaler MUST get a reading under saturation.
         // See ActorCommand::ClusterSnapshot doc for rationale.
-        self.actor
-            .send_unchecked(ActorCommand::ClusterSnapshot { reply: tx })
+        let snap = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::ClusterSnapshot { reply })
             .await
-            .map_err(|_| Status::unavailable("actor channel closed"))?;
-
-        // rx.await fails only if the actor dropped the oneshot::Sender
-        // without replying — which means the actor task panicked mid-
-        // handler (impossible for ClusterSnapshot, it's a pure read
-        // with no .await points, but be robust anyway).
-        let snap = rx
-            .await
-            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         // SystemTime::now() - elapsed → "start time in CURRENT wall-clock
         // terms." checked_sub: if elapsed > now (clock jumped way back),
@@ -390,27 +448,47 @@ impl AdminService for AdminServiceImpl {
             active_builds: snap.active_builds,
             queued_derivations: snap.queued_derivations,
             running_derivations: snap.running_derivations,
-            store_size_bytes: 0,
+            store_size_bytes: self
+                .store_size_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
             uptime_since: Some(prost_types::Timestamp::from(uptime_since)),
         }))
     }
 
-    // -----------------------------------------------------------------------
-    // Stubs — return UNIMPLEMENTED. Phase 4 (dashboard) implements these.
-    // -----------------------------------------------------------------------
-
+    // r[impl sched.admin.list-workers]
+    #[instrument(skip(self, request), fields(rpc = "ListWorkers"))]
     async fn list_workers(
         &self,
-        _request: Request<ListWorkersRequest>,
+        request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
-        Err(Status::unimplemented("ListWorkers: phase4 dashboard"))
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        let resp = workers::list_workers(&self.actor, &req.status_filter).await?;
+        Ok(Response::new(resp))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "ListBuilds"))]
     async fn list_builds(
         &self,
-        _request: Request<ListBuildsRequest>,
+        request: Request<ListBuildsRequest>,
     ) -> Result<Response<ListBuildsResponse>, Status> {
-        Err(Status::unimplemented("ListBuilds: phase4 dashboard"))
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let req = request.into_inner();
+        let tenant_filter =
+            crate::grpc::resolve_tenant_name(&self.pool, &req.tenant_filter).await?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let resp = builds::list_builds(
+            &db,
+            &req.status_filter,
+            tenant_filter,
+            if req.limit == 0 { 100 } else { req.limit },
+            req.offset,
+        )
+        .await?;
+        Ok(Response::new(resp))
     }
 
     /// Proxy to store's `StoreAdminService.TriggerGC` after
@@ -433,20 +511,19 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GcRequest>,
     ) -> Result<Response<Self::TriggerGCStream>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let mut req = request.into_inner();
 
         // Step 1: collect extra_roots from the actor. send_unchecked
         // bypasses backpressure — GC is operator-initiated, rare,
         // and should work even when the scheduler is saturated.
-        let (tx, rx) = oneshot::channel();
-        self.actor
-            .send_unchecked(ActorCommand::GcRoots { reply: tx })
+        let mut extra_roots = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::GcRoots { reply })
             .await
-            .map_err(|e| Status::internal(format!("actor send failed: {e}")))?;
-        let mut extra_roots = rx
-            .await
-            .map_err(|_| Status::internal("actor GcRoots reply dropped"))?;
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         // Merge with any client-provided extra_roots (unusual but
         // allowed — maybe the client has additional pins).
@@ -467,9 +544,12 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| Status::unavailable(format!("store admin connect failed: {e}")))?;
 
         // Step 3: proxy the call. The store's stream becomes OUR
-        // stream — we wrap it in a forwarding task.
+        // stream — we wrap it in a forwarding task. inject_current
+        // so the store's link_parent can stitch the trace chain.
+        let mut tonic_req = tonic::Request::new(req);
+        rio_proto::interceptor::inject_current(tonic_req.metadata_mut());
         let store_stream = store_admin
-            .trigger_gc(req)
+            .trigger_gc(tonic_req)
             .await
             .map_err(|e| Status::internal(format!("store TriggerGC failed: {e}")))?
             .into_inner();
@@ -530,6 +610,8 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<DrainWorkerRequest>,
     ) -> Result<Response<DrainWorkerResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 
@@ -537,22 +619,20 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument("worker_id is required"));
         }
 
-        let (tx, rx) = oneshot::channel();
         // send_unchecked: drain MUST land even under backpressure. A
         // shutting-down worker accepting new assignments is a feedback
         // loop into MORE load — exactly what we don't want.
-        self.actor
-            .send_unchecked(ActorCommand::DrainWorker {
-                worker_id: req.worker_id.into(),
-                force: req.force,
-                reply: tx,
+        let worker_id = req.worker_id.into();
+        let force = req.force;
+        let result = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::DrainWorker {
+                worker_id,
+                force,
+                reply,
             })
             .await
-            .map_err(|_| Status::unavailable("actor channel closed"))?;
-
-        let result = rx
-            .await
-            .map_err(|_| Status::unavailable("actor dropped reply"))?;
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         Ok(Response::new(DrainWorkerResponse {
             accepted: result.accepted,
@@ -560,11 +640,119 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
+    #[instrument(skip(self, request), fields(rpc = "ClearPoison"))]
     async fn clear_poison(
         &self,
-        _request: Request<ClearPoisonRequest>,
+        request: Request<ClearPoisonRequest>,
     ) -> Result<Response<ClearPoisonResponse>, Status> {
-        Err(Status::unimplemented("ClearPoison: phase4 dashboard"))
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        if req.derivation_hash.is_empty() {
+            return Err(Status::invalid_argument("derivation_hash is required"));
+        }
+        let drv_hash: crate::state::DrvHash = req.derivation_hash.into();
+        let cleared = self
+            .actor
+            .query_unchecked(|reply| ActorCommand::ClearPoison { drv_hash, reply })
+            .await
+            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
+        Ok(Response::new(ClearPoisonResponse { cleared }))
+    }
+
+    // r[impl sched.admin.list-tenants]
+    #[instrument(skip(self, request), fields(rpc = "ListTenants"))]
+    async fn list_tenants(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<ListTenantsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let rows = db
+            .list_tenants()
+            .await
+            .map_err(|e| Status::internal(format!("db: {e}")))?;
+        Ok(Response::new(ListTenantsResponse {
+            tenants: rows.into_iter().map(tenant_row_to_proto).collect(),
+        }))
+    }
+
+    // r[impl sched.admin.create-tenant]
+    #[instrument(skip(self, request), fields(rpc = "CreateTenant"))]
+    async fn create_tenant(
+        &self,
+        request: Request<CreateTenantRequest>,
+    ) -> Result<Response<CreateTenantResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
+        let req = request.into_inner();
+        // Trim once, use for BOTH validation and storage. Read paths
+        // trim (gateway server.rs:223, cache auth.rs:51) so storing
+        // untrimmed " team-a " makes WHERE tenant_name = 'team-a'
+        // never match — invisible-whitespace debugging session.
+        let tenant_name = req.tenant_name.trim();
+        if tenant_name.is_empty() {
+            return Err(Status::invalid_argument("tenant_name is required"));
+        }
+        let cache_token = req.cache_token.as_deref().map(str::trim);
+        if cache_token.is_some_and(str::is_empty) {
+            return Err(Status::invalid_argument(
+                "cache_token must not be empty string (omit field for no-cache-auth)",
+            ));
+        }
+        // u32→i32 / u64→i64 would wrap to negative for out-of-range
+        // values (PG stores INTEGER/BIGINT signed). GC with negative
+        // retention is undefined downstream.
+        let gc_retention_hours = req
+            .gc_retention_hours
+            .map(|h| {
+                i32::try_from(h).map_err(|_| {
+                    Status::invalid_argument("gc_retention_hours out of range (max 2^31-1)")
+                })
+            })
+            .transpose()?;
+        let gc_max_store_bytes = req
+            .gc_max_store_bytes
+            .map(|b| {
+                i64::try_from(b).map_err(|_| {
+                    Status::invalid_argument("gc_max_store_bytes out of range (max 2^63-1)")
+                })
+            })
+            .transpose()?;
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
+        let row = db
+            .create_tenant(
+                tenant_name,
+                gc_retention_hours,
+                gc_max_store_bytes,
+                cache_token,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("db: {e}")))?
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "tenant '{tenant_name}' already exists (or cache_token collision)"
+                ))
+            })?;
+        Ok(Response::new(CreateTenantResponse {
+            tenant: Some(tenant_row_to_proto(row)),
+        }))
+    }
+}
+
+fn tenant_row_to_proto(row: crate::db::TenantRow) -> TenantInfo {
+    TenantInfo {
+        tenant_id: row.tenant_id.to_string(),
+        tenant_name: row.tenant_name,
+        gc_retention_hours: row.gc_retention_hours as u32,
+        gc_max_store_bytes: row.gc_max_store_bytes.map(|b| b as u64),
+        created_at: Some(prost_types::Timestamp {
+            seconds: row.created_at,
+            nanos: 0,
+        }),
+        has_cache_token: row.has_cache_token,
     }
 }
 

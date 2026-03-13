@@ -1,79 +1,155 @@
-# EKS Terraform for rio-build
+# EKS deployment for rio-build
+
+One-shot bring-up: OpenTofu for infra, `push-images.sh` for images,
+`just eks deploy` for the chart, `smoke-test.sh` for verification. Driven
+by the justfile at the repo root — `just --list` for the menu.
+
+## What gets created
+
+| Component | Resource | Notes |
+|---|---|---|
+| EKS cluster | 1.33, 1 nodegroup | system (3× m5.large, untainted) |
+| Karpenter | helm_release + Pod Identity + SQS | provisions worker nodes on-demand (c6a/c7a preferred, m/r fallback) |
+| Aurora PG | Serverless v2, 0.5-2 ACU | shared by scheduler + store, password in Secrets Manager |
+| S3 bucket | NAR chunk storage | name: `<cluster_name>-chunks-<random>` |
+| ECR repos | 7 (gateway/scheduler/store/controller/worker/fod-proxy/bootstrap) | immutable tags, keep-last-10 lifecycle |
+| cert-manager | helm_release | issues mTLS certs for intra-cluster gRPC |
+| aws-load-balancer-controller | helm_release + IRSA | provisions the gateway NLB |
+| SSM bastion | t3.micro, private subnet | tunnel to the internal NLB — no inbound SG rules |
 
 ## Prerequisites
 
-- Terraform >= 1.5
-- AWS CLI configured with `AWS_PROFILE=beme_sandbox` (or adjust)
-- S3 bucket for chunk storage (pre-create: `aws s3 mb s3://my-rio-chunks`)
-- cert-manager installed in cluster (after EKS is up)
+- `AWS_PROFILE` with admin-ish permissions in the target account
+  (EKS, RDS, EC2, IAM, S3, ECR, Secrets Manager — it's a lot)
+- [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  for `aws ssm start-session` (separate binary from awscli)
+- `nix develop` in the repo root gives you everything else
+  (opentofu, kubectl, awscli2, skopeo, helm, jq)
 
-## Usage
+## Bring-up
 
 ```bash
-cd infra/eks
-export AWS_PROFILE=beme_sandbox
+# ONE-TIME per user: per-user env (AWS_PROFILE). Gitignored.
+cp .env.local.example .env.local  # edit AWS_PROFILE if not beme_sandbox
+direnv allow
 
-# First time
-terraform init
+# ONE-TIME per AWS account: S3 state bucket. Idempotent — detects
+# whether state already exists in S3; if not, does the first-time
+# dance (local apply → create bucket → migrate state to S3).
+just eks bootstrap                # ~5s if already set up
 
-# Review plan
-terraform plan -var chunk_bucket=my-rio-chunks
+# Full bring-up: apply (prompts) → kubeconfig → push → deploy
+just eks up                       # ~25min (EKS ~12min, Aurora ~8min, push ~3min, deploy ~2min)
 
-# Apply (~15 minutes for EKS control plane)
-terraform apply -var chunk_bucket=my-rio-chunks
-
-# Configure kubectl
-$(terraform output -raw kubeconfig_command)
+# Or piecewise:
+# just eks apply                  # tofu apply (prompts)
+# just eks kubeconfig             # aws eks update-kubeconfig
+# just eks push                   # nix build + skopeo copy to ECR, zstd layers
+# just eks deploy                 # render + kubectl apply
 
 # Verify
-kubectl get nodes
+kubectl get nodes                 # should show 3 system nodes Ready (workers scale from 0 on demand)
+just eks smoke                    # ~5min — builds nixpkgs#hello, kills a worker, asserts reassign
 ```
 
-## Deploy rio-build
+`just eks up-auto` skips the tofu apply prompt (`-auto-approve`).
+
+### State backend configuration
+
+Both `infra/eks/bootstrap` and `infra/eks` store state in the same S3
+bucket (bootstrap is self-referential — it manages the bucket it
+stores its own state in). Bucket name and region are passed via
+`-backend-config` by the justfile, so nothing account-specific is
+committed. Defaults:
+
+| Var | Default | Override in `.env.local` |
+|---|---|---|
+| bucket | `rio-tfstate-${account_id}` (from `aws sts`) | `RIO_TFSTATE_BUCKET` |
+| region | `us-east-2` | `RIO_TFSTATE_REGION` |
+
+Running in a fresh AWS account just works: `just eks bootstrap`
+computes the bucket name, creates it, migrates state into it.
+Everything downstream reads the same computed name.
+
+## Iterating
+
+The cluster stays up. `just eks deploy` runs `helm upgrade` from the
+working tree — chart changes deploy without commit/push. Code changes
+need a push (image tag is derived from git SHA + dirty-tree hash):
 
 ```bash
-# Get IRSA role ARN for rio-store
-export STORE_IAM_ROLE_ARN=$(terraform output -raw store_iam_role_arn)
+# Chart-only change (template/values): no push needed
+just eks deploy
 
-# Apply EKS overlay (envsubst for IRSA patch)
-cd ../../
-kubectl kustomize deploy/overlays/eks | envsubst | kubectl apply -f -
-
-# Wait for cert-manager to issue certs (if not already installed)
-kubectl -n cert-manager wait --for=condition=Available deployment/cert-manager
-
-# Wait for rio components
-kubectl -n rio-system wait --for=condition=Ready pod -l app.kubernetes.io/part-of=rio-build --timeout=300s
+# Code change: push new image + deploy
+just eks push eks deploy
 ```
 
-## Smoke test
+Deploy history: `just eks history`. Rollback: `just eks rollback [REV]`
+(omit REV for previous).
 
-```bash
-./infra/eks/smoke-test.sh
-```
+## Autoscaling
+
+Two layers, chained:
+
+1. **Pod layer** (`rio-controller/src/scaling.rs`): polls scheduler queue depth every 30s, SSA-patches the WorkerPool StatefulSet replica count between `spec.replicas.{min,max}`. Scale-up is immediate; scale-down requires 10 minutes of quiet (`SCALE_DOWN_WINDOW`).
+2. **Node layer** (Karpenter): watches for Pending pods that can't schedule, provisions an EC2 instance that fits (~30-60s boot). When pods scale to zero, empty nodes are consolidated after `consolidateAfter` (30s for workers, 5m for general).
+
+The chain: build submitted → queue depth > 0 → rio-controller scales STS to N → N pods Pending (no worker nodes exist) → Karpenter provisions node(s) → pods Running. Cold start from zero: ~50-80s. `consolidationPolicy: WhenEmpty` means Karpenter never evicts a worker mid-build — only consolidates after rio-controller has scaled the pods away.
+
+Three NodePools (weighted priority): `rio-worker-preferred` (c6a/c7a, weight 100), `rio-worker-fallback` (m/r-category, weight 10), `rio-general` (untainted, for future gateway/scheduler HPA overflow). One shared EC2NodeClass. Configured in `infra/helm/rio-build/values.yaml` under `karpenter.nodePools`.
+
+## Cost (us-east-2, on-demand)
+
+| Item | ~USD/mo |
+|---|---|
+| EKS control plane | $73 (fixed) |
+| 3× m5.large (system) | ~$210 |
+| Karpenter worker nodes | $0 idle; ~$55/mo per c6a.large while building |
+| Aurora Serverless v2 @ 0.5 ACU | ~$44 |
+| NAT Gateway | ~$35 + data |
+| t3.micro bastion | ~$8 |
+| **Total (idle, no builds)** | **~$370/mo** |
+
+Worker cost scales with build load. rio-controller's 10-min scale-down + Karpenter consolidation means an hour of intermittent builds ≈ 1h of node time. Aurora at 2 ACU adds ~$130/mo.
 
 ## Teardown
 
 ```bash
-# Delete rio resources first (finalizers)
-kubectl delete workerpools --all -n rio-system
-kubectl -n rio-system delete -k deploy/overlays/eks
-
-# Then terraform destroy
-cd infra/eks
-terraform destroy -var chunk_bucket=my-rio-chunks
+just eks destroy                  # ~15min
 ```
 
-## Cost estimate (us-west-2)
+This deletes WorkerPools first (their finalizers hold pods → NLB
+→ tofu destroy blocks), then `tofu -chdir=infra/eks destroy`.
 
-| Item | Approx monthly |
-|---|---|
-| EKS control plane | $73 (fixed) |
-| 3× m5.large (system) | ~$210 |
-| 2× c6a.xlarge (workers min) | ~$220 |
-| NAT Gateway | ~$35 + data |
-| **Total (min workers)** | **~$540/mo** |
+The S3 bucket has `force_destroy = true` so it deletes even with
+chunks in it. Aurora has `skip_final_snapshot = true`. Both are
+dev/test settings — flip them for anything you care about keeping.
 
-Scaling to 10 workers adds ~$1100/mo. Consider spot instances for
-the worker nodegroup (builds are interruptible — the scheduler
-reassigns).
+The state bucket (`infra/eks/bootstrap`) is NOT destroyed by this —
+it's a per-account fixture. Destroy it separately (and manually
+empty it first — no `force_destroy` on state buckets, losing
+state orphans resources).
+
+## Troubleshooting
+
+**`tofu plan` fails with "connection refused" before first apply:**
+The helm/kubernetes providers try to contact the cluster during plan.
+Run `tofu apply -target=module.eks` first, then full `tofu apply`.
+
+**Pods stuck ImagePullBackOff:**
+`just eks push` wasn't run (no image at that tag in ECR). Check the
+current release values: `helm get values rio -n rio-system | grep tag`.
+
+**Scheduler/store CrashLoopBackOff with PG connection errors:**
+Check the rio-postgres Secret: `kubectl -n rio-system get secret
+rio-postgres -o jsonpath='{.data.url}' | base64 -d`. If it's
+missing `?sslmode=require`, Aurora (rds.force_ssl=1) rejects the
+connection. Check the rio-postgres ExternalSecret status.
+
+**smoke-test.sh SSM tunnel times out:**
+Check `aws ssm describe-instance-information --region us-east-2`
+— the bastion should show `PingStatus: Online`. If not, the SSM
+agent isn't connecting (usually NAT gateway routing or instance
+profile misconfiguration). `/tmp/ssm-session.log` has the client
+side.

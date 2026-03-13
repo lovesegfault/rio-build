@@ -1,0 +1,80 @@
+{{- if .Values.karpenter.enabled }}
+{{- $k := .Values.karpenter -}}
+# Karpenter NodePools + EC2NodeClass. In the chart (not terraform) so
+# `helm rollback` takes node config with the rest, and to dodge the
+# kubernetes_manifest plan-time GVK trap (Karpenter CRDs don't exist
+# until helm_release.karpenter applies).
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: rio-default
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  amiSelectorTerms:
+    - alias: {{ $k.amiAlias }}
+  role: {{ required "karpenter.nodeRoleName is required when karpenter.enabled=true" $k.nodeRoleName }}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ required "karpenter.clusterName is required when karpenter.enabled=true" $k.clusterName }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ $k.clusterName }}
+  # IMDSv2 hop limit 1: container network adds a hop, so limit 1 means
+  # kubelet (on-node) can reach IMDS but pods can't. Same defense-in-
+  # depth as the deleted managed nodegroup had.
+  metadataOptions:
+    httpEndpoint: enabled
+    httpTokens: required
+    httpPutResponseHopLimit: 1
+  # Bottlerocket has two volumes: /dev/xvda (OS, ~2GB, immutable) and
+  # /dev/xvdb (container data — images, emptyDir, logs). The AMI default
+  # for xvdb is ~20GB, which Karpenter treats as the allocatable
+  # ephemeral-storage ceiling. Worker pods request 25Gi (fuseCacheSize
+  # 20Gi + headroom) so without this NO instance size fits.
+  blockDeviceMappings:
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: {{ $k.dataVolumeSize }}
+        volumeType: gp3
+        deleteOnTermination: true
+        encrypted: true
+  tags:
+    karpenter.sh/discovery: {{ $k.clusterName }}
+{{- range $k.nodePools }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ .name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  weight: {{ .weight }}
+  template:
+    metadata:
+      labels:
+        {{- toYaml .labels | nindent 8 }}
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: rio-default
+      {{- with .taints }}
+      taints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      requirements:
+        {{- toYaml .requirements | nindent 8 }}
+  limits:
+    cpu: {{ .limits.cpu }}
+  disruption:
+    # WhenEmpty only — builds are long-running; don't consolidate a
+    # node with a worker pod on it even if underutilized.
+    # rio-controller's 10-min SCALE_DOWN_WINDOW scales pods to 0 →
+    # THEN Karpenter sees an empty node and consolidates.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: {{ .consolidateAfter | default "30s" }}
+{{- end }}
+{{- end }}

@@ -59,10 +59,10 @@ pub struct BuildSpec {
     #[serde(default)]
     pub timeout_seconds: i64,
 
-    /// Tenant identifier for multi-tenancy. Passed through to the
-    /// scheduler; not yet enforced. String not UUID — tenant naming
-    /// is an operator concern.
-    // TODO(phase4): enforcement (scheduler-side tenant isolation).
+    /// Tenant name for multi-tenancy. Passed through to the scheduler
+    /// which resolves it to a UUID via the `tenants` table. Unknown
+    /// name → build rejected with `InvalidArgument`. String not UUID —
+    /// the CRD uses the human-readable tenant name (what operators know).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }

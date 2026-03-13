@@ -122,7 +122,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
 | HMAC signing key (assignment tokens) | Scheduler + Store | Annually or on compromise | Implemented — `RIO_HMAC_KEY_PATH`, same key file both sides |
 | JWT signing key (tenant tokens)[^jwt] | Gateway | Annually; SIGHUP reload for zero-downtime | **Phase 5** — no tenant token issuance yet |
 | Database credentials (`database_url`) | Scheduler, Store, Controller | Via Vault database engine or External Secrets | Implemented |
-| TLS certificates | All gRPC components | Via cert-manager auto-renewal (90d certs, renew at 30d) | Implemented — see `deploy/overlays/prod/cert-manager.yaml` |
+| TLS certificates | All gRPC components | Via cert-manager auto-renewal (90d certs, renew at 30d) | Implemented — see `infra/helm/rio-build/templates/cert-manager.yaml` |
 
 [^authkeys]: Tenant annotation in the `authorized_keys` comment field (e.g., `ssh-ed25519 AAAA... tenant=acme`) is not yet parsed. All authenticated keys currently share a single implicit tenant. SSH key → tenant mapping is Phase 5.
 [^jwt]: There is no JWT issuance or verification code. Tenant identity exists only as a string field in the scheduler's `BuildOptions` with no authentication backing.
@@ -154,7 +154,7 @@ rio-build requires several secrets: SSH host keys, signing keys, database creden
   - The proxy enforces a domain allowlist (configurable per deployment; default: `cache.nixos.org`, `github.com`, `gitlab.com`, common source forges).
   - All proxied requests are logged for audit. Requests to non-allowlisted domains are rejected.
   - Non-FOD builds retain the full egress deny NetworkPolicy --- no proxy access.
-- **Phase**: Implemented (Phase 3b). See `deploy/base/fod-proxy.yaml` (Squid + allowlist) and the worker's `spawn_daemon_in_namespace` (`fod_proxy` param, injects env only when `is_fixed_output`).
+- **Phase**: Implemented (Phase 3b). See `infra/helm/rio-build/templates/fod-proxy.yaml` (Squid + allowlist) and the worker's `spawn_daemon_in_namespace` (`fod_proxy` param, injects env only when `is_fixed_output`).
 
 ### Log Injection
 

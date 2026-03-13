@@ -3012,21 +3012,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kube-leader-election"
-version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6768feabf1008b50aa8b96835865b5d18971e031de74d9f29d1c1061571c9283"
-dependencies = [
- "jiff",
- "k8s-openapi",
- "kube",
- "log",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "kube-runtime"
 version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4538,6 +4523,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rio-common",
+ "rio-proto",
+ "rustls 0.23.37",
+ "serde",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "rio-common"
 version = "0.1.0"
 dependencies = [
@@ -4587,6 +4586,7 @@ dependencies = [
  "rio-common",
  "rio-nix",
  "rio-proto",
+ "rio-test-support",
  "rustls 0.23.37",
  "schemars",
  "scopeguard",
@@ -4596,7 +4596,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tonic",
- "tower-test",
  "tracing",
 ]
 
@@ -4649,6 +4648,7 @@ name = "rio-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
@@ -4659,6 +4659,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
@@ -4677,9 +4678,9 @@ dependencies = [
  "dashmap",
  "figment",
  "flate2",
+ "http 1.4.0",
  "k8s-openapi",
  "kube",
- "kube-leader-election",
  "metrics",
  "ordered-float 5.1.0",
  "prost",
@@ -4756,15 +4757,20 @@ name = "rio-test-support"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http 1.4.0",
+ "k8s-openapi",
+ "kube",
  "nix 0.31.2",
  "rio-nix",
  "rio-proto",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower-test",
 ]
 
 [[package]]
@@ -5560,6 +5566,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5570,6 +5577,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -6711,6 +6719,24 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.6",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

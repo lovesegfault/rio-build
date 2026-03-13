@@ -190,7 +190,11 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     let sts = build_statefulset(
         &wp,
         oref,
-        &ctx.scheduler_addr,
+        &builders::SchedulerAddrs {
+            addr: ctx.scheduler_addr.clone(),
+            balance_host: ctx.scheduler_balance_host.clone(),
+            balance_port: ctx.scheduler_balance_port,
+        },
         &ctx.store_addr,
         initial_replicas,
     )?;

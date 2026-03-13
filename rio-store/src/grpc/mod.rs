@@ -315,6 +315,7 @@ impl StoreService for StoreServiceImpl {
         &self,
         request: Request<ContentLookupRequest>,
     ) -> Result<Response<ContentLookupResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
         let req = request.into_inner();
 
         // Validate hash length. 32 bytes = SHA-256. Anything else is

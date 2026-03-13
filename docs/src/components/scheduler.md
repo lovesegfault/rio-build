@@ -88,6 +88,34 @@ r[sched.merge.toctou-serial]
 r[sched.completion.idempotent]
 > **Completion report idempotency:** A `CompletionReport` for an already-completed derivation is accepted and ignored (no-op). The actor's state machine treats `completed → completed` as an idempotent transition. This handles duplicate reports caused by worker retries during scheduler failover, network retransmissions, or race conditions with CA early cutoff.
 
+r[sched.tenant.resolve]
+
+The gateway sends the tenant name in `SubmitBuildRequest.tenant_name` — captured from the server-side `authorized_keys` entry's comment field. The scheduler's `submit_build` handler resolves this to a UUID via `SELECT tenant_id FROM tenants WHERE tenant_name = $1`. Unknown tenant name → `InvalidArgument`. Empty string → `None` (single-tenant mode, no PG lookup). This keeps the gateway PostgreSQL-free — preserving stateless N-replica HA.
+
+r[sched.poison.ttl-persist]
+
+`poisoned_at` is persisted to `derivations.poisoned_at TIMESTAMPTZ` when the poison threshold trips. Recovery loads poisoned rows via a separate `load_poisoned_derivations` query (since `TERMINAL_STATUSES` includes `"poisoned"` and `load_nonterminal_derivations` filters it out). The timestamp is converted back to `Instant` via PG-computed `EXTRACT(EPOCH FROM (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
+
+r[sched.admin.list-workers]
+
+`AdminService.ListWorkers` returns a point-in-time snapshot of all connected workers via an `ActorCommand::ListWorkers` (O(workers) scan, `send_unchecked` like `ClusterSnapshot` — dashboard needs a reading even under saturation). Each `WorkerInfo` includes `worker_id`, `systems`, `supported_features`, `max_builds`, `running_builds`, `status` ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and `last_resources`. `Instant` fields are converted to wall-clock `SystemTime` by subtracting elapsed from `SystemTime::now()`. The optional `status_filter` matches "alive" (registered + not draining), "draining", or empty/unknown (show all).
+
+r[sched.admin.list-builds]
+
+`AdminService.ListBuilds` paginates via a direct PostgreSQL query with `LIMIT/OFFSET` (proto field `offset = 3`). Per-build derivation counts come from `LEFT JOIN build_derivations + derivations`; `cached_derivations` uses the heuristic "completed with no assignment row" (a cache-hit derivation transitions directly to Completed at merge time without dispatch). Optional `status_filter` matches the `builds.status` column. `total_count` is from a separate `COUNT(*)` query (unaffected by pagination). `ClusterStatus.store_size_bytes` is now populated from a 60s background task that polls `SUM(nar_size) FROM narinfo` — kept out of the handler's hot path since the autoscaler hits it every 30s.
+
+r[sched.admin.clear-poison]
+
+`AdminService.ClearPoison` resets both in-memory state (`reset_from_poison()`: Poisoned→Created, clear `failed_workers`, zero `retry_count`, null `poisoned_at`) and PostgreSQL (`db.clear_poison()`). Returns `cleared=true` only if both succeed. If PG fails after in-mem reset, returns `false` so the operator retries — next recovery would restore Poisoned, so in-mem/PG drift is self-correcting. Idempotent: calling on a non-poisoned or non-existent derivation returns `cleared=false` without error.
+
+r[sched.admin.list-tenants]
+
+`AdminService.ListTenants` returns all rows from the `tenants` table. Each `TenantInfo` includes the UUID, name, GC retention settings, `created_at`, and a `has_cache_token` projection (boolean — does NOT leak the actual token value).
+
+r[sched.admin.create-tenant]
+
+`AdminService.CreateTenant` inserts a new tenant row. `tenant_name` is required (empty → `INVALID_ARGUMENT`). On name collision or cache_token collision, returns `ALREADY_EXISTS`. On success, returns the created `TenantInfo` including the generated UUID.
+
 ## Multi-Build DAG Merging
 
 r[sched.merge.dedup]
@@ -410,7 +438,8 @@ CREATE TABLE derivations (
     CONSTRAINT derivations_drv_hash_uq UNIQUE (drv_hash)
 );
 CREATE INDEX derivations_status_idx ON derivations (status) WHERE status NOT IN ('completed', 'poisoned', 'dependency_failed');
--- TODO(phase4): CREATE INDEX derivations_tenant_idx ON derivations (tenant_id);  -- deferred with multi-tenancy
+-- Partial index: most rows NULL in single-tenant mode (migration 009 Part A).
+CREATE INDEX derivations_tenant_idx ON derivations (tenant_id) WHERE tenant_id IS NOT NULL;
 
 CREATE TABLE derivation_edges (
     parent_id   UUID NOT NULL REFERENCES derivations (derivation_id),
@@ -459,16 +488,31 @@ CREATE TABLE build_history (
 ## Leader Election
 
 r[sched.lease.k8s-lease]
-The scheduler uses a **Kubernetes Lease** (`coordination.k8s.io/v1`) for leader election, via the `kube-leader-election` crate. A background task polls `try_acquire_or_renew` every 5 seconds against a 15-second lease TTL (3:1 renew ratio, per Kubernetes convention). On the acquire transition (standby → leader), the task increments the in-memory generation counter and sets `is_leader=true`; on the lose transition, it clears `is_leader`. The dispatch loop checks `is_leader` and no-ops while standby (DAGs are still merged so state is warm for takeover).
+The scheduler uses a **Kubernetes Lease** (`coordination.k8s.io/v1`) for leader election, via an in-house implementation modeled on client-go's `leaderelection` package. A background task polls every 5 seconds against a 15-second lease TTL (3:1 renew ratio, per Kubernetes convention). On the acquire transition (standby → leader), the task increments the in-memory generation counter and sets `is_leader=true`; on the lose transition, it clears `is_leader`. The dispatch loop checks `is_leader` and no-ops while standby (DAGs are still merged so state is warm for takeover).
 
 - **Configuration:** Enabled by setting `RIO_LEASE_NAME`. When unset (VM tests, single-scheduler deployments), the scheduler runs in non-K8s mode: `is_leader` defaults to `true` immediately and generation stays at 1. Namespace is read from `RIO_LEASE_NAMESPACE` or the in-cluster service-account mount; holder identity defaults to the pod's `HOSTNAME`.
+- **Optimistic concurrency:** All lease mutations (acquire, renew, step-down) use `kube::Api::replace()` (HTTP PUT) with `metadata.resourceVersion` from the preceding GET. The apiserver rejects with 409 Conflict if the lease changed between GET and PUT --- exactly one of N racing writers succeeds. A 409 on renew is treated as an immediate lose transition (someone stole the lease since our GET); a 409 on steal means another standby raced and won.
+- **Observed-record expiry:** A standby does not compare the lease's `renewTime` against its own wall clock (cross-node skew would make that unreliable). Instead, it records the lease's `metadata.resourceVersion` plus a local monotonic `Instant` when that rv was first seen. The apiserver bumps rv on every write, so a leader renewing every 5s produces a fresh rv every 5s. If rv stays unchanged for `lease_ttl` of local time, nobody has written --- steal. Only the standby's own `Instant` monotonicity matters; the `renewTime` value is never read.
 - **Transient API errors:** On apiserver errors, the loop logs a warning and retries on the next tick without flipping `is_leader`. If errors persist past the lease TTL, the lease expires naturally and another replica acquires --- correct behavior for a replica with broken K8s connectivity.
-- **Split-brain window:** `kube-leader-election` is a polling loop, not a watch-based fence. During a network partition, both replicas may believe they are leader for up to `lease_ttl` (15s). This is **acceptable** because dispatch is idempotent: DAG merge dedups by `drv_hash`, and workers reject stale-generation assignments after seeing the new generation in `HeartbeatResponse`. Worst case: a derivation is dispatched twice, builds twice, produces the same deterministic output. Wasteful but correct.
+- **Split-brain window:** This is a polling loop, not a watch-based fence. During a true network partition where the leader cannot reach the apiserver but can still reach workers, both replicas may believe they are leader for up to `lease_ttl` (15s). This is **acceptable** because dispatch is idempotent: DAG merge dedups by `drv_hash`, and workers reject stale-generation assignments after seeing the new generation in `HeartbeatResponse`. Worst case: a derivation is dispatched twice, builds twice, produces the same deterministic output. Wasteful but correct.
 
 r[sched.lease.generation-fence]
 **Generation-based staleness detection is worker-side only.** On each lease acquisition, the new leader increments an in-memory `Arc<AtomicU64>` generation counter. Workers see the new generation in `HeartbeatResponse` and reject any `WorkAssignment` carrying an older generation. **No PostgreSQL-level write fencing exists.** A deposed leader's in-flight PG writes will succeed; the split-brain window is bounded by the Lease renew deadline (default 15s). Because the writes in question are idempotent upserts keyed by `drv_hash` and status transitions are monotone, brief dual-writer windows do not corrupt state.
 
 > **Optional hardening (Phase 4+):** If stricter at-most-one-writer semantics are needed, add a `scheduler_meta` row with a `leader_generation` column and gate all synchronous writes with `WHERE leader_generation = $current_gen`. Not currently implemented --- the worker-side generation check plus idempotent PG schema is sufficient for correctness.
+
+r[sched.lease.graceful-release]
+On graceful shutdown (SIGTERM), if the lease loop was leading, it calls `step_down()` to clear `holderIdentity` before the process exits. This is an optimization, not a correctness requirement: without it, the next replica waits up to `lease_ttl` (15s) for observed-record expiry. With it, the next replica's `decide()` sees an empty holder and steals immediately on its next poll (~1s). The `step_down()` call is a resourceVersion-guarded PUT (409 → someone already stole, treated as success); `main()` awaits the lease-loop's `JoinHandle` after `serve_with_shutdown` returns, ensuring the PUT lands before process exit. If `step_down()` fails (apiserver unreachable), the loop logs a warning and observed-record expiry is the fallback.
+
+r[sched.grpc.leader-guard]
+Every gRPC handler (SchedulerService, WorkerService, AdminService) checks `is_leader` at entry and returns `UNAVAILABLE` ("not leader") when false. This decouples K8s readiness from leadership: both pods are Ready (process up, gRPC listening), but only the leader serves RPCs. Clients with a health-aware balanced channel discover the leader via `grpc.health.v1/Check` (which reports NOT_SERVING on the standby) and route accordingly. A client that hits the standby anyway (race during failover, or a per-call connect via the ClusterIP Service) gets UNAVAILABLE, which by gRPC convention is retryable --- on the health-aware balancer, the retry goes to the leader.
+
+r[sched.lease.deletion-cost]
+On the acquire transition, the lease loop annotates its own Pod with `controller.kubernetes.io/pod-deletion-cost: "1"`; on the lose transition, it sets `"0"`. Kubernetes's ReplicaSet controller sorts pods by this annotation (ascending, lower = kill first) when picking which pod to evict during scale-down --- including the surge-reconcile phase of RollingUpdate. With cost=1 on the leader and cost=0 on the standby, `kubectl rollout restart` kills the standby first, new pod comes up, acquires (old leader step_down on SIGTERM), no double leadership churn. The PATCH is fire-and-forget (the lease loop must not block on it) and failure is non-fatal: without the annotation, K8s picks arbitrarily, which means 50% of rollouts churn leadership twice instead of once. Annoying but correct.
+
+**Deployment strategy interaction:** Readiness is decoupled from leadership (`r[sched.grpc.leader-guard]`): both pods are Ready (TCP probe = process up), RollingUpdate works with `maxUnavailable: 1`, zero-downtime rollouts. Clients route via a health-aware balanced channel against the headless Service `rio-scheduler-headless` --- they DNS-resolve to pod IPs, probe `grpc.health.v1/Check` on each (NOT_SERVING on standby), and only insert the leader into the tonic p2c balancer. The ClusterIP Service `rio-scheduler` is kept for per-call connects (controller reconcilers, rio-cli) where a 50% chance of hitting UNAVAILABLE + retry is acceptable. Combined with `step_down()` and pod-deletion-cost, a rollout flips leadership exactly once: K8s kills the standby first (cost=0), new pod comes up as standby, K8s kills the old leader, old leader step_down releases the lease, new pod acquires within one poll (~1s), balanced-channel clients reroute within one probe tick (~3s). Workers reconnect in place --- running builds continue, no pod restarts.
+
+> TODO(phase4b): VM test for 2-replica failover. Requires decomposing `mkControlNode` (scheduler-only VMs sharing one PG+store), adding PG network-trust auth (currently localhost-only), and either dnsmasq for multi-A-record resolution or testing single-channel reconnect (the relay/reconnect loop is channel-agnostic). Unit coverage exists for the mechanics: `test_not_leader_rejects_all_rpcs` (leader-guard), `tick_follows_health_flip` (balance health probe), `relay_survives_target_swap` (worker relay buffering). End-to-end "build survives rollout" verified against EKS via the recipe in the zero-downtime-rollouts plan.
 
 ## Incremental Critical-Path Maintenance
 

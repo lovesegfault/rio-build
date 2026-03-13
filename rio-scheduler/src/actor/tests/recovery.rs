@@ -265,6 +265,7 @@ async fn merge_chain(
                 edges,
                 options: Default::default(),
                 keep_going: true,
+                traceparent: String::new(),
             },
             reply: tx,
         })
@@ -848,6 +849,254 @@ async fn test_reconcile_store_unreachable_assumes_incomplete() -> TestResult {
     assert!(
         post.retry_count >= 1,
         "retry_count should be bumped (this is a retry)"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.poison.ttl-persist]
+/// Poison a derivation on actor A, drop A, spawn actor B on the same PG,
+/// send LeaderAcquired → recover_from_pg should load the poisoned derivation
+/// with Poisoned status for TTL tracking. Without migration 009's poisoned_at
+/// persistence, poison TTL would reset on every scheduler restart.
+#[tokio::test]
+async fn test_recovery_loads_poisoned_derivations() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: actor A poisons a derivation ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "poison-rec-w", "x86_64-linux", 1).await?;
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "poison-rec",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        complete_failure(
+            &handle,
+            "poison-rec-w",
+            &test_drv_path("poison-rec"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        // Barrier: ensure persist_status + set_poisoned_at hit PG.
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Verify PG has it poisoned + poisoned_at set (precondition).
+    let (status, has_ts): (String, bool) =
+        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
+            .bind("poison-rec")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "poisoned", "PG status should be poisoned");
+    assert!(
+        has_ts,
+        "PG poisoned_at should be set (the as_bytes bug broke this)"
+    );
+
+    // --- Phase 2: fresh actor B recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+
+    // Before recovery: DAG is empty.
+    let pre = handle.debug_query_derivation("poison-rec").await?;
+    assert!(pre.is_none(), "fresh actor has empty DAG");
+
+    // LeaderAcquired → recover_from_pg loads poisoned derivations.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // After recovery: derivation is back in the DAG with Poisoned status.
+    let post = handle
+        .debug_query_derivation("poison-rec")
+        .await?
+        .expect("poisoned drv should be recovered for TTL tracking");
+    assert_eq!(
+        post.status,
+        DerivationStatus::Poisoned,
+        "recovered with Poisoned status — handle_tick will TTL-check it"
+    );
+
+    Ok(())
+}
+
+/// Recovery loads a poisoned row whose PG `poisoned_at` is already past
+/// TTL. Recovery should clear it in PG and NOT insert it into the DAG.
+///
+/// Without the recovery.rs pre-filter, `from_poisoned_row` on a fresh
+/// k8s node (booted 1h ago) with elapsed=30h would do Instant::now()
+/// .checked_sub(30h) → None → unwrap_or(now) → poisoned_at=now →
+/// duration_since(now)=0 < POISON_TTL → FRESH 24h TTL for a derivation
+/// that should have expired 6h ago. PG's wall-clock elapsed_secs
+/// comparison is immune to node uptime.
+#[tokio::test]
+async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: actor A poisons a derivation, then we backdate PG ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "exp-poison-w", "x86_64-linux", 1).await?;
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "exp-poison",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        complete_failure(
+            &handle,
+            "exp-poison-w",
+            &test_drv_path("exp-poison"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Backdate poisoned_at well past POISON_TTL (cfg(test) = 100ms, so
+    // 10s is 100× past). PG computes elapsed_secs = now() - poisoned_at
+    // at load time.
+    sqlx::query(
+        "UPDATE derivations SET poisoned_at = now() - interval '10 seconds' WHERE drv_hash = $1",
+    )
+    .bind("exp-poison")
+    .execute(&db.pool)
+    .await?;
+
+    // Precondition: PG still shows poisoned.
+    let (status, _): (String, bool) =
+        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
+            .bind("exp-poison")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "poisoned");
+
+    // --- Phase 2: fresh actor B recovers ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Derivation NOT in the DAG — recovery filtered it.
+    let post = handle.debug_query_derivation("exp-poison").await?;
+    assert!(
+        post.is_none(),
+        "expired-at-load poison should be cleared, not reloaded into DAG"
+    );
+
+    // PG: clear_poison ran → status='created', poisoned_at NULL.
+    let (status, has_ts): (String, bool) =
+        sqlx::query_as("SELECT status, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash=$1")
+            .bind("exp-poison")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(status, "created", "clear_poison sets status='created'");
+    assert!(!has_ts, "clear_poison NULLs poisoned_at");
+
+    Ok(())
+}
+
+/// Regression: a ClearPoison on a recovered poisoned node must remove it
+/// from the DAG so a resubmit inserts it fresh with full proto fields.
+///
+/// Before the fix, `reset_from_poison` left the node in Created with stub
+/// fields from `from_poisoned_row` (`output_names: []`,
+/// `expected_output_paths: []`). `dag.merge()` on an existing node only
+/// touches `interested_builds` + `traceparent`, and `compute_initial_states`
+/// only iterates `newly_inserted` — so the resubmit's node never progressed
+/// past Created. Build counters stuck at `completed=0, failed=0, total=1`;
+/// `check_build_completion` never fired. Hard hang.
+#[tokio::test]
+async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // --- Phase 1: actor A poisons a derivation ---
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "zombie-w", "x86_64-linux", 1).await?;
+        let _ev = merge_single_node(
+            &handle,
+            Uuid::new_v4(),
+            "zombie-drv",
+            PriorityClass::Scheduled,
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        complete_failure(
+            &handle,
+            "zombie-w",
+            &test_drv_path("zombie-drv"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "permanent",
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // --- Phase 2: fresh actor B recovers, operator clears poison,
+    //     user resubmits ---
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let mut worker_rx = connect_worker(&handle, "zombie-w2", "x86_64-linux", 1).await?;
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // Precondition: recovery loaded the poisoned node.
+    let recovered = handle
+        .debug_query_derivation("zombie-drv")
+        .await?
+        .expect("poisoned drv recovered from PG");
+    assert_eq!(recovered.status, DerivationStatus::Poisoned);
+
+    // ClearPoison → node REMOVED (not reset-in-place).
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::ClearPoison {
+            drv_hash: "zombie-drv".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rx.await?, "ClearPoison → cleared=true");
+
+    let post_clear = handle.debug_query_derivation("zombie-drv").await?;
+    assert!(
+        post_clear.is_none(),
+        "ClearPoison must remove the node so next merge treats it as newly-inserted"
+    );
+
+    // Resubmit — the bug's trigger. Node is newly-inserted → gets full
+    // proto fields → runs through compute_initial_states → dispatches.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "zombie-drv", PriorityClass::Scheduled).await?;
+
+    // The regression: before the fix, merge saw a stale Created stub,
+    // skipped compute_initial_states, and the node never dispatched.
+    // Assert it actually reaches the worker. recv_assignment has a 2s
+    // timeout and panics on non-Assignment — both are hang symptoms.
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert_eq!(assignment.drv_path, test_drv_path("zombie-drv"));
+
+    // And status progressed past Created.
+    let post_merge = handle
+        .debug_query_derivation("zombie-drv")
+        .await?
+        .expect("freshly inserted");
+    assert_ne!(
+        post_merge.status,
+        DerivationStatus::Created,
+        "node must progress past Created (compute_initial_states ran)"
     );
 
     Ok(())

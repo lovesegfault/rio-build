@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5bec46c4c1a8f8b3b269991748e5bc617dd83eb531414f90f2859b18e221b1db # shrinks to result = BuildResult { status: Built, error_msg: "", times_built: 0, is_non_deterministic: false, start_time: 0, stop_time: 0, cpu_user: None, cpu_system: None, built_outputs: [BuiltOutput { drv_output_id: "sha256:aaaa00a00aaa000aa0000a00a0a0a0000aa00a00a0a0a0a00aa00000aa0aaaa0!a", out_path: "/nix/store/00aa000aaa0a0a00aa0aaaaaaa0a000a-a" }] }

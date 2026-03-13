@@ -176,8 +176,8 @@ pub struct DerivationState {
     pub output_names: Vec<String>,
     /// Whether this is a fixed-output derivation (fetchurl, etc.).
     pub is_fixed_output: bool,
-    /// Current state machine status. Private: mutate only via `transition()`,
-    /// `reset_to_ready()`, or `reset_from_poison()` to preserve invariants.
+    /// Current state machine status. Private: mutate only via `transition()`
+    /// or `reset_to_ready()` to preserve invariants.
     status: DerivationStatus,
     /// Set of build IDs interested in this derivation.
     pub interested_builds: HashSet<Uuid>,
@@ -254,6 +254,13 @@ pub struct DerivationState {
     /// longer than expected is likely stuck (worker heartbeating
     /// but daemon wedged, or the worker's clock jumped).
     pub(crate) running_since: Option<Instant>,
+    /// W3C traceparent of the submitting gRPC handler's span, captured
+    /// at DAG-merge time. Embedded into `WorkAssignment.traceparent` at
+    /// dispatch so the worker's build span chains back to the gateway's
+    /// trace regardless of which code path (immediate merge, deferred
+    /// completion/heartbeat) triggers dispatch. Empty for recovered
+    /// derivations (no user trace). First submitter wins on dedup.
+    pub traceparent: String,
 }
 
 impl DerivationState {
@@ -295,6 +302,7 @@ impl DerivationState {
             ready_at: None,
             backoff_until: None,
             running_since: None,
+            traceparent: String::new(),
         })
     }
 
@@ -362,7 +370,66 @@ impl DerivationState {
             // (won't spuriously cancel) at the cost of a possibly
             // stale build running longer.
             running_since: (status == DerivationStatus::Running).then_some(now),
-            backoff_until: None, // any in-flight backoff is forgiven
+            backoff_until: None,        // any in-flight backoff is forgiven
+            traceparent: String::new(), // recovered: no user trace
+        })
+    }
+
+    /// Construct from a `PoisonedDerivationRow` during recovery.
+    /// Minimal — poisoned rows aren't dispatched, just TTL-tracked.
+    /// `elapsed_secs` comes from PG's `EXTRACT(EPOCH FROM (now() -
+    /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
+    /// Duration::from_secs_f64(elapsed)` — approximate but good enough
+    /// for a 24h TTL.
+    pub fn from_poisoned_row(
+        row: crate::db::PoisonedDerivationRow,
+    ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
+        let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)
+            .map_err(|e| (row.drv_hash.clone(), e))?;
+        let now = Instant::now();
+        // Convert PG-computed elapsed seconds back to an Instant.
+        // Clamp: negative/NaN → 0 (conservative full TTL), +inf → 1yr
+        // (poisoned_at = -infinity::timestamp would make from_secs_f64
+        // panic). Follows the `.max(0.0).min(MAX)` pattern from
+        // worker.rs:207.
+        //
+        // Note: recovery.rs filters out rows with elapsed_secs >
+        // POISON_TTL before calling this, so the checked_sub(elapsed)
+        // → None → unwrap_or(now) path only fires for still-valid
+        // poison on a recently-booted node — in which case treating
+        // poisoned_at as "now" is a conservative approximation (slight
+        // TTL extension from recovery time, bounded by node uptime).
+        const MAX_ELAPSED_SECS: f64 = 365.0 * 86400.0;
+        #[allow(clippy::manual_clamp)]
+        let clamped = row.elapsed_secs.max(0.0).min(MAX_ELAPSED_SECS);
+        let elapsed = std::time::Duration::from_secs_f64(clamped);
+        let poisoned_at = now.checked_sub(elapsed).unwrap_or(now);
+        Ok(Self {
+            drv_hash: row.drv_hash.into(),
+            drv_path,
+            pname: row.pname,
+            system: row.system,
+            required_features: Vec::new(),
+            output_names: Vec::new(),
+            is_fixed_output: false,
+            status: DerivationStatus::Poisoned,
+            interested_builds: HashSet::new(),
+            assigned_worker: None,
+            assigned_size_class: None,
+            drv_content: Vec::new(),
+            retry_count: 0,
+            failed_workers: row.failed_workers.into_iter().map(Into::into).collect(),
+            poisoned_at: Some(poisoned_at),
+            output_paths: Vec::new(),
+            expected_output_paths: Vec::new(),
+            est_duration: 0.0,
+            input_srcs_nar_size: 0,
+            priority: 0.0,
+            db_id: Some(row.derivation_id),
+            ready_at: None,
+            running_since: None,
+            backoff_until: None,
+            traceparent: String::new(),
         })
     }
 
@@ -427,15 +494,6 @@ impl DerivationState {
             }
         }
         self.assigned_worker = None;
-        Ok(())
-    }
-
-    /// Poison TTL expiry. Transitions Poisoned -> Created and clears poison state.
-    pub fn reset_from_poison(&mut self) -> Result<(), TransitionError> {
-        self.transition(DerivationStatus::Created)?;
-        self.poisoned_at = None;
-        self.retry_count = 0;
-        self.failed_workers.clear();
         Ok(())
     }
 
@@ -633,26 +691,45 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_from_poison() -> anyhow::Result<()> {
-        let node = dummy_node();
+    fn test_from_poisoned_row_invalid_drv_path() {
+        // Malformed drv_path (not a store path) → Err((hash, StorePathError)).
+        // Covers the error branch that recovery.rs logs-and-skips.
+        let row = crate::db::PoisonedDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: "somehash".into(),
+            drv_path: "not-a-store-path".into(),
+            pname: None,
+            system: "x86_64-linux".into(),
+            failed_workers: vec![],
+            elapsed_secs: 100.0,
+        };
+        let err = DerivationState::from_poisoned_row(row).unwrap_err();
+        assert_eq!(
+            err.0, "somehash",
+            "error tuple returns drv_hash for logging"
+        );
+    }
 
-        let mut state = DerivationState::try_from_node(&node)?;
-        state.set_status_for_test(DerivationStatus::Poisoned);
-        state.poisoned_at = Some(Instant::now());
-        state.retry_count = 5;
-        state.failed_workers.insert("w1".into());
-        state.failed_workers.insert("w2".into());
-
-        assert!(state.reset_from_poison().is_ok());
-        assert_eq!(state.status(), DerivationStatus::Created);
-        assert!(state.poisoned_at.is_none());
-        assert_eq!(state.retry_count, 0);
-        assert!(state.failed_workers.is_empty());
-
-        // Non-poisoned state rejected
-        let mut state = DerivationState::try_from_node(&node)?;
-        state.set_status_for_test(DerivationStatus::Running);
-        assert!(state.reset_from_poison().is_err());
-        Ok(())
+    #[test]
+    fn test_from_poisoned_row_infinity_elapsed_does_not_panic() {
+        // poisoned_at = '-infinity'::timestamp in PG → EXTRACT returns
+        // +inf. from_secs_f64(+inf) panics. The clamp guards this
+        // (requires manual DB corruption, but a panic here bricks
+        // scheduler startup entirely — disproportionate).
+        let row = crate::db::PoisonedDerivationRow {
+            derivation_id: uuid::Uuid::new_v4(),
+            drv_hash: "infhash".into(),
+            drv_path: rio_test_support::fixtures::test_drv_path("inf"),
+            pname: None,
+            system: "x86_64-linux".into(),
+            failed_workers: vec![],
+            elapsed_secs: f64::INFINITY,
+        };
+        let state = DerivationState::from_poisoned_row(row).unwrap();
+        // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →
+        // poisoned_at = now. This is a panic guard, not correctness
+        // — recovery.rs filters expired rows before calling here so
+        // a +inf elapsed would never reach this in practice.
+        assert!(state.poisoned_at.is_some());
     }
 }

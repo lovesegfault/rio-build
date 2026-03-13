@@ -444,6 +444,9 @@ impl DagActor {
 
         self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
             .await;
+        if let Err(e) = self.db.set_poisoned_at(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist poisoned_at");
+        }
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
@@ -455,6 +458,42 @@ impl DagActor {
         for build_id in interested_builds {
             self.handle_derivation_failure(build_id, drv_hash).await;
         }
+    }
+
+    // r[impl sched.admin.clear-poison]
+    /// Clear poison state for a derivation (admin-initiated via
+    /// `AdminService.ClearPoison`). Returns `true` if cleared.
+    ///
+    /// In-mem: node removed from the DAG entirely — next submit re-inserts
+    /// it fresh with full proto fields and runs it through
+    /// `compute_initial_states`. PG: `db.clear_poison()` sets
+    /// status='created', NULLs `poisoned_at`/`retry_count`/`failed_workers`.
+    ///
+    /// PG first, in-mem second — if PG fails the operator's retry
+    /// finds in-mem still Poisoned and can proceed. The previous
+    /// order (in-mem first) meant a PG blip left status=Created,
+    /// so retry hit the not-poisoned guard → permanent no-op until
+    /// scheduler restart.
+    pub(super) async fn handle_clear_poison(&mut self, drv_hash: &DrvHash) -> bool {
+        match self.dag.node(drv_hash).map(|s| s.status()) {
+            None => return false, // not found
+            Some(s) if s != DerivationStatus::Poisoned => return false,
+            Some(_) => {}
+        }
+        if let Err(e) = self.db.clear_poison(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e,
+                   "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
+            return false;
+        }
+        // Remove from DAG so next merge treats it as newly-inserted.
+        // Resetting status in-place would strand stub fields from
+        // `from_poisoned_row` and `compute_initial_states` only iterates
+        // `newly_inserted` — node would sit in Created forever. Poisoned
+        // nodes have no interested builds (build already terminated) so
+        // removal here orphans no live build accounting.
+        self.dag.remove_node(drv_hash);
+        info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
+        true
     }
 
     pub(super) async fn handle_transient_failure(
@@ -544,16 +583,26 @@ impl DagActor {
         error_msg: &str,
         _worker_id: &WorkerId,
     ) {
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            state.ensure_running();
-            if let Err(e) = state.transition(DerivationStatus::Poisoned) {
-                warn!(drv_hash = %drv_hash, error = %e, "->Poisoned transition failed");
-            }
-            state.poisoned_at = Some(Instant::now());
+        let Some(state) = self.dag.node_mut(drv_hash) else {
+            return;
+        };
+        state.ensure_running();
+        if let Err(e) = state.transition(DerivationStatus::Poisoned) {
+            // Stale PermanentFailure (e.g., drv already Completed on
+            // another worker after reassignment). Don't write Poisoned
+            // to PG or cascade — in-mem/PG drift + spurious cascade is
+            // worse than a missed failure event.
+            warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
+                  "handle_permanent_failure: ->Poisoned transition rejected, skipping");
+            return;
         }
+        state.poisoned_at = Some(Instant::now());
 
         self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
             .await;
+        if let Err(e) = self.db.set_poisoned_at(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e, "failed to persist poisoned_at");
+        }
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.

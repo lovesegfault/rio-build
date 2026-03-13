@@ -48,6 +48,18 @@
         # leave it unfollowed rather than polluting our inputs.
       };
     };
+
+    # Helm charts as Nix derivations (FODs — hash-pinned, cached). The
+    # bitnami PG subchart + rook-ceph operator + cluster charts come from
+    # here. Alternative was vendoring .tgz into git (ugly) or hand-rolling
+    # a `helm pull` FOD (nixhelm already did that work). Only the
+    # chartsDerivations output is used; nixhelm's transitive inputs
+    # (pyproject-nix etc) are unused but pulled into flake.lock — cost of
+    # one flake input.
+    nixhelm = {
+      url = "github:farcaller/nixhelm";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -250,8 +262,8 @@
               ;
           };
 
-          # Spec-coverage CLI (CI: `tracey query validate`).
-          # Dashboard is stubbed — see nix/tracey.nix for why.
+          # Spec-coverage CLI + web dashboard. The SPA is built via
+          # fetchPnpmDeps in nix/tracey.nix and embedded at compile time.
           traceyPkg = import ./nix/tracey.nix { inherit craneLib pkgs; };
 
           # --------------------------------------------------------------
@@ -346,10 +358,6 @@
             # docs/**/*.md and .config/tracey/config.styx, which crane's
             # source filter drops. tracey's daemon writes .tracey/daemon.sock
             # under the working dir, so we cp to a writable tmpdir first.
-            #
-            # v1.3.0 bug: `tracey query validate` always exits 0 even when it
-            # reports errors. Workaround: grep for "0 total error(s)". Remove
-            # the grep once upstream fixes the exit code.
             tracey-validate =
               pkgs.runCommand "rio-tracey-validate"
                 {
@@ -366,11 +374,42 @@
                   # outside the working dir) goes somewhere writable.
                   rm -rf .tracey/
                   export HOME=$TMPDIR
-                  tracey query validate 2>&1 | tee validate.log
-                  grep -q '0 total error(s)' validate.log || {
-                    echo "FAIL: tracey validate found errors (see above)"
-                    exit 1
-                  }
+                  set -o pipefail
+                  tracey query validate 2>&1 | tee $out
+                '';
+
+            # Helm chart lint + template for all value profiles. Catches
+            # Go-template syntax errors, missing required values, bad YAML
+            # in rendered output. Subcharts are NOT vendored — charts/ is
+            # gitignored; the PG chart is symlinked from the nix store (via
+            # nix/helm-charts.nix, nixhelm FOD) because `helm dependency
+            # build` needs network and fails in the sandbox.
+            # kubeconform schema validation is NOT here (it fetches schemas
+            # from raw.githubusercontent.com; nixbuild.net sandbox blocks
+            # that) — it's a pre-commit hook instead (runs on dev laptop
+            # with network).
+            helm-lint =
+              let
+                chart = pkgs.lib.cleanSource ./infra/helm/rio-build;
+              in
+              pkgs.runCommand "rio-helm-lint"
+                {
+                  nativeBuildInputs = [ pkgs.kubernetes-helm ];
+                }
+                ''
+                  cp -r ${chart} $TMPDIR/chart
+                  chmod -R +w $TMPDIR/chart
+                  cd $TMPDIR/chart
+                  # PG subchart from nixhelm (FOD). Rook is NOT a subchart
+                  # (separate release, operator-first lifecycle) so helm-lint
+                  # doesn't need it.
+                  mkdir -p charts
+                  ln -s ${subcharts.postgresql} charts/postgresql
+                  helm lint .
+                  # Default (prod) profile: tag must be set (empty → bad image ref).
+                  helm template rio . --set global.image.tag=test > /dev/null
+                  helm template rio . -f values/dev.yaml > /dev/null
+                  helm template rio . -f values/vmtest.yaml > /dev/null
                   touch $out
                 '';
             # Coverage via `cargo llvm-cov nextest` (NOT `cargo llvm-cov test`).
@@ -445,6 +484,15 @@
             );
           dockerImages = mkDockerImages rio-workspace;
 
+          # Subcharts from nixhelm (FODs — hash-pinned `helm pull`).
+          # Referenced by: helm-lint check (symlinked into charts/ in-sandbox),
+          # packages.helm-* (`just eks deploy` / `just dev apply` symlink from
+          # the result path into the working-tree charts/ — gitignored).
+          subcharts = import ./nix/helm-charts.nix {
+            inherit (inputs) nixhelm;
+            inherit system;
+          };
+
           # --------------------------------------------------------------
           # Per-phase VM tests (Linux-only — need NixOS VMs + KVM)
           # --------------------------------------------------------------
@@ -489,10 +537,13 @@
                 inherit pkgs rio-workspace coverage;
                 rioModules = inputs.self.nixosModules;
               };
-              # phase3a/3b need dockerImages + crds on top of the base args.
+              # phase3a/3b need dockerImages + crds; phase4 also needs
+              # nixhelm (helm-render.nix fetches the PG subchart so
+              # `helm template` doesn't error on missing dependency).
               k3sArgs = vmTestArgs // {
-                inherit dockerImages;
+                inherit dockerImages system;
                 inherit (inputs.self.packages.${system}) crds;
+                inherit (inputs) nixhelm;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -505,6 +556,10 @@
               # MIN_CPU than the count would suggest.
               vm-phase3a = withMinCpu 4 (import ./nix/tests/phase3a.nix k3sArgs);
               vm-phase3b = withMinCpu 4 (import ./nix/tests/phase3b.nix k3sArgs);
+              # phase4.nix starts with k3s topology from the start
+              # (Section A only in 4a; sections B–J appended in 4b/4c).
+              # Auto-included in ci-fast via builtins.attrValues vmTests.
+              vm-phase4 = withMinCpu 4 (import ./nix/tests/phase4.nix k3sArgs);
             };
 
           vmTests = mkVmTests {
@@ -569,6 +624,7 @@
             cargoChecks.coverage
             cargoChecks.deny
             cargoChecks.tracey-validate
+            cargoChecks.helm-lint
             # pre-commit is auto-generated by git-hooks-nix; referencing
             # config.checks from packages is acyclic.
             config.checks.pre-commit
@@ -642,6 +698,7 @@
                   doc
                   deny
                   tracey-validate
+                  helm-lint
                   ;
                 inherit (config.checks) pre-commit;
               };
@@ -724,6 +781,15 @@
               deadnix.enable = true;
               nil.enable = true;
               statix.enable = true;
+
+              # No kubeconform hook: it fetches ~300MB of schemas from
+              # raw.githubusercontent.com at runtime, which fails in the
+              # nixbuild.net sandbox (config.checks.pre-commit runs all
+              # hooks there). Run it interactively if needed:
+              #   helm template rio infra/helm/rio-build --set global.image.tag=x \
+              #     | kubeconform -strict -skip CustomResourceDefinition,Certificate,...
+              # The helm-lint flake check above catches template syntax
+              # errors without network.
             };
           };
 
@@ -765,6 +831,40 @@
 
                 # Spec-coverage: `tracey query validate`, `tracey web`
                 traceyPkg
+
+                # Deploy tooling for infra/eks/. Large closures (awscli2
+                # pulls python3 + botocore) but the user asked for
+                # everything-in-one-shell over a separate .#deploy.
+                # Scripts under infra/eks/ also carry nix-shell shebangs
+                # pointing at these same packages, so they work even if
+                # someone runs them outside `nix develop`.
+                awscli2
+                # opentofu (not terraform: BSL license → unfree in nixpkgs)
+                # with providers bundled via withPlugins. No `tofu init`
+                # download step — providers are in the nix store, pinned by
+                # nixpkgs rev. .terraform.lock.hcl is gitignored (nix is the
+                # lock). The provider set must cover transitive module deps
+                # too (EKS module pulls cloudinit + null).
+                (opentofu.withPlugins (p: [
+                  p.hashicorp_aws
+                  p.hashicorp_helm
+                  p.hashicorp_kubernetes
+                  p.hashicorp_random
+                  p.hashicorp_tls
+                  p.hashicorp_time
+                  p.hashicorp_cloudinit # transitive: terraform-aws-modules/eks
+                  p.hashicorp_null # transitive: terraform-aws-modules/eks
+                ]))
+                kubectl
+                skopeo # nix build .#docker-* | skopeo copy docker-archive:... docker://ECR
+                kubernetes-helm
+                kubeconform # ad-hoc schema validation (no pre-commit hook — fetches 300MB, sandbox blocks)
+                yq-go # scripts/split-crds.sh + nix/helm-render.nix
+                grpcurl # manual AdminService poking when rio-cli isn't enough
+                jq # push-images.sh parses terraform output + smoke-test.sh
+                openssl # openssl rand 32 → HMAC key
+                git # push-images.sh dirty-tree check + rev-parse for image tag
+                just # deploy workflow recipes (see justfile at repo root)
               ];
               shellEnv = {
                 RUST_BACKTRACE = "1";
@@ -805,6 +905,14 @@
             # debug: nix build .#fuzz-build-nix / .#fuzz-build-store
             fuzz-build-nix = fuzz.builds.rio-nix-fuzz-build;
             fuzz-build-store = fuzz.builds.rio-store-fuzz-build;
+            # Helm charts from nixhelm (unpacked dirs). `just dev apply` and
+            # `just eks deploy` build these and symlink/install from the
+            # result path. PG must be in charts/ even when
+            # condition: postgresql.enabled is false — Helm validates
+            # charts/ against Chart.yaml BEFORE evaluating conditions.
+            helm-postgresql = subcharts.postgresql;
+            helm-rook-ceph = subcharts.rook-ceph;
+            helm-rook-ceph-cluster = subcharts.rook-ceph-cluster;
           }
           # Container images: docker-{gateway,scheduler,store,worker}
           # plus a linkFarm aggregate at `.#dockerImages` (milestone
@@ -817,9 +925,11 @@
             docker-store = dockerImages.store;
             docker-worker = dockerImages.worker;
             docker-controller = dockerImages.controller;
+            docker-fod-proxy = dockerImages.fod-proxy;
+            docker-bootstrap = dockerImages.bootstrap;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList (name: drv: {
-                name = "${name}.tar.gz";
+                name = "${name}.tar.zst";
                 path = drv;
               }) dockerImages
             );
@@ -828,12 +938,13 @@
             # binary (serde_yaml write-only) and dumps two YAML
             # documents (WorkerPool + Build) to $out. Kustomize
             # references this via `nix build .#crds` → result is a
-            # file, copy to deploy/base/crds.yaml and commit.
+            # file; ./scripts/split-crds.sh result splits it into
+            # one-file-per-CRD under infra/helm/crds/.
             #
             # NOT a derivation that the kustomize base depends on
             # directly (kustomize needs real files, not /nix/store
             # paths). It's a convenience for regeneration:
-            #   nix build .#crds && cp result deploy/base/crds.yaml
+            #   nix build .#crds && cp result infra/k8s/base/crds.yaml
             #
             # Why not auto-regenerate in CI: the committed YAML is
             # what operators `kubectl apply`. Regenerating on every

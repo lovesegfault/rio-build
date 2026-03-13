@@ -1,0 +1,14 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+    {{- with .Values.namespace.podSecurityLabel }}
+    # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
+    # Workers live in SAME namespace (WorkerPool CRD is namespaced,
+    # reconciler creates STS there).
+    pod-security.kubernetes.io/enforce: {{ . }}
+    {{- end }}
+{{- end }}

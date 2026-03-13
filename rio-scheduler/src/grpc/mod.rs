@@ -5,6 +5,7 @@
 // r[impl proto.stream.bidi]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +36,11 @@ pub struct SchedulerGrpc {
     /// replay). Production always sets it — main.rs already has
     /// the pool for the DB handle.
     pool: Option<sqlx::PgPool>,
+    /// Shared with the lease loop. When false (standby), all
+    /// handlers return UNAVAILABLE immediately — clients with
+    /// a health-aware balanced channel route to the leader
+    /// instead. Tests default to `true` (always-leader).
+    is_leader: Arc<AtomicBool>,
 }
 
 impl SchedulerGrpc {
@@ -51,6 +57,19 @@ impl SchedulerGrpc {
             actor,
             log_buffers: Arc::new(LogBuffers::new()),
             pool: None,
+            is_leader: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Test constructor with a PG pool for tenant-resolution tests.
+    /// Like `new_for_tests` but with a pool so `resolve_tenant` works.
+    #[cfg(test)]
+    pub fn new_for_tests_with_pool(actor: ActorHandle, pool: sqlx::PgPool) -> Self {
+        Self {
+            actor,
+            log_buffers: Arc::new(LogBuffers::new()),
+            pool: Some(pool),
+            is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -64,11 +83,13 @@ impl SchedulerGrpc {
         actor: ActorHandle,
         log_buffers: Arc<LogBuffers>,
         pool: sqlx::PgPool,
+        is_leader: Arc<AtomicBool>,
     ) -> Self {
         Self {
             actor,
             log_buffers,
             pool: Some(pool),
+            is_leader,
         }
     }
 
@@ -83,6 +104,26 @@ impl SchedulerGrpc {
             return Err(Status::unavailable(
                 "scheduler actor is unavailable (panicked or exited)",
             ));
+        }
+        Ok(())
+    }
+
+    // r[impl sched.grpc.leader-guard]
+    /// Return UNAVAILABLE when this replica is not the leader.
+    /// Called at the top of every handler, before any actor
+    /// interaction. Standby replicas keep the gRPC server up
+    /// (so the process is Ready from K8s's PoV) but refuse all
+    /// RPCs — clients with a health-aware balanced channel see
+    /// NOT_SERVING from grpc.health.v1 and route elsewhere.
+    ///
+    /// A bare `Status::unavailable` (not `Status::failed_precondition`)
+    /// because tonic's p2c balancer ejects endpoints on
+    /// UNAVAILABLE-at-connection but NOT on RPC-level errors;
+    /// clients retry on UNAVAILABLE by convention (health-aware
+    /// balancer has already removed us, so retry goes to leader).
+    fn ensure_leader(&self) -> Result<(), Status> {
+        if !self.is_leader.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("not leader (standby replica)"));
         }
         Ok(())
     }
@@ -130,6 +171,29 @@ impl SchedulerGrpc {
         s.parse()
             .map_err(|_| Status::invalid_argument("invalid build_id UUID"))
     }
+}
+
+/// Resolve a tenant name to its UUID, mapping errors to gRPC `Status`.
+/// Shared by `SubmitBuild` (here) and `ListBuilds` (admin/mod.rs).
+///
+/// The gateway sends the tenant NAME (from the `authorized_keys` entry's
+/// comment field); the scheduler resolves it here. Empty name → `Ok(None)`
+/// (single-tenant mode; no PG roundtrip). Unknown name →
+/// `Status::invalid_argument`. PG error → `Status::internal`.
+pub(crate) async fn resolve_tenant_name(
+    pool: &sqlx::PgPool,
+    name: &str,
+) -> Result<Option<Uuid>, Status> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Status::internal(format!("tenant lookup failed: {e}")))?
+        .ok_or_else(|| Status::invalid_argument(format!("unknown tenant: {name}")))
+        .map(Some)
 }
 
 /// Parameters for PG-backed event replay on WatchBuild.
@@ -270,7 +334,7 @@ pub(crate) fn bridge_build_events(
 impl SchedulerService for SchedulerGrpc {
     type SubmitBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
 
-    #[instrument(skip(self, request), fields(rpc = "SubmitBuild", build_id = tracing::field::Empty))]
+    #[instrument(skip(self, request), fields(rpc = "SubmitBuild", build_id = tracing::field::Empty, tenant_id = tracing::field::Empty))]
     async fn submit_build(
         &self,
         request: Request<rio_proto::types::SubmitBuildRequest>,
@@ -280,6 +344,7 @@ impl SchedulerService for SchedulerGrpc {
         // link_parent stitches it to the client's trace_id. Everything
         // below (actor calls, DB writes, store RPCs) inherits this span.
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 
@@ -359,22 +424,29 @@ impl SchedulerService for SchedulerGrpc {
             build_cores: req.build_cores,
         };
 
+        // r[impl sched.tenant.resolve]
+        // Tenant resolution: proto field carries tenant NAME (from gateway's
+        // authorized_keys comment); resolve to UUID here via the tenants
+        // table. Empty string → None (single-tenant mode). Unknown name →
+        // InvalidArgument. Keeps gateway PG-free (stateless N-replica HA).
+        let tenant_id = if req.tenant_name.is_empty() {
+            None
+        } else {
+            let pool = self.pool.as_ref().ok_or_else(|| {
+                Status::failed_precondition("tenant lookup requires database connection")
+            })?;
+            resolve_tenant_name(pool, &req.tenant_name).await?
+        };
+
+        // Capture the current span's traceparent BEFORE sending to the
+        // actor. Span context does not cross the mpsc channel boundary;
+        // the actor task's `handle_merge_dag` #[instrument] span is a
+        // fresh root. Carrying traceparent as plain data lets dispatch
+        // embed the gateway-linked trace in WorkAssignment.
+        let traceparent = rio_proto::interceptor::current_traceparent();
         let req = MergeDagRequest {
             build_id,
-            tenant_id: if req.tenant_id.is_empty() {
-                None
-            } else {
-                // Parse at the boundary: a malformed UUID (e.g., "customer-foo")
-                // would otherwise leak as a PostgreSQL text-to-uuid cast error.
-                Some(
-                    req.tenant_id
-                        .parse::<uuid::Uuid>()
-                        .map_err(|e| {
-                            Status::invalid_argument(format!("invalid tenant_id UUID: {e}"))
-                        })?
-                        .to_string(),
-                )
-            },
+            tenant_id,
             priority_class: if req.priority_class.is_empty() {
                 crate::state::PriorityClass::default()
             } else {
@@ -386,6 +458,7 @@ impl SchedulerService for SchedulerGrpc {
             edges: req.edges,
             options,
             keep_going: req.keep_going,
+            traceparent,
         };
         let cmd = ActorCommand::MergeDag {
             req,
@@ -393,9 +466,12 @@ impl SchedulerService for SchedulerGrpc {
         };
 
         let bcast = self.send_and_await(cmd, reply_rx).await?;
-        // Record build_id on the span (declared Empty in #[instrument]).
-        // Per observability.md:204 this is a required structured-log field.
+        // Record build_id + tenant_id on the span (declared Empty in #[instrument]).
+        // Per observability.md these are required structured-log fields.
         tracing::Span::current().record("build_id", build_id.to_string());
+        if let Some(tid) = tenant_id {
+            tracing::Span::current().record("tenant_id", tracing::field::display(tid));
+        }
         info!(build_id = %build_id, "build submitted");
         // No replay: fresh build, MergeDag subscribed BEFORE seq=1
         // (Started) was emitted. last_seq=0, no gap. Pure broadcast.
@@ -414,6 +490,7 @@ impl SchedulerService for SchedulerGrpc {
         request: Request<rio_proto::types::WatchBuildRequest>,
     ) -> Result<Response<Self::WatchBuildStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -456,6 +533,7 @@ impl SchedulerService for SchedulerGrpc {
         request: Request<rio_proto::types::QueryBuildRequest>,
     ) -> Result<Response<rio_proto::types::BuildStatus>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -477,6 +555,7 @@ impl SchedulerService for SchedulerGrpc {
         request: Request<rio_proto::types::CancelBuildRequest>,
     ) -> Result<Response<rio_proto::types::CancelBuildResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
         let build_id = Self::parse_build_id(&req.build_id)?;
@@ -511,6 +590,7 @@ impl WorkerService for SchedulerGrpc {
         request: Request<tonic::Streaming<rio_proto::types::WorkerMessage>>,
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let mut stream = request.into_inner();
 
@@ -709,6 +789,7 @@ impl WorkerService for SchedulerGrpc {
         request: Request<rio_proto::types::HeartbeatRequest>,
     ) -> Result<Response<rio_proto::types::HeartbeatResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        self.ensure_leader()?;
         self.check_actor_alive()?;
         let req = request.into_inner();
 
@@ -776,6 +857,7 @@ impl WorkerService for SchedulerGrpc {
             running_builds: req.running_builds,
             bloom,
             size_class,
+            resources: req.resources,
         };
 
         // Heartbeats bypass backpressure: dropping a heartbeat under load

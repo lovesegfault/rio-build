@@ -49,6 +49,7 @@ impl DagActor {
 
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (stream + heartbeat)");
+            metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
         }
     }
 
@@ -251,7 +252,7 @@ impl DagActor {
                         count = to_reassign.len(),
                         "sent CancelSignal for force-drain (preemption)"
                     );
-                    metrics::counter!("rio_scheduler_cancel_signals_sent_total")
+                    metrics::counter!("rio_scheduler_cancel_signals_total")
                         .increment(to_reassign.len() as u64);
                 }
             }
@@ -283,6 +284,9 @@ impl DagActor {
         }
     }
 
+    // 9 args — all independent heartbeat fields. A struct would add
+    // boilerplate at every call site for an internal-only method.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_heartbeat(
         &mut self,
         worker_id: &WorkerId,
@@ -290,11 +294,9 @@ impl DagActor {
         supported_features: Vec<String>,
         max_builds: u32,
         running_builds: Vec<String>, // drv_paths from worker proto
-        // Grouped to stay under clippy's 7-arg limit. Both are
-        // optional heartbeat-carried hints with identical overwrite-
-        // unconditionally semantics (None clears stale). They're
-        // unpacked immediately below; the tuple is just transport.
-        (bloom, size_class): (Option<rio_common::bloom::BloomFilter>, Option<String>),
+        bloom: Option<rio_common::bloom::BloomFilter>,
+        size_class: Option<String>,
+        resources: Option<rio_proto::types::ResourceUsage>,
     ) {
         // TOCTOU fix: a stale heartbeat must not clobber fresh assignments.
         // The scheduler is authoritative for what it assigned. We reconcile:
@@ -369,6 +371,13 @@ impl DagActor {
         // becomes a wildcard worker that accepts any class. Same
         // don't-trust-stale reasoning as bloom.
         worker.size_class = size_class;
+        // resources: DON'T clobber with None. Prost makes message
+        // fields Option<T>; worker always populates, but if a future
+        // proto version omits it, keep the last-known reading for
+        // ListWorkers rather than flashing None.
+        if resources.is_some() {
+            worker.last_resources = resources;
+        }
 
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (heartbeat + stream)");
@@ -535,6 +544,7 @@ impl DagActor {
                         },
                     )),
                 });
+                metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
             }
             // Remove from worker's running set (we're taking it back).
             if let Some(worker) = self.workers.get_mut(worker_id) {
@@ -548,22 +558,18 @@ impl DagActor {
         }
 
         for drv_hash in expired_poisons {
-            info!(drv_hash = %drv_hash, "poison TTL expired, resetting to created");
-            if let Some(state) = self.dag.node_mut(&drv_hash)
-                && let Err(e) = state.reset_from_poison()
-            {
-                warn!(drv_hash = %drv_hash, error = %e, "poison reset failed");
+            info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
+            // PG first, in-mem second (same ordering as handle_clear_poison):
+            // a PG blip here leaves in-mem still Poisoned, so the next
+            // tick's expired_poisons scan retries. Previous order meant
+            // a blip left in-mem gone → scan never finds it again
+            // → PG clear deferred to next scheduler restart.
+            if let Err(e) = self.db.clear_poison(&drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;
             }
-            self.persist_status(&drv_hash, DerivationStatus::Created, None)
-                .await;
-            // reset_from_poison (in-mem) clears failed_workers +
-            // retry_count; PG must match. Without this, crash after
-            // reset → recovery loads stale failed_workers (3 workers)
-            // → immediately excluded from dispatch.
-            if let Err(e) = self.db.clear_failed_workers_and_retry(&drv_hash).await {
-                error!(drv_hash = %drv_hash, error = %e, "failed to persist failed_workers clear");
-            }
+            // Remove (not reset) — same rationale as handle_clear_poison.
+            self.dag.remove_node(&drv_hash);
         }
 
         // build_event_log time-based sweep. Every 360 ticks (~1h at

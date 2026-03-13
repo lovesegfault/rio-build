@@ -529,6 +529,7 @@ pub fn build_submit_request(
     edges: Vec<types::DerivationEdge>,
     options: Option<&ClientOptions>,
     priority_class: &str,
+    tenant_name: &str,
 ) -> types::SubmitBuildRequest {
     let (max_silent_time, build_timeout, build_cores, keep_going) = match options {
         Some(opts) => (
@@ -541,7 +542,7 @@ pub fn build_submit_request(
     };
 
     types::SubmitBuildRequest {
-        tenant_id: String::new(), // TODO(phase4): derive from SSH key identity
+        tenant_name: tenant_name.to_string(),
         priority_class: priority_class.to_string(),
         nodes,
         edges,
@@ -569,6 +570,19 @@ mod tests {
             vec![],
             env,
         )?)
+    }
+
+    #[test]
+    fn test_build_submit_request_carries_tenant_name() {
+        let req = build_submit_request(vec![], vec![], None, "ci", "team-foo");
+        assert_eq!(req.tenant_name, "team-foo");
+        assert_eq!(req.priority_class, "ci");
+
+        let req_empty = build_submit_request(vec![], vec![], None, "ci", "");
+        assert_eq!(
+            req_empty.tenant_name, "",
+            "empty tenant_name → single-tenant mode"
+        );
     }
 
     #[test]

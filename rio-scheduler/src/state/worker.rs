@@ -74,6 +74,15 @@ pub struct WorkerState {
     /// assignment before the next DrainWorker call (which the preStop
     /// hook sends on every SIGTERM, so it would re-drain).
     pub draining: bool,
+    /// When this WorkerState was created (= stream open or first
+    /// heartbeat, whichever came first via `entry().or_insert_with()`).
+    /// Reported in `ListWorkers`.
+    pub connected_since: Instant,
+    /// Last `ResourceUsage` from heartbeat. `None` until the first
+    /// heartbeat with resources. Reported in `ListWorkers`. Not
+    /// cleared on heartbeats that omit resources (keep the last-known
+    /// reading rather than clobbering with `None`).
+    pub last_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
 impl WorkerState {
@@ -93,6 +102,8 @@ impl WorkerState {
             bloom: None,
             size_class: None,
             draining: false,
+            connected_since: Instant::now(),
+            last_resources: None,
         }
     }
 

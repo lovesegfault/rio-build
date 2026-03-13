@@ -1,0 +1,12 @@
+# VCS
+.git/
+.gitignore
+# Editors
+*.swp
+*~
+.DS_Store
+# Helm
+.helmignore
+# Values profiles are NOT packaged — they're repo-side overlays passed
+# via `-f values/<profile>.yaml`, not shipped with the chart.
+values/

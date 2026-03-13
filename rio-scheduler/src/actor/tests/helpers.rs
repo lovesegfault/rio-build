@@ -98,6 +98,7 @@ pub(crate) async fn connect_worker(
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: None,
             worker_id: worker_id.into(),
@@ -130,6 +131,7 @@ pub(crate) async fn merge_single_node(
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -158,6 +160,7 @@ pub(crate) async fn merge_dag(
                 edges,
                 options: BuildOptions::default(),
                 keep_going,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })

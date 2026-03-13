@@ -1,0 +1,27 @@
+[package]
+name = "rio-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Admin CLI for rio-build — talks to the scheduler's AdminService"
+
+[[bin]]
+name = "rio-cli"
+path = "src/main.rs"
+
+[dependencies]
+rio-common = { workspace = true }
+rio-proto = { workspace = true }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+# Direct rustls for CryptoProvider::install_default(). Without it,
+# dual ring+aws-lc-rs feature activation → rustls panic on first TLS
+# use. Same rationale as every other rio binary.
+rustls = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }

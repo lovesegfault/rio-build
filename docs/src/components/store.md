@@ -151,9 +151,11 @@ rio-store serves the standard Nix binary cache protocol so Nix clients can use i
 - Compression: serves `.nar.zst` only (target Nix 2.20+ fully supports zstd; `.nar.xz` is not supported to avoid CPU-expensive on-the-fly XZ compression)
 - **FileHash/FileSize omission:** narinfo responses omit the optional `FileHash` and `FileSize` fields because NARs are compressed on-the-fly from chunks (no pre-compressed file exists on disk or in S3). Nix falls back to `NarHash`/`NarSize` verification after decompression, which rio-store already guarantees via its content integrity checks.
 - `HEAD` requests for narinfo are handled efficiently (metadata lookup, no NAR reassembly)
-- **Authentication:** Bearer token or `netrc`-compatible authentication for private caches. Nix supports `netrc-file` and `access-tokens` settings for HTTP cache auth.
+- **Authentication:** Bearer token authentication for private caches. Nix supports `netrc-file` and `access-tokens` settings for HTTP cache auth.
 
-> **Phase deferral:** Binary cache authentication (Bearer/netrc) is not yet implemented — the cache server currently serves all paths publicly. TODO(phase4): wire auth middleware alongside multi-tenancy.
+r[store.cache.auth-bearer]
+
+Binary cache authentication uses per-tenant Bearer tokens mapped via the `tenants.cache_token` column. The auth middleware queries `SELECT tenant_name FROM tenants WHERE cache_token = $1` on each request; a valid token authenticates as that tenant. Unknown/missing token → `401 Unauthorized` with `WWW-Authenticate: Bearer`. Unauthenticated access requires explicit opt-in via `cache_allow_unauthenticated = true` in the store config (default `false` — fail loud). When auth is required but no tenants have tokens configured (misconfigured deployment), requests return `503 Service Unavailable` with a descriptive message so operators notice immediately.
 
 ## Signing Key Management
 

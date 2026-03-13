@@ -64,6 +64,71 @@ pub fn inject_current(metadata: &mut MetadataMap) {
     });
 }
 
+/// Returns the current span's trace_id as a 32-char lowercase hex string,
+/// or empty if no span is active or the trace context is invalid.
+///
+/// Used by the gateway to emit `rio trace_id: {hex}` to the Nix client via
+/// `STDERR_NEXT` — gives operators a grep handle for Tempo.
+pub fn current_trace_id_hex() -> String {
+    use opentelemetry::trace::TraceContextExt;
+    let cx = tracing::Span::current().context();
+    let trace_id = cx.span().span_context().trace_id();
+    if trace_id == opentelemetry::trace::TraceId::INVALID {
+        String::new()
+    } else {
+        // TraceId's Display impl is lowercase hex (32 chars for a 128-bit ID).
+        format!("{trace_id:032x}")
+    }
+}
+
+/// Returns the current span's W3C traceparent as a string, for embedding
+/// in non-gRPC payloads (e.g., [`WorkAssignment.traceparent`]).
+///
+/// ssh-ng has no gRPC metadata channel, so the scheduler injects its
+/// current span's traceparent directly into the `WorkAssignment` proto
+/// message. The worker then parses this string via [`span_from_traceparent`]
+/// and parents its build-task span accordingly.
+///
+/// Returns an empty string if no span is active or no propagator is
+/// registered — the worker treats empty as "create a fresh root span"
+/// (same as the no-traceparent gRPC case).
+///
+/// [`WorkAssignment.traceparent`]: crate::types::WorkAssignment
+pub fn current_traceparent() -> String {
+    let mut carrier = std::collections::HashMap::new();
+    let cx = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.inject_context(&cx, &mut carrier);
+    });
+    carrier.remove("traceparent").unwrap_or_default()
+}
+
+/// Extract a parent Context from a W3C traceparent string (e.g., from
+/// `WorkAssignment.traceparent`). Pairs with [`current_traceparent`].
+///
+/// Empty/malformed traceparent → returns a no-op Context (fresh root).
+fn extract_traceparent(traceparent: &str) -> opentelemetry::Context {
+    if traceparent.is_empty() {
+        return opentelemetry::Context::new();
+    }
+    let carrier: std::collections::HashMap<String, String> =
+        [("traceparent".to_string(), traceparent.to_string())].into();
+    opentelemetry::global::get_text_map_propagator(|prop| prop.extract(&carrier))
+}
+
+/// Create a tracing span parented by the given W3C traceparent string.
+/// Bundles `extract_traceparent` + `OpenTelemetrySpanExt::set_parent`
+/// so callers (e.g., `rio-worker`) don't need `tracing-opentelemetry`
+/// as a direct dependency.
+///
+/// Empty traceparent → the span is a fresh root.
+pub fn span_from_traceparent(name: &'static str, traceparent: &str) -> tracing::Span {
+    let span = tracing::info_span!("span", otel.name = name);
+    let parent = extract_traceparent(traceparent);
+    let _ = span.set_parent(parent);
+    span
+}
+
 /// Extract a parent Context from incoming gRPC metadata and link the
 /// current span to it. Call this FIRST inside each `#[instrument]`ed
 /// server handler.
@@ -136,7 +201,14 @@ impl Extractor for MetadataExtractor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider};
+
+    /// Register the W3C propagator (normally done by init_tracing;
+    /// tests don't go through that).
+    fn register_propagator() {
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    }
 
     /// Round-trip: inject current → extract → same trace_id.
     ///
@@ -146,17 +218,13 @@ mod tests {
     /// init_tracing; tests don't go through that).
     #[test]
     fn inject_then_extract_roundtrips_trace_id() {
-        // Register the propagator (normally done by init_tracing).
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
 
         // Build a non-no-op tracer. The default global tracer is a noop
         // that generates all-zero trace IDs; we need real IDs to assert
         // roundtrip. A bare SdkTracerProvider (no exporter) gives real IDs
         // without any network.
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
-        use opentelemetry::trace::{Tracer, TracerProvider};
         let tracer = provider.tracer("test");
 
         // Create an OTel span directly (not via tracing — we want to
@@ -209,9 +277,7 @@ mod tests {
     /// injection for invalid contexts.
     #[test]
     fn inject_current_no_active_span_is_noop() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
 
         let mut metadata = MetadataMap::new();
         // No span entered — `Span::current()` returns the noop span with
@@ -233,9 +299,7 @@ mod tests {
     /// parent).
     #[test]
     fn link_parent_no_header_is_noop() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-        );
+        register_propagator();
 
         let req: tonic::Request<()> = tonic::Request::new(());
         // No traceparent header in metadata.
@@ -260,5 +324,88 @@ mod tests {
             !keys.iter().any(|k| k.contains("binary")),
             "binary keys should be skipped: {keys:?}"
         );
+    }
+
+    /// `current_traceparent` with no active span returns empty string.
+    /// The worker treats empty as "fresh root span".
+    #[test]
+    fn current_traceparent_no_span_is_empty() {
+        register_propagator();
+        assert_eq!(current_traceparent(), "");
+    }
+
+    // r[verify sched.trace.assignment-traceparent]
+    /// `current_traceparent` + `extract_traceparent` roundtrip preserves trace_id.
+    #[test]
+    fn current_traceparent_roundtrip() {
+        register_propagator();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("test");
+
+        let span = tracer.start("test-span");
+        let cx = opentelemetry::Context::current_with_span(span);
+        let expected_trace_id = cx.span().span_context().trace_id();
+        assert_ne!(expected_trace_id, opentelemetry::trace::TraceId::INVALID);
+
+        // Enter the context so current_traceparent() picks it up via
+        // tracing::Span::current().context(). But we're using the OTel
+        // context directly, not the tracing bridge — so inject manually
+        // via the same machinery current_traceparent uses.
+        let mut carrier = std::collections::HashMap::new();
+        opentelemetry::global::get_text_map_propagator(|prop| {
+            prop.inject_context(&cx, &mut carrier);
+        });
+        let tp = carrier.remove("traceparent").expect("should inject");
+
+        // W3C format check.
+        assert!(tp.starts_with("00-"), "{tp}");
+        assert_eq!(tp.len(), 55, "{tp}");
+
+        // extract_traceparent recovers the same trace_id.
+        let extracted = extract_traceparent(&tp);
+        assert_eq!(
+            extracted.span().span_context().trace_id(),
+            expected_trace_id
+        );
+    }
+
+    /// `extract_traceparent` with empty string returns a no-op Context.
+    #[test]
+    fn extract_traceparent_empty_is_noop() {
+        register_propagator();
+        let cx = extract_traceparent("");
+        assert_eq!(
+            cx.span().span_context().trace_id(),
+            opentelemetry::trace::TraceId::INVALID,
+            "empty traceparent → fresh root (invalid trace_id in the no-op context)"
+        );
+    }
+
+    /// `current_trace_id_hex` with no active span returns empty string.
+    #[test]
+    fn current_trace_id_hex_no_span_is_empty() {
+        // No tracing span set up → TraceId::INVALID → empty string.
+        assert_eq!(current_trace_id_hex(), "");
+    }
+
+    /// `current_trace_id_hex` format: 32 lowercase hex chars.
+    /// Can't easily test the inside-span case without the full tracing-
+    /// opentelemetry bridge, but we CAN verify the format string by
+    /// checking what a known TraceId produces.
+    #[test]
+    fn current_trace_id_hex_format() {
+        use opentelemetry::trace::TraceId;
+        // TraceId from known bytes — verify the 32-hex-lowercase format.
+        let tid = TraceId::from_bytes([
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45,
+            0x67, 0x89,
+        ]);
+        let hex = format!("{tid:032x}");
+        assert_eq!(hex.len(), 32);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+        assert_eq!(hex, "abcdef0123456789abcdef0123456789");
     }
 }

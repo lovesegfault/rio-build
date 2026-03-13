@@ -1,0 +1,44 @@
+{{- if .Values.workerPool.enabled }}
+{{- $wp := .Values.workerPool -}}
+---
+apiVersion: rio.build/v1alpha1
+kind: WorkerPool
+metadata:
+  name: {{ $wp.name }}
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  replicas:
+    min: {{ $wp.replicas.min }}
+    max: {{ $wp.replicas.max }}
+  autoscaling:
+    metric: {{ $wp.autoscaling.metric }}
+    targetValue: {{ $wp.autoscaling.targetValue }}
+  maxConcurrentBuilds: {{ $wp.maxConcurrentBuilds }}
+  fuseCacheSize: {{ $wp.fuseCacheSize }}
+  systems:
+    {{- toYaml $wp.systems | nindent 4 }}
+  features:
+    {{- toYaml $wp.features | nindent 4 }}
+  sizeClass: {{ $wp.sizeClass | quote }}
+  image: {{ include "rio.image" (list . $wp.image) }}
+  {{- if .Values.tls.enabled }}
+  tlsSecretName: rio-worker-tls
+  {{- end }}
+  # Phase 4b placeholder — phase 4c WorkerPoolSet replaces this with
+  # per-size-class requests derived from build_history. Without it,
+  # Karpenter doesn't know what to provision (zero-request pods
+  # schedule anywhere, including nodes too small).
+  resources:
+    {{- toYaml $wp.resources | nindent 4 }}
+  privileged: {{ $wp.privileged }}
+  {{- with $wp.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $wp.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

@@ -72,7 +72,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
 
     // Submit a build via SchedulerService.
     let submit_req = rio_proto::types::SubmitBuildRequest {
-        tenant_id: String::new(),
+        tenant_name: String::new(),
         priority_class: "scheduled".into(),
         nodes: vec![make_test_node("e2e-hash", "x86_64-linux")],
         edges: vec![],
@@ -421,30 +421,106 @@ async fn test_submit_build_rejects_invalid_priority_class() {
     );
 }
 
-/// SubmitBuild with a non-empty tenant_id that's not a valid UUID should
-/// be rejected at the gRPC boundary, not leak as a PostgreSQL cast error.
+// r[verify sched.tenant.resolve]
+/// SubmitBuild with a tenant name not in the tenants table → InvalidArgument.
+/// Proto field carries tenant NAME (from gateway's authorized_keys comment);
+/// scheduler resolves to UUID via PG lookup.
 #[tokio::test]
-async fn test_submit_build_rejects_invalid_tenant_id() {
+async fn test_submit_build_rejects_unknown_tenant() {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, _task) = setup_actor(db.pool.clone());
-    let grpc = SchedulerGrpc::new_for_tests(handle);
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
 
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![make_test_node("h", "x86_64-linux")],
         edges: vec![],
-        tenant_id: "customer-foo".into(), // not a UUID
+        tenant_name: "nonexistent-team".into(),
         ..Default::default()
     });
 
     let result = grpc.submit_build(req).await;
-    assert!(result.is_err(), "invalid tenant_id should be rejected");
+    assert!(result.is_err(), "unknown tenant should be rejected");
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(
-        status.message().contains("tenant_id"),
-        "error should mention tenant_id: {}",
+        status.message().contains("unknown tenant"),
+        "error should mention 'unknown tenant': {}",
         status.message()
     );
+    assert!(
+        status.message().contains("nonexistent-team"),
+        "error should include the tenant name: {}",
+        status.message()
+    );
+}
+
+/// SubmitBuild with a tenant name that IS in the tenants table → resolves
+/// to the UUID and the build is submitted successfully.
+#[tokio::test]
+async fn test_submit_build_resolves_known_tenant() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    let grpc = SchedulerGrpc::new_for_tests_with_pool(handle, db.pool.clone());
+
+    // Seed the tenants table.
+    let tenant_uuid: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO tenants (tenant_name) VALUES ($1) RETURNING tenant_id")
+            .bind("team-alpha")
+            .fetch_one(&db.pool)
+            .await
+            .expect("tenant insert");
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("resolve-tenant-drv", "x86_64-linux")],
+        edges: vec![],
+        tenant_name: "team-alpha".into(),
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(
+        result.is_ok(),
+        "known tenant should be accepted: {result:?}"
+    );
+
+    // Verify the build row has the resolved UUID.
+    let db_tenant: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("build lookup");
+    assert_eq!(db_tenant, Some(tenant_uuid));
+}
+
+/// SubmitBuild with empty tenant_name (single-tenant mode) → None, no PG lookup.
+/// This is the common case and must work even without a pool.
+#[tokio::test]
+async fn test_submit_build_empty_tenant_is_none() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor(db.pool.clone());
+    // Intentionally pool-less to assert no PG hit for empty tenant_name.
+    let grpc = SchedulerGrpc::new_for_tests(handle);
+
+    let req = Request::new(rio_proto::types::SubmitBuildRequest {
+        nodes: vec![make_test_node("no-tenant-drv", "x86_64-linux")],
+        edges: vec![],
+        tenant_name: String::new(), // empty = single-tenant mode
+        ..Default::default()
+    });
+
+    let result = grpc.submit_build(req).await;
+    assert!(
+        result.is_ok(),
+        "empty tenant_name should succeed without PG: {result:?}"
+    );
+
+    // Verify tenant_id is NULL in the build row.
+    let db_tenant: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM builds ORDER BY submitted_at DESC LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("build lookup");
+    assert_eq!(db_tenant, None);
 }
 
 /// SubmitBuild with more edges than MAX_DAG_EDGES should be rejected
@@ -629,7 +705,7 @@ async fn test_build_ids_are_time_ordered_v7() -> anyhow::Result<()> {
     let grpc = SchedulerGrpc::new_for_tests(handle);
 
     let mk_req = |tag: &str| rio_proto::types::SubmitBuildRequest {
-        tenant_id: String::new(),
+        tenant_name: String::new(),
         priority_class: String::new(),
         nodes: vec![make_test_node(tag, "x86_64-linux")],
         edges: vec![],
@@ -1171,6 +1247,80 @@ async fn test_build_execution_empty_stream_rejected() -> anyhow::Result<()> {
         "error should mention empty stream: {}",
         status.message()
     );
+
+    Ok(())
+}
+
+// r[verify sched.grpc.leader-guard]
+/// Standby replica rejects all RPCs with UNAVAILABLE. Constructs the
+/// service with `is_leader=false` (simulating a pod that lost or never
+/// acquired the lease) and hits each RPC via the trait method directly.
+/// No actor interaction — the guard fires before `check_actor_alive`.
+#[tokio::test]
+async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _actor_task) = setup_actor(db.pool.clone());
+
+    let mut grpc = SchedulerGrpc::new_for_tests(handle);
+    // Flip to standby. The test constructor defaults to true;
+    // this reaches in and swaps the Arc. `Arc::new(false)` would
+    // leave the original true-Arc orphaned, which is fine —
+    // nobody else holds it (fresh from new_for_tests).
+    grpc.is_leader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // SchedulerService handlers. Call trait methods directly (no
+    // server spin-up needed — guard is synchronous, fires before
+    // any async work).
+    use rio_proto::{SchedulerService as _, WorkerService as _};
+
+    let s = grpc
+        .submit_build(tonic::Request::new(Default::default()))
+        .await
+        .expect_err("standby should reject submit_build");
+    assert_eq!(s.code(), tonic::Code::Unavailable);
+    assert!(s.message().contains("not leader"));
+
+    let s = grpc
+        .watch_build(tonic::Request::new(Default::default()))
+        .await
+        .expect_err("standby should reject watch_build");
+    assert_eq!(s.code(), tonic::Code::Unavailable);
+
+    let s = grpc
+        .query_build_status(tonic::Request::new(Default::default()))
+        .await
+        .expect_err("standby should reject query_build_status");
+    assert_eq!(s.code(), tonic::Code::Unavailable);
+
+    let s = grpc
+        .cancel_build(tonic::Request::new(Default::default()))
+        .await
+        .expect_err("standby should reject cancel_build");
+    assert_eq!(s.code(), tonic::Code::Unavailable);
+
+    // WorkerService handlers.
+    let s = grpc
+        .heartbeat(tonic::Request::new(Default::default()))
+        .await
+        .expect_err("standby should reject heartbeat");
+    assert_eq!(s.code(), tonic::Code::Unavailable);
+
+    // BuildExecution: the request is a Streaming<WorkerMessage>. We
+    // can't easily construct one synthetically outside a real gRPC
+    // call. Spin up a server for this one.
+    let router =
+        tonic::transport::Server::builder().add_service(rio_proto::WorkerServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut worker_client = WorkerServiceClient::new(channel);
+    let (_tx, rx) = mpsc::channel::<rio_proto::types::WorkerMessage>(1);
+    let s = worker_client
+        .build_execution(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .expect_err("standby should reject build_execution");
+    assert_eq!(s.code(), tonic::Code::Unavailable);
 
     Ok(())
 }

@@ -561,7 +561,7 @@ impl ChunkCache {
         // caller's remove() fires. Worst case: ~100-byte map entry
         // leaks until the next get for this hash. Acceptable; a
         // scopeguard here would need careful Drop ordering with the
-        // Shared clone. TODO(phase4): scopeguard if leak becomes
+        // Shared clone. TODO(phase4c): scopeguard if leak becomes
         // measurable under sustained cancellation.
         self.inflight.remove(hash);
 

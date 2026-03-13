@@ -1,6 +1,6 @@
-//! Generate CRD YAML for kustomize.
+//! Generate CRD YAML for the Helm chart.
 //!
-//! `cargo run --bin crdgen > deploy/base/crds.yaml`
+//! `nix build .#crds && ./scripts/split-crds.sh result`
 //!
 //! Two documents separated by `---`. serde_yml doesn't have a
 //! multi-document writer so we concat manually. That's fine —

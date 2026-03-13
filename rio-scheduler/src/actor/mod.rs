@@ -354,6 +354,7 @@ impl DagActor {
                     running_builds,
                     bloom,
                     size_class,
+                    resources,
                 } => {
                     self.handle_heartbeat(
                         &worker_id,
@@ -361,7 +362,9 @@ impl DagActor {
                         supported_features,
                         max_builds,
                         running_builds,
-                        (bloom, size_class),
+                        bloom,
+                        size_class,
+                        resources,
                     );
                     // Dispatch on heartbeat: new capacity may be available
                     self.dispatch_ready().await;
@@ -389,6 +392,29 @@ impl DagActor {
                 }
                 ActorCommand::ClusterSnapshot { reply } => {
                     let _ = reply.send(self.compute_cluster_snapshot());
+                }
+                ActorCommand::ClearPoison { drv_hash, reply } => {
+                    let cleared = self.handle_clear_poison(&drv_hash).await;
+                    let _ = reply.send(cleared);
+                }
+                ActorCommand::ListWorkers { reply } => {
+                    let snapshots = self
+                        .workers
+                        .values()
+                        .map(|w| command::WorkerSnapshot {
+                            worker_id: w.worker_id.clone(),
+                            systems: w.systems.clone(),
+                            supported_features: w.supported_features.clone(),
+                            max_builds: w.max_builds,
+                            running_builds: w.running_builds.len() as u32,
+                            draining: w.draining,
+                            size_class: w.size_class.clone(),
+                            connected_since: w.connected_since,
+                            last_heartbeat: w.last_heartbeat,
+                            last_resources: w.last_resources,
+                        })
+                        .collect();
+                    let _ = reply.send(snapshots);
                 }
                 ActorCommand::DrainWorker {
                     worker_id,

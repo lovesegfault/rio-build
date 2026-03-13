@@ -118,7 +118,7 @@ impl DagActor {
                 count = to_cancel.len(),
                 "sent CancelSignal to workers for sole-interest in-flight derivations"
             );
-            metrics::counter!("rio_scheduler_cancel_signals_sent_total")
+            metrics::counter!("rio_scheduler_cancel_signals_total")
                 .increment(to_cancel.len() as u64);
         }
 

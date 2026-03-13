@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::state::{BuildOptions, PriorityClass, WorkerId};
+use crate::state::{BuildOptions, DrvHash, PriorityClass, WorkerId};
 
 #[cfg(test)]
 use super::handle::{DebugDerivationInfo, DebugWorkerInfo};
@@ -18,12 +18,18 @@ use super::handle::{DebugDerivationInfo, DebugWorkerInfo};
 #[derive(Debug)]
 pub struct MergeDagRequest {
     pub build_id: Uuid,
-    pub tenant_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
     pub priority_class: PriorityClass,
     pub nodes: Vec<rio_proto::types::DerivationNode>,
     pub edges: Vec<rio_proto::types::DerivationEdge>,
     pub options: BuildOptions,
     pub keep_going: bool,
+    /// W3C traceparent of the submitting gRPC handler's span. Span
+    /// context does NOT cross the mpsc channel to the actor task, so
+    /// we carry it as plain data. Stored on each newly-inserted
+    /// `DerivationState` so dispatch can embed it in `WorkAssignment`
+    /// regardless of which code path triggers dispatch.
+    pub traceparent: String,
 }
 
 /// Commands sent to the DAG actor.
@@ -94,6 +100,11 @@ pub enum ActorCommand {
         /// maps empty-string → None. Stored on WorkerState for the
         /// classify() → best_worker() filter.
         size_class: Option<String>,
+        /// ResourceUsage from the heartbeat. Prost generates Option for
+        /// message fields; worker always populates, so None is defensive
+        /// (shouldn't happen). Stored on WorkerState as `last_resources`
+        /// for `ListWorkers`.
+        resources: Option<rio_proto::types::ResourceUsage>,
     },
 
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
@@ -195,6 +206,25 @@ pub enum ActorCommand {
     /// that may not be in narinfo yet (worker hasn't uploaded).
     GcRoots { reply: oneshot::Sender<Vec<String>> },
 
+    /// Snapshot all workers for `AdminService.ListWorkers`.
+    /// O(workers) scan; acceptable for dashboard polling.
+    /// `send_unchecked`: same rationale as `ClusterSnapshot` —
+    /// dashboard needs a reading even (especially) under saturation.
+    ListWorkers {
+        reply: oneshot::Sender<Vec<WorkerSnapshot>>,
+    },
+
+    /// Clear poison state for a derivation: in-mem reset + PG clear.
+    /// Returns `true` if the derivation was poisoned and is now cleared.
+    /// `false` if not found or not in Poisoned status.
+    ///
+    /// `send_unchecked`: ClearPoison is operator-initiated, rare,
+    /// and should work even under saturation.
+    ClearPoison {
+        drv_hash: DrvHash,
+        reply: oneshot::Sender<bool>,
+    },
+
     /// Lease acquired: trigger state recovery from PG. Fire-and-
     /// forget (no reply) — the lease loop keeps renewing while
     /// recovery runs in the actor task. handle_leader_acquired
@@ -270,6 +300,23 @@ pub struct DrainResult {
     /// this is 0 (reassigned). The worker's preStop hook uses this to
     /// decide whether to wait.
     pub running_builds: u32,
+}
+
+/// Point-in-time worker snapshot for `AdminService.ListWorkers`.
+/// Internal (not proto) — `admin.rs` translates to `WorkerInfo`.
+/// `Instant` fields are converted to wall-clock `SystemTime` there.
+#[derive(Debug, Clone)]
+pub struct WorkerSnapshot {
+    pub worker_id: WorkerId,
+    pub systems: Vec<String>,
+    pub supported_features: Vec<String>,
+    pub max_builds: u32,
+    pub running_builds: u32,
+    pub draining: bool,
+    pub size_class: Option<String>,
+    pub connected_since: std::time::Instant,
+    pub last_heartbeat: std::time::Instant,
+    pub last_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

@@ -53,7 +53,9 @@ impl GatewaySession {
         // `drain_stderr_expecting_error` check, not the server return.
         let server_task = tokio::spawn(async move {
             let (mut r, mut w) = tokio::io::split(server_stream);
-            if let Err(e) = session::run_protocol(&mut r, &mut w, &mut sc, &mut scc).await {
+            if let Err(e) =
+                session::run_protocol(&mut r, &mut w, &mut sc, &mut scc, String::new()).await
+            {
                 let is_eof = e
                     .downcast_ref::<rio_nix::protocol::wire::WireError>()
                     .is_some_and(|we| {

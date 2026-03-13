@@ -1,0 +1,21 @@
+apiVersion: v2
+name: rio-build
+description: Distributed Nix build service — gateway, scheduler, store, controller, workers
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+# Conditional subchart (dev only). Prod uses external PG (Aurora).
+# NOT vendored — nix/helm-charts.nix fetches it as a FOD (hash-pinned
+# `helm pull`). The helm-lint flake check symlinks it into charts/.
+#
+# Rook (dev S3) is NOT a subchart: its operator-first-then-cluster
+# lifecycle doesn't fit (operator CRDs must establish before CephCluster
+# CRs apply, and store needs the dynamically-generated ObjectStoreUser
+# access key). `just dev apply` installs rook-ceph + rook-ceph-cluster
+# as separate helm releases before this chart.
+dependencies:
+  - name: postgresql
+    version: "18.5.6"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled

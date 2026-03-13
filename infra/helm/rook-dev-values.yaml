@@ -1,0 +1,96 @@
+# rook-ceph-cluster values for single-node dev. Used by `just dev apply`.
+#
+# This is Ceph on a single node with a loop-device OSD — heavyweight for
+# dev S3 (~3GB memory floor, multi-minute bootstrap) compared to MinIO,
+# but gives a real S3 implementation. CephObjectStoreUser generates the
+# access key; values/dev.yaml's store.extraEnv reads it via secretKeyRef.
+
+# The operator (separate `rook-ceph` release) created its resources in
+# rook-ceph namespace. Cluster lives in same namespace.
+operatorNamespace: rook-ceph
+
+cephClusterSpec:
+  # Single node — 1 mon is OK for dev (no quorum, any restart = short
+  # outage). Prod would be 3.
+  mon:
+    count: 1
+    allowMultiplePerNode: true
+  mgr:
+    count: 1
+    allowMultiplePerNode: true
+  dashboard:
+    enabled: false
+  # No crash collector (sends telemetry). No monitoring (prometheus).
+  crashCollector:
+    disable: true
+  monitoring:
+    enabled: false
+  # Loop-device OSD: Rook creates a sparse file, losetup-s it, uses it
+  # as a block device. Single-node dev has no spare disk. allowLoopDevices
+  # is the explicit "I know this is dev" toggle. 10Gi is the sparse file
+  # size (not pre-allocated).
+  storage:
+    useAllNodes: true
+    useAllDevices: false
+    allowDeviceClassUpdate: true
+    allowOsdCrushWeightUpdate: true
+    config:
+      osdsPerDevice: "1"
+    storageClassDeviceSets: []
+    # The loop device. Rook's CSI driver + OSD pod manage it.
+    nodes:
+      - name: ""  # empty = all nodes
+        devices: []
+    # Loop device via flexibleStorage (Rook 1.14+). PVC-backed, so works
+    # on any StorageClass. Single OSD, 10Gi.
+    # Actually: simpler path for dev is `useAllNodes: false` + explicit
+    # hostPath-backed directory store. But Ceph's FileStore is deprecated;
+    # BlueStore needs a block device. Loop device it is.
+  # ↑ The above storage block is fragile — Rook's single-node loop
+  # setup has changed between versions. If `kubectl -n rook-ceph get
+  # cephcluster` shows HEALTH_ERR, check the operator logs and the
+  # Rook v1.19 single-node docs.
+
+  # Resource floors. Lower than Rook's defaults — Ceph whines but runs.
+  resources:
+    mgr:
+      requests: {cpu: 100m, memory: 512Mi}
+    mon:
+      requests: {cpu: 100m, memory: 512Mi}
+    osd:
+      requests: {cpu: 100m, memory: 1Gi}
+
+# No CephBlockPool / CephFilesystem — we only want S3 (ObjectStore).
+cephBlockPools: []
+cephFileSystems: []
+
+# The S3 piece. One RGW, replicated size=1 (single OSD → can't do more).
+cephObjectStores:
+  - name: rio
+    spec:
+      metadataPool:
+        replicated: {size: 1}
+        # Single OSD: Ceph refuses to go HEALTH_OK with replicated size<
+        # min_size. failureDomain=osd (not host) + min_size=1 lets it.
+        failureDomain: osd
+        parameters:
+          min_size: "1"
+      dataPool:
+        replicated: {size: 1}
+        failureDomain: osd
+        parameters:
+          min_size: "1"
+      gateway:
+        instances: 1
+        port: 80
+    storageClass:
+      enabled: false
+
+# Access key generation. The operator creates a Secret named
+# `rook-ceph-object-user-rio-rio` with keys AccessKey + SecretKey.
+# values/dev.yaml's store.extraEnv reads those via secretKeyRef.
+cephObjectStoreUsers:
+  - name: rio
+    spec:
+      store: rio
+      displayName: rio-dev

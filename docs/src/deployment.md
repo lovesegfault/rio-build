@@ -5,7 +5,7 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 ## Prerequisites
 
 - Kubernetes 1.33+ (EKS, GKE, or self-managed) --- required for user namespace isolation (`hostUsers: false`), see [ADR-012](./decisions/012-privileged-worker-pods.md)
-- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG)
+- PostgreSQL 15+ (managed service recommended: RDS, Cloud SQL, or CloudNativePG). Aurora/RDS PG 15+ have `rds.force_ssl=1` by default --- the connection string must include `?sslmode=require` (sqlx has `tls-rustls-aws-lc-rs` enabled for this)
 - S3-compatible object storage (AWS S3, MinIO, GCS with S3 compatibility)
 - `kubectl` configured for the target cluster
 
@@ -27,6 +27,8 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 4. **rio-scheduler** (needs PostgreSQL and rio-store)
 5. **rio-gateway** (needs rio-scheduler and rio-store)
 6. **WorkerPool CRD** (rio-controller creates and manages worker StatefulSets)
+
+`helm upgrade --wait` blocks until all Deployments report Available — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires PG migrations done, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable.
 
 ## Minimum Viable Deployment
 
@@ -57,6 +59,12 @@ Workers require a dedicated node pool with:
 - **`/dev/fuse` access:** Worker pods need access to `/dev/fuse`. A `hostPath` volume with `privileged: true` works for development but production should use a device plugin to avoid granting full privileges. `CAP_SYS_ADMIN` alone is not sufficient for `/dev/fuse` access — the container's device cgroup must also allow the FUSE character device.
 - **EKS addons:** `vpc-cni` and `kube-proxy` must be installed before node groups are created (they are daemonsets). `coredns` requires schedulable (untainted) nodes and should be installed after the system node group is ready.
 
+### Node autoscaling
+
+Worker pod autoscaling (rio-controller) and node autoscaling (cluster autoscaler or Karpenter) are separate concerns that chain together. rio-controller scales the WorkerPool StatefulSet replica count based on scheduler queue depth; the node autoscaler provisions capacity for the resulting Pending pods. Without a node autoscaler, rio-controller scaling beyond the static node pool's capacity just produces permanently-Pending pods.
+
+The EKS reference deployment (`infra/eks/`) uses Karpenter: the `workers` managed nodegroup is replaced entirely with three Karpenter NodePools (compute-optimized preferred, general-purpose fallback, untainted general). `consolidationPolicy: WhenEmpty` on worker NodePools means Karpenter never evicts a node with a worker pod on it --- the 10-minute `SCALE_DOWN_WINDOW` in rio-controller scales pods away first, then Karpenter consolidates the empty node. Scale-to-zero is the default (`WorkerPool.spec.replicas.min: 0`): cold start from zero is ~50-80s (node boot + pod start).
+
 ## Key Configuration
 
 See [Configuration Reference](./configuration.md) for all parameters. The minimum required settings:
@@ -81,26 +89,36 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Database credentials (scheduler, store)
 - HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{worker_id, drv_hash, expected_outputs, expiry} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
-> **SSH key mounting:** The base manifests and shipped overlays (`deploy/overlays/dev`, `deploy/overlays/prod`) do **not** mount the SSH host key or authorized_keys Secret into the gateway container --- without a mount, the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production deployments must add a `volumeMount` patch to the gateway Deployment for the SSH key Secret.
+> **SSH key mounting:** The default chart values do **not** set `gateway.ssh.hostKeySecret` — the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production should set it to a Secret with a persistent key so all replicas present the same host key. `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
 
 ## Verification
 
 After deployment:
 
 ```bash
-# 1. Verify gateway is reachable
-# (Service maps external port 22 → container port 2222; use the default SSH port externally)
-ssh -i ~/.ssh/rio_key rio-gateway.example.com
+# 1. Tenant bootstrap + cluster status. rio-cli is bundled in the
+#    scheduler image (/bin/rio-cli); the pod's RIO_TLS__* env gives
+#    it mTLS to localhost:9001 automatically.
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli create-tenant my-team
+kubectl -n rio-system exec deploy/rio-scheduler -- rio-cli status
 
-# 2. Query a known store path
-nix path-info --store ssh-ng://rio-gateway.example.com /nix/store/...-hello
+# 2. SSH key with tenant-name comment. The gateway maps the
+#    authorized_keys comment field to tenant_name (server-side
+#    comment, not the client's key comment).
+ssh-keygen -t ed25519 -C my-team -f ~/.ssh/rio_key -N ''
+kubectl -n rio-system create secret generic rio-gateway-ssh \
+  --from-file=authorized_keys=~/.ssh/rio_key.pub \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n rio-system rollout restart deployment/rio-gateway
 
-# 3. Build a simple package
-nix build --store ssh-ng://rio-gateway.example.com nixpkgs#hello
+# 3. Build a simple package (Service maps external port 22 → container 2222)
+nix build --store "ssh-ng://rio@rio-gateway.example.com?ssh-key=$HOME/.ssh/rio_key" nixpkgs#hello
 
 # 4. Verify binary cache
 curl -s https://rio-cache.example.com/nix-cache-info
 ```
+
+For a complete scripted walkthrough against EKS, see `infra/eks/smoke-test.sh`.
 
 ## Production Considerations
 

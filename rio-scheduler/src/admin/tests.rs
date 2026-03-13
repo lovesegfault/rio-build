@@ -5,6 +5,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
 use rio_proto::types::BuildLogBatch;
 use rio_test_support::TestDb;
+use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 
 /// Set up `AdminServiceImpl` with a live actor but no S3.
@@ -38,8 +39,21 @@ async fn setup_svc(
         // the proxy connect with a clear error. Use :1 (fails
         // fast, never listened on) not a timeout-prone addr.
         "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
     (svc, actor, task, db)
+}
+
+/// `setup_svc` with the common defaults (empty log buffers, no S3).
+async fn setup_svc_default() -> (
+    AdminServiceImpl,
+    ActorHandle,
+    tokio::task::JoinHandle<()>,
+    TestDb,
+) {
+    let buffers = Arc::new(LogBuffers::new());
+    setup_svc(buffers, None).await
 }
 
 fn mk_batch(drv_path: &str, first_line: u64, lines: &[&[u8]]) -> BuildLogBatch {
@@ -170,6 +184,8 @@ async fn get_build_logs_from_s3_fallback() -> anyhow::Result<()> {
         db.pool.clone(),
         actor,
         "127.0.0.1:1".into(),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     );
 
     let resp = svc
@@ -213,7 +229,7 @@ async fn get_build_logs_not_found_in_either() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
         .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -230,26 +246,27 @@ async fn get_build_logs_empty_drv_path_invalid() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn stubs_return_unimplemented() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+async fn admin_rpcs_are_wired() -> anyhow::Result<()> {
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
-    // ClusterStatus, DrainWorker, TriggerGC are no longer stubs.
-    // TriggerGC is tested separately (proxy to store); here we just
-    // confirm the remaining stubs.
-    assert_eq!(
-        svc.list_workers(Request::new(ListWorkersRequest::default()))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
-    );
-    assert_eq!(
-        svc.list_builds(Request::new(ListBuildsRequest::default()))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unimplemented
-    );
+    // All phase4a RPCs are wired (no remaining stubs). This test proves
+    // each returns a non-Unimplemented error or success — NOT full
+    // behavior coverage (see dedicated tests below).
+
+    // ListWorkers is implemented — no workers → empty list, not error.
+    let lw = svc
+        .list_workers(Request::new(ListWorkersRequest::default()))
+        .await?
+        .into_inner();
+    assert!(lw.workers.is_empty(), "no workers registered → empty list");
+
+    // ListBuilds is implemented — no builds → empty list, not error.
+    let lb = svc
+        .list_builds(Request::new(ListBuildsRequest::default()))
+        .await?
+        .into_inner();
+    assert!(lb.builds.is_empty(), "no builds → empty list");
+    assert_eq!(lb.total_count, 0);
     // TriggerGC: now implemented (proxy to store). Test separately.
     // With the test store_addr (127.0.0.1:1), proxy connect fails
     // with Unavailable (not Unimplemented) — proves it's wired.
@@ -262,13 +279,24 @@ async fn stubs_return_unimplemented() -> anyhow::Result<()> {
         tonic::Code::Unavailable,
         "TriggerGC implemented but store unreachable in tests"
     );
+    // ClearPoison is now implemented. Default request has empty
+    // derivation_hash → InvalidArgument. Proves it's wired (no
+    // longer Unimplemented).
     assert_eq!(
         svc.clear_poison(Request::new(ClearPoisonRequest::default()))
             .await
             .unwrap_err()
             .code(),
-        tonic::Code::Unimplemented
+        tonic::Code::InvalidArgument
     );
+    // Non-empty but non-poisoned → cleared=false (not an error).
+    let resp = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "nonexistent-drv-hash".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!resp.cleared, "non-poisoned drv → cleared=false");
     Ok(())
 }
 
@@ -325,7 +353,7 @@ fn gunzip_and_chunk_since_filtering() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cluster_status_empty() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let resp = svc.cluster_status(Request::new(())).await?.into_inner();
 
@@ -338,7 +366,7 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
     assert_eq!(resp.running_derivations, 0);
     assert_eq!(
         resp.store_size_bytes, 0,
-        "scheduler doesn't track store size"
+        "store_size bg refresh not spawned in tests → stays at initial 0"
     );
 
     // uptime_since is "now minus elapsed since construction" → within
@@ -357,7 +385,7 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
 async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
     use crate::actor::tests::connect_worker;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Stream-only worker (no heartbeat) → total=1, active=0.
     // is_registered() requires BOTH stream_tx AND system; this has
@@ -390,7 +418,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Worker with max_builds=1: will accept exactly one assignment,
     // leaving the second derivation in ready_queue.
@@ -441,7 +469,7 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
 async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
     // Set up, then drop the handle + abort the task → actor channel closes.
     // check_actor_alive() catches this before the oneshot would hang.
-    let (svc, actor, task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, task, _db) = setup_svc_default().await;
     drop(actor);
     task.abort();
     // Give tokio a tick to process the abort.
@@ -475,7 +503,7 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn drain_worker_empty_id_invalid() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
         .drain_worker(Request::new(DrainWorkerRequest {
@@ -497,7 +525,7 @@ async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
     // break → stream drop → actor removes entry → preStop's drain
     // call arrives to an empty slot). The worker proceeds as if
     // drain succeeded — nothing to wait for.
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let resp = svc
         .drain_worker(Request::new(DrainWorkerRequest {
@@ -517,7 +545,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Worker with max_builds=4: plenty of capacity.
     let mut worker_rx = connect_worker(&actor, "w1", "x86_64-linux", 4).await?;
@@ -580,7 +608,7 @@ async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
     // Ring buffer empty → forces S3 fallback → build_id parse.
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc
         .get_build_logs(Request::new(GetBuildLogsRequest {
@@ -607,7 +635,7 @@ async fn test_get_build_logs_invalid_uuid() -> anyhow::Result<()> {
 /// Client should retry.
 #[tokio::test]
 async fn test_trigger_gc_store_unreachable() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, _actor, _task, _db) = setup_svc_default().await;
 
     let result = svc.trigger_gc(Request::new(GcRequest::default())).await;
 
@@ -631,7 +659,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     use crate::actor::tests::{connect_worker, merge_single_node};
     use crate::state::PriorityClass;
 
-    let (svc, actor, _task, _db) = setup_svc(Arc::new(LogBuffers::new()), None).await;
+    let (svc, actor, _task, _db) = setup_svc_default().await;
 
     // Two workers: w1 gets the first dispatch, then we force-drain it.
     // The reassigned drv should go to w2 on the next dispatch.
@@ -681,6 +709,7 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
     // heartbeat/merge/completion. Send a heartbeat to trigger it.
     actor
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             worker_id: first_worker.into(),
             systems: vec!["x86_64-linux".into()],
             supported_features: vec![],
@@ -711,5 +740,497 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
         "drv re-Assigned to other worker"
     );
     assert_eq!(status.queued_derivations, 0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tenant RPCs: ListTenants, CreateTenant
+// ---------------------------------------------------------------------------
+
+// r[verify sched.admin.list-tenants]
+// r[verify sched.admin.create-tenant]
+#[tokio::test]
+async fn test_create_and_list_tenants() -> anyhow::Result<()> {
+    let (svc, _actor, _task, db) = setup_svc_default().await;
+
+    // Initially empty.
+    let resp = svc.list_tenants(Request::new(())).await?.into_inner();
+    assert!(resp.tenants.is_empty());
+
+    // Create a tenant.
+    let created = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-alpha".into(),
+            gc_retention_hours: Some(72),
+            gc_max_store_bytes: Some(100 * 1024 * 1024 * 1024),
+            cache_token: Some("secret-token".into()),
+        }))
+        .await?
+        .into_inner();
+    let t = created.tenant.expect("tenant should be set");
+    assert_eq!(t.tenant_name, "team-alpha");
+    assert_eq!(t.gc_retention_hours, 72);
+    assert_eq!(t.gc_max_store_bytes, Some(100 * 1024 * 1024 * 1024));
+    assert!(t.has_cache_token, "cache_token was set");
+    assert!(!t.tenant_id.is_empty(), "UUID should be populated");
+    assert!(
+        t.created_at.is_some_and(|ts| ts.seconds > 0),
+        "created_at should be populated (epoch seconds via EXTRACT)"
+    );
+
+    // List shows it.
+    let resp = svc.list_tenants(Request::new(())).await?.into_inner();
+    assert_eq!(resp.tenants.len(), 1);
+    assert_eq!(resp.tenants[0].tenant_name, "team-alpha");
+
+    // Duplicate name → AlreadyExists.
+    let dup = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-alpha".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(dup.unwrap_err().code(), tonic::Code::AlreadyExists);
+
+    // Empty name → InvalidArgument.
+    let empty = svc
+        .create_tenant(Request::new(
+            rio_proto::types::CreateTenantRequest::default(),
+        ))
+        .await;
+    assert_eq!(empty.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Whitespace-only name → InvalidArgument (same as empty).
+    let ws_name = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "   ".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(ws_name.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Empty cache_token → InvalidArgument (round-3 fix; this test was
+    // missing — the validation existed but was never exercised).
+    let empty_tok = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-gamma".into(),
+            cache_token: Some("".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(empty_tok.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Whitespace-only cache_token → InvalidArgument (round-4 fix;
+    // same bypass class as empty-token, just with "   " instead of "").
+    let ws_tok = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-delta".into(),
+            cache_token: Some("   ".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(ws_tok.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // Surrounding whitespace is TRIMMED before storage. Read paths
+    // trim (gateway comment().trim(), cache auth str::trim), so an
+    // untrimmed PG row makes WHERE tenant_name = 'team-trim' never
+    // match — invisible-whitespace 'unknown tenant' bug.
+    let trimmed = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "  team-trim  ".into(),
+            cache_token: Some("  trim-secret  ".into()),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        trimmed.tenant.as_ref().unwrap().tenant_name,
+        "team-trim",
+        "stored tenant_name must be trimmed"
+    );
+    // cache_token isn't returned (has_cache_token bool only) — verify PG directly.
+    let stored_tok: Option<String> =
+        sqlx::query_scalar("SELECT cache_token FROM tenants WHERE tenant_name = 'team-trim'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored_tok.as_deref(), Some("trim-secret"));
+
+    // gc_retention_hours > i32::MAX → InvalidArgument (was silently
+    // wrapping to negative via `as i32` and storing in PG INTEGER).
+    let oor = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-oor".into(),
+            gc_retention_hours: Some(u32::MAX),
+            ..Default::default()
+        }))
+        .await;
+    let err = oor.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("out of range"));
+
+    // Tenant with defaults (no optionals).
+    let defaults = svc
+        .create_tenant(Request::new(rio_proto::types::CreateTenantRequest {
+            tenant_name: "team-beta".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    let t = defaults.tenant.expect("tenant should be set");
+    assert_eq!(t.gc_retention_hours, 168, "default 7 days");
+    assert_eq!(t.gc_max_store_bytes, None);
+    assert!(!t.has_cache_token);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ListBuilds
+// ---------------------------------------------------------------------------
+
+// r[verify sched.admin.list-builds]
+#[tokio::test]
+async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
+    let (svc, _actor, _task, db) = setup_svc_default().await;
+    let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
+
+    // Seed 3 builds directly via db helper (bypasses the actor).
+    use crate::state::{BuildOptions, PriorityClass};
+    for i in 0..3 {
+        sched_db
+            .insert_build(
+                uuid::Uuid::new_v4(),
+                None,
+                PriorityClass::Scheduled,
+                false,
+                &BuildOptions::default(),
+            )
+            .await?;
+        // Small sleep so submitted_at ordering is deterministic.
+        if i < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    // Transition one to succeeded.
+    let builds: Vec<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT build_id FROM builds ORDER BY submitted_at LIMIT 1")
+            .fetch_all(&db.pool)
+            .await?;
+    sqlx::query("UPDATE builds SET status = 'succeeded', finished_at = now() WHERE build_id = $1")
+        .bind(builds[0].0)
+        .execute(&db.pool)
+        .await?;
+
+    // No filter → 3 builds, total_count=3.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest::default()))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 3);
+    assert_eq!(resp.total_count, 3);
+
+    // filter=pending → 2.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            status_filter: "pending".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 2);
+    assert_eq!(resp.total_count, 2);
+
+    // Pagination: limit=1 offset=1 → 1 build (second-newest), total=3.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            limit: 1,
+            offset: 1,
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 1);
+    assert_eq!(resp.total_count, 3, "total_count unaffected by pagination");
+
+    // Pagination: offset past end → empty page, total still correct.
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            limit: 10,
+            offset: 99,
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert!(
+        resp.builds.is_empty(),
+        "offset >= total_count → empty page, got {} builds",
+        resp.builds.len()
+    );
+    assert_eq!(
+        resp.total_count, 3,
+        "total_count unaffected by offset-past-end"
+    );
+
+    // tenant_filter: seed a tenant + one build tagged with it.
+    let tenant_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO tenants (tenant_name) VALUES ('filter-test') RETURNING tenant_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    sched_db
+        .insert_build(
+            uuid::Uuid::new_v4(),
+            Some(tenant_id),
+            PriorityClass::Scheduled,
+            false,
+            &BuildOptions::default(),
+        )
+        .await?;
+    let resp = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            tenant_filter: "filter-test".into(),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.builds.len(), 1, "only the tenant-tagged build");
+    assert_eq!(resp.total_count, 1);
+
+    // Unknown tenant → InvalidArgument.
+    let err = svc
+        .list_builds(Request::new(ListBuildsRequest {
+            tenant_filter: "nonexistent-tenant".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ListWorkers
+// ---------------------------------------------------------------------------
+
+// r[verify sched.admin.list-workers]
+#[tokio::test]
+async fn test_list_workers_with_filter() -> anyhow::Result<()> {
+    use crate::actor::tests::connect_worker;
+
+    let (svc, actor, _task, _db) = setup_svc_default().await;
+
+    // Fully registered worker.
+    let _rx1 = connect_worker(&actor, "alive-worker", "x86_64-linux", 4).await?;
+
+    // Drain a second worker.
+    let _rx2 = connect_worker(&actor, "drain-worker", "aarch64-linux", 2).await?;
+    let (tx, rx) = oneshot::channel();
+    actor
+        .send_unchecked(ActorCommand::DrainWorker {
+            worker_id: "drain-worker".into(),
+            force: false,
+            reply: tx,
+        })
+        .await?;
+    let _ = rx.await?;
+
+    // No filter → both.
+    let resp = svc
+        .list_workers(Request::new(ListWorkersRequest::default()))
+        .await?
+        .into_inner();
+    assert_eq!(resp.workers.len(), 2);
+
+    // filter=alive → only alive-worker.
+    let resp = svc
+        .list_workers(Request::new(ListWorkersRequest {
+            status_filter: "alive".into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.workers.len(), 1);
+    let w = &resp.workers[0];
+    assert_eq!(w.worker_id, "alive-worker");
+    assert_eq!(w.status, "alive");
+    assert_eq!(w.systems, vec!["x86_64-linux".to_string()]);
+    assert_eq!(w.max_builds, 4);
+    assert_eq!(w.running_builds, 0);
+    assert!(w.connected_since.is_some());
+    assert!(w.last_heartbeat.is_some());
+    // size_class: connect_worker doesn't set it → empty string.
+    // (Proves the field is wired — a worker heartbeating with
+    // size_class="medium" would round-trip it here.)
+    assert_eq!(w.size_class, "");
+
+    // filter=draining → only drain-worker.
+    let resp = svc
+        .list_workers(Request::new(ListWorkersRequest {
+            status_filter: "draining".into(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(resp.workers.len(), 1);
+    assert_eq!(resp.workers[0].worker_id, "drain-worker");
+    assert_eq!(resp.workers[0].status, "draining");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ClearPoison happy path
+// ---------------------------------------------------------------------------
+
+// r[verify sched.admin.clear-poison]
+/// Poison a derivation via PermanentFailure, then ClearPoison it.
+/// Verifies cleared=true, in-mem status reset, PG poisoned_at cleared.
+#[tokio::test]
+async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
+    use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
+    use crate::state::PriorityClass;
+
+    let (svc, actor, _task, db) = setup_svc_default().await;
+    let mut worker_rx = connect_worker(&actor, "poison-w", "x86_64-linux", 1).await?;
+
+    // Merge → dispatches to worker.
+    let _ev = merge_single_node(
+        &actor,
+        uuid::Uuid::new_v4(),
+        "poison-me",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = worker_rx.recv().await.expect("assignment");
+
+    // PermanentFailure → poisoned (both in-mem and PG).
+    complete_failure(
+        &actor,
+        "poison-w",
+        &test_drv_path("poison-me"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "test permanent failure",
+    )
+    .await?;
+
+    // Verify poisoned (barrier via debug_query).
+    let pre = actor
+        .debug_query_derivation("poison-me")
+        .await?
+        .expect("exists");
+    assert_eq!(pre.status, crate::state::DerivationStatus::Poisoned);
+    // PG should have poisoned_at set (the as_bytes() bug would break this).
+    let pg_poisoned: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations WHERE drv_hash=$1",
+    )
+    .bind("poison-me")
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_poisoned.is_some(),
+        "poisoned_at should be persisted to PG"
+    );
+
+    // ClearPoison via RPC.
+    let resp = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "poison-me".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(resp.cleared, "happy path → cleared=true");
+
+    // In-mem: node removed from DAG (next submit re-inserts it fresh
+    // with full proto fields — see Dag::remove_node rationale).
+    let post = actor.debug_query_derivation("poison-me").await?;
+    assert!(post.is_none(), "node removed from DAG on ClearPoison");
+
+    // PG: poisoned_at cleared.
+    let pg_poisoned: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations WHERE drv_hash=$1",
+    )
+    .bind("poison-me")
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_poisoned.is_none(),
+        "clear_poison should NULL poisoned_at"
+    );
+
+    Ok(())
+}
+
+/// ClearPoison ordering regression: PG clear must precede in-mem
+/// reset so that a PG failure leaves in-mem Poisoned for retry.
+/// The old order (in-mem first) left status=Created on PG blip →
+/// retry hit the not-poisoned guard → permanent no-op.
+#[tokio::test]
+async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyhow::Result<()> {
+    use crate::actor::tests::{complete_failure, connect_worker, merge_single_node, test_drv_path};
+    use crate::state::PriorityClass;
+
+    let (svc, actor, _task, db) = setup_svc_default().await;
+    let mut worker_rx = connect_worker(&actor, "pg-blip-w", "x86_64-linux", 1).await?;
+
+    let _ev = merge_single_node(
+        &actor,
+        uuid::Uuid::new_v4(),
+        "pg-blip",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ = worker_rx.recv().await.expect("assignment");
+    complete_failure(
+        &actor,
+        "pg-blip-w",
+        &test_drv_path("pg-blip"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "test",
+    )
+    .await?;
+
+    // Confirm poisoned.
+    let pre = actor
+        .debug_query_derivation("pg-blip")
+        .await?
+        .expect("exists");
+    assert_eq!(pre.status, crate::state::DerivationStatus::Poisoned);
+
+    // Simulate PG blip: close the pool. All subsequent queries fail.
+    db.pool.close().await;
+
+    // First attempt: PG fails → cleared=false, in-mem STILL Poisoned.
+    let resp1 = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "pg-blip".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!resp1.cleared, "PG failure → cleared=false");
+
+    let post1 = actor
+        .debug_query_derivation("pg-blip")
+        .await?
+        .expect("exists");
+    assert_eq!(
+        post1.status,
+        crate::state::DerivationStatus::Poisoned,
+        "PG failure must leave in-mem Poisoned so retry can proceed"
+    );
+
+    // Second attempt with PG still down: same result (proves retry
+    // is still hitting the PG path, not the not-poisoned early-return).
+    let resp2 = svc
+        .clear_poison(Request::new(ClearPoisonRequest {
+            derivation_hash: "pg-blip".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(!resp2.cleared);
+    let post2 = actor
+        .debug_query_derivation("pg-blip")
+        .await?
+        .expect("exists");
+    assert_eq!(post2.status, crate::state::DerivationStatus::Poisoned);
+
     Ok(())
 }

@@ -96,12 +96,17 @@ pub struct SessionContext {
     pub has_seen_build_paths_with_results: bool,
     /// Active build IDs for scheduler failover: build_id → last_sequence.
     pub active_build_ids: HashMap<String, u64>,
+    /// Tenant name from the matched `authorized_keys` entry's comment.
+    /// Sent in `SubmitBuildRequest.tenant_name`; scheduler resolves to UUID.
+    /// Empty = single-tenant mode.
+    pub tenant_name: String,
 }
 
 impl SessionContext {
     pub fn new(
         store_client: StoreServiceClient<Channel>,
         scheduler_client: SchedulerServiceClient<Channel>,
+        tenant_name: String,
     ) -> Self {
         Self {
             store_client,
@@ -111,6 +116,7 @@ impl SessionContext {
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
             active_build_ids: HashMap::new(),
+            tenant_name,
         }
     }
 }
@@ -299,6 +305,14 @@ fn insert_drv_bounded(
     drv_cache.insert(path, drv);
     true
 }
+
+/// Maximum NAR size to buffer for `.drv` caching. Above this, the NAR
+/// streams directly to the store and [`try_cache_drv`] is skipped —
+/// `resolve_derivation` fetches from the store later during DAG
+/// reconstruction (one extra round-trip, correctness unchanged).
+/// 16 MiB covers observed outliers (`options.json.drv` ≈ 9.7MB) with
+/// headroom; typical `.drv` NARs are <10KB.
+pub(super) const DRV_NAR_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
 
 fn try_cache_drv(
     path: &StorePath,

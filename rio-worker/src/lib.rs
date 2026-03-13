@@ -93,4 +93,22 @@ pub fn describe_metrics() {
          sustained high = check bloom sizing). error = store fetch failed (debug-only log; \
          build's own FUSE ops surface the real problem if store is flaky)."
     );
+    describe_counter!(
+        "rio_worker_upload_bytes_total",
+        "Bytes uploaded to store via PutPath (nar_size on success)"
+    );
+    describe_counter!(
+        "rio_worker_fuse_fetch_bytes_total",
+        "Bytes fetched from store via FUSE misses (nar_data.len())"
+    );
+    describe_gauge!(
+        "rio_worker_cpu_fraction",
+        "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. \
+         1.0 = one core fully used; >1.0 on multi-core."
+    );
+    describe_gauge!(
+        "rio_worker_memory_fraction",
+        "Worker cgroup memory utilization: memory.current / memory.max. \
+         0.0 if memory.max is unbounded ('max' literal)."
+    );
 }

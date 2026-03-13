@@ -342,9 +342,13 @@ pub async fn read_build_result<R: AsyncRead + Unpin>(r: &mut R) -> Result<BuildR
         let drv_output_id = wire::read_string(r).await?;
         // Value: Realisation as JSON string
         let json_str = wire::read_string(r).await?;
+        // Wire outPath is the BASENAME (<hashpart>-<name>) per Nix's
+        // StorePath::to_string(). Prepend /nix/store/ so internal
+        // repr is always the full path.
         let out_path = match serde_json::from_str::<serde_json::Value>(&json_str) {
             Ok(v) => match v.get("outPath").and_then(|p| p.as_str()) {
-                Some(p) => p.to_string(),
+                Some(p) if p.starts_with(crate::store_path::STORE_PREFIX) => p.to_string(),
+                Some(p) => format!("{}{p}", crate::store_path::STORE_PREFIX),
                 None => {
                     tracing::warn!(json = %json_str, "Realisation JSON missing 'outPath' field");
                     return Err(wire::WireError::Io(std::io::Error::other(format!(
@@ -402,10 +406,19 @@ pub async fn write_build_result<W: AsyncWrite + Unpin>(
     for output in &result.built_outputs {
         // Key: DrvOutput string
         wire::write_string(w, &output.drv_output_id).await?;
-        // Value: Realisation as JSON
+        // Value: Realisation as JSON. outPath is the BASENAME
+        // (<hashpart>-<name>), NOT the full /nix/store/ path — Nix's
+        // StorePath::to_string() doesn't include the prefix, and
+        // Realisation::fromJSON parses via that path. Sending the
+        // full path fails client-side with "illegal base-32
+        // character '/'".
+        let out_path_basename = output
+            .out_path
+            .strip_prefix(crate::store_path::STORE_PREFIX)
+            .unwrap_or(&output.out_path);
         let json = serde_json::json!({
             "id": output.drv_output_id,
-            "outPath": output.out_path,
+            "outPath": out_path_basename,
             "signatures": [],
             "dependentRealisations": {}
         });

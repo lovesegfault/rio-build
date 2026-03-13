@@ -182,6 +182,19 @@ impl ActorHandle {
         self.tx.send(cmd).await.map_err(|_| ActorError::ChannelSend)
     }
 
+    /// Send a command carrying a oneshot reply, await the reply. For
+    /// admin-RPC patterns where the caller uses `send_unchecked` (bypass
+    /// backpressure). Callers in the gRPC layer convert via
+    /// `actor_error_to_status`.
+    pub async fn query_unchecked<R>(
+        &self,
+        mk_cmd: impl FnOnce(oneshot::Sender<R>) -> ActorCommand,
+    ) -> Result<R, ActorError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_unchecked(mk_cmd(tx)).await?;
+        rx.await.map_err(|_| ActorError::ChannelSend)
+    }
+
     /// Test-only: query all worker states.
     #[cfg(test)]
     pub async fn debug_query_workers(&self) -> Result<Vec<DebugWorkerInfo>, ActorError> {

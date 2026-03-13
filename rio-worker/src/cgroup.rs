@@ -298,10 +298,10 @@ pub fn delegated_root() -> io::Result<PathBuf> {
         // fails to clear RO if a runtime ever sets it via the
         // bind-remount path instead of superblock.
         //
-        // TODO(phase4): this path is unreachable under
+        // TODO(phase5): this path is unreachable under
         // privileged=true (containerd mounts rw already). Exercise
         // it in VM tests once the non-privileged + device-plugin
-        // setup (ADR-012) is wired.
+        // setup (ADR-012) is wired. ADR-012 is a separate track.
         nix::mount::mount(
             None::<&str>,
             CGROUP_ROOT,
@@ -531,6 +531,92 @@ fn read_single_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+fn cpu_fraction(delta_usec: u64, wall_usec: u64) -> f64 {
+    if wall_usec > 0 {
+        delta_usec as f64 / wall_usec as f64
+    } else {
+        0.0
+    }
+}
+
+/// `max = None` (cgroup `memory.max = "max"`) → 0.0 per obs spec.
+fn mem_fraction(current: u64, max: Option<u64>) -> f64 {
+    match max {
+        Some(m) if m > 0 => current as f64 / m as f64,
+        _ => 0.0,
+    }
+}
+
+/// Background task that polls the worker's parent cgroup for CPU and
+/// memory utilization, emitting `rio_worker_cpu_fraction` and
+/// `rio_worker_memory_fraction` gauges every 15s.
+///
+/// `root` is the PARENT cgroup (what `delegated_root()` returns) —
+/// this captures the whole worker's tree: rio-worker process + all
+/// per-build sub-cgroups + all nix-daemon subprocesses.
+///
+/// CPU fraction: delta `cpu.stat usage_usec` / interval µs. 1.0 = one
+/// core fully utilized; >1.0 on multi-core. Directly comparable to
+/// cgroup `cpu.max` limits.
+///
+/// Memory fraction: `memory.current` / `memory.max`. If `memory.max`
+/// is `"max"` (unbounded — no cgroup memory limit), the fraction is
+/// reported as 0.0 (gauge stays at default; can't compute saturation
+/// without a limit).
+///
+/// Spawned from `main.rs` after `delegated_root()` returns. If the
+/// cgroup files become unreadable mid-run (rare — would indicate the
+/// cgroup was removed out from under us), the gauge simply stops
+/// updating; no crash.
+// r[impl obs.metric.worker-util]
+pub async fn utilization_reporter_loop(root: PathBuf) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+    let cpu_stat_path = root.join("cpu.stat");
+    let mem_current_path = root.join("memory.current");
+    let mem_max_path = root.join("memory.max");
+
+    let mut last_usage_usec = fs::read_to_string(&cpu_stat_path)
+        .ok()
+        .and_then(|c| parse_cpu_stat_usage_usec(&c));
+    let mut last_instant = std::time::Instant::now();
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let now_usage = fs::read_to_string(&cpu_stat_path)
+            .ok()
+            .and_then(|c| parse_cpu_stat_usage_usec(&c));
+        let now_instant = std::time::Instant::now();
+
+        let mem_current = read_single_u64(&mem_current_path);
+        let mem_max = fs::read_to_string(&mem_max_path).ok().and_then(|s| {
+            let s = s.trim();
+            if s == "max" {
+                None
+            } else {
+                s.parse::<u64>().ok()
+            }
+        });
+
+        // CPU: only set if we have BOTH a previous sample and a new reading.
+        if let (Some(last_usage), Some(now_usage)) = (last_usage_usec, now_usage) {
+            let cpu_delta = now_usage.saturating_sub(last_usage);
+            let wall_delta = now_instant.duration_since(last_instant).as_micros() as u64;
+            metrics::gauge!("rio_worker_cpu_fraction").set(cpu_fraction(cpu_delta, wall_delta));
+        }
+        if let Some(nu) = now_usage {
+            last_usage_usec = Some(nu);
+            last_instant = now_instant;
+        }
+
+        // Memory: always set if memory.current is readable (explicit 0.0
+        // on unbounded max per obs spec — avoids stale-gauge persistence).
+        if let Some(current) = mem_current {
+            metrics::gauge!("rio_worker_memory_fraction").set(mem_fraction(current, mem_max));
+        }
+    }
+}
+
 // Need libc for EBUSY. Worker already has `nix` dep but libc is lighter.
 use nix::libc;
 
@@ -618,6 +704,36 @@ mod tests {
             Some(42),
             "space-delimited key match, not prefix match"
         );
+    }
+
+    // r[verify obs.metric.worker-util]
+    #[test]
+    fn cpu_fraction_half_core() {
+        // 500ms cpu usage over 1s wall → 0.5 (half a core).
+        assert_eq!(cpu_fraction(500_000, 1_000_000), 0.5);
+    }
+
+    #[test]
+    fn cpu_fraction_zero_wall_guard() {
+        // Div-by-zero guard: zero wall → 0.0 (not NaN/inf).
+        assert_eq!(cpu_fraction(500, 0), 0.0);
+    }
+
+    #[test]
+    fn mem_fraction_half() {
+        assert_eq!(mem_fraction(512, Some(1024)), 0.5);
+    }
+
+    #[test]
+    fn mem_fraction_unbounded_is_zero() {
+        // memory.max = "max" (None) → 0.0 per obs spec.
+        assert_eq!(mem_fraction(999_999, None), 0.0);
+    }
+
+    #[test]
+    fn mem_fraction_zero_max_guard() {
+        // Div-by-zero guard: max=0 → 0.0 (not NaN/inf).
+        assert_eq!(mem_fraction(999, Some(0)), 0.0);
     }
 
     // ---- filesystem (real /proc, real cgroup — Linux-only) ----------------

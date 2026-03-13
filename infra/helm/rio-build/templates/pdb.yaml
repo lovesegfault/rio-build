@@ -1,0 +1,47 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# No PDB for controller/store: replicas=1. PDB on single-replica doesn't
+# help — minAvailable=1 blocks drain forever, minAvailable=0 is a no-op.
+# Controller tolerates 30s restart gap. Store outage → PutPath/GetPath fail,
+# scheduler's circuit-breaker handles gracefully, workers retry.
+#
+# Workers don't get a PDB here either — WorkerPool reconciler creates
+# per-pool PDBs (maxUnavailable=1) with ownerRef → GC on delete.
+# See build_pdb in builders.rs.
+
+{{- if and .Values.scheduler.enabled (gt (int .Values.scheduler.replicas) 1) }}
+---
+# maxUnavailable=1: with replicas=2, one stays up during drain. Leader
+# election handles failover (15s Lease TTL → ~15s blip).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rio-scheduler
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-scheduler" | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.gateway.enabled (gt (int .Values.gateway.replicas) 1) }}
+---
+# minAvailable (not maxUnavailable): SSH ingress must stay up. Killing both
+# gateways = no way to submit builds (Build CRD path still works, but most
+# clients use SSH).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rio-gateway
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-gateway" | nindent 6 }}
+{{- end }}
+{{- end }}

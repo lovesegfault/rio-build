@@ -23,18 +23,19 @@ use crate::handler::{self, SessionContext};
 /// Runs the Nix worker protocol on separate read/write streams,
 /// delegating store operations to `StoreServiceClient` and build
 /// operations to `SchedulerServiceClient`.
-#[tracing::instrument(name = "session", skip_all)]
+#[tracing::instrument(name = "session", skip_all, fields(tenant = %tenant_name))]
 pub async fn run_protocol<R, W>(
     reader: &mut R,
     writer: &mut W,
     store_client: &mut StoreServiceClient<Channel>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
+    tenant_name: String,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin,
 {
-    let mut ctx = SessionContext::new(store_client.clone(), scheduler_client.clone());
+    let mut ctx = SessionContext::new(store_client.clone(), scheduler_client.clone(), tenant_name);
 
     let version_string = format!("rio-gateway {}", env!("CARGO_PKG_VERSION"));
     match handshake::server_handshake_split(reader, writer, &version_string).await {

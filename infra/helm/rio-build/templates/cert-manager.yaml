@@ -1,0 +1,139 @@
+{{- if .Values.tls.enabled }}
+{{- $ns := .Values.namespace.name -}}
+# Architecture:
+#   1. selfsigned-bootstrap ClusterIssuer bootstraps a root CA cert
+#      (isCA: true, self-signed).
+#   2. rio-ca-issuer (namespaced Issuer, NOT ClusterIssuer) reads that root
+#      CA Secret and issues leaf certs. MUST be namespaced: cert-manager's
+#      `ca:` issuer type reads the Secret from ITS OWN namespace — a
+#      ClusterIssuer would look in cert-manager's install namespace, not
+#      ours. We want the CA Secret in our namespace (least privilege — only
+#      rio pods can read it; other tenants' Issuers can't).
+#   3. Per-component Certificate: each gets tls.crt/tls.key/ca.crt. ca.crt
+#      is SAME for all (the root). tls.crt is unique with appropriate SANs.
+---
+# Only used to sign the root CA cert below, then ignored. Bootstrap.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: rio-selfsigned-bootstrap
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  selfSigned: {}
+---
+# The root CA cert. 10y duration: rotating the root means re-issuing EVERY
+# leaf + restarting every pod to pick up new ca.crt. Rare, deliberate event.
+#
+# encoding: PKCS8 is REQUIRED for EC keys. cert-manager defaults to ECDSA
+# P256; without PKCS8, emitted key has legacy `BEGIN EC PRIVATE KEY` header
+# that rustls's PEM parser rejects. NOT a values knob — this is load-bearing.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rio-root-ca
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  isCA: true
+  secretName: rio-root-ca-secret
+  commonName: rio-root-ca
+  duration: 87600h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+  issuerRef:
+    kind: ClusterIssuer
+    name: rio-selfsigned-bootstrap
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: rio-ca-issuer
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  ca:
+    secretName: rio-root-ca-secret
+
+{{- /*
+Leaf certs. Shared settings:
+  - 90d duration, 30d renewBefore. cert-manager auto-renews at 30d left.
+    Pods pick up new cert on next restart (K8s doesn't hot-reload Secret
+    mounts into processes — mount UPDATES but tonic already read old PEM).
+    Pods restart more often than every 60d in practice (deploys, drains).
+    If that changes: add stakater/reloader.
+  - PKCS8 (rustls requirement, see root CA comment).
+  - dnsNames short form: tonic's SAN check uses :authority from URL —
+    `rio-scheduler:9001` → authority `rio-scheduler`, so short name MUST
+    be in SANs. `localhost` is there so in-pod tooling (rio-cli via
+    kubectl exec — see rio-cli/src/main.rs) can talk to the local
+    process with the same RIO_TLS__* env.
+*/}}
+
+{{- range $component := list "scheduler" "store" "gateway" "controller" }}
+{{- $svc := printf "rio-%s" $component }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $svc }}-tls
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: {{ $svc }}
+    app.kubernetes.io/part-of: rio-build
+spec:
+  secretName: {{ $svc }}-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+  issuerRef:
+    kind: Issuer
+    name: rio-ca-issuer
+  dnsNames:
+    - {{ $svc }}
+    - {{ $svc }}.{{ $ns }}
+    - {{ $svc }}.{{ $ns }}.svc
+    - {{ $svc }}.{{ $ns }}.svc.cluster.local
+    - localhost
+{{- end }}
+
+---
+# Worker cert: wildcard SAN. StatefulSet's headless-Service pod DNS is
+# <pod>.<svc>.<ns>.svc.cluster.local. Each pod has its own DNS but shares
+# ONE cert — per-pod certs would require the controller to create
+# Certificate objects per pod. Scheduler doesn't verify WHICH worker, just
+# CA-signed.
+#
+# Wildcard caveat: `*.X` matches ONE label only. Workers don't RECEIVE gRPC
+# so server SAN doesn't strictly matter — purely client-cert. Wildcard is
+# belt-and-suspenders for future metrics scrape etc.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rio-worker-tls
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: rio-worker
+    app.kubernetes.io/part-of: rio-build
+spec:
+  secretName: rio-worker-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+  issuerRef:
+    kind: Issuer
+    name: rio-ca-issuer
+  dnsNames:
+    - rio-worker
+    - "*.{{ $ns }}.svc.cluster.local"
+{{- end }}

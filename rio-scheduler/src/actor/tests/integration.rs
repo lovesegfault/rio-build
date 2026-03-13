@@ -244,6 +244,7 @@ async fn test_cyclic_merge_does_not_leak_in_memory_state() -> TestResult {
                 edges,
                 options: BuildOptions::default(),
                 keep_going: false,
+                traceparent: String::new(),
             },
             reply: reply_tx,
         })
@@ -373,6 +374,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
         .await?;
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: None,
             worker_id: "tight-worker".into(),
@@ -430,6 +432,7 @@ async fn test_assign_send_failure_cleans_running_builds() -> TestResult {
     // Trigger dispatch via heartbeat.
     handle
         .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
             bloom: None,
             size_class: None,
             worker_id: "tight-worker".into(),

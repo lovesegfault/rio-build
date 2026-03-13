@@ -18,6 +18,7 @@ rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 # Direct rustls for CryptoProvider::install_default(). Needed now that
 # tonic tls-aws-lc is enabled (Phase 3b mTLS). Without the install call,
@@ -46,5 +47,4 @@ serde_json = { workspace = true }
 rio-test-support = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tokio-stream = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1,0 +1,10 @@
+.terraform/
+.terraform.lock.hcl
+.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.backup
+
+# State lives in the bucket this module manages (self-referential
+# S3 backend — see main.tf header). Nothing state-like is committed.
+# First-time setup creates a transient local tfstate during the
+# bootstrap dance; it's dead after `tofu init -migrate-state`.

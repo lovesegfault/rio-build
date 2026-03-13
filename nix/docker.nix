@@ -2,8 +2,8 @@
 #
 # Usage:
 #   nix build .#docker-gateway      # single image tarball at result
-#   nix build .#dockerImages        # all 4 at result/{gateway,scheduler,store,worker}.tar.gz
-#   docker load < result/gateway.tar.gz
+#   nix build .#dockerImages        # all 6 at result/{gateway,scheduler,store,controller,worker,fod-proxy}.tar.zst
+#   docker load < result/gateway.tar.zst
 #   docker run rio-gateway:dev --help
 #
 # buildLayeredImage stratifies by popularity — the Nix store closure of each
@@ -17,6 +17,25 @@
 { pkgs, rio-workspace }:
 let
   inherit (pkgs) lib dockerTools;
+
+  # zstd tarballs instead of gzip: ~3x faster to compress, ~4x faster
+  # to decompress, smaller output. Both skopeo (docker-archive:
+  # transport, magic-byte detect) and k3s airgap import (wharfie
+  # SupportedExtensions whitelist) handle .tar.zst natively.
+  #
+  # nixpkgs' compressor arg is a fixed lookup key (none/gz/zstd) —
+  # no level knob. But `zstd` reads ZSTD_CLEVEL from env, and
+  # buildLayeredImage is a runCommand whose attrs become builder
+  # env. overrideAttrs threads it through.
+  #
+  # Level 6: ~2MB window. Do NOT crank this + --long: wharfie's
+  # zstd decoder on k3s nodes caps at 32MB, exceeding that OOMs
+  # the VM test airgap import.
+  buildZstd =
+    args:
+    (dockerTools.buildLayeredImage (args // { compressor = "zstd"; })).overrideAttrs {
+      ZSTD_CLEVEL = "6";
+    };
 
   # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
   # tzdata so log timestamps aren't UTC-only.
@@ -32,7 +51,7 @@ let
       extraEnv ? [ ],
       extraCommands ? "",
     }:
-    dockerTools.buildLayeredImage {
+    buildZstd {
       name = "rio-${name}";
       inherit extraCommands;
       # "dev" not "latest": :latest defaults to imagePullPolicy=Always
@@ -70,6 +89,11 @@ let
 in
 {
   gateway = mkImage { name = "gateway"; };
+  # Scheduler also carries rio-cli (admin client) — buildLayeredImage's
+  # `contents` symlinks rio-workspace/bin/* into /bin/, so `kubectl exec
+  # deploy/rio-scheduler -- rio-cli create-tenant foo` resolves via the
+  # default /bin in PATH. The pod's RIO_TLS__* env (from tls-mounts.yaml)
+  # gives rio-cli mTLS to localhost:9001 for free.
   scheduler = mkImage { name = "scheduler"; };
   store = mkImage { name = "store"; };
 
@@ -79,6 +103,122 @@ in
   # the service-account CA is mounted separately but kube-rs also
   # reads SSL_CERT_FILE for the initial client config probe).
   controller = mkImage { name = "controller"; };
+
+  # FOD forward proxy. Not a rio binary — just squid with cacert.
+  # Built here (not pulled from Docker Hub) so it goes to our ECR
+  # with the rest: same git-SHA immutable tag, can't disappear
+  # from under us like ubuntu/squid:5.7-22.04_beta did. Config
+  # stays in the ConfigMap (infra/helm/rio-build/templates/fod-proxy.yaml)
+  # operators can edit the allowlist without rebuilding.
+  #
+  # Can't use mkImage — that's built around rio-workspace binaries.
+  fod-proxy = buildZstd {
+    name = "rio-fod-proxy";
+    tag = "dev";
+    maxLayers = 20;
+    contents = baseContents ++ [ pkgs.squid ];
+    config = {
+      # -N: foreground (no daemonize — container PID 1 must block).
+      # -d 1: log to stderr at debug level 1 (kubectl logs sees it).
+      Entrypoint = [
+        "${pkgs.squid}/bin/squid"
+        "-N"
+        "-d"
+        "1"
+        "-f"
+        "/etc/squid/squid.conf"
+      ];
+      Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
+      ExposedPorts."3128/tcp" = { };
+    };
+    # Squid writes connection state even with `cache deny all`.
+    # The manifest mounts tmpfs over /var/spool/squid; /var/log
+    # needs to exist for stderr symlink. /etc/squid: config lands
+    # here via ConfigMap subPath mount — dir must pre-exist.
+    extraCommands = ''
+      mkdir -p var/spool/squid var/log/squid etc/squid
+    '';
+  };
+
+  # Secrets bootstrap. Argo PreSync hook — runs before the main sync,
+  # generates rio/hmac + rio/signing-key in AWS Secrets Manager IF THEY
+  # DON'T EXIST (describe-secret guard). Regenerating would invalidate
+  # in-flight assignment tokens / all narinfo signatures. ESO then syncs
+  # them back into k8s Secrets. Public signing key goes to rio/signing-
+  # key-pub so operators can read it without touching the private half.
+  #
+  # Needs nix (nix-store --generate-binary-cache-key), awscli2, openssl.
+  # IRSA via the rio-bootstrap ServiceAccount gives it
+  # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
+  bootstrap =
+    let
+      script = pkgs.writeShellScript "rio-bootstrap" ''
+        set -euo pipefail
+        : "''${AWS_REGION:?}" "''${CHUNK_BUCKET:?}"
+
+        if aws secretsmanager describe-secret --secret-id rio/hmac >/dev/null 2>&1; then
+          echo "[bootstrap] rio/hmac already exists, skipping"
+        else
+          echo "[bootstrap] generating rio/hmac"
+          # 32 raw bytes. SecretBinary (not SecretString) — the HMAC key
+          # isn't text. ESO's decodingStrategy: None preserves raw bytes.
+          openssl rand 32 > /tmp/hmac
+          aws secretsmanager create-secret --name rio/hmac \
+            --secret-binary fileb:///tmp/hmac
+        fi
+
+        if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1; then
+          echo "[bootstrap] rio/signing-key already exists, skipping"
+        else
+          echo "[bootstrap] generating rio/signing-key"
+          tmp=$(mktemp -d)
+          # Key name includes the bucket so narinfo `Sig:` lines identify
+          # which cluster signed them. Format: name:base64-seed.
+          nix-store --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
+            "$tmp/key.sec" "$tmp/key.pub"
+          aws secretsmanager create-secret --name rio/signing-key \
+            --secret-string "file://$tmp/key.sec"
+          # Public half separately so operators can `get-secret-value`
+          # it for their nix.conf trusted-public-keys without access to
+          # the private half.
+          aws secretsmanager create-secret --name rio/signing-key-pub \
+            --secret-string "file://$tmp/key.pub"
+          echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+          cat "$tmp/key.pub"
+        fi
+      '';
+    in
+    buildZstd {
+      name = "rio-bootstrap";
+      tag = "dev";
+      maxLayers = 20;
+      contents = baseContents ++ [
+        pkgs.awscli2
+        pkgs.openssl
+        pkgs.nix
+        pkgs.bash
+        pkgs.coreutils
+      ];
+      config = {
+        Entrypoint = [ "${script}" ];
+        Env = [
+          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          "PATH=${
+            lib.makeBinPath [
+              pkgs.awscli2
+              pkgs.openssl
+              pkgs.nix
+              pkgs.coreutils
+            ]
+          }"
+        ];
+      };
+      # mktemp needs /tmp.
+      extraCommands = ''
+        mkdir -p tmp
+        chmod 1777 tmp
+      '';
+    };
 
   # Worker needs the nix toolchain + FUSE runtime + mount utilities.
   worker = mkImage {

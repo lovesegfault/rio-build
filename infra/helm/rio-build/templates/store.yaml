@@ -1,0 +1,120 @@
+{{- if .Values.store.enabled }}
+{{- $s := .Values.store -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-store
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  # Stateless at runtime (PG + S3 hold everything) BUT concurrent migrations
+  # from multiple replicas would race. Scale later after adding a
+  # migration-lock mechanism.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-store" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 8 }}
+    spec:
+      serviceAccountName: rio-store
+      containers:
+        - name: store
+          image: {{ include "rio.image" (list . $s.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: 9002
+            - name: metrics
+              containerPort: 9092
+            # Plaintext health for K8s probes when mTLS is on. Shares the
+            # same HealthReporter as the main port.
+            - name: health
+              containerPort: 9102
+          env:
+            - name: RIO_LISTEN_ADDR
+              value: "0.0.0.0:9002"
+            - name: RIO_HEALTH_ADDR
+              value: "0.0.0.0:9102"
+            - name: RIO_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rio-postgres
+                  key: url
+            {{- with $s.chunkBackend }}
+            {{- if .kind }}
+            - name: RIO_CHUNK_BACKEND__KIND
+              value: {{ .kind | quote }}
+            {{- end }}
+            {{- if .bucket }}
+            - name: RIO_CHUNK_BACKEND__BUCKET
+              value: {{ .bucket | quote }}
+            {{- end }}
+            {{- if .prefix }}
+            - name: RIO_CHUNK_BACKEND__PREFIX
+              value: {{ .prefix | quote }}
+            {{- end }}
+            {{- if .endpoint }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ .endpoint | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if $s.logS3Bucket }}
+            - name: RIO_LOG_S3_BUCKET
+              value: {{ $s.logS3Bucket | quote }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            {{- include "rio.tlsEnv" . | nindent 12 }}
+            {{- end }}
+            {{- with $s.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            {{- include "rio.tlsVolumeMount" . | nindent 12 }}
+          {{- end }}
+          # tonic-health set_serving() runs AFTER migrations in main.rs —
+          # "PG connected + migrations done" = Ready.
+          #
+          # TLS retarget: when mTLS is on, port 9002 rejects the K8s probe
+          # (no client cert). 9102 is the plaintext health port, same
+          # HealthReporter. Strategic-merge patches can't do this (adding a
+          # second handler type → K8s rejects "may not specify more than 1"),
+          # which is why the old kustomize overlay templated the whole probe.
+          readinessProbe:
+            grpc:
+              port: {{ if .Values.tls.enabled }}9102{{ else }}9002{{ end }}
+              service: rio.store.StoreService
+            periodSeconds: 5
+            failureThreshold: 3
+          # Liveness stays on 9002: tcpSocket completes before the TLS layer.
+          livenessProbe:
+            tcpSocket: {port: 9002}
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml $s.resources | nindent 12 }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        {{- include "rio.tlsVolume" "rio-store-tls" | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-store
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "rio.selectorLabels" "rio-store" | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9002
+      targetPort: grpc
+{{- end }}

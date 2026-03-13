@@ -54,4 +54,8 @@ pub fn describe_metrics() {
         "rio_gateway_errors_total",
         "Protocol errors (labeled by type)"
     );
+    describe_counter!(
+        "rio_gateway_bytes_total",
+        "Bytes forwarded to/from SSH client (labeled by direction: rx/tx)"
+    );
 }

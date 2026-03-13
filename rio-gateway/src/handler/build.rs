@@ -218,6 +218,15 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
     active_build_ids.insert(build_id.clone(), 0);
 
+    // Emit trace_id to the client via STDERR_NEXT — gives operators a
+    // grep handle for Tempo when debugging a user's build. Empty-guard
+    // suppresses output when no OTel tracer is configured
+    // (current_trace_id_hex returns "" for TraceId::INVALID).
+    let trace_id = rio_proto::interceptor::current_trace_id_hex();
+    if !trace_id.is_empty() {
+        let _ = stderr.log(&format!("rio trace_id: {trace_id}\n")).await;
+    }
+
     match &first.event {
         Some(types::build_event::Event::Started(started)) => {
             debug!(
@@ -399,6 +408,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         drv_cache,
         has_seen_build_paths_with_results,
         active_build_ids,
+        tenant_name,
         ..
     } = ctx;
     let drv_path_str = wire::read_string(reader).await?;
@@ -505,7 +515,13 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     let mut nodes = nodes;
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
-    let request = translate::build_submit_request(nodes, edges, options.as_ref(), priority_class);
+    let request = translate::build_submit_request(
+        nodes,
+        edges,
+        options.as_ref(),
+        priority_class,
+        tenant_name,
+    );
 
     let build_result =
         match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
@@ -541,6 +557,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         options,
         drv_cache,
         active_build_ids,
+        tenant_name,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -621,7 +638,8 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     // don't serialize the same derivation twice).
     translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
-    let request = translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
+    let request =
+        translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci", tenant_name);
 
     let build_result =
         match submit_and_process_build(stderr, scheduler_client, request, active_build_ids).await {
@@ -653,6 +671,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         options,
         drv_cache,
         active_build_ids,
+        tenant_name,
         ..
     } = ctx;
     let raw_paths = wire::read_strings(reader).await?;
@@ -770,8 +789,13 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             // Inline .drv content for will-dispatch nodes.
             translate::filter_and_inline_drv(&mut all_nodes, drv_cache, store_client).await;
 
-            let request =
-                translate::build_submit_request(all_nodes, all_edges, options.as_ref(), "ci");
+            let request = translate::build_submit_request(
+                all_nodes,
+                all_edges,
+                options.as_ref(),
+                "ci",
+                tenant_name,
+            );
 
             submit_and_process_build(stderr, scheduler_client, request, active_build_ids)
                 .await

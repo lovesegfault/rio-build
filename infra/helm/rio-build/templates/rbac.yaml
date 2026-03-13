@@ -1,0 +1,175 @@
+{{- $ns := .Values.namespace.name -}}
+# ServiceAccounts first. gateway/store/worker get
+# automountServiceAccountToken: false — no K8s API access. Dedicated SA
+# anyway for IRSA annotations + NetworkPolicy scoping.
+#
+# automountServiceAccountToken is TOP-LEVEL (sibling of metadata), not
+# under metadata. Easy to mis-indent.
+{{- if .Values.controller.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-controller
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+{{- end }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-gateway
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-gateway" "component" "gateway") | nindent 4 }}
+automountServiceAccountToken: false
+{{- end }}
+{{- if .Values.store.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-store
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+  {{- with .Values.store.serviceAccount.annotations }}
+  # EKS IRSA: eks.amazonaws.com/role-arn attaches an IAM role via projected
+  # token. Store needs S3 access. NO static AWS keys.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+{{- end }}
+---
+# Worker SA is always created — WorkerPool reconciler references it even
+# when nothing else in this chart is enabled (vmtest profile).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-worker
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-worker" "component" "worker") | nindent 4 }}
+automountServiceAccountToken: false
+{{- if .Values.scheduler.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rio-scheduler
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+{{- end }}
+
+{{- if .Values.controller.enabled }}
+---
+# Controller watches CRDs cluster-wide → ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rio-controller
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+rules:
+  # Full lifecycle. `update` for finalizer add/remove (finalizer() patches
+  # metadata.finalizers).
+  - apiGroups: [rio.build]
+    resources: [workerpools, builds]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Status subresource = separate permission. Never GET /status separately
+  # (it's in the main GET).
+  - apiGroups: [rio.build]
+    resources: [workerpools/status, builds/status]
+    verbs: [get, patch]
+  # Owned children. `create` because SSA PATCH creates if missing but some
+  # clusters still check `create` perm.
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # List only — cleanup enumerates pods by label to DrainWorker each.
+  # No mutation — pod lifecycle is the StatefulSet controller's job.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  # Headless Service per WorkerPool. Created by apply(), deleted by ownerRef GC.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # `kubectl describe workerpool` shows events. create/patch for aggregation
+  # (K8s dedups by key).
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  # Per-WorkerPool PDB (maxUnavailable=1) managed by reconciler.
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rio-controller
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rio-controller
+subjects:
+  - kind: ServiceAccount
+    name: rio-controller
+    namespace: {{ $ns }}
+{{- end }}
+
+{{- if .Values.scheduler.enabled }}
+---
+# Scheduler touches ONE Lease in ONE namespace → Role suffices (least
+# privilege). In-house election (src/lease/election.rs): GET to observe,
+# CREATE on first acquire, UPDATE (PUT via kube::Api::replace) for
+# renew/steal/step_down. resourceVersion-guarded — 409 on race.
+#
+# VM tests won't catch RBAC misconfig here: k3s controller-as-systemd uses
+# admin kubeconfig, bypassing RBAC. The Helm-rendered controller path
+# (values/vmtest.yaml) will.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rio-scheduler-lease
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+  # pod-deletion-cost annotation: leader PATCHes own Pod's
+  # metadata.annotations so K8s kills standby first during RollingUpdate.
+  # Namespace-wide (NOT resourceNames-scoped) because pod name is dynamic
+  # (Deployment-generated). Code only patches cfg.holder_id = HOSTNAME =
+  # own pod. `get` needed: kube-rs's Api::patch GETs first for
+  # resourceVersion (Merge doesn't strictly need it but client does
+  # GET-before-PATCH anyway).
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rio-scheduler-lease
+  namespace: {{ $ns }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rio-scheduler-lease
+subjects:
+  - kind: ServiceAccount
+    name: rio-scheduler
+    namespace: {{ $ns }}
+{{- end }}

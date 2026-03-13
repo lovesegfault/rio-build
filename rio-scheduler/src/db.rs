@@ -74,6 +74,37 @@ pub struct SchedulerDb {
 /// EMA alpha for duration estimation updates.
 const EMA_ALPHA: f64 = 0.3;
 
+/// Row from `list_builds`. 4-table join (builds / build_derivations /
+/// derivations / assignments). `cached_derivations` heuristic:
+/// "completed with no assignment row" — a cache-hit derivation
+/// transitions directly to Completed at merge time without ever being
+/// dispatched.
+#[derive(Debug, sqlx::FromRow)]
+pub struct BuildListRow {
+    pub build_id: String,
+    pub tenant_id: Option<String>,
+    pub priority_class: String,
+    pub status: String,
+    pub error_summary: Option<String>,
+    pub total_derivations: i64,
+    pub completed_derivations: i64,
+    pub cached_derivations: i64,
+}
+
+/// Row from `list_tenants` / `create_tenant`. `has_cache_token`
+/// is a projection (`cache_token IS NOT NULL`) — the token itself
+/// is never returned. `created_at` is epoch seconds via
+/// `EXTRACT(EPOCH FROM created_at)::bigint` — avoids a chrono dep.
+#[derive(Debug, sqlx::FromRow)]
+pub struct TenantRow {
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    pub gc_retention_hours: i32,
+    pub gc_max_store_bytes: Option<i64>,
+    pub has_cache_token: bool,
+    pub created_at: i64,
+}
+
 /// Row from `load_nonterminal_builds`. FromRow for named-column
 /// mapping (tuples at this arity are error-prone).
 ///
@@ -83,11 +114,26 @@ const EMA_ALPHA: f64 = 0.3;
 #[derive(Debug, sqlx::FromRow)]
 pub struct RecoveryBuildRow {
     pub build_id: Uuid,
-    pub tenant_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
     pub status: String,
     pub priority_class: String,
     pub keep_going: bool,
     pub options_json: Option<sqlx::types::Json<crate::state::BuildOptions>>,
+}
+
+/// Row from `load_poisoned_derivations`. Minimal — poisoned rows
+/// aren't dispatched, just TTL-tracked. `elapsed_secs` is computed
+/// PG-side (`now() - poisoned_at`) so the caller can reconstruct
+/// an `Instant` via `Instant::now() - Duration::from_secs_f64(elapsed)`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PoisonedDerivationRow {
+    pub derivation_id: Uuid,
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub pname: Option<String>,
+    pub system: String,
+    pub failed_workers: Vec<String>,
+    pub elapsed_secs: f64,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
@@ -138,6 +184,109 @@ impl SchedulerDb {
     }
 
     // -----------------------------------------------------------------------
+    // Tenant operations
+    // -----------------------------------------------------------------------
+
+    /// List builds with optional status/tenant filters + offset pagination
+    /// (for AdminService.ListBuilds). Returns `(total_count, page_rows)`.
+    ///
+    /// `status_opt`: `None` = no filter, `Some(s)` = `b.status = s`.
+    /// `limit` is taken as-is — caller clamps.
+    pub async fn list_builds(
+        &self,
+        status_opt: Option<&str>,
+        tenant_filter: Option<Uuid>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(i64, Vec<BuildListRow>), sqlx::Error> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM builds b
+             WHERE ($1::text IS NULL OR b.status = $1)
+               AND ($2::uuid IS NULL OR b.tenant_id = $2)",
+        )
+        .bind(status_opt)
+        .bind(tenant_filter)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows: Vec<BuildListRow> = sqlx::query_as(
+            r#"
+            SELECT
+                b.build_id::text,
+                b.tenant_id::text,
+                b.priority_class,
+                b.status,
+                b.error_summary,
+                COALESCE(COUNT(bd.derivation_id), 0)::bigint AS total_derivations,
+                COALESCE(COUNT(*) FILTER (WHERE d.status = 'completed'), 0)::bigint
+                    AS completed_derivations,
+                COALESCE(COUNT(*) FILTER (
+                    WHERE d.status = 'completed'
+                      AND NOT EXISTS (SELECT 1 FROM assignments a
+                                      WHERE a.derivation_id = d.derivation_id)
+                ), 0)::bigint AS cached_derivations
+            FROM builds b
+            LEFT JOIN build_derivations bd USING (build_id)
+            LEFT JOIN derivations d ON bd.derivation_id = d.derivation_id
+            WHERE ($1::text IS NULL OR b.status = $1)
+              AND ($2::uuid IS NULL OR b.tenant_id = $2)
+            GROUP BY b.build_id
+            ORDER BY b.submitted_at DESC, b.build_id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(status_opt)
+        .bind(tenant_filter)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((total, rows))
+    }
+
+    /// List all tenants (for AdminService.ListTenants).
+    pub async fn list_tenants(&self) -> Result<Vec<TenantRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
+                   cache_token IS NOT NULL AS has_cache_token,
+                   EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+            FROM tenants ORDER BY created_at
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Create a tenant. Returns `None` on conflict (tenant_name OR
+    /// cache_token already exists) — caller maps to `AlreadyExists`.
+    pub async fn create_tenant(
+        &self,
+        name: &str,
+        gc_retention_hours: Option<i32>,
+        gc_max_store_bytes: Option<i64>,
+        cache_token: Option<&str>,
+    ) -> Result<Option<TenantRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            INSERT INTO tenants (tenant_name, gc_retention_hours, gc_max_store_bytes, cache_token)
+            VALUES ($1, COALESCE($2, 168), $3, $4)
+            ON CONFLICT DO NOTHING
+            RETURNING tenant_id, tenant_name, gc_retention_hours, gc_max_store_bytes,
+                      cache_token IS NOT NULL AS has_cache_token,
+                      EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+            "#,
+        )
+        .bind(name)
+        .bind(gc_retention_hours)
+        .bind(gc_max_store_bytes)
+        .bind(cache_token)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    // -----------------------------------------------------------------------
     // Build operations
     // -----------------------------------------------------------------------
 
@@ -150,7 +299,7 @@ impl SchedulerDb {
     pub async fn insert_build(
         &self,
         build_id: Uuid,
-        tenant_id: Option<&str>,
+        tenant_id: Option<Uuid>,
         priority_class: crate::state::PriorityClass,
         keep_going: bool,
         options: &crate::state::BuildOptions,
@@ -160,7 +309,7 @@ impl SchedulerDb {
             INSERT INTO builds
                 (build_id, tenant_id, requestor, status, priority_class,
                  keep_going, options_json)
-            VALUES ($1, $2::uuid, '', 'pending', $3, $4, $5)
+            VALUES ($1, $2, '', 'pending', $3, $4, $5)
             "#,
         )
         .bind(build_id)
@@ -301,24 +450,62 @@ impl SchedulerDb {
         Ok(())
     }
 
-    /// Clear `failed_workers` + `retry_count` for a derivation.
-    /// Called on poison-TTL expiry (reset_from_poison) so PG
-    /// matches in-mem. Without this, crash after poison-reset →
-    /// recovery loads stale failed_workers → immediately excluded
-    /// from dispatch (best_worker skips them).
-    pub async fn clear_failed_workers_and_retry(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<(), sqlx::Error> {
+    // r[impl sched.poison.ttl-persist]
+    /// Persist `poisoned_at = now()` for a derivation. Called from
+    /// `poison_and_cascade` and `handle_permanent_failure` after
+    /// `persist_status(.., Poisoned)`. Best-effort — status write
+    /// already happened; missing poisoned_at means recovery won't
+    /// load it (same as pre-009 behavior).
+    pub async fn set_poisoned_at(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE derivations \
-             SET failed_workers = '{}', retry_count = 0, updated_at = now() \
+            "UPDATE derivations SET poisoned_at = now(), updated_at = now() WHERE drv_hash = $1",
+        )
+        .bind(drv_hash.as_str())
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// Clear poison state: NULL `poisoned_at`, empty `failed_workers`,
+    /// zero `retry_count`, status='created'. Used by ClearPoison admin
+    /// RPC + TTL expiry in `handle_tick`.
+    pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_workers = '{}', retry_count = 0,
+                 status = 'created', updated_at = now()
              WHERE drv_hash = $1",
         )
         .bind(drv_hash.as_str())
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
+        .map(|_| ())
+    }
+
+    /// Load poisoned derivations with their `poisoned_at` timestamps
+    /// for recovery. Separate from `load_nonterminal_derivations`
+    /// because `TERMINAL_STATUSES` includes `"poisoned"`. Rows with
+    /// `poisoned_at IS NULL` are pre-009 orphans — skip them (they'll
+    /// be overwritten by a fresh submit; same as pre-009 behavior).
+    ///
+    /// Returns minimal fields — poisoned rows aren't dispatched, just
+    /// TTL-tracked. The `failed_workers` count matters for display;
+    /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
+    /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
+    pub async fn load_poisoned_derivations(
+        &self,
+    ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            SELECT derivation_id, drv_hash, drv_path, pname, system,
+                   failed_workers,
+                   EXTRACT(EPOCH FROM (now() - poisoned_at))::float8 AS elapsed_secs
+            FROM derivations
+            WHERE status = 'poisoned' AND poisoned_at IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -645,7 +832,7 @@ impl SchedulerDb {
     pub async fn load_nonterminal_builds(&self) -> Result<Vec<RecoveryBuildRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT build_id, tenant_id::text, status, priority_class,
+            SELECT build_id, tenant_id, status, priority_class,
                    keep_going, options_json
             FROM builds
             WHERE status IN ('pending', 'active')
@@ -1389,6 +1576,56 @@ mod tests {
             "Some×Some blends: expected {expected}, got {cpu:?}"
         );
 
+        Ok(())
+    }
+
+    // r[verify sched.poison.ttl-persist]
+    /// Roundtrip: set_poisoned_at → load_poisoned_derivations → clear_poison.
+    /// Catches the `.as_bytes()` vs `.as_str()` binding regression — PG rejects
+    /// BYTEA against a TEXT column, but call sites swallow the error as best-effort.
+    #[tokio::test]
+    async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+        let drv_hash: DrvHash = "poison-rt-hash".into();
+        let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
+
+        // load_poisoned_derivations filters on status='poisoned' AND
+        // poisoned_at IS NOT NULL. set_poisoned_at only touches poisoned_at;
+        // status must be set separately (actors do this via persist_status).
+        sqlx::query("UPDATE derivations SET status='poisoned' WHERE drv_hash=$1")
+            .bind(drv_hash.as_str())
+            .execute(&test_db.pool)
+            .await?;
+        db.set_poisoned_at(&drv_hash).await?;
+
+        let rows = db.load_poisoned_derivations().await?;
+        assert_eq!(rows.len(), 1, "set_poisoned_at should make row loadable");
+        assert_eq!(rows[0].drv_hash, drv_hash.as_str());
+        assert_ne!(rows[0].derivation_id, Uuid::nil());
+        assert!(
+            rows[0].elapsed_secs >= 0.0 && rows[0].elapsed_secs < 5.0,
+            "elapsed should be ~0s, got {}",
+            rows[0].elapsed_secs
+        );
+
+        // clear_poison → no longer loadable; status reset to 'created'.
+        db.clear_poison(&drv_hash).await?;
+        let rows = db.load_poisoned_derivations().await?;
+        assert!(
+            rows.is_empty(),
+            "clear_poison should remove from poisoned set"
+        );
+
+        let (status, poisoned_at): (String, Option<f64>) = sqlx::query_as(
+            "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 \
+             FROM derivations WHERE drv_hash=$1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(status, "created");
+        assert!(poisoned_at.is_none());
         Ok(())
     }
 }
