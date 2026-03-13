@@ -14,12 +14,14 @@
 //!    had acquired.
 //!
 //! 2. **Observed-record expiry.** A standby doesn't trust the
-//!    Lease's `renewTime` (written by a *different* node's clock).
-//!    Instead it records `(holderIdentity, leaseTransitions)` plus
-//!    a local monotonic `Instant` when that pair was first seen.
-//!    If the pair doesn't change for `ttl` of *local* time, the
-//!    leader stopped renewing — steal. Cross-node clock skew is
-//!    irrelevant; only our own `Instant` monotonicity matters.
+//!    Lease's `renewTime` VALUE (written by a *different* node's
+//!    clock). Instead it records the lease's `resourceVersion`
+//!    plus a local monotonic `Instant` when that rv was first
+//!    seen. The apiserver bumps rv on every write, so a leader
+//!    renewing every 5s produces a new rv every 5s. If rv doesn't
+//!    change for `ttl` of *local* time, nobody wrote — steal.
+//!    Cross-node clock skew is irrelevant; only our own `Instant`
+//!    monotonicity matters.
 //!
 //! The split into a pure `decide()` function + an I/O shell is
 //! deliberate: `decide()` is table-tested with no kube client.
@@ -70,35 +72,42 @@ pub(super) enum Decision {
 }
 
 /// client-go's "observed record": when did WE (this process, our
-/// monotonic clock) first see this exact (holder, transitions)
-/// pair? If the pair changes, the leader is alive (it renewed, or
-/// a new leader took over). If it doesn't change for `ttl`, the
-/// leader is dead.
+/// monotonic clock) first see this `resourceVersion`? The
+/// apiserver bumps rv on every write (including renew), so a
+/// live leader produces a fresh rv every RENEW_INTERVAL. If rv
+/// doesn't change for `ttl`, nobody is writing — the holder is
+/// dead.
+///
+/// Tracking rv (not `(holder, transitions)`) is load-bearing:
+/// renew only touches `renew_time`, leaving holder/transitions
+/// unchanged — a standby watching only those would see a live
+/// leader as frozen and steal it after ttl.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Observed {
-    holder: String,
-    transitions: i32,
+    resource_version: String,
     at: Instant,
 }
 
 /// Pure decision function. No I/O, no clock reads — `now` is
 /// injected. Separated for table testing.
 ///
-/// Updates `observed` in place: resets `at = now` if the (holder,
-/// transitions) pair changed, leaves it alone if unchanged.
+/// Updates `observed` in place: resets `at = now` if the
+/// resourceVersion changed since the last call, leaves it alone
+/// if unchanged.
 ///
-/// The `holder == our_id` branch doesn't consult `observed` at
-/// all — if the apiserver says we hold it, we renew. The
-/// resourceVersion guard on the replace() catches any staleness.
+/// `holder` and `resource_version` are passed separately rather
+/// than as `&Lease` because the caller already has both and we
+/// don't want decide() coupled to the full k8s type (simpler
+/// table tests).
 pub(super) fn decide(
-    spec: &LeaseSpec,
+    holder: Option<&str>,
+    resource_version: &str,
     observed: &mut Option<Observed>,
     our_id: &str,
     ttl: Duration,
     now: Instant,
 ) -> Decision {
-    let holder = spec.holder_identity.as_deref().unwrap_or("");
-    let transitions = spec.lease_transitions.unwrap_or(0);
+    let holder = holder.unwrap_or("");
 
     // Empty holder: previous leader stepped down gracefully (set
     // holder_identity: None). No one to wait for — steal now.
@@ -108,19 +117,20 @@ pub(super) fn decide(
     }
 
     // We hold it. Renew. Don't touch `observed` — it tracks OTHER
-    // holders, not ourselves. If we lose and re-observe ourselves
-    // later (restart with same holder_id), the renew branch still
-    // applies; observed-record staleness is irrelevant for renew.
+    // holders' activity, not ours. If we restart with the same
+    // holder_id, this branch still applies; the rv guard on
+    // replace() catches any staleness.
     if holder == our_id {
         return Decision::Renew;
     }
 
     // Someone else holds it. Check the observed-record clock.
     match observed {
-        Some(obs) if obs.holder == holder && obs.transitions == transitions => {
-            // Same pair we saw before. Has it been ttl since we
-            // FIRST saw it? (Not since the lease's renewTime — we
-            // don't trust that clock.)
+        Some(obs) if obs.resource_version == resource_version => {
+            // Same rv we saw before — nobody has written since.
+            // Has it been ttl since we FIRST saw it? (Not since
+            // the lease's renewTime — we never read that value,
+            // only watch rv for change.)
             if now.duration_since(obs.at) > ttl {
                 Decision::Steal
             } else {
@@ -128,14 +138,13 @@ pub(super) fn decide(
             }
         }
         _ => {
-            // New pair (first observation, or holder/transitions
-            // changed). Reset the clock. This is the "first-tick
-            // penalty": even if the lease is actually stale, we
-            // can't know that without a prior observation, so we
-            // wait one full ttl. client-go does the same.
+            // New rv (first observation, or the leader renewed
+            // since our last look). Reset the clock. This is
+            // also the "first-tick penalty": even if the lease
+            // is actually stale, we can't know without a prior
+            // observation, so we wait one full ttl.
             *observed = Some(Observed {
-                holder: holder.to_string(),
-                transitions,
+                resource_version: resource_version.to_string(),
                 at: now,
             });
             Decision::Standby
@@ -182,10 +191,21 @@ impl LeaderElection {
             None => return self.create().await,
         };
 
-        // 2. Decide.
-        let spec = lease.spec.clone().unwrap_or_default();
+        // 2. Decide. resource_version is always set on objects
+        // that came from the apiserver (unwrap_or_default is
+        // defensive, not expected).
+        let holder = lease
+            .spec
+            .as_ref()
+            .and_then(|s| s.holder_identity.as_deref());
+        let rv = lease
+            .metadata
+            .resource_version
+            .as_deref()
+            .unwrap_or_default();
         let decision = decide(
-            &spec,
+            holder,
+            rv,
             &mut self.observed,
             &self.holder_id,
             self.ttl,
@@ -316,12 +336,11 @@ impl LeaderElection {
 mod tests {
     use super::*;
 
-    fn spec(holder: Option<&str>, transitions: i32) -> LeaseSpec {
-        LeaseSpec {
-            holder_identity: holder.map(String::from),
-            lease_transitions: Some(transitions),
-            ..Default::default()
-        }
+    fn obs(rv: &str, at: Instant) -> Option<Observed> {
+        Some(Observed {
+            resource_version: rv.to_string(),
+            at,
+        })
     }
 
     const TTL: Duration = Duration::from_secs(15);
@@ -334,64 +353,51 @@ mod tests {
     /// second-guess what the apiserver told us.
     #[test]
     fn we_hold_it_renews() {
-        let mut obs = None;
-        let d = decide(&spec(Some("us"), 3), &mut obs, "us", TTL, Instant::now());
+        let mut o = None;
+        let d = decide(Some("us"), "42", &mut o, "us", TTL, Instant::now());
         assert_eq!(d, Decision::Renew);
-        assert_eq!(obs, None, "renew doesn't touch observed");
+        assert_eq!(o, None, "renew doesn't touch observed");
     }
 
     /// First time we see someone else → standby, start the clock.
     #[test]
     fn fresh_observation_is_standby() {
-        let mut obs = None;
+        let mut o = None;
         let now = Instant::now();
-        let d = decide(&spec(Some("other"), 5), &mut obs, "us", TTL, now);
+        let d = decide(Some("other"), "42", &mut o, "us", TTL, now);
         assert_eq!(d, Decision::Standby);
-        assert_eq!(
-            obs,
-            Some(Observed {
-                holder: "other".into(),
-                transitions: 5,
-                at: now
-            })
-        );
+        assert_eq!(o, obs("42", now));
     }
 
-    /// Same holder seen again, not yet ttl elapsed → still standby,
-    /// clock NOT reset (we're measuring time since FIRST sight).
+    /// Same rv seen again, not yet ttl elapsed → still standby,
+    /// clock NOT reset (measuring time since FIRST sight).
     #[test]
-    fn not_yet_stale_stays_standby() {
+    fn same_rv_not_yet_stale_stays_standby() {
         let t0 = Instant::now();
-        let mut obs = Some(Observed {
-            holder: "other".into(),
-            transitions: 5,
-            at: t0,
-        });
+        let mut o = obs("42", t0);
         let d = decide(
-            &spec(Some("other"), 5),
-            &mut obs,
+            Some("other"),
+            "42",
+            &mut o,
             "us",
             TTL,
             t0 + Duration::from_secs(5),
         );
         assert_eq!(d, Decision::Standby);
-        assert_eq!(obs.as_ref().unwrap().at, t0, "clock preserved");
+        assert_eq!(o.as_ref().unwrap().at, t0, "clock preserved");
     }
 
-    /// Same holder, ttl elapsed since first sight → steal.
-    /// The lease's renewTime isn't consulted — only our local
-    /// monotonic observation.
+    /// Same rv, ttl elapsed since first sight → steal. The
+    /// lease's renewTime isn't consulted — only our local
+    /// monotonic observation of whether rv MOVED.
     #[test]
-    fn stale_observation_steals() {
+    fn same_rv_stale_steals() {
         let t0 = Instant::now();
-        let mut obs = Some(Observed {
-            holder: "other".into(),
-            transitions: 5,
-            at: t0,
-        });
+        let mut o = obs("42", t0);
         let d = decide(
-            &spec(Some("other"), 5),
-            &mut obs,
+            Some("other"),
+            "42",
+            &mut o,
             "us",
             TTL,
             t0 + Duration::from_secs(20),
@@ -399,63 +405,39 @@ mod tests {
         assert_eq!(d, Decision::Steal);
     }
 
-    /// Holder CHANGED (A→B) → reset the clock even though we'd
-    /// been watching A for >ttl. B is a NEW leader; their renew
-    /// cadence starts fresh.
+    /// rv CHANGED → reset the clock even though we'd been watching
+    /// for >ttl. Something wrote (renew or steal) — holder is live.
+    ///
+    /// This is the case that was BROKEN when we tracked (holder,
+    /// transitions): a renew bumps renewTime and resourceVersion
+    /// but NOT holder or transitions, so a standby would see a
+    /// live leader as frozen and steal it after ttl. Flip-flop.
     #[test]
-    fn holder_changed_resets_clock() {
+    fn rv_changed_resets_clock() {
         let t0 = Instant::now();
-        let mut obs = Some(Observed {
-            holder: "A".into(),
-            transitions: 5,
-            at: t0,
-        });
+        let mut o = obs("42", t0);
         let t1 = t0 + Duration::from_secs(20);
-        let d = decide(&spec(Some("B"), 6), &mut obs, "us", TTL, t1);
-        assert_eq!(d, Decision::Standby, "new holder → fresh observation");
-        let obs = obs.unwrap();
-        assert_eq!(obs.holder, "B");
-        assert_eq!(obs.transitions, 6);
-        assert_eq!(obs.at, t1);
-    }
-
-    /// Same holder string but transitions bumped → they re-acquired
-    /// (e.g., crash + restart with same pod name). Still alive —
-    /// reset the clock.
-    #[test]
-    fn transitions_bumped_resets_clock() {
-        let t0 = Instant::now();
-        let mut obs = Some(Observed {
-            holder: "other".into(),
-            transitions: 5,
-            at: t0,
-        });
-        let t1 = t0 + Duration::from_secs(20);
-        let d = decide(&spec(Some("other"), 6), &mut obs, "us", TTL, t1);
-        assert_eq!(d, Decision::Standby);
-        assert_eq!(obs.as_ref().unwrap().at, t1, "tx change = alive → reset");
+        let d = decide(Some("other"), "43", &mut o, "us", TTL, t1);
+        assert_eq!(d, Decision::Standby, "rv moved → leader alive → reset");
+        assert_eq!(o, obs("43", t1));
     }
 
     /// holder_identity: None (graceful step_down) → steal
     /// immediately, no observed-record wait.
     #[test]
     fn empty_holder_steals_immediately() {
-        let mut obs = Some(Observed {
-            holder: "other".into(),
-            transitions: 5,
-            at: Instant::now(),
-        });
-        let d = decide(&spec(None, 5), &mut obs, "us", TTL, Instant::now());
+        let mut o = obs("42", Instant::now());
+        let d = decide(None, "42", &mut o, "us", TTL, Instant::now());
         assert_eq!(d, Decision::Steal);
-        assert_eq!(obs, None, "cleared — no one to observe");
+        assert_eq!(o, None, "cleared — no one to observe");
     }
 
-    /// holder_identity: Some("") — treat same as None. The old
-    /// crate wrote empty string on step_down; be tolerant.
+    /// holder_identity: Some("") — treat same as None. Be tolerant
+    /// of code that clears via empty string.
     #[test]
     fn empty_string_holder_steals_immediately() {
-        let mut obs = None;
-        let d = decide(&spec(Some(""), 0), &mut obs, "us", TTL, Instant::now());
+        let mut o = None;
+        let d = decide(Some(""), "42", &mut o, "us", TTL, Instant::now());
         assert_eq!(d, Decision::Steal);
     }
 
@@ -555,8 +537,7 @@ mod tests {
         // hangs waiting for the PUT scenario).
         let stale = Instant::now() - Duration::from_secs(20);
         election.observed = Some(Observed {
-            holder: "dead-leader".into(),
-            transitions: 2,
+            resource_version: "100".into(),
             at: stale,
         });
 
