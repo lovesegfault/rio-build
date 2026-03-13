@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tracing::info;
 
 use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
@@ -139,9 +139,32 @@ async fn main() -> anyhow::Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rio_worker::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
-    // Connect to gRPC services
+    // Connect to gRPC services. Scheduler has two modes:
+    // - Balanced (K8s, multi-replica scheduler): DNS-resolve the
+    //   headless Service, health-probe pod IPs, route to leader.
+    //   Heartbeat (separate unary RPC) routes through the same
+    //   balanced channel — when leadership flips, the probe task
+    //   sees NOT_SERVING on the old leader within one tick (~3s)
+    //   and removes it; next heartbeat goes to the new leader.
+    // - Single (non-K8s): plain connect. VM tests use this.
     let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
-    let mut scheduler_client = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
+    let (mut scheduler_client, _balance_guard) = if cfg.scheduler_balance_host.is_empty() {
+        info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
+        let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
+        (c, None)
+    } else {
+        info!(
+            host = %cfg.scheduler_balance_host,
+            port = cfg.scheduler_balance_port,
+            "scheduler: health-aware balanced mode"
+        );
+        let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
+            cfg.scheduler_balance_host.clone(),
+            cfg.scheduler_balance_port,
+        )
+        .await?;
+        (c, Some(bc))
+    };
 
     info!(
         %worker_id,
@@ -205,26 +228,35 @@ async fn main() -> anyhow::Result<()> {
         "FUSE store mounted"
     );
 
-    // Set up build execution stream (bidirectional)
-    let (stream_tx, stream_rx) = mpsc::channel::<WorkerMessage>(256);
+    // ---- BuildExecution stream with reconnect ----
+    //
+    // Architecture: a PERMANENT sink channel (sink_tx, sink_rx)
+    // lives for process lifetime. BuildSpawnContext holds sink_tx
+    // — running builds send CompletionReport/LogBatch here.
+    // sink_rx is drained by a relay task that pumps into whatever
+    // gRPC outbound channel is currently live (via watch::channel).
+    //
+    // Why: stderr_loop.rs breaks the build with MiscFailure if
+    // its log send fails (channel closed). If we handed build
+    // tasks the gRPC channel directly, stream death on scheduler
+    // failover would kill every running build. With the permanent
+    // sink, the build tasks' channel NEVER closes — the relay
+    // just buffers (up to mpsc capacity) during the ~1s gap
+    // between old-stream-dead and new-stream-open.
+    //
+    // The relay recovers the one message lost on transition
+    // (mpsc::error::SendError<T> holds the unsent message) and
+    // blocks on watch.changed() until the reconnect loop swaps
+    // in a fresh gRPC channel.
+    let (sink_tx, sink_rx) = mpsc::channel::<WorkerMessage>(256);
 
-    // Send WorkerRegister as the first message before opening the stream.
-    // The scheduler reads this to associate the stream with our worker_id,
-    // ensuring stream and heartbeat share the same identity.
-    stream_tx
-        .send(WorkerMessage {
-            msg: Some(worker_message::Msg::Register(WorkerRegister {
-                worker_id: worker_id.clone(),
-            })),
-        })
-        .await?;
+    // Relay target: Some(grpc_tx) while connected, None during
+    // the reconnect gap. Starts None — the reconnect loop sets
+    // it before opening the first stream.
+    let (relay_target_tx, relay_target_rx) =
+        watch::channel::<Option<mpsc::Sender<WorkerMessage>>>(None);
 
-    let outbound = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
-
-    let build_stream = scheduler_client
-        .build_execution(outbound)
-        .await?
-        .into_inner();
+    rio_common::task::spawn_monitored("stream-relay", relay_loop(sink_rx, relay_target_rx));
 
     // Concurrent build semaphore
     let build_semaphore = Arc::new(Semaphore::new(cfg.max_builds as usize));
@@ -311,7 +343,9 @@ async fn main() -> anyhow::Result<()> {
         worker_id,
         fuse_mount_point: cfg.fuse_mount_point,
         overlay_base_dir: cfg.overlay_base_dir,
-        stream_tx,
+        // The permanent sink, NOT a per-connection gRPC channel.
+        // Build tasks' sends never fail on scheduler failover.
+        stream_tx: sink_tx,
         running_builds,
         leaked_mounts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         log_limits: rio_worker::log_stream::LogLimits {
@@ -327,113 +361,165 @@ async fn main() -> anyhow::Result<()> {
 
     // Process incoming scheduler messages + SIGTERM for graceful drain.
     //
+    // Wrapped in a reconnect loop: on stream close/error, open a
+    // fresh BuildExecution via the balanced channel (p2c routes to
+    // the new leader). Running builds continue — their completions
+    // land in the permanent sink, the relay buffers until the new
+    // gRPC channel is swapped in. Heartbeat (separate unary RPC,
+    // same balanced channel) reports running_builds to the new
+    // leader within one tick; reconcile at T+45s sees the worker
+    // connected + running_builds populated → no reassignment.
+    // See rio-scheduler/src/actor/recovery.rs handle_reconcile_assignments.
+    //
     // select! is biased toward sigterm: poll it FIRST each iteration.
     // Without `biased;`, select! picks a ready branch pseudorandomly —
     // under heavy assignment traffic, SIGTERM could starve behind
     // stream messages. K8s sends SIGTERM then starts the grace period
     // clock; we want to react immediately, not after the next gap in
     // assignments.
-    let mut build_stream = build_stream;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    let drain_reason = loop {
-        // A worker without a live heartbeat is a liability (scheduler will
-        // time it out and re-dispatch its builds). Die fast rather than
-        // silently duplicate work. Check BEFORE awaiting select — if
-        // heartbeat died mid-iteration, don't process another message.
-        if heartbeat_handle.is_finished() {
-            tracing::error!("heartbeat loop terminated unexpectedly; exiting");
-            std::process::exit(1);
-        }
+    'reconnect: loop {
+        // Fresh per-connection outbound channel. The relay pumps
+        // the permanent sink into this; when the gRPC bidi dies,
+        // grpc_rx (wrapped in ReceiverStream → build_execution)
+        // is dropped → grpc_tx.send() fails in the relay → relay
+        // buffers and waits for the next swap.
+        let (grpc_tx, grpc_rx) = mpsc::channel::<WorkerMessage>(256);
 
-        tokio::select! {
-            biased;
+        // WorkerRegister MUST be the first message. Send it on
+        // grpc_tx directly (not via the sink — we want it to go
+        // out on THIS connection, not be buffered by a relay that
+        // might still be pointing at the old channel).
+        grpc_tx
+            .send(WorkerMessage {
+                msg: Some(worker_message::Msg::Register(WorkerRegister {
+                    worker_id: build_ctx.worker_id.clone(),
+                })),
+            })
+            .await?;
 
-            _ = sigterm.recv() => {
-                break DrainReason::Sigterm;
+        // Swap in the new gRPC target. Relay resumes pumping.
+        // send_replace because we don't care about the old value
+        // (it's a dead channel or None).
+        relay_target_tx.send_replace(Some(grpc_tx));
+
+        let mut build_stream = match scheduler_client
+            .build_execution(tokio_stream::wrappers::ReceiverStream::new(grpc_rx))
+            .await
+        {
+            Ok(s) => s.into_inner(),
+            Err(e) => {
+                // Leader still settling, or balance channel hasn't
+                // caught up. Back off and retry. The balanced
+                // channel's probe loop rediscovers within ~3s.
+                tracing::warn!(error = %e, "BuildExecution open failed; retrying in 1s");
+                relay_target_tx.send_replace(None);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue 'reconnect;
+            }
+        };
+        info!("BuildExecution stream open");
+
+        let stream_end = loop {
+            if heartbeat_handle.is_finished() {
+                tracing::error!("heartbeat loop terminated unexpectedly; exiting");
+                std::process::exit(1);
             }
 
-            msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
-                let Some(msg_result) = msg_result else {
-                    // Stream closed by server (scheduler shutdown/restart).
-                    // Not a SIGTERM drain — just exit. The scheduler
-                    // will reassign via WorkerDisconnected.
-                    break DrainReason::StreamClosed;
-                };
-                let msg = match msg_result {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!(error = %e, "build execution stream error");
-                        break DrainReason::StreamError;
-                    }
-                };
+            tokio::select! {
+                biased;
 
-                match msg.msg {
-                    Some(scheduler_message::Msg::Assignment(assignment)) => {
-                        info!(drv_path = %assignment.drv_path, "received work assignment");
+                _ = sigterm.recv() => {
+                    break StreamEnd::Sigterm;
+                }
 
-                        // Acquire permit BEFORE ACKing: don't tell the
-                        // scheduler we accepted work we can't immediately
-                        // start. On Err(Closed): semaphore.close() was
-                        // called — impossible here (close happens in the
-                        // drain path below, AFTER loop exit), so this is
-                        // a bug. Break with a distinct reason.
-                        let permit = match Arc::clone(&build_semaphore).acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => {
-                                tracing::error!("semaphore closed mid-loop (bug)");
-                                break DrainReason::StreamError;
-                            }
-                        };
+                msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
+                    let Some(msg_result) = msg_result else {
+                        break StreamEnd::Closed;
+                    };
+                    let msg = match msg_result {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "build execution stream error");
+                            break StreamEnd::Error;
+                        }
+                    };
 
-                        spawn_build_task(assignment, permit, &build_ctx).await;
-                    }
-                    Some(scheduler_message::Msg::Cancel(cancel)) => {
-                        info!(
-                            drv_path = %cancel.drv_path,
-                            reason = %cancel.reason,
-                            "received cancel signal"
-                        );
-                        // Look up cgroup → write cgroup.kill → daemon
-                        // + builder + children SIGKILLed → run_daemon_
-                        // build sees stdout EOF → Err → execute_build
-                        // returns Err → spawn_build_task checks the
-                        // cancelled flag → reports Cancelled (not
-                        // InfrastructureFailure). The semaphore permit
-                        // drops when the spawned task exits (scopeguard).
-                        //
-                        // Fire-and-forget: scheduler doesn't wait for
-                        // confirmation. If the build already finished
-                        // (race), try_cancel_build returns false and
-                        // we log at debug.
-                        rio_worker::runtime::try_cancel_build(
-                            &cancel_registry,
-                            &cancel.drv_path,
-                        );
-                    }
-                    Some(scheduler_message::Msg::Prefetch(prefetch)) => {
-                        tracing::debug!(
-                            paths = prefetch.store_paths.len(),
-                            "received prefetch hint"
-                        );
-                        handle_prefetch_hint(
-                            prefetch,
-                            Arc::clone(&prefetch_cache),
-                            prefetch_store.clone(),
-                            prefetch_runtime.clone(),
-                            Arc::clone(&prefetch_sem),
-                        );
-                    }
-                    None => {
-                        tracing::warn!("received empty scheduler message");
+                    match msg.msg {
+                        Some(scheduler_message::Msg::Assignment(assignment)) => {
+                            info!(drv_path = %assignment.drv_path, "received work assignment");
+
+                            // Acquire permit BEFORE ACKing: don't tell the
+                            // scheduler we accepted work we can't immediately
+                            // start. On Err(Closed): semaphore.close() was
+                            // called — impossible here (close happens in the
+                            // drain path below, AFTER loop exit), so this is
+                            // a bug. Break with a distinct reason.
+                            let permit = match Arc::clone(&build_semaphore).acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::error!("semaphore closed mid-loop (bug)");
+                                    break StreamEnd::Error;
+                                }
+                            };
+
+                            spawn_build_task(assignment, permit, &build_ctx).await;
+                        }
+                        Some(scheduler_message::Msg::Cancel(cancel)) => {
+                            info!(
+                                drv_path = %cancel.drv_path,
+                                reason = %cancel.reason,
+                                "received cancel signal"
+                            );
+                            rio_worker::runtime::try_cancel_build(
+                                &cancel_registry,
+                                &cancel.drv_path,
+                            );
+                        }
+                        Some(scheduler_message::Msg::Prefetch(prefetch)) => {
+                            tracing::debug!(
+                                paths = prefetch.store_paths.len(),
+                                "received prefetch hint"
+                            );
+                            handle_prefetch_hint(
+                                prefetch,
+                                Arc::clone(&prefetch_cache),
+                                prefetch_store.clone(),
+                                prefetch_runtime.clone(),
+                                Arc::clone(&prefetch_sem),
+                            );
+                        }
+                        None => {
+                            tracing::warn!("received empty scheduler message");
+                        }
                     }
                 }
             }
+        };
+
+        match stream_end {
+            StreamEnd::Sigterm => break 'reconnect,
+            StreamEnd::Closed | StreamEnd::Error => {
+                // Swap relay target to None — relay buffers until
+                // we open the next stream. Running builds' send()s
+                // to the permanent sink succeed; the relay just
+                // holds them. 256-cap sink → up to 256 messages
+                // buffered before build tasks block on send. At
+                // typical log rates (100ms batch flush), that's
+                // ~25s of buffer — far more than the ~1s gap.
+                tracing::warn!(
+                    running = build_ctx.running_builds.read().await.len(),
+                    "BuildExecution stream ended; reconnecting (running builds continue)"
+                );
+                relay_target_tx.send_replace(None);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue 'reconnect;
+            }
         }
-    };
+    }
 
     run_drain(
-        drain_reason,
         &build_semaphore,
         cfg.max_builds,
         &cfg.scheduler_addr,
@@ -470,7 +556,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Execute the drain sequence after the event loop exits.
+/// Execute the SIGTERM drain sequence.
 ///
 /// K8s preStop (controller.md:211-216):
 ///   1. DrainWorker: scheduler stops sending assignments
@@ -482,131 +568,220 @@ async fn main() -> anyhow::Result<()> {
 /// SIGKILL — builds lost. 2h is enough for ~any single build; the
 /// ones that take longer (LLVM+ccache-cold) are rare.
 ///
-/// Only DrainReason::Sigterm does the full sequence. Stream close/
-/// error means the scheduler is gone — DrainWorker would fail, and
-/// WorkerDisconnected already reassigned our builds. Just exit.
-async fn run_drain(
-    reason: DrainReason,
-    semaphore: &Semaphore,
-    max_builds: u32,
-    scheduler_addr: &str,
-    worker_id: &str,
-) {
-    match reason {
-        DrainReason::Sigterm => {
-            info!(
-                in_flight = max_builds as usize - semaphore.available_permits(),
-                "SIGTERM received, draining"
-            );
+/// Only called on SIGTERM. Stream close/error is handled by the
+/// reconnect loop — we no longer exit on those.
+async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str, worker_id: &str) {
+    info!(
+        in_flight = max_builds as usize - semaphore.available_permits(),
+        "SIGTERM received, draining"
+    );
 
-            // Step 1: DrainWorker. Best-effort — if it fails (scheduler
-            // unreachable, actor dead), log and continue. The scheduler
-            // will eventually time us out via heartbeat (we're still
-            // heartbeating until exit) and WorkerDisconnected will
-            // reassign. We lose nothing by trying.
-            //
-            // Fresh admin client: could clone the scheduler_client's
-            // channel, but that's internal to WorkerServiceClient.
-            // Simpler to just connect — the address is in cfg, and
-            // connect is cheap (happy path: one TCP handshake, ~1ms
-            // on localhost, ~RTT over network). This is a one-shot
-            // call at shutdown, not a hot path.
-            match rio_proto::client::connect_admin(scheduler_addr).await {
-                Ok(mut admin) => {
-                    match admin
-                        .drain_worker(rio_proto::types::DrainWorkerRequest {
-                            worker_id: worker_id.to_string(),
-                            force: false,
-                        })
-                        .await
-                    {
-                        Ok(resp) => {
-                            let r = resp.into_inner();
-                            info!(
-                                accepted = r.accepted,
-                                running = r.running_builds,
-                                "drain acknowledged by scheduler"
-                            );
-                            // accepted=false means the scheduler already
-                            // removed us (WorkerDisconnected raced). Fine —
-                            // our builds are reassigned, but our local
-                            // nix-daemons are still running. We still
-                            // wait for them below (they'll complete,
-                            // upload outputs, and CompletionReport will
-                            // be dropped by the scheduler as "unknown
-                            // drv" — wasted but correct).
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "DrainWorker RPC failed; continuing drain");
-                        }
-                    }
+    // Step 1: DrainWorker. Best-effort — if it fails (scheduler
+    // unreachable, actor dead), log and continue. The scheduler
+    // will eventually time us out via heartbeat (we're still
+    // heartbeating until exit) and WorkerDisconnected will
+    // reassign. We lose nothing by trying.
+    //
+    // Fresh admin client: ClusterIP Service works here (we're
+    // a one-shot unary call at shutdown; 50% chance of hitting
+    // standby → UNAVAILABLE → we log and move on, same as any
+    // other DrainWorker failure).
+    match rio_proto::client::connect_admin(scheduler_addr).await {
+        Ok(mut admin) => {
+            match admin
+                .drain_worker(rio_proto::types::DrainWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    force: false,
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let r = resp.into_inner();
+                    info!(
+                        accepted = r.accepted,
+                        running = r.running_builds,
+                        "drain acknowledged by scheduler"
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "admin connect failed; continuing drain without DrainWorker");
+                    tracing::warn!(error = %e, "DrainWorker RPC failed; continuing drain");
                 }
             }
-
-            // Step 2: wait for in-flight. close() makes future
-            // acquire_owned() return Err(Closed) — if the scheduler
-            // DOES send more assignments (DrainWorker raced), the
-            // Assignment arm's acquire fails and... well, we already
-            // broke out of the loop, so the stream is undriven.
-            // Messages queue in the gRPC buffer and are dropped on
-            // drop(build_stream) below. The scheduler sees stream
-            // close → WorkerDisconnected → reassigns those. Correct.
-            //
-            // acquire_many(max_builds) succeeds when ALL permits are
-            // returned — every build task dropped its OwnedPermit on
-            // completion. This is the synchronization point: when this
-            // returns, no build is mid-upload.
-            //
-            // DON'T close() before acquire_many: close makes waiting
-            // acquires return Err even when permits return. The loop
-            // already broke — no new acquires can happen.
-            match semaphore.acquire_many(max_builds).await {
-                Ok(_all_permits) => {
-                    info!("all in-flight builds complete");
-                }
-                Err(_) => {
-                    // Err on a non-closed semaphore is impossible
-                    // (acquire only errs on close). If we hit this,
-                    // someone else closed it — a bug. Exit anyway:
-                    // hanging here is worse than abandoning a build
-                    // that may-or-may-not be stuck.
-                    tracing::error!("semaphore closed unexpectedly (bug); exiting anyway");
-                }
-            }
-
-            // FUSE unmount+join after return (see end of main).
-            // build_stream Drop closes gRPC → scheduler
-            // WorkerDisconnected → removes our entry (if DrainWorker
-            // didn't already).
-            info!("drain complete, exiting");
         }
-        DrainReason::StreamClosed => {
-            info!("build execution stream closed, shutting down");
-        }
-        DrainReason::StreamError => {
-            info!("build execution stream error, shutting down");
+        Err(e) => {
+            tracing::warn!(error = %e, "admin connect failed; continuing drain without DrainWorker");
         }
     }
+
+    // Step 2: wait for in-flight. acquire_many(max_builds) succeeds
+    // when ALL permits are returned — every build task dropped its
+    // OwnedPermit on completion. This is the synchronization point:
+    // when this returns, no build is mid-upload.
+    //
+    // DON'T close() before acquire_many: close makes waiting
+    // acquires return Err even when permits return. The loop
+    // already broke — no new acquires can happen.
+    match semaphore.acquire_many(max_builds).await {
+        Ok(_all_permits) => {
+            info!("all in-flight builds complete");
+        }
+        Err(_) => {
+            tracing::error!("semaphore closed unexpectedly (bug); exiting anyway");
+        }
+    }
+
+    info!("drain complete, exiting");
 }
 
-/// Why the event loop exited. Determines whether to run the full
-/// drain sequence (SIGTERM) or just exit (scheduler gone).
-enum DrainReason {
-    /// K8s preStop → full drain: DrainWorker + wait for in-flight.
+/// Why the inner select loop exited. Sigterm breaks the outer
+/// reconnect loop; Closed/Error trigger a reconnect.
+enum StreamEnd {
     Sigterm,
-    /// Server closed stream (scheduler restart). Scheduler-side
-    /// WorkerDisconnected already reassigned; just exit.
-    StreamClosed,
-    /// gRPC error on stream. Same treatment as StreamClosed.
-    StreamError,
+    Closed,
+    Error,
+}
+
+/// Pump the permanent sink channel into the current gRPC outbound
+/// channel. The target is a `watch` so the reconnect loop can swap
+/// it: `Some(tx)` = connected, `None` = reconnecting (relay blocks
+/// on `changed()`, sink buffers in its mpsc backlog).
+///
+/// Exits only when the permanent sink closes (all `sink_tx` clones
+/// dropped — process shutdown).
+async fn relay_loop(
+    mut sink_rx: mpsc::Receiver<WorkerMessage>,
+    mut target: watch::Receiver<Option<mpsc::Sender<WorkerMessage>>>,
+) {
+    // One-message buffer for the transition case: we recv'd from
+    // the sink, tried to send to gRPC, gRPC channel is dead.
+    // `mpsc::error::SendError<T>` holds the unsent message —
+    // extract it, wait for the next target swap, retry.
+    let mut buffered: Option<WorkerMessage> = None;
+
+    loop {
+        // Wait for a live target. borrow_and_update() so the next
+        // changed() fires only on an actual swap, not immediately.
+        let Some(grpc_tx) = target.borrow_and_update().clone() else {
+            // No target yet (startup) or mid-reconnect. Block
+            // until the reconnect loop swaps one in. changed()
+            // errs only if the Sender dropped — main() owns it
+            // for process lifetime, so this is shutdown.
+            if target.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+
+        // Flush the buffered message first (if any).
+        if let Some(msg) = buffered.take()
+            && let Err(e) = grpc_tx.send(msg).await
+        {
+            // Still dead (reconnect raced us). Re-buffer
+            // and wait again.
+            buffered = Some(e.0);
+            if target.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // Pump until this gRPC target dies.
+        loop {
+            let Some(msg) = sink_rx.recv().await else {
+                // Permanent sink closed — all sink_tx clones
+                // dropped. BuildSpawnContext holds one for process
+                // lifetime, so this is shutdown (main returning).
+                return;
+            };
+            if let Err(e) = grpc_tx.send(msg).await {
+                // gRPC channel died (reconnect loop is about to
+                // or already did swap the target to None). Buffer
+                // this one message and go back to the top.
+                buffered = Some(e.0);
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(id: &str) -> WorkerMessage {
+        WorkerMessage {
+            msg: Some(worker_message::Msg::Register(WorkerRegister {
+                worker_id: id.into(),
+            })),
+        }
+    }
+
+    /// Relay pumps sink → gRPC. When gRPC dies, relay buffers ONE
+    /// message (from SendError) and blocks until a new target is
+    /// swapped in. Messages in the sink's mpsc backlog are held
+    /// (build tasks block on sink.send at cap, but don't see Err).
+    #[tokio::test]
+    async fn relay_survives_target_swap() {
+        let (sink_tx, sink_rx) = mpsc::channel(8);
+        let (target_tx, target_rx) = watch::channel(None);
+        let relay = tokio::spawn(relay_loop(sink_rx, target_rx));
+
+        // Connect target #1.
+        let (grpc1_tx, mut grpc1_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(grpc1_tx));
+
+        // Send via sink → relay pumps → arrives at grpc1.
+        sink_tx.send(msg("a")).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(1), grpc1_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            r.msg,
+            Some(worker_message::Msg::Register(WorkerRegister { worker_id })) if worker_id == "a"
+        ));
+
+        // Kill target #1 (drop rx → tx.send() fails in relay).
+        // Then send "b" — relay recv's it, send fails, buffers it.
+        drop(grpc1_rx);
+        sink_tx.send(msg("b")).await.unwrap();
+        // Also queue "c" in the sink backlog (relay is blocked on
+        // target.changed(), hasn't recv'd yet).
+        sink_tx.send(msg("c")).await.unwrap();
+
+        // Brief yield so relay has a chance to recv "b", hit the
+        // dead channel, and buffer.
+        tokio::task::yield_now().await;
+
+        // Swap in target #2. Relay flushes "b" (buffered) then
+        // resumes pumping "c" from the sink.
+        let (grpc2_tx, mut grpc2_rx) = mpsc::channel(8);
+        target_tx.send_replace(Some(grpc2_tx));
+
+        let r = tokio::time::timeout(Duration::from_secs(1), grpc2_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            r.msg,
+            Some(worker_message::Msg::Register(WorkerRegister { worker_id })) if worker_id == "b"
+        ));
+        let r = tokio::time::timeout(Duration::from_secs(1), grpc2_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            r.msg,
+            Some(worker_message::Msg::Register(WorkerRegister { worker_id })) if worker_id == "c"
+        ));
+
+        // Cleanup: drop sink → relay exits.
+        drop(sink_tx);
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     /// The drain-wait synchronization: `acquire_many(max)` succeeds
     /// exactly when all in-flight build tasks have dropped their

@@ -437,6 +437,18 @@ fn build_container(
         image_pull_policy: wp.spec.image_pull_policy.clone(),
         env: Some(vec![
             env("RIO_SCHEDULER_ADDR", scheduler_addr),
+            // Headless Service for health-aware balanced routing.
+            // Worker DNS-resolves this to pod IPs, health-probes
+            // grpc.health.v1 on each, routes to the leader. On
+            // scheduler failover, BuildExecution reconnects via
+            // the balanced channel; running builds continue.
+            //
+            // Hardcoded: the headless Service name is fixed in
+            // infra/k8s/base/scheduler.yaml. If ctx.scheduler_addr
+            // ever becomes configurable per-deployment, this would
+            // need to be threaded through too. Today it isn't.
+            env("RIO_SCHEDULER_BALANCE_HOST", "rio-scheduler-headless"),
+            env("RIO_SCHEDULER_BALANCE_PORT", "9001"),
             // From ctx.store_addr — NOT derived from scheduler_addr.
             // The kustomize base uses different Service names
             // (rio-scheduler vs rio-store); a port-replace would
