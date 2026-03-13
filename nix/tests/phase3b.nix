@@ -5,6 +5,10 @@
 # validation. Skips PDB/NetPol/FOD-proxy (need NetworkPolicy + Squid
 # VM) and cancel-timing (covered by unit tests).
 #
+# r[verify ctrl.build.watch-by-uid]
+# Section F asserts rio_controller_build_watch_spawns_total == 1 across
+# multiple reconciles of one Build CR (UID-keyed DashMap dedup).
+#
 # Topology (4 VMs):
 #   control — PG + store + scheduler + gateway. Server cert with
 #             SANs {control, localhost, 127.0.0.1}. HMAC key

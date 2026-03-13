@@ -9,6 +9,20 @@
 # namespaces, gateway speaking ssh-ng, scheduler dispatching across 2 workers,
 # and Prometheus metrics validating distribution + FUSE fetch.
 #
+# r[verify worker.overlay.stacked-lower]
+# r[verify worker.ns.order]
+# The writableStore=false pattern in common.nix:mkWorkerNode keeps the
+# worker VM's /nix/store as a plain 9p mount (not itself an overlay),
+# so the per-build overlay's lowerdir=/nix/store:{fuse} stack is valid.
+# A build succeeding also proves mount-namespace ordering: both overlayfs
+# and nix-daemon's sandbox need unshare(CLONE_NEWNS); wrong order → fail.
+#
+# r[verify obs.metric.scheduler]
+# r[verify obs.metric.worker]
+# r[verify obs.metric.store]
+# Asserted end-to-end from /metrics scrapes: rio_scheduler_builds_total,
+# rio_worker_builds_total, rio_store_put_path_total (exact names from spec).
+#
 # Topology:
 #   control   — PostgreSQL, rio-store, rio-scheduler, rio-gateway
 #   worker1   — rio-worker (CAP_SYS_ADMIN, /dev/fuse)

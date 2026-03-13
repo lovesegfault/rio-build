@@ -12,9 +12,8 @@
 // those can carry r[verify ...] because src/ is in `include` and tracey
 // doesn't restrict verbs in non-test files.
 //
-// VM tests (nix/tests/*.nix) are NOT included — tracey doesn't parse .nix.
-// VM-verified requirements carry r[verify ...] in the embedded test scripts'
-// shell/python helpers (.sh extension is supported), or in a thin .rs shim.
+// VM tests (nix/tests/*.nix) carry # r[verify ...] directly — tracey
+// parses .nix since upstream 31d0543 (arborium-nix tree-sitter grammar).
 
 specs (
   {
@@ -50,6 +49,7 @@ specs (
         test_include (
           rio-gateway/tests/**/*.rs
           rio-proto/tests/**/*.rs
+          nix/tests/*.nix
         )
       }
     )

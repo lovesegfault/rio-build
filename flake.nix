@@ -250,8 +250,8 @@
               ;
           };
 
-          # Spec-coverage CLI (CI: `tracey query validate`).
-          # Dashboard is stubbed — see nix/tracey.nix for why.
+          # Spec-coverage CLI + web dashboard. The SPA is built via
+          # fetchPnpmDeps in nix/tracey.nix and embedded at compile time.
           traceyPkg = import ./nix/tracey.nix { inherit craneLib pkgs; };
 
           # --------------------------------------------------------------
@@ -346,10 +346,6 @@
             # docs/**/*.md and .config/tracey/config.styx, which crane's
             # source filter drops. tracey's daemon writes .tracey/daemon.sock
             # under the working dir, so we cp to a writable tmpdir first.
-            #
-            # v1.3.0 bug: `tracey query validate` always exits 0 even when it
-            # reports errors. Workaround: grep for "0 total error(s)". Remove
-            # the grep once upstream fixes the exit code.
             tracey-validate =
               pkgs.runCommand "rio-tracey-validate"
                 {
@@ -366,12 +362,8 @@
                   # outside the working dir) goes somewhere writable.
                   rm -rf .tracey/
                   export HOME=$TMPDIR
-                  tracey query validate 2>&1 | tee validate.log
-                  grep -q '0 total error(s)' validate.log || {
-                    echo "FAIL: tracey validate found errors (see above)"
-                    exit 1
-                  }
-                  touch $out
+                  set -o pipefail
+                  tracey query validate 2>&1 | tee $out
                 '';
             # Coverage via `cargo llvm-cov nextest` (NOT `cargo llvm-cov test`).
             #

@@ -8,6 +8,10 @@
 #   memory.peak → build_history.ema_peak_memory_bytes end-to-end
 #   (cgroup memory.peak captures tree-wide footprint). Finalizer drain.
 #
+# r[verify obs.metric.controller]
+# Autoscaler section scrapes rio_controller_scaling_decisions_total
+# (exact name from the observability spec's controller metrics table).
+#
 # Topology (3 VMs):
 #   k8s     — k3s server + rio-controller (systemd, not pod).
 #             Worker runs AS A POD here. 4GB RAM, 8 cores
