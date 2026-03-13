@@ -163,7 +163,7 @@ deploy:
         --set externalSecrets.auroraEndpoint="$db_host" \
         --set bootstrap.enabled=true \
         --set bootstrap.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$bootstrap_arn" \
-        --set-json 'gateway.service.annotations={"service.beta.kubernetes.io/aws-load-balancer-type":"external","service.beta.kubernetes.io/aws-load-balancer-nlb-target-type":"ip","service.beta.kubernetes.io/aws-load-balancer-scheme":"internal","service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22":"tcp.idle_timeout.seconds=3600"}' \
+        --set-json 'gateway.service.annotations={"service.beta.kubernetes.io/aws-load-balancer-type":"external","service.beta.kubernetes.io/aws-load-balancer-nlb-target-type":"ip","service.beta.kubernetes.io/aws-load-balancer-scheme":"internal","service.beta.kubernetes.io/aws-load-balancer-attributes":"load_balancing.cross_zone.enabled=true","service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22":"tcp.idle_timeout.seconds=3600"}' \
         --set karpenter.enabled=true \
         --set karpenter.clusterName="$cluster" \
         --set karpenter.nodeRoleName="$node_role" \

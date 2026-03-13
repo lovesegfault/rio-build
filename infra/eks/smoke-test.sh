@@ -111,11 +111,15 @@ aws ssm start-session \
 SSM_PID=$!
 trap 'kill $SSM_PID 2>/dev/null || true' EXIT
 
-# Wait for the tunnel to come up. nc -z = just check listening,
-# no data. 6×5s = 30s max.
-log "waiting for tunnel"
-retry 6 5 nc -z localhost "$LOCAL_PORT" \
-  || die "SSM tunnel never opened (check /tmp/ssm-session.log)"
+# Wait for the tunnel to actually forward. `nc -z` only checks that
+# session-manager-plugin bound the local socket — the SSM agent on
+# the bastion can still fail to reach the NLB (e.g. cross-zone LB off
+# + empty-AZ ENI). Read the SSH banner to prove the full path works.
+log "waiting for tunnel (reading SSH banner through full path)"
+retry 10 3 bash -c '
+  banner=$(timeout 3 bash -c "exec 3<>/dev/tcp/localhost/'"$LOCAL_PORT"' && head -c 12 <&3" 2>/dev/null)
+  [[ "$banner" == SSH-2.0-* ]]
+' || die "SSM tunnel not forwarding — check /tmp/ssm-session.log and NLB target health"
 
 # ----------------------------------------------------------------
 # 4. Wait for the chart's default WorkerPool to reconcile
@@ -145,7 +149,7 @@ STORE_URL="ssh-ng://rio@localhost:$LOCAL_PORT?ssh-key=$SSH_KEY"
 # build output appears.
 log "building nixpkgs#hello via $STORE_URL (cold-start: ~2min before first output)"
 NIX_SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-  nix build nixpkgs#hello --store "$STORE_URL" --no-link \
+  nix build nixpkgs#hello --store "$STORE_URL" --no-link -L \
   || die "hello build failed"
 log "hello build OK"
 
