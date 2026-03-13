@@ -49,6 +49,7 @@ impl DagActor {
 
         if !was_registered && worker.is_registered() {
             info!(worker_id = %worker_id, "worker fully registered (stream + heartbeat)");
+            metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
         }
     }
 
