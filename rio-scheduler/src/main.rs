@@ -118,10 +118,10 @@ struct CliArgs {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // rustls CryptoProvider MUST be installed before any TLS
-    // use. kube-leader-election → kube → hyper-rustls enables
-    // `ring`; rio-proto → aws-sdk enables `aws-lc-rs`. With BOTH
-    // active, rustls 0.23 can't auto-select and PANICS on first
-    // TLS handshake (the Lease loop's K8s API call). Pin aws-lc-rs.
+    // use. kube → hyper-rustls enables `ring`; rio-proto →
+    // aws-sdk enables `aws-lc-rs`. With BOTH active, rustls 0.23
+    // can't auto-select and PANICS on first TLS handshake (the
+    // Lease loop's K8s API call). Pin aws-lc-rs.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let cli = CliArgs::parse();

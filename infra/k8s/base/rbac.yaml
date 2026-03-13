@@ -111,14 +111,14 @@ kind: Role
 metadata:
   name: rio-scheduler-lease
 rules:
-  # kube-leader-election renews via PATCH (strategic merge on
-  # spec.renewTime + holderIdentity), not UPDATE. The old verbs
-  # list was wrong — renew failed with 403 Forbidden every 5s
-  # on a real cluster. VM tests missed it: k3s control-plane
+  # In-house election (src/lease/election.rs): GET to observe,
+  # CREATE on first acquire, UPDATE (PUT via kube::Api::replace)
+  # for renew/steal/step_down. resourceVersion-guarded — 409 on
+  # race. VM tests won't catch RBAC misconfig: k3s control-plane
   # runs as systemd with admin kubeconfig, bypassing RBAC.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update", "patch"]
+    verbs: ["get", "create", "update"]
   # pod-deletion-cost annotation: leader PATCHes its own Pod's
   # metadata.annotations so K8s kills the standby first during
   # RollingUpdate. Namespace-wide `patch pods` (not resourceNames-

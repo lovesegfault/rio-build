@@ -13,13 +13,19 @@
 //! generation stays at 1. Zero behavior change for existing
 //! deployments.
 //!
-//! # No fencing — why it's OK
+//! # Election mechanics (see `election.rs`)
 //!
-//! `kube-leader-election` is a polling loop, not a watch-based
-//! fence. If the network partitions, both replicas may believe
-//! they're leader for up to `lease_ttl` (15s). During that window
-//! both dispatch. This is ACCEPTABLE because dispatch is
-//! idempotent:
+//! All lease mutations go through `kube::Api::replace()` (PUT),
+//! which requires the GET's `metadata.resourceVersion` — the
+//! apiserver rejects with 409 if the object changed. Two racing
+//! writers: exactly one wins. On top of that, standbys use a
+//! local-monotonic "observed record" clock to decide staleness
+//! (immune to cross-node clock skew — we never compare against
+//! the lease's `renewTime`).
+//!
+//! This STILL isn't a linearizable fence — a partitioned leader
+//! can keep dispatching until its TTL runs out locally. That's
+//! acceptable because dispatch is idempotent:
 //!
 //! - DAG merge dedups by `drv_hash`. Two schedulers merging the
 //!   same SubmitBuild both end up with the same DAG node.
@@ -30,11 +36,6 @@
 //! - Worst case: a derivation dispatches twice (one from each
 //!   leader), builds twice, produces the same output (deterministic
 //!   builds). Wasteful but correct.
-//!
-//! A proper fenced lease (etcd-style linearizable) would eliminate
-//! the dual-leader window entirely. kube-leader-election doesn't
-//! offer that. If we need it: replace with a direct etcd client
-//! or a raft crate. Not worth the complexity today.
 //!
 //! # Lease TTL and renew cadence
 //!
@@ -50,8 +51,10 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::serde_json::json;
 use kube::api::{Api, Patch, PatchParams};
-use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use tracing::{debug, info, warn};
+
+mod election;
+use election::{ElectionResult, LeaderElection};
 
 /// Lease TTL. After this much time without renewal, another
 /// replica can acquire.
@@ -235,18 +238,16 @@ pub async fn run_lease_loop(
         }
     };
 
-    // Clone for pod-deletion-cost patching. LeaseLock::new takes
-    // ownership (no public accessor to get it back out).
+    // Clone for pod-deletion-cost patching. LeaderElection::new
+    // takes ownership (wraps the client in Api<Lease>).
     let pod_patch_client = client.clone();
 
-    let lease = LeaseLock::new(
+    let mut election = LeaderElection::new(
         client,
         &cfg.namespace,
-        LeaseLockParams {
-            holder_id: cfg.holder_id.clone(),
-            lease_name: cfg.lease_name.clone(),
-            lease_ttl: LEASE_TTL,
-        },
+        cfg.lease_name.clone(),
+        cfg.holder_id.clone(),
+        LEASE_TTL,
     );
 
     info!(
@@ -269,13 +270,14 @@ pub async fn run_lease_loop(
             _ = interval.tick() => {}
         }
 
-        match lease.try_acquire_or_renew().await {
-            Ok(lease_state) => {
-                // LeaseLockResult is an enum: Acquired(Lease) vs
-                // NotAcquired. The crate's doc comment says
-                // `.acquired_lease` but that's outdated — match
-                // the variant.
-                let now_leading = matches!(lease_state, LeaseLockResult::Acquired(_));
+        match election.try_acquire_or_renew().await {
+            Ok(result) => {
+                // Conflict on renew = someone stole since our GET
+                // → unambiguous lose. Conflict on steal = another
+                // standby raced us → we were never leading. Both
+                // map to now_leading=false; was_leading edge-
+                // detection below distinguishes the lose case.
+                let now_leading = matches!(result, ElectionResult::Leading);
 
                 if now_leading && !was_leading {
                     // ---- Acquire transition ----
@@ -400,15 +402,12 @@ pub async fn run_lease_loop(
     // r[impl sched.lease.graceful-release]
     // Graceful release: on shutdown, release the lease so the next
     // replica acquires immediately (~1s poll) instead of waiting
-    // for TTL expiry (15s). This isn't a correctness fix — the
-    // Recreate deployment strategy already unblocks rollouts —
-    // but it shaves 15s off every deploy. step_down() errors if
-    // we're not actually the holder (ReleaseLockWhenNotLeading),
-    // so gate on was_leading. Any other error is also non-fatal:
-    // we're shutting down regardless, and TTL expiry is the
-    // fallback.
+    // for TTL expiry (15s). Gate on was_leading to skip the
+    // apiserver round-trip when we were standby all along. Any
+    // error is non-fatal: we're shutting down regardless, and
+    // TTL expiry is the fallback.
     if was_leading {
-        match lease.step_down().await {
+        match election.step_down().await {
             Ok(()) => info!("released lease on shutdown"),
             Err(e) => {
                 warn!(error = %e, "step_down failed; lease will expire in {}s", LEASE_TTL.as_secs())

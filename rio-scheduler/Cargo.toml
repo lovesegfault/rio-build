@@ -22,14 +22,13 @@ tonic = { workspace = true }
 # grpc.health.v1.Health for K8s readiness probes. C3 gates SERVING on
 # is_leader so the K8s Service routes only to the leader replica.
 tonic-health = { workspace = true }
-# Lease-based leader election. Thin wrapper over coordination.k8s.io/v1
-# Lease. Gated on RIO_LEASE_NAME env — unset means non-K8s mode
-# (generation stays at 1, VM tests unaffected). No fencing: brief
-# dual-leader possible on network partition. Acceptable — dispatch
-# is idempotent (DAG merge dedups by drv_hash; workers reject
-# stale-generation assignments via heartbeat compare).
+# coordination.k8s.io/v1 Lease for leader election. In-house
+# implementation (src/lease/election.rs) using kube::Api::replace()
+# for resourceVersion-guarded optimistic concurrency + local-
+# monotonic observed-record expiry (client-go's model). Gated on
+# RIO_LEASE_NAME env — unset means non-K8s mode (generation stays
+# at 1, VM tests unaffected).
 kube = { workspace = true }
-kube-leader-election = { workspace = true }
 rustls = { workspace = true }
 k8s-openapi = { workspace = true }
 sqlx = { workspace = true }
@@ -69,3 +68,6 @@ aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 # figment::Jail for env-var isolation in lease.rs tests (env is
 # process-global; parallel tests would race without isolation).
 figment = { workspace = true, features = ["test"] }
+# lease/election.rs integration tests: ApiServerVerifier scenarios
+# need http::Method for the expected-request shape.
+http = { workspace = true }

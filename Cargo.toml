@@ -162,11 +162,6 @@ k8s-openapi = { version = "0.27", features = ["v1_35"] }
 # schemars 1.x NOT 0.8 — kube 3.0 requires the major break. CRD JSON
 # schema generation for #[derive(JsonSchema)].
 schemars = "1"
-# Lease-based leader election. Thin wrapper over coordination.k8s.io/v1
-# Lease. No fencing — if two replicas briefly believe they're leader,
-# both dispatch. Acceptable: dispatch is idempotent (drv_hash dedup in
-# DAG merge, workers ignore stale-generation assignments).
-kube-leader-election = "0.43"
 # crdgen-only: serialize CustomResourceExt::crd() to YAML for kustomize.
 # serde_yml is the maintained fork of serde_yaml (which is RUSTSEC-
 # 2024-0320 unmaintained). Drop-in API. kube-client still transitively

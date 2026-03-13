@@ -28,7 +28,6 @@
 | `fuser` | FUSE filesystem | 2 | Per-worker `/nix/store` mount |
 | `tracing-opentelemetry` | Distributed tracing | 2 (done) | Trace propagation across gRPC boundaries. `init_tracing` in `rio-common/observability.rs` + `inject_current`/`link_parent` in `rio-proto/interceptor.rs`. |
 | `kube` + `kube-runtime` | K8s client, CRDs, operator framework | 3 | `features = ["runtime", "derive", "client"]` (kube 3.0) |
-| `kube-leader-election` | Lease-based leader election | 3 | Scheduler active/standby via `coordination.k8s.io/v1` Lease. No fencing --- brief dual-leader is acceptable (dispatch is idempotent). |
 | `k8s-openapi` | K8s API types | 3 | `features = ["v1_35"]` (feature-gates which struct fields exist; pin to highest supported API version) |
 | `schemars` | JSON Schema for CRDs | 3 | schemars 1.x (NOT 0.8 --- kube 3.0 requires the major break) |
 | `rustls` | TLS provider selection | 3 | Direct dep to call `install_default()`: kube pulls rustls via ring, aws-sdk via aws-lc-rs; with both active, rustls 0.23 panics on first TLS use. |
