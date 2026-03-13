@@ -3,14 +3,20 @@
 
   inputs = {
     nix = {
-      url = "github:NixOS/Nix/2.33.3";
+      url = "github:NixOS/Nix/2.34.1";
       inputs = {
+        flake-compat.follows = "flake-compat";
         flake-parts.follows = "flake-parts";
         git-hooks-nix.follows = "git-hooks-nix";
       };
     };
 
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    flake-compat = {
+      url = "github:edolstra/flake-compat";
+      flake = false;
+    };
 
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
@@ -32,6 +38,7 @@
     git-hooks-nix = {
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-compat.follows = "flake-compat";
     };
 
     # Self-hosted binary cache push CLI. Pinned in flake.lock;
@@ -318,7 +325,12 @@
                 # `--no-tests=warn`: workspace has leaf bins with no tests.
                 cargoNextestExtraArgs = "--no-tests=warn --profile ci";
                 nativeCheckInputs = with pkgs; [
-                  inputs.nix.packages.${system}.default
+                  # nix-cli (not .default / nix-everything): the latter has
+                  # nix-functional-tests as a *buildInput*, which fails on
+                  # non-NixOS builders (sandboxing/overlayfs tests need priv).
+                  # nix-cli has the full bin/ set (nix, nix-daemon, nix-store)
+                  # — everything the golden conformance tests need.
+                  inputs.nix.packages.${system}.nix-cli
                   openssh
                   postgresql_18
                 ];
@@ -448,7 +460,7 @@
                 # which used buildPhase), so nativeCheckInputs is correct
                 # here — matching the plain `nextest` check above.
                 nativeCheckInputs = with pkgs; [
-                  inputs.nix.packages.${system}.default
+                  inputs.nix.packages.${system}.nix-cli
                   openssh
                   postgresql_18
                 ];
