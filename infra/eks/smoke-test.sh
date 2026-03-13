@@ -5,7 +5,7 @@
 # smoke-test.sh — end-to-end build via SSM-tunneled gateway.
 #
 # Prerequisites:
-#   - deploy.sh has run (cluster is up, control-plane Ready)
+#   - `just eks deploy` has run (cluster is up, control-plane Ready)
 #   - AWS_PROFILE set
 #   - Session Manager plugin installed (`aws ssm start-session`
 #     needs it — it's a separate binary from awscli. The nix-shell

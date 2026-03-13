@@ -1,9 +1,10 @@
-# ECR repositories for the 5 rio images. `nix run .#push-images`
-# builds each via nix/docker.nix and skopeo-copies here with a
-# git-SHA tag.
+# ECR repositories for the rio images. push-images.sh builds each via
+# nix/docker.nix and skopeo-copies here with a git-SHA tag. `bootstrap`
+# is the helm pre-install hook Job image (awscli + openssl + nix for
+# seeding rio/* secrets in Secrets Manager).
 
 locals {
-  rio_images = ["gateway", "scheduler", "store", "controller", "worker", "fod-proxy"]
+  rio_images = ["gateway", "scheduler", "store", "controller", "worker", "fod-proxy", "bootstrap"]
 }
 
 resource "aws_ecr_repository" "rio" {

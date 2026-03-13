@@ -15,7 +15,12 @@ output "kubeconfig_command" {
 
 output "store_iam_role_arn" {
   description = "IAM role ARN for rio-store IRSA (set STORE_IAM_ROLE_ARN to this before kustomize apply)"
-  value       = module.rio_store_irsa.iam_role_arn
+  value       = module.rio_store_irsa.arn
+}
+
+output "bootstrap_iam_role_arn" {
+  description = "IAM role ARN for the rio-bootstrap Job IRSA (helm pre-install hook that seeds rio/* secrets in Secrets Manager)"
+  value       = module.rio_bootstrap_irsa.arn
 }
 
 output "oidc_provider_arn" {
@@ -24,12 +29,12 @@ output "oidc_provider_arn" {
 }
 
 output "ecr_registry" {
-  description = "ECR registry hostname (<account>.dkr.ecr.<region>.amazonaws.com). push-images.sh and deploy.sh both read this."
+  description = "ECR registry hostname (<account>.dkr.ecr.<region>.amazonaws.com). push-images.sh and `just eks deploy` both read this."
   value       = local.ecr_registry
 }
 
 output "chunk_bucket_name" {
-  description = "S3 bucket for NAR chunks (deploy.sh sets RIO_CHUNK_BACKEND__BUCKET to this)"
+  description = "S3 bucket for NAR chunks (`just eks deploy` passes as --set store.chunkBackend.bucket)"
   value       = aws_s3_bucket.chunks.bucket
 }
 
@@ -44,7 +49,7 @@ output "db_endpoint" {
 }
 
 output "db_secret_arn" {
-  description = "Secrets Manager ARN for the Aurora master password (deploy.sh fetches this to build the connection string)"
+  description = "Secrets Manager ARN for the Aurora master password (`just eks deploy` passes to the chart; ESO builds the connection string)"
   value       = aws_rds_cluster.rio.master_user_secret[0].secret_arn
 }
 

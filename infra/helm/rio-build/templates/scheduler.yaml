@@ -1,0 +1,170 @@
+{{- if .Values.scheduler.enabled }}
+{{- $s := .Values.scheduler -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-scheduler
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  replicas: {{ $s.replicas }}
+  # RollingUpdate works now that readiness ≠ leadership. Both pods Ready →
+  # Available condition true. pod-deletion-cost annotation (set by leader on
+  # acquire, lease.rs) makes K8s kill the standby first:
+  #   1. surge: new pod up, Ready, stays standby
+  #   2. scale-down: K8s picks lowest cost = old standby, kills it
+  #   3. repeat: new pod up, old leader step_down on SIGTERM, new pod
+  #      acquires, balanced-channel clients reroute in ~3s
+  # → ONE leadership flip per rollout instead of two.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-scheduler" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 8 }}
+    spec:
+      serviceAccountName: rio-scheduler
+      {{- if gt (int $s.replicas) 1 }}
+      # REQUIRE different nodes for replicas>1. Both on one node → node drain
+      # kills both (PDB blocks it, but that stalls drain — still bad).
+      # requiredDuringScheduling is safe on any multi-node cluster; single-node
+      # dev uses replicas=1 so this block doesn't render.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "rio.selectorLabels" "rio-scheduler" | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        - name: scheduler
+          image: {{ include "rio.image" (list . $s.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: 9001
+            - name: metrics
+              containerPort: 9091
+            # Plaintext health — only listens when server mTLS is configured
+            # (RIO_TLS__* set). K8s gRPC probes can't present client certs.
+            # Shares SAME HealthReporter as main port: leader-toggle loop's
+            # set_not_serving propagates → standby correctly fails readiness.
+            # Without shared reporter: standby always SERVING → K8s routes to
+            # non-leader → cluster split.
+            - name: health
+              containerPort: 9101
+          env:
+            # All replicas contend for SAME Lease. Presence ENABLES lease mode
+            # (LeaseConfig::from_env returns None without it → always-leader,
+            # WRONG with replicas>1).
+            - name: RIO_LEASE_NAME
+              value: {{ $s.leaseName | quote }}
+            # Downward API — matches wherever deployed.
+            - name: RIO_LEASE_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # Holder ID = pod name. Unique per replica.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: RIO_LISTEN_ADDR
+              value: "0.0.0.0:9001"
+            - name: RIO_HEALTH_ADDR
+              value: "0.0.0.0:9101"
+            - name: RIO_STORE_ADDR
+              value: {{ $s.storeAddr | quote }}
+            - name: RIO_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rio-postgres
+                  key: url
+            {{- if .Values.tls.enabled }}
+            {{- include "rio.tlsEnv" . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            {{- include "rio.tlsVolumeMount" . | nindent 12 }}
+          {{- end }}
+          # TCP, NOT gRPC. "is gRPC server listening." NOT gated on is_leader
+          # — that's the whole design point. Both pods Ready; clients route
+          # via health-aware balancer which DOES check is_leader (via
+          # grpc.health.v1 on named service). The old gRPC-named-service probe
+          # is still what the BALANCER uses — just not what K8s uses.
+          #
+          # No TLS retarget: tcpSocket handshake completes before TLS layer.
+          readinessProbe:
+            tcpSocket: {port: 9001}
+            periodSeconds: 5
+            failureThreshold: 3
+          # Longer threshold. Standby is NOT_SERVING but ALIVE — don't restart.
+          # Liveness only fires if gRPC server itself dead. grpc.service
+          # liveness would ALSO fail on standby → wrong.
+          livenessProbe:
+            tcpSocket: {port: 9001}
+            periodSeconds: 10
+            failureThreshold: 6
+          # TCP (NOT named gRPC). Named SchedulerService only goes SERVING
+          # when is_leader=true; standby never acquires while leader healthy
+          # → named-service startupProbe would crash-loop standby. Generous:
+          # migrations + PG connect + store connect ~60s worst case.
+          startupProbe:
+            tcpSocket: {port: 9001}
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            {{- toYaml $s.resources | nindent 12 }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        {{- include "rio.tlsVolume" "rio-scheduler-tls" | nindent 8 }}
+      {{- end }}
+---
+# Kept for per-call connects (controller reconcilers, rio-cli, tests). Those
+# get UNAVAILABLE ~50% of the time and retry — fine for non-hot-path.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-scheduler
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "rio.selectorLabels" "rio-scheduler" | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9001
+      targetPort: grpc
+---
+# Exposes pod IPs as DNS A records. CoreDNS returns ALL matching pod IPs
+# (TTL 5s default). Balanced-channel clients (gateway, worker) resolve this,
+# probe each IP via grpc.health.v1, route to the SERVING one (= leader).
+#
+# TLS: clients connect to pod IPs (https://10.42.x.y:9001) but cert's SAN is
+# `rio-scheduler` (ClusterIP name). ClientTlsConfig::domain_name() overrides
+# verify domain independently of connect URI — see balance.rs. No SAN change
+# needed in cert-manager.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rio-scheduler-headless
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-scheduler" "component" "scheduler") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "rio.selectorLabels" "rio-scheduler" | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 9001
+      targetPort: grpc
+{{- end }}

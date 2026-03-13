@@ -98,7 +98,7 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// Worker nix.conf content for sandbox builds.
 ///
-/// The ConfigMap `rio-nix-conf` in infra/k8s/base/configmaps.yaml can
+/// The ConfigMap `rio-nix-conf` in the Helm chart's configmaps.yaml can
 /// override this at `/etc/rio/nix-conf/nix.conf` — operators customize
 /// without image rebuild. `setup_nix_conf` checks for the override
 /// first; this is the fallback when the mount is absent (VM tests,
@@ -111,7 +111,8 @@ pub const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(7200);
 /// opcodes, no `nix` CLI involvement. Dropped here to reduce attack
 /// surface in the sandbox-spawned daemon.
 ///
-/// This constant must stay in sync with infra/k8s/base/configmaps.yaml —
+/// This constant must stay in sync with infra/helm/rio-build/templates/
+/// configmaps.yaml —
 /// a mismatch means K8s deployments get different behavior than VM
 /// tests (which use native NixOS modules, not this path).
 const WORKER_NIX_CONF: &str = "\
@@ -436,7 +437,7 @@ pub async fn execute_build(
     // FOD proxy: compute once here (is_fixed_output × config).
     // Passed to spawn which sets http_proxy/https_proxy env on
     // the daemon. Nix's FOD sandbox passes these through to the
-    // builder; the Squid proxy (infra/k8s/base/fod-proxy.yaml)
+    // builder; the Squid proxy (infra/helm/rio-build/templates/fod-proxy.yaml)
     // allowlists known source hosts.
     let fod_proxy = if assignment.is_fixed_output {
         env.fod_proxy_url.as_deref()

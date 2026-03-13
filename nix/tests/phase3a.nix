@@ -28,7 +28,9 @@
 # (RBAC first, then controller). As a systemd service with
 # KUBECONFIG=/etc/rancher/k3s/k3s.yaml, it has cluster-admin
 # (the node's own kubeconfig) — starts immediately after k3s.
-# Production uses the pod path (infra/k8s/base/controller.yaml).
+# Production uses the pod path (infra/helm/rio-build/templates/controller.yaml).
+# phase4.nix exercises that via helmRendered — phase3a stays on systemd
+# until the helm path is proven green there.
 #
 # Why hostNetwork + privileged on the worker pod: k3s pods
 # can't resolve `control` (CoreDNS doesn't know NixOS-test
@@ -48,6 +50,10 @@
   dockerImages, # for airgap preload into k3s
   crds, # nix build .#crds output — auto-deployed via manifests
   coverage ? false,
+  # nixhelm/system passed via k3sArgs for phase4's helm-render. Unused here
+  # (controller runs as systemd, no chart) but swallowed to avoid flake-side
+  # arg branching.
+  ...
 }:
 let
   common = import ./common.nix {

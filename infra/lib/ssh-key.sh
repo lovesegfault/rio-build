@@ -3,7 +3,7 @@
 # rio_authorized_keys — validate RIO_SSH_PUBKEY and emit an
 # authorized_keys file with the comment stripped (or replaced).
 #
-# Sourced by dev.just and infra/eks/deploy.sh. Do not execute directly.
+# Sourced by dev.just and eks.just (deploy recipe). Do not execute directly.
 #
 # The comment strip matters: the gateway maps the authorized_keys
 # comment field to tenant_name (rio-gateway/src/server.rs:211-223);
@@ -21,6 +21,10 @@
 
 rio_authorized_keys() {
   local pubkey="${RIO_SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+  # .env.local loaders (direnv dotenv, just's dotenv-load) don't tilde-
+  # expand — `RIO_SSH_PUBKEY=~/.ssh/foo.pub` arrives here as a literal `~`.
+  # Quoted `[[ -r "$pubkey" ]]` won't expand it either. Do it manually.
+  pubkey="${pubkey/#\~/$HOME}"
 
   if [[ ! -r "$pubkey" ]]; then
     echo "error: SSH pubkey not found at $pubkey" >&2

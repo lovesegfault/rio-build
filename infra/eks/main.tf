@@ -14,20 +14,22 @@
 
 terraform {
   required_version = ">= 1.5"
+  # Version constraints match what nixpkgs ships (opentofu.withPlugins
+  # in flake.nix). Nix is the real lock; these are for human readers
+  # and for the EKS/IAM modules' own >=-constraints. Bumping nixpkgs
+  # may require bumping these.
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
-    # helm + kubernetes providers: for cert-manager and
-    # aws-load-balancer-controller helm_release (addons.tf).
     helm = {
       source  = "hashicorp/helm"
-      version = "~> 2.0"
+      version = "~> 3.0"
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = "~> 2.0"
+      version = "~> 3.0"
     }
     random = {
       source  = "hashicorp/random"
@@ -50,10 +52,13 @@ provider "aws" {
 # helm_releases wait for module.eks — the provider block itself
 # can't have depends_on.
 provider "helm" {
-  kubernetes {
+  # helm provider v3 migrated to the plugin framework: `kubernetes` and
+  # `exec` are now nested object ATTRIBUTES (`= { ... }`), not blocks.
+  # See hashicorp/terraform-provider-helm docs/guides/v3-upgrade-guide.md.
+  kubernetes = {
     host                   = module.eks.cluster_endpoint
     cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-    exec {
+    exec = {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
       args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
@@ -78,8 +83,10 @@ data "aws_availability_zones" "available" {
 # VPC: 3 AZs, public + private subnets. EKS control plane in
 # public (managed), nodes in private (egress via NAT).
 module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+  source = "terraform-aws-modules/vpc/aws"
+  # v6 is a provider-constraint-only bump (requires aws >= 6.0); no
+  # variable/output renames for our usage.
+  version = "~> 6.0"
 
   name = "${var.cluster_name}-vpc"
   cidr = "10.42.0.0/16"
@@ -104,10 +111,16 @@ module "vpc" {
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
-  version = "~> 20.0"
+  version = "~> 21.0"
 
-  cluster_name    = var.cluster_name
-  cluster_version = var.kubernetes_version
+  # v21 stripped the `cluster_` prefix from input variables to match the
+  # underlying API (cluster_name → name, cluster_version →
+  # kubernetes_version, cluster_endpoint_public_access →
+  # endpoint_public_access). OUTPUTS kept the prefix —
+  # `module.eks.cluster_name` etc. are unchanged. See
+  # terraform-aws-eks/docs/UPGRADE-21.0.md.
+  name               = var.cluster_name
+  kubernetes_version = var.kubernetes_version
 
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
@@ -116,13 +129,12 @@ module "eks" {
   # for rio-store's S3 access (no static AWS keys in pods).
   enable_irsa = true
 
-  # Public endpoint for kubectl from outside the VPC. eks module v20
-  # default is unclear from docs — set explicitly. Private-only would
+  # Public endpoint for kubectl from outside the VPC. Private-only would
   # require running kubectl from inside the VPC (bastion) or via an
   # SSM tunnel to the API server, which is more friction than the
   # cluster being a dev/test deployment warrants. Lock down with
-  # cluster_endpoint_public_access_cidrs if this bothers you.
-  cluster_endpoint_public_access = true
+  # endpoint_public_access_cidrs if this bothers you.
+  endpoint_public_access = true
 
   # API authentication mode. CONFIG_MAP = legacy aws-auth only.
   # API_AND_CONFIG_MAP = both, for migration. API = access entries
@@ -161,11 +173,17 @@ module "eks" {
       # the WorkerPool reconciler when spec.tolerations is
       # configured) land here. Keeps kube-system pods off the
       # worker nodes — they're for builds only.
-      taints = [{
-        key    = "rio.build/worker"
-        value  = "true"
-        effect = "NO_SCHEDULE"
-      }]
+      #
+      # eks module v21 tightened the type: taints is now
+      # map(object), not list. The map key is arbitrary (used for
+      # for_each stability inside the module), not the taint key.
+      taints = {
+        worker = {
+          key    = "rio.build/worker"
+          value  = "true"
+          effect = "NO_SCHEDULE"
+        }
+      }
 
       labels = {
         "rio.build/node-role" = "worker"
@@ -207,10 +225,14 @@ data "aws_iam_policy_document" "rio_store_s3" {
 }
 
 module "rio_store_irsa" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.0"
+  # v6 renamed the submodule (dropped `-eks` suffix) and stripped the
+  # `role_` prefix from inputs/outputs: role_name → name,
+  # role_policy_arns → policies, output iam_role_arn → arn.
+  # See terraform-aws-iam/docs/UPGRADE-6.0.md.
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts"
+  version = "~> 6.0"
 
-  role_name = "${var.cluster_name}-rio-store"
+  name = "${var.cluster_name}-rio-store"
 
   oidc_providers = {
     eks = {
@@ -219,7 +241,7 @@ module "rio_store_irsa" {
     }
   }
 
-  role_policy_arns = {
+  policies = {
     s3 = aws_iam_policy.rio_store_s3.arn
   }
 }

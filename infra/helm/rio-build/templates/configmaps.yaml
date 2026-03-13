@@ -1,0 +1,47 @@
+{{- if .Values.controller.enabled }}
+# Mounted into WORKER pods by the controller's StatefulSet builder — NOT by
+# any Deployment in this chart. Every line is correctness-critical; not
+# parameterized on purpose.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rio-nix-conf
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-worker" "component" "worker") | nindent 4 }}
+data:
+  nix.conf: |
+    # No remote builders. The worker IS the builder — it runs
+    # nix-daemon in an overlay namespace. If builders is set,
+    # nix-daemon tries to SSH out, which (a) doesn't work from
+    # the sandbox and (b) defeats the whole point.
+    builders =
+
+    # No substituters. rio-store is NOT a nix binary cache from
+    # nix-daemon's perspective — it's served via FUSE. With
+    # substitute=true, nix-daemon would try cache.nixos.org
+    # (egress we want to block) before checking FUSE.
+    substitute = false
+
+    # Sandbox MUST be on. Non-sandboxed builds read /etc,
+    # $HOME, etc — non-hermetic, different results per worker.
+    # `relaxed` would be almost as bad (allows network).
+    sandbox = true
+
+    # If sandbox setup fails (bad mount, missing cap), FAIL.
+    # Without this, nix-daemon silently falls back to non-
+    # sandboxed — builds that LOOK hermetic but aren't. We'd
+    # rather have a build fail loudly than succeed wrongly.
+    sandbox-fallback = false
+
+    # Restrict eval: no fetchurl/fetchgit at eval time. Eval
+    # happens on the GATEWAY (the client's nix-build sends the
+    # pre-evaluated .drv), but if a .drv somehow embeds an
+    # IFD-like eval call, this blocks it. Defense in depth.
+    restrict-eval = true
+
+    # Experimental features the worker needs. ca-derivations
+    # for content-addressed outputs (phase2c CA support);
+    # nix-command for `nix store` diagnostics in the pod.
+    experimental-features = nix-command ca-derivations
+{{- end }}

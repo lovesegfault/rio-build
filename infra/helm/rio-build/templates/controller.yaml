@@ -1,0 +1,96 @@
+{{- if .Values.controller.enabled }}
+{{- $c := .Values.controller -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rio-controller
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 4 }}
+spec:
+  # HARD replicas=1. NOT leader-elected. Two controllers fight — both
+  # SSA-patch the same StatefulSet, fieldManager conflicts. kube-runtime
+  # handles concurrent reconcile within one process but not across
+  # processes. 30s reschedule gap during pod restart is acceptable.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "rio.selectorLabels" "rio-controller" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rio.labels" (dict "root" . "name" "rio-controller" "component" "controller") | nindent 8 }}
+    spec:
+      serviceAccountName: rio-controller
+      {{- if $c.hostNetwork }}
+      # VM-test concession: CoreDNS doesn't know NixOS-test VM hostnames.
+      # hostNetwork → pod uses node's /etc/hosts. Production never sets this.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      containers:
+        - name: controller
+          image: {{ include "rio.image" (list . $c.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9094
+            - name: health
+              containerPort: 9194
+          env:
+            - name: RIO_SCHEDULER_ADDR
+              value: {{ $c.schedulerAddr | quote }}
+            - name: RIO_STORE_ADDR
+              value: {{ $c.storeAddr | quote }}
+            {{- if $c.schedulerBalanceHost }}
+            # Passed through to worker pods. Workers DNS-resolve the headless
+            # Service, health-probe pod IPs, route to leader. Unset → workers
+            # fall back to single-channel.
+            - name: RIO_SCHEDULER_BALANCE_HOST
+              value: {{ $c.schedulerBalanceHost | quote }}
+            - name: RIO_SCHEDULER_BALANCE_PORT
+              value: {{ $c.schedulerBalancePort | quote }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            {{- include "rio.tlsEnv" . | nindent 12 }}
+            {{- end }}
+            {{- with $c.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.tls.enabled $c.coverage.enabled }}
+          volumeMounts:
+            {{- if .Values.tls.enabled }}
+            {{- include "rio.tlsVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- if $c.coverage.enabled }}
+            - name: cov
+              mountPath: /var/lib/rio/cov
+            {{- end }}
+          {{- end }}
+          # /healthz serves 200 once kube client + scheduler admin client
+          # connected. Controller that can't watch CRDs is useless → NotReady
+          # is correct. Already plaintext HTTP — no TLS retarget needed.
+          readinessProbe:
+            httpGet: {path: /healthz, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+      {{- if or .Values.tls.enabled $c.coverage.enabled }}
+      volumes:
+        {{- if .Values.tls.enabled }}
+        {{- include "rio.tlsVolume" "rio-controller-tls" | nindent 8 }}
+        {{- end }}
+        {{- if $c.coverage.enabled }}
+        # hostPath so profraws survive pod termination. nix/tests/common.nix
+        # collectCoverage tars /var/lib/rio/cov out of the VM.
+        - name: cov
+          hostPath:
+            path: /var/lib/rio/cov
+            type: DirectoryOrCreate
+        {{- end }}
+      {{- end }}
+{{- end }}

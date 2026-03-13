@@ -108,7 +108,7 @@ in
   # Built here (not pulled from Docker Hub) so it goes to our ECR
   # with the rest: same git-SHA immutable tag, can't disappear
   # from under us like ubuntu/squid:5.7-22.04_beta did. Config
-  # stays in the ConfigMap (infra/k8s/base/fod-proxy.yaml) so
+  # stays in the ConfigMap (infra/helm/rio-build/templates/fod-proxy.yaml)
   # operators can edit the allowlist without rebuilding.
   #
   # Can't use mkImage — that's built around rio-workspace binaries.
@@ -139,6 +139,86 @@ in
       mkdir -p var/spool/squid var/log/squid etc/squid
     '';
   };
+
+  # Secrets bootstrap. Argo PreSync hook — runs before the main sync,
+  # generates rio/hmac + rio/signing-key in AWS Secrets Manager IF THEY
+  # DON'T EXIST (describe-secret guard). Regenerating would invalidate
+  # in-flight assignment tokens / all narinfo signatures. ESO then syncs
+  # them back into k8s Secrets. Public signing key goes to rio/signing-
+  # key-pub so operators can read it without touching the private half.
+  #
+  # Needs nix (nix-store --generate-binary-cache-key), awscli2, openssl.
+  # IRSA via the rio-bootstrap ServiceAccount gives it
+  # secretsmanager:CreateSecret/PutSecretValue/DescribeSecret on rio/*.
+  bootstrap =
+    let
+      script = pkgs.writeShellScript "rio-bootstrap" ''
+        set -euo pipefail
+        : "''${AWS_REGION:?}" "''${CHUNK_BUCKET:?}"
+
+        if aws secretsmanager describe-secret --secret-id rio/hmac >/dev/null 2>&1; then
+          echo "[bootstrap] rio/hmac already exists, skipping"
+        else
+          echo "[bootstrap] generating rio/hmac"
+          # 32 raw bytes. SecretBinary (not SecretString) — the HMAC key
+          # isn't text. ESO's decodingStrategy: None preserves raw bytes.
+          openssl rand 32 > /tmp/hmac
+          aws secretsmanager create-secret --name rio/hmac \
+            --secret-binary fileb:///tmp/hmac
+        fi
+
+        if aws secretsmanager describe-secret --secret-id rio/signing-key >/dev/null 2>&1; then
+          echo "[bootstrap] rio/signing-key already exists, skipping"
+        else
+          echo "[bootstrap] generating rio/signing-key"
+          tmp=$(mktemp -d)
+          # Key name includes the bucket so narinfo `Sig:` lines identify
+          # which cluster signed them. Format: name:base64-seed.
+          nix-store --generate-binary-cache-key "rio-$CHUNK_BUCKET" \
+            "$tmp/key.sec" "$tmp/key.pub"
+          aws secretsmanager create-secret --name rio/signing-key \
+            --secret-string "file://$tmp/key.sec"
+          # Public half separately so operators can `get-secret-value`
+          # it for their nix.conf trusted-public-keys without access to
+          # the private half.
+          aws secretsmanager create-secret --name rio/signing-key-pub \
+            --secret-string "file://$tmp/key.pub"
+          echo "[bootstrap] public key (add to nix.conf trusted-public-keys):"
+          cat "$tmp/key.pub"
+        fi
+      '';
+    in
+    buildZstd {
+      name = "rio-bootstrap";
+      tag = "dev";
+      maxLayers = 20;
+      contents = baseContents ++ [
+        pkgs.awscli2
+        pkgs.openssl
+        pkgs.nix
+        pkgs.bash
+        pkgs.coreutils
+      ];
+      config = {
+        Entrypoint = [ "${script}" ];
+        Env = [
+          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          "PATH=${
+            lib.makeBinPath [
+              pkgs.awscli2
+              pkgs.openssl
+              pkgs.nix
+              pkgs.coreutils
+            ]
+          }"
+        ];
+      };
+      # mktemp needs /tmp.
+      extraCommands = ''
+        mkdir -p tmp
+        chmod 1777 tmp
+      '';
+    };
 
   # Worker needs the nix toolchain + FUSE runtime + mount utilities.
   worker = mkImage {

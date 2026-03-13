@@ -1,0 +1,174 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ns := .Values.namespace.name -}}
+# Defense in depth. Compromised builder (malicious .drv through sandbox, or
+# sandbox escape) should only reach rio-scheduler and rio-store — not exfil,
+# not cloud metadata, not K8s apiserver.
+#
+# ONE policy per selector — K8s merges additively; multiple policies per
+# selector are confusing.
+---
+# Worker egress: DNS, scheduler, store, fod-proxy. NO rule for
+# 169.254.169.254 or 0.0.0.0/0 → DENIED (default-deny for listed
+# policyTypes). Metadata block is implicit.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-worker-egress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  # Matches pods created by WorkerPool reconciler (build_statefulset sets
+  # this label).
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-worker
+  policyTypes: [Egress]
+  egress:
+    # Can't resolve rio-scheduler without CoreDNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports: [{protocol: UDP, port: 53}]
+    # 9001 only, no metrics (9091).
+    - to:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-scheduler}
+      ports: [{protocol: TCP, port: 9001}]
+    # GetPath/PutPath.
+    - to:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-store}
+      ports: [{protocol: TCP, port: 9002}]
+    # FOD fetches route through Squid. http_proxy/https_proxy injected into
+    # the daemon's Nix FOD sandbox.
+    - to:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-fod-proxy}
+      ports: [{protocol: TCP, port: 3128}]
+---
+# Controller egress: DNS + RFC1918. apiserver isn't a pod (control plane,
+# outside cluster network on managed K8s). kubernetes Service ClusterIP is
+# .1 on most distros but not guaranteed. Allow private-IP, deny public +
+# link-local — maintainable vs enumerating every internal IP.
+#
+# Metadata (169.254.169.254, link-local) NOT in any RFC1918 block → DENIED
+# implicitly. No `except` needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-controller-egress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-controller
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports: [{protocol: UDP, port: 53}]
+    - to:
+        - ipBlock: {cidr: 10.0.0.0/8}
+        - ipBlock: {cidr: 172.16.0.0/12}
+        - ipBlock: {cidr: 192.168.0.0/16}
+---
+# Scheduler ingress: gRPC from rio components + plaintext health from any
+# pod. kubelet isn't a pod → would need ipBlock for node CIDR, which varies.
+# Plaintext port serves ONLY health (SERVING/NOT_SERVING, no data) → harmless.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-scheduler-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-scheduler
+  policyTypes: [Ingress]
+  ingress:
+    # gateway: SubmitBuild. worker: Heartbeat/BuildExecution. controller:
+    # ClusterStatus/DrainWorker.
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-gateway}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-worker}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-controller}
+      ports: [{protocol: TCP, port: 9001}]
+    - from:
+        - podSelector: {}
+      ports: [{protocol: TCP, port: 9101}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-store-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-store
+  policyTypes: [Ingress]
+  ingress:
+    # gateway: PutPath from nix copy. worker: GetPath inputs, PutPath outputs.
+    # scheduler: FindMissingPaths cache-check.
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-gateway}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-worker}
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: rio-scheduler}
+      ports: [{protocol: TCP, port: 9002}]
+    - from:
+        - podSelector: {}
+      ports: [{protocol: TCP, port: 9102}]
+---
+# FOD proxy egress: internet (HTTP/HTTPS only) with `except` for RFC1918 +
+# link-local + loopback. Malicious FOD trying `http_proxy=Squid →
+# http://169.254.169.254/` would bypass worker's NetPol (traffic originates
+# from Squid, not worker). Domain allowlist is primary defense; this is the
+# IP-literal fallback.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rio-fod-proxy-egress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-fod-proxy
+  policyTypes: [Egress]
+  egress:
+    # Squid resolves dstdomain names.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports: [{protocol: UDP, port: 53}]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - {protocol: TCP, port: 80}
+        - {protocol: TCP, port: 443}
+{{- end }}

@@ -1,7 +1,7 @@
 # EKS deployment for rio-build
 
 One-shot bring-up: OpenTofu for infra, `push-images.sh` for images,
-`deploy.sh` for manifests, `smoke-test.sh` for verification. Driven
+`just eks deploy` for the chart, `smoke-test.sh` for verification. Driven
 by the justfile at the repo root — `just --list` for the menu.
 
 ## What gets created
@@ -11,7 +11,7 @@ by the justfile at the repo root — `just --list` for the menu.
 | EKS cluster | 1.33, 2 nodegroups | system (3× m5.large) + workers (2-10× c6a.xlarge, tainted) |
 | Aurora PG | Serverless v2, 0.5-2 ACU | shared by scheduler + store, password in Secrets Manager |
 | S3 bucket | NAR chunk storage | name: `<cluster_name>-chunks-<random>` |
-| ECR repos | 6 (gateway/scheduler/store/controller/worker/fod-proxy) | immutable tags, keep-last-10 lifecycle |
+| ECR repos | 7 (gateway/scheduler/store/controller/worker/fod-proxy/bootstrap) | immutable tags, keep-last-10 lifecycle |
 | cert-manager | helm_release | issues mTLS certs for intra-cluster gRPC |
 | aws-load-balancer-controller | helm_release + IRSA | provisions the gateway NLB |
 | SSM bastion | t3.micro, private subnet | tunnel to the internal NLB — no inbound SG rules |
@@ -72,18 +72,20 @@ Everything downstream reads the same computed name.
 
 ## Iterating
 
-The cluster stays up. To deploy a code change:
+The cluster stays up. `just eks deploy` runs `helm upgrade` from the
+working tree — chart changes deploy without commit/push. Code changes
+need a push (image tag is derived from git SHA + dirty-tree hash):
 
 ```bash
-git commit -am "..."
-just eks push eks deploy          # new SHA → new ECR tag → rollout
+# Chart-only change (template/values): no push needed
+just eks deploy
+
+# Code change: push new image + deploy
+just eks push eks deploy
 ```
 
-To just bounce a pod without new code:
-
-```bash
-kubectl -n rio-system rollout restart deployment/rio-scheduler
-```
+Deploy history: `just eks history`. Rollback: `just eks rollback [REV]`
+(omit REV for previous).
 
 ## Cost (us-east-2, on-demand)
 
@@ -124,15 +126,14 @@ The helm/kubernetes providers try to contact the cluster during plan.
 Run `tofu apply -target=module.eks` first, then full `tofu apply`.
 
 **Pods stuck ImagePullBackOff:**
-Either `just eks push` wasn't run, or `RIO_IMAGE_TAG` doesn't match
-what's in ECR. `aws ecr list-images --repository-name rio-scheduler`
-shows what's actually pushed.
+`just eks push` wasn't run (no image at that tag in ECR). Check the
+current release values: `helm get values rio -n rio-system | grep tag`.
 
 **Scheduler/store CrashLoopBackOff with PG connection errors:**
 Check the rio-postgres Secret: `kubectl -n rio-system get secret
 rio-postgres -o jsonpath='{.data.url}' | base64 -d`. If it's
 missing `?sslmode=require`, Aurora (rds.force_ssl=1) rejects the
-connection. Re-run `deploy.sh`.
+connection. Check the rio-postgres ExternalSecret status.
 
 **smoke-test.sh SSM tunnel times out:**
 Check `aws ssm describe-instance-information --region us-east-2`

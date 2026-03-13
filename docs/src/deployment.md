@@ -28,6 +28,8 @@ This guide covers deploying rio-build to a Kubernetes cluster. For development, 
 5. **rio-gateway** (needs rio-scheduler and rio-store)
 6. **WorkerPool CRD** (rio-controller creates and manages worker StatefulSets)
 
+`helm upgrade --wait` blocks until all Deployments report Available — strict ordering isn't enforced, but no component is externally reachable until the release as a whole is Ready. Readiness probes on each component ensure this: store readiness requires PG migrations done, scheduler readiness requires store reachable, gateway readiness requires scheduler reachable.
+
 ## Minimum Viable Deployment
 
 For development or evaluation, a minimal deployment needs:
@@ -81,7 +83,7 @@ See [Security: Secrets Management](./security.md#secrets-management) for recomme
 - Database credentials (scheduler, store)
 - HMAC signing key for assignment tokens (scheduler, store) --- set via `RIO_HMAC_KEY_PATH` on both. The scheduler signs Claims{worker_id, drv_hash, expected_outputs, expiry} at dispatch; the store verifies on `PutPath`. Same key file both sides (shared secret). Generate: `openssl rand -out /path/to/key 32`.
 
-> **SSH key mounting:** The base manifests and shipped overlays (`infra/k8s/overlays/dev`, `infra/k8s/overlays/prod`) do **not** mount the SSH host key or authorized_keys Secret into the gateway container --- without a mount, the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production deployments must add a `volumeMount` patch to the gateway Deployment for the SSH key Secret.
+> **SSH key mounting:** The default chart values do **not** set `gateway.ssh.hostKeySecret` — the gateway generates an ephemeral host key on startup (fine for dev; breaks `known_hosts` on every restart). Production should set it to a Secret with a persistent key so all replicas present the same host key. `gateway.ssh.authorizedKeysSecret` defaults to `rio-gateway-ssh` — create that Secret before deploy or the gateway pod blocks on the missing mount.
 
 ## Verification
 

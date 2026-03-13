@@ -1,8 +1,11 @@
 # EKS deployment recipes. Invoked as `just eks <recipe>`.
 #
-# Settings do NOT inherit from the root justfile — `set shell` here
-# is load-bearing (without it: no pipefail, silent pipe failures).
+# Settings do NOT inherit from the root justfile into modules — both
+# `set shell` (pipefail) and `set dotenv-*` (RIO_SSH_PUBKEY, RIO_TFSTATE_*)
+# must be re-declared here or they're silently off.
 set shell := ["bash", "-euo", "pipefail", "-c"]
+set dotenv-load := true
+set dotenv-filename := ".env.local"
 
 # ── State backend ────────────────────────────────────────────────────
 # Both infra/eks/bootstrap and infra/eks store state in the same S3
@@ -89,9 +92,85 @@ kubeconfig:
 push:
     ./infra/eks/push-images.sh
 
-# Render kustomize overlay + kubectl apply
+# Render infra values from tofu outputs + helm upgrade from the WORKING
+# TREE. No git involved — chart changes on a dirty tree deploy directly.
+# Image tag comes from .rio-image-tag (push-images.sh writes it).
+#
+# This is the same information the old ApplicationSet's inline `values:`
+# block templated from cluster Secret annotations, delivered via --set
+# instead. Push-model: iterate without commit+push.
 deploy:
-    ./infra/eks/deploy.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ -f .rio-image-tag ]] || { echo "no .rio-image-tag — run 'just eks push' first" >&2; exit 1; }
+    tag=$(<.rio-image-tag)
+
+    ecr=$(just eks::_tf-out ecr_registry)
+    bucket=$(just eks::_tf-out chunk_bucket_name)
+    store_arn=$(just eks::_tf-out store_iam_role_arn)
+    bootstrap_arn=$(just eks::_tf-out bootstrap_iam_role_arn)
+    db_arn=$(just eks::_tf-out db_secret_arn)
+    db_host=$(just eks::_tf-out db_endpoint)
+    region=$(just eks::_tf-out region)
+
+    echo "[deploy] tag=$tag registry=$ecr"
+
+    # CRDs first, server-side apply (WorkerPool schema is ~15KB —
+    # client-side apply bloats last-applied-configuration).
+    kubectl apply --server-side -f infra/helm/crds/
+
+    # Namespace + SSH authorized_keys Secret (operator-provided, not in
+    # Secrets Manager). Capture rio_authorized_keys into a variable FIRST
+    # so a missing/bad pubkey aborts under set -e BEFORE kubectl runs —
+    # otherwise the pipeline races and applies an empty-keyed Secret
+    # (gateway silently rejects all SSH auth) before pipefail catches it.
+    #
+    # Namespace is created HERE (not by the chart — namespace.create=false
+    # below) because: (a) the SSH Secret must exist before helm runs; (b)
+    # Helm refuses to adopt a namespace it didn't create ("invalid
+    # ownership metadata"). PSA label (privileged) is load-bearing:
+    # workers need SYS_ADMIN for FUSE mounts.
+    source infra/lib/ssh-key.sh
+    authorized_keys=$(rio_authorized_keys)
+    kubectl create ns rio-system --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label ns rio-system pod-security.kubernetes.io/enforce=privileged --overwrite
+    printf '%s\n' "$authorized_keys" | kubectl -n rio-system create secret generic rio-gateway-ssh \
+        --from-file=authorized_keys=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -
+
+    # Subchart: helm validates charts/ against Chart.yaml BEFORE evaluating
+    # condition: postgresql.enabled — so even though EKS uses Aurora (not
+    # the subchart), the chart dir must exist. Gitignored; nix store symlink.
+    mkdir -p infra/helm/rio-build/charts
+    ln -sfn "$(nix build --no-link --print-out-paths .#helm-postgresql)" \
+        infra/helm/rio-build/charts/postgresql
+
+    # Chart from the working tree. --wait blocks on Deployment Available
+    # (replaces what Argo's sync-wave ordering used to do — we don't
+    # actually need ordered bring-up, just "don't return until Ready").
+    helm upgrade --install rio infra/helm/rio-build \
+        --namespace rio-system \
+        --set namespace.create=false \
+        --set global.image.registry="$ecr" \
+        --set global.image.tag="$tag" \
+        --set global.region="$region" \
+        --set store.chunkBackend.bucket="$bucket" \
+        --set store.logS3Bucket="$bucket" \
+        --set store.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$store_arn" \
+        --set externalSecrets.enabled=true \
+        --set externalSecrets.auroraSecretArn="$db_arn" \
+        --set externalSecrets.auroraEndpoint="$db_host" \
+        --set bootstrap.enabled=true \
+        --set bootstrap.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$bootstrap_arn" \
+        --set-json 'gateway.service.annotations={"service.beta.kubernetes.io/aws-load-balancer-type":"external","service.beta.kubernetes.io/aws-load-balancer-nlb-target-type":"ip","service.beta.kubernetes.io/aws-load-balancer-scheme":"internal","service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-22":"tcp.idle_timeout.seconds=3600"}' \
+        --wait --timeout 5m
+
+# Rollback to a previous release (REV from `just eks history`; omit for previous)
+rollback REV="0":
+    helm rollback rio {{REV}} --namespace rio-system --wait --timeout 5m
+
+# Release history (what values, what tag, when)
+history:
+    helm history rio --namespace rio-system
 
 # End-to-end smoke test (builds nixpkgs#hello, kills a worker, asserts reassign)
 smoke:

@@ -309,7 +309,7 @@ impl BalancedChannel {
 pub const SCHEDULER_HEALTH_SERVICE: &str = "rio.scheduler.SchedulerService";
 
 /// Default TLS domain for scheduler connections. Matches the
-/// first SAN in `infra/k8s/overlays/prod/cert-manager.yaml`.
+/// first SAN in `infra/helm/rio-build/templates/cert-manager.yaml`.
 pub const SCHEDULER_TLS_DOMAIN: &str = "rio-scheduler";
 
 /// Default probe interval. CoreDNS headless-Service TTL is 5s

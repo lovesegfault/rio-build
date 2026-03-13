@@ -7,7 +7,7 @@
 # migration attempts from the two services racing at startup —
 # first one wins, second one sees its migrations already applied.
 #
-# Connection string (built in deploy.sh from outputs):
+# Connection string (templated by ESO in the rio-postgres ExternalSecret):
 #   postgres://rio:<pw>@<endpoint>:5432/rio?sslmode=require
 #
 # sslmode=require because Aurora PG 15+ has rds.force_ssl=1 by
@@ -61,7 +61,8 @@ resource "aws_rds_cluster" "rio" {
   master_username = "rio"
   # manage_master_user_password: Aurora generates a password and
   # stores it in Secrets Manager. No sensitive values in tfstate.
-  # deploy.sh fetches it via `aws secretsmanager get-secret-value`.
+  # ESO syncs it into the rio-postgres Secret (see secrets.tf + the
+  # chart's external-secrets.yaml template).
   manage_master_user_password = true
 
   db_subnet_group_name   = aws_db_subnet_group.rio.name

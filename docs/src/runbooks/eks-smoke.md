@@ -14,7 +14,7 @@ automated script fails or for first-time setup validation.
 ## Step 1: Deploy
 
 ```bash
-kubectl kustomize infra/k8s/overlays/eks | envsubst | kubectl apply -f -
+just eks deploy    # helm upgrade --install from working tree
 ```
 
 Wait for control-plane readiness:
@@ -160,8 +160,7 @@ grpcurl -d '{"dry_run": true, "grace_period_hours": 2}' \
 
 ```bash
 kubectl -n rio-system delete workerpool smoke-test
-kubectl -n rio-system delete -k infra/k8s/overlays/eks
-cd infra/eks && terraform destroy -var chunk_bucket=<your-bucket>
+helm uninstall rio -n rio-system    # or: just eks destroy for full teardown
 ```
 
 ## Troubleshooting Matrix

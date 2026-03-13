@@ -172,7 +172,7 @@ r[ctrl.reconcile.owner-refs]
 
 ## RBAC
 
-The controller requires a dedicated ServiceAccount with a ClusterRole granting (see `infra/k8s/base/rbac.yaml`):
+The controller requires a dedicated ServiceAccount with a ClusterRole granting (see `infra/helm/rio-build/templates/rbac.yaml`):
 
 | API Group | Resources | Verbs |
 |---|---|---|
@@ -190,7 +190,7 @@ Lease permissions (`coordination.k8s.io/leases`: get, create, update) are grante
 
 ## NetworkPolicy
 
-NetworkPolicy resources are deployed via the prod kustomize overlay (`infra/k8s/overlays/prod/networkpolicy.yaml`), not controller-managed. The controller has no `networking.k8s.io` RBAC permissions. Intended policies:
+NetworkPolicy resources are deployed via the Helm chart (`infra/helm/rio-build/templates/networkpolicy.yaml`, gated on `networkPolicy.enabled`), not controller-managed. The controller has no `networking.k8s.io` RBAC permissions. Intended policies:
 
 - **Workers**: egress to rio-scheduler and rio-store only (gRPC ports). No access to the Kubernetes API server or cloud metadata service (`169.254.169.254`). DNS egress to kube-system (CoreDNS) required for service resolution.
 - **Gateway**: ingress from external (Service type LoadBalancer/NodePort for SSH). Egress to rio-scheduler and rio-store. DNS egress to kube-system.
@@ -209,7 +209,7 @@ The WorkerPool reconciler creates a `PodDisruptionBudget` child for each pool wi
 | Scheduler | Static manifest | `maxUnavailable: 1` | Leader election handles failover; at most one pod unavailable |
 | Gateway | Static manifest | `minAvailable: 1` | At least one pod must remain for SSH connectivity |
 
-Scheduler and gateway PDBs remain static manifests in the prod kustomize overlay (`infra/k8s/overlays/prod/pdb.yaml`) --- the controller does not deploy scheduler/store.
+Scheduler and gateway PDBs remain static manifests in the Helm chart (`infra/helm/rio-build/templates/pdb.yaml`, gated on `podDisruptionBudget.enabled`) --- the controller does not deploy scheduler/store.
 
 ## Service Definitions
 
@@ -225,7 +225,7 @@ Scheduler and gateway PDBs remain static manifests in the prod kustomize overlay
 r[ctrl.probe.named-service]
 K8s readiness probes on gRPC components MUST target a named health check service (e.g., `grpc.health.v1.Health/Check` with `service: rio-scheduler`), not the empty-string default. `set_not_serving` only affects named services, not `""` --- readiness would stay green during drain otherwise.
 
-> **Note:** This requirement is satisfied by the static kustomize base manifests (`infra/k8s/base/scheduler.yaml` and `infra/k8s/base/store.yaml`), which set `readinessProbe.grpc.service` to `rio.scheduler.SchedulerService` and `rio.store.StoreService` respectively. It is not controller-managed (the controller does not deploy scheduler/store). Worker probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
+> **Note:** This requirement is satisfied by the static Helm templates (`infra/helm/rio-build/templates/scheduler.yaml` and `store.yaml`), which set `readinessProbe.grpc.service` to `rio.scheduler.SchedulerService` and `rio.store.StoreService` respectively. It is not controller-managed (the controller does not deploy scheduler/store). Worker probes are HTTP (`/healthz`/`/readyz`) and are unrelated to this rule.
 
 | Component | Liveness | Readiness | Startup |
 |---|---|---|---|

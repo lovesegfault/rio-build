@@ -5,11 +5,10 @@
 # push-images.sh — build all docker images and skopeo-copy to ECR,
 # tagged with the current git short-SHA. zstd layers, OCI manifest.
 #
-# Reads ECR_REGISTRY + AWS_REGION from tofu outputs (same pattern
-# as deploy.sh). No manual exports needed.
+# Reads ECR_REGISTRY + AWS_REGION from tofu outputs. No manual exports needed.
 #
 # Writes the resolved tag to .rio-image-tag at the repo root —
-# deploy.sh reads it from there (not from `git rev-parse`, so a
+# `just eks deploy` reads it from there (not from `git rev-parse`, so a
 # dirty push's suffix flows through, and a push-at-X-deploy-at-Y
 # mismatch errors loudly instead of silently deploying the wrong
 # tag). Also prints RIO_IMAGE_TAG= on stdout for shell chaining.
@@ -116,7 +115,7 @@ done
 (( ${#failed[@]} == 0 )) || die "${#failed[@]} push(es) failed: ${failed[*]}"
 
 log "done — pushed ${#images[@]} images, tag: $tag"
-# deploy.sh reads this file (gitignored). Flows the dirty suffix
+# `just eks deploy` reads this file (gitignored). Flows the dirty suffix
 # through, and catches push-at-X-deploy-at-Y drift that the old
 # derive-from-HEAD approach would silently get wrong.
 echo "$tag" > "$REPO_ROOT/.rio-image-tag"

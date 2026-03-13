@@ -198,7 +198,7 @@ pub struct WorkerPoolSpec {
     /// Non-FOD builds never get proxy env (they don't need network).
     ///
     /// Typical: `http://rio-fod-proxy:3128` (the Squid deployment
-    /// from infra/k8s/base/fod-proxy.yaml). The proxy allowlists
+    /// from infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists
     /// known source hosts (nixos.org, github, crates.io etc) and
     /// denies everything else — defense against FODs fetching from
     /// arbitrary attacker-controlled URLs.

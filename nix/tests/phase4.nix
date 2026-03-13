@@ -13,7 +13,10 @@
 # Topology (3 VMs, k3s from the start — avoids a 4c refactor when
 # Sections G (NetPol) / H (WorkerPoolSet) need it):
 #   control — PG + store + scheduler + gateway (systemd, PLAINTEXT)
-#   k8s     — k3s + rio-controller systemd + worker-as-pod
+#   k8s     — k3s + rio-controller POD (Helm-rendered) + worker-as-pod.
+#             Controller-as-pod exercises the production ClusterRole +
+#             Deployment template in CI (controller-as-systemd used the
+#             admin kubeconfig, bypassing RBAC). See nix/helm-render.nix.
 #   client  — nix client, ssh-ng to control's gateway
 #
 # PLAINTEXT (no mTLS/HMAC) for Section A: tenant resolution doesn't
@@ -33,8 +36,12 @@
   rio-workspace,
   rioModules,
   dockerImages, # for airgap preload into k3s
-  crds, # auto-deployed via manifests
+  nixhelm, # helm-render.nix fetches PG subchart (helm template presence check)
+  system,
   coverage ? false,
+  # crds arg still passed via k3sArgs (phase3a/3b use it). phase4 ignores
+  # it — helmRendered includes CRDs (00-crds.yaml split).
+  ...
 }:
 let
   common = import ./common.nix {
@@ -45,6 +52,8 @@ let
       coverage
       ;
   };
+
+  helmRender = import ../helm-render.nix { inherit pkgs nixhelm system; };
 
   # ── Test derivation ─────────────────────────────────────────────────
   # Three distinct derivations (trivially different output) so each
@@ -123,16 +132,28 @@ pkgs.testers.runNixOSTest {
     };
 
     k8s = common.mkK3sNode {
-      controllerEnv = {
-        KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
-        RIO_SCHEDULER_ADDR = "control:9001";
-        RIO_STORE_ADDR = "control:9002";
-        RIO_LOG_FORMAT = "pretty";
+      # Helm-rendered: controller as a pod. The chart's vmtest values
+      # profile enables ONLY the controller (hostNetwork=true so
+      # `control` hostname resolves via node's /etc/hosts).
+      helmRendered = helmRender {
+        valuesFile = ../../infra/helm/rio-build/values/vmtest.yaml;
+        extraSet = {
+          "controller.schedulerAddr" = "control:9001";
+          "controller.storeAddr" = "control:9002";
+          "controller.extraEnv[0].name" = "RIO_LOG_FORMAT";
+          "controller.extraEnv[0].value" = "pretty";
+        }
+        // pkgs.lib.optionalAttrs coverage {
+          "controller.coverage.enabled" = "true";
+          "controller.extraEnv[1].name" = "LLVM_PROFILE_FILE";
+          "controller.extraEnv[1].value" = "/var/lib/rio/cov/rio-%p-%m.profraw";
+        };
       };
-      manifests = {
-        "00-rio-crds".source = crds;
-      };
-      extraK3sImages = [ dockerImages.worker ];
+      # Controller is now a pod → its image must be preloaded too.
+      extraK3sImages = [
+        dockerImages.worker
+        dockerImages.controller
+      ];
     };
 
     client = common.mkClientNode { gatewayHost = "control"; };
@@ -192,7 +213,13 @@ pkgs.testers.runNixOSTest {
     k8s.succeed("k3s kubectl apply -f ${workerPoolCRFile}")
     k8s.wait_until_succeeds(
         "k3s kubectl wait --for=condition=Established crd/workerpools.rio.build --timeout=60s")
-    k8s.wait_for_unit("rio-controller.service")
+    # Controller is a pod now (not a systemd unit). Wait for it to be
+    # Ready before expecting reconcile outputs. Deployment name from
+    # the chart.
+    k8s.wait_until_succeeds("k3s ctr images ls -q | grep -q 'rio-controller:dev'", timeout=120)
+    k8s.wait_until_succeeds(
+        "k3s kubectl wait --for=condition=Available deploy/rio-controller --timeout=120s",
+        timeout=150)
     k8s.wait_until_succeeds("k3s kubectl get statefulset default-workers -o name", timeout=60)
     k8s.wait_until_succeeds(
         "k3s kubectl wait --for=condition=Ready pod/default-workers-0 --timeout=150s",
@@ -204,7 +231,7 @@ pkgs.testers.runNixOSTest {
     ${common.seedBusybox "control"}
 
     def dump_logs():
-        k8s.execute("journalctl -u rio-controller --no-pager -n 100 >&2")
+        k8s.execute("k3s kubectl logs deploy/rio-controller --tail=100 >&2 || true")
         k8s.execute("k3s kubectl logs default-workers-0 --tail=100 >&2 || true")
         control.execute("journalctl -u rio-scheduler -u rio-gateway --no-pager -n 100 >&2")
 

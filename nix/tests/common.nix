@@ -412,25 +412,50 @@ rec {
   # k3s server node + rio-controller systemd service. Extracted
   # from phase3a.nix for reuse in phase3b.nix (Build CRD section).
   #
-  # Parameters:
-  #   controllerEnv: rio-controller systemd environment attrset
-  #     (RIO_SCHEDULER_ADDR, RIO_STORE_ADDR, KUBECONFIG, etc).
-  #     Must include at least KUBECONFIG.
-  #   manifests: services.k3s.manifests (auto-deploy; k3s applies
-  #     in filename order, use "00-" prefix for CRDs so they
-  #     establish before dependent CRs).
-  #   extraK3sImages: images to preload beyond airgap-images.
-  #     [] if no containerized rio components (e.g., phase3b uses
-  #     a native NixOS worker, no pod).
+  # Two modes (mutually exclusive):
+  #
+  #   controllerEnv (legacy, phase3a/3b): rio-controller runs as a
+  #     SYSTEMD service with KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+  #     (cluster-admin — bypasses RBAC). manifests must include the
+  #     CRDs (typically {"00-rio-crds".source = crds;}).
+  #
+  #   helmRendered (phase4+): rio-controller runs as a POD, rendered
+  #     from the Helm chart via nix/helm-render.nix with the vmtest
+  #     values profile. Exercises the production ClusterRole + pod
+  #     template in CI (controller-as-systemd never did). manifests
+  #     are derived from helmRendered's 00-crds/01-rbac/02-workloads
+  #     split. extraK3sImages MUST include dockerImages.controller.
+  #
+  # manifests: extra services.k3s.manifests (merged on top of the
+  #   helmRendered-derived ones if set).
+  # extraK3sImages: images to preload beyond airgap-images.
   #
   # Returns a NixOS module function ({ config, ... }: { ... }).
   # The caller provides hostName="k8s" via nodes.k8s attribute.
   mkK3sNode =
     {
-      controllerEnv,
-      manifests,
+      controllerEnv ? null,
+      helmRendered ? null,
+      manifests ? { },
       extraK3sImages ? [ ],
     }:
+    assert (controllerEnv == null) != (helmRendered == null);
+    let
+      # helmRendered mode: feed the split YAML files into k3s manifests.
+      # k3s applies in filename order → CRDs establish before RBAC binds
+      # before the controller pod watches. Solves the RBAC bootstrap
+      # ordering that controller-as-systemd sidestepped with admin
+      # kubeconfig.
+      helmManifests =
+        if helmRendered != null then
+          {
+            "00-rio-crds".source = "${helmRendered}/00-crds.yaml";
+            "01-rio-rbac".source = "${helmRendered}/01-rbac.yaml";
+            "02-rio-workloads".source = "${helmRendered}/02-workloads.yaml";
+          }
+        else
+          { };
+    in
     { config, ... }:
     {
       networking = {
@@ -479,7 +504,7 @@ rec {
         # ErrImagePull. The testScript should wait for import via
         # `k3s ctr images ls | grep -q pause` before proceeding.
         images = [ config.services.k3s.package.airgap-images ] ++ extraK3sImages;
-        inherit manifests;
+        manifests = helmManifests // manifests;
       };
 
       systemd = {
@@ -487,11 +512,9 @@ rec {
         # Without this: pods stuck in ContainerCreating.
         services.k3s.serviceConfig.Delegate = "yes";
 
-        # rio-controller as systemd (not pod). Simpler for VM tests
-        # — no RBAC bootstrap ordering problem (k3s.yaml is
-        # cluster-admin). After=k3s but k3s "starts" before
-        # apiserver is ready; RestartSec handles the gap.
-        services.rio-controller = {
+        # rio-controller systemd unit (legacy mode only — helmRendered
+        # runs it as a pod instead).
+        services.rio-controller = pkgs.lib.mkIf (controllerEnv != null) {
           description = "rio-controller (K8s operator)";
           wantedBy = [ "multi-user.target" ];
           after = [ "k3s.service" ];

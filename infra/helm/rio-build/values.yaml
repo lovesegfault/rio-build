@@ -1,0 +1,244 @@
+# Default values = prod topology (TLS on, external PG/S3, PDBs, NetworkPolicy).
+# values/dev.yaml flips everything for local k3s/kind.
+# values/vmtest.yaml renders controller-only for VM test k3s injection.
+
+global:
+  image:
+    # Registry prefix (e.g., "123456.dkr.ecr.us-east-2.amazonaws.com").
+    # Empty → bare repo names (dev: airgap-loaded images).
+    # EKS: `just eks deploy` passes --set global.image.registry=<ecr> from tofu output.
+    registry: ""
+    # Set via `--set global.image.tag=<sha>` (read from .rio-image-tag by
+    # `just eks deploy`). NEVER committed — private ECR, dev tags include
+    # -dirty-<hash>. See infra/eks/README.md.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Region for ExternalSecrets SecretsManager provider. Set via --set from tofu output.
+  region: ""
+
+namespace:
+  create: true
+  name: rio-system
+  # Workers need SYS_ADMIN (FUSE mount); restricted/baseline PSA reject it.
+  # Workers live in SAME namespace (WorkerPool CRD is namespaced, reconciler
+  # creates STS there). Possible future split: workers → dedicated privileged
+  # ns, control plane → baseline.
+  podSecurityLabel: privileged
+
+# TLS on → renders cert-manager resources (ClusterIssuer bootstrap, root CA,
+# namespaced Issuer, per-component Certificates) + mounts TLS secrets into
+# each Deployment + sets RIO_TLS__* env + retargets store's readiness probe
+# to the plaintext health port (9102). Requires cert-manager in the cluster.
+tls:
+  enabled: true
+
+# External Secrets Operator sync from AWS Secrets Manager.
+# When enabled: renders ClusterSecretStore + 3 ExternalSecrets (rio-postgres
+# with templated Aurora URL, rio-hmac, rio-signing-key). Requires ESO in the
+# cluster and the bootstrap Job (below) to have populated rio/hmac and
+# rio/signing-key in Secrets Manager.
+externalSecrets:
+  enabled: false
+  clusterSecretStore: rio-aws-secrets
+  # ARN of the Aurora master password secret (manage_master_user_password
+  # creates it). Set via --set from tofu output db_secret_arn.
+  auroraSecretArn: ""
+  # Aurora writer endpoint (hostname only). Set via --set from tofu output.
+  auroraEndpoint: ""
+
+# Helm pre-install/pre-upgrade hook Job. Idempotent — describe-secret guards.
+# Generates rio/hmac (openssl rand 32) and rio/signing-key (nix-store
+# --generate-binary-cache-key) in Secrets Manager IF THEY DON'T EXIST.
+# Regenerating would invalidate in-flight assignment tokens / all narinfo
+# signatures. The public signing key goes to rio/signing-key-pub so operators
+# can read it without touching the private half.
+bootstrap:
+  enabled: false
+  # Nix-built image (awscli2 + openssl + nix). See nix/docker.nix.
+  image: rio-bootstrap
+  serviceAccount:
+    # IRSA: secretsmanager:CreateSecret, PutSecretValue, DescribeSecret on rio/*
+    annotations: {}
+
+podDisruptionBudget:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+
+# ──────────────────────────────────────────────────────────────────────────
+# rio-controller
+# ──────────────────────────────────────────────────────────────────────────
+# K8s operator. Watches WorkerPool/Build CRDs, reconciles StatefulSets.
+# HARD replicas=1: NOT leader-elected. Two controllers fight — both SSA-patch
+# same StatefulSet, fieldManager conflicts. kube-runtime handles concurrent
+# reconcile within one process but not across processes. 30s reschedule gap
+# during pod restart is acceptable.
+controller:
+  enabled: true
+  image: rio-controller
+  # Addresses passed through to worker pods via the controller's env.
+  # Lazy-connected per-reconcile — transient scheduler outage doesn't kill
+  # the controller.
+  schedulerAddr: rio-scheduler:9001
+  storeAddr: rio-store:9002
+  # Balanced-channel config also passed through to workers. Workers
+  # DNS-resolve the headless Service, health-probe pod IPs, route to leader.
+  # Empty → workers fall back to single-channel (VM tests don't set this).
+  schedulerBalanceHost: rio-scheduler-headless
+  schedulerBalancePort: 9001
+  # Extra env injected after base vars. VM tests use this for autoscaler
+  # tuning (RIO_AUTOSCALER_POLL_SECS=3 etc); coverage mode injects
+  # LLVM_PROFILE_FILE here.
+  extraEnv: []
+  # hostNetwork: CoreDNS in k3s VM tests doesn't know NixOS-test VM
+  # hostnames. hostNetwork → pod uses node's /etc/hosts.
+  hostNetwork: false
+  # Coverage mode: mounts /var/lib/rio/cov as hostPath so profraws survive
+  # pod termination. nix/tests/common.nix collectCoverage tars this out.
+  coverage:
+    enabled: false
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 256Mi}
+
+# ──────────────────────────────────────────────────────────────────────────
+# rio-store
+# ──────────────────────────────────────────────────────────────────────────
+# PG + S3/inline chunk storage. replicas=1: stateless at runtime but
+# concurrent migrations from multiple replicas would race. Add a
+# migration-lock mechanism before scaling horizontally.
+store:
+  enabled: true
+  image: rio-store
+  serviceAccount:
+    # EKS IRSA: eks.amazonaws.com/role-arn set via --set from tofu output.
+    # Store needs S3 access; IRSA attaches IAM role via projected token.
+    # NO static AWS keys.
+    annotations: {}
+  chunkBackend:
+    # inline = NARs in PG (works out of the box, doesn't scale).
+    # s3 requires bucket (+ endpoint/region/creds via env or IRSA).
+    kind: s3
+    bucket: ""
+    prefix: chunks/
+    # For MinIO in dev: http://rio-build-minio:9000 (bitnami subchart svc name)
+    endpoint: ""
+  # Build logs go to the same bucket (different prefix). Empty → logs stay
+  # in PG only.
+  logS3Bucket: ""
+  # For MinIO dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
+  extraEnv: []
+  resources:
+    # NAR uploads buffer up to one chunk (4MB) per concurrent stream.
+    # 10 × 4MB = 40MB working set + ChunkCache (default 2GB). 4Gi is headroom.
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 4Gi}
+
+# ──────────────────────────────────────────────────────────────────────────
+# rio-scheduler
+# ──────────────────────────────────────────────────────────────────────────
+# Leader-elected via K8s Lease. replicas=2: ONE dispatches; standby merges
+# DAGs (state warm) but dispatch_ready early-returns until it acquires.
+scheduler:
+  enabled: true
+  image: rio-scheduler
+  replicas: 2
+  # All replicas contend for SAME Lease. Presence of this name ENABLES lease
+  # mode (LeaseConfig::from_env returns None without RIO_LEASE_NAME →
+  # always-leader mode, WRONG with replicas>1).
+  leaseName: rio-scheduler-leader
+  storeAddr: rio-store:9002
+  resources:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {memory: 2Gi}
+
+# ──────────────────────────────────────────────────────────────────────────
+# rio-gateway
+# ──────────────────────────────────────────────────────────────────────────
+# SSH ingress. Stateless (session state per-connection, no shared state).
+# LB distributes SSH round-robin. Dying gateway kills its sessions (nix
+# client retries).
+gateway:
+  enabled: true
+  image: rio-gateway
+  replicas: 2
+  schedulerAddr: rio-scheduler:9001
+  storeAddr: rio-store:9002
+  # Balanced-channel: gateway DNS-resolves headless to pod IPs, probes
+  # grpc.health.v1 on each, routes to leader.
+  schedulerBalanceHost: rio-scheduler-headless
+  schedulerBalancePort: 9001
+  service:
+    type: LoadBalancer
+    # NO AWS LB annotations here — base is cloud-agnostic. Set via
+    # --set-json per deployment. Putting them here was wrong twice: leaks
+    # AWS specifics AND legacy in-tree-provider syntax that
+    # aws-load-balancer-controller silently ignores.
+    annotations: {}
+  ssh:
+    # Secret with key `authorized_keys`. Without it: gateway has no keys to
+    # check → all SSH auth fails. Empty string → don't mount (gateway
+    # generates ephemeral host key, useful for VM tests that don't SSH in).
+    authorizedKeysSecret: rio-gateway-ssh
+    # Secret with key `host_key` (persistent SSH host key). Empty → emptyDir
+    # holds an auto-generated key (survives container restart, regenerates on
+    # pod reschedule — breaks known_hosts). Prod with replicas>1 should use a
+    # real Secret so both replicas present the same host key.
+    hostKeySecret: ""
+  resources:
+    # Gateway buffers NAR uploads in-memory (streaming via tee — ~1MB per
+    # concurrent upload since phase2b's dump_path_streaming).
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {memory: 1Gi}
+
+# ──────────────────────────────────────────────────────────────────────────
+# rio-fod-proxy
+# ──────────────────────────────────────────────────────────────────────────
+# Squid forward proxy for FOD (fixed-output derivation) fetches. FODs need
+# internet; default NetworkPolicy denies all worker egress. Worker → Squid
+# (cluster IP, allowed by NetPol exception) → internet. Squid's allowlist =
+# FODs can ONLY fetch from known source hosts. Defense in depth: FOD sandbox
+# already verifies output hash (malicious source can't inject content that
+# PASSES) but could exfiltrate via request if builder compromised.
+# Harmless if unused — ~50MB, idle, no traffic unless a WorkerPool points at it.
+fodProxy:
+  enabled: true
+  image: rio-fod-proxy
+  # Squid `acl allowed_domains dstdomain`. `.example.com` matches example.com
+  # AND subdomains. Covers the vast majority of nixpkgs fetchurl sources.
+  allowedDomains:
+    - .nixos.org
+    - .github.com
+    - .githubusercontent.com
+    - .gitlab.com
+    - .crates.io
+    - .pypi.org
+    - .pythonhosted.org
+    - .npmjs.org
+    - .rubygems.org
+    - .golang.org
+    - .debian.org
+    - .kernel.org
+    - .sourceforge.net
+    - .gnu.org
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 256Mi}
+
+# ──────────────────────────────────────────────────────────────────────────
+# Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.
+# Dev S3 (Rook) is NOT a subchart — operator-first-then-cluster lifecycle
+# doesn't fit; `just dev apply` installs it as separate helm releases.
+# ──────────────────────────────────────────────────────────────────────────
+postgresql:
+  enabled: false
+  # When enabled, also renders a rio-postgres Secret with the connection
+  # string (templates/postgres-secret.yaml).
+  auth:
+    database: rio
+    username: rio
+    password: rio
+  primary:
+    persistence:
+      size: 5Gi
