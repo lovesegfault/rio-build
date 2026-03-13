@@ -62,3 +62,14 @@ spec; the caller must also append the matching volumes: entry.
   secret:
     secretName: {{ . }}
 {{- end -}}
+
+{{/*
+RUST_LOG env var. Self-guarded — empty global.logLevel renders nothing
+(binary falls back to "info"). Include unconditionally with `| nindent 12`.
+*/}}
+{{- define "rio.rustLogEnv" -}}
+{{- with .Values.global.logLevel }}
+- name: RUST_LOG
+  value: {{ . | quote }}
+{{- end }}
+{{- end -}}

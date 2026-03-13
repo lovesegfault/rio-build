@@ -85,7 +85,8 @@ apply: _ssh-key _chart-deps rook _s3-bridge
       --from-file=authorized_keys=infra/helm/ssh/authorized_keys \
       --dry-run=client -o yaml | kubectl apply -f -
     helm upgrade --install rio infra/helm/rio-build \
-      -f infra/helm/rio-build/values/dev.yaml
+      -f infra/helm/rio-build/values/dev.yaml \
+      --set global.logLevel="${RIO_LOG_LEVEL:-debug}"
 
 delete:
     helm uninstall rio --ignore-not-found

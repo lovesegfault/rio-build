@@ -38,6 +38,7 @@ spec:
             - name: health
               containerPort: 9194
           env:
+            {{- include "rio.rustLogEnv" . | nindent 12 }}
             - name: RIO_SCHEDULER_ADDR
               value: {{ $c.schedulerAddr | quote }}
             - name: RIO_STORE_ADDR

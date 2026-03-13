@@ -62,6 +62,7 @@ spec:
             - name: health
               containerPort: 9101
           env:
+            {{- include "rio.rustLogEnv" . | nindent 12 }}
             # All replicas contend for SAME Lease. Presence ENABLES lease mode
             # (LeaseConfig::from_env returns None without it → always-leader,
             # WRONG with replicas>1).

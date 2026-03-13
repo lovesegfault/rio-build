@@ -532,6 +532,14 @@ fn build_container(
                     "/var/lib/rio/cov/rio-%p-%m.profraw",
                 ));
             }
+            // Propagate the controller's RUST_LOG verbatim. The helm
+            // chart sets global.logLevel → RUST_LOG on all rio-* pods;
+            // passing it through here makes workers follow the same
+            // knob. Verbatim means per-crate filters work as written:
+            // "info,rio_worker=debug" → worker at debug, deps at info.
+            if let Ok(level) = std::env::var("RUST_LOG") {
+                e.push(env("RUST_LOG", &level));
+            }
             e
         }),
 

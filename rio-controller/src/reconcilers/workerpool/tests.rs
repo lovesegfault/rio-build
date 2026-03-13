@@ -833,6 +833,56 @@ fn coverage_propagated_when_controller_env_set() -> figment::error::Result<()> {
 
 #[test]
 #[allow(clippy::result_large_err)]
+fn rust_log_propagated_verbatim() -> figment::error::Result<()> {
+    figment::Jail::expect_with(|jail| {
+        jail.set_env("RUST_LOG", "info,rio_worker=debug");
+
+        let wp = test_wp();
+        let sts = test_sts(&wp);
+        let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+
+        let envs = container.env.as_ref().expect("env vars");
+        let rust_log = envs
+            .iter()
+            .find(|e| e.name == "RUST_LOG")
+            .expect("RUST_LOG env injected");
+        assert_eq!(
+            rust_log.value.as_deref(),
+            Some("info,rio_worker=debug"),
+            "verbatim — per-crate EnvFilter directives preserved"
+        );
+
+        Ok(())
+    });
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::result_large_err)]
+fn rust_log_absent_when_controller_env_unset() -> figment::error::Result<()> {
+    figment::Jail::expect_with(|_jail| {
+        // SAFETY: Jail's global mutex serializes env access.
+        unsafe {
+            std::env::remove_var("RUST_LOG");
+        }
+
+        let wp = test_wp();
+        let sts = test_sts(&wp);
+        let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+
+        let envs = container.env.as_ref().expect("env vars");
+        assert!(
+            !envs.iter().any(|e| e.name == "RUST_LOG"),
+            "RUST_LOG should be absent — worker falls back to binary's info default"
+        );
+
+        Ok(())
+    });
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::result_large_err)]
 fn coverage_absent_when_controller_env_unset() -> figment::error::Result<()> {
     figment::Jail::expect_with(|_jail| {
         // SAFETY: Jail serializes env access via a global mutex — no

@@ -15,6 +15,16 @@ global:
     pullPolicy: IfNotPresent
   # Region for ExternalSecrets SecretsManager provider. Set via --set from tofu output.
   region: ""
+  # RUST_LOG for all rio-* binaries (gateway, scheduler, store, controller).
+  # Full tracing_subscriber::EnvFilter syntax — a simple level name sets
+  # everything, or target individual crates/modules:
+  #   "debug"                            all crates at debug
+  #   "info,rio_gateway=trace"           gateway at trace, rest at info
+  #   "warn,rio_scheduler::actor=debug"  one module at debug, rest at warn
+  # Empty string → env var omitted → binary's built-in "info" fallback.
+  # Worker pods inherit the controller's RUST_LOG verbatim (builders.rs
+  # reads its own env and passes it through), so one knob covers all.
+  logLevel: "info"
 
 namespace:
   create: true
