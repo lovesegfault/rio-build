@@ -721,47 +721,12 @@
               nil.enable = true;
               statix.enable = true;
 
-              # Validate kustomize overlay output against K8s OpenAPI
-              # schema. Catches typos, wrong types, unknown fields.
-              # Does NOT catch apiserver admission-time validation
-              # (e.g. "more than 1 probe handler" from a strategic-
-              # merge collision) — that's not in the schema. deploy.sh
-              # runs --dry-run=server before apply to catch those.
-              #
-              # `files` triggers on any infra/k8s/ change; the hook
-              # re-renders ALL overlays (a base change affects
-              # every overlay's output). -skip: CRDs we define
-              # ourselves + cert-manager resources (schemas not in
-              # the default registry).
-              kubeconform = {
-                enable = true;
-                name = "kubeconform";
-                entry = "${pkgs.writeShellScript "kubeconform-overlays" ''
-                  set -euo pipefail
-                  fail=0
-                  for overlay in infra/k8s/overlays/*/; do
-                    # Some overlays (dev/) have secretGenerator
-                    # sourcing gitignored per-user files that
-                    # don't exist in the Nix sandbox. Render
-                    # first; skip overlay if kustomize itself
-                    # can't resolve inputs. kubeconform only
-                    # runs on overlays that DID render.
-                    if ! out=$(${pkgs.kubectl}/bin/kubectl kustomize "$overlay" 2>&1); then
-                      echo "kubeconform: $overlay (skipped — kustomize render failed)"
-                      echo "$out" | head -1
-                      continue
-                    fi
-                    echo "kubeconform: $overlay"
-                    printf '%s\n' "$out" \
-                      | ${pkgs.kubeconform}/bin/kubeconform -strict -summary \
-                          -skip CustomResourceDefinition,Certificate,ClusterIssuer,Issuer,Cluster,WorkerPool,Build \
-                      || fail=1
-                  done
-                  exit $fail
-                ''}";
-                files = "^infra/k8s/";
-                pass_filenames = false;
-              };
+              # kubeconform hook removed: it downloads schemas from
+              # raw.githubusercontent.com at runtime, which fails in
+              # the nixbuild.net sandbox (no network). deploy.sh runs
+              # `kubectl apply --dry-run=server` before apply — that
+              # catches schema errors against the REAL apiserver, plus
+              # admission-time validation that kubeconform can't see.
             };
           };
 
@@ -817,7 +782,6 @@
                 # under infra/eks/ invoke `tofu`, not `terraform`.
                 opentofu
                 kubectl
-                kubeconform # offline K8s manifest schema validation (pre-commit hook uses this too)
                 skopeo # nix build .#docker-* | skopeo copy docker-archive:... docker://ECR
                 kubernetes-helm
                 grpcurl # manual AdminService poking when rio-cli isn't enough
