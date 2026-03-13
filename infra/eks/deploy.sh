@@ -184,6 +184,17 @@ sed \
   "$REPO_ROOT/infra/k8s/overlays/eks/kustomization.yaml" \
   > "$RENDER/infra/k8s/overlays/eks/kustomization.yaml"
 
+# Server-side dry-run first. Catches apiserver admission rejects
+# (e.g. "may not specify more than 1 handler type" from a
+# strategic-merge collision) BEFORE we mutate anything. These
+# aren't in the OpenAPI schema, so kubeconform/--dry-run=client
+# miss them — only the live apiserver knows. Fails fast on a
+# broken overlay instead of half-applying and leaving the
+# cluster in a mixed state.
+log "validating manifests (server-side dry-run)"
+kubectl apply -k "$RENDER/infra/k8s/overlays/eks" --dry-run=server \
+  || die "manifest validation failed (apiserver rejected)"
+
 log "applying manifests"
 kubectl apply -k "$RENDER/infra/k8s/overlays/eks"
 
