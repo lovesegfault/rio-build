@@ -1,6 +1,9 @@
 {
   description = "rio-build - Nix build orchestration";
 
+  # tracey's patched source derivation requires IFD during evaluation.
+  nixConfig.allow-import-from-derivation = true;
+
   inputs = {
     nix = {
       url = "github:NixOS/Nix/2.33.3";
