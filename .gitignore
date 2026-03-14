@@ -32,6 +32,9 @@ target/
 **/*.rs.bk
 *.pdb
 
+# Python bytecode (nix/tests/lib/assertions.py is source-only)
+__pycache__/
+
 # mdbook output
 docs/book/
 

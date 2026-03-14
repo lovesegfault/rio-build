@@ -75,6 +75,11 @@ rec {
   # startup (sqlx migrate, advisory-lock serialized), so no separate oneshot.
   databaseUrl = "postgres://postgres@localhost/rio";
 
+  # Shared Python assertion helpers (scrape_metrics, assert_metric_exact,
+  # assert_set_eq, psql, dump_all_logs, load_otel_spans). Scenarios prepend
+  # `${common.assertions}` to their testScript. See lib/assertions.py.
+  assertions = builtins.readFile ./lib/assertions.py;
+
   # ── PostgreSQL config (5× identical across all tests) ───────────────
 
   postgresqlConfig = {
