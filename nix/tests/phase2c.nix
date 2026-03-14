@@ -42,7 +42,7 @@ let
       ;
   };
 
-  testDrvFile = ./phase2c-derivation.nix;
+  testDrvFile = ./lib/derivations/sizeclass.nix;
 
   # Size-class cutoffs. "small" for quick builds (≤30s), "large" for
   # slow ones. mem_limit is effectively unlimited here (u64::MAX-ish);

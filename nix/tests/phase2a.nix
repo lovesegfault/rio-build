@@ -51,7 +51,7 @@ let
 
   # The 5-node test DAG. Passed to `nix-build` on the client via
   # `--arg busybox '<storePath>'`.
-  testDrvFile = ./phase2a-derivation.nix;
+  testDrvFile = ./lib/derivations/fanout.nix;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-phase2a";
@@ -121,7 +121,7 @@ pkgs.testers.runNixOSTest {
     #
     # Verify the build output CONTENT via ssh-ng. The root's
     # $out/stamp contains its own name followed by all 4 child
-    # stamps (phase2a-derivation.nix:27-28). grep -c 'rio-leaf-' == 4
+    # stamps (lib/derivations/fanout.nix:27-28). grep -c 'rio-leaf-' == 4
     # proves: (a) the output is actually retrievable via wopNarFromPath,
     # (b) the collector concatenated all 4 children (DAG walked
     # correctly), (c) the NAR bytes are intact (wrong content → wrong

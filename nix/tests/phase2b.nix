@@ -41,7 +41,7 @@ let
       ;
   };
 
-  testDrvFile = ./phase2b-derivation.nix;
+  testDrvFile = ./lib/derivations/chain.nix;
 
   # OTLP endpoint on control. Tempo listens on 4317 for OTLP/gRPC.
   # The milestone spec says "visible in Jaeger" but Jaeger all-in-one
