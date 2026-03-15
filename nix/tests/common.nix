@@ -431,15 +431,14 @@ rec {
   #
   # When coverage=true, stops all rio services (SIGTERM → graceful
   # drain via shutdown_signal → atexit → LLVM profraw flush), tars
-  #
-  # TODO(phase4c): scheduler profraw collection is broken for any test
-  # that runs builds. lcov shows 0/360 coverage for actor/mod.rs in ALL
-  # tests except phase1a (idle scheduler, no builds). systemctl stop
-  # likely times out on worker-stream drain → SIGKILL → no atexit.
-  # Fix: settle the queue (wait for builds_running==0) before stop, or
-  # increase TimeoutStopSec, or send SIGTERM to workers first so
-  # scheduler streams close before scheduler stop fires.
   # /var/lib/rio/cov, and copies to $out/coverage/<node>/.
+  #
+  # Stop ORDER matters: workers first. A dead worker closes the
+  # BuildExecution bidi stream → scheduler's worker-stream-reader
+  # task breaks → sends WorkerDisconnected → actor drops that
+  # worker's stream_tx. By the time the scheduler gets SIGTERM, its
+  # serve_with_shutdown has no open response streams to wait on.
+  # Belt-and-suspenders for the actor's own token-aware drain.
   #
   # `pyNodeVars` is a Python expression evaluating to a list of Machine
   # instances — typically comma-separated node var names, e.g.,
@@ -458,9 +457,13 @@ rec {
       ''
         with subtest("collect coverage profraws"):
             for n in [${pyNodeVars}]:
+                # Workers first — closes BuildExecution streams so
+                # scheduler's serve_with_shutdown isn't waiting on
+                # open bidi handlers.
+                n.execute("systemctl stop rio-worker 2>/dev/null || true")
                 n.execute(
                     "systemctl stop rio-gateway rio-scheduler rio-store "
-                    "rio-worker rio-controller 2>/dev/null || true"
+                    "rio-controller 2>/dev/null || true"
                 )
                 # k3s worker pod (phase3a only): delete STS, wait for
                 # pod termination. --wait blocks until pod is gone.
