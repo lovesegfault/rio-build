@@ -21,16 +21,18 @@ in
 {
   # Path to a values file (typically values/vmtest.yaml).
   valuesFile,
-  # --set overrides. Each becomes a "--set key=value" arg. Use for
-  # per-test controller env (RIO_SCHEDULER_ADDR=control:9001, autoscaler
-  # tuning, coverage toggle).
+  # --set-string overrides. Each becomes a "--set-string key=value"
+  # arg. --set-string (not --set): Helm's --set coerces "3" to int 3,
+  # which breaks EnvVar.value (must be string). All current callers
+  # pass env var values; if a caller needs int semantics later, add
+  # a separate extraSetInt param rather than switching back.
   extraSet ? { },
 }:
 let
   chart = pkgs.lib.cleanSource ../infra/helm/rio-build;
   crds = pkgs.lib.cleanSource ../infra/helm/crds;
   setArgs = pkgs.lib.concatMapStringsSep " " (
-    k: "--set ${pkgs.lib.escapeShellArg "${k}=${toString extraSet.${k}}"}"
+    k: "--set-string ${pkgs.lib.escapeShellArg "${k}=${toString extraSet.${k}}"}"
   ) (builtins.attrNames extraSet);
 in
 pkgs.runCommand "rio-helm-rendered"
