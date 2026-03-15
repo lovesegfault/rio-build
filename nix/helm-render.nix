@@ -63,14 +63,17 @@ pkgs.runCommand "rio-helm-rendered"
     # 00-crds.yaml so k3s applies them first.
     cat ${crds}/*.yaml > $out/00-crds.yaml
     # yq-go: filter by kind. k3s applies in filename order — CRDs must
-    # establish before the controller pod tries to watch them, RBAC
-    # must bind before the pod's SA token is validated against it.
-    yq 'select(.kind == "ServiceAccount" or
+    # establish before the controller pod tries to watch them; Namespace
+    # must exist before ServiceAccounts can be created in it; RBAC must
+    # bind before the pod's SA token is validated against it.
+    yq 'select(.kind == "Namespace" or
+               .kind == "ServiceAccount" or
                .kind == "ClusterRole" or
                .kind == "ClusterRoleBinding" or
                .kind == "Role" or
                .kind == "RoleBinding")' all.yaml > $out/01-rbac.yaml
-    yq 'select(.kind != "ServiceAccount" and
+    yq 'select(.kind != "Namespace" and
+               .kind != "ServiceAccount" and
                .kind != "ClusterRole" and
                .kind != "ClusterRoleBinding" and
                .kind != "Role" and

@@ -276,10 +276,23 @@ in
     # ── rio deployments Available ───────────────────────────────────
     # store + scheduler crash-loop until PG is up (sqlx migrate retry),
     # then come clean. gateway needs scheduler+store healthy (balanced-
-    # channel probe fails → NOT_SERVING → readiness fails). controller
-    # just needs apiserver. Order reflects dependency, but `kubectl
-    # wait` handles the concurrency.
-    for d in ["rio-store", "rio-scheduler", "rio-gateway", "rio-controller"]:
+    # channel probe fails → container exits → CrashLoopBackOff).
+    # controller just needs apiserver.
+    #
+    # Gateway accumulates backoff (2m40s by the time scheduler is up)
+    # while its deps aren't ready — k8s started it concurrently with
+    # PG/scheduler. Restart it after scheduler Available so it gets a
+    # fresh attempt against healthy deps, instead of waiting out backoff.
+    for d in ["rio-store", "rio-scheduler"]:
+        k3s_server.wait_until_succeeds(
+            f"k3s kubectl -n ${ns} wait --for=condition=Available "
+            f"deploy/{d} --timeout=120s",
+            timeout=150,
+        )
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} rollout restart deploy/rio-gateway"
+    )
+    for d in ["rio-gateway", "rio-controller"]:
         k3s_server.wait_until_succeeds(
             f"k3s kubectl -n ${ns} wait --for=condition=Available "
             f"deploy/{d} --timeout=120s",
