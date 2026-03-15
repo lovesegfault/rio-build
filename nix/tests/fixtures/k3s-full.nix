@@ -161,6 +161,12 @@ let
           "k3s-server"
           "--node-ip"
           config.networking.primaryIPAddress
+          # Quiet the "Failed to record snapshots: nodes not found"
+          # spam during startup. The etcd snapshot reconciler fires
+          # on a tight loop before the kubelet registers the node
+          # (IO-starved by the airgap image import). We don't use
+          # etcd snapshots in an ephemeral VM test.
+          "--etcd-disable-snapshots"
         ];
       };
 
@@ -368,13 +374,15 @@ in
     )
     # rollout status returns when the Deployment has Ready replicas,
     # but kube-proxy hasn't necessarily synced the endpoint to the
-    # NodePort's iptables rules yet. Poll from the CLIENT (which
-    # connects to k3s-server:32222) until SSH accepts. The ssh-ng
-    # protocol handshake is stricter than nc -z — proves the
-    # gateway process itself is serving, not just TCP accept.
+    # NodePort's iptables rules yet. Poll from the CLIENT until the
+    # SSH host key exchange succeeds. ssh-keyscan (not `ssh ...
+    # true`): rio-gateway is a russh server that only accepts the
+    # nix-ssh subsystem — exec requests get rejected. Keyscan just
+    # does the handshake + key exchange, which proves the gateway
+    # process is serving (stricter than `nc -z` TCP-accept check).
     client.wait_until_succeeds(
-        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 "
-        "-p 32222 rio@k3s-server true",
+        "ssh-keyscan -T 2 -p 32222 k3s-server 2>/dev/null | "
+        "grep -q ssh-ed25519",
         timeout=30,
     )
   '';
