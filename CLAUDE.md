@@ -53,12 +53,9 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | Command | What it does |
 |---|---|
 | `nix build` | Build the workspace (release profile with thin LTO) |
-| `nix build .#ci-local-fast` | Full local validation: build, clippy, nextest, doc, coverage, pre-commit, 30s fuzz smoke ×8 |
-| `nix build .#ci-local-slow` | Same as `ci-local-fast` but with 10-min fuzz instead of 30s smoke |
-| `nix build .#ci-fast` / `.#ci-slow` | Same as `ci-local-*` plus VM tests (Linux+KVM only — typically via `nix-build-remote`) |
-| `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 30s fuzz smoke, VM tests) |
+| `nix-build-remote -- .#ci` | Full validation: build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz ×8, all VM tests (Linux+KVM only) |
+| `nix flake check` | Runs all `checks.*` (build, clippy, nextest, doc, coverage, 2min fuzz, VM tests) |
 | `nix develop .#stable` | Dev shell with stable Rust (CI parity) |
-| `nix build .#fuzz-nightly-<target>` | 10-minute nightly-tier fuzz run for a single target |
 | `nix build .#checks.x86_64-linux.tracey-validate` | Spec-coverage validation (r[...] annotation integrity) |
 | `tracey query status` | Spec-coverage summary (in dev shell) |
 | `nix fmt` | Same as `treefmt` |
@@ -66,23 +63,16 @@ cd rio-nix/fuzz && cargo fuzz run wire_primitives
 | `nix-build-remote -- .#cov-vm-phase1a` | Run one VM test in coverage mode (debugging, raw profraws at `result/coverage/`) |
 | `nix build .#coverage-vm-phase1a` | Per-test lcov from one coverage-mode VM run |
 
-### CI aggregate targets
+### CI aggregate target
 
-Single-target validation bundles — build one of these instead of remembering individual checks:
-
-|                | 30s fuzz smoke | 10min fuzz nightly |
-|----------------|----------------|--------------------|
-| **no VM tests** | `ci-local-fast` | `ci-local-slow` |
-| **with VM tests** | `ci-fast` | `ci-slow` |
-
-The VM-including aggregates need KVM — use `nix-build-remote -- .#ci-slow`. On non-Linux, `ci-local-*` degrades to cargo checks + pre-commit only (fuzz is Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
+`nix-build-remote -- .#ci` bundles all checks + VM tests + 2min fuzz into a single build. Needs KVM for the VM tests. On non-Linux, degrades to cargo checks + pre-commit only (VM tests and fuzz are both Linux-only). Result is a directory of symlinks to each constituent's output (`ls result/`).
 
 ### Coverage
 
 Two tiers:
 
 - **Unit-test only** (~5min): `nix build .#checks.x86_64-linux.coverage`. Output: `result/lcov.info`. HTML via `nix build .#coverage-html`.
-- **Combined unit+VM** (~25min, manual, needs KVM): `nix-build-remote -- .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-phase*.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `ci-fast`/`ci-slow` — invoke on demand.
+- **Combined unit+VM** (~25min, manual, needs KVM): `nix-build-remote -- .#coverage-full`. Output: `result/lcov.info` (combined), `result/html/`, `result/per-test/vm-phase*.lcov`. Fills the ~15% "permanently red" gap of VM-only code (FUSE callbacks, namespace setup, cgroup tracking, main.rs wiring, k8s lease/reconcilers, SSH accept loop). **Not** in `.#ci` — invoke on demand.
 
 VM coverage architecture (`nix/coverage.nix`):
 
@@ -128,10 +118,9 @@ nix develop -c bash -c 'cd rio-nix/fuzz && cargo fuzz run wire_primitives'
 nix develop -c bash -c 'cd rio-store/fuzz && cargo fuzz run manifest_deserialize'
 ```
 
-CI equivalents:
+CI equivalent:
 ```bash
-nix build .#checks.x86_64-linux.fuzz-smoke-wire_primitives  # 30s smoke (PR tier, in flake check)
-nix build .#fuzz-nightly-wire_primitives                    # 10min (nightly tier, explicit)
+nix build .#checks.x86_64-linux.fuzz-wire_primitives  # 2min, in flake check
 ```
 
 When adding a new parser, also add a fuzz target:

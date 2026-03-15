@@ -22,8 +22,8 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 - `build_result_parsing` --- BuildResult wire format (status, error message, timing, built outputs)
 - `manifest_deserialize` (rio-store) --- chunk manifest deserialization
 - Run continuously via `cargo-fuzz` / `libFuzzer`:
-  - **PR tier:** 30s/target smoke run with seed corpus (`nix flake check` includes `checks.fuzz-smoke-*`)
-  - **Nightly tier:** 10min/target deep run (`nix build .#fuzz-nightly-<target>`, or via `.#ci-slow` aggregate)
+  - **CI tier:** 2min/target run with seed corpus (`nix flake check` includes `checks.fuzz-*`)
+  - **Deep runs:** `cd <crate>/fuzz && cargo fuzz run <target>` in the dev shell — libFuzzer accumulates corpus in `./corpus/`
   - Corpus seeded from `rio-nix/fuzz/corpus/<target>/` and `rio-store/fuzz/corpus/<target>/` (committed seeds prefixed `seed-`; NAR seeds regenerable via `gen-nar-corpus.sh`)
 
 ## Unit Tests
@@ -86,16 +86,14 @@ Security-critical protocol parsers must be fuzz-tested. Targets live in per-crat
 
 | Tier | Trigger | Tests | Aggregate target | Time Budget |
 |------|---------|-------|------------------|-------------|
-| PR | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 30s fuzz smoke ×8 | `.#ci-local-fast` | < 5 min |
-| Merge | Every merge to main | + VM integration tests (see below) | `.#ci-fast` | < 15 min |
-| Nightly | Scheduled | + 10min fuzz ×8 | `.#ci-slow` | < 60 min |
+| CI | Every push | Unit tests, clippy, treefmt, live-daemon golden conformance tests, cargo-deny, 2min fuzz ×8, VM integration tests | `.#ci` | < 20 min |
 | Weekly | Scheduled | + EKS cluster tests, chaos tests, load tests | — | Unbounded |
 
 > **Phase 4 deferral:** criterion benchmarks, Nix multi-version compatibility matrix, and `cargo-mutants` mutation testing are not yet wired into any CI tier.
 
 ## VM Integration Tests
 
-NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci-fast` (needs KVM):
+NixOS-VM tests exercise full-system flows with real kernel features (FUSE, cgroup v2, overlayfs, k3s). Each test spins up 2--5 QEMU VMs via `nixosTest`. Run via `nix-build-remote .#ci` (needs KVM):
 
 | Test | VMs | Validates |
 |------|-----|-----------|

@@ -43,8 +43,8 @@ cargo clippy --all-targets -- --deny warnings
 # Format (runs rustfmt + nixfmt + taplo via treefmt)
 nix fmt
 
-# Full local validation (build, clippy, nextest, doc, coverage, pre-commit, 30s fuzz smoke)
-nix build .#ci-local-fast
+# Full validation (build, clippy, nextest, doc, coverage, pre-commit, 2min fuzz, VM tests)
+nix-build-remote -- .#ci
 ```
 
 ## Code Style
@@ -71,7 +71,7 @@ The scope regex only allows alphanumerics and `-`/`_`/`/` --- **no commas** in t
 1. **Branch from `main`**, name branches descriptively (e.g., `feat/nar-streaming`, `fix/handshake-padding`)
 2. **Keep PRs focused** --- one logical change per PR
 3. **Write tests** for new functionality. Protocol parsers must include property-based tests (`proptest`)
-4. **Run `nix build .#ci-local-fast`** before opening a PR --- this bundles all local validation
+4. **Run `nix-build-remote -- .#ci`** before opening a PR --- this bundles all validation including VM tests (needs KVM — use the remote builder)
 5. **Update docs** if your change affects the design or configuration
 
 ## Project Structure

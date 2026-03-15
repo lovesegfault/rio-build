@@ -76,6 +76,6 @@ The FOD-proxy test (Squid allowlist) is a new `scenarios/fod-proxy.nix` on
 
 ## Milestone
 
-All three sub-phase milestones pass. `ci-fast` aggregate includes the standalone-fixture scenarios (`vm-{protocol,scheduling,security,observability}-standalone`); `ci-slow` adds the k3s scenarios (`vm-{lifecycle,leader-election}-k3s`). Grafana dashboards render against a `vm-lifecycle-k3s` Prometheus scrape. `rio-cli status/workers/builds/gc/cutoffs` works against the live scheduler (section E in `scenarios/cli.nix`). `helm install --dry-run` renders without errors.
+All three sub-phase milestones pass. The `.#ci` aggregate includes all standalone-fixture scenarios (`vm-{protocol,scheduling,security,observability}-standalone`) and k3s scenarios (`vm-{lifecycle,leader-election}-k3s`). Grafana dashboards render against a `vm-lifecycle-k3s` Prometheus scrape. `rio-cli status/workers/builds/gc/cutoffs` works against the live scheduler (section E in `scenarios/cli.nix`). `helm install --dry-run` renders without errors.
 
 **Manual post-phase verification:** Deploy the Helm chart to a real (non-VM) k8s cluster, seed a tenant, run `rio-cli status` — documented procedure in `docs/src/capacity-planning.md`, not in the CI gate.

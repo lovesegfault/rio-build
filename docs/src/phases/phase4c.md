@@ -46,7 +46,7 @@
   - Section I (security) → `scenarios/security.nix`. (i) binary cache auth: unauthenticated `curl /{storePathHash}.narinfo` → 401, with Bearer token from `tenants` seed → 200; (ii) mTLS rejection: gRPC `QueryPathInfo` with no client cert → TLS handshake fails (already partly covered by `mtls-reject` subtest — extend it).
   - Section J (load) → `scenarios/scheduling.nix`. 50-derivation DAG, assert completion + `rio_scheduler_derivations_completed_total >= 50`.
 - [ ] **FOD-proxy test** → new `scenarios/fod-proxy.nix` on `k3s-full` with `fodProxy.enabled=true`. Squid as a k8s pod (tests the production `fod-proxy.yaml` template directly). Local HTTP origin (busybox httpd pod) for airgap-safe fetch — same pattern as `drvs.coldBootstrapServer`. ConfigMap patch adds the local origin to the Squid allowlist. Assertions: FOD fetching allowlisted hostname → success + Squid access log shows the request; FOD fetching non-allowlisted → `TCP_DENIED/403` in Squid log; non-FOD derivation → no `http_proxy` env set. New `dockerImages.squid` in `nix/docker.nix` (~25 lines).
-- [ ] Register `vm-netpol-k3s` + `vm-fod-proxy-k3s` in `nix/tests/default.nix`. Add to `ci-slow` (slow k3s tests).
+- [ ] Register `vm-netpol-k3s` + `vm-fod-proxy-k3s` in `nix/tests/default.nix` (picked up automatically by `.#ci`).
 
 ### Grafana + benchmarks
 
@@ -111,4 +111,4 @@
 
 ## Milestone
 
-`NIXBUILDNET_REUSE_BUILD_FAILURES=false nix-build-remote --no-nom -- -L .#ci-fast` passes with `vm-phase4` and `vm-phase4-fod` in the aggregate. `tracey query validate` shows 0 errors with the new markers. Grafana dashboards render against a live `vm-phase4` Prometheus. `nix run .#bench` reports SubmitBuild p99 < 50ms at N=100.
+`NIXBUILDNET_REUSE_BUILD_FAILURES=false nix-build-remote --no-nom -- -L .#ci` passes with `vm-phase4` and `vm-phase4-fod` in the aggregate. `tracey query validate` shows 0 errors with the new markers. Grafana dashboards render against a live `vm-phase4` Prometheus. `nix run .#bench` reports SubmitBuild p99 < 50ms at N=100.
