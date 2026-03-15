@@ -129,10 +129,15 @@ workerPool:
 
 postgresql:
   enabled: true
-  # Chart defaults to tag:latest; pin to the digest-matched tag from
-  # nix/docker-pulled.nix. When nixhelm bumps the chart, this and the
-  # pullImage FOD update together.
+  # Pin the full image ref to what nix/docker-pulled.nix preloads.
+  # Bitnami chart defaults differ from what ctr imports as
+  # ("docker.io/..." via finalImageName); containerd does exact-string
+  # lookup so any mismatch → ImagePullBackOff in the airgapped VM.
+  # When nixhelm bumps the chart, this + the pullImage FOD update
+  # together.
   image:
+    registry: docker.io
+    repository: bitnami/postgresql
     tag: "18.3.0"
     pullPolicy: IfNotPresent
   auth:
