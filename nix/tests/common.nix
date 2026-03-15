@@ -313,6 +313,11 @@ rec {
   mkClientNode =
     {
       gatewayHost,
+      # k3s-full fixture: gateway is a NodePort Service, not port 2222.
+      gatewayPort ? 2222,
+      # Chart-deployed gateway uses `rio` (see gateway.yaml); NixOS module
+      # uses `root`.
+      gatewayUser ? "root",
       extraPackages ? [ ],
     }:
     {
@@ -335,8 +340,8 @@ rec {
       programs.ssh.extraConfig = ''
         Host ${gatewayHost}
           HostName ${gatewayHost}
-          User root
-          Port 2222
+          User ${gatewayUser}
+          Port ${toString gatewayPort}
           IdentityFile /root/.ssh/id_ed25519
           StrictHostKeyChecking no
           UserKnownHostsFile /dev/null

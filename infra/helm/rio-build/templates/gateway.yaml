@@ -125,4 +125,7 @@ spec:
     - name: ssh
       port: 22
       targetPort: ssh
+      {{- with $g.service.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
 {{- end }}

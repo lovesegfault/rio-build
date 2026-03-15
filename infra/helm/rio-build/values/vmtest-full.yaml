@@ -1,0 +1,149 @@
+# Full-chart VM test profile: all rio services + bitnami PG as pods.
+#
+# Unlike vmtest.yaml (controller-only, systemd control plane on a
+# separate VM), this renders gateway/scheduler/store/controller/PG
+# templates for the first time in CI. 2-node k3s via
+# nix/tests/fixtures/k3s-full.nix.
+#
+# Airgapped: all images preloaded via services.k3s.images. NodePort
+# gateway (no cloud LB). Inline chunk backend (no S3).
+
+global:
+  image:
+    tag: dev
+    pullPolicy: IfNotPresent
+  logLevel: debug
+
+namespace:
+  create: true
+  name: rio-system
+  # Workers need SYS_ADMIN for FUSE. Control plane is fine with
+  # restricted but shares the namespace.
+  podSecurityLabel: privileged
+
+# cert-manager not preloaded (phase4c, needs its own airgap images).
+# TLS tests run on the standalone fixture with openssl PKI.
+tls:
+  enabled: false
+
+# EKS-only (IRSA → Secrets Manager).
+externalSecrets:
+  enabled: false
+
+# EKS-only (NodePool CRDs need Karpenter controller).
+karpenter:
+  enabled: false
+
+# phase4c: needs kube-router/Calico enforcement pre-check.
+networkPolicy:
+  enabled: false
+
+# Tests the pdb.yaml template. Gateway PDB with minAvailable=1 is a
+# no-op at replicas=1 (blocks drain, which we don't do) but renders.
+podDisruptionBudget:
+  enabled: true
+
+# Tenant bootstrap: scenarios seed via `kubectl exec rio-postgresql-0`.
+bootstrap:
+  enabled: false
+
+controller:
+  enabled: true
+  # In-cluster Service DNS. hostNetwork=false — unlike vmtest.yaml,
+  # everything is in-cluster so CoreDNS works.
+  hostNetwork: false
+  schedulerAddr: rio-scheduler:9001
+  storeAddr: rio-store:9002
+  schedulerBalanceHost: rio-scheduler-headless
+  schedulerBalancePort: 9001
+
+store:
+  enabled: true
+  chunkBackend:
+    # inline = NARs in PG. No MinIO/Rook airgapped.
+    kind: inline
+
+scheduler:
+  enabled: true
+  # 2 replicas → podAntiAffinity spreads across k3s server + agent.
+  # Exercises leader election for scenarios/leader-election.nix.
+  replicas: 2
+  leaseName: rio-scheduler-leader
+  storeAddr: rio-store:9002
+
+gateway:
+  enabled: true
+  # 1 replica: no LB in VM. podAntiAffinity renders only at replicas>1.
+  replicas: 1
+  schedulerAddr: rio-scheduler:9001
+  storeAddr: rio-store:9002
+  schedulerBalanceHost: rio-scheduler-headless
+  schedulerBalancePort: 9001
+  service:
+    # NodePort so client VM connects to k3s-server:32222. No cloud LB.
+    type: NodePort
+    nodePort: 32222
+    annotations: {}
+  ssh:
+    # testScript creates this Secret from ssh-keygen output before
+    # waiting for the gateway deployment.
+    authorizedKeysSecret: rio-gateway-ssh
+    # Empty → ephemeral host key in emptyDir. Fine for a VM test;
+    # client uses StrictHostKeyChecking=no.
+    hostKeySecret: ""
+
+fodProxy:
+  enabled: false
+
+workerPool:
+  enabled: true
+  name: default
+  replicas:
+    # Scenarios that need >1 use --set workerPool.replicas.min=2.
+    # min=1 so there's always a worker ready (protocol-cold doesn't
+    # want to wait for autoscaling).
+    min: 1
+    max: 2
+  autoscaling:
+    metric: queueDepth
+    targetValue: 2
+  maxConcurrentBuilds: 1
+  fuseCacheSize: 5Gi
+  systems: [x86_64-linux]
+  features: []
+  sizeClass: ""
+  image: rio-worker
+  # Smaller than prod defaults — k3s agent VM is 4GB.
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+      ephemeral-storage: "6Gi"
+  # Required until the device-plugin path lands (ADR-012). k3s's
+  # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN.
+  privileged: true
+  # Blank: no Karpenter nodepools → no taints → no tolerations needed.
+  # Workers schedule on any node.
+  tolerations: []
+  nodeSelector: {}
+
+postgresql:
+  enabled: true
+  # Chart defaults to tag:latest; pin to the digest-matched tag from
+  # nix/docker-pulled.nix. When nixhelm bumps the chart, this and the
+  # pullImage FOD update together.
+  image:
+    tag: "18.3.0"
+    pullPolicy: IfNotPresent
+  auth:
+    database: rio
+    username: rio
+    password: rio
+  primary:
+    persistence:
+      # k3s local-path-provisioner (default storageClass) → host disk.
+      size: 2Gi
+    # Tiny — k3s VM is 4GB total.
+    resources:
+      requests: {cpu: 250m, memory: 256Mi}
+      limits: {memory: 512Mi}

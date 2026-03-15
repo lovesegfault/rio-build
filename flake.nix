@@ -422,6 +422,7 @@
                   helm template rio . --set global.image.tag=test > /dev/null
                   helm template rio . -f values/dev.yaml > /dev/null
                   helm template rio . -f values/vmtest.yaml > /dev/null
+                  helm template rio . -f values/vmtest-full.yaml > /dev/null
                   touch $out
                 '';
             # Coverage via `cargo llvm-cov nextest` (NOT `cargo llvm-cov test`).
