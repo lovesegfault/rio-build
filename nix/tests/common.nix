@@ -427,146 +427,18 @@ rec {
   # tests (both are "control"; phase1a doesn't build so N/A there).
   # `testDrvFile` is baked at Nix-eval time (per-phase; can be either
   # a `./foo.nix` path literal or a `pkgs.writeText` derivation).
-  # k3s server node + rio-controller systemd service. Extracted
-  # from phase3a.nix for reuse in phase3b.nix (Build CRD section).
-  #
-  # Two modes (mutually exclusive):
-  #
-  #   controllerEnv (legacy, phase3a/3b): rio-controller runs as a
-  #     SYSTEMD service with KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-  #     (cluster-admin — bypasses RBAC). manifests must include the
-  #     CRDs (typically {"00-rio-crds".source = crds;}).
-  #
-  #   helmRendered (phase4+): rio-controller runs as a POD, rendered
-  #     from the Helm chart via nix/helm-render.nix with the vmtest
-  #     values profile. Exercises the production ClusterRole + pod
-  #     template in CI (controller-as-systemd never did). manifests
-  #     are derived from helmRendered's 00-crds/01-rbac/02-workloads
-  #     split. extraK3sImages MUST include dockerImages.controller.
-  #
-  # manifests: extra services.k3s.manifests (merged on top of the
-  #   helmRendered-derived ones if set).
-  # extraK3sImages: images to preload beyond airgap-images.
-  #
-  # Returns a NixOS module function ({ config, ... }: { ... }).
-  # The caller provides hostName="k8s" via nodes.k8s attribute.
-  mkK3sNode =
-    {
-      controllerEnv ? null,
-      helmRendered ? null,
-      manifests ? { },
-      extraK3sImages ? [ ],
-    }:
-    assert (controllerEnv == null) != (helmRendered == null);
-    let
-      # helmRendered mode: feed the split YAML files into k3s manifests.
-      # k3s applies in filename order → CRDs establish before RBAC binds
-      # before the controller pod watches. Solves the RBAC bootstrap
-      # ordering that controller-as-systemd sidestepped with admin
-      # kubeconfig.
-      helmManifests =
-        if helmRendered != null then
-          {
-            "00-rio-crds".source = "${helmRendered}/00-crds.yaml";
-            "01-rio-rbac".source = "${helmRendered}/01-rbac.yaml";
-            "02-rio-workloads".source = "${helmRendered}/02-workloads.yaml";
-          }
-        else
-          { };
-    in
-    { config, ... }:
-    {
-      networking = {
-        hostName = "k8s";
-        # 6443 = k3s apiserver. 8472 = flannel VXLAN.
-        firewall.allowedTCPPorts = [ 6443 ];
-        firewall.allowedUDPPorts = [ 8472 ];
-      };
-
-      # k3s needs swap off (kubelet check). NixOS test VMs don't
-      # enable swap by default, but make it explicit.
-      swapDevices = [ ];
-
-      # FUSE kernel module — /dev/fuse must exist on the HOST for
-      # the hostPath CharDevice volume to mount.
-      boot.kernelModules = [ "fuse" ];
-
-      # cgroup v2 unified hierarchy (explicit — if it fell back
-      # to hybrid, worker's own_cgroup() parser fails).
-      boot.kernelParams = [ "systemd.unified_cgroup_hierarchy=1" ];
-
-      services.k3s = {
-        enable = true;
-        role = "server";
-        extraFlags = [
-          # eth1 = test vlan (inter-VM). eth0 = slirp (mgmt) —
-          # flannel doesn't work there (no broadcast).
-          "--flannel-iface"
-          "eth1"
-          # Disable unneeded components: ingress, K8s metrics.
-          "--disable"
-          "traefik"
-          "--disable"
-          "metrics-server"
-          # SAN: cross-VM clients (scheduler for Lease, phase3b
-          # controller) reach https://k8s:6443; cert must include
-          # `k8s` or TLS verification rejects.
-          "--tls-san"
-          "k8s"
-        ];
-        # Airgap: NixOS test VMs have no internet. Preload k3s's
-        # own pod images + any caller-provided ones. Note: `ctr
-        # images import` runs as a separate oneshot unit AFTER
-        # k3s.service starts — on slow storage (ARC runner EBS),
-        # pods may try to schedule before import completes and
-        # ErrImagePull. The testScript should wait for import via
-        # `k3s ctr images ls | grep -q pause` before proceeding.
-        images = [ config.services.k3s.package.airgap-images ] ++ extraK3sImages;
-        manifests = helmManifests // manifests;
-      };
-
-      systemd = {
-        # containerd needs cgroup delegation to create pod cgroups.
-        # Without this: pods stuck in ContainerCreating.
-        services.k3s.serviceConfig.Delegate = "yes";
-
-        # rio-controller systemd unit (legacy mode only — helmRendered
-        # runs it as a pod instead).
-        services.rio-controller = pkgs.lib.mkIf (controllerEnv != null) {
-          description = "rio-controller (K8s operator)";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "k3s.service" ];
-          requires = [ "k3s.service" ];
-          # covEnv propagates LLVM_PROFILE_FILE — the controller's
-          # builders.rs checks this env var and, if set, injects a
-          # hostPath cov volume + env into the worker pod (phase3a).
-          environment = controllerEnv // covEnv;
-          serviceConfig = {
-            ExecStart = "${rio-workspace}/bin/rio-controller";
-            Restart = "on-failure";
-            RestartSec = 5;
-          };
-        };
-
-        tmpfiles.rules = covTmpfiles;
-      };
-
-      environment.systemPackages = [
-        pkgs.curl
-        pkgs.kubectl
-      ];
-
-      virtualisation = {
-        memorySize = 4096 + covMemBump;
-        cores = 8;
-        diskSize = 8192;
-      };
-    };
-
   # ── Coverage profraw collection (appended to end of testScript) ─────
   #
   # When coverage=true, stops all rio services (SIGTERM → graceful
   # drain via shutdown_signal → atexit → LLVM profraw flush), tars
+  #
+  # TODO(phase4c): scheduler profraw collection is broken for any test
+  # that runs builds. lcov shows 0/360 coverage for actor/mod.rs in ALL
+  # tests except phase1a (idle scheduler, no builds). systemctl stop
+  # likely times out on worker-stream drain → SIGKILL → no atexit.
+  # Fix: settle the queue (wait for builds_running==0) before stop, or
+  # increase TimeoutStopSec, or send SIGTERM to workers first so
+  # scheduler streams close before scheduler stop fires.
   # /var/lib/rio/cov, and copies to $out/coverage/<node>/.
   #
   # `pyNodeVars` is a Python expression evaluating to a list of Machine

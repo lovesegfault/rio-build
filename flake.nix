@@ -422,7 +422,6 @@
                   # Default (prod) profile: tag must be set (empty → bad image ref).
                   helm template rio . --set global.image.tag=test > /dev/null
                   helm template rio . -f values/dev.yaml > /dev/null
-                  helm template rio . -f values/vmtest.yaml > /dev/null
                   helm template rio . -f values/vmtest-full.yaml > /dev/null
                   touch $out
                 '';
@@ -508,18 +507,14 @@
           };
 
           # --------------------------------------------------------------
-          # Per-phase VM tests (Linux-only — need NixOS VMs + KVM)
+          # Scenario×fixture VM tests (Linux-only — need NixOS VMs + KVM)
           # --------------------------------------------------------------
           #
-          # Each validates the corresponding milestone in docs/src/phases/.
-          #
-          #   vm-phase1a — 2 VMs: read-only opcodes (path-info, store ls)
-          #   vm-phase1b — 3 VMs: single-worker end-to-end build
-          #   vm-phase2a — 4 VMs: distributed build across 2+ workers
-          #   vm-phase2b — 5 VMs: chain + cache-hit + log pipeline + Tempo (OTLP)
-          #   vm-phase2c — 5 VMs: CA + critical-path + size-class + circuit-breaker
-          #   vm-phase3a — 3 VMs: k3s operator, WorkerPool CRD, cgroup memory.peak
-          #   vm-phase3b — 4 VMs: mTLS, HMAC, recovery, GC, Build CRD
+          #   vm-protocol-{warm,cold}-standalone — 3 VMs: opcode coverage
+          #   vm-scheduling-standalone — 5 VMs: fanout, size-class, cgroup
+          #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
+          #   vm-observability-standalone — 5 VMs: metrics, traces, logs
+          #   vm-{lifecycle,leader-election}-k3s — 2-node k3s, ci-slow only
           #
           # mkVmTests: build the attrset for a given (workspace,
           # dockerImages, coverage) triple. vmTests uses the normal
@@ -556,22 +551,13 @@
                   coverage
                   ;
                 rioModules = inputs.self.nixosModules;
-                inherit (inputs.self.packages.${system}) crds;
                 inherit (inputs) nixhelm;
               };
-              # Per-test builder CPU hint. withMinCpu sets requiredSystem
-              # Features to prevent oversubscription (vm-phase2a once got
-              # 5 CPUs for 4 VMs → 16 vCPUs on 5 → qemu stall). Default 4
+              # Per-test builder CPU hint. withMinCpu sets
+              # NIXBUILDNET_MIN_CPU (numVMs × 4 + 1) to prevent
+              # oversubscription → TCG fallback → qemu stall. Default 4
               # for anything not in the table.
               cpuHints = {
-                vm-phase1a = 2;
-                vm-phase1b = 3;
-                vm-phase2a = 4;
-                vm-phase2b = 5;
-                vm-phase2c = 5;
-                vm-phase3a = 4;
-                vm-phase3b = 4;
-                vm-phase4 = 4;
                 # 3 VMs (control+worker+client). Control is 4-core.
                 vm-protocol-warm-standalone = 3;
                 vm-protocol-cold-standalone = 3;
