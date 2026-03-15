@@ -150,7 +150,7 @@ def dump_all_logs(nodes, kube_node=None, kube_namespace="rio-system"):
 # ExportTraceServiceRequest protos as JSON, one resourceSpans batch
 # per line. We flatten to a list of (service_name, trace_id, span).
 
-def load_otel_spans(node, path="/var/lib/otelcol/traces.json"):
+def load_otel_spans(node, path="/var/lib/opentelemetry-collector/traces.json"):
     raw = node.succeed(f"cat {path} 2>/dev/null || echo ''")
     spans = []
     for line in raw.splitlines():

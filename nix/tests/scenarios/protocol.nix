@@ -174,6 +174,14 @@ let
         )
         assert "busybox" in ls_output, f"missing busybox binary: {ls_output!r}"
 
+    # ── phase1a: wopIsValidPath ──────────────────────────────────────
+    with subtest("store verify (wopIsValidPath)"):
+        # --no-trust skips signature checks; --no-contents skips NAR
+        # hash recomputation. What's left: wopIsValidPath for the path.
+        client.succeed(
+            f"nix store verify --no-trust --store '{store_url}' ${common.busybox}"
+        )
+
     # ── phase1a: negative path ───────────────────────────────────────
     with subtest("nonexistent path: clean error, no hang"):
         client.fail(

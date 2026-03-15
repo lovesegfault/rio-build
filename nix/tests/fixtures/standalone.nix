@@ -92,14 +92,22 @@ let
   # File exporter writes one ExportTraceServiceRequest JSON per line.
   # lib/assertions.py load_otel_spans() parses it. debug exporter
   # duplicates spans to journalctl for `systemctl status` debugging.
+  #
+  # GOTCHAS:
+  #   - `file` exporter is in otelcol-CONTRIB, not the base package.
+  #     Base package → "unknown exporters type: file" → service fails.
+  #   - Service runs with DynamicUser=true + StateDirectory=
+  #     opentelemetry-collector → only /var/lib/opentelemetry-collector
+  #     is writable. Writing elsewhere → permission denied.
   otelModule = lib.optionalAttrs withOtel {
     services.opentelemetry-collector = {
       enable = true;
+      package = pkgs.opentelemetry-collector-contrib;
       settings = {
         receivers.otlp.protocols.grpc.endpoint = "0.0.0.0:4317";
         exporters = {
           file = {
-            path = "/var/lib/otelcol/traces.json";
+            path = "/var/lib/opentelemetry-collector/traces.json";
             format = "json";
           };
           debug.verbosity = "normal";
@@ -113,7 +121,6 @@ let
         };
       };
     };
-    systemd.tmpfiles.rules = [ "d /var/lib/otelcol 0755 root root -" ];
     networking.firewall.allowedTCPPorts = [ 4317 ];
   };
 
@@ -140,13 +147,22 @@ let
       })
       otelModule
     ];
-    # Gateway CN override. mkControlNode's extraServiceEnv applies
-    # controlTlsEnv to ALL three services (including gateway). NixOS
-    # module merge of two string values for the same key → conflict.
-    # mapAttrs mkForce makes the gateway cert paths win unambiguously.
-    systemd.services.rio-gateway.environment = lib.mkIf withPki (
-      lib.mapAttrs (_: lib.mkForce) gatewayTlsEnv
-    );
+    systemd.services = {
+      # Gateway CN override. mkControlNode's extraServiceEnv applies
+      # controlTlsEnv to ALL three services (including gateway). NixOS
+      # module merge of two string values for the same key → conflict.
+      # mapAttrs mkForce makes the gateway cert paths win unambiguously.
+      rio-gateway.environment = lib.mkIf withPki (lib.mapAttrs (_: lib.mkForce) gatewayTlsEnv);
+      # OTel ordering: rio-* services on control must start AFTER
+      # otelcol. Without this, the services boot, try to connect to
+      # each other during boot churn, and the restart dance adds ~10s
+      # of flake. After= doesn't block startup if otelcol is disabled
+      # (unit doesn't exist → no-op), so the mkIf guard is belt-and-
+      # suspenders.
+      rio-store.after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+      rio-scheduler.after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+      rio-gateway.after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+    };
   };
 
   # ── Worker nodes ────────────────────────────────────────────────────

@@ -92,6 +92,14 @@ pkgs.testers.runNixOSTest {
     # Port map (nix/modules/*.nix defaults):
     #   gateway=9090  scheduler=9091  store=9092  worker=9093
     # scrape_metrics uses curl localhost — firewall irrelevant.
+    #
+    # ONLY includes metrics that FIRE during a successful chain build:
+    #   - no cache hits (first build) → rio_scheduler_cache_hits_total absent
+    #   - no disconnects → rio_scheduler_worker_disconnects_total absent
+    #   - inline chunk backend → rio_store_chunk_cache_* absent
+    # Those counters exist (grep rio-*/src/lib.rs describe_counter!) but
+    # metrics-rs only registers on first increment. Scheduling scenario
+    # covers worker_disconnects; protocol-warm covers cache_hits.
     EXPECTED_METRICS = {
         (${gatewayHost}, 9090, "gateway"): [
             "rio_gateway_connections_total",
@@ -105,24 +113,22 @@ pkgs.testers.runNixOSTest {
             "rio_scheduler_builds_total",
             "rio_scheduler_builds_active",
             "rio_scheduler_assignments_total",
-            "rio_scheduler_cache_hits_total",
             "rio_scheduler_log_lines_forwarded_total",
-            "rio_scheduler_worker_disconnects_total",
         ],
         (${gatewayHost}, 9092, "store"): [
             "rio_store_put_path_total",
-            "rio_store_chunk_cache_hits_total",
-            "rio_store_chunk_cache_misses_total",
-        ],
-        # Any worker will do — all three built exactly one derivation.
-        (worker1, 9093, "worker"): [
-            "rio_worker_builds_total",
-            "rio_worker_builds_active",
-            "rio_worker_fuse_cache_hits_total",
-            "rio_worker_fuse_cache_misses_total",
-            "rio_worker_uploads_total",
         ],
     }
+    # Worker metrics checked separately below — chain is sequential
+    # (A→B→C), scheduler MAY dispatch all 3 to one worker. Find one
+    # that actually built. The metrics exist; we just need a worker
+    # that incremented them.
+    EXPECTED_WORKER_METRICS = [
+        "rio_worker_builds_total",
+        "rio_worker_builds_active",
+        "rio_worker_fuse_cache_misses_total",
+        "rio_worker_uploads_total",
+    ]
 
     with subtest("metrics-registered: spec'd metrics present on /metrics"):
         for (node, port, component), names in EXPECTED_METRICS.items():
@@ -134,6 +140,29 @@ pkgs.testers.runNixOSTest {
                 f"  present rio_{component}_* metrics: "
                 f"{sorted(m for m in present if m.startswith(f'rio_{component}_'))}"
             )
+
+        # Find a worker that actually built something, then check it
+        # has all expected worker metrics. (Proves the metrics exist
+        # in the rio-worker binary; scheduling scenario proves exact
+        # per-worker counts.)
+        busy_worker = None
+        for w in workers:
+            scraped = scrape_metrics(w, 9093)
+            if "rio_worker_builds_total" in scraped:
+                busy_worker = (w, scraped)
+                break
+        assert busy_worker is not None, (
+            "no worker has rio_worker_builds_total — chain build "
+            "didn't dispatch anywhere?"
+        )
+        w, scraped = busy_worker
+        present = set(scraped.keys())
+        missing = [n for n in EXPECTED_WORKER_METRICS if n not in present]
+        assert not missing, (
+            f"worker {w.name} (:9093) missing metrics: {missing}\n"
+            f"  present rio_worker_* metrics: "
+            f"{sorted(m for m in present if m.startswith('rio_worker_'))}"
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # log-pipeline: worker LogBatcher → scheduler → gateway STDERR_NEXT

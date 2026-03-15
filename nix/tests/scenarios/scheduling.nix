@@ -137,18 +137,21 @@ pkgs.testers.runNixOSTest {
         assert_metric_ge(${gatewayHost}, 9091,
             "rio_scheduler_builds_total", 1.0, labels='{outcome="success"}')
 
-        # Distribution: EACH worker executed ≥1 derivation. With 4
-        # parallel leaves, 4 small slots (2×2) + 1 large slot, all
-        # three workers should get at least one leaf. If any worker
-        # sat idle, dispatch is broken (scheduler not round-robin,
-        # or worker registration metadata wrong).
-        for w in all_workers:
+        # Distribution: EACH SMALL worker executed ≥1 derivation.
+        # With size-classes configured, no-pname leaves route to the
+        # default class ("small") → wlarge gets nothing from this
+        # fanout. 4 parallel leaves + 4 small slots (2×2) means BOTH
+        # small workers get at least one leaf. If either sat idle,
+        # dispatch is broken (scheduler not round-robin, or worker
+        # registration metadata wrong).
+        for w in small_workers:
             assert_metric_ge(w, 9093,
                 "rio_worker_builds_total", 1.0, labels='{outcome="success"}')
 
-        # FUSE fetch: each worker pulled ≥1 path from rio-store
-        # (busybox must be fetched before any build runs).
-        for w in all_workers:
+        # FUSE fetch: each SMALL worker pulled ≥1 path from rio-store
+        # (busybox must be fetched before any build runs). wlarge
+        # never built anything → never fetched anything.
+        for w in small_workers:
             assert_metric_ge(w, 9093,
                 "rio_worker_fuse_cache_misses_total", 1.0)
 
@@ -156,6 +159,25 @@ pkgs.testers.runNixOSTest {
         # ≥5 to be robust against retries.
         assert_metric_ge(${gatewayHost}, 9092,
             "rio_store_put_path_total", 5.0, labels='{result="created"}')
+
+        # PrefetchHint: the collector (rio-root) has 4 DAG children.
+        # When root dispatches, approx_input_closure returns the 4
+        # leaf output paths. Worker bloom filter is cold (first hint
+        # for that worker) → hint sent with ≥1 path. paths_sent is
+        # tighter than hints_sent: an empty-hint bug (message sent,
+        # 0 paths) would pass hints≥1 but fail paths≥1. (phase3a:485)
+        assert_metric_ge(${gatewayHost}, 9091,
+            "rio_scheduler_prefetch_paths_sent_total", 1.0)
+
+        # content_index populated: every PutPath inserts a row. ≥5
+        # (same bound as put_path_total above). Proves the insert is
+        # wired in the real binary, not just unit tests. (phase2c:304)
+        ci_count = int(psql(${gatewayHost},
+            "SELECT count(*) FROM content_index"))
+        assert ci_count >= 5, (
+            f"content_index should have ≥5 entries after fanout; "
+            f"got {ci_count}"
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # sizeclass — psql-seeded EMA routes bigthing to large
@@ -285,8 +307,8 @@ pkgs.testers.runNixOSTest {
                 bg["out"] = build("${reassignDrv}", capture_stderr=False).strip()
             except Exception as e:
                 bg["err"] = e
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
+        bg_thread = threading.Thread(target=_bg, daemon=True)
+        bg_thread.start()
 
         # Find which SMALL worker got the assignment. No-pname drv →
         # estimator default → "small" class. With 4 small slots free
@@ -319,8 +341,8 @@ pkgs.testers.runNixOSTest {
         # Wait for the background build to complete. Worst case: the
         # first attempt ran ~20s before kill, then a fresh 25s run on
         # another worker, plus scheduler tick latency. 120s is generous.
-        t.join(timeout=120)
-        assert not t.is_alive(), (
+        bg_thread.join(timeout=120)
+        assert not bg_thread.is_alive(), (
             "reassign build thread did not finish within 120s "
             "(hung? scheduler didn't requeue?)"
         )
