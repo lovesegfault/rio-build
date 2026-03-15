@@ -304,16 +304,19 @@ in
     # scales STS to 1 immediately. FUSE device hostPath needs the
     # node's /dev/fuse to exist (boot.kernelModules = ["fuse"] above).
     #
-    # Diagnostic dump BEFORE the wait: if the STS never appears,
-    # controller logs + WorkerPool status explain why. >&2 so it
-    # lands in the test driver log (via -L).
+    # Diagnostic dump: controller logs + STS describe (shows why
+    # pod isn't created) + all pods. First a short wait so the STS
+    # controller has time to process; then dump; then the real wait.
+    k3s_server.execute("sleep 20")
     k3s_server.execute(
         "echo '--- WORKER DIAGNOSTIC ---' >&2; "
-        "k3s kubectl get workerpool -A -o yaml >&2 2>&1; "
-        "echo '--- controller logs ---' >&2; "
-        "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=50 >&2 2>&1; "
-        "echo '--- STS list ---' >&2; "
-        "k3s kubectl get sts -A >&2 2>&1; "
+        "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=30 >&2 2>&1; "
+        "echo '--- describe sts ---' >&2; "
+        "k3s kubectl -n ${ns} describe sts default-workers >&2 2>&1; "
+        "echo '--- get pods -A ---' >&2; "
+        "k3s kubectl get pods -A -o wide >&2 2>&1; "
+        "echo '--- events ---' >&2; "
+        "k3s kubectl get events -A --sort-by=.lastTimestamp >&2 2>&1 | tail -30; "
         "echo '--- END DIAGNOSTIC ---' >&2"
     )
     k3s_server.wait_until_succeeds(
