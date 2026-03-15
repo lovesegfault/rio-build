@@ -160,8 +160,8 @@ in
   };
 
   # ── k3s-full scenarios ───────────────────────────────────────────────
-  # First boot of the 2-node k3s fixture with full chart. Slow (~4min
-  # waitReady), belong in ci-slow.
+  # First boot of the 2-node k3s fixture with full chart. Slow
+  # (~4min waitReady).
   vm-lifecycle-k3s = lifecycle {
     inherit pkgs common;
     fixture = k3sFull {

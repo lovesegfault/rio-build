@@ -259,8 +259,7 @@
           #
           # Produces:
           #   fuzz.builds.rio-{nix,store}-fuzz-build  — compiled target binaries
-          #   fuzz.smoke    — 30s PR-tier checks, keyed fuzz-smoke-<target>
-          #   fuzz.nightly  — 10min nightly runs, keyed fuzz-nightly-<target>
+          #   fuzz.runs   — 2min checks, keyed fuzz-<target>
           fuzz = import ./nix/fuzz.nix {
             inherit
               pkgs
@@ -514,7 +513,7 @@
           #   vm-scheduling-standalone — 5 VMs: fanout, size-class, cgroup
           #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
-          #   vm-{lifecycle,leader-election}-k3s — 2-node k3s, ci-slow only
+          #   vm-{lifecycle,leader-election}-k3s — 2-node k3s fixture
           #
           # mkVmTests: build the attrset for a given (workspace,
           # dockerImages, coverage) triple. vmTests uses the normal
@@ -611,21 +610,18 @@
           );
 
           # --------------------------------------------------------------
-          # CI aggregate targets
+          # CI aggregate target
           # --------------------------------------------------------------
           #
-          # Single-target validation bundles. Built via linkFarmFromDrvs —
+          # Single-target validation bundle. Built via linkFarmFromDrvs —
           # result is a directory of symlinks to each constituent's output
           # (inspectable with `ls result/`).
           #
-          #                   | 30s fuzz smoke | 10min fuzz nightly
-          #   ----------------+----------------+-------------------
-          #   no VM tests     | ci-local-fast  | ci-local-slow
-          #   with VM tests   | ci-fast        | ci-slow
-          #
-          # VM-including aggregates are Linux-only (need KVM) — typically
-          # built via nix-build-remote. On non-Linux, ci-local-* degrades
-          # to cargoChecks + pre-commit only (fuzz is also Linux-only).
+          # All VM tests (including k3s scenarios) + 2min fuzz. On
+          # non-Linux, degrades to cargo checks + pre-commit only (VM
+          # tests and fuzz are both optionalAttrs isLinux upstream).
+          # Linux+KVM required for the full set — typically via
+          # `nix-build-remote -- .#ci`.
 
           # Base constituents present in every aggregate.
           # fuzz-build is NOT listed — it's a transitive dep of every fuzz
@@ -644,47 +640,11 @@
             config.checks.pre-commit
           ];
 
-          # k3s-full scenarios (vm-*-k3s) boot a 2-node cluster with
-          # 6 airgapped images + bitnami PG. ~4min waitReady under KVM,
-          # ~7min under TCG. They stabilize separately from the standalone
-          # scenarios and belong in ci-slow only.
-          isK3sTest = name: pkgs.lib.hasSuffix "-k3s" name;
-
-          mkCiAggregate =
-            {
-              name,
-              fuzz,
-              vmTestSet ? { },
-            }:
-            pkgs.linkFarmFromDrvs "rio-${name}" (
-              ciBaseDrvs ++ builtins.attrValues fuzz ++ builtins.attrValues vmTestSet
-            );
-
-          ciAggregates = {
-            ci-local-fast = mkCiAggregate {
-              name = "ci-local-fast";
-              fuzz = fuzz.smoke;
-            };
-            ci-local-slow = mkCiAggregate {
-              name = "ci-local-slow";
-              fuzz = fuzz.nightly;
-            };
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            ci-fast = mkCiAggregate {
-              name = "ci-fast";
-              fuzz = fuzz.smoke;
-              # Standalone scenarios + legacy phase tests. k3s-full
-              # scenarios excluded (too slow for PR gate, stabilize in
-              # ci-slow first).
-              vmTestSet = pkgs.lib.filterAttrs (n: _: !isK3sTest n) vmTests;
-            };
-            ci-slow = mkCiAggregate {
-              name = "ci-slow";
-              fuzz = fuzz.nightly;
-              vmTestSet = vmTests;
-            };
-          };
+          ci = pkgs.linkFarmFromDrvs "rio-ci" (
+            ciBaseDrvs
+            ++ builtins.attrValues fuzz.runs
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (builtins.attrValues vmTests)
+          );
 
           # ──────────────────────────────────────────────────────────
           # GitHub Actions integration
@@ -703,7 +663,7 @@
           # everything else on `rio-ci` (spot). This keeps the flake
           # emitting simple name→drv maps without per-entry metadata.
           #
-          # CI runners are Linux-only. vmTests/coverage/fuzz.smoke are
+          # CI runners are Linux-only. vmTests/coverage/fuzz.runs are
           # all optionalAttrs isLinux upstream, so this whole block is
           # too — on Darwin it's {} (harmless).
           githubActions = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -721,12 +681,11 @@
                   ;
                 inherit (config.checks) pre-commit;
               };
-              # 30s fuzz smokes, one matrix entry per target. Keys
-              # are fuzz-smoke-<target> (from nix/fuzz.nix). On a
-              # cold cache each entry rebuilds the shared fuzz-build
-              # derivation, but spot CPU is cheap and the cache fills
-              # after first green.
-              fuzz-smoke = fuzz.smoke;
+              # 2min fuzz runs, one matrix entry per target. Keys are
+              # fuzz-<target> (from nix/fuzz.nix). On a cold cache each
+              # entry rebuilds the shared fuzz-build derivation, but
+              # spot CPU is cheap and the cache fills after first green.
+              fuzz = fuzz.runs;
               # Normal VM tests. Keys: vm-phase1a etc. Per-test
               # red/green signal in the GHA UI.
               vm-test = vmTests;
@@ -975,7 +934,7 @@
             '';
 
             # ──────────────────────────────────────────────────────────
-            # VM coverage targets (manual — NOT in ci-fast/ci-slow)
+            # VM coverage targets (manual — NOT in .#ci)
             # ──────────────────────────────────────────────────────────
             #
             # coverage-full: unit + all 7 VM tests merged. ~25min,
@@ -1031,11 +990,9 @@
                 --output-directory $out
             '';
           }
-          # 10-minute nightly fuzz runs — NOT in checks, explicitly invoked
-          # by the nightly pipeline. Shares rio-{nix,store}-fuzz-build with
-          # the smoke tier.
-          // fuzz.nightly
-          // ciAggregates;
+          // {
+            inherit ci;
+          };
 
           # --------------------------------------------------------------
           # Checks (run with 'nix flake check')
@@ -1044,10 +1001,9 @@
             build = rio-workspace;
           }
           // cargoChecks
-          # 30s PR-tier fuzz smokes (Linux-only). Compiled binaries
-          # shared with the nightly-tier packages via
-          # rio-{nix,store}-fuzz-build.
-          // fuzz.smoke
+          # 2min fuzz runs (Linux-only). Compiled binaries shared
+          # across targets via rio-{nix,store}-fuzz-build.
+          // fuzz.runs
           # Per-phase milestone VM tests (Linux-only, need KVM).
           # Debug interactively:
           #   nix build .#checks.x86_64-linux.vm-phase2a.driverInteractive
