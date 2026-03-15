@@ -51,6 +51,9 @@ in
   extraSchedulerConfig ? { },
   extraStoreConfig ? { },
   extraPackages ? [ ],
+  # NixOS modules merged into the client VM. protocol-cold uses this
+  # for drvs.coldBootstrapServer (Python http.server serving busybox).
+  extraClientModules ? [ ],
 }:
 let
   pki = if withPki then mkPki { } else null;
@@ -171,7 +174,12 @@ in
   # Drop into runNixOSTest.
   nodes = {
     control = controlNode;
-    client = common.mkClientNode { gatewayHost = "control"; };
+    client = {
+      imports = [
+        (common.mkClientNode { gatewayHost = "control"; })
+      ]
+      ++ extraClientModules;
+    };
   }
   // workerNodes;
 

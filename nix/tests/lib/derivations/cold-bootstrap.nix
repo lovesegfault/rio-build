@@ -24,13 +24,17 @@
   # cpu.stat poll fires at least once (completion.rs:202 guard skips
   # the DB write if peak_cpu_cores=0).
   sleepSecs ? 2,
+  # VM tests override with `file://` (workers are airgapped). The FOD's
+  # outputHash is content-addressed — same bytes from any URL → same
+  # output. EKS smoke-test keeps the http URL (pods have egress).
+  url ? "http://tarballs.nixos.org/stdenv/x86_64-unknown-linux-gnu/82b583ba2ba2e5706b35dbe23f31362e62be2a9d/busybox",
 }:
 let
   busybox = builtins.derivation {
     name = "busybox";
     builder = "builtin:fetchurl";
     system = "builtin";
-    url = "http://tarballs.nixos.org/stdenv/x86_64-unknown-linux-gnu/82b583ba2ba2e5706b35dbe23f31362e62be2a9d/busybox";
+    inherit url;
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
     outputHash = "sha256-QrTEnQTBM1Y/qV9odq8irZkQSD9uOMbs2Q5NgCvKCNQ=";

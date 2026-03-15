@@ -41,6 +41,7 @@ let
   # };
 
   protocol = import ./scenarios/protocol.nix;
+  drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # ── Legacy phase tests (deleted in commit 10) ───────────────────────
   phaseArgs = {
@@ -82,6 +83,11 @@ in
           maxBuilds = 1;
         };
       };
+      # Python http.server on :8000 serving the pre-fetched busybox.
+      # cold-bootstrap.nix's url is overridden to http://client:8000/
+      # busybox — builtin:fetchurl gets a real HTTP fetch (same codepath
+      # as EKS) without needing internet egress.
+      extraClientModules = [ drvs.coldBootstrapServer ];
     };
     cold = true;
   };

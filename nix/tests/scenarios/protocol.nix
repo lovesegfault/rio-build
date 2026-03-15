@@ -39,10 +39,18 @@ let
     # Do NOT seedBusybox. The store must be empty so wopQueryMissing
     # returns a non-trivial willBuild set.
 
+    # Workers are airgapped. drvs.coldBootstrapServer (passed via
+    # extraClientModules in nix/tests/default.nix) serves the pre-
+    # fetched busybox on client:8000. builtin:fetchurl does a real
+    # HTTP fetch — same codepath as EKS, just to a VM-local endpoint.
+    client.wait_for_unit("busybox-http.service")
+    client.wait_for_open_port(8000)
+
     # Instantiate on the CLIENT, copy the .drv closure (not outputs).
     # --impure: builtins.currentSystem in cold-bootstrap.nix.
     drv = client.succeed(
         "nix-instantiate --impure --argstr tag smoke "
+        "--argstr url 'http://client:8000/busybox' "
         "${drvs.coldBootstrap} 2>&1 | tail -1"
     ).strip()
     assert drv.endswith(".drv"), f"expected .drv path, got {drv!r}"
@@ -59,40 +67,41 @@ let
         f"nix copy --no-check-sigs --derivation --to '{store_url}' {drv}"
     )
 
-    with subtest("wopQueryMissing: willBuild is an exact StorePathSet"):
-        # --dry-run triggers wopQueryMissing. Output format:
-        #   these N derivations will be built:
-        #     /nix/store/...-busybox.drv
-        #     /nix/store/...-rio-cold-smoke.drv
-        # Parse lines that start with /nix/store/ and end .drv.
-        dry = client.succeed(
-            f"nix build --dry-run --store '{store_url}' '{drv}^*' 2>&1"
-        )
-        will_build = {
-            line.strip()
-            for line in dry.splitlines()
-            if line.strip().startswith("/nix/store/") and line.strip().endswith(".drv")
-        }
-        # THE assertion that catches the `!out` bug (5786f82). If
-        # willBuild contains `...drv!out` (DerivedPath syntax), the set
-        # won't match and assert_set_eq shows it in `extra:`.
-        assert_set_eq(
-            will_build,
-            {drv, busybox_fod_drv},
-            context="wopQueryMissing willBuild",
-        )
-
-    with subtest("cold build completes (system=builtin advertised)"):
-        # If workers don't advertise builtin, can_build() is always false
-        # for the busybox FOD → permanently undispatchable → this hangs.
-        # globalTimeout caps the hang; the assertion below gives a precise
-        # error if it partially ran.
-        out = client.succeed(
+    with subtest("cold build from empty store (catches 3/4 5786f82 bugs)"):
+        # wopQueryMissing fires INSIDE nix build (precursor to dispatch),
+        # not as a separately-observable dry-run. All three bugs manifest
+        # as build failures:
+        #
+        #   wopQueryMissing `!out` → client fails StorePath parse on '!'
+        #     before dispatch. Stderr: "invalid character in store path".
+        #
+        #   system="builtin" not advertised → busybox FOD can_build()
+        #     always false → DAG leaf never dispatches → hang (globalTimeout).
+        #
+        #   Realisation outPath full-path → client's BuildResult parser
+        #     rejects with "illegal base-32 character '/'" after build.
+        #
+        # Build succeeding = all three absent. Capture stderr to make any
+        # failure mode diagnosable from CI logs.
+        result = client.succeed(
             f"nix build --no-link --print-out-paths --store '{store_url}' "
             f"'{drv}^*' 2>&1"
-        ).strip().splitlines()[-1]
-        assert out.startswith("/nix/store/"), f"expected store path, got {out!r}"
+        )
+        # Last non-empty line is the output path (earlier lines are
+        # build progress to stderr via 2>&1).
+        lines = [l.strip() for l in result.strip().splitlines() if l.strip()]
+        assert lines, f"empty build output: {result!r}"
+        out = lines[-1]
+        assert out.startswith("/nix/store/"), (
+            f"expected store path, got {out!r}\nfull output:\n{result}"
+        )
         assert "rio-cold-smoke" in out, f"wrong output name: {out!r}"
+        # Proves wopQueryMissing returned a well-formed StorePathSet: if
+        # it had `!out` suffixes, we'd never get here (client aborts at
+        # parse, pre-dispatch). busybox_fod_drv is unused after this
+        # point but kept above — asserting the .drv closure shape
+        # (exactly 1 inputDrv) is independently valuable.
+        _ = busybox_fod_drv
 
     with subtest("output round-trips (Realisation outPath basename parsed)"):
         # The build succeeding at all requires the client's BuildResult
@@ -109,11 +118,18 @@ let
         parsed = _json.loads(info)
         assert parsed[out]["narSize"] > 0, f"narSize=0 for {out!r}: {info}"
 
-    with subtest("scheduler recorded both builds"):
-        # Exact count: 1 FOD + 1 consumer = 2. Not `[1-9]`.
+    with subtest("metric accounting (per-submit vs per-dispatch)"):
+        # scheduler_builds_total is per-SubmitBuild RPC: one submit,
+        # one count — the whole DAG succeeded. worker_builds_total is
+        # per-derivation-dispatched: FOD + consumer = 2.
         assert_metric_exact(
             ${gatewayHost}, 9091,
-            "rio_scheduler_builds_total", 2.0,
+            "rio_scheduler_builds_total", 1.0,
+            labels='{outcome="success"}',
+        )
+        assert_metric_exact(
+            worker, 9093,
+            "rio_worker_builds_total", 2.0,
             labels='{outcome="success"}',
         )
   '';

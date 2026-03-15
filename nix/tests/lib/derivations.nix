@@ -12,7 +12,7 @@
 #    scenario needs a different marker/sleep. These produce a store path
 #    that `nix-build` in the VM can read.
 { pkgs }:
-{
+rec {
   # ── Path literals (in-VM nix-build targets) ─────────────────────────
 
   # 4 parallel leaves + 1 collector. Exercises fanout distribution and
@@ -32,6 +32,38 @@
   # builtin:fetchurl busybox FOD + raw consumer. Cold-store only.
   # Takes `{ tag, sleepSecs }` at nix-build time via `--arg`.
   coldBootstrap = ./derivations/cold-bootstrap.nix;
+
+  # Host-side pre-fetch of the busybox for airgapped VM workers. Served
+  # via Python http.server on the client VM (see coldBootstrapServer
+  # below); cold-bootstrap.nix's url is overridden to http://client:8000/
+  # busybox. This gives builtin:fetchurl a real HTTP fetch (same codepath
+  # as EKS) without needing internet egress.
+  #
+  # NOT used via file:// — builtin:fetchurl's file:// handling produces
+  # a different NAR hash than http:// for reasons not worth debugging
+  # (tested: got sha256-NOALh... vs expected sha256-QrTEn...).
+  coldBootstrapBusybox = pkgs.fetchurl {
+    url = "http://tarballs.nixos.org/stdenv/x86_64-unknown-linux-gnu/82b583ba2ba2e5706b35dbe23f31362e62be2a9d/busybox";
+    hash = "sha256-QrTEnQTBM1Y/qV9odq8irZkQSD9uOMbs2Q5NgCvKCNQ=";
+    executable = true;
+  };
+
+  # Tiny HTTP server for cold tests. Serves coldBootstrapBusybox at
+  # /busybox. Drop into the client VM's NixOS config via imports.
+  # Opens firewall port 8000 so the worker (where builtin:fetchurl
+  # runs) can reach it.
+  coldBootstrapServer = {
+    systemd.services.busybox-http = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        mkdir -p /srv
+        ln -sf ${coldBootstrapBusybox} /srv/busybox
+        cd /srv
+        exec ${pkgs.python3}/bin/python3 -m http.server 8000
+      '';
+    };
+    networking.firewall.allowedTCPPorts = [ 8000 ];
+  };
 
   # ── Parameterized factories (pkgs.writeText) ────────────────────────
 
