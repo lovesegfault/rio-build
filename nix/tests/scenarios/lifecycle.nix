@@ -417,7 +417,6 @@ pkgs.testers.runNixOSTest {
         # Controller's Recorder emits Submitted (from apply()) + terminal
         # event (Building + Succeeded, or Building + Cached). Field
         # selector filters to THIS Build object (phase3a.nix:680-695).
-        import json
         events_json = kubectl(
             "get events "
             "--field-selector involvedObject.name=test-watch-dedup,involvedObject.kind=Build "
