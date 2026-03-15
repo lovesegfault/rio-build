@@ -546,34 +546,39 @@
               coverage,
             }:
             let
-              vmTestArgs = {
-                inherit pkgs rio-workspace coverage;
+              allTests = import ./nix/tests {
+                inherit
+                  pkgs
+                  rio-workspace
+                  dockerImages
+                  system
+                  coverage
+                  ;
                 rioModules = inputs.self.nixosModules;
-              };
-              # phase3a/3b need dockerImages + crds; phase4 also needs
-              # nixhelm (helm-render.nix fetches the PG subchart so
-              # `helm template` doesn't error on missing dependency).
-              k3sArgs = vmTestArgs // {
-                inherit dockerImages system;
                 inherit (inputs.self.packages.${system}) crds;
                 inherit (inputs) nixhelm;
               };
+              # Per-test builder CPU hint. withMinCpu sets requiredSystem
+              # Features to prevent oversubscription (vm-phase2a once got
+              # 5 CPUs for 4 VMs → 16 vCPUs on 5 → qemu stall). Default 4
+              # for anything not in the table.
+              cpuHints = {
+                vm-phase1a = 2;
+                vm-phase1b = 3;
+                vm-phase2a = 4;
+                vm-phase2b = 5;
+                vm-phase2c = 5;
+                vm-phase3a = 4;
+                vm-phase3b = 4;
+                vm-phase4 = 4;
+                # 3 VMs (control+worker+client). Control is 4-core.
+                vm-protocol-warm-standalone = 3;
+                vm-protocol-cold-standalone = 3;
+              };
             in
-            pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-              vm-phase1a = withMinCpu 2 (import ./nix/tests/phase1a.nix vmTestArgs);
-              vm-phase1b = withMinCpu 3 (import ./nix/tests/phase1b.nix vmTestArgs);
-              vm-phase2a = withMinCpu 4 (import ./nix/tests/phase2a.nix vmTestArgs);
-              vm-phase2b = withMinCpu 5 (import ./nix/tests/phase2b.nix vmTestArgs);
-              vm-phase2c = withMinCpu 5 (import ./nix/tests/phase2c.nix vmTestArgs);
-              # 3 VMs but k8s is 8-core (k3s + worker pod) → higher
-              # MIN_CPU than the count would suggest.
-              vm-phase3a = withMinCpu 4 (import ./nix/tests/phase3a.nix k3sArgs);
-              vm-phase3b = withMinCpu 4 (import ./nix/tests/phase3b.nix k3sArgs);
-              # phase4.nix starts with k3s topology from the start
-              # (Section A only in 4a; sections B–J appended in 4b/4c).
-              # Auto-included in ci-fast via builtins.attrValues vmTests.
-              vm-phase4 = withMinCpu 4 (import ./nix/tests/phase4.nix k3sArgs);
-            };
+            pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+              pkgs.lib.mapAttrs (name: withMinCpu (cpuHints.${name} or 4)) allTests
+            );
 
           vmTests = mkVmTests {
             inherit rio-workspace dockerImages;

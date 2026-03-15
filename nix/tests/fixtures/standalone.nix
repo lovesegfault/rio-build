@@ -164,6 +164,10 @@ in
   # null when withPki=false.
   inherit pki;
 
+  # SSH target for `ssh-ng://${gatewayHost}` + Python node var for
+  # `${gatewayHost}.succeed(...)`. Scenarios interpolate into both.
+  gatewayHost = "control";
+
   # Drop into runNixOSTest.
   nodes = {
     control = controlNode;
