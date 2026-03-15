@@ -45,13 +45,22 @@
   fixture,
 }:
 let
-  inherit (fixture) ns;
+  inherit (fixture) ns pki;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
 
   # grpcurl not in k3sBase systemPackages (only curl+kubectl). Use the
   # store path directly — it's pulled into the VM closure by interpolation.
   grpcurl = "${pkgs.grpcurl}/bin/grpcurl";
+
+  # mTLS client cert args. The fixture's PKI generates per-component
+  # certs; the controller cert works as a generic client (rio checks
+  # CA-signed, not CN). SANs include `localhost` so grpcurl-via-port-
+  # forward (connects to localhost:19001, SNI=localhost) verifies.
+  grpcurlTls =
+    "-cacert ${pki}/ca.crt "
+    + "-cert ${pki}/rio-controller/tls.crt "
+    + "-key ${pki}/rio-controller/tls.key";
 
   # ── Test derivations ────────────────────────────────────────────────
   # Distinct markers so each build creates a fresh derivations row —
@@ -195,10 +204,13 @@ pkgs.testers.runNixOSTest {
         )
 
     # grpcurl against the scheduler's gRPC port (9001) and store (9002).
-    # vmtest-full.yaml has tls.enabled=false → -plaintext. port-forward
-    # routes through the apiserver — doesn't care that the pod has no
-    # shell. `-max-time` bounds the RPC itself; port-forward is killed
-    # by trap even if grpcurl hangs.
+    # mTLS (tls.enabled=true in vmtest-full.yaml) → present the
+    # controller client cert from the fixture's PKI. port-forward is a
+    # raw TCP tunnel through the apiserver — grpcurl does the TLS
+    # handshake end-to-end with the pod. SNI=localhost (from grpcurl's
+    # :authority derivation on -addr localhost); the server cert has
+    # localhost in its SANs. `-max-time` bounds the RPC itself;
+    # port-forward is killed by trap even if grpcurl hangs.
     def sched_grpc(payload, method):
         """TriggerGC etc. on the scheduler leader. Returns stdout+stderr."""
         leader = leader_pod()
@@ -206,7 +218,7 @@ pkgs.testers.runNixOSTest {
             f"k3s kubectl -n ${ns} port-forward {leader} 19001:9001 "
             f">/dev/null 2>&1 & pf=$!; "
             f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-            f"${grpcurl} -plaintext -max-time 30 "
+            f"${grpcurl} ${grpcurlTls} -max-time 30 "
             f"-protoset ${protoset}/rio.protoset "
             f"-d '{payload}' localhost:19001 {method} 2>&1"
         )
@@ -218,7 +230,7 @@ pkgs.testers.runNixOSTest {
             f"k3s kubectl -n ${ns} port-forward deploy/rio-store 19002:9002 "
             f">/dev/null 2>&1 & pf=$!; "
             f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-            f"${grpcurl} -plaintext -max-time 30 "
+            f"${grpcurl} ${grpcurlTls} -max-time 30 "
             f"-protoset ${protoset}/rio.protoset "
             f"-d '{payload}' localhost:19002 {method} 2>&1"
         )

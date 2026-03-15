@@ -38,6 +38,7 @@ let
   };
   helmRender = import ../../helm-render.nix { inherit pkgs nixhelm system; };
   pulled = import ../../docker-pulled.nix { inherit pkgs; };
+  mkPkiK8s = import ../lib/pki-k8s.nix { inherit pkgs; };
 in
 {
   # --set overrides layered on top of vmtest-full.yaml. scenarios/
@@ -60,6 +61,14 @@ let
     extraSet = extraValues;
     namespace = ns;
   };
+
+  # ── mTLS PKI (replaces cert-manager) ─────────────────────────────────
+  # openssl-generated root CA + per-component leaf certs with k8s
+  # Service-name SANs. Rendered into k8s Secrets so tls.enabled=true
+  # works without cert-manager (which isn't in the airgap set —
+  # phase4c). Makes the fixture representative of production: mTLS
+  # on all gRPC links, plaintext health ports (9101/9102/9194).
+  pkiK8s = mkPkiK8s { inherit ns; };
 
   # ── Airgap image set ────────────────────────────────────────────────
   # Same list on BOTH nodes — pods land on either via scheduler whims
@@ -134,6 +143,10 @@ let
             stringData:
               authorized_keys: ""
           '';
+          # mTLS certs. Applied before 02-workloads so pods' TLS
+          # Secret volume mounts resolve on first start (no Pending
+          # on unbound Secret). See lib/pki-k8s.nix.
+          "01-rio-tls-secrets".source = pkiK8s.secretsManifest;
         };
         extraFlags = [
           "--flannel-iface"
@@ -199,6 +212,10 @@ in
 {
   # Exposed for testScript: `k3s-server.succeed("k3s kubectl -n ${fixture.ns} ...")`.
   inherit ns helmRendered;
+  # For grpcurl client cert args (scenarios/lifecycle.nix sched_grpc
+  # etc). The controller cert works as a generic mTLS client — rio
+  # doesn't check CN, only that the cert chains to the shared CA.
+  inherit (pkiK8s) pki;
 
   nodes = {
     k3s-server = serverNode;
@@ -348,6 +365,17 @@ in
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
         timeout=90,
+    )
+    # rollout status returns when the Deployment has Ready replicas,
+    # but kube-proxy hasn't necessarily synced the endpoint to the
+    # NodePort's iptables rules yet. Poll from the CLIENT (which
+    # connects to k3s-server:32222) until SSH accepts. The ssh-ng
+    # protocol handshake is stricter than nc -z — proves the
+    # gateway process itself is serving, not just TCP accept.
+    client.wait_until_succeeds(
+        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 "
+        "-p 32222 rio@k3s-server true",
+        timeout=30,
     )
   '';
 
