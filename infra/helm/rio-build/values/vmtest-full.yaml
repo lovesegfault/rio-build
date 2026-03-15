@@ -122,10 +122,15 @@ workerPool:
   # Required until the device-plugin path lands (ADR-012). k3s's
   # containerd default seccomp blocks mount(2) even with CAP_SYS_ADMIN.
   privileged: true
-  # Blank: no Karpenter nodepools → no taints → no tolerations needed.
-  # Workers schedule on any node.
-  tolerations: []
-  nodeSelector: {}
+  # No Karpenter nodepools → no dedicated worker nodes. Workers
+  # schedule on any k3s node.
+  #
+  # null (not {} or []): Helm DEEP-MERGES values files. The default
+  # values.yaml has nodeSelector: {rio.build/node-role: worker} and
+  # a matching toleration. `{}` merges → default wins → pod Pending
+  # (no node has that label). `null` deletes the key from the merge.
+  tolerations: null
+  nodeSelector: null
 
 postgresql:
   enabled: true
