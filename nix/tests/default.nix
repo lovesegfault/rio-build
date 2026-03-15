@@ -41,6 +41,9 @@ let
   # };
 
   protocol = import ./scenarios/protocol.nix;
+  scheduling = import ./scenarios/scheduling.nix;
+  security = import ./scenarios/security.nix;
+  observability = import ./scenarios/observability.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # ── Legacy phase tests (deleted in commit 10) ───────────────────────
@@ -90,6 +93,83 @@ in
       extraClientModules = [ drvs.coldBootstrapServer ];
     };
     cold = true;
+  };
+
+  vm-scheduling-standalone = scheduling {
+    inherit pkgs common;
+    fixture = standalone {
+      workers = {
+        wsmall1 = {
+          maxBuilds = 2;
+          sizeClass = "small";
+        };
+        wsmall2 = {
+          maxBuilds = 2;
+          sizeClass = "small";
+        };
+        wlarge = {
+          maxBuilds = 1;
+          sizeClass = "large";
+        };
+      };
+      extraSchedulerConfig = {
+        tickIntervalSecs = 2;
+        extraConfig = ''
+          [[size_classes]]
+          name = "small"
+          cutoff_secs = 30.0
+          mem_limit_bytes = 17179869184
+
+          [[size_classes]]
+          name = "large"
+          cutoff_secs = 3600.0
+          mem_limit_bytes = 68719476736
+        '';
+      };
+      extraStoreConfig = {
+        extraConfig = ''
+          [chunk_backend]
+          kind = "filesystem"
+          base_dir = "/var/lib/rio/store/chunks"
+        '';
+      };
+      extraPackages = [ pkgs.postgresql ];
+    };
+  };
+
+  vm-security-standalone = security {
+    inherit pkgs common;
+    fixture = standalone {
+      workers = {
+        worker = {
+          maxBuilds = 1;
+        };
+      };
+      withPki = true;
+      extraPackages = [
+        pkgs.grpcurl
+        pkgs.grpc-health-probe
+        pkgs.postgresql
+      ];
+    };
+  };
+
+  vm-observability-standalone = observability {
+    inherit pkgs common;
+    fixture = standalone {
+      workers = {
+        worker1 = {
+          maxBuilds = 1;
+        };
+        worker2 = {
+          maxBuilds = 1;
+        };
+        worker3 = {
+          maxBuilds = 1;
+        };
+      };
+      withOtel = true;
+    };
   };
 
   # ── Legacy phase tests (migration period; deleted in commit 10) ─────

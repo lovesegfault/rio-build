@@ -574,6 +574,12 @@
                 # 3 VMs (control+worker+client). Control is 4-core.
                 vm-protocol-warm-standalone = 3;
                 vm-protocol-cold-standalone = 3;
+                # 5 VMs: control + wsmall1/wsmall2/wlarge + client.
+                vm-scheduling-standalone = 5;
+                # 3 VMs: control + worker + client.
+                vm-security-standalone = 3;
+                # 5 VMs: control + worker1/2/3 + client.
+                vm-observability-standalone = 5;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (

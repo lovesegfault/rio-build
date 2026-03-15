@@ -140,10 +140,13 @@ let
       })
       otelModule
     ];
-    # Gateway CN override. lib.mkIf (not optionalAttrs) so the
-    # attribute doesn't appear at all when withPki=false — cleaner
-    # module eval.
-    systemd.services.rio-gateway.environment = lib.mkIf withPki gatewayTlsEnv;
+    # Gateway CN override. mkControlNode's extraServiceEnv applies
+    # controlTlsEnv to ALL three services (including gateway). NixOS
+    # module merge of two string values for the same key → conflict.
+    # mapAttrs mkForce makes the gateway cert paths win unambiguously.
+    systemd.services.rio-gateway.environment = lib.mkIf withPki (
+      lib.mapAttrs (_: lib.mkForce) gatewayTlsEnv
+    );
   };
 
   # ── Worker nodes ────────────────────────────────────────────────────
