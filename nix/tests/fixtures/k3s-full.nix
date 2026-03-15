@@ -58,6 +58,7 @@ let
   helmRendered = helmRender {
     valuesFile = ../../../infra/helm/rio-build/values/vmtest-full.yaml;
     extraSet = extraValues;
+    namespace = ns;
   };
 
   # ── Airgap image set ────────────────────────────────────────────────

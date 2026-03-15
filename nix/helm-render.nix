@@ -27,6 +27,12 @@ in
   # pass env var values; if a caller needs int semantics later, add
   # a separate extraSetInt param rather than switching back.
   extraSet ? { },
+  # Passed as -n to helm template. The rio-build chart uses
+  # .Values.namespace.name (not .Release.Namespace), so -n doesn't
+  # affect rio-* resources. But the bitnami PG subchart uses
+  # .Release.Namespace — without this, PG lands in `default` while
+  # rio-* land in rio-system, and waitReady's `-n ${ns}` can't see it.
+  namespace ? "default",
 }:
 let
   chart = pkgs.lib.cleanSource ../infra/helm/rio-build;
@@ -49,7 +55,7 @@ pkgs.runCommand "rio-helm-rendered"
     mkdir -p charts
     ln -s ${subcharts.postgresql} charts/postgresql
 
-    helm template rio . -f ${valuesFile} ${setArgs} > all.yaml
+    helm template rio . -n ${namespace} -f ${valuesFile} ${setArgs} > all.yaml
 
     mkdir -p $out
     # CRDs come from infra/helm/crds/ (not the chart — Helm's crds/ dir

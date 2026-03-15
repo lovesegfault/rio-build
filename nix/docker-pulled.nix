@@ -30,9 +30,12 @@
   bitnami-postgresql = pkgs.dockerTools.pullImage {
     imageName = "registry-1.docker.io/bitnami/postgresql";
     imageDigest = "sha256:106cae6ba66dc1498dba57037b16d6d0f3470277bfcaf440860b1df2f967bf14";
-    # finalImageTag: what `ctr images ls` shows. The chart is told via
-    # values override to use this tag, not :latest.
-    finalImageName = "bitnami/postgresql";
+    # finalImageName/Tag: what `ctr images ls` shows. MUST match what
+    # the bitnami chart renders (docker.io/bitnami/postgresql:<tag>) —
+    # containerd does exact-string image lookup; "bitnami/postgresql"
+    # ≠ "docker.io/bitnami/postgresql" → cache miss → tries to pull
+    # from network → ImagePullBackOff in the airgapped VM.
+    finalImageName = "docker.io/bitnami/postgresql";
     finalImageTag = "18.3.0";
     hash = "sha256-MpAV88ItXcTgRTAtF48I1SL+08Yg1Mn233Cry/96gCY=";
     os = "linux";
