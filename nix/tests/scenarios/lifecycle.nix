@@ -1,0 +1,784 @@
+# Lifecycle scenario: scheduler recovery, GC, autoscaler, finalizer,
+# Build-CRD watch dedup — all exercised against the k3s-full fixture.
+#
+# Ports phase3b sections S (recovery), C (GC), F (watch-dedup) + phase3a
+# autoscaler/finalizer/SSA-field-ownership onto the 2-node k3s Helm-chart
+# fixture. Unlike phase3b (control/worker/k8s/client as separate systemd
+# VMs), everything here runs as PODS — closes the "production uses pod
+# path, VM tests use systemd" gap for the reconciler/lease/autoscaler
+# surface.
+#
+# Key adaptation: scheduler pods are minimal images (no shell, no curl).
+# All metric scrapes + grpcurl calls go through `kubectl port-forward`
+# on k3s_server. Scheduler has 2 replicas (podAntiAffinity spreads them
+# across server+agent), so killing the leader means the STANDBY takes
+# over — a strictly stronger recovery test than phase3b's single-instance
+# restart.
+#
+# r[verify ctrl.build.watch-by-uid]
+#   build-crd-dedup asserts rio_controller_build_watch_spawns_total == 1
+#   across multiple reconcile cycles of ONE Build CR (UID-keyed DashMap).
+#
+# r[verify obs.metric.controller]
+#   autoscaler scrapes rio_controller_scaling_decisions_total{direction="up"}
+#   — exact name from observability.md controller metrics table.
+#
+# Caller (default.nix) constructs the fixture with autoscaler tuning via
+# controller.extraEnv (see end-of-file comment block for exact extraValues):
+#
+#   fixture = k3sFull {
+#     extraValues = {
+#       "controller.extraEnv[0].name"  = "RIO_AUTOSCALER_POLL_SECS";
+#       "controller.extraEnv[0].value" = "3";
+#       "controller.extraEnv[1].name"  = "RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS";
+#       "controller.extraEnv[1].value" = "3";
+#       "controller.extraEnv[2].name"  = "RIO_AUTOSCALER_MIN_INTERVAL_SECS";
+#       "controller.extraEnv[2].value" = "3";
+#     };
+#   };
+{
+  pkgs,
+  common,
+  fixture,
+}:
+let
+  inherit (fixture) ns;
+  drvs = import ../lib/derivations.nix { inherit pkgs; };
+  protoset = import ../lib/protoset.nix { inherit pkgs; };
+
+  # grpcurl not in k3sBase systemPackages (only curl+kubectl). Use the
+  # store path directly — it's pulled into the VM closure by interpolation.
+  grpcurl = "${pkgs.grpcurl}/bin/grpcurl";
+
+  # ── Test derivations ────────────────────────────────────────────────
+  # Distinct markers so each build creates a fresh derivations row —
+  # otherwise DAG-dedup would reuse an earlier build's result and the
+  # "not a cache hit" assertions would be hollow.
+
+  # Pin target for GC-sweep. Built FIRST (before recovery) so it's been
+  # in PG long enough that gc-sweep's backdate targets a DIFFERENT row.
+  pinDrv = drvs.mkTrivial { marker = "lifecycle-pin"; };
+
+  # In-flight build for recovery. 90s sleep survives the leader-kill
+  # window: lease TTL (~15s worst case for standby to detect) + standby's
+  # recovery query (~1s) + re-dispatch latency (~5s). phase3b rationale
+  # (phase3b.nix:85-99) applies verbatim — a shorter sleep lets the build
+  # finish during the failover gap → PG has 0 non-terminal rows →
+  # recovery loads nothing → hollow test.
+  recoverySlowDrv = drvs.mkTrivial {
+    marker = "lifecycle-recovery-slow";
+    sleepSecs = 90;
+  };
+
+  # Post-recovery build. DIFFERENT marker than pinDrv so this is NOT a
+  # cache hit — proves dispatch actually unblocked after LeaderAcquired →
+  # recover_from_pg → recovery_complete.store(true). Also becomes the
+  # backdate target for gc-sweep (unpinned, so sweep can delete it).
+  recoveryDrv = drvs.mkTrivial { marker = "lifecycle-recovery"; };
+
+  # Build CRD watch-dedup. 5s sleep → multiple BuildEvent cycles
+  # (Pending → Building → log lines → Succeeded). Each cycle patches
+  # status → watch event → reconcile. Without dedup, each reconcile
+  # spawns a duplicate drain_stream task.
+  watchDedupDrv = drvs.mkTrivial {
+    marker = "lifecycle-watchdedup";
+    sleepSecs = 5;
+  };
+
+  # Autoscaler queue pressure: 5 leaves, all independent, all Ready
+  # immediately. With maxConcurrentBuilds=1 (vmtest-full.yaml), 1 runs
+  # + 4 queue → compute_desired(4, target=2) = ceil(4/2) = 2 → STS
+  # replicas 1→2. sleep 15 × 5 ≈ 75s sequential (pod-1 may never come
+  # Ready on the 4GB agent VM) — long enough for ~3 poll cycles (3s
+  # each, via controller.extraEnv) to see sustained pressure.
+  #
+  # Same ''${...}/''' escaping dance as phase3a.nix:79-81: the inner
+  # .nix file reads ITS OWN let-bound `busybox` arg, not this Nix
+  # evaluation's scope.
+  autoscaleDrvFile = pkgs.writeText "lifecycle-autoscale.nix" ''
+    { busybox }:
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      mk = n: derivation {
+        name = "rio-lifecycle-queue-''${toString n}";
+        system = builtins.currentSystem;
+        builder = sh;
+        args = [ "-c" '''
+          ''${bb} mkdir -p $out
+          ''${bb} echo "queue pressure ''${toString n}" > $out/stamp
+          ''${bb} sleep 15
+        ''' ];
+      };
+    in {
+      d1 = mk 1;
+      d2 = mk 2;
+      d3 = mk 3;
+      d4 = mk 4;
+      d5 = mk 5;
+    }
+  '';
+in
+pkgs.testers.runNixOSTest {
+  name = "rio-lifecycle";
+
+  # Bring-up ~3-4min + recovery slow-build 90s sleep + queue-drain 120s
+  # + autoscaler drain 120s + finalizer pod-gone 120s + GC grpcurl calls
+  # + margin for 2-node k3s churn. Longest scenario by far.
+  globalTimeout = 1200;
+
+  inherit (fixture) nodes;
+
+  testScript = ''
+    ${common.assertions}
+
+    start_all()
+    ${fixture.waitReady}
+
+    ${fixture.kubectlHelpers}
+
+    # ── Port-forward helpers ──────────────────────────────────────────
+    # Scheduler/controller/store pods are minimal images (no sh, no curl).
+    # For metrics + grpcurl, port-forward on k3s_server and curl localhost.
+    # Each call spawns a fresh port-forward, sleeps 2s for it to bind,
+    # then tears down — fresh leader_pod() lookup every time (the leader
+    # CHANGES across recovery).
+    #
+    # Distinct local ports so forwards never collide if teardown races.
+
+    def sched_metrics():
+        """One-shot scrape of the CURRENT scheduler leader's /metrics."""
+        leader = leader_pod()
+        k3s_server.succeed(
+            f"k3s kubectl -n ${ns} port-forward {leader} 19091:9091 "
+            f">/dev/null 2>&1 & echo $! > /tmp/pf-sched.pid; sleep 2"
+        )
+        try:
+            return scrape_metrics(k3s_server, 19091)
+        finally:
+            k3s_server.execute(
+                "kill $(cat /tmp/pf-sched.pid) 2>/dev/null; rm -f /tmp/pf-sched.pid"
+            )
+
+    def ctrl_metrics():
+        """One-shot scrape of the controller pod's /metrics (port 9094)."""
+        k3s_server.succeed(
+            "k3s kubectl -n ${ns} port-forward deploy/rio-controller 19094:9094 "
+            ">/dev/null 2>&1 & echo $! > /tmp/pf-ctrl.pid; sleep 2"
+        )
+        try:
+            return scrape_metrics(k3s_server, 19094)
+        finally:
+            k3s_server.execute(
+                "kill $(cat /tmp/pf-ctrl.pid) 2>/dev/null; rm -f /tmp/pf-ctrl.pid"
+            )
+
+    # wait_until_succeeds can't easily wrap a Python helper (the condition
+    # needs to be shell-evaluable). Inline bash: spawn port-forward, trap
+    # EXIT teardown, sleep, curl, grep/awk the condition. Same pattern as
+    # fixture.waitReady's workers_active check (k3s-full.nix:307-316).
+    def sched_metric_wait(condition, timeout=60):
+        """Wait until the leader's /metrics satisfies a bash condition.
+        `condition` is a pipe-fragment appended after `curl /metrics |`."""
+        k3s_server.wait_until_succeeds(
+            "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            "  -o jsonpath='{.spec.holderIdentity}') && "
+            "test -n \"$leader\" && "
+            "k3s kubectl -n ${ns} port-forward $leader 19091:9091 "
+            "  >/dev/null 2>&1 & pf=$!; "
+            "trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+            f"curl -sf http://localhost:19091/metrics | {condition}",
+            timeout=timeout,
+        )
+
+    # grpcurl against the scheduler's gRPC port (9001) and store (9002).
+    # vmtest-full.yaml has tls.enabled=false → -plaintext. port-forward
+    # routes through the apiserver — doesn't care that the pod has no
+    # shell. `-max-time` bounds the RPC itself; port-forward is killed
+    # by trap even if grpcurl hangs.
+    def sched_grpc(payload, method):
+        """TriggerGC etc. on the scheduler leader. Returns stdout+stderr."""
+        leader = leader_pod()
+        return k3s_server.succeed(
+            f"k3s kubectl -n ${ns} port-forward {leader} 19001:9001 "
+            f">/dev/null 2>&1 & pf=$!; "
+            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+            f"${grpcurl} -plaintext -max-time 30 "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-d '{payload}' localhost:19001 {method} 2>&1"
+        )
+
+    def store_grpc(payload, method):
+        """PinPath/UnpinPath on the store. deploy/ port-forward picks any
+        replica (there's only one). Returns stdout+stderr."""
+        return k3s_server.succeed(
+            f"k3s kubectl -n ${ns} port-forward deploy/rio-store 19002:9002 "
+            f">/dev/null 2>&1 & pf=$!; "
+            f"trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+            f"${grpcurl} -plaintext -max-time 30 "
+            f"-protoset ${protoset}/rio.protoset "
+            f"-d '{payload}' localhost:19002 {method} 2>&1"
+        )
+
+    # ── SSH + seed ────────────────────────────────────────────────────
+    # fixture.sshKeySetup (NOT common.sshKeySetup): patches the
+    # rio-gateway-ssh Secret + rollout-restarts the gateway Deployment.
+    # The common.nix version writes /var/lib/rio/gateway/authorized_keys
+    # on a systemd host — wrong for a pod.
+    ${fixture.sshKeySetup}
+    ${common.seedBusybox "k3s-server"}
+
+    # ── Build helper ──────────────────────────────────────────────────
+    # client's programs.ssh.extraConfig routes `Host k3s-server` →
+    # port 32222, user rio (mkClientNode in common.nix:348-356). So
+    # `ssh-ng://k3s-server` hits the gateway NodePort.
+    def build(drv_file, capture_stderr=True):
+        cmd = (
+            f"nix-build --no-out-link --store 'ssh-ng://k3s-server' "
+            f"--arg busybox '(builtins.storePath ${common.busybox})' "
+            f"{drv_file}"
+        )
+        if capture_stderr:
+            cmd += " 2>&1"
+        try:
+            return client.succeed(cmd)
+        except Exception:
+            dump_all_logs([], kube_node=k3s_server, kube_namespace="${ns}")
+            raise
+
+    # ══════════════════════════════════════════════════════════════════
+    # initial — build the pin target BEFORE recovery
+    # ══════════════════════════════════════════════════════════════════
+    # Built first so GC-sweep has TWO distinct outputs to work with:
+    # out_pin (pinned, survives sweep) and out_recovery (backdated,
+    # deleted by sweep). If recovery ran first, its slow-build would
+    # monopolize the single worker slot and delay everything.
+    with subtest("initial: seed pin-target output"):
+        out_pin = build("${pinDrv}", capture_stderr=False).strip()
+        assert out_pin.startswith("/nix/store/"), f"unexpected output: {out_pin!r}"
+        print(f"initial PASS: pin target = {out_pin}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # build-crd-dedup — one watch task per Build UID, not per-reconcile
+    # ══════════════════════════════════════════════════════════════════
+    # Runs EARLY (before recovery's queue churn) for a clean baseline:
+    # rio_controller_build_watch_spawns_total is a monotonic counter,
+    # and this is the ONLY Build CR created in the whole test. If the
+    # dedup is broken, the 5s-sleep build's status transitions (Pending
+    # → Building → Succeeded, plus log-line patches) each trigger a
+    # reconcile → each spawns a duplicate drain_stream → counter ≥3.
+    with subtest("build-crd-dedup: Build CRD watch spawns once, not per-reconcile"):
+        # Instantiate + copy the .drv closure (not outputs) to the store.
+        # The Build reconciler's fetch_and_build_node reads the .drv from
+        # rio-store to construct its DAG node.
+        drv_path = client.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${watchDedupDrv} 2>/dev/null"
+        ).strip()
+        client.succeed(
+            f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
+        )
+
+        # Apply Build CR. Namespace = rio-system (the controller pod's
+        # SA/ClusterRole watches here; phase3b used `default` because
+        # its controller ran as systemd with the admin kubeconfig).
+        k3s_server.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Build\n"
+            "metadata:\n"
+            "  name: test-watch-dedup\n"
+            "  namespace: ${ns}\n"
+            "spec:\n"
+            f"  derivation: {drv_path}\n"
+            "  priority: 10\n"
+            "EOF"
+        )
+
+        # Terminal phase: 5s sleep + dispatch overhead. 60s generous.
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get build test-watch-dedup "
+            "-o jsonpath='{.status.phase}' | "
+            "grep -E '^(Succeeded|Completed|Cached)$'",
+            timeout=60,
+        )
+
+        # THE ASSERTION: exactly 1 watch spawn. Not ≥1, not "present" —
+        # the whole point is that reconcile #2 onward hit the
+        # ctx.watching.contains_key gate and DIDN'T spawn again.
+        cm = ctrl_metrics()
+        spawns = metric_value(cm, "rio_controller_build_watch_spawns_total") or 0.0
+        assert spawns == 1.0, (
+            f"expected exactly 1 watch spawn (UID dedup), got {spawns}\n"
+            f"  all build_watch series: {cm.get('rio_controller_build_watch_spawns_total', {})!r}"
+        )
+
+        # Controller pod log (NOT journalctl — controller is a pod here).
+        # Without dedup, reconcile #2+ hit the is_real_uuid && !terminal
+        # gate → "reconnecting WatchBuild" → spawn_reconnect_watch. With
+        # dedup, contains_key returns true → silent skip.
+        reconnect_count = k3s_server.succeed(
+            "k3s kubectl -n ${ns} logs deploy/rio-controller | "
+            "grep -c 'reconnecting WatchBuild' || true"
+        ).strip()
+        assert reconnect_count == "0", (
+            f"expected 0 reconnect-path spawns, got {reconnect_count}"
+        )
+
+        # --wait=false: don't block on Build finalizer.
+        kubectl("delete build test-watch-dedup --wait=false")
+        print(f"build-crd-dedup PASS: spawns={spawns}, reconnects={reconnect_count}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # recovery — kill leader pod mid-build, standby takes over
+    # ══════════════════════════════════════════════════════════════════
+    # STRONGER than phase3b's single-instance `systemctl kill`: with
+    # scheduler.replicas=2 (podAntiAffinity across server+agent), killing
+    # the leader means the STANDBY acquires the lease. The standby's
+    # recovery_total was 0 (standby never ran recover_from_pg —
+    # LeaderAcquired never fired). After acquiring, it's exactly 1.
+    #
+    # Proves: lease TTL expiry detection → standby LeaderAcquired →
+    # recover_from_pg loads REAL non-terminal rows from PG → dispatch
+    # gate unblocks (if !is_leader || !recovery_complete → no-op).
+    with subtest("recovery: kill leader mid-build, standby acquires + recovers"):
+        # Baseline: boot-time leader already ran recovery once (its
+        # LeaderAcquired fired during waitReady). This scrape goes to
+        # the CURRENT leader — confirms recovery happened at all before
+        # we trust any of the dispatch paths above.
+        m = sched_metrics()
+        boot_recovery = metric_value(m, "rio_scheduler_recovery_total",
+                                     labels='{outcome="success"}')
+        assert boot_recovery is not None and boot_recovery >= 1.0, (
+            f"boot-time leader should have run recovery >=1 time, "
+            f"got {boot_recovery!r}\n"
+            f"  all recovery series: {m.get('rio_scheduler_recovery_total', {})!r}"
+        )
+
+        # Settle: q==0 AND r==0 BEFORE starting the slow build. The
+        # derivations_running gauge is Tick-updated (scheduler default
+        # ~10s; worker.rs:604-623). Without this baseline, the running
+        # gauge might still show a stale count from pinDrv/watchDedup →
+        # we'd kill the leader before the slow build is even dispatched
+        # → PG has 0 non-terminal rows → assert fails. 60s covers ≥3
+        # default-interval Ticks.
+        sched_metric_wait(
+            "awk '/^rio_scheduler_derivations_queued / {q=$2} "
+            "/^rio_scheduler_derivations_running / {r=$2} "
+            "END {exit !(q==0 && r==0)}'",
+            timeout=60,
+        )
+
+        # Capture the pre-kill leader name. After `delete pod`, the
+        # Deployment controller creates a NEW replacement pod with a
+        # DIFFERENT name — so seeing leader_pod() return a different
+        # value is positive proof the lease moved.
+        old_leader = leader_pod()
+        print(f"recovery: pre-kill leader = {old_leader}")
+
+        # Backgrounded slow build. `nohup ... < /dev/null &` fully
+        # detaches (no stdin read, no HUP on shell exit). client.execute
+        # (not .succeed): returns immediately, no exit-code check.
+        client.execute(
+            "nohup nix-build --no-out-link "
+            "--store 'ssh-ng://k3s-server' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${recoverySlowDrv} "
+            "> /tmp/recovery-slow.log 2>&1 < /dev/null &"
+        )
+
+        # Poll for dispatch (running ≥1). Settle-wait guaranteed
+        # baseline 0, so a nonzero reading IS our slow build. 30s
+        # timeout: dispatch + Tick latency.
+        sched_metric_wait(
+            "grep -E '^rio_scheduler_derivations_running [1-9]'",
+            timeout=30,
+        )
+
+        # PG snapshot BEFORE the kill. At kill time the worker's gRPC
+        # stream is dead — it CANNOT report completion until a scheduler
+        # is back. So the row is guaranteed non-terminal NOW. Checking
+        # after recovery races with the build finishing (worker
+        # reconnects → reports → status='completed' before the assert).
+        # Same TERMINAL_STATUSES filter as load_nonterminal_derivations
+        # (db.rs:625).
+        #
+        # psql_k8s (NOT psql): bitnami PG runs in a pod, not systemd.
+        nonterminal = int(psql_k8s(k3s_server,
+            "SELECT COUNT(*) FROM derivations "
+            "WHERE status NOT IN "
+            "('completed','poisoned','dependency_failed','cancelled')"
+        ))
+        assert nonterminal >= 1, (
+            f"PG snapshot at kill time should have >=1 non-terminal drv "
+            f"(slow build in-flight), got {nonterminal}"
+        )
+        print(f"recovery: PG has {nonterminal} non-terminal row(s) for recovery to load")
+
+        # Kill the leader pod. --grace-period=0 --force: immediate
+        # deletion, no SIGTERM drain. Simulates a node crash / OOMKill,
+        # NOT graceful shutdown. The Deployment controller immediately
+        # creates a replacement — but the STANDBY pod acquires the
+        # lease first (it's already running, watching, probing;
+        # replacement pod takes ~10-20s to reach Ready).
+        kubectl(f"delete pod {old_leader} --grace-period=0 --force")
+
+        # Standby acquires. Lease holderIdentity becomes a DIFFERENT
+        # pod name. 60s timeout: lease TTL + acquire tick (~5s poll).
+        # The Lease's holderIdentity briefly stays the old name until
+        # the lease expires — that's why we can't just assert -n.
+        k3s_server.wait_until_succeeds(
+            f"test \"$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            f"-o jsonpath='{{.spec.holderIdentity}}')\" != '{old_leader}'",
+            timeout=60,
+        )
+        new_leader = leader_pod()
+        assert new_leader != old_leader, (
+            f"lease should move off killed pod: old={old_leader} new={new_leader}"
+        )
+        print(f"recovery: new leader = {new_leader}")
+
+        # New leader ran recovery. EXACTLY 1.0: this pod was the
+        # standby, it never ran recovery before (LeaderAcquired never
+        # fired for it). Fresh acquisition → exactly one recovery. If
+        # the replacement pod somehow won the lease race instead, same
+        # thing — fresh process, first acquire, recovery_total = 1.
+        #
+        # wait_until_succeeds (not one-shot): recovery runs in the
+        # LeaderAcquired handler, asynchronously after lease acquire.
+        # There's a small window where lease moved but recovery hasn't
+        # finished yet.
+        sched_metric_wait(
+            "grep -qx 'rio_scheduler_recovery_total{outcome=\"success\"} 1'",
+            timeout=30,
+        )
+
+        # Worker re-registered with the new leader. Fresh scheduler
+        # process = metrics reset → workers_active climbs back to 1
+        # (or 2 if pod-1 from a later autoscaler run somehow exists —
+        # it doesn't yet). ≥1 not ==1: the slow build's worker may
+        # have briefly disconnected/reconnected during failover.
+        sched_metric_wait(
+            "grep -E '^rio_scheduler_workers_active [1-9]'",
+            timeout=60,
+        )
+
+        # Post-recovery build. DIFFERENT marker → different output path
+        # → NOT a cache hit. Proves dispatch is unblocked AFTER the
+        # lease re-acquire + recover_from_pg sequence (if recovery
+        # failed or never ran, dispatch_ready stays false forever).
+        out_recovery = build("${recoveryDrv}", capture_stderr=False).strip()
+        assert out_recovery.startswith("/nix/store/"), (
+            f"post-recovery build should succeed: {out_recovery!r}"
+        )
+        assert out_recovery != out_pin, (
+            f"should be a DIFFERENT path than pin build (not cache hit): "
+            f"{out_recovery!r} == {out_pin!r}"
+        )
+
+        # Re-check recovery_total is EXACTLY 1 at the end — proves
+        # recovery ran exactly once in THIS leader's process lifetime
+        # (no spurious re-acquires, no double-recovery bugs).
+        m = sched_metrics()
+        final_recovery = metric_value(m, "rio_scheduler_recovery_total",
+                                      labels='{outcome="success"}')
+        assert final_recovery == 1.0, (
+            f"new leader should have recovery_total=1 (fresh process, one "
+            f"acquire), got {final_recovery!r}\n"
+            f"  all recovery series: {m.get('rio_scheduler_recovery_total', {})!r}"
+        )
+
+        # Drain the slow build before the next sections. 150s: up to
+        # ~90s sleep remainder + re-dispatch overhead after failover +
+        # ReconcileAssignments cross-check delay.
+        sched_metric_wait(
+            "awk '/^rio_scheduler_derivations_queued / {q=$2} "
+            "/^rio_scheduler_derivations_running / {r=$2} "
+            "END {exit !(q==0 && r==0)}'",
+            timeout=150,
+        )
+        print(f"recovery PASS: standby took over, loaded {nonterminal} row(s), built {out_recovery}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # gc-dry-run — TriggerGC via AdminService proxy, sweep ROLLBACK
+    # ══════════════════════════════════════════════════════════════════
+    # Same RPC path as phase3b (scheduler → store → mark → sweep →
+    # progress stream → proxy back), but -plaintext since vmtest-full
+    # has tls.enabled=false. grace=24h → nothing past grace → empty
+    # unreachable set → proves the stream runs end-to-end, NOT that
+    # the for-batch loop body executes (that's gc-sweep's job).
+    with subtest("gc-dry-run: TriggerGC completes, currentPath describes outcome"):
+        result = sched_grpc(
+            '{"dry_run": true, "grace_period_hours": 24}',
+            "rio.admin.AdminService/TriggerGC",
+        )
+        # GCProgress stream: at least one message with isComplete=true.
+        # grpcurl emits proto3 JSON (camelCase) per streamed message.
+        assert '"isComplete": true' in result or '"isComplete":true' in result, (
+            f"expected GCProgress.isComplete=true, got: {result[:500]}"
+        )
+        # currentPath describes the outcome (mark+sweep RAN, even if
+        # sweep found nothing). pathsScanned=0 is OMITTED from proto3
+        # JSON (zero-value default) — currentPath string is the signal.
+        assert "delete" in result.lower() and "path" in result.lower(), (
+            f"expected currentPath to describe delete outcome "
+            f"(mark+sweep ran), got: {result[:500]}"
+        )
+        print("gc-dry-run PASS: TriggerGC stream completed via AdminService proxy")
+
+    # ══════════════════════════════════════════════════════════════════
+    # reconciler-replicas — manual STS scale NOT stomped by reconciler
+    # ══════════════════════════════════════════════════════════════════
+    # Regression: the reconciler was reverting STS.spec.replicas to
+    # spec.replicas.min on every reconcile (SSA with .force() re-claimed
+    # the field from the autoscaler's field-manager). Simulate the
+    # autoscaler by scaling directly — the .owns(StatefulSet) watch
+    # fires → reconcile runs. If bug present, replicas reverts to 1
+    # within the same reconcile that patches status.
+    #
+    # POSITIVE signal before NEGATIVE: wait for the reconciler's own
+    # status patch (desiredReplicas=2) — proves the reconcile RAN —
+    # THEN assert STS.spec.replicas is STILL 2. Replaces phase3a's
+    # `time.sleep(5)` hope-the-reconcile-ran hack with a deterministic
+    # gate (phase3a.nix:725-730).
+    with subtest("reconciler-replicas: SSA field-ownership handoff preserves manual scale"):
+        kubectl("scale statefulset default-workers --replicas=2")
+
+        # Reconciler observed the change (via .owns watch), reconciled,
+        # patched WorkerPool.status.desiredReplicas=2. This IS the
+        # reconcile — if it were going to stomp replicas, it would have
+        # done so in the same apply() call.
+        k3s_server.wait_until_succeeds(
+            "test \"$(k3s kubectl -n ${ns} get workerpool default "
+            "-o jsonpath='{.status.desiredReplicas}')\" = 2",
+            timeout=20,
+        )
+
+        # STILL 2 after the reconcile. Synchronous check — reconciler
+        # had its chance in the status-patch reconcile above.
+        kubectl(
+            "get statefulset default-workers "
+            "-o jsonpath='{.spec.replicas}' | grep -qx 2"
+        )
+
+        # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
+        kubectl("scale statefulset default-workers --replicas=1")
+        k3s_server.wait_until_succeeds(
+            "test \"$(k3s kubectl -n ${ns} get workerpool default "
+            "-o jsonpath='{.status.desiredReplicas}')\" = 1",
+            timeout=20,
+        )
+        print("reconciler-replicas PASS: manual STS scale survived reconcile")
+
+    # ══════════════════════════════════════════════════════════════════
+    # autoscaler — queue pressure → STS replicas 1→2
+    # ══════════════════════════════════════════════════════════════════
+    # FIRST TIME scale_one() runs against a real apiserver. The
+    # reconciler-replicas test proved the reconciler doesn't STOMP, but
+    # the autoscaler ITSELF never patched anything until now. Proves:
+    # (a) SSA patch body includes apiVersion+kind — without them the STS
+    # patch 400s "apiVersion must be set" → warn log → autoscaler
+    # silently never scales (phase3a.nix:819-823), (b) autoscaler patches
+    # WorkerPool.status.lastScaleTime via its SEPARATE field-manager.
+    #
+    # Timing: controller.extraEnv sets poll/up-window/min-interval = 3s
+    # (default 30s would mean ~60s to first scale — too slow). With
+    # sustained queued≥3, first scale in ~6-12s.
+    with subtest("autoscaler: queue pressure patches STS replicas 1→2"):
+        # 5 builds, all leaves, one DAG submit. Backgrounded — script
+        # polls metrics while builds run. No NIX_CONFIG: client VM's
+        # nix.settings.experimental-features already set (mkClientNode).
+        client.execute(
+            "nohup nix-build --no-out-link "
+            "--store 'ssh-ng://k3s-server' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${autoscaleDrvFile} -A d1 -A d2 -A d3 -A d4 -A d5 "
+            "> /tmp/autoscale-build.log 2>&1 < /dev/null &"
+        )
+
+        # Queue depth ≥3. With maxConcurrentBuilds=1, 1 runs + 4 queue.
+        # ≥3 not ==4: first dispatch may happen between poll + gauge
+        # update (Tick-lagged). ≥3 is enough for compute_desired=2. 40s
+        # timeout: Tick latency + submit overhead.
+        sched_metric_wait(
+            "awk '/^rio_scheduler_derivations_queued / {print $2}' | "
+            "grep -qE '^[3-9]|^[1-9][0-9]'",
+            timeout=40,
+        )
+
+        # THE ASSERTION: STS replicas 1→2. EXACTLY 2 (not ≥2) — proves
+        # the patch body was well-formed (apiVersion+kind present). A
+        # malformed patch would leave replicas at 1 forever (400s are
+        # swallowed as warn-logs by kube-rs). 60s: 3s poll + 3s
+        # up-window + jitter + k3s VM latency.
+        k3s_server.wait_until_succeeds(
+            "test \"$(k3s kubectl -n ${ns} get statefulset default-workers "
+            "-o jsonpath='{.spec.replicas}')\" = 2",
+            timeout=60,
+        )
+
+        # WorkerPool.status.lastScaleTime set (RFC3339 string, non-
+        # empty). Owned by the autoscaler's SSA field-manager (distinct
+        # from the reconciler's — otherwise reconcile would clobber it
+        # to None every cycle).
+        k3s_server.wait_until_succeeds(
+            "sc=$(k3s kubectl -n ${ns} get workerpool default "
+            "-o jsonpath='{.status.lastScaleTime}'); "
+            "test -n \"$sc\"",
+            timeout=20,
+        )
+
+        # Scaling condition explains WHY replicas changed.
+        kubectl(
+            "get workerpool default "
+            "-o jsonpath='{.status.conditions[?(@.type==\"Scaling\")].reason}' | "
+            "grep -q ScaledUp"
+        )
+
+        # scaling_decisions_total{direction="up"} ≥1. Proves scale_one()
+        # ran to COMPLETION (metric increments after the patch succeeds,
+        # scaling.rs:257). Not exact — an earlier reconciler-replicas
+        # reset to 1 MIGHT have triggered a scale-up race depending on
+        # timing, so ≥1 is the honest bound.
+        cm = ctrl_metrics()
+        scale_up = metric_value(cm, "rio_controller_scaling_decisions_total",
+                                labels='{direction="up"}')
+        assert scale_up is not None and scale_up >= 1.0, (
+            f"expected scaling_decisions_total{{direction=\"up\"}} >= 1, "
+            f"got {scale_up!r}\n"
+            f"  all scaling series: {cm.get('rio_controller_scaling_decisions_total', {})!r}"
+        )
+
+        # Drain the 5 builds. Can't `wait` across shell sessions (each
+        # .succeed is a fresh shell — the &-backgrounded nix-build is a
+        # job in a DIFFERENT shell). Poll q==0 AND r==0. 5×15s ≈ 75s
+        # sequential on pod-0 alone (pod-1 may never Ready on 4GB VM).
+        # Build success irrelevant — we only need queue drained so
+        # finalizer's acquire_many doesn't block.
+        sched_metric_wait(
+            "awk '/^rio_scheduler_derivations_queued / {q=$2} "
+            "/^rio_scheduler_derivations_running / {r=$2} "
+            "END {exit !(q==0 && r==0)}'",
+            timeout=150,
+        )
+        print(f"autoscaler PASS: STS scaled 1→2, scaling_decisions_total={scale_up}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # gc-sweep — PinPath + backdate + non-dry-run sweep PROVES commit
+    # ══════════════════════════════════════════════════════════════════
+    # THE test that proves sweep's for-batch loop body executes. With
+    # all-in-grace paths, unreachable=vec![] → loop never runs → neither
+    # commit NOR rollback fires → dry-run and non-dry-run are
+    # indistinguishable. Backdating ONE path past grace makes it the
+    # sole unreachable candidate → `pathsCollected: "1"` proves the
+    # DELETE ran.
+    #
+    # Runs AFTER all builds (no more worker uploads touching narinfo)
+    # but BEFORE finalizer (grpcurl still works without workers, but
+    # keeping ordering monotonic is easier to reason about).
+    with subtest("gc-sweep: PinPath + backdated sweep deletes EXACTLY 1"):
+        # Pin out_pin. PinPath is rio.store.StoreAdminService on the
+        # STORE (port 9002), NOT scheduler's AdminService (9001 — that
+        # only has the TriggerGC proxy, not Pin/Unpin).
+        #
+        # JSON construction: f-string inside Python inside Nix.
+        # {{ }} → Python sees { }. The store_path value is a /nix/store/
+        # path — no embedded quotes, safe to single-quote wrap.
+        store_grpc(
+            f'{{"store_path": "{out_pin}", "source": "vm-lifecycle"}}',
+            "rio.store.StoreAdminService/PinPath",
+        )
+        # Verify pin persisted in PG.
+        pin_count = psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots")
+        assert pin_count == "1", f"expected 1 gc_roots row after PinPath, got {pin_count!r}"
+
+        # Backdate out_recovery past grace. This is the path sweep will
+        # delete. out_recovery is unpinned (we only pinned out_pin) AND
+        # unreferenced (worker uploads have references=vec![] — phase4
+        # gap, see phase3b.nix:922-924). created_at = now() - 25h puts
+        # it 1h past a 24h grace window.
+        #
+        # Single-quote SQL avoids bash-escaping (psql_k8s wraps in
+        # double quotes). Python f-string interpolates the path.
+        psql_k8s(k3s_server,
+            f"UPDATE narinfo SET created_at = now() - interval '25 hours' "
+            f"WHERE store_path = '{out_recovery}'"
+        )
+
+        # Non-dry-run sweep. dry_run=false → sweep COMMITs. grace=24h →
+        # ONLY out_recovery is past grace → unreachable={out_recovery}
+        # → for-batch loop iterates once → DELETE → COMMIT.
+        result = sched_grpc(
+            '{"dry_run": false, "grace_period_hours": 24}',
+            "rio.admin.AdminService/TriggerGC",
+        )
+        assert '"isComplete": true' in result or '"isComplete":true' in result, (
+            f"expected GCProgress.isComplete=true: {result[:500]}"
+        )
+        # pathsCollected EXACTLY "1" (proto3 JSON uint64 → string).
+        # paths_collected → camelCase. This is THE assertion — without
+        # the backdate, pathsCollected would be 0 (or absent, proto3
+        # zero-value) and we'd have proven nothing about the loop body.
+        assert (
+            '"pathsCollected": "1"' in result
+            or '"pathsCollected":"1"' in result
+        ), f"expected EXACTLY 1 path collected (backdated recovery output): {result[:500]}"
+
+        # out_recovery GONE — nix path-info MUST fail.
+        client.fail(
+            f"nix path-info --store 'ssh-ng://k3s-server' {out_recovery}"
+        )
+        # out_pin still there — pin protected it.
+        client.succeed(
+            f"nix path-info --store 'ssh-ng://k3s-server' {out_pin}"
+        )
+
+        # UnpinPath round-trip (idempotent).
+        store_grpc(
+            f'{{"store_path": "{out_pin}"}}',
+            "rio.store.StoreAdminService/UnpinPath",
+        )
+        unpin_count = psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots")
+        assert unpin_count == "0", f"expected 0 gc_roots after UnpinPath, got {unpin_count!r}"
+        print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
+
+    # ══════════════════════════════════════════════════════════════════
+    # finalizer — delete WorkerPool → pod gone → CR gone → workers=0
+    # ══════════════════════════════════════════════════════════════════
+    # Runs LAST: deletes the only WorkerPool, so no workers exist after.
+    # Finalizer's cleanup(): DrainWorker + scale STS → 0 + wait for pod
+    # termination + remove finalizer. Queue is already empty (autoscaler
+    # drained) → acquire_many succeeds immediately → no blocking.
+    with subtest("finalizer: delete WorkerPool → drain → pod gone → CR gone"):
+        # --wait=false: don't block kubectl on the finalizer. We assert
+        # each stage with its own timeout so a hang points at the exact
+        # stage (pod-gone vs CR-gone vs workers_active).
+        kubectl("delete workerpool default --wait=false")
+
+        # Pod gone. Proves: STS scaled to 0, SIGTERM drain exited
+        # cleanly (no in-flight builds), finalizer removed (K8s could
+        # GC the owned StatefulSet). Pod-1 from autoscaler is also gone
+        # (same STS).
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get pod default-workers-0 2>/dev/null",
+            timeout=120,
+        )
+
+        # WorkerPool CR gone (finalizer removed → K8s deleted it).
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get workerpool default 2>/dev/null",
+            timeout=30,
+        )
+
+        # Scheduler saw the disconnect. workers_active EXACTLY 0 — not
+        # just ≤0 (gauge underflow would be a bug).
+        sched_metric_wait(
+            "grep -qx 'rio_scheduler_workers_active 0'",
+            timeout=30,
+        )
+        print("finalizer PASS: WorkerPool deleted, pod drained, scheduler saw disconnect")
+
+    ${common.collectCoverage fixture.pyNodeVars}
+  '';
+}

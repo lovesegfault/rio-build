@@ -580,6 +580,9 @@
                 vm-security-standalone = 3;
                 # 5 VMs: control + worker1/2/3 + client.
                 vm-observability-standalone = 5;
+                # 3 VMs but k3s-server is 8-core 6GB + k3s-agent 8-core 4GB.
+                vm-lifecycle-k3s = 8;
+                vm-leader-election-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (

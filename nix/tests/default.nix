@@ -35,15 +35,24 @@ let
       ;
   };
 
-  # k3s-full not wired yet — commit 9 adds lifecycle/leader-election.
-  # k3sFull = import ./fixtures/k3s-full.nix {
-  #   inherit pkgs rio-workspace rioModules dockerImages nixhelm system coverage;
-  # };
+  k3sFull = import ./fixtures/k3s-full.nix {
+    inherit
+      pkgs
+      rio-workspace
+      rioModules
+      dockerImages
+      nixhelm
+      system
+      coverage
+      ;
+  };
 
   protocol = import ./scenarios/protocol.nix;
   scheduling = import ./scenarios/scheduling.nix;
   security = import ./scenarios/security.nix;
   observability = import ./scenarios/observability.nix;
+  lifecycle = import ./scenarios/lifecycle.nix;
+  leader-election = import ./scenarios/leader-election.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # ── Legacy phase tests (deleted in commit 10) ───────────────────────
@@ -170,6 +179,28 @@ in
       };
       withOtel = true;
     };
+  };
+
+  # ── k3s-full scenarios ───────────────────────────────────────────────
+  # First boot of the 2-node k3s fixture with full chart. Slow (~4min
+  # waitReady), belong in ci-slow.
+  vm-lifecycle-k3s = lifecycle {
+    inherit pkgs common;
+    fixture = k3sFull {
+      extraValues = {
+        "controller.extraEnv[0].name" = "RIO_AUTOSCALER_POLL_SECS";
+        "controller.extraEnv[0].value" = "3";
+        "controller.extraEnv[1].name" = "RIO_AUTOSCALER_SCALE_UP_WINDOW_SECS";
+        "controller.extraEnv[1].value" = "3";
+        "controller.extraEnv[2].name" = "RIO_AUTOSCALER_MIN_INTERVAL_SECS";
+        "controller.extraEnv[2].value" = "3";
+      };
+    };
+  };
+
+  vm-leader-election-k3s = leader-election {
+    inherit pkgs common;
+    fixture = k3sFull { };
   };
 
   # ── Legacy phase tests (migration period; deleted in commit 10) ─────
