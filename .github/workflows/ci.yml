@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 60
     outputs:
       checks: ${{ steps.gen.outputs.checks }}
-      fuzz-smoke: ${{ steps.gen.outputs.fuzz-smoke }}
+      fuzz: ${{ steps.gen.outputs.fuzz }}
       vm-test: ${{ steps.gen.outputs.vm-test }}
       coverage: ${{ steps.gen.outputs.coverage }}
     steps:
@@ -45,7 +45,7 @@ jobs:
           all=$(nix eval ".#${GHA}.matrix" --json \
             --apply 'builtins.mapAttrs (_: builtins.attrNames)')
           echo "::notice::matrices: $all"
-          for m in checks fuzz-smoke vm-test coverage; do
+          for m in checks fuzz vm-test coverage; do
             echo "$m=$(jq -c --arg m "$m" '.[$m]' <<<"$all")" >> "$GITHUB_OUTPUT"
           done
 
@@ -65,7 +65,7 @@ jobs:
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
-  fuzz-smoke:
+  fuzz:
     name: fuzz / ${{ matrix.name }}
     needs: gen-matrix
     runs-on: rio-ci
@@ -73,11 +73,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: ${{ fromJSON(needs.gen-matrix.outputs.fuzz-smoke) }}
+        name: ${{ fromJSON(needs.gen-matrix.outputs.fuzz) }}
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-nix
-      - run: nix build ".#${GHA}.matrix.fuzz-smoke.${{ matrix.name }}" --print-build-logs
+      - run: nix build ".#${GHA}.matrix.fuzz.${{ matrix.name }}" --print-build-logs
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 
@@ -140,7 +140,7 @@ jobs:
   # check silently passes).
   ci-gate:
     if: always()
-    needs: [gen-matrix, checks, fuzz-smoke, vm-test, coverage]
+    needs: [gen-matrix, checks, fuzz, vm-test, coverage]
     runs-on: rio-ci
     timeout-minutes: 60
     steps:
