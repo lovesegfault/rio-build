@@ -160,12 +160,14 @@ async fn main() -> anyhow::Result<()> {
     // Enables atexit handlers (LLVM coverage profraw flush, tracing
     // shutdown) by letting main() return normally.
     //
-    // Shutdown chain for the actor: serve returns → SchedulerGrpc +
-    // AdminService drop their ActorHandle clones → tick-loop + lease-
-    // loop also break and drop theirs → all mpsc::Sender clones drop →
-    // actor's rx.recv() returns None → actor exits → drops
-    // event_persist_tx → event-persister also exits (channel-close).
-    // event_log::spawn doesn't need a token; it self-terminates.
+    // Shutdown chain for the actor: token cancels → actor's select!
+    // loop sees it → drops all worker stream_tx → build-exec-bridge
+    // tasks exit → ReceiverStream closes → serve_with_shutdown
+    // returns → SchedulerGrpc + AdminService drop their ActorHandle
+    // clones → tick-loop + lease-loop also break and drop theirs →
+    // all mpsc::Sender clones drop → actor's rx.recv() returns None
+    // → actor exits → drops event_persist_tx → event-persister also
+    // exits (channel-close). event_log::spawn doesn't need a token.
     let shutdown = rio_common::signal::shutdown_signal();
 
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
@@ -331,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         Some(leader),
         Some(event_persist_tx),
         hmac_signer,
+        shutdown.clone(),
     );
     info!("DAG actor spawned");
 

@@ -194,6 +194,19 @@ pub struct DagActor {
     /// Arc because assign_to_worker is hot path and cloning the
     /// underlying key Vec on every dispatch would allocate.
     hmac_signer: Option<Arc<rio_common::hmac::HmacSigner>>,
+    /// Shutdown token. When cancelled (SIGTERM via `shutdown_signal`),
+    /// the run loop drains `self.workers` and breaks. Dropping the
+    /// worker `stream_tx` senders cascades: `build-exec-bridge` tasks
+    /// exit → `ReceiverStream` closes → tonic's `serve_with_shutdown`
+    /// sees all response streams closed → server returns. Without
+    /// this, `serve_with_shutdown` deadlocks on open bidi streams
+    /// because the `SchedulerGrpc` that holds an `ActorHandle`
+    /// (sender) is itself held by the server's handler registry —
+    /// circular wait.
+    ///
+    /// Default (from `new()`) is a fresh never-cancelled token →
+    /// tests and non-production constructors are unchanged.
+    shutdown: rio_common::signal::Token,
 }
 
 impl DagActor {
@@ -234,6 +247,7 @@ impl DagActor {
             recovery_complete: Arc::new(AtomicBool::new(true)),
             event_persist_tx: None,
             hmac_signer: None,
+            shutdown: rio_common::signal::Token::new(),
         }
     }
 
@@ -288,7 +302,30 @@ impl DagActor {
     async fn run_inner(&mut self, rx: &mut mpsc::Receiver<ActorCommand>) {
         info!("DAG actor started");
 
-        while let Some(cmd) = rx.recv().await {
+        loop {
+            let cmd = tokio::select! {
+                // biased: check the shutdown arm first so a cancelled
+                // token wins even if commands are pending. On SIGTERM
+                // we want fast drain, not a queue-process-then-exit.
+                biased;
+                _ = self.shutdown.cancelled() => {
+                    info!(
+                        workers = self.workers.len(),
+                        "actor shutting down, dropping worker streams"
+                    );
+                    // Drop all stream_tx → build-exec-bridge tasks
+                    // see actor_rx close → drop output_tx →
+                    // ReceiverStream closes → serve_with_shutdown
+                    // unblocks.
+                    self.workers.clear();
+                    break;
+                }
+                cmd = rx.recv() => match cmd {
+                    Some(c) => c,
+                    None => break,
+                },
+            };
+
             // Check backpressure state
             let queue_len = rx.len();
             let capacity = rx.max_capacity();
@@ -713,6 +750,16 @@ impl DagActor {
     /// three come from the same `LeaderState`.
     pub fn with_recovery_flag(mut self, recovery_complete: Arc<AtomicBool>) -> Self {
         self.recovery_complete = recovery_complete;
+        self
+    }
+
+    /// Inject the shutdown token from `shutdown_signal()`. The run
+    /// loop `select!`s on `token.cancelled()` with `biased` ordering
+    /// so SIGTERM drains workers immediately. REPLACES the default
+    /// never-cancelled token from `new()`. Only `spawn_with_leader`
+    /// (production path) calls this; test actors keep the default.
+    pub fn with_shutdown_token(mut self, token: rio_common::signal::Token) -> Self {
+        self.shutdown = token;
         self
     }
 

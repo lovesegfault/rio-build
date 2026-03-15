@@ -60,6 +60,7 @@ impl ActorHandle {
             None,
             None,
             None,
+            rio_common::signal::Token::new(),
         )
     }
 
@@ -76,6 +77,7 @@ impl ActorHandle {
     /// test callsites (setup_actor etc) all use `spawn()` with no
     /// lease; keeping that signature stable avoids updating ~8
     /// test helpers.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_leader(
         db: SchedulerDb,
         store_client: Option<StoreServiceClient<Channel>>,
@@ -84,9 +86,12 @@ impl ActorHandle {
         leader: Option<crate::lease::LeaderState>,
         event_persist_tx: Option<mpsc::Sender<crate::event_log::EventLogEntry>>,
         hmac_signer: Option<rio_common::hmac::HmacSigner>,
+        shutdown: rio_common::signal::Token,
     ) -> Self {
         let (tx, rx) = mpsc::channel(ACTOR_CHANNEL_CAPACITY);
-        let mut actor = DagActor::new(db, store_client).with_size_classes(size_classes);
+        let mut actor = DagActor::new(db, store_client)
+            .with_size_classes(size_classes)
+            .with_shutdown_token(shutdown);
         if let Some(flush_tx) = log_flush_tx {
             actor = actor.with_log_flusher(flush_tx);
         }
