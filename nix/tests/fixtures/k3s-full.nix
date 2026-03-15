@@ -303,6 +303,19 @@ in
     # workerPool.replicas.min=1 in vmtest-full.yaml → controller
     # scales STS to 1 immediately. FUSE device hostPath needs the
     # node's /dev/fuse to exist (boot.kernelModules = ["fuse"] above).
+    #
+    # Diagnostic dump BEFORE the wait: if the STS never appears,
+    # controller logs + WorkerPool status explain why. >&2 so it
+    # lands in the test driver log (via -L).
+    k3s_server.execute(
+        "echo '--- WORKER DIAGNOSTIC ---' >&2; "
+        "k3s kubectl get workerpool -A -o yaml >&2 2>&1; "
+        "echo '--- controller logs ---' >&2; "
+        "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=50 >&2 2>&1; "
+        "echo '--- STS list ---' >&2; "
+        "k3s kubectl get sts -A >&2 2>&1; "
+        "echo '--- END DIAGNOSTIC ---' >&2"
+    )
     k3s_server.wait_until_succeeds(
         "k3s kubectl -n ${ns} wait --for=condition=Ready "
         "pod/default-workers-0 --timeout=150s",
