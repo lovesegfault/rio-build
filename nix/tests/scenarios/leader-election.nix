@@ -273,8 +273,8 @@ pkgs.testers.runNixOSTest {
                 ).strip()
             except Exception as e:
                 bg["err"] = e
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
+        bg_thread = threading.Thread(target=_bg, daemon=True)
+        bg_thread.start()
 
         # Wait for the build to actually DISPATCH before killing the
         # leader. If we kill too early (build still in SubmitBuild /
@@ -295,8 +295,8 @@ pkgs.testers.runNixOSTest {
         # reconnect slack. 180s is very generous — if we hit this,
         # something is hung (gateway never rerouted, worker relay
         # buffer overflowed, new leader rejected the replay).
-        t.join(timeout=180)
-        assert not t.is_alive(), (
+        bg_thread.join(timeout=180)
+        assert not bg_thread.is_alive(), (
             "build thread did not finish within 180s after leader kill. "
             "Gateway balanced-channel never rerouted to new leader? "
             "Worker relay buffer lost on reconnect?"

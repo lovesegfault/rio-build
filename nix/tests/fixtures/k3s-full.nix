@@ -99,6 +99,7 @@ let
     environment.systemPackages = [
       pkgs.curl
       pkgs.kubectl
+      pkgs.grpc-health-probe # health-shared probe (lifecycle.nix)
     ];
   };
 

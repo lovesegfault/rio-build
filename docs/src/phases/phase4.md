@@ -52,27 +52,30 @@ Explicitly out of Phase 4 scope:
 | Staggered scheduling (delay dispatch to cold workers until prefetch-warm) | In-process chunk cache + per-derivation prefetch absorb most thundering-herd. Revisit if mass cold-start (all pools scaling from 0) spikes S3 in production. |
 | Nix multi-version compatibility matrix + `cargo-mutants` | Testing infrastructure expansion; separate track. |
 
-## VM test `phase4.nix` section map
+## VM test section map
 
-`nix/tests/phase4.nix` is built incrementally across sub-phases (same pattern as migration 009):
+VM tests use the topology×scenario architecture (`nix/tests/scenarios/*.nix`
+on `nix/tests/fixtures/{standalone,k3s-full}.nix`). Phase 4 work adds cases
+to existing scenario files rather than growing a monolithic `phase4.nix`:
 
-| Section | Sub-phase | Content |
-|---|---|---|
-| A | 4a | Tenant smoke: SSH key comment → `builds.tenant_id` resolved |
-| B | 4b | GC + references: NAR scanner populates `narinfo.references`; `path_tenants` retention windows |
-| C | 4b | Rate-limit trip |
-| D | 4b | `maxSilentTime` kill |
-| E | 4b | `rio-cli` smoke |
-| F | 4c | Cancel timing: metric + cgroup cleanup |
-| G | 4c | NetPol egress block |
-| H | 4c | `WorkerPoolSet` reconcile + cascade delete |
-| I | 4c | Security: binary cache auth 401→200, mTLS no-cert rejection |
-| J | 4c | 50-derivation load scenario |
+| Section | Sub-phase | Content | Scenario file |
+|---|---|---|---|
+| A | 4a | Tenant smoke: SSH key comment → `builds.tenant_id` | `security.nix` (standalone, `withPki`) |
+| B | 4b | GC + references: NAR scanner, `path_tenants` retention | `lifecycle.nix` (k3s-full) |
+| C | 4b | Rate-limit trip | `security.nix` |
+| D | 4b | `maxSilentTime` kill | `scheduling.nix` |
+| E | 4b | `rio-cli` smoke | new `scenarios/cli.nix` |
+| F | 4c | Cancel timing: metric + cgroup cleanup | `scheduling.nix` |
+| G | 4c | NetPol egress block | new `scenarios/netpol.nix` (k3s-full) |
+| H | 4c | `WorkerPoolSet` reconcile + cascade delete | `lifecycle.nix` |
+| I | 4c | Security: binary cache auth, mTLS no-cert rejection | `security.nix` |
+| J | 4c | 50-derivation load scenario | `scheduling.nix` |
 
-`nix/tests/phase4-fod.nix` is standalone (4c only).
+The FOD-proxy test (Squid allowlist) is a new `scenarios/fod-proxy.nix` on
+`k3s-full` with `fodProxy.enabled=true` in the values profile.
 
 ## Milestone
 
-All three sub-phase milestones pass. `ci-fast` aggregate includes `vm-phase4` (all sections A–J) and `vm-phase4-fod`. Grafana dashboards render against the `vm-phase4` Prometheus. `rio-cli status/workers/builds/gc/cutoffs` works against the `vm-phase4` scheduler. `helm install --dry-run` renders without errors.
+All three sub-phase milestones pass. `ci-fast` aggregate includes the standalone-fixture scenarios (`vm-{protocol,scheduling,security,observability}-standalone`); `ci-slow` adds the k3s scenarios (`vm-{lifecycle,leader-election}-k3s`). Grafana dashboards render against a `vm-lifecycle-k3s` Prometheus scrape. `rio-cli status/workers/builds/gc/cutoffs` works against the live scheduler (section E in `scenarios/cli.nix`). `helm install --dry-run` renders without errors.
 
 **Manual post-phase verification:** Deploy the Helm chart to a real (non-VM) k8s cluster, seed a tenant, run `rio-cli status` — documented procedure in `docs/src/capacity-planning.md`, not in the CI gate.

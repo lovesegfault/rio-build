@@ -283,6 +283,11 @@ impl Filesystem for NixStoreFs {
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
+        // TODO(phase5): guard with file.metadata()?.is_file() before
+        // open_backing. FUSE_DEV_IOC_BACKING_OPEN EPERMs on directory
+        // fds; open() on the FUSE root (ino=2) succeeds in File::open
+        // but then warns here on every mount. Harmless (fallback works)
+        // but noisy in VM test logs.
         if self.passthrough {
             match reply.open_backing(&file) {
                 Ok(backing_id) => {

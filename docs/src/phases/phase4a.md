@@ -43,7 +43,7 @@
 
 ### VM test scaffolding
 
-- [x] **Create `nix/tests/phase4.nix`** with Section A only (tenant smoke). Register as `vm-phase4` in `flake.nix` (`withMinCpu 4`, `k3sArgs` — same shape as `vm-phase3a`). Later sub-phases append sections B–J (see section map in `phase4.md`). Section A: SSH key with comment `team-test` → `SubmitBuild` → PG `builds` row has `tenant_id` matching a pre-seeded `tenants` row; second key with no comment → `tenant_id IS NULL`.
+- [x] **Section A (tenant smoke)** lives in `nix/tests/scenarios/security.nix` `tenant-resolve` subtest (standalone fixture, `withPki=true`). Three SSH keys: comment `team-test` → `SubmitBuild` → PG `builds` row has `tenant_id` matching a pre-seeded `tenants` row; comment `unknown-team` → rejected pre-insert with `"unknown tenant"` error; empty comment → `tenant_id IS NULL`. Later sub-phases add cases to existing scenario files per the section map in `phase4.md`.
 
 ### Tracey markers
 

@@ -1,9 +1,11 @@
 # Lifecycle scenario: scheduler recovery, GC, autoscaler, finalizer,
-# Build-CRD watch dedup — all exercised against the k3s-full fixture.
+# Build-CRD reconciler flow, health-shared NOT_SERVING probe — all
+# exercised against the k3s-full fixture.
 #
-# Ports phase3b sections S (recovery), C (GC), F (watch-dedup) + phase3a
-# autoscaler/finalizer/SSA-field-ownership onto the 2-node k3s Helm-chart
-# fixture. Unlike phase3b (control/worker/k8s/client as separate systemd
+# Ports phase3b sections S (recovery), C (GC), F (watch-dedup), T
+# (health-shared) + phase3a autoscaler/finalizer/SSA-field-ownership/
+# Build-CRD events+finalizer onto the 2-node k3s Helm-chart fixture.
+# Unlike phase3b (control/worker/k8s/client as separate systemd
 # VMs), everything here runs as PODS — closes the "production uses pod
 # path, VM tests use systemd" gap for the reconciler/lease/autoscaler
 # surface.
@@ -16,8 +18,9 @@
 # restart.
 #
 # r[verify ctrl.build.watch-by-uid]
-#   build-crd-dedup asserts rio_controller_build_watch_spawns_total == 1
-#   across multiple reconcile cycles of ONE Build CR (UID-keyed DashMap).
+#   build-crd-flow asserts rio_controller_build_watch_spawns_total == 1
+#   across multiple reconcile cycles of ONE Build CR (UID-keyed DashMap),
+#   PLUS full apply→status→events→finalizer chain (phase3a:606-705).
 #
 # r[verify obs.metric.controller]
 #   autoscaler scrapes rio_controller_scaling_decisions_total{direction="up"}
@@ -247,6 +250,82 @@ pkgs.testers.runNixOSTest {
             raise
 
     # ══════════════════════════════════════════════════════════════════
+    # health-shared — standby NOT_SERVING, leader SERVING on plaintext port
+    # ══════════════════════════════════════════════════════════════════
+    # Ports phase3b section T (phase3b.nix:342-360 + 506-520) onto the
+    # k3s-full fixture. In phase3b the standby window was ARTIFICIAL
+    # (scheduler in STANDBY because kubeconfig didn't exist yet). Here
+    # the standby is REAL: scheduler.replicas=2, one pod holds the Lease,
+    # the other is a live standby.
+    #
+    # Proves: the plaintext health port (9101) shares its HealthReporter
+    # with the mTLS port via health_service.clone(). Standby's
+    # set_not_serving on the NAMED service is visible on BOTH ports — if
+    # the reporter weren't shared, the plaintext port would default to
+    # SERVING regardless of lease state.
+    #
+    # MUST run BEFORE recovery: recovery deletes the leader pod, which
+    # disrupts the stable 2-replica state (the former standby becomes
+    # leader, and the Deployment-spawned replacement pod may briefly
+    # show SERVING-then-NOT_SERVING churn during its own startup).
+    with subtest("health-shared: standby NOT_SERVING, leader SERVING (shared HealthReporter)"):
+        # app.kubernetes.io/name=rio-scheduler is the Deployment's pod
+        # selector (templates/_helpers.tpl rio.selectorLabels).
+        all_sched = kubectl(
+            "get pods -l app.kubernetes.io/name=rio-scheduler "
+            "-o jsonpath='{.items[*].metadata.name}'"
+        ).split()
+        assert len(all_sched) == 2, (
+            f"expected exactly 2 scheduler pods (replicas=2), got: {all_sched}"
+        )
+        leader = leader_pod()
+        standby = next(p for p in all_sched if p != leader)
+        print(f"health-shared: leader={leader}, standby={standby}")
+
+        # ── STANDBY: NOT_SERVING on named service ─────────────────────
+        # grpc-health-probe exits 1 for NOT_SERVING (phase3b.nix:348).
+        # .fail() expects non-zero exit AND returns stdout+stderr.
+        # Probe the NAMED service — set_not_serving only affects named,
+        # not the "" default (which is always SERVING).
+        k3s_server.succeed(
+            f"k3s kubectl -n ${ns} port-forward {standby} 19101:9101 "
+            f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"
+        )
+        try:
+            out = k3s_server.fail(
+                "grpc-health-probe -addr localhost:19101 "
+                "-service rio.scheduler.SchedulerService 2>&1"
+            )
+            assert "NOT_SERVING" in out, (
+                f"standby plaintext health should report NOT_SERVING "
+                f"(shared HealthReporter, lease-gated), got: {out!r}"
+            )
+        finally:
+            k3s_server.execute(
+                "kill $(cat /tmp/pf-health.pid) 2>/dev/null; rm -f /tmp/pf-health.pid"
+            )
+
+        # ── LEADER: SERVING on named service ──────────────────────────
+        # Exit 0 = SERVING. Leader acquired lease during waitReady →
+        # LeaderAcquired → recover_from_pg → recovery_complete=true →
+        # set_serving on named service.
+        k3s_server.succeed(
+            f"k3s kubectl -n ${ns} port-forward {leader} 19101:9101 "
+            f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"
+        )
+        try:
+            k3s_server.succeed(
+                "grpc-health-probe -addr localhost:19101 "
+                "-service rio.scheduler.SchedulerService"
+            )
+        finally:
+            k3s_server.execute(
+                "kill $(cat /tmp/pf-health.pid) 2>/dev/null; rm -f /tmp/pf-health.pid"
+            )
+        print("health-shared PASS: standby NOT_SERVING, leader SERVING "
+              "(plaintext port shares reporter with mTLS port)")
+
+    # ══════════════════════════════════════════════════════════════════
     # initial — build the pin target BEFORE recovery
     # ══════════════════════════════════════════════════════════════════
     # Built first so GC-sweep has TWO distinct outputs to work with:
@@ -259,15 +338,29 @@ pkgs.testers.runNixOSTest {
         print(f"initial PASS: pin target = {out_pin}")
 
     # ══════════════════════════════════════════════════════════════════
-    # build-crd-dedup — one watch task per Build UID, not per-reconcile
+    # build-crd-flow — full reconciler chain: apply → status → events →
+    #                  finalizer + watch-dedup (one task per Build UID)
     # ══════════════════════════════════════════════════════════════════
+    # Ports phase3a Build-CRD reconciler exercise (phase3a.nix:606-705)
+    # onto the pod-based fixture. phase3a ran the controller as systemd
+    # with admin kubeconfig (ns=default); here the controller is a pod
+    # with SA-scoped RBAC (ns=rio-system). FIRST time the full chain runs
+    # against a real apiserver from a pod.
+    #
     # Runs EARLY (before recovery's queue churn) for a clean baseline:
     # rio_controller_build_watch_spawns_total is a monotonic counter,
     # and this is the ONLY Build CR created in the whole test. If the
     # dedup is broken, the 5s-sleep build's status transitions (Pending
     # → Building → Succeeded, plus log-line patches) each trigger a
     # reconcile → each spawns a duplicate drain_stream → counter ≥3.
-    with subtest("build-crd-dedup: Build CRD watch spawns once, not per-reconcile"):
+    #
+    # Asserts (in order):
+    #   1. status.phase reaches terminal
+    #   2. status.buildId is a real UUID (NOT sentinel "submitted")
+    #   3. K8s Events ≥2 on the Build object, one reason=Submitted
+    #   4. watch_spawns_total == EXACTLY 1 (UID-keyed DashMap dedup)
+    #   5. delete → finalizer cleanup() → CR gone (not stuck Terminating)
+    with subtest("build-crd-flow: apply → status → events → finalizer + watch-dedup"):
         # Instantiate + copy the .drv closure (not outputs) to the store.
         # The Build reconciler's fetch_and_build_node reads the .drv from
         # rio-store to construct its DAG node.
@@ -304,6 +397,43 @@ pkgs.testers.runNixOSTest {
             timeout=60,
         )
 
+        # ── status.buildId: real UUID, not sentinel ───────────────────
+        # If the sentinel patch ran AFTER the watch task's first patch
+        # (patch-ordering race), build_id would be stuck at "submitted".
+        # UUID regex checks 8-4-4-4-12 hex shape (phase3a.nix:663-672).
+        build_id = kubectl(
+            "get build test-watch-dedup -o jsonpath='{.status.buildId}'"
+        ).strip()
+        print(f"build-crd-flow: build_id = {build_id}")
+        assert build_id != "" and build_id != "submitted", (
+            f"build_id stuck at sentinel/empty (patch-ordering race?): {build_id!r}"
+        )
+        import re
+        assert re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-', build_id), (
+            f"build_id not UUID-like: {build_id!r}"
+        )
+
+        # ── K8s Events: ≥2, at least one reason=Submitted ─────────────
+        # Controller's Recorder emits Submitted (from apply()) + terminal
+        # event (Building + Succeeded, or Building + Cached). Field
+        # selector filters to THIS Build object (phase3a.nix:680-695).
+        import json
+        events_json = kubectl(
+            "get events "
+            "--field-selector involvedObject.name=test-watch-dedup,involvedObject.kind=Build "
+            "-o json"
+        )
+        events = json.loads(events_json).get("items", [])
+        event_reasons = [e.get("reason", "") for e in events]
+        print(f"build-crd-flow: events = {event_reasons}")
+        assert len(events) >= 2, (
+            f"expected >=2 K8s Events on test-watch-dedup "
+            f"(Submitted + terminal), got {len(events)}: {event_reasons}"
+        )
+        assert "Submitted" in event_reasons, (
+            f"expected Submitted event from apply(), got: {event_reasons}"
+        )
+
         # THE ASSERTION: exactly 1 watch spawn. Not ≥1, not "present" —
         # the whole point is that reconcile #2 onward hit the
         # ctx.watching.contains_key gate and DIDN'T spawn again.
@@ -326,9 +456,20 @@ pkgs.testers.runNixOSTest {
             f"expected 0 reconnect-path spawns, got {reconnect_count}"
         )
 
-        # --wait=false: don't block on Build finalizer.
+        # ── Finalizer: delete → cleanup() → CR gone ───────────────────
+        # --wait=false: don't block kubectl on the finalizer. Then poll
+        # for the CR to be GONE — proves cleanup() ran (CancelBuild,
+        # NotFound OK since already terminal) → finalizer removed → K8s
+        # deleted the CR. Without the wait_until_succeeds, a stuck
+        # finalizer (Terminating forever) would pass silently
+        # (phase3a.nix:700-704).
         kubectl("delete build test-watch-dedup --wait=false")
-        print(f"build-crd-dedup PASS: spawns={spawns}, reconnects={reconnect_count}")
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get build test-watch-dedup 2>/dev/null",
+            timeout=15,
+        )
+        print(f"build-crd-flow PASS: build_id={build_id}, events={len(events)}, "
+              f"spawns={spawns}, reconnects={reconnect_count}, finalizer OK")
 
     # ══════════════════════════════════════════════════════════════════
     # recovery — kill leader pod mid-build, standby takes over

@@ -89,7 +89,8 @@
       ];
 
       # NixOS modules for deploying rio services. These are consumed by the
-      # phase-milestone VM tests (nix/tests/phase*.nix) and can be reused
+      # standalone-fixture VM tests (nix/tests/fixtures/standalone.nix) and
+      # can be reused
       # for real deployments. Each module reads `services.rio.package` for
       # binaries, so callers must set that to a workspace build.
       flake.nixosModules = {

@@ -53,7 +53,11 @@
 
 ### VM test sections
 
-- [ ] **Append to `nix/tests/phase4.nix`** (created in 4a): Section B (GC+references: build with tenant → `narinfo.references` non-empty via NAR scanner, `path_tenants` row exists, backdate `first_referenced_at` past retention + `TriggerGC` → unreferenced path swept, referenced path survives), Section C (rate-limit trip: 11 rapid SubmitBuilds from the same tenant → 11th gets `STDERR_ERROR` `TooManyRequests`), Section D (`maxSilentTime` kill: submit a derivation that sleeps silently → worker kills after timeout → `BuildResult.status == TimedOut`), Section E (`rio-cli` smoke: `status`/`workers`/`builds`/`gc --dry-run` against the live scheduler).
+- [ ] **Add cases to scenario files** (see section map in `phase4.md`):
+  - Section B (GC+references) → `nix/tests/scenarios/lifecycle.nix` on `k3s-full`. Build with tenant → `narinfo.references` non-empty via NAR scanner, `path_tenants` row exists, backdate `first_referenced_at` past retention + `TriggerGC` → unreferenced path swept, referenced path survives. Extends the existing `gc-sweep` subtest.
+  - Section C (rate-limit trip) → `nix/tests/scenarios/security.nix`. 11 rapid SubmitBuilds from the same tenant → 11th gets `STDERR_ERROR` `TooManyRequests`.
+  - Section D (`maxSilentTime` kill) → `nix/tests/scenarios/scheduling.nix`. Submit a derivation that sleeps silently → worker kills after timeout → `BuildResult.status == TimedOut`.
+  - Section E (`rio-cli` smoke) → new `nix/tests/scenarios/cli.nix` on standalone fixture. `status`/`workers`/`builds`/`gc --dry-run` against the live scheduler. `rio-cli` binary needs `pkgs.grpcurl` pattern OR direct tonic client — check which the crate uses.
 
 ### Tracey markers
 
