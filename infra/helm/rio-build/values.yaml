@@ -35,12 +35,18 @@ namespace:
   # ns, control plane → baseline.
   podSecurityLabel: privileged
 
-# TLS on → renders cert-manager resources (ClusterIssuer bootstrap, root CA,
-# namespaced Issuer, per-component Certificates) + mounts TLS secrets into
-# each Deployment + sets RIO_TLS__* env + retargets store's readiness probe
-# to the plaintext health port (9102). Requires cert-manager in the cluster.
+# TLS on → mounts TLS secrets into each Deployment + sets RIO_TLS__* env +
+# retargets store's readiness probe to the plaintext health port (9102).
+#
+# provisioner:
+#   cert-manager — renders ClusterIssuer bootstrap + root CA + namespaced
+#     Issuer + per-component Certificates. Requires cert-manager in cluster.
+#   external — Secrets (rio-{scheduler,store,gateway,controller,worker}-tls)
+#     are provided out-of-band. Use for VM tests (openssl PKI) or any
+#     deployment that doesn't use cert-manager.
 tls:
   enabled: true
+  provisioner: cert-manager
 
 # External Secrets Operator sync from AWS Secrets Manager.
 # When enabled: renders ClusterSecretStore + 3 ExternalSecrets (rio-postgres

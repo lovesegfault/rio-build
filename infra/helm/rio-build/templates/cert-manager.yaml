@@ -1,4 +1,4 @@
-{{- if .Values.tls.enabled }}
+{{- if and .Values.tls.enabled (eq .Values.tls.provisioner "cert-manager") }}
 {{- $ns := .Values.namespace.name -}}
 # Architecture:
 #   1. selfsigned-bootstrap ClusterIssuer bootstraps a root CA cert
