@@ -375,3 +375,57 @@ async fn test_backpressure_hysteresis() -> TestResult {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Token-aware shutdown
+// ---------------------------------------------------------------------------
+
+/// Cancelling the shutdown token drains `workers` and exits the actor
+/// loop. The worker's `stream_rx` closes (receives None), proving the
+/// `stream_tx` senders were dropped. This is the cascade that unblocks
+/// tonic's `serve_with_shutdown` — without it, open bidi streams keep
+/// the server waiting past `systemctl stop`'s timeout → SIGKILL →
+/// no atexit → no LLVM profraw.
+#[tokio::test]
+async fn test_shutdown_token_drains_workers() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let token = rio_common::signal::Token::new();
+    let (handle, task) = setup_actor_configured(db.pool.clone(), None, {
+        let token = token.clone();
+        |a| a.with_shutdown_token(token)
+    });
+
+    // Connect a worker — gives the actor a stream_tx to drop. Then
+    // query workers: the reply arrives AFTER WorkerConnected is
+    // processed (same mpsc queue, FIFO), so the stream_tx is in
+    // self.workers when we cancel — the test exercises workers.clear()
+    // specifically, not just "rx drops when the loop breaks".
+    let mut stream_rx = connect_worker(&handle, "sd-worker", "x86_64-linux", 1).await?;
+    let workers = handle.debug_query_workers().await?;
+    assert_eq!(workers.len(), 1, "worker should be registered");
+
+    // Cancel. biased select! sees this first; workers.clear() drops
+    // stream_tx.
+    token.cancel();
+
+    // stream_rx.recv() returns None once all senders (just the actor's
+    // stream_tx) drop. Timeout: if the actor didn't drain, this hangs.
+    let closed = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await
+        .expect("stream should close within 5s of token cancel");
+    assert!(
+        closed.is_none(),
+        "stream_rx should close (None) after drain"
+    );
+
+    // Actor loop broke → task joinable. Drop the handle so the
+    // mpsc::Sender drops → rx.recv() also returns None if the select!
+    // happens to poll the rx arm first (race, but biased mitigates).
+    drop(handle);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("actor task should join within 5s")
+        .expect("actor task should not panic");
+
+    Ok(())
+}
