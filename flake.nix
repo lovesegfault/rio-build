@@ -658,40 +658,45 @@
             config.checks.pre-commit
           ];
 
+          # k3s-full scenarios (vm-*-k3s) boot a 2-node cluster with
+          # 6 airgapped images + bitnami PG. ~4min waitReady under KVM,
+          # ~7min under TCG. They stabilize separately from the standalone
+          # scenarios and belong in ci-slow only.
+          isK3sTest = name: pkgs.lib.hasSuffix "-k3s" name;
+
           mkCiAggregate =
             {
               name,
               fuzz,
-              withVmTests,
+              vmTestSet ? { },
             }:
             pkgs.linkFarmFromDrvs "rio-${name}" (
-              ciBaseDrvs
-              ++ builtins.attrValues fuzz
-              ++ pkgs.lib.optionals withVmTests (builtins.attrValues vmTests)
+              ciBaseDrvs ++ builtins.attrValues fuzz ++ builtins.attrValues vmTestSet
             );
 
           ciAggregates = {
             ci-local-fast = mkCiAggregate {
               name = "ci-local-fast";
               fuzz = fuzz.smoke;
-              withVmTests = false;
             };
             ci-local-slow = mkCiAggregate {
               name = "ci-local-slow";
               fuzz = fuzz.nightly;
-              withVmTests = false;
             };
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
             ci-fast = mkCiAggregate {
               name = "ci-fast";
               fuzz = fuzz.smoke;
-              withVmTests = true;
+              # Standalone scenarios + legacy phase tests. k3s-full
+              # scenarios excluded (too slow for PR gate, stabilize in
+              # ci-slow first).
+              vmTestSet = pkgs.lib.filterAttrs (n: _: !isK3sTest n) vmTests;
             };
             ci-slow = mkCiAggregate {
               name = "ci-slow";
               fuzz = fuzz.nightly;
-              withVmTests = true;
+              vmTestSet = vmTests;
             };
           };
 

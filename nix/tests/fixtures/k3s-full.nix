@@ -237,27 +237,30 @@ in
     k3s_agent.wait_for_unit("k3s.service")
     k3s_server.wait_for_file("/etc/rancher/k3s/k3s.yaml")
 
-    # ── Agent joined ────────────────────────────────────────────────
-    # Agent Ready condition means kubelet registered + CNI up.
+    # ── Airgap import complete on BOTH nodes (BEFORE agent-ready) ───
+    # ctr images import runs as a separate oneshot unit AFTER k3s
+    # starts. Under TCG (nixbuild.net's non-KVM fallback), 6 images ×
+    # ~20-30s each ≈ 180s just for import. The agent's kubelet can't
+    # reach Ready until pause/CNI images are available, so waiting for
+    # agent-Ready FIRST times out before import completes.
+    # Gate on the last-to-import image (bitnami PG, largest at ~140MB).
+    for n in [k3s_server, k3s_agent]:
+        n.wait_until_succeeds(
+            "k3s ctr images ls -q | grep -q pause", timeout=240
+        )
+        n.wait_until_succeeds(
+            "k3s ctr images ls -q | grep -q 'bitnami/postgresql'", timeout=240
+        )
+
+    # ── Agent joined (images present → kubelet can start pods) ──────
+    # Agent Ready condition means kubelet registered + CNI up. With
+    # images already imported this is just kubelet startup (~30s).
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-agent "
         "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
         "| grep -qx True",
         timeout=120,
     )
-
-    # ── Airgap import complete on BOTH nodes ────────────────────────
-    # ctr images import runs as a separate oneshot unit AFTER k3s
-    # starts. On slow storage, pods schedule before import → ErrImage
-    # Pull (the pause container is the first casualty). Gate on the
-    # last-to-import image (bitnami PG, largest by far at ~140MB).
-    for n in [k3s_server, k3s_agent]:
-        n.wait_until_succeeds(
-            "k3s ctr images ls -q | grep -q pause", timeout=120
-        )
-        n.wait_until_succeeds(
-            "k3s ctr images ls -q | grep -q 'bitnami/postgresql'", timeout=120
-        )
 
     # ── PG Ready (everything else blocks on migrations) ─────────────
     # Bitnami's sts name pattern: <release>-postgresql. Our release
