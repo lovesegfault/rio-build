@@ -840,63 +840,108 @@ pkgs.testers.runNixOSTest {
         )
 
         # phase=Building → daemon spawned, cgroup created, sleep started.
+        # timeout=120: same dispatch-lag variance as controller-restart.
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${ns} get build test-cancel "
             "-o jsonpath='{.status.phase}' | grep -qx Building",
-            timeout=60,
+            timeout=120,
         )
 
         # Find the build's cgroup. sanitize_build_id(drv_path) = basename
         # with . → _, so the cgroup dir contains "lifecycle-cancel_drv".
-        # Worker pod runs in its own cgroup ns (probe above) — find
-        # relative to /sys/fs/cgroup.
-        cgroup_path = k3s_server.succeed(
-            "k3s kubectl -n ${ns} exec default-workers-0 -- "
-            "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' 2>/dev/null | head -1"
+        # Worker pod is DISTROLESS — no `find`/`wc`/`test` via `kubectl
+        # exec`. Probe from the VM host instead: the worker's cgroup-ns
+        # scopes its OWN /sys/fs/cgroup view, but the HOST sees the full
+        # kubepods.slice/... tree. Same leaf dirname, longer path.
+        # Resolve which node the pod is on (STS may schedule to either).
+        worker_node = k3s_server.succeed(
+            "k3s kubectl -n ${ns} get pod default-workers-0 "
+            "-o jsonpath='{.spec.nodeName}'"
+        ).strip()
+        worker_vm = k3s_agent if worker_node == "k3s-agent" else k3s_server
+        # -print -quit stops after first match (no `| head` SIGPIPE).
+        cgroup_path = worker_vm.succeed(
+            "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' "
+            "-print -quit 2>/dev/null"
         ).strip()
         assert cgroup_path, (
-            "no cgroup dir matching *lifecycle-cancel_drv on worker — "
+            f"no cgroup dir matching *lifecycle-cancel_drv on {worker_node} — "
             "build not running, or sanitize_build_id changed?"
         )
-        procs_before = int(k3s_server.succeed(
-            f"k3s kubectl -n ${ns} exec default-workers-0 -- "
+        procs_before = int(worker_vm.succeed(
             f"wc -l < {cgroup_path}/cgroup.procs"
         ).strip())
         assert procs_before > 0, (
             f"cgroup.procs empty ({cgroup_path}) — build not actually "
             f"running in the cgroup?"
         )
-        print(f"cancel-cgroup-kill: cgroup={cgroup_path}, procs={procs_before}")
+        print(f"cancel-cgroup-kill: node={worker_node}, cgroup={cgroup_path}, "
+              f"procs={procs_before}")
 
         # Delete → finalizer → CancelBuild → worker cgroup.kill.
         # --wait=false: the finalizer removes itself after CancelBuild
         # returns (or times out); don't block kubectl on that.
         kubectl("delete build test-cancel --wait=false")
 
-        # THE assertion: worker logs the kill. runtime.rs:197 info! fires
+        # PRIMARY assertion: cgroup.procs empties. Direct evidence
+        # cgroup.kill fired (kernel SIGKILLs all PIDs). The log line
+        # (below) is secondary — it can lag containerd's log flush.
+        # Chain: controller reconcile (deletionTimestamp) → cleanup()
+        # → CancelBuild RPC (balanced, leader) → scheduler dispatch
+        # Cancel to worker → runtime.rs try_cancel_build → write
+        # cgroup.kill="1". Under TCG, budget for each hop.
+        # Diagnostic on timeout distinguishes: procs_after>0 = cancel
+        # never reached worker (scheduler dispatch or finalizer broken);
+        # procs_after=0 + log missing = log-flush lag only.
+        try:
+            worker_vm.wait_until_succeeds(
+                f"test 0 -eq $(wc -l < {cgroup_path}/cgroup.procs 2>/dev/null || echo 0)",
+                timeout=30,
+            )
+        except Exception:
+            procs_after = worker_vm.succeed(
+                f"cat {cgroup_path}/cgroup.procs 2>/dev/null | wc -l || echo '?'"
+            ).strip()
+            k3s_server.execute(
+                "echo '=== DIAG: Build CR state (gone = finalizer ran) ===' >&2; "
+                "k3s kubectl -n ${ns} get build test-cancel -o yaml 2>&1 >&2; "
+                "echo '=== DIAG: worker logs (non-DEBUG, last 2m) ===' >&2; "
+                "k3s kubectl -n ${ns} logs default-workers-0 --since=2m "
+                "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true; "
+                "echo '=== DIAG: controller logs (cleanup/CancelBuild) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --since=2m "
+                "  | grep -E 'cancel|cleanup|CancelBuild' >&2 || true"
+            )
+            print(f"cancel-cgroup-kill DIAG: procs_after={procs_after} "
+                  f"(was {procs_before})")
+            raise
+
+        # Secondary: worker logs the kill. runtime.rs:197 info! fires
         # after fs::write(cgroup.kill, "1") returns Ok. Pod logs (not
-        # VM serial — k3s pod stdout isn't in journald).
+        # VM serial — k3s pod stdout isn't in journald). Now that
+        # cgroup.procs is confirmed empty, this is just confirming
+        # the log-line path; generous timeout for containerd flush.
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${ns} logs default-workers-0 | "
             "grep -q 'cancelled via cgroup.kill'",
-            timeout=15,
+            timeout=30,
         )
 
         # Cgroup removed: BuildCgroup::Drop rmdirs it after kill()
         # + the daemon wait (kill is sync but reap isn't; Drop waits).
-        # test -e returns 1 on missing → shell success when negated.
-        k3s_server.wait_until_succeeds(
-            f"! k3s kubectl -n ${ns} exec default-workers-0 -- "
-            f"test -e {cgroup_path}",
-            timeout=15,
+        # Host-side check (distroless pod can't `test -e`).
+        worker_vm.wait_until_succeeds(
+            f"! test -e {cgroup_path}",
+            timeout=30,
         )
 
-        # Build CR gone — finalizer cleanup() completed, removed itself.
+        # Build CR gone --- finalizer cleanup() completed, removed itself.
         k3s_server.wait_until_succeeds(
             "! k3s kubectl -n ${ns} get build test-cancel 2>/dev/null",
             timeout=15,
         )
-        print("cancel-cgroup-kill PASS: cgroup.kill fired, cgroup rmdir'd, CR gone")
+        print("cancel-cgroup-kill PASS: cgroup.procs emptied, log line seen, "
+              "cgroup rmdir'd, CR gone")
 
     # ══════════════════════════════════════════════════════════════════
     # recovery — kill leader pod mid-build, standby takes over
