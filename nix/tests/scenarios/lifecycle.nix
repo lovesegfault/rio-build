@@ -751,12 +751,35 @@ pkgs.testers.runNixOSTest {
         # last_sequence. 180s: 60s build + lease TTL 15s + controller
         # backoff 1+2+4s + new leader's recover_from_pg + informer lag.
         # Before the fix: status stuck at Building, this times out.
-        k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} get build test-reconnect "
-            "-o jsonpath='{.status.phase}' | "
-            "grep -E '^(Succeeded|Completed|Cached)$'",
-            timeout=180,
-        )
+        try:
+            k3s_server.wait_until_succeeds(
+                "k3s kubectl -n ${ns} get build test-reconnect "
+                "-o jsonpath='{.status.phase}' | "
+                "grep -E '^(Succeeded|Completed|Cached)$'",
+                timeout=180,
+            )
+        except Exception:
+            # DIAGNOSTIC: why didn't status reach Succeeded? Dump the
+            # controller pod logs (drain_stream's reconnect warns) +
+            # the Build CR's final status + metric.
+            k3s_server.execute(
+                "echo '=== DIAG: controller pod logs (last 80) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 >&2; "
+                "echo '=== DIAG: test-reconnect Build CR ===' >&2; "
+                "k3s kubectl -n ${ns} get build test-reconnect -o yaml >&2; "
+                "echo '=== DIAG: scheduler pods ===' >&2; "
+                "k3s kubectl -n ${ns} get pods -l app.kubernetes.io/name=rio-scheduler -o wide >&2; "
+                "echo '=== DIAG: lease holder ===' >&2; "
+                "k3s kubectl -n ${ns} get lease rio-scheduler-leader -o yaml >&2"
+            )
+            # Also scrape the reconnect metric — did drain_stream even
+            # TRY to reconnect? Zero → my A.1 fix is broken.
+            # Nonzero → reconnect fired, something downstream failed.
+            cm_diag = ctrl_metrics()
+            reconnects_diag = metric_value(cm_diag, "rio_controller_build_watch_reconnects_total") or 0.0
+            print(f"DIAG: build_watch_reconnects_total = {reconnects_diag} "
+                  f"(baseline was {reconnects0})")
+            raise
 
         # Metric proof: reconnect counter incremented. drain_stream's
         # shared reconnect body fires this on every attempt (EOF or

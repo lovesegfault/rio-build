@@ -856,13 +856,21 @@ async fn drain_stream(
                         // reads from the new stream.
                     }
                     Err(wb_err) => {
-                        // WatchBuild itself failed (build
-                        // not found — recovery didn't
-                        // reconstruct it). Don't retry
-                        // THIS error — it's not transient.
+                        // WatchBuild failed. Two cases:
+                        // (a) Recovery RACE: hit the standby or a
+                        //     still-recovering leader → build_events
+                        //     map empty → BuildNotFound. TRANSIENT;
+                        //     retry after next backoff. ~15-30s until
+                        //     recover_from_pg completes.
+                        // (b) Recovery GAP: recover_from_pg ran but
+                        //     didn't reconstruct this build (PG was
+                        //     cleared, build_id orphaned). Permanent.
+                        // Can't distinguish (a) from (b) here — retry
+                        // and let MAX_RECONNECT bound the damage.
+                        // The dead stream errors again next iteration
+                        // → another backoff → another WatchBuild.
                         warn!(build = %name, error = %wb_err,
-                              "WatchBuild failed (build unknown?); exiting watch");
-                        return;
+                              "WatchBuild failed; retrying (recovery race or build unknown)");
                     }
                 }
             }
