@@ -19,11 +19,11 @@
   dockerImages,
   nixhelm,
   system,
-  # TODO(coverage): controller.extraEnv LLVM_PROFILE_FILE via --set,
-  # hostPath cov volume on worker pods. Deferred — scenarios using
-  # this fixture (lifecycle, leader-election) have unique coverage
-  # surface (kube-rs reconcilers, lease loop) that unit tests can't
-  # reach, so coverage-full eventually wants this.
+  # Coverage: passes coverage.enabled=true to the chart → each rio
+  # pod gets LLVM_PROFILE_FILE + hostPath /var/lib/rio/cov. Profraws
+  # land on the NODE (not pod) filesystem. collectCoverage tars them.
+  # Worker (STS) coverage NOT wired — builders.rs would need an
+  # extraEnv field; standalone scenarios already cover worker code.
   coverage ? false,
   ...
 }:
@@ -59,6 +59,11 @@ let
   helmRendered = helmRender {
     valuesFile = ../../../infra/helm/rio-build/values/vmtest-full.yaml;
     extraSet = extraValues;
+    # coverage is a bool — must use --set (not --set-string) or
+    # "false" becomes truthy (non-empty string).
+    extraSetTyped = {
+      "coverage.enabled" = coverage;
+    };
     namespace = ns;
   };
 

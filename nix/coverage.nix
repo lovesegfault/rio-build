@@ -102,15 +102,7 @@ let
         -a $TMPDIR/raw.lcov -o $out
     '';
 
-  # k3s-full fixture doesn't wire pod-level profraw collection yet
-  # (TODO in fixtures/k3s-full.nix: controller.extraEnv LLVM_PROFILE_
-  # FILE + hostPath cov volume). collectCoverage's systemctl-stop is a
-  # no-op on k3s nodes (no rio-* systemd units). Filtering them out
-  # avoids wasting VM-test wall-clock on builds that contribute zero
-  # coverage. Remove this filter once the fixture TODO is resolved.
-  vmTestsCovFiltered = lib.filterAttrs (n: _: !(lib.hasSuffix "-k3s" n)) vmTestsCov;
-
-  perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCovFiltered;
+  perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
 
   # Union all per-test lcovs. `lcov -a` is additive — a line hit
   # in ANY VM test is hit in the union.

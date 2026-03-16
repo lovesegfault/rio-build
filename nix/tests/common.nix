@@ -465,12 +465,17 @@ rec {
                     "systemctl stop rio-gateway rio-scheduler rio-store "
                     "rio-controller 2>/dev/null || true"
                 )
-                # k3s worker pod (phase3a only): delete STS, wait for
-                # pod termination. --wait blocks until pod is gone.
+                # k3s pods (phase3a worker-only, k3s-full all components):
+                # delete by label → graceful SIGTERM → profraw flush via
+                # atexit. Label selector avoids touching bitnami PG /
+                # kube-system. --wait blocks until pods gone. Only the
+                # k3s SERVER runs this (agent lacks kubeconfig); deletes
+                # affect pods on BOTH nodes.
                 n.execute(
                     "[ -f /etc/rancher/k3s/k3s.yaml ] && "
-                    "k3s kubectl delete sts --all --wait=true --timeout=30s "
-                    "2>/dev/null || true"
+                    "k3s kubectl delete deploy,sts -A "
+                    "-l 'app.kubernetes.io/part-of=rio-build' "
+                    "--wait=true --timeout=60s 2>/dev/null || true"
                 )
                 # Empty tarball if dir doesn't exist (e.g., client node
                 # runs no rio services).

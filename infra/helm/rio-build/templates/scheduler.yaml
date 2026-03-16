@@ -63,6 +63,7 @@ spec:
               containerPort: 9101
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
+            {{- include "rio.covEnv" . | nindent 12 }}
             # All replicas contend for SAME Lease. Presence ENABLES lease mode
             # (LeaseConfig::from_env returns None without it → always-leader,
             # WRONG with replicas>1).
@@ -90,9 +91,12 @@ spec:
             {{- if .Values.tls.enabled }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
             {{- end }}
-          {{- if .Values.tls.enabled }}
+          {{- if or .Values.tls.enabled .Values.coverage.enabled }}
           volumeMounts:
+            {{- if .Values.tls.enabled }}
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- include "rio.covVolumeMount" . | nindent 12 }}
           {{- end }}
           # TCP, NOT gRPC. "is gRPC server listening." NOT gated on is_leader
           # — that's the whole design point. Both pods Ready; clients route
@@ -122,9 +126,12 @@ spec:
             failureThreshold: 12
           resources:
             {{- toYaml $s.resources | nindent 12 }}
-      {{- if .Values.tls.enabled }}
+      {{- if or .Values.tls.enabled .Values.coverage.enabled }}
       volumes:
+        {{- if .Values.tls.enabled }}
         {{- include "rio.tlsVolume" "rio-scheduler-tls" | nindent 8 }}
+        {{- end }}
+        {{- include "rio.covVolume" . | nindent 8 }}
       {{- end }}
 ---
 # Kept for per-call connects (controller reconcilers, rio-cli, tests). Those

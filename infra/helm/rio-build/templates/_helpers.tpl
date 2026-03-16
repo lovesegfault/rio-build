@@ -73,3 +73,37 @@ RUST_LOG env var. Self-guarded — empty global.logLevel renders nothing
   value: {{ . | quote }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Coverage profraw collection. Self-guarded on .Values.coverage.enabled
+— renders nothing when disabled. Include unconditionally in each pod
+template alongside rustLogEnv/tlsVolumeMount.
+
+LLVM writes profraws via an atexit handler. Graceful shutdown
+(SIGTERM → main returns) flushes them. %p = PID (multiple pods per
+node don't collide), %m = binary signature (safe merge). hostPath
+lands the files on the NODE filesystem so collectCoverage can tar
+them after pod deletion.
+*/}}
+{{- define "rio.covEnv" -}}
+{{- if .Values.coverage.enabled }}
+- name: LLVM_PROFILE_FILE
+  value: /var/lib/rio/cov/rio-%p-%m.profraw
+{{- end }}
+{{- end -}}
+
+{{- define "rio.covVolumeMount" -}}
+{{- if .Values.coverage.enabled }}
+- name: cov
+  mountPath: /var/lib/rio/cov
+{{- end }}
+{{- end -}}
+
+{{- define "rio.covVolume" -}}
+{{- if .Values.coverage.enabled }}
+- name: cov
+  hostPath:
+    path: /var/lib/rio/cov
+    type: DirectoryOrCreate
+{{- end }}
+{{- end -}}

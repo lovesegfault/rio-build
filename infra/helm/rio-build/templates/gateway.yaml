@@ -33,6 +33,7 @@ spec:
               containerPort: 9190
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
+            {{- include "rio.covEnv" . | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:2222"
             # Still used even with balance host — it's the TLS verify domain
@@ -54,7 +55,7 @@ spec:
             {{- if .Values.tls.enabled }}
             {{- include "rio.tlsEnv" . | nindent 12 }}
             {{- end }}
-          {{- if or $g.ssh.authorizedKeysSecret .Values.tls.enabled }}
+          {{- if or $g.ssh.authorizedKeysSecret .Values.tls.enabled .Values.coverage.enabled }}
           volumeMounts:
             {{- if $g.ssh.authorizedKeysSecret }}
             - name: gateway-state
@@ -66,6 +67,7 @@ spec:
             {{- if .Values.tls.enabled }}
             {{- include "rio.tlsVolumeMount" . | nindent 12 }}
             {{- end }}
+            {{- include "rio.covVolumeMount" . | nindent 12 }}
           {{- end }}
           # tonic-health server — SERVING after connect_scheduler succeeds.
           readinessProbe:
@@ -79,7 +81,7 @@ spec:
             failureThreshold: 6
           resources:
             {{- toYaml $g.resources | nindent 12 }}
-      {{- if or $g.ssh.authorizedKeysSecret .Values.tls.enabled }}
+      {{- if or $g.ssh.authorizedKeysSecret .Values.tls.enabled .Values.coverage.enabled }}
       volumes:
         {{- if $g.ssh.authorizedKeysSecret }}
         {{- if $g.ssh.hostKeySecret }}
@@ -102,6 +104,7 @@ spec:
         {{- if .Values.tls.enabled }}
         {{- include "rio.tlsVolume" "rio-gateway-tls" | nindent 8 }}
         {{- end }}
+        {{- include "rio.covVolume" . | nindent 8 }}
       {{- end }}
 ---
 apiVersion: v1

@@ -44,6 +44,14 @@ namespace:
 #   external — Secrets (rio-{scheduler,store,gateway,controller,worker}-tls)
 #     are provided out-of-band. Use for VM tests (openssl PKI) or any
 #     deployment that doesn't use cert-manager.
+# LLVM coverage profraw collection. When enabled, each rio pod gets
+# LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw + a hostPath
+# volume mounted there. Profraws flush via atexit on graceful SIGTERM.
+# The k3s-full VM test fixture passes coverage.enabled=true via --set
+# when running instrumented binaries.
+coverage:
+  enabled: false
+
 tls:
   enabled: true
   provisioner: cert-manager
@@ -110,10 +118,6 @@ controller:
   # hostNetwork: CoreDNS in k3s VM tests doesn't know NixOS-test VM
   # hostnames. hostNetwork → pod uses node's /etc/hosts.
   hostNetwork: false
-  # Coverage mode: mounts /var/lib/rio/cov as hostPath so profraws survive
-  # pod termination. nix/tests/common.nix collectCoverage tars this out.
-  coverage:
-    enabled: false
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {memory: 256Mi}

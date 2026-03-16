@@ -27,6 +27,11 @@ in
   # pass env var values; if a caller needs int semantics later, add
   # a separate extraSetInt param rather than switching back.
   extraSet ? { },
+  # --set overrides (typed). For bools/ints that must NOT be coerced
+  # to string. --set-string coverage.enabled=true would make the
+  # string "true" (truthy), but =false would make "false" (ALSO
+  # truthy — non-empty string). --set respects YAML types.
+  extraSetTyped ? { },
   # Passed as -n to helm template. The rio-build chart uses
   # .Values.namespace.name (not .Release.Namespace), so -n doesn't
   # affect rio-* resources. But the bitnami PG subchart uses
@@ -37,9 +42,15 @@ in
 let
   chart = pkgs.lib.cleanSource ../infra/helm/rio-build;
   crds = pkgs.lib.cleanSource ../infra/helm/crds;
-  setArgs = pkgs.lib.concatMapStringsSep " " (
+  setStringArgs = pkgs.lib.concatMapStringsSep " " (
     k: "--set-string ${pkgs.lib.escapeShellArg "${k}=${toString extraSet.${k}}"}"
   ) (builtins.attrNames extraSet);
+  # builtins.toJSON renders Nix bools/ints as YAML-parseable (true not
+  # "true", 3 not "3"). Helm's --set parser reads YAML syntax.
+  setTypedArgs = pkgs.lib.concatMapStringsSep " " (
+    k: "--set ${pkgs.lib.escapeShellArg "${k}=${builtins.toJSON extraSetTyped.${k}}"}"
+  ) (builtins.attrNames extraSetTyped);
+  setArgs = "${setStringArgs} ${setTypedArgs}";
 in
 pkgs.runCommand "rio-helm-rendered"
   {
