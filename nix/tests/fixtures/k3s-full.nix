@@ -335,14 +335,17 @@ in
     # ── Worker registered at scheduler ───────────────────────────────
     # Scheduler pods have no shell (minimal image). Scrape via the
     # apiserver's pods/proxy subresource — no local port-forward,
-    # no TIME_WAIT churn, no `sleep 2` bind wait. Named port
-    # `metrics` (templates/scheduler.yaml) → no hardcoded 9091.
+    # no TIME_WAIT churn, no `sleep 2` bind wait.
+    #
+    # NUMERIC port (9091), not named (`:metrics`): k3s apiserver
+    # PANICS (nil-deref in normalizeLocation, upgradeaware.go:173)
+    # when named-port resolution fails. Observed v20.
     k3s_server.wait_until_succeeds(
         "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
         "  -o jsonpath='{.spec.holderIdentity}') && "
         'test -n "$leader" && '
         "k3s kubectl get --raw "
-        '"/api/v1/namespaces/${ns}/pods/$leader:metrics/proxy/metrics" '
+        '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
         "| grep -qx 'rio_scheduler_workers_active 1'",
         timeout=60,
     )

@@ -165,11 +165,13 @@ pkgs.testers.runNixOSTest {
     # 100s in v18 ≈ 30+ retries), the port was in heavy TIME_WAIT and
     # subsequent calls failed bind for 60s+.
     #
-    # Named port `metrics` (templates/{scheduler,controller}.yaml).
+    # NUMERIC ports (9091/9094), not named (`:metrics`): k3s
+    # apiserver PANICS (nil-deref in normalizeLocation,
+    # upgradeaware.go:173) on named-port proxy. Observed v20.
     # Fresh leader_pod() lookup per scrape — the leader CHANGES
     # across recovery.
 
-    def proxy_url(pod, port="metrics", path="metrics"):
+    def proxy_url(pod, port, path="metrics"):
         return (
             f"/api/v1/namespaces/${ns}/pods/{pod}:{port}/proxy/{path}"
         )
@@ -177,7 +179,7 @@ pkgs.testers.runNixOSTest {
     def sched_metrics():
         """One-shot scrape of the CURRENT scheduler leader's /metrics."""
         raw = k3s_server.succeed(
-            f"k3s kubectl get --raw '{proxy_url(leader_pod())}'"
+            f"k3s kubectl get --raw '{proxy_url(leader_pod(), 9091)}'"
         )
         return parse_prometheus(raw)
 
@@ -188,7 +190,7 @@ pkgs.testers.runNixOSTest {
             "-o jsonpath='{.items[0].metadata.name}'"
         ).strip()
         raw = k3s_server.succeed(
-            f"k3s kubectl get --raw '{proxy_url(pod)}'"
+            f"k3s kubectl get --raw '{proxy_url(pod, 9094)}'"
         )
         return parse_prometheus(raw)
 
@@ -204,7 +206,7 @@ pkgs.testers.runNixOSTest {
             "  -o jsonpath='{.spec.holderIdentity}') && "
             'test -n "$leader" && '
             "k3s kubectl get --raw "
-            '"/api/v1/namespaces/${ns}/pods/$leader:metrics/proxy/metrics" '
+            '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
             f"| {condition}",
             timeout=timeout,
         )

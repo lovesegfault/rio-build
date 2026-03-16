@@ -299,13 +299,14 @@ pkgs.testers.runNixOSTest {
         # running (client shows `building '...'`).
         #
         # apiserver pods/proxy subresource — no local port-forward,
-        # no TIME_WAIT. Same mechanism as lifecycle's sched_metric_wait.
+        # no TIME_WAIT. Numeric port 9091 (not named `:metrics` —
+        # k3s apiserver nil-derefs on named-port proxy, v20).
         k3s_server.wait_until_succeeds(
             "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
             "  -o jsonpath='{.spec.holderIdentity}') && "
             'test -n "$leader" && '
             "k3s kubectl get --raw "
-            '"/api/v1/namespaces/${ns}/pods/$leader:metrics/proxy/metrics" '
+            '"/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
             "| grep -E '^rio_scheduler_derivations_running [1-9]'",
             timeout=30,
         )
