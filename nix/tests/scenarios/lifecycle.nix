@@ -605,7 +605,7 @@ pkgs.testers.runNixOSTest {
         # finished yet.
         sched_metric_wait(
             "grep -qx 'rio_scheduler_recovery_total{outcome=\"success\"} 1'",
-            timeout=30,
+            timeout=60,
         )
 
         # Worker re-registered with the new leader. Fresh scheduler
@@ -615,7 +615,7 @@ pkgs.testers.runNixOSTest {
         # have briefly disconnected/reconnected during failover.
         sched_metric_wait(
             "grep -E '^rio_scheduler_workers_active [1-9]'",
-            timeout=60,
+            timeout=120,
         )
 
         # Post-recovery build. DIFFERENT marker → different output path

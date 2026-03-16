@@ -187,13 +187,16 @@ pkgs.testers.runNixOSTest {
 
         kubectl(f"delete pod {old_leader} --grace-period=0 --force")
 
-        # Wait for standby to ACQUIRE (not just old leader to release).
-        # step_down clears holder instantly; standby acquires on its
-        # next poll tick (5s). 45s: ≈10s typical + VM slack.
+        # Wait for ANY non-empty holder ≠ old_leader. step_down clears
+        # holder instantly; either the standby OR the Deployment-spawned
+        # replacement acquires on their next poll tick. -n guards
+        # against the empty window between step_down and acquire.
+        # Which one actually won is checked by `new_leader == standby`
+        # below — this wait just clears the empty window.
         k3s_server.wait_until_succeeds(
-            "test \"$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-            "-o jsonpath='{.spec.holderIdentity}')\" "
-            f"= '{standby}'",
+            "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            "-o jsonpath='{.spec.holderIdentity}'); "
+            f"test -n \"$h\" && test \"$h\" != '{old_leader}'",
             timeout=45,
         )
 
