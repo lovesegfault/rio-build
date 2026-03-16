@@ -366,19 +366,20 @@ in
         "--dry-run=client -o yaml | k3s kubectl apply -f -"
     )
     # Gateway reads authorized_keys once at startup (Arc<Vec<PublicKey>>
-    # load, no hot-reload). Restart so it picks up the new Secret.
-    k3s_server.succeed("k3s kubectl -n ${ns} rollout restart deploy/rio-gateway")
-    k3s_server.wait_until_succeeds(
-        "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
-        timeout=90,
-    )
     # rollout status returns when the Deployment has Ready replicas,
     # but kube-proxy hasn't necessarily synced the endpoint to the
-    # NodePort's iptables rules yet. Poll from the CLIENT until the
-    # SSH host key exchange succeeds. ssh-keyscan (not `ssh ...
-    # true`): rio-gateway is a russh server that only accepts the
-    # nix-ssh subsystem — exec requests get rejected. Keyscan just
-    # does the handshake + key exchange, which proves the gateway
+    # NodePort's iptables rules yet. Poll TCP accept from the client.
+    # nc -z (not ssh/ssh-keyscan): the gateway's russh server only
+    # accepts the nix-ssh subsystem — `ssh ... true` gets "exec
+    # request failed", and ssh-keyscan doesn't handshake with russh's
+    # banner the way it expects. TCP accept is sufficient: rollout
+    # status already proved the gateway's readinessProbe passed (gRPC
+    # health on 9190), so the process is serving; we just need
+    # kube-proxy's iptables to catch up.
+    client.wait_until_succeeds(
+        "${pkgs.netcat}/bin/nc -zw2 k3s-server 32222",
+        timeout=30,
+    )
     # process is serving (stricter than `nc -z` TCP-accept check).
     client.wait_until_succeeds(
         "ssh-keyscan -T 2 -p 32222 k3s-server 2>/dev/null | "
