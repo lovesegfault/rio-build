@@ -143,6 +143,15 @@ let
     sleepSecs = 30;
   };
 
+  # cancel-cgroup-kill in-flight build. 60s sleep: wait-for-Building
+  # + find cgroup + assert it has procs + delete CR + wait for cgroup
+  # gone. Shorter than recoverySlowDrv because cancel is direct
+  # (controller→scheduler→worker RPC, no lease transition).
+  cancelDrv = drvs.mkTrivial {
+    marker = "lifecycle-cancel";
+    sleepSecs = 60;
+  };
+
   # Autoscaler queue pressure: 5 leaves, all independent, all Ready
   # immediately. With maxConcurrentBuilds=1 (vmtest-full.yaml), 1 runs
   # + 4 queue → compute_desired(4, target=2) = ceil(4/2) = 2 → STS
@@ -678,13 +687,18 @@ pkgs.testers.runNixOSTest {
         # with since_sequence from status.last_sequence — picks up
         # where the old drain_stream left off. Build was at ~10-15s of
         # its 30s sleep when we killed the controller; another ~15-20s
-        # to go + reconnect slack.
+        # to go + reconnect slack. 120s not 90s: flannel subnet race
+        # during bootstrap can delay worker pod start → dispatch lag.
+        # Observed 2026-03-16: status.phase=Building but progress=0/1
+        # at 90s — build never REACHED the worker. 30s more absorbs
+        # that without masking a real reconnect-path failure (a
+        # genuine hang shows progress=0/1 AND no worker assignment).
         try:
             k3s_server.wait_until_succeeds(
                 "k3s kubectl -n ${ns} get build test-ctrl-restart "
                 "-o jsonpath='{.status.phase}' | "
                 "grep -E '^(Succeeded|Completed|Cached)$'",
-                timeout=90,
+                timeout=120,
             )
         except Exception:
             k3s_server.execute(
@@ -735,6 +749,100 @@ pkgs.testers.runNixOSTest {
         )
         print(f"controller-restart PASS: reconnect_log={reconnect_log}, "
               f"spawns_new={spawns_new}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # cancel-cgroup-kill — delete Build CR mid-exec → cgroup.kill="1"
+    # ══════════════════════════════════════════════════════════════════
+    # r[verify worker.cancel.cgroup-kill]
+    # cgroup.rs:180 kill() writes "1" to cgroup.kill → kernel SIGKILLs
+    # every PID in the tree. NO prior test cancels a RUNNING build —
+    # build-crd-flow lets it complete, build-crd-reconnect/recovery kill
+    # the scheduler/controller (build keeps running on the worker).
+    #
+    # Flow: delete Build CR → finalizer cleanup() → CancelBuild RPC →
+    # scheduler dispatch Cancel to worker → runtime.rs try_cancel_build
+    # → cgroup::kill_cgroup → fs::write(cgroup.kill, "1"). Log signal:
+    # "build cancelled via cgroup.kill" at runtime.rs:197.
+    with subtest("cancel-cgroup-kill: delete Build CR mid-exec → cgroup.kill"):
+        drv_path = client.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${cancelDrv} 2>/dev/null"
+        ).strip()
+        client.succeed(
+            f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
+        )
+        k3s_server.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Build\n"
+            "metadata:\n"
+            "  name: test-cancel\n"
+            "  namespace: ${ns}\n"
+            "spec:\n"
+            f"  derivation: {drv_path}\n"
+            "  priority: 10\n"
+            "EOF"
+        )
+
+        # phase=Building → daemon spawned, cgroup created, sleep started.
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get build test-cancel "
+            "-o jsonpath='{.status.phase}' | grep -qx Building",
+            timeout=60,
+        )
+
+        # Find the build's cgroup. sanitize_build_id(drv_path) = basename
+        # with . → _, so the cgroup dir contains "lifecycle-cancel_drv".
+        # Worker pod runs in its own cgroup ns (probe above) — find
+        # relative to /sys/fs/cgroup.
+        cgroup_path = k3s_server.succeed(
+            "k3s kubectl -n ${ns} exec default-workers-0 -- "
+            "find /sys/fs/cgroup -type d -name '*lifecycle-cancel_drv' 2>/dev/null | head -1"
+        ).strip()
+        assert cgroup_path, (
+            "no cgroup dir matching *lifecycle-cancel_drv on worker — "
+            "build not running, or sanitize_build_id changed?"
+        )
+        procs_before = int(k3s_server.succeed(
+            f"k3s kubectl -n ${ns} exec default-workers-0 -- "
+            f"wc -l < {cgroup_path}/cgroup.procs"
+        ).strip())
+        assert procs_before > 0, (
+            f"cgroup.procs empty ({cgroup_path}) — build not actually "
+            f"running in the cgroup?"
+        )
+        print(f"cancel-cgroup-kill: cgroup={cgroup_path}, procs={procs_before}")
+
+        # Delete → finalizer → CancelBuild → worker cgroup.kill.
+        # --wait=false: the finalizer removes itself after CancelBuild
+        # returns (or times out); don't block kubectl on that.
+        kubectl("delete build test-cancel --wait=false")
+
+        # THE assertion: worker logs the kill. runtime.rs:197 info! fires
+        # after fs::write(cgroup.kill, "1") returns Ok. Pod logs (not
+        # VM serial — k3s pod stdout isn't in journald).
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} logs default-workers-0 | "
+            "grep -q 'cancelled via cgroup.kill'",
+            timeout=15,
+        )
+
+        # Cgroup removed: BuildCgroup::Drop rmdirs it after kill()
+        # + the daemon wait (kill is sync but reap isn't; Drop waits).
+        # test -e returns 1 on missing → shell success when negated.
+        k3s_server.wait_until_succeeds(
+            f"! k3s kubectl -n ${ns} exec default-workers-0 -- "
+            f"test -e {cgroup_path}",
+            timeout=15,
+        )
+
+        # Build CR gone — finalizer cleanup() completed, removed itself.
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get build test-cancel 2>/dev/null",
+            timeout=15,
+        )
+        print("cancel-cgroup-kill PASS: cgroup.kill fired, cgroup rmdir'd, CR gone")
 
     # ══════════════════════════════════════════════════════════════════
     # recovery — kill leader pod mid-build, standby takes over
@@ -1085,6 +1193,93 @@ pkgs.testers.runNixOSTest {
             f"got: {final.get('currentPath')!r}"
         )
         print("gc-dry-run PASS: TriggerGC stream completed via AdminService proxy")
+
+    # ══════════════════════════════════════════════════════════════════
+    # build-crd-errors — InvalidSpec + cleanup never-submitted
+    # ══════════════════════════════════════════════════════════════════
+    # Two error paths with ONE Build CR: spec.derivation points to a
+    # .drv NOT in rio-store → fetch_and_build_node GetPath NotFound
+    # (build.rs:524) → Error::InvalidSpec → error_policy 300s requeue
+    # (build.rs:481-483). Status never progresses past empty. Then
+    # delete → cleanup() sees build_id.is_empty() → "never submitted"
+    # early return (build.rs:431-432) — no CancelBuild RPC, finalizer
+    # just removes itself.
+    #
+    # Skipping scheduler-unreachable (build.rs:463-464, ~2 lines):
+    # needs scheduler scaled to 0 then back to 2, which disrupts the
+    # autoscaler subtest below. Cost > value for 2 lines.
+    with subtest("build-crd-errors: InvalidSpec → error_policy + cleanup never-submitted"):
+        cm_before = ctrl_metrics()
+        errs_before = cm_before.get("rio_controller_reconcile_errors_total", {})
+
+        # Valid-looking store path (32-char nixbase32 hash) but NOT in
+        # rio-store. fetch_and_build_node does GetPath → NotFound.
+        k3s_server.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Build\n"
+            "metadata:\n"
+            "  name: test-invalidspec\n"
+            "  namespace: ${ns}\n"
+            "spec:\n"
+            "  derivation: /nix/store/00000000000000000000000000000000-nonexistent.drv\n"
+            "  priority: 10\n"
+            "EOF"
+        )
+
+        # error_policy fired → reconcile_errors_total{error_kind=
+        # "invalid_spec"} incremented. Counter is multi-label; check
+        # that SOME series under reconciler=build gained a count. 10s
+        # slack: reconcile fires on informer delivery (~immediate) +
+        # one retry.
+        for _ in range(20):  # 10s at 0.5s poll
+            cm = ctrl_metrics()
+            errs = cm.get("rio_controller_reconcile_errors_total", {})
+            grew = any(
+                'reconciler="build"' in labels and v > errs_before.get(labels, 0.0)
+                for labels, v in errs.items()
+            )
+            if grew:
+                break
+            import time as _time
+            _time.sleep(0.5)
+        else:
+            raise AssertionError(
+                f"reconcile_errors_total{{reconciler=build}} didn't grow "
+                f"in 10s; before={errs_before!r}, after={errs!r}"
+            )
+
+        # Status stays empty — InvalidSpec returns Err BEFORE any
+        # status patch. buildId was never set, never even "submitted".
+        bid = kubectl(
+            "get build test-invalidspec -o jsonpath='{.status.buildId}'"
+        ).strip()
+        assert bid == "", (
+            "buildId should be empty (InvalidSpec before any status "
+            f"patch); got {bid!r}"
+        )
+
+        # Delete → cleanup() → build_id.is_empty() → "never submitted"
+        # → return early, no CancelBuild. CR gone fast (no scheduler
+        # round-trip, just finalizer self-remove).
+        kubectl("delete build test-invalidspec --wait=false")
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get build test-invalidspec 2>/dev/null",
+            timeout=10,
+        )
+
+        # Log evidence: "never submitted (nothing to cancel)" at
+        # build.rs:431. Proves cleanup took the empty-buildId branch,
+        # not the normal CancelBuild path.
+        never_submitted = int(k3s_server.succeed(
+            "k3s kubectl -n ${ns} logs deploy/rio-controller | "
+            "grep -c 'never submitted' || echo 0"
+        ).strip())
+        assert never_submitted >= 1, (
+            f"expected 'never submitted' log from cleanup(); got {never_submitted}"
+        )
+        print("build-crd-errors PASS: InvalidSpec → error_policy → "
+              "cleanup never-submitted → CR gone")
 
     # ══════════════════════════════════════════════════════════════════
     # reconciler-replicas — manual STS scale NOT stomped by reconciler
