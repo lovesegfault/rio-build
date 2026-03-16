@@ -133,6 +133,16 @@ let
     sleepSecs = 5;
   };
 
+  # controller-restart in-flight build. 30s sleep: controller pod
+  # graceful delete (~3s) + Deployment spawns replacement (~10s) +
+  # new controller's informer sync (~2s) + reconcile fires. The build
+  # runs on the WORKER the whole time — only the controller's watch
+  # task is interrupted.
+  ctrlRestartDrv = drvs.mkTrivial {
+    marker = "lifecycle-ctrl-restart";
+    sleepSecs = 30;
+  };
+
   # Autoscaler queue pressure: 5 leaves, all independent, all Ready
   # immediately. With maxConcurrentBuilds=1 (vmtest-full.yaml), 1 runs
   # + 4 queue → compute_desired(4, target=2) = ceil(4/2) = 2 → STS
@@ -594,6 +604,139 @@ pkgs.testers.runNixOSTest {
               f"spawns={spawns}, finalizer OK")
 
     # ══════════════════════════════════════════════════════════════════
+    # controller-restart — reconcile sees real UUID, empty DashMap →
+    # spawn_reconnect_watch (~65 lines in build.rs:164-193 + 346-409)
+    # ══════════════════════════════════════════════════════════════════
+    # DISTINCT from build-crd-reconnect below. That kills the SCHEDULER
+    # — drain_stream sees Ok(None) (TCP FIN from pod graceful stop),
+    # loops through its OWN reconnect body, increments
+    # build_watch_reconnects_total. This kills the CONTROLLER — the
+    # drain_stream task dies with the process. The NEW controller's
+    # RECONCILER sees: is_real_uuid=true (Build CR has a real buildId),
+    # is_terminal=false (phase=Building), watching.contains_key=false
+    # (fresh DashMap). That's the gate at build.rs:156-193 — "this
+    # Build was being watched by a controller that died". build-crd-
+    # flow above deliberately asserts spawns==1 + reconnect_count==0
+    # to prove the dedup works; THAT leaves the whole reconnect
+    # apparatus at 0 lcov hits.
+    #
+    # Ordering: AFTER build-crd-flow (so spawns==1 proved dedup first),
+    # BEFORE recovery (recovery kills the scheduler, which would
+    # conflate the two reconnect mechanisms).
+    with subtest("controller-restart: reconcile spawns reconnect_watch on fresh DashMap"):
+        drv_path = client.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${ctrlRestartDrv} 2>/dev/null"
+        ).strip()
+        client.succeed(
+            f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
+        )
+        k3s_server.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Build\n"
+            "metadata:\n"
+            "  name: test-ctrl-restart\n"
+            "  namespace: ${ns}\n"
+            "spec:\n"
+            f"  derivation: {drv_path}\n"
+            "  priority: 10\n"
+            "EOF"
+        )
+
+        # Wait for Building — watch task running, buildId is a real
+        # UUID. THIS is the state the new controller must find.
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get build test-ctrl-restart "
+            "-o jsonpath='{.status.phase}' | grep -qx Building",
+            timeout=60,
+        )
+
+        # Graceful delete — NOT --force. SIGTERM → main() returns →
+        # atexit → profraw flush. The OLD controller's profraw captures
+        # the apply() path (build-crd-flow above) and some of this
+        # subtest's initial reconcile. The NEW controller's profraw
+        # captures spawn_reconnect_watch.
+        ctrl_old = kubectl(
+            "get pods -l app.kubernetes.io/name=rio-controller "
+            "-o jsonpath='{.items[0].metadata.name}'"
+        ).strip()
+        print(f"controller-restart: deleting {ctrl_old}")
+        kubectl(f"delete pod {ctrl_old} --grace-period=10")
+
+        # Deployment spawns a replacement. Wait for it to be Ready
+        # before checking anything — the reconcile fires after informer
+        # sync, which needs the pod Running.
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} wait --for=condition=Available "
+            "deploy/rio-controller --timeout=60s",
+            timeout=90,
+        )
+
+        # Build STILL completes. spawn_reconnect_watch calls WatchBuild
+        # with since_sequence from status.last_sequence — picks up
+        # where the old drain_stream left off. Build was at ~10-15s of
+        # its 30s sleep when we killed the controller; another ~15-20s
+        # to go + reconnect slack.
+        try:
+            k3s_server.wait_until_succeeds(
+                "k3s kubectl -n ${ns} get build test-ctrl-restart "
+                "-o jsonpath='{.status.phase}' | "
+                "grep -E '^(Succeeded|Completed|Cached)$'",
+                timeout=90,
+            )
+        except Exception:
+            k3s_server.execute(
+                "echo '=== DIAG: NEW controller logs ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 >&2; "
+                "echo '=== DIAG: Build CR ===' >&2; "
+                "k3s kubectl -n ${ns} get build test-ctrl-restart -o yaml >&2"
+            )
+            raise
+
+        # NEW controller's log. `reconnecting WatchBuild` is the info!
+        # at build.rs:~168 — fires ONLY from the is_real_uuid &&
+        # !is_terminal && !watching branch. The OLD controller's logs
+        # are gone (pod deleted), so this grep only sees the NEW one.
+        # ≥1 not ==1: kube-rs reconcile can requeue before the watch
+        # key is inserted, but the dedup at contains_key catches the
+        # second attempt. ONE spawn, possibly one "skipping" debug.
+        reconnect_log = int(k3s_server.succeed(
+            "k3s kubectl -n ${ns} logs deploy/rio-controller | "
+            "grep -c 'reconnecting WatchBuild' || echo 0"
+        ).strip())
+        assert reconnect_log >= 1, (
+            "expected 'reconnecting WatchBuild' in NEW controller logs "
+            "(spawn_reconnect_watch fires from reconcile on a Build "
+            f"with real UUID + non-terminal + empty DashMap); got {reconnect_log}"
+        )
+
+        # spawns_total on the NEW controller. Exactly 1: the reconnect
+        # path increments at build.rs:180. The NEW controller NEVER
+        # hit apply()'s submit_build path (buildId was already real
+        # when it reconciled) — so this 1 is PURELY from reconnect.
+        # The OLD controller's spawns (from build-crd-flow's 1 +
+        # this subtest's initial 1 = 2) are gone with its pod.
+        cm_new = ctrl_metrics()
+        spawns_new = metric_value(cm_new,
+            "rio_controller_build_watch_spawns_total") or 0.0
+        assert spawns_new == 1.0, (
+            "expected exactly 1 spawn on NEW controller (reconnect "
+            "path only — buildId was already set, never hit apply()'s "
+            f"submit_build); got {spawns_new}"
+        )
+
+        # Cleanup. --wait=false + poll: same finalizer pattern.
+        kubectl("delete build test-ctrl-restart --wait=false")
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get build test-ctrl-restart 2>/dev/null",
+            timeout=15,
+        )
+        print(f"controller-restart PASS: reconnect_log={reconnect_log}, "
+              f"spawns_new={spawns_new}")
+
+    # ══════════════════════════════════════════════════════════════════
     # recovery — kill leader pod mid-build, standby takes over
     # ══════════════════════════════════════════════════════════════════
     # STRONGER than phase3b's single-instance `systemctl kill`: with
@@ -826,6 +969,23 @@ pkgs.testers.runNixOSTest {
         print(f"build-crd-reconnect: killing leader {leader}")
         kubectl(f"delete pod {leader} --grace-period=0 --force")
 
+        # Wait for the NEW leader's recovery to load the in-flight
+        # build from PG. Without this, the controller's drain_stream
+        # reconnects burn through MAX_RECONNECT on WatchBuild NotFound
+        # (actor in-memory map is empty until recover_from_pg finishes —
+        # 35597c0 made NotFound retryable but the retry budget is
+        # finite). derivations_running ≥1 on the leader proves recovery
+        # loaded the non-terminal row. sched_metric_wait re-resolves
+        # leader_pod() each poll — picks up the new leader once it
+        # acquires. 60s: lease TTL ≤1× (graceful delete step_down()
+        # clears holder → standby steals on next 5s tick) + recovery
+        # PG query + slack. This is STRUCTURAL, not a timeout bump —
+        # moves the controller's retry budget out of the race window.
+        sched_metric_wait(
+            "awk '/^rio_scheduler_derivations_running / {exit !($2>=1)}'",
+            timeout=60,
+        )
+
         # THE ASSERTION: status reaches Succeeded. Controller reconnected
         # via WatchBuild on the new leader, which replayed events from
         # last_sequence. 180s: 60s build + lease TTL 15s + controller
@@ -897,17 +1057,19 @@ pkgs.testers.runNixOSTest {
             "rio.admin.AdminService/TriggerGC",
         )
         # GCProgress stream: at least one message with isComplete=true.
-        # grpcurl emits proto3 JSON (camelCase) per streamed message.
-        # grpcurl emits one JSON object per stream message (proto3
-        # camelCase). Parse structurally — substring match on "delete"/
-        # "path" is satisfied by any error like "failed to delete, path
-        # unknown". Find the isComplete:true message; assert currentPath
-        # mentions the dry-run outcome.
-        gc_msgs = [
-            json.loads(line)
-            for line in result.splitlines()
-            if line.strip().startswith("{")
-        ]
+        # grpcurl emits one PRETTY-PRINTED JSON object per stream message
+        # (proto3 camelCase, multi-line with indented fields). Parse
+        # structurally — substring match on "delete"/"path" is satisfied
+        # by any error like "failed to delete, path unknown". raw_decode
+        # loop handles the multi-line format AND any leading non-JSON
+        # noise from port-forward's stderr (2>&1).
+        dec = json.JSONDecoder()
+        gc_msgs = []
+        idx = result.find("{")
+        while 0 <= idx < len(result):
+            obj, idx = dec.raw_decode(result, idx)
+            gc_msgs.append(obj)
+            idx = result.find("{", idx)
         complete_msgs = [m for m in gc_msgs if m.get("isComplete")]
         assert complete_msgs, (
             f"expected at least one GCProgress with isComplete=true; "
@@ -1170,17 +1332,17 @@ pkgs.testers.runNixOSTest {
             '{"dry_run": false, "grace_period_hours": 24}',
             "rio.admin.AdminService/TriggerGC",
         )
-        # Parse the stream — proto3 JSON uint64 is a STRING ("1" not 1).
-        # pathsCollected EXACTLY "1" is THE assertion: without backdate,
-        # it's 0 (or absent — proto3 omits zero-value) and we've proven
-        # nothing about the loop body. Substring-match would accept
-        # spacing variations or garbage like "11"; structured parse is
-        # exact.
-        gc_msgs = [
-            json.loads(line)
-            for line in result.splitlines()
-            if line.strip().startswith("{")
-        ]
+        # proto3 JSON uint64 is a STRING ("1" not 1). pathsCollected
+        # EXACTLY "1" is THE assertion: without backdate, it's 0 (or
+        # absent — proto3 omits zero-value) and we've proven nothing
+        # about the loop body. Same raw_decode loop as gc-dry-run.
+        dec = json.JSONDecoder()
+        gc_msgs = []
+        idx = result.find("{")
+        while 0 <= idx < len(result):
+            obj, idx = dec.raw_decode(result, idx)
+            gc_msgs.append(obj)
+            idx = result.find("{", idx)
         complete_msgs = [m for m in gc_msgs if m.get("isComplete")]
         assert complete_msgs, (
             f"expected GCProgress.isComplete=true; got {len(gc_msgs)} "
