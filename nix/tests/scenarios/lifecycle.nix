@@ -401,14 +401,16 @@ pkgs.testers.runNixOSTest {
             "EOF"
         )
 
-        # Terminal phase: 5s sleep + dispatch overhead. 90s: v13 timed
-        # out at 60s (controller's Build informer still warming up
-        # after the CRD Established → cache sync window).
+        # Terminal phase: 5s sleep + dispatch overhead. 180s: the
+        # controller's Build informer has variable cache-sync time
+        # — if its first watch attempt fires before the CRD is
+        # Established, kube-rs backs off. Observed: 48s (v15), >90s
+        # (v16). 180s absorbs the backoff variance.
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${ns} get build test-watch-dedup "
             "-o jsonpath='{.status.phase}' | "
             "grep -E '^(Succeeded|Completed|Cached)$'",
-            timeout=90,
+            timeout=180,
         )
 
         # ── status.buildId: real UUID, not sentinel ───────────────────
