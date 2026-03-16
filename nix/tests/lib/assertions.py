@@ -131,15 +131,17 @@ def psql_k8s(kube_node, query, db="rio", user="rio", ns="rio-system",
     """psql for k3s-full fixture — bitnami PG runs in a pod, not as a
     systemd service. `kubectl exec` into the StatefulSet pod.
 
-    `-h 127.0.0.1`: bitnami's Unix socket is at /opt/bitnami/
-    postgresql/tmp, not the libpq default. kubectl-exec bypasses the
-    container entrypoint so PGHOST isn't set. TCP loopback works
-    regardless. Password comes from PGPASSWORD in the pod's env
-    (bitnami sets it in the StatefulSet spec, not the entrypoint)."""
+    `-h 127.0.0.1 PGPASSWORD=`: bitnami's Unix socket is at
+    /opt/bitnami/postgresql/tmp, not the libpq default, and
+    kubectl-exec bypasses the container entrypoint so PGHOST isn't
+    set. TCP loopback works but needs password auth (Unix socket
+    uses trust). The password is the literal `rio` from
+    vmtest-full.yaml `postgresql.auth.password` — cleartext is
+    fine for an airgapped VM test."""
     q = query.replace('"', '\\"')
     return kube_node.succeed(
         f'k3s kubectl -n {ns} exec {pod} -- '
-        f'psql -h 127.0.0.1 -U {user} {db} -qtAc "{q}"'
+        f'env PGPASSWORD=rio psql -h 127.0.0.1 -U {user} {db} -qtAc "{q}"'
     ).strip()
 
 
