@@ -31,6 +31,12 @@
 # maxBuilds=1 × 3 workers forces each chain step to a distinct worker (same
 # as phase2b). withOtel=true adds otelcol to control + sets RIO_OTEL_ENDPOINT
 # on all services (standalone.nix:86-118).
+#
+# r[verify obs.metric.gateway]
+#   EXPECTED_METRICS[(gateway, 9090)] asserts rio_gateway_connections_*,
+#   opcodes, handshakes, channels are present in /metrics after a build.
+#   metrics-rs only registers on first increment — presence proves both
+#   the describe_*! wiring at gateway/lib.rs:25+ AND actual increments.
 {
   pkgs,
   common,
@@ -100,6 +106,12 @@ pkgs.testers.runNixOSTest {
     # Those counters exist (grep rio-*/src/lib.rs describe_counter!) but
     # metrics-rs only registers on first increment. Scheduling scenario
     # covers worker_disconnects; protocol-warm covers cache_hits.
+    # The gateway entries below (rio_gateway_connections_*, opcodes,
+    # handshakes, channels) are the describe_counter!/describe_gauge!
+    # registrations at gateway/lib.rs:25+. Presence in /metrics after
+    # a successful build proves they're wired AND incremented (metrics-
+    # rs only registers on first increment). The per-component loop
+    # below asserts each name is present.
     EXPECTED_METRICS = {
         (${gatewayHost}, 9090, "gateway"): [
             "rio_gateway_connections_total",

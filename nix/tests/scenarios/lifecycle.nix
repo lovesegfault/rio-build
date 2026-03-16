@@ -47,6 +47,24 @@
 #   build-crd-reconnect kills the scheduler leader mid-build and asserts
 #   the controller's drain_stream reconnects on non-terminal EOF (Ok(None)
 #   from tonic on TCP FIN). Same bug class as gateway 06a1fa0.
+#
+# r[verify ctrl.build.sentinel]
+#   build-crd-flow asserts status.buildId != "submitted" (the sentinel)
+#   after phase reaches terminal. Proves the reconciler's idempotence
+#   gate at build.rs:111-140 completed the sentinel→real-UUID transition.
+#
+# r[verify ctrl.probe.named-service]
+#   health-shared probes with `-service rio.scheduler.SchedulerService`
+#   (the named service, NOT empty-string) and asserts NOT_SERVING on
+#   standby. scheduler/main.rs:380-392: set_not_serving only affects
+#   the named service; if the K8s readinessProbe probed "" instead,
+#   standby would pass readiness.
+#
+# r[verify ctrl.autoscale.skip-deleting]
+#   finalizer subtest deletes the WorkerPool and waits ~300s for pod
+#   termination. The autoscaler's 30s poll fires DURING that window;
+#   scaling.rs:222 deletion_timestamp.is_some() skip-gate MUST fire
+#   or the autoscaler would race the finalizer's scale-to-0.
 {
   pkgs,
   common,
@@ -322,10 +340,16 @@ pkgs.testers.runNixOSTest {
         print(f"health-shared: leader={leader}, standby={standby}")
 
         # ── STANDBY: NOT_SERVING on named service ─────────────────────
+        # r[verify ctrl.probe.named-service]
         # grpc-health-probe exits 1 for NOT_SERVING (phase3b.nix:348).
         # .fail() expects non-zero exit AND returns stdout+stderr.
-        # Probe the NAMED service — set_not_serving only affects named,
-        # not the "" default (which is always SERVING).
+        # Probe the NAMED service (rio.scheduler.SchedulerService), NOT
+        # the empty-string default. scheduler/main.rs:380-392 comment:
+        # set_not_serving only affects the named service; empty-string
+        # stays SERVING forever after the first set_serving. If the K8s
+        # readinessProbe probed "" instead, standby would pass readiness
+        # and K8s would route to it. This probe with `-service ...` AND
+        # the NOT_SERVING result together prove the named-service gate.
         k3s_server.succeed(
             f"k3s kubectl -n ${ns} port-forward {standby} 19101:9101 "
             f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"
@@ -498,9 +522,13 @@ pkgs.testers.runNixOSTest {
             raise
 
         # ── status.buildId: real UUID, not sentinel ───────────────────
+        # r[verify ctrl.build.sentinel]
         # If the sentinel patch ran AFTER the watch task's first patch
         # (patch-ordering race), build_id would be stuck at "submitted".
-        # UUID regex checks 8-4-4-4-12 hex shape (phase3a.nix:663-672).
+        # The reconciler's idempotence gate at build.rs:111-140 keys on
+        # `build_id != "submitted"` to skip re-submit. This assert proves
+        # the sentinel→real-UUID transition completed. UUID regex checks
+        # 8-4-4-4-12 hex shape (phase3a.nix:663-672).
         build_id = kubectl(
             "get build test-watch-dedup -o jsonpath='{.status.buildId}'"
         ).strip()
@@ -543,17 +571,12 @@ pkgs.testers.runNixOSTest {
             f"  all build_watch series: {cm.get('rio_controller_build_watch_spawns_total', {})!r}"
         )
 
-        # Controller pod log (NOT journalctl — controller is a pod here).
-        # Without dedup, reconcile #2+ hit the is_real_uuid && !terminal
-        # gate → "reconnecting WatchBuild" → spawn_reconnect_watch. With
-        # dedup, contains_key returns true → silent skip.
-        reconnect_count = k3s_server.succeed(
-            "k3s kubectl -n ${ns} logs deploy/rio-controller | "
-            "grep -c 'reconnecting WatchBuild' || true"
-        ).strip()
-        assert reconnect_count == "0", (
-            f"expected 0 reconnect-path spawns, got {reconnect_count}"
-        )
+        # Reconnect-path dedup verified via the METRIC above (spawns==1).
+        # The log-grep pattern previously here (`kubectl logs | grep -c`)
+        # reads the whole pod history — a Deployment roll would give a
+        # fresh pod with 0 logs → false pass; a reorder after
+        # build-crd-reconnect would poison it to "1" → false fail.
+        # The metric is the same signal, tighter assertion.
 
         # ── Finalizer: delete → cleanup() → CR gone ───────────────────
         # --wait=false: don't block kubectl on the finalizer. Then poll
@@ -568,7 +591,7 @@ pkgs.testers.runNixOSTest {
             timeout=15,
         )
         print(f"build-crd-flow PASS: build_id={build_id}, events={len(events)}, "
-              f"spawns={spawns}, reconnects={reconnect_count}, finalizer OK")
+              f"spawns={spawns}, finalizer OK")
 
     # ══════════════════════════════════════════════════════════════════
     # recovery — kill leader pod mid-build, standby takes over
@@ -875,15 +898,29 @@ pkgs.testers.runNixOSTest {
         )
         # GCProgress stream: at least one message with isComplete=true.
         # grpcurl emits proto3 JSON (camelCase) per streamed message.
-        assert '"isComplete": true' in result or '"isComplete":true' in result, (
-            f"expected GCProgress.isComplete=true, got: {result[:500]}"
+        # grpcurl emits one JSON object per stream message (proto3
+        # camelCase). Parse structurally — substring match on "delete"/
+        # "path" is satisfied by any error like "failed to delete, path
+        # unknown". Find the isComplete:true message; assert currentPath
+        # mentions the dry-run outcome.
+        gc_msgs = [
+            json.loads(line)
+            for line in result.splitlines()
+            if line.strip().startswith("{")
+        ]
+        complete_msgs = [m for m in gc_msgs if m.get("isComplete")]
+        assert complete_msgs, (
+            f"expected at least one GCProgress with isComplete=true; "
+            f"got {len(gc_msgs)} messages: {result[:500]}"
         )
-        # currentPath describes the outcome (mark+sweep RAN, even if
-        # sweep found nothing). pathsScanned=0 is OMITTED from proto3
-        # JSON (zero-value default) — currentPath string is the signal.
-        assert "delete" in result.lower() and "path" in result.lower(), (
-            f"expected currentPath to describe delete outcome "
-            f"(mark+sweep ran), got: {result[:500]}"
+        # currentPath describes the outcome (mark+sweep RAN, even if sweep
+        # found nothing). Looking for "would delete" (dry-run phrasing)
+        # in the final message's currentPath — NOT a substring match on
+        # the whole stream blob.
+        final = complete_msgs[-1]
+        assert "would delete" in final.get("currentPath", "").lower(), (
+            f"expected dry-run currentPath to say 'would delete'; "
+            f"got: {final.get('currentPath')!r}"
         )
         print("gc-dry-run PASS: TriggerGC stream completed via AdminService proxy")
 
@@ -1090,6 +1127,12 @@ pkgs.testers.runNixOSTest {
     # but BEFORE finalizer (grpcurl still works without workers, but
     # keeping ordering monotonic is easier to reason about).
     with subtest("gc-sweep: PinPath + backdated sweep deletes EXACTLY 1"):
+        # Baseline BEFORE PinPath. The prior absolute-==1 check would
+        # confusingly fail if anything earlier (fixture, controller
+        # startup) inserts a gc_roots row, AND ==1 PASSES a no-op
+        # PinPath if nothing else ever inserts either. Delta is robust.
+        gc_roots_base = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
+
         # Pin out_pin. PinPath is rio.store.StoreAdminService on the
         # STORE (port 9002), NOT scheduler's AdminService (9001 — that
         # only has the TriggerGC proxy, not Pin/Unpin).
@@ -1101,9 +1144,11 @@ pkgs.testers.runNixOSTest {
             f'{{"store_path": "{out_pin}", "source": "vm-lifecycle"}}',
             "rio.store.StoreAdminService/PinPath",
         )
-        # Verify pin persisted in PG.
-        pin_count = psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots")
-        assert pin_count == "1", f"expected 1 gc_roots row after PinPath, got {pin_count!r}"
+        pin_after = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
+        assert pin_after == gc_roots_base + 1, (
+            f"PinPath should add exactly 1 gc_roots row; "
+            f"before={gc_roots_base}, after={pin_after}"
+        )
 
         # Backdate out_recovery past grace. This is the path sweep will
         # delete. out_recovery is unpinned (we only pinned out_pin) AND
@@ -1125,17 +1170,27 @@ pkgs.testers.runNixOSTest {
             '{"dry_run": false, "grace_period_hours": 24}',
             "rio.admin.AdminService/TriggerGC",
         )
-        assert '"isComplete": true' in result or '"isComplete":true' in result, (
-            f"expected GCProgress.isComplete=true: {result[:500]}"
+        # Parse the stream — proto3 JSON uint64 is a STRING ("1" not 1).
+        # pathsCollected EXACTLY "1" is THE assertion: without backdate,
+        # it's 0 (or absent — proto3 omits zero-value) and we've proven
+        # nothing about the loop body. Substring-match would accept
+        # spacing variations or garbage like "11"; structured parse is
+        # exact.
+        gc_msgs = [
+            json.loads(line)
+            for line in result.splitlines()
+            if line.strip().startswith("{")
+        ]
+        complete_msgs = [m for m in gc_msgs if m.get("isComplete")]
+        assert complete_msgs, (
+            f"expected GCProgress.isComplete=true; got {len(gc_msgs)} "
+            f"messages: {result[:500]}"
         )
-        # pathsCollected EXACTLY "1" (proto3 JSON uint64 → string).
-        # paths_collected → camelCase. This is THE assertion — without
-        # the backdate, pathsCollected would be 0 (or absent, proto3
-        # zero-value) and we'd have proven nothing about the loop body.
-        assert (
-            '"pathsCollected": "1"' in result
-            or '"pathsCollected":"1"' in result
-        ), f"expected EXACTLY 1 path collected (backdated recovery output): {result[:500]}"
+        final = complete_msgs[-1]
+        assert final.get("pathsCollected") == "1", (
+            f"expected EXACTLY pathsCollected='1' (backdated recovery "
+            f"output); got {final.get('pathsCollected')!r}. Full: {final!r}"
+        )
 
         # out_recovery GONE — nix path-info MUST fail.
         client.fail(
@@ -1151,13 +1206,26 @@ pkgs.testers.runNixOSTest {
             f'{{"store_path": "{out_pin}"}}',
             "rio.store.StoreAdminService/UnpinPath",
         )
-        unpin_count = psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots")
-        assert unpin_count == "0", f"expected 0 gc_roots after UnpinPath, got {unpin_count!r}"
+        unpin_after = int(psql_k8s(k3s_server, "SELECT COUNT(*) FROM gc_roots"))
+        # Back to baseline — PinPath's row is gone. ==gc_roots_base NOT
+        # ==0: if anything else ever pins, ==0 is wrong; if PinPath was
+        # a no-op AND UnpinPath was a no-op, ==0 passes (both broke).
+        assert unpin_after == gc_roots_base, (
+            f"UnpinPath should restore gc_roots to baseline; "
+            f"base={gc_roots_base}, now={unpin_after}"
+        )
         print("gc-sweep PASS: pin protected, backdated path deleted, unpin round-trip OK")
 
     # ══════════════════════════════════════════════════════════════════
     # finalizer — delete WorkerPool → pod gone → CR gone → workers=0
     # ══════════════════════════════════════════════════════════════════
+    # r[verify ctrl.autoscale.skip-deleting]
+    #   The autoscaler's 30s poll fires DURING this subtest (~300s wall
+    #   time). scaling.rs:222 `if pool.metadata.deletion_timestamp.is_some()
+    #   { skip }` MUST fire — otherwise the autoscaler would try to scale
+    #   a being-deleted pool, racing the finalizer's scale-to-0. The test
+    #   passing (pod gone + CR gone) proves the skip gate works.
+    #
     # Runs LAST: deletes the only WorkerPool, so no workers exist after.
     # Finalizer's cleanup(): DrainWorker + scale STS → 0 + wait for pod
     # termination + remove finalizer. Queue is already empty (autoscaler

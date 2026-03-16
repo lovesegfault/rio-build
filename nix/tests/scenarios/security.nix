@@ -231,6 +231,12 @@ pkgs.testers.runNixOSTest {
         # needs crafting a raw PutPath gRPC stream with NAR chunks —
         # complex via grpcurl. Covered by unit tests in
         # rio-store/src/grpc/put_path.rs hmac module.
+        # Baseline BEFORE the build. seedBusybox (L197) already did a
+        # PutPath — ≥1 here would be satisfied by the seed alone. If
+        # the HMAC token were silently rejected and the build succeeded
+        # via some other bypass, the old assert passes anyway. Delta
+        # proves THIS build's PutPath hit result=created.
+        store_before = scrape_metrics(${gatewayHost}, 9092)
         try:
             out_hmac = client.succeed(
                 "nix-build --no-out-link "
@@ -249,10 +255,14 @@ pkgs.testers.runNixOSTest {
         # PutPath succeeded (token accepted). result="created" means
         # the path was NEW (not a cache hit) — so the HMAC check
         # actually ran (cache hits short-circuit before HMAC).
-        assert_metric_ge(
-            ${gatewayHost}, 9092,
-            "rio_store_put_path_total", 1.0,
-            labels='{result="created"}',
+        store_after = scrape_metrics(${gatewayHost}, 9092)
+        pp_before = metric_value(store_before,
+            "rio_store_put_path_total", '{result="created"}') or 0.0
+        pp_after = metric_value(store_after,
+            "rio_store_put_path_total", '{result="created"}') or 0.0
+        assert pp_after > pp_before, (
+            f"HMAC build should increment put_path_total{{result=created}}; "
+            f"before={pp_before}, after={pp_after}"
         )
         print(f"hmac-positive PASS: build with HMAC token succeeded, output {out_hmac}")
 

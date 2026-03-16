@@ -572,6 +572,10 @@ mod tests {
         assert_eq!(classify(3600.0, None, &c).as_deref(), Some("large"));
     }
 
+    // r[verify sched.classify.mem-bump]
+    // 10s would classify "small" by duration alone, but 2 GiB > the
+    // 1 GiB mem_limit on "small" → bumps to "large". Proves the
+    // mem_limit_bytes gate at classify():115-119 fires.
     #[test]
     fn classify_memory_bump() {
         let c = classes();

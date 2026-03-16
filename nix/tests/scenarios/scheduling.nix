@@ -27,6 +27,21 @@
 # r[verify obs.metric.scheduler]
 # r[verify obs.metric.worker]
 # r[verify obs.metric.store]
+#
+# r[verify worker.fuse.lookup-caches]
+#   fanout asserts rio_worker_fuse_cache_misses_total ≥1 on each small
+#   worker. Nonzero misses prove lookup()→ensure_cached()→materialize
+#   ran and the inode→realpath mapping is cached (ops.rs:52+).
+#
+# r[verify store.inline.threshold]
+#   chunks builds a 300 KiB blob (> INLINE_THRESHOLD=256 KiB) and asserts
+#   chunk_after > chunk_baseline. Proves put_path.rs:494 nar_data.len()
+#   >= INLINE_THRESHOLD gate fired (tiny-text builds go inline).
+#
+# r[verify obs.metric.transfer-volume]
+#   chunks asserts rio_store_bytes_received_total delta ≥300000 after
+#   bigblob upload. Proves the volume counter (put_path.rs:574) runs on
+#   the chunked path.
 #   Asserted end-to-end from /metrics scrapes via assert_metric_*: exact
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
 {
@@ -133,9 +148,12 @@ pkgs.testers.runNixOSTest {
             f"got {leaf_count}. DAG walk or NAR content corrupted?"
         )
 
-        # Scheduler: at least one build reached terminal success.
-        assert_metric_ge(${gatewayHost}, 9091,
-            "rio_scheduler_builds_total", 1.0, labels='{outcome="success"}')
+        # scheduler_builds_total is per-SubmitBuild, not per-derivation
+        # (protocol.nix:122-124). fanout submits once → exactly 1 here.
+        # BUT: leaf_count=="4" above is strictly stronger (proves all 5
+        # derivations built AND the NAR retrievable). A ≥1 metric check
+        # would pass even if 4 leaves silently failed and only the
+        # collector cache-hit. Deleted — the content check IS the test.
 
         # Distribution: EACH SMALL worker executed ≥1 derivation.
         # With size-classes configured, no-pname leaves route to the
@@ -148,9 +166,13 @@ pkgs.testers.runNixOSTest {
             assert_metric_ge(w, 9093,
                 "rio_worker_builds_total", 1.0, labels='{outcome="success"}')
 
+        # r[verify worker.fuse.lookup-caches]
         # FUSE fetch: each SMALL worker pulled ≥1 path from rio-store
-        # (busybox must be fetched before any build runs). wlarge
-        # never built anything → never fetched anything.
+        # (busybox must be fetched before any build runs). lookup()
+        # materializes the tree on miss (ops.rs:105 ensure_cached)
+        # then caches the inode→realpath mapping for the kernel TTL.
+        # Nonzero misses prove the cold-lookup→fetch→cache path ran.
+        # wlarge never built anything → never fetched anything.
         for w in small_workers:
             assert_metric_ge(w, 9093,
                 "rio_worker_fuse_cache_misses_total", 1.0)
@@ -329,6 +351,16 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # chunks — 300KiB output forces chunked PutPath, not inline
     # ══════════════════════════════════════════════════════════════════
+    # r[verify store.inline.threshold]
+    #   300 KiB > INLINE_THRESHOLD (256 KiB) → nar_data.len() >= cas::
+    #   INLINE_THRESHOLD at put_path.rs:494 is true → chunked path.
+    #   chunk_after > chunk_baseline proves the threshold gate fired.
+    # r[verify obs.metric.transfer-volume]
+    #   The chunked PutPath increments rio_store_bytes_received_total
+    #   (put_path.rs:574). bytes_after - bytes_before ≥ 300*1024 proves
+    #   the volume counter runs on the chunked path (tiny text-file
+    #   builds above probably went inline, so this is the first check
+    #   that hits the counter inside the chunked branch).
     with subtest("chunks: 300KiB bigblob writes chunk files to disk"):
         # All builds above are tiny text files, likely inline — a
         # post-build `chunk_count > 0` check would NOT prove the chunked
@@ -337,6 +369,7 @@ pkgs.testers.runNixOSTest {
         chunk_baseline = int(${gatewayHost}.succeed(
             "find /var/lib/rio/store/chunks -type f 2>/dev/null | wc -l"
         ).strip())
+        bytes_before = scrape_metrics(${gatewayHost}, 9092)
 
         build("${drvs.sizeclass}", attr="bigblob")
 
@@ -348,6 +381,17 @@ pkgs.testers.runNixOSTest {
             f"(>INLINE_THRESHOLD). baseline={chunk_baseline}, "
             f"after={chunk_after} — chunk backend not wired, or "
             f"INLINE_THRESHOLD changed?"
+        )
+
+        # transfer-volume: bigblob is 300 KiB of zeros. NAR framing
+        # adds a few hundred bytes of overhead. ≥300000 is a loose
+        # floor — chunk dedup doesn't change what PutPath RECEIVES.
+        bytes_after = scrape_metrics(${gatewayHost}, 9092)
+        b_before = metric_value(bytes_before, "rio_store_bytes_received_total") or 0.0
+        b_after = metric_value(bytes_after, "rio_store_bytes_received_total") or 0.0
+        assert b_after - b_before >= 300000, (
+            f"expected ≥300000 bytes delta for 300 KiB bigblob upload; "
+            f"before={b_before}, after={b_after}, delta={b_after - b_before}"
         )
 
         # Dedup metric registered + exported (proves chunked PutPath
