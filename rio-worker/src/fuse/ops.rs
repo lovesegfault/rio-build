@@ -32,6 +32,13 @@ impl Filesystem for NixStoreFs {
         Ok(())
     }
 
+    // COVERAGE: destroy() only fires on clean umount — main()
+    // drops BackgroundSession on the normal-return path, which
+    // unmounts, which triggers this. VM tests `systemctl stop` for
+    // graceful shutdown so it SHOULD run, but empirically stays 0:
+    // fuser's background thread is detached (no join), so the
+    // umount→destroy path races atexit's profraw flush. The
+    // passthrough-failures rollup is best-effort anyway.
     fn destroy(&mut self) {
         let failures = self.passthrough_failures.load(Ordering::Relaxed);
         if failures > 0 {
@@ -42,6 +49,12 @@ impl Filesystem for NixStoreFs {
         }
     }
 
+    // COVERAGE: forget() fires when the kernel evicts inodes
+    // under memory pressure. VM tests allocate ≥6GB and touch a
+    // handful of store paths — no pressure, no eviction. Would
+    // need a smaller-VM-RAM fixture + a cache-filling stress
+    // build to hit. The ino-map cleanup is defensive (leaks
+    // without it, but the mount is ephemeral anyway).
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
         let mut map = self.inodes_write();
         if map.forget(ino.0, nlookup) {

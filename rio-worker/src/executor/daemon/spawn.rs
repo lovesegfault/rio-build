@@ -162,6 +162,15 @@ pub(in crate::executor) async fn spawn_daemon_in_namespace(
         }
 
         // SAFETY: see function doc. Closure body is async-signal-safe.
+        //
+        // COVERAGE: the closure body runs post-fork pre-exec in the
+        // CHILD. The child never returns to main() — it exec()s
+        // nix-daemon or dies — so atexit never fires and LLVM's
+        // profraw never flushes. The parent's fork-point counter
+        // shows the closure was entered (cmd.pre_exec line itself
+        // is covered), but the body instructions belong to a PID
+        // that writes no profraw. Not a test gap; a fundamental
+        // coverage-model limitation for pre_exec hooks.
         unsafe {
             cmd.pre_exec(move || {
                 // New mount namespace for this process tree (daemon + sandbox).
