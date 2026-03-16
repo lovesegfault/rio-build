@@ -150,13 +150,19 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # failover — kill leader (no step_down), standby acquires
+    # failover — kill leader, standby acquires
     # ══════════════════════════════════════════════════════════════════
-    # --grace-period=0 --force → SIGKILL, no graceful shutdown, no
-    # step_down(). The standby has to notice via observed-record expiry:
-    # dead leader's rv stops bumping → standby's local clock runs to
-    # TTL (15s) → steal. Acquisition latency: up to RENEW_INTERVAL(5s)
-    # from last renew + TTL(15s) + one poll tick(5s) ≈ 25s worst case.
+    # --grace-period=0 --force still sends SIGTERM before SIGKILL
+    # (kubelet behavior). The scheduler's graceful shutdown is now
+    # fast enough (a5b06ef token-aware drain) that step_down()
+    # completes before SIGKILL arrives — it clears holderIdentity.
+    # The standby's decide() sees empty holder → Decision::Steal →
+    # acquires immediately (no TTL wait) AND bumps leaseTransitions.
+    #
+    # The old `!= old_leader` wait passed on the EMPTY holder
+    # between step_down and standby acquire — reading tx then
+    # raced the standby's poll tick (5s). Wait for the standby
+    # to actually hold instead.
     with subtest("failover: kill leader, standby acquires"):
         tx_before = lease_transitions()
         old_leader = leader_pod()
@@ -181,12 +187,13 @@ pkgs.testers.runNixOSTest {
 
         kubectl(f"delete pod {old_leader} --grace-period=0 --force")
 
-        # Wait for holderIdentity to flip. 45s: ~25s worst-case acquire
-        # (see above) + VM slack.
+        # Wait for standby to ACQUIRE (not just old leader to release).
+        # step_down clears holder instantly; standby acquires on its
+        # next poll tick (5s). 45s: ≈10s typical + VM slack.
         k3s_server.wait_until_succeeds(
             "test \"$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
             "-o jsonpath='{.spec.holderIdentity}')\" "
-            f"!= '{old_leader}'",
+            f"= '{standby}'",
             timeout=45,
         )
 
