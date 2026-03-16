@@ -570,12 +570,15 @@ fn test_ctx(client: kube::Client) -> Arc<Ctx> {
             instance: None,
         },
     );
+    // Unreachable --- apply() doesn't touch the scheduler, and
+    // cleanup() treats RPC failure as best-effort skip. connect_lazy
+    // defers the TCP connect until the first RPC, which fails fast on
+    // port 1 (never listened on).
+    let dead_ch = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
     Arc::new(Ctx {
         client,
-        // Unreachable — apply() doesn't touch the scheduler,
-        // and cleanup() treats connect failure as best-effort
-        // skip. Using an address that fails fast (port 1 is
-        // never listened on) vs one that times out.
+        scheduler: rio_proto::SchedulerServiceClient::new(dead_ch.clone()),
+        admin: rio_proto::AdminServiceClient::new(dead_ch),
         scheduler_addr: "http://127.0.0.1:1".into(),
         store_addr: "http://127.0.0.1:1".into(),
         scheduler_balance_host: None,

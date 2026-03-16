@@ -320,51 +320,36 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
         .list(&kube::api::ListParams::default().labels(&format!("rio.build/pool={name}")))
         .await?;
 
-    // Best-effort scheduler connect. Failure → skip all drains,
-    // proceed to scale-0. One connect for the batch (not per
-    // pod — if pod 0's drain fails on connect, pod 1's would too).
-    match rio_proto::client::connect_admin(&ctx.scheduler_addr).await {
-        Ok(mut admin) => {
-            for pod in &pods.items {
-                let Some(worker_id) = &pod.metadata.name else {
-                    continue;
-                };
-                // force=false: in-flight builds complete. The
-                // scheduler just stops dispatching NEW work.
-                // SIGTERM (phase 2) is what triggers the worker
-                // to actually exit once drained.
-                match admin
-                    .drain_worker(rio_proto::types::DrainWorkerRequest {
-                        worker_id: worker_id.clone(),
-                        force: false,
-                    })
-                    .await
-                {
-                    Ok(resp) => {
-                        let r = resp.into_inner();
-                        debug!(
-                            worker = %worker_id,
-                            running = r.running_builds,
-                            "DrainWorker OK"
-                        );
-                    }
-                    Err(e) => {
-                        // One pod's drain failed — log and
-                        // continue with the rest. SIGTERM still
-                        // drains it (just doesn't prevent the
-                        // scheduler from sending it one more
-                        // assignment in the gap).
-                        warn!(worker = %worker_id, error = %e, "DrainWorker failed (continuing)");
-                    }
-                }
+    // Best-effort DrainWorker per pod. Balanced client routes to
+    // the leader; if the scheduler is down, each RPC fails and we
+    // log+continue (SIGTERM still drains in-flight). If the leader
+    // comes back mid-loop, later pods succeed.
+    let mut admin = ctx.admin.clone();
+    for pod in &pods.items {
+        let Some(worker_id) = &pod.metadata.name else {
+            continue;
+        };
+        // force=false: in-flight builds complete. The scheduler
+        // just stops dispatching NEW work. SIGTERM (phase 2) is
+        // what triggers the worker to actually exit once drained.
+        match admin
+            .drain_worker(rio_proto::types::DrainWorkerRequest {
+                worker_id: worker_id.clone(),
+                force: false,
+            })
+            .await
+        {
+            Ok(resp) => {
+                let r = resp.into_inner();
+                debug!(worker = %worker_id, running = r.running_builds, "DrainWorker OK");
             }
-        }
-        Err(e) => {
-            warn!(
-                workerpool = %name,
-                error = %e,
-                "scheduler unreachable; skipping DrainWorker (SIGTERM still drains in-flight)"
-            );
+            Err(e) => {
+                // One pod's drain failed --- log and continue.
+                // SIGTERM still drains it (just doesn't prevent
+                // the scheduler from sending it one more assignment
+                // in the gap).
+                warn!(worker = %worker_id, error = %e, "DrainWorker failed (continuing)");
+            }
         }
     }
 

@@ -171,20 +171,14 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
                 since_seq = status.last_sequence,
                 "reconnecting WatchBuild (controller restart or watch died)"
             );
-            let sched = rio_proto::client::connect_scheduler(&ctx.scheduler_addr)
-                .await
-                .map_err(|e| {
-                    Error::SchedulerUnavailable(tonic::Status::unavailable(e.to_string()))
-                })?;
             ctx.watching.insert(watch_key.clone(), ());
             metrics::counter!("rio_controller_build_watch_spawns_total").increment(1);
             spawn_reconnect_watch(
                 name.clone(),
                 Api::namespaced(ctx.client.clone(), &ns),
-                sched,
+                ctx.scheduler.clone(),
                 status.build_id.clone(),
                 status.last_sequence as u64,
-                ctx.scheduler_addr.clone(),
                 Arc::clone(&ctx.watching),
                 watch_key,
                 ctx.recorder.clone(),
@@ -201,17 +195,13 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // ---- First apply: fetch .drv, build node, submit ----
     info!(build = %name, drv = %b.spec.derivation, "submitting");
 
-    // Lazy connect. Two separate connections (store for the .drv
-    // fetch, scheduler for SubmitBuild) rather than holding them
-    // in Ctx — a transient outage during ONE Build's submit
-    // shouldn't affect other reconciles. connect_* already
-    // handles retry/timeout internally.
+    // Store: lazy per-reconcile connect — a transient store outage
+    // during ONE Build's submit shouldn't affect other reconciles.
+    // Scheduler: balanced client from Ctx (routes to leader only).
     let mut store = rio_proto::client::connect_store(&ctx.store_addr)
         .await
         .map_err(|e| Error::SchedulerUnavailable(tonic::Status::unavailable(e.to_string())))?;
-    let mut sched = rio_proto::client::connect_scheduler(&ctx.scheduler_addr)
-        .await
-        .map_err(|e| Error::SchedulerUnavailable(tonic::Status::unavailable(e.to_string())))?;
+    let mut sched = ctx.scheduler.clone();
 
     let node = fetch_and_build_node(&mut store, &b.spec.derivation).await?;
 
@@ -292,7 +282,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     // returning from apply() lets the controller move on to the
     // next reconcile. The stream drains in the background.
     //
-    // scheduler_addr cloned in for reconnect on stream error.
+    // Balanced scheduler client cloned in for mid-stream reconnect.
     //
     // Dedup gate: should already be empty (first apply, build_id
     // was empty above), but guard anyway — the sentinel patch
@@ -316,7 +306,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             name.clone(),
             api,
             stream,
-            ctx.scheduler_addr.clone(),
+            ctx.scheduler.clone(),
             // since_seq=0 for initial connect — this IS the
             // SubmitBuild stream, it starts from the beginning.
             0,
@@ -338,10 +328,17 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
 /// idempotence gate when build_id is real + phase non-terminal
 /// (controller restarted mid-build).
 ///
-/// Fire-and-forget like the initial drain_stream spawn. If
-/// WatchBuild fails (scheduler down, unknown build_id after
-/// recovery didn't find it), logs and exits — status stays stale.
-/// Next controller restart retries.
+/// Fire-and-forget like the initial drain_stream spawn. `sched` is
+/// the balanced client from Ctx --- routes only to the leader via
+/// health-probe endpoint filtering, so no ClusterIP round-robin
+/// lottery. Retry covers the leader-failover window: probe loop
+/// removes dead leader + adds new one within ~probe_interval (5s),
+/// during which RPCs fail. Without retry, SubmitBuild in apply()
+/// gets retried via reconcile requeue (error_policy), but this task
+/// is outside the reconcile cycle --- returned `await_change()`
+/// already, nothing changes the CR to re-trigger. Same
+/// MAX_RECONNECT/backoff as drain_stream. On exhaustion: patch
+/// phase=Unknown so operator sees "watch lost".
 #[allow(clippy::too_many_arguments)]
 fn spawn_reconnect_watch(
     name: String,
@@ -349,7 +346,6 @@ fn spawn_reconnect_watch(
     mut sched: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
     build_id: String,
     since_seq: u64,
-    scheduler_addr: String,
     watching: Arc<dashmap::DashMap<String, ()>>,
     watch_key: String,
     recorder: kube::runtime::events::Recorder,
@@ -361,48 +357,81 @@ fn spawn_reconnect_watch(
         // inner) creates a race: inner drops → new reconcile inserts
         // → outer drops stale removal. The ONLY exit path where
         // drain_stream's guard doesn't run is WatchBuild-fails-
-        // immediately (Err branch below) — we handle that explicitly
-        // with watching.remove().
-        match sched
-            .watch_build(types::WatchBuildRequest {
-                build_id: build_id.clone(),
-                since_sequence: since_seq,
-            })
-            .await
-        {
-            Ok(resp) => {
-                info!(build = %name, %build_id, since_seq, "WatchBuild reconnect ok");
-                drain_stream(
-                    name,
-                    api,
-                    resp.into_inner(),
-                    scheduler_addr,
-                    since_seq,
-                    // Pass known build_id: we HAVE it (from CRD
-                    // status). Without this, stream-error-before-
-                    // first-event → status.build_id empty →
-                    // drain_stream exits → status stale until
-                    // controller restart.
-                    Some(build_id),
-                    watching,
-                    watch_key,
-                    recorder,
-                    obj_ref,
-                )
-                .await;
-                // drain_stream's guard removed the entry on exit.
-            }
-            Err(e) => {
-                // Scheduler down, or build not found (recovery
-                // didn't reconstruct it — PG was cleared, or
-                // it's from a very old pre-recovery scheduler).
-                // Log and exit; status stays stale. Next restart
-                // retries.
-                warn!(build = %name, %build_id, error = %e,
-                      "WatchBuild reconnect failed; status will stop updating");
-                // Manual cleanup for the WatchBuild-fails path.
-                // drain_stream never ran → its guard didn't fire.
-                watching.remove(&watch_key);
+        // exhausted (Err arm below) — handled explicitly.
+        const MAX_RECONNECT: u32 = 5;
+        for attempt in 1..=MAX_RECONNECT {
+            match sched
+                .watch_build(types::WatchBuildRequest {
+                    build_id: build_id.clone(),
+                    since_sequence: since_seq,
+                })
+                .await
+            {
+                Ok(resp) => {
+                    info!(build = %name, %build_id, since_seq, attempt,
+                          "WatchBuild reconnect ok");
+                    drain_stream(
+                        name,
+                        api,
+                        resp.into_inner(),
+                        sched,
+                        since_seq,
+                        // Pass known build_id: we HAVE it (from CRD
+                        // status). Without this, stream-error-before-
+                        // first-event → status.build_id empty →
+                        // drain_stream exits → status stale until
+                        // controller restart.
+                        Some(build_id),
+                        watching,
+                        watch_key,
+                        recorder,
+                        obj_ref,
+                    )
+                    .await;
+                    // drain_stream's guard removed the entry on exit.
+                    return;
+                }
+                Err(e) if attempt < MAX_RECONNECT => {
+                    // Leader failover window (probe loop hasn't
+                    // updated endpoint set yet), or scheduler
+                    // mid-recovery. Balanced channel's probe loop
+                    // handles endpoint updates in the background ---
+                    // next RPC after backoff uses the fresh set.
+                    // Same backoff as drain_stream (1/2/4/8/16s).
+                    let backoff = std::time::Duration::from_secs(1 << (attempt - 1).min(4));
+                    warn!(build = %name, %build_id, error = %e, attempt,
+                          backoff_secs = backoff.as_secs(),
+                          "WatchBuild reconnect failed; retrying");
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => {
+                    // Exhausted. Scheduler down past failover
+                    // window, or build not found (recovery didn't
+                    // reconstruct it — PG cleared, or from a very
+                    // old pre-recovery scheduler). Patch phase=
+                    // Unknown so operator sees "watch lost" not
+                    // just "stuck at last state" (same as
+                    // drain_stream's exhaustion path). Next
+                    // controller restart retries.
+                    warn!(build = %name, %build_id, error = %e,
+                          attempts = MAX_RECONNECT,
+                          "WatchBuild reconnect exhausted; status will stop updating");
+                    let _ = patch_status(
+                        &api,
+                        &name,
+                        BuildStatus {
+                            build_id: build_id.clone(),
+                            phase: "Unknown".into(),
+                            last_sequence: since_seq as i64,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    // Manual cleanup — drain_stream never ran so
+                    // its guard didn't fire.
+                    watching.remove(&watch_key);
+                    return;
+                }
             }
         }
     });
@@ -433,35 +462,29 @@ async fn cleanup(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     }
 
     info!(build = %name, %build_id, "cancelling");
-    // Best-effort. Scheduler down → log and proceed — blocking
+    // Best-effort. Scheduler down → log and proceed --- blocking
     // delete on a down scheduler means the CRD sticks around
     // until the scheduler comes back, which is operationally
     // annoying (can't `kubectl delete -f build.yaml` during an
     // outage). The scheduler's terminal-cleanup eventually reaps
     // the zombie build anyway (60s delay + DAG reap).
-    match rio_proto::client::connect_scheduler(&ctx.scheduler_addr).await {
-        Ok(mut sched) => {
-            let res = sched
-                .cancel_build(types::CancelBuildRequest {
-                    build_id: build_id.to_string(),
-                    reason: "k8s Build CRD deleted".into(),
-                })
-                .await;
-            match res {
-                Ok(resp) => {
-                    debug!(build = %name, cancelled = resp.into_inner().cancelled, "CancelBuild OK");
-                }
-                Err(e) if e.code() == tonic::Code::NotFound => {
-                    // Build already terminal (cleaned up). Fine.
-                    debug!(build = %name, "scheduler: build not found (already terminal)");
-                }
-                Err(e) => {
-                    warn!(build = %name, error = %e, "CancelBuild failed (proceeding with delete anyway)");
-                }
-            }
+    let mut sched = ctx.scheduler.clone();
+    match sched
+        .cancel_build(types::CancelBuildRequest {
+            build_id: build_id.to_string(),
+            reason: "k8s Build CRD deleted".into(),
+        })
+        .await
+    {
+        Ok(resp) => {
+            debug!(build = %name, cancelled = resp.into_inner().cancelled, "CancelBuild OK");
+        }
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            // Build already terminal (cleaned up). Fine.
+            debug!(build = %name, "scheduler: build not found (already terminal)");
         }
         Err(e) => {
-            warn!(build = %name, error = %e, "scheduler unreachable during cleanup (proceeding anyway)");
+            warn!(build = %name, error = %e, "CancelBuild failed (proceeding with delete anyway)");
         }
     }
 
@@ -641,7 +664,7 @@ fn priority_to_class(p: i32) -> &'static str {
 /// are emitted on derivation state transitions (1/sec worst
 /// case), and that's what the printer column shows anyway.
 ///
-/// `scheduler_addr` + `start_seq`: for reconnect on stream error
+/// `sched` + `start_seq`: for reconnect on stream error (balanced
 /// (scheduler failover). Backoff-retry up to 5 attempts; WatchBuild
 /// with the LAST seq we saw (or start_seq on first reconnect).
 /// After max retries: log warn, exit — status stale.
@@ -658,7 +681,7 @@ async fn drain_stream(
     name: String,
     api: Api<Build>,
     mut stream: tonic::Streaming<types::BuildEvent>,
-    scheduler_addr: String,
+    mut sched: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
     start_seq: u64,
     known_build_id: Option<String>,
     watching: Arc<dashmap::DashMap<String, ()>>,
@@ -840,51 +863,37 @@ async fn drain_stream(
             return;
         }
 
-        match rio_proto::client::connect_scheduler(&scheduler_addr).await {
-            Ok(mut sched) => {
-                match sched
-                    .watch_build(types::WatchBuildRequest {
-                        build_id: status.build_id.clone(),
-                        since_sequence: status.last_sequence as u64,
-                    })
-                    .await
-                {
-                    Ok(resp) => {
-                        info!(build = %name, "reconnected WatchBuild");
-                        stream = resp.into_inner();
-                        // Loop continues: next iteration
-                        // reads from the new stream.
-                    }
-                    Err(wb_err) => {
-                        // WatchBuild failed. Two cases:
-                        // (a) Recovery RACE: hit the standby or a
-                        //     still-recovering leader → build_events
-                        //     map empty → BuildNotFound. TRANSIENT;
-                        //     retry after next backoff. ~15-30s until
-                        //     recover_from_pg completes.
-                        // (b) Recovery GAP: recover_from_pg ran but
-                        //     didn't reconstruct this build (PG was
-                        //     cleared, build_id orphaned). Permanent.
-                        // Can't distinguish (a) from (b) here — retry
-                        // and let MAX_RECONNECT bound the damage.
-                        // The dead stream errors again next iteration
-                        // → another backoff → another WatchBuild.
-                        warn!(build = %name, error = %wb_err,
-                              "WatchBuild failed; retrying (recovery race or build unknown)");
-                    }
-                }
+        // Balanced client --- probe loop updates endpoint set in
+        // the background; next RPC uses the fresh set. No explicit
+        // reconnect needed.
+        match sched
+            .watch_build(types::WatchBuildRequest {
+                build_id: status.build_id.clone(),
+                since_sequence: status.last_sequence as u64,
+            })
+            .await
+        {
+            Ok(resp) => {
+                info!(build = %name, "reconnected WatchBuild");
+                stream = resp.into_inner();
+                // Loop continues: next iteration reads from the
+                // new stream.
             }
-            Err(conn_err) => {
-                // Connect failed. Count as reconnect
-                // attempt; next iteration of the outer
-                // loop will Error again (stream is still
-                // the dead one) → another backoff. After
-                // MAX, give up.
-                warn!(build = %name, error = %conn_err,
-                      "scheduler connect failed during reconnect");
-                // Don't continue — the dead stream will
-                // just error again immediately. Sleep was
-                // already done above.
+            Err(wb_err) => {
+                // WatchBuild failed. (a) Failover window: probe
+                // loop hasn't updated endpoint set yet — stale
+                // leader IP or no-endpoints. (b) Recovery RACE: a
+                // still-recovering leader → build_events map empty
+                // → BuildNotFound. TRANSIENT; retry after next
+                // backoff. ~15-30s until recover_from_pg completes.
+                // (c) Recovery GAP: recover_from_pg ran but didn't
+                // reconstruct this build (PG was cleared, build_id
+                // orphaned). Permanent. Can't distinguish ---
+                // retry and let MAX_RECONNECT bound the damage.
+                // The dead stream errors again next iteration
+                // → another backoff → another WatchBuild.
+                warn!(build = %name, error = %wb_err,
+                      "WatchBuild failed; retrying (failover/recovery race or build unknown)");
             }
         }
     }

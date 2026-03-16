@@ -164,52 +164,66 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     info!("kubernetes client connected");
 
-    // ---- Scheduler client (for autoscaler) ----
+    // ---- Scheduler clients (autoscaler + reconcilers) ----
     // Retry until connected. All rio-* pods start in parallel via
     // helm; under coverage-instrumented binaries + the k3s flannel
     // CNI race (`/run/flannel/subnet.env` written at t≈186s while
     // pod sandboxes start at t≈185s), this process can reach this
     // line before the scheduler Service has endpoints. connect_admin
-    // uses eager .connect().await — refused → Err. The previous `?`
-    // here meant process-exit → CrashLoopBackOff → 10s/20s/40s
-    // kubelet backoff → 180s test budget exhausted (observed 2/2
+    // uses eager .connect().await --- refused --> Err. The previous `?`
+    // here meant process-exit --> CrashLoopBackOff --> 10s/20s/40s
+    // kubelet backoff --> 180s test budget exhausted (observed 2/2
     // coverage-full failures 2026-03-16). Retry internally instead:
     // pod stays not-Ready (health server below hasn't spawned), so
     // the Deployment's Available condition correctly gates on this.
     //
-    // Once connected: hold the channel for process lifetime. The
-    // autoscaler polls every 30s. Balanced when scheduler_balance_host
-    // is set — the standby returns UNAVAILABLE on AdminService RPCs,
-    // so ClusterIP round-robin fails ~50% of ticks; balanced channel
-    // health-probes pod IPs and routes only to the leader. Guard held
-    // in _balance_guard (dropping it stops the probe loop).
+    // Once connected: hold the channel for process lifetime. Balanced
+    // when scheduler_balance_host is set --- the standby returns
+    // UNAVAILABLE on all RPCs, so ClusterIP round-robin fails ~50% of
+    // ticks; balanced channel health-probes pod IPs and routes only
+    // to the leader. BOTH AdminServiceClient (autoscaler ClusterStatus
+    // polls) AND SchedulerServiceClient (Build reconciler SubmitBuild/
+    // WatchBuild/CancelBuild) wrap the SAME channel --- one probe
+    // loop, one endpoint set. Guard held in _balance_guard (dropping
+    // it stops the probe loop).
     //
-    // The reconcilers DON'T use this client — they patch K8s objects
-    // only. WorkerPool finalizer's cleanup() connects lazily per-call
-    // for DrainWorker.
-    let (scheduler, _balance_guard) = loop {
-        let result = match &cfg.scheduler_balance_host {
+    // Single-channel mode: two separate connects (two TCP conns).
+    // Dev/test only (single replica, no standby to round-robin to).
+    let (admin, sched_client, _balance_guard) = loop {
+        let result: anyhow::Result<_> = match &cfg.scheduler_balance_host {
             None => {
                 info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
-                rio_proto::client::connect_admin(&cfg.scheduler_addr)
-                    .await
-                    .map(|c| (c, None))
+                async {
+                    let admin = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
+                    let sched = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
+                    Ok((admin, sched, None))
+                }
+                .await
             }
             Some(host) => {
                 info!(
                     %host, port = cfg.scheduler_balance_port,
                     "connecting to scheduler (health-aware balanced)"
                 );
-                rio_proto::client::balance::connect_admin_balanced(
-                    host.clone(),
-                    cfg.scheduler_balance_port,
-                )
+                async {
+                    let (admin, bc) = rio_proto::client::balance::connect_admin_balanced(
+                        host.clone(),
+                        cfg.scheduler_balance_port,
+                    )
+                    .await?;
+                    // Reuse the same balanced Channel for the
+                    // SchedulerServiceClient --- ONE probe loop,
+                    // BOTH clients route only to the leader.
+                    let sched = rio_proto::SchedulerServiceClient::new(bc.channel())
+                        .max_decoding_message_size(rio_proto::max_message_size())
+                        .max_encoding_message_size(rio_proto::max_message_size());
+                    Ok((admin, sched, Some(bc)))
+                }
                 .await
-                .map(|(c, bc)| (c, Some(bc)))
             }
         };
         match result {
-            Ok(pair) => break pair,
+            Ok(triple) => break triple,
             Err(e) => {
                 warn!(error = %e, "scheduler connect failed; retrying in 2s (pod stays not-Ready)");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -244,6 +258,8 @@ async fn main() -> anyhow::Result<()> {
     // ---- Context ----
     let ctx = Arc::new(Ctx {
         client: client.clone(),
+        scheduler: sched_client,
+        admin: admin.clone(),
         scheduler_addr: cfg.scheduler_addr.clone(),
         scheduler_balance_host: cfg.scheduler_balance_host.clone(),
         scheduler_balance_port: cfg.scheduler_balance_port,
@@ -293,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
         min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
     };
     info!(?timing, "autoscaler timing");
-    let autoscaler = Autoscaler::new(client.clone(), scheduler, timing, recorder);
+    let autoscaler = Autoscaler::new(client.clone(), admin, timing, recorder);
     rio_common::task::spawn_monitored("autoscaler", autoscaler.run());
 
     // ---- Build controller ----

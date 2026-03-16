@@ -21,22 +21,31 @@ use kube::Client;
 /// Shared context for all reconcilers. Cloned into each
 /// `Controller::run()` via Arc.
 ///
-/// `scheduler_addr` not a live client: reconcilers connect lazily
-/// (per-reconcile) so a transient scheduler outage doesn't kill
-/// the controller at startup. The autoscaler holds a live client
-/// — it polls every 30s, the connection cost amortizes.
+/// `scheduler` + `admin` are live clients, not addresses. When
+/// `scheduler_balance_host` is set (production), they share the same
+/// health-aware balanced Channel that routes only to the leader ---
+/// no ClusterIP round-robin lottery (which fails ~50% with standby's
+/// `UNAVAILABLE: "not leader"`). The startup retry loop in main()
+/// handles the "scheduler not up yet" case; reconcilers just clone.
+/// `scheduler_addr` kept for worker pod env injection (workers need
+/// the address string, not a client).
 pub struct Ctx {
-    /// K8s client. Shared (clone per `Api<T>` call — cheap, it's
+    /// K8s client. Shared (clone per `Api<T>` call --- cheap, it's
     /// an Arc internally).
     pub client: Client,
-    /// rio-scheduler gRPC address (e.g., "rio-scheduler:9001").
-    /// AdminService (ClusterStatus, DrainWorker) and
-    /// SchedulerService (SubmitBuild, CancelBuild) are on the
-    /// same port.
+    /// Balanced SchedulerServiceClient (SubmitBuild/WatchBuild/
+    /// CancelBuild). Routes to leader only when balance is set.
+    /// Clone per call (tonic clients are Arc-backed).
+    pub scheduler: rio_proto::SchedulerServiceClient<tonic::transport::Channel>,
+    /// Balanced AdminServiceClient (DrainWorker in workerpool
+    /// finalizer). Same channel as `scheduler` --- one probe loop.
+    pub admin: rio_proto::AdminServiceClient<tonic::transport::Channel>,
+    /// rio-scheduler ClusterIP address (e.g., "rio-scheduler:9001").
+    /// For worker pod env injection ONLY --- reconcilers use
+    /// `scheduler`/`admin` above.
     pub scheduler_addr: String,
-    /// Headless Service host for workers' balanced channels.
-    /// `Some(host)` = injected as `RIO_SCHEDULER_BALANCE_HOST`
-    /// into worker pods. `None` = env var NOT injected → workers
+    /// Headless Service host. Injected as `RIO_SCHEDULER_BALANCE_HOST`
+    /// into worker pods. `None` = env var NOT injected --> workers
     /// fall back to single-channel (VM tests, single-replica).
     pub scheduler_balance_host: Option<String>,
     pub scheduler_balance_port: u16,
