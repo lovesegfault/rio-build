@@ -19,6 +19,14 @@
 #   failover: ungraceful kill (no step_down) → standby observes unchanged
 #     rv for TTL → steals → leaseTransitions +1.
 #
+# r[verify sched.lease.graceful-release]
+# r[verify sched.lease.deletion-cost]
+#   graceful-release: SIGTERM leader (no --force, --grace-period=30)
+#   → step_down() runs to completion → standby acquires in <10s (vs
+#   ~15s TTL-steal on ungraceful kill). lease/mod.rs:409-420. The
+#   new leader's pod carries pod-deletion-cost=1 annotation so k8s
+#   RollingUpdate kills the standby first → no leadership churn.
+#
 # Fixture: k3s-full (scheduler.replicas=2, podAntiAffinity spreads across
 # k3s-server + k3s-agent). Caller wiring: see nix/tests/default.nix.
 {
@@ -189,9 +197,6 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # graceful-release — SIGTERM (no --force) → step_down → fast acquire
     # ══════════════════════════════════════════════════════════════════
-    # r[verify sched.lease.graceful-release]
-    # r[verify sched.lease.deletion-cost]
-    #
     # failover below uses --grace-period=0 --force: SIGTERM + ~immediate
     # SIGKILL. step_down() RACES the SIGKILL (it wins post-a5b06ef, but
     # the profraw doesn't flush — POD_NAME fix solved the overwrite, not

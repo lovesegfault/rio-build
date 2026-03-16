@@ -65,6 +65,13 @@
 #   termination. The autoscaler's 30s poll fires DURING that window;
 #   scaling.rs:222 deletion_timestamp.is_some() skip-gate MUST fire
 #   or the autoscaler would race the finalizer's scale-to-0.
+#
+# r[verify worker.cancel.cgroup-kill]
+#   cancel-cgroup-kill deletes a Build CR mid-exec and asserts the
+#   "build cancelled via cgroup.kill" log line. cgroup.rs:180 kill()
+#   writes "1" to cgroup.kill → kernel SIGKILLs the tree. No other
+#   test cancels a RUNNING build (build-crd-flow lets it complete;
+#   recovery/reconnect kill the scheduler, build keeps running).
 {
   pkgs,
   common,
@@ -359,7 +366,6 @@ pkgs.testers.runNixOSTest {
         print(f"health-shared: leader={leader}, standby={standby}")
 
         # ── STANDBY: NOT_SERVING on named service ─────────────────────
-        # r[verify ctrl.probe.named-service]
         # grpc-health-probe exits 1 for NOT_SERVING (phase3b.nix:348).
         # .fail() expects non-zero exit AND returns stdout+stderr.
         # Probe the NAMED service (rio.scheduler.SchedulerService), NOT
@@ -541,7 +547,6 @@ pkgs.testers.runNixOSTest {
             raise
 
         # ── status.buildId: real UUID, not sentinel ───────────────────
-        # r[verify ctrl.build.sentinel]
         # If the sentinel patch ran AFTER the watch task's first patch
         # (patch-ordering race), build_id would be stuck at "submitted".
         # The reconciler's idempotence gate at build.rs:111-140 keys on
@@ -753,7 +758,6 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # cancel-cgroup-kill — delete Build CR mid-exec → cgroup.kill="1"
     # ══════════════════════════════════════════════════════════════════
-    # r[verify worker.cancel.cgroup-kill]
     # cgroup.rs:180 kill() writes "1" to cgroup.kill → kernel SIGKILLs
     # every PID in the tree. NO prior test cancels a RUNNING build —
     # build-crd-flow lets it complete, build-crd-reconnect/recovery kill
@@ -1576,7 +1580,6 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # finalizer — delete WorkerPool → pod gone → CR gone → workers=0
     # ══════════════════════════════════════════════════════════════════
-    # r[verify ctrl.autoscale.skip-deleting]
     #   The autoscaler's 30s poll fires DURING this subtest (~300s wall
     #   time). scaling.rs:222 `if pool.metadata.deletion_timestamp.is_some()
     #   { skip }` MUST fire — otherwise the autoscaler would try to scale

@@ -166,7 +166,6 @@ pkgs.testers.runNixOSTest {
             assert_metric_ge(w, 9093,
                 "rio_worker_builds_total", 1.0, labels='{outcome="success"}')
 
-        # r[verify worker.fuse.lookup-caches]
         # FUSE fetch: each SMALL worker pulled ≥1 path from rio-store
         # (busybox must be fetched before any build runs). lookup()
         # materializes the tree on miss (ops.rs:105 ensure_cached)
@@ -351,11 +350,9 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # chunks — 300KiB output forces chunked PutPath, not inline
     # ══════════════════════════════════════════════════════════════════
-    # r[verify store.inline.threshold]
     #   300 KiB > INLINE_THRESHOLD (256 KiB) → nar_data.len() >= cas::
     #   INLINE_THRESHOLD at put_path.rs:494 is true → chunked path.
     #   chunk_after > chunk_baseline proves the threshold gate fired.
-    # r[verify obs.metric.transfer-volume]
     #   The chunked PutPath increments rio_store_put_path_bytes_total
     #   (put_path.rs:574). bytes_after - bytes_before ≥ 300*1024 proves
     #   the volume counter runs on the chunked path (tiny text-file
