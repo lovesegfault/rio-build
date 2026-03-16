@@ -766,9 +766,9 @@ pkgs.testers.runNixOSTest {
         cm = ctrl_metrics()
         reconnects = metric_value(cm, "rio_controller_build_watch_reconnects_total") or 0.0
         assert reconnects > reconnects0, (
-            f"expected build_watch_reconnects_total to increment "
+            "expected build_watch_reconnects_total to increment "
             f"(was {reconnects0}, now {reconnects}) — drain_stream "
-            f"should have entered the reconnect loop on non-terminal EOF"
+            "should have entered the reconnect loop on non-terminal EOF"
         )
 
         # Cleanup. --wait=false + poll: same finalizer pattern as
@@ -962,7 +962,7 @@ pkgs.testers.runNixOSTest {
         scale_down = metric_value(cm, "rio_controller_scaling_decisions_total",
                                   labels='{direction="down"}')
         assert scale_down is not None and scale_down >= 1.0, (
-            f"expected scaling_decisions_total{{direction=\"down\"}} >= 1, "
+            'expected scaling_decisions_total{direction="down"} >= 1, '
             f"got {scale_down!r}\n"
             f"  all scaling series: {cm.get('rio_controller_scaling_decisions_total', {})!r}"
         )
@@ -975,7 +975,7 @@ pkgs.testers.runNixOSTest {
             "-o name"
         ).strip()
         assert events_down, (
-            f"expected ScaledDown K8s Event on WorkerPool/default, got none"
+            "expected ScaledDown K8s Event on WorkerPool/default, got none"
         )
         print(f"autoscaler PASS: STS scaled 1→2→1, up={scale_up} down={scale_down}")
 

@@ -57,7 +57,7 @@ pkgs.testers.runNixOSTest {
     leader = leader_pod()
     k3s_server.succeed(
         f"k3s kubectl -n ${ns} port-forward {leader} 19001:9001 "
-        f">/tmp/pf-cli.log 2>&1 & echo $! > /tmp/pf-cli.pid"
+        ">/tmp/pf-cli.log 2>&1 & echo $! > /tmp/pf-cli.pid"
     )
     # Port-forward needs a moment to bind. nc-probe (not sleep):
     # fails fast if the pf died (scheduler crashed, port in use).
