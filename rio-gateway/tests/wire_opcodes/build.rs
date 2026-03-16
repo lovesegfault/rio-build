@@ -81,21 +81,31 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
 /// wopBuildPaths when the scheduler stream closes without a terminal event
 /// (BuildCompleted/BuildFailed/BuildCancelled). Regression guard:
 /// process_build_events must NOT send STDERR_ERROR itself — it returns Err
-/// and lets the CALLER send STDERR_ERROR (opcode 9) or STDERR_LAST + failure
-/// (opcode 46). If process_build_events sent STDERR_ERROR inside the loop,
-/// we'd get a double-STDERR_ERROR or STDERR_ERROR-then-STDERR_LAST invalid
-/// frame sequence depending on the opcode.
+/// and lets the CALLER decide (STDERR_ERROR for opcode 9, STDERR_LAST +
+/// failure for opcode 46). Sending STDERR_ERROR inside would produce a
+/// double-error / ERROR-then-LAST invalid frame sequence.
 ///
-/// For opcode 9, the correct behavior is: EXACTLY ONE STDERR_ERROR, then the
-/// session closes. We verify this by using drain_stderr_expecting_error which
-/// reads until it gets STDERR_ERROR; if process_build_events had already sent
-/// one AND the handler sent another, the test harness's handler_task would
-/// fail or the stream would desync.
+/// EofWithoutTerminal is reconnect-worthy (k8s pod kill = TCP FIN = EOF,
+/// not Transport). This test: SubmitBuild EOF → retry loop (STDERR_NEXT
+/// "reconnecting...", NOT STDERR_ERROR) → WatchBuild delivers Completed →
+/// STDERR_LAST + success. One 1s backoff; real time (paused time fires
+/// the store GetPath 300s timeout while TCP I/O is pending).
+///
+/// Regression guard: if process_build_events had sent STDERR_ERROR on
+/// EOF before my fix, we'd see ERROR before the reconnecting-NEXT, and
+/// drain_stderr_until_last would desync.
 #[tokio::test]
-async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyhow::Result<()> {
+async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_outcome(MockSchedulerOutcome {
+        // SubmitBuild: close stream after Started → EofWithoutTerminal.
         close_stream_early: true,
+        // WatchBuild: deliver Completed on the retry.
+        watch_scripted_events: Some(vec![ev(build_event::Event::Completed(
+            types::BuildCompleted {
+                output_paths: vec!["/nix/store/zzz-out".into()],
+            },
+        ))]),
         ..Default::default()
     });
 
@@ -109,16 +119,28 @@ async fn test_build_paths_stream_closed_without_terminal_single_error() -> anyho
         u64: 0,
     );
 
-    // For opcode 9: caller (handle_build_paths) sends STDERR_ERROR on failure.
-    // process_build_events must NOT also have sent one (that's what this regression guards).
-    // drain_stderr_expecting_error reads one STDERR_ERROR and stops; if there
-    // were two, the leftover bytes would desync the stream and h.finish()
-    // would fail.
-    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    // Drain until STDERR_LAST. We should see a "reconnecting..." NEXT
+    // (proves the retry loop entered on EOF) and NO STDERR_ERROR
+    // (proves process_build_events didn't send one).
+    let frames = collect_stderr_frames(&mut h.stream).await;
+    let saw_reconnect = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting")));
     assert!(
-        err.message.contains("stream ended") || err.message.contains("disconnect"),
-        "error should mention stream ended / scheduler disconnect: {}",
-        err.message
+        saw_reconnect,
+        "should see 'reconnecting...' STDERR_NEXT (EOF \u{2192} retry loop). frames: {frames:?}"
+    );
+    let saw_error = frames.iter().any(|m| matches!(m, StderrMessage::Error(_)));
+    assert!(
+        !saw_error,
+        "process_build_events should NOT send STDERR_ERROR on EOF (regression guard). frames: {frames:?}"
+    );
+
+    // Opcode 9 success: u64(1) after STDERR_LAST.
+    let success = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        success, 1,
+        "wopBuildPaths should return success after reconnect"
     );
 
     h.finish().await;

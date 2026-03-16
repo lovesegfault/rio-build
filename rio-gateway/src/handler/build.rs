@@ -13,10 +13,10 @@ enum StreamProcessError {
     /// a good chance of resuming.
     Transport(tonic::Status),
     /// Stream returned `Ok(None)` (EOF) without a Completed/
-    /// Failed/Cancelled event. Scheduler closed the stream
-    /// gracefully but the build didn't finish from our view.
-    /// Reconnecting is unlikely to help (if it were a failover,
-    /// we'd see a transport error, not a clean close).
+    /// Failed/Cancelled event. This IS the primary failover
+    /// signature: k8s pod kill → SIGTERM → graceful shutdown →
+    /// TCP FIN → clean stream close. NOT a Transport error.
+    /// Reconnect-worthy for the same reason as Transport.
     EofWithoutTerminal,
     /// Error writing STDERR to the client (WireError). The Nix
     /// client disconnected or the SSH channel closed. NOT
@@ -163,12 +163,10 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
     // send via STDERR_LAST + BuildResult. Sending STDERR_ERROR here first
     // would produce an invalid STDERR_ERROR -> STDERR_LAST frame sequence.
     //
-    // EofWithoutTerminal (not Transport): this is a clean stream close
-    // (Ok(None)), not a connection drop. Reconnecting via WatchBuild
-    // is unlikely to help — if it were a scheduler crash/failover,
-    // we'd see a transport error. Clean close + incomplete build
-    // suggests the scheduler intentionally dropped us (bug or
-    // resource exhaustion). Don't retry; surface the failure.
+    // EofWithoutTerminal: clean stream close (Ok(None)). This IS
+    // what a scheduler failover looks like — k8s pod kill → SIGTERM
+    // → graceful shutdown → TCP FIN. The caller's reconnect loop
+    // retries this the same as Transport.
     Err(StreamProcessError::EofWithoutTerminal)
 }
 
@@ -291,14 +289,22 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         .await
         {
             Ok(outcome) => break Ok(outcome),
-            // EOF or wire error: NOT reconnect-worthy. EOF =
-            // scheduler closed gracefully but incompletely (not a
-            // crash — crash would be Transport). Wire = client
-            // gone (SSH closed). Surface immediately.
-            Err(e @ (StreamProcessError::EofWithoutTerminal | StreamProcessError::Wire(_))) => {
+            // Wire error: NOT reconnect-worthy. Client disconnected
+            // (SSH closed) — scheduler is fine, there's no one to
+            // send the result to. Surface immediately.
+            Err(e @ StreamProcessError::Wire(_)) => {
                 break Err(e);
             }
-            Err(e @ StreamProcessError::Transport(_)) => {
+            // Transport OR EofWithoutTerminal: both are failover
+            // signatures. Transport = RST / tonic connection error.
+            // EofWithoutTerminal = scheduler cleanly closed the
+            // stream mid-build — THIS is what k8s pod kill looks
+            // like (SIGTERM → graceful shutdown → TCP FIN →
+            // Ok(None), not Err). vm-leader-election-k3s proved the
+            // prior "crash = Transport" assumption wrong.
+            Err(
+                e @ (StreamProcessError::Transport(_) | StreamProcessError::EofWithoutTerminal),
+            ) => {
                 reconnect_attempts += 1;
                 if reconnect_attempts > MAX_RECONNECT {
                     // Max retries exhausted. Give up — surface
