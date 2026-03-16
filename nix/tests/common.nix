@@ -474,14 +474,29 @@ rec {
                 # k3s pods (phase3a worker-only, k3s-full all components):
                 # delete by label → graceful SIGTERM → profraw flush via
                 # atexit. Label selector avoids touching bitnami PG /
-                # kube-system. --wait blocks until pods gone. Only the
-                # k3s SERVER runs this (agent lacks kubeconfig); deletes
-                # affect pods on BOTH nodes.
+                # kube-system. Only the k3s SERVER runs this (agent
+                # lacks kubeconfig); deletes affect pods on BOTH nodes.
+                #
+                # CRITICAL: `kubectl delete deploy,sts --wait=true`
+                # waits only for the DEPLOYMENT object to be gone.
+                # Pods are still terminating when it returns. The
+                # `kubectl wait --for=delete pods` below blocks until
+                # pods are actually gone — which means the container
+                # process has exited and profraws have flushed to the
+                # hostPath. Without this, tar races with pod
+                # termination → profraws incomplete → k3s per-test
+                # coverage swings 5× between runs (observed 5.5% vs
+                # 26.2% for leader-election on otherwise-identical
+                # test runs).
                 n.execute(
-                    "[ -f /etc/rancher/k3s/k3s.yaml ] && "
-                    "k3s kubectl delete deploy,sts -A "
-                    "-l 'app.kubernetes.io/part-of=rio-build' "
-                    "--wait=true --timeout=60s 2>/dev/null || true"
+                    "[ -f /etc/rancher/k3s/k3s.yaml ] && {"
+                    "  k3s kubectl delete deploy,sts -A "
+                    "    -l 'app.kubernetes.io/part-of=rio-build' "
+                    "    --wait=true --timeout=60s 2>/dev/null;"
+                    "  k3s kubectl wait --for=delete pods -A "
+                    "    -l 'app.kubernetes.io/part-of=rio-build' "
+                    "    --timeout=60s 2>/dev/null;"
+                    "} || true"
                 )
                 # Empty tarball if dir doesn't exist (e.g., client node
                 # runs no rio services).
