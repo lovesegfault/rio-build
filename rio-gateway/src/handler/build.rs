@@ -269,9 +269,16 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // Without reconnect: scheduler restart mid-build → client's
     // `nix build` fails with MiscFailure even though the build
     // itself completes fine on a worker. With reconnect: client
-    // doesn't notice the scheduler blip (~15s failover).
+    // doesn't notice the scheduler blip.
+    //
+    // 10 attempts = 1+2+4+8+16 + 5×16 = 111s total (backoff capped
+    // at 16s via `.min(4)` shift below). 5 attempts (=31s) was too
+    // tight: a force-killed leader's REPLACEMENT pod needs ~20-30s
+    // (start + mTLS cert mount + lease acquire on 5s tick). Found
+    // by vm-leader-election-k3s under the replacement-wins-race
+    // path — standby-wins was fast enough to mask it.
     // r[impl gw.reconnect.backoff]
-    const MAX_RECONNECT: u32 = 5;
+    const MAX_RECONNECT: u32 = 10;
     let mut reconnect_attempts = 0u32;
 
     let outcome = loop {
