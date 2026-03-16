@@ -80,15 +80,29 @@ Coverage profraw collection. Self-guarded on .Values.coverage.enabled
 template alongside rustLogEnv/tlsVolumeMount.
 
 LLVM writes profraws via an atexit handler. Graceful shutdown
-(SIGTERM → main returns) flushes them. %p = PID (multiple pods per
-node don't collide), %m = binary signature (safe merge). hostPath
-lands the files on the NODE filesystem so collectCoverage can tar
-them after pod deletion.
+(SIGTERM → main returns) flushes them. hostPath lands the files
+on the NODE filesystem so collectCoverage can tar them after pod
+deletion.
+
+POD_NAME in the filename: all pods on a node share the hostPath.
+In containers, the main process is PID 1 — %p alone does NOT
+disambiguate two pods of the same binary on the same node. When
+a Deployment replaces a killed pod (leader-election failover,
+controller restart, gateway rollout), the replacement lands on
+the SAME node and its PID-1 profraw OVERWRITES the predecessor's.
+Kubelet's dependent-env-var expansion substitutes $(POD_NAME)
+with metadata.name at container start, before LLVM sees the
+string. %p still covers in-container restarts (CrashLoop within
+the same pod), %m covers same-PID-different-binary.
 */}}
 {{- define "rio.covEnv" -}}
 {{- if .Values.coverage.enabled }}
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
 - name: LLVM_PROFILE_FILE
-  value: /var/lib/rio/cov/rio-%p-%m.profraw
+  value: /var/lib/rio/cov/rio-$(POD_NAME)-%p-%m.profraw
 {{- end }}
 {{- end -}}
 

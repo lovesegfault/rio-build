@@ -114,6 +114,43 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
+    # lease-acquired-metric — acquire-transition sanity + profraw check
+    # ══════════════════════════════════════════════════════════════════
+    # lease/mod.rs:300-305 comment says vm-phase3a polled this metric.
+    # That check was lost in the fixture migration. Restoring it here
+    # guards two things at once:
+    #   1. The acquire transition (lease/mod.rs:282-353) actually fires.
+    #      waitReady proved a holder exists, but that only proves the
+    #      election.try_acquire_or_renew() succeeded — not that the
+    #      edge-detection (`if now_leading && !was_leading`) ever went
+    #      TRUE. A was_leading-init bug could let the lease work while
+    #      deletion-cost/LeaderAcquired never fire.
+    #   2. Profraw collection. Pre-POD_NAME fix, replacement pods on
+    #      the same node overwrote the predecessor's profraw (both PID 1,
+    #      same %m, shared hostPath). lcov showed DA:282=91 but DA:293=0
+    #      — the condition ran 91× but the body never. This metric
+    #      proves the body DID run; if lcov still shows 0 after the
+    #      _helpers.tpl POD_NAME fix, the instrumentation is broken.
+    with subtest("lease-acquired-metric: acquire transition fires"):
+        total_acq = 0.0
+        for pod in scheduler_pods():
+            raw = k3s_server.succeed(
+                f"k3s kubectl get --raw "
+                f"'/api/v1/namespaces/${ns}/pods/{pod}:9091/proxy/metrics'"
+            )
+            m = parse_prometheus(raw)
+            acq = metric_value(m, "rio_scheduler_lease_acquired_total") or 0.0
+            print(f"{pod}: lease_acquired_total = {acq}")
+            total_acq += acq
+        # Exactly one scheduler should have acquired (the leader, once).
+        # ≥1 not ==1: a slow apiserver during waitReady could cause a
+        # brief steal-back before we check. ==0 is unambiguously broken.
+        assert total_acq >= 1.0, (
+            f"total lease_acquired across all schedulers = {total_acq}. "
+            f"Acquire transition body (lease/mod.rs:293-353) never fired."
+        )
+
+    # ══════════════════════════════════════════════════════════════════
     # stable-leadership — THE cdb70c2 assertion
     # ══════════════════════════════════════════════════════════════════
     # Pre-fix: flip-flop every ~35s → over 60s, leaseTransitions climbs
