@@ -187,6 +187,86 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
+    # graceful-release — SIGTERM (no --force) → step_down → fast acquire
+    # ══════════════════════════════════════════════════════════════════
+    # r[verify sched.lease.graceful-release]
+    # r[verify sched.lease.deletion-cost]
+    #
+    # failover below uses --grace-period=0 --force: SIGTERM + ~immediate
+    # SIGKILL. step_down() RACES the SIGKILL (it wins post-a5b06ef, but
+    # the profraw doesn't flush — POD_NAME fix solved the overwrite, not
+    # the SIGKILL-before-atexit). This subtest is the PRODUCTION rollout
+    # path: --grace-period=30, no --force → pure SIGTERM → full 30s
+    # drain window → step_down() completes, main() returns, atexit
+    # flushes profraw. lease/mod.rs:409-420 graceful-release body.
+    #
+    # deletion-cost: on acquire, spawn_patch_deletion_cost writes
+    # controller.kubernetes.io/pod-deletion-cost=1 to the pod. K8s
+    # ReplicaSet sorts by this during scale-down/RollingUpdate →
+    # kills standby first → no leadership churn on rollout. The new
+    # leader's pod should have it.
+    with subtest("graceful-release: SIGTERM leader → step_down → standby acquires <10s"):
+        import time as _time
+        leader = leader_pod()
+        tx_before = lease_transitions()
+
+        # Graceful delete. No --force. --wait=false returns after
+        # sending the DELETE (doesn't block for pod Terminating→gone)
+        # so we can time the lease handover. NOT a background thread:
+        # NixOS test driver Machine.succeed isn't thread-safe —
+        # concurrent shell commands interleave output streams,
+        # breaking the driver's return-code parse (int on empty).
+        k3s_server.succeed(
+            f"k3s kubectl -n ${ns} delete pod {leader} "
+            f"--grace-period=30 --wait=false"
+        )
+
+        # step_down clears holderIdentity → standby sees empty →
+        # Steal on next 5s tick. TTL=15s is the FALLBACK if step_down
+        # failed. <10s proves step_down fired (5s poll + slack);
+        # 10-15s would be ambiguous; >15s = step_down broken.
+        t0 = _time.time()
+        k3s_server.wait_until_succeeds(
+            f"h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            f"-o jsonpath='{{.spec.holderIdentity}}') && "
+            f'test -n "$h" && test "$h" != "{leader}"',
+            timeout=10,
+        )
+        elapsed = _time.time() - t0
+        assert elapsed < 10, (
+            f"standby took {elapsed:.1f}s to acquire (TTL=15s). "
+            f"step_down didn't fire — graceful-release broken?"
+        )
+
+        # deletion-cost on the NEW leader. Fire-and-forget spawn
+        # (lease/mod.rs:320) — may take a tick to land. 5s slack.
+        new_leader = leader_pod()
+        k3s_server.wait_until_succeeds(
+            f"test \"$(k3s kubectl -n ${ns} get pod {new_leader} "
+            f"-o jsonpath='{{.metadata.annotations.controller\\.kubernetes\\.io/pod-deletion-cost}}')\" = 1",
+            timeout=10,
+        )
+
+        # leaseTransitions bumped exactly once (one clean handover).
+        tx_after = lease_transitions()
+        assert tx_after == tx_before + 1, (
+            f"expected leaseTransitions +1 (one clean step_down→steal), "
+            f"got {tx_before}→{tx_after}"
+        )
+
+        # Wait for Deployment replacement to settle — failover below
+        # expects 2 running pods. --wait=false above returned
+        # immediately; the old pod is still draining for up to 30s.
+        k3s_server.wait_until_succeeds(
+            "test $(k3s kubectl -n ${ns} get pods "
+            "-l app.kubernetes.io/name=rio-scheduler "
+            "--field-selector=status.phase=Running --no-headers | wc -l) = 2",
+            timeout=60,
+        )
+        print(f"graceful-release PASS: {leader}→{new_leader} in {elapsed:.1f}s, "
+              f"deletion-cost=1 on new leader")
+
+    # ══════════════════════════════════════════════════════════════════
     # failover — kill leader, standby acquires
     # ══════════════════════════════════════════════════════════════════
     # --grace-period=0 --force still sends SIGTERM before SIGKILL
