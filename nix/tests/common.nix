@@ -468,11 +468,27 @@ rec {
     else
       ''
         with subtest("collect coverage profraws"):
-            for n in [${pyNodeVars}]:
-                # Workers first — closes BuildExecution streams so
-                # scheduler's serve_with_shutdown isn't waiting on
-                # open bidi handlers.
+            _cov_nodes = [${pyNodeVars}]
+            # Pass 1: stop workers on ALL nodes FIRST. The worker's
+            # SIGTERM path (main.rs:439 select! arm) only fires if the
+            # worker is in the inner build-stream loop when SIGTERM
+            # arrives — which requires the scheduler to still be alive.
+            # If scheduler dies first (old single-pass ordering:
+            # control iteration stops scheduler before worker
+            # iterations run), workers see stream-close → enter the
+            # reconnect retry loop (main.rs:413-425) which does NOT
+            # poll sigterm → hang → systemd SIGKILL → no profraw.
+            # Cascading: scheduler's serve_with_shutdown was ALSO
+            # hung on the open worker streams → also SIGKILLed →
+            # rio-scheduler per-test coverage = 0. Observed in v4:
+            # scheduling-standalone worker total=154 (init-only, all
+            # from early-exit restarts) vs lifecycle-k3s=1462.
+            for n in _cov_nodes:
                 n.execute("systemctl stop rio-worker 2>/dev/null || true")
+            # Pass 2: control services + k3s + tar. Workers' bidi
+            # streams are now closed — scheduler's serve_with_shutdown
+            # unblocks immediately.
+            for n in _cov_nodes:
                 n.execute(
                     "systemctl stop rio-gateway rio-scheduler rio-store "
                     "rio-controller 2>/dev/null || true"
@@ -482,6 +498,8 @@ rec {
                 # atexit. Label selector avoids touching bitnami PG /
                 # kube-system. Only the k3s SERVER runs this (agent
                 # lacks kubeconfig); deletes affect pods on BOTH nodes.
+                # Unlike standalone, kubectl deletes ALL rio pods at
+                # once → concurrent SIGTERM → no ordering issue.
                 #
                 # CRITICAL: `kubectl delete deploy,sts --wait=true`
                 # waits only for the DEPLOYMENT object to be gone.
