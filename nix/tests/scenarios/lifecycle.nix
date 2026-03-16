@@ -926,11 +926,26 @@ pkgs.testers.runNixOSTest {
         # Pod gone. Proves: STS scaled to 0, SIGTERM drain exited
         # cleanly (no in-flight builds), finalizer removed (K8s could
         # GC the owned StatefulSet). Pod-1 from autoscaler is also gone
-        # (same STS).
-        k3s_server.wait_until_succeeds(
-            "! k3s kubectl -n ${ns} get pod default-workers-0 2>/dev/null",
-            timeout=120,
-        )
+        # (same STS). 180s: controller's cleanup() connect_admin has
+        # a 10s timeout — if the scheduler addr is stale (post-recovery
+        # pod IP changed), connect times out, cleanup proceeds
+        # best-effort to scale-0. Pod SIGTERM drain (no builds) <30s.
+        try:
+            k3s_server.wait_until_succeeds(
+                "! k3s kubectl -n ${ns} get pod default-workers-0 2>/dev/null",
+                timeout=180,
+            )
+        except Exception:
+            # Diagnostic: what's the controller/WorkerPool/STS state?
+            k3s_server.execute(
+                "echo '=== controller logs (last 50) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=50 >&2 2>&1; "
+                "echo '=== workerpool yaml ===' >&2; "
+                "k3s kubectl -n ${ns} get workerpool default -o yaml >&2 2>&1; "
+                "echo '=== sts + pods ===' >&2; "
+                "k3s kubectl -n ${ns} get sts,pods -o wide >&2 2>&1"
+            )
+            raise
 
         # WorkerPool CR gone (finalizer removed → K8s deleted it).
         k3s_server.wait_until_succeeds(

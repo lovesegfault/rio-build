@@ -71,6 +71,16 @@ pub(crate) fn client_tls() -> Option<ClientTlsConfig> {
 /// set → `https://` + `.tls_config()`; unset → `http://` (plaintext).
 /// The global is initialized by [`init_client_tls`] in each binary's
 /// main; if main doesn't call it (or calls it with `None`), plaintext.
+///
+/// 10s connect timeout: tonic's default is UNBOUNDED. A stale address
+/// (e.g., scheduler pod killed → replacement has new IP, but DNS TTL /
+/// caller's cached addr hasn't updated) hangs forever on TCP SYN.
+/// vm-lifecycle-k3s finalizer subtest: controller's cleanup() never
+/// logged "starting drain" — stuck in connect_admin after recovery
+/// killed the scheduler leader. 10s is enough for a real connect
+/// (even cross-AZ) and bounds the failure mode.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
     // `get().and_then(|o| o.as_ref())` collapses both "OnceLock not
     // initialized" and "initialized with None" to plaintext. Tests
@@ -79,6 +89,7 @@ async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
         Some(tls) => {
             let endpoint = format!("https://{addr}");
             Channel::from_shared(endpoint)?
+                .connect_timeout(CONNECT_TIMEOUT)
                 .tls_config(tls.clone())?
                 .connect()
                 .await
@@ -87,6 +98,7 @@ async fn connect_channel(addr: &str) -> anyhow::Result<Channel> {
         None => {
             let endpoint = format!("http://{addr}");
             Channel::from_shared(endpoint)?
+                .connect_timeout(CONNECT_TIMEOUT)
                 .connect()
                 .await
                 .map_err(Into::into)
