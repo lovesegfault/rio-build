@@ -33,6 +33,9 @@ spec:
   resources:
     {{- toYaml $wp.resources | nindent 4 }}
   privileged: {{ $wp.privileged }}
+  {{- with $wp.terminationGracePeriodSeconds }}
+  terminationGracePeriodSeconds: {{ . }}
+  {{- end }}
   {{- with $wp.tolerations }}
   tolerations:
     {{- toYaml . | nindent 4 }}

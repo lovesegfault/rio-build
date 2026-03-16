@@ -135,6 +135,20 @@ pub struct WorkerPoolSpec {
     #[schemars(schema_with = "crate::crds::any_object_array")]
     pub tolerations: Option<Vec<Toleration>>,
 
+    /// Pod terminationGracePeriodSeconds. SIGTERM → worker drain
+    /// (DrainWorker + wait for in-flight builds to complete). After
+    /// this many seconds: SIGKILL, builds lost. Also bounds the
+    /// finalizer's cleanup() wait (grace + 60s slop for kubelet/STS
+    /// status observation).
+    ///
+    /// Default 7200 (2h) — nix builds can legitimately take that
+    /// long (LLVM from cold ccache, full NixOS closure). Clusters
+    /// with known-shorter builds (e.g., VM test fixtures with ≤90s
+    /// sleeps) should set this lower so WorkerPool deletion doesn't
+    /// stall on a stuck/never-Ready pod for 2h.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_grace_period_seconds: Option<i64>,
+
     /// Run the worker container privileged. None/false = the
     /// default granular caps (SYS_ADMIN + SYS_CHROOT), which is
     /// sufficient on most clusters. true = full privileged,

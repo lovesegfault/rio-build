@@ -29,6 +29,7 @@ fn test_wp() -> WorkerPool {
         image_pull_policy: None,
         node_selector: None,
         tolerations: None,
+        termination_grace_period_seconds: None,
         privileged: None,
         host_network: None,
         tls_secret_name: None,

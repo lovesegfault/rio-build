@@ -1,3 +1,4 @@
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -9,329 +10,359 @@ spec:
     kind: WorkerPool
     plural: workerpools
     shortNames:
-    - wp
+      - wp
     singular: workerpool
   scope: Namespaced
   versions:
-  - additionalPrinterColumns:
-    - jsonPath: .status.readyReplicas
-      name: Ready
-      type: integer
-    - jsonPath: .status.desiredReplicas
-      name: Desired
-      type: integer
-    - jsonPath: .spec.sizeClass
-      name: Class
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        description: Auto-generated derived type for WorkerPoolSpec via `CustomResource`
-        properties:
-          spec:
-            description: "Spec for a worker pool. The derive generates a `WorkerPool`\n\
-              struct with `.metadata`, `.spec` (this), `.status`.\n\n`namespaced`\
-              \ because WorkerPools are per-namespace (multiple\ntenants can have\
-              \ their own pools). Cluster-scoped would mean\none global set \u2014\
-              \ too rigid.\n\nPrinter columns: what `kubectl get workerpools` shows.\
-              \ Ready/\nDesired at a glance is the main thing operators want.\n\n\
-              `KubeSchema` alongside `CustomResource`: KubeSchema processes\n`#[x_kube(validation)]`\
-              \ attrs into x-kubernetes-validations.\nCustomResource alone ignores\
-              \ them \u2014 the schema would have no\nCEL rules and the apiserver\
-              \ would accept invalid specs. The\ntwo derives cooperate: CustomResource\
-              \ generates the full CRD\nwrapper, KubeSchema handles the schema internals\
-              \ (including\nthe JsonSchema impl, so don't derive that separately)."
-            properties:
-              autoscaling:
-                description: 'Autoscaling policy. `target_value` is queued-derivations-per-
+    - additionalPrinterColumns:
+        - jsonPath: '.status.readyReplicas'
+          name: Ready
+          type: integer
+        - jsonPath: '.status.desiredReplicas'
+          name: Desired
+          type: integer
+        - jsonPath: '.spec.sizeClass'
+          name: Class
+          type: string
+        - jsonPath: '.metadata.creationTimestamp'
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for WorkerPoolSpec via `CustomResource`
+          properties:
+            spec:
+              description: |-
+                Spec for a worker pool. The derive generates a `WorkerPool`
+                struct with `.metadata`, `.spec` (this), `.status`.
 
-                  worker: scale up when `queued / active_workers > target`.'
-                properties:
-                  metric:
-                    default: queueDepth
-                    description: "Metric driving scale decisions. Currently only \"\
-                      queueDepth\"\n(scheduler's ClusterStatus.queued_derivations).\
-                      \ String not\nenum so future metrics don't need a CRD version\
-                      \ bump \u2014\nunknown metric is a RECONCILE error (surfaces\
-                      \ in\n.status.conditions), not a schema rejection."
+                `namespaced` because WorkerPools are per-namespace (multiple
+                tenants can have their own pools). Cluster-scoped would mean
+                one global set — too rigid.
+
+                Printer columns: what `kubectl get workerpools` shows. Ready/
+                Desired at a glance is the main thing operators want.
+
+                `KubeSchema` alongside `CustomResource`: KubeSchema processes
+                `#[x_kube(validation)]` attrs into x-kubernetes-validations.
+                CustomResource alone ignores them — the schema would have no
+                CEL rules and the apiserver would accept invalid specs. The
+                two derives cooperate: CustomResource generates the full CRD
+                wrapper, KubeSchema handles the schema internals (including
+                the JsonSchema impl, so don't derive that separately).
+              properties:
+                autoscaling:
+                  description: |-
+                    Autoscaling policy. `target_value` is queued-derivations-per-
+                    worker: scale up when `queued / active_workers > target`.
+                  properties:
+                    metric:
+                      default: queueDepth
+                      description: |-
+                        Metric driving scale decisions. Currently only "queueDepth"
+                        (scheduler's ClusterStatus.queued_derivations). String not
+                        enum so future metrics don't need a CRD version bump —
+                        unknown metric is a RECONCILE error (surfaces in
+                        .status.conditions), not a schema rejection.
+                      type: string
+                    targetValue:
+                      default: 5
+                      description: |-
+                        Scale up when `queued_derivations / active_workers >
+                        target_value`. "5" means "scale up when there are more
+                        than 5 queued builds per worker." Lower = more aggressive
+                        scaling (more pods, lower queue latency, higher cost).
+                      format: int32
+                      type: integer
+                  type: object
+                features:
+                  default: []
+                  description: |-
+                    requiredSystemFeatures this pool advertises (e.g., "kvm",
+                    "big-parallel"). Worker's Nix config `system-features`.
+                  items:
                     type: string
-                  targetValue:
-                    default: 5
-                    description: 'Scale up when `queued_derivations / active_workers
-                      >
+                  type: array
+                fodProxyUrl:
+                  description: |-
+                    Forward proxy URL for fixed-output derivation (FOD) fetches.
+                    When set, the worker injects `http_proxy`/`https_proxy` env
+                    vars into the nix-daemon spawn IF the build is an FOD.
+                    Non-FOD builds never get proxy env (they don't need network).
 
-                      target_value`. "5" means "scale up when there are more
+                    Typical: `http://rio-fod-proxy:3128` (the Squid deployment
+                    from infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists
+                    known source hosts (nixos.org, github, crates.io etc) and
+                    denies everything else — defense against FODs fetching from
+                    arbitrary attacker-controlled URLs.
 
-                      than 5 queued builds per worker." Lower = more aggressive
-
-                      scaling (more pods, lower queue latency, higher cost).'
-                    format: int32
-                    type: integer
-                type: object
-              features:
-                default: []
-                description: 'requiredSystemFeatures this pool advertises (e.g., "kvm",
-
-                  "big-parallel"). Worker''s Nix config `system-features`.'
-                items:
+                    Unset = FODs have direct internet (if NetworkPolicy allows
+                    it, which it doesn't by default in prod overlay). Dev mode.
+                  nullable: true
                   type: string
-                type: array
-              fodProxyUrl:
-                description: "Forward proxy URL for fixed-output derivation (FOD)\
-                  \ fetches.\nWhen set, the worker injects `http_proxy`/`https_proxy`\
-                  \ env\nvars into the nix-daemon spawn IF the build is an FOD.\n\
-                  Non-FOD builds never get proxy env (they don't need network).\n\n\
-                  Typical: `http://rio-fod-proxy:3128` (the Squid deployment\nfrom\
-                  \ infra/helm/rio-build/templates/fod-proxy.yaml). It allowlists\n\
-                  known source hosts (nixos.org, github, crates.io etc) and\ndenies\
-                  \ everything else \u2014 defense against FODs fetching from\narbitrary\
-                  \ attacker-controlled URLs.\n\nUnset = FODs have direct internet\
-                  \ (if NetworkPolicy allows\nit, which it doesn't by default in prod\
-                  \ overlay). Dev mode."
-                nullable: true
-                type: string
-              fuseCacheSize:
-                default: 50Gi
-                description: 'FUSE cache size as a K8s Quantity string (e.g., "100Gi").
+                fuseCacheSize:
+                  default: '50Gi'
+                  description: |-
+                    FUSE cache size as a K8s Quantity string (e.g., "100Gi").
+                    Maps to an emptyDir sizeLimit + parsed to bytes for
+                    `RIO_FUSE_CACHE_SIZE_GB` env. String because Quantity is
+                    standard K8s (operators know "50Gi" syntax); the reconciler
+                    parses it.
 
-                  Maps to an emptyDir sizeLimit + parsed to bytes for
-
-                  `RIO_FUSE_CACHE_SIZE_GB` env. String because Quantity is
-
-                  standard K8s (operators know "50Gi" syntax); the reconciler
-
-                  parses it.
-
-
-                  Why not u64 bytes directly: operators write "100Gi" in
-
-                  kustomize; making them write 107374182400 is hostile.'
-                type: string
-              hostNetwork:
-                description: "Use the node's network namespace (`hostNetwork: true`).\n\
-                  None/false = pod has its own netns (the default, CNI-\nassigned\
-                  \ IP). true = pod shares the node's IP + DNS +\n/etc/hosts.\n\n\
-                  When to set true: VM tests where scheduler/store run on\na separate\
-                  \ VM reachable by node hostname but not cluster\nDNS; or bare-metal\
-                  \ where pod networking adds unwanted\nlatency (worker \u2192 store\
-                  \ is NAR-heavy).\n\nCaveat: hostNetwork pods can't use containerPort-based\n\
-                  Services. The worker doesn't serve anything inbound\n(metrics/health\
-                  \ are scraped from the node), so this\ndoesn't break it."
-                nullable: true
-                type: boolean
-              image:
-                description: "Container image ref. Required \u2014 there's no sensible\n\
-                  default (depends on how operators build/tag)."
-                type: string
-              imagePullPolicy:
-                description: "Container imagePullPolicy. None = K8s default (IfNotPresent\n\
-                  for tagged images, Always for `:latest`). Airgap/dev clusters\n\
-                  (k3s/kind with `ctr images import`) MUST set \"IfNotPresent\"\n\
-                  or \"Never\" \u2014 `:latest` otherwise tries docker.io and fails.\n\
-                  \nController-managed StatefulSets can't be kustomize-patched\n(the\
-                  \ CRD is patched, not the generated STS), so this has to\nbe a CRD\
-                  \ field."
-                nullable: true
-                type: string
-              maxConcurrentBuilds:
-                description: 'Maximum concurrent builds per worker pod. Maps to
-
-                  `RIO_MAX_BUILDS` env var. CEL: must be >= 1 (0 builds =
-
-                  pointless worker).'
-                format: int32
-                type: integer
-                x-kubernetes-validations:
-                - rule: self >= 1
-              nodeSelector:
-                additionalProperties:
+                    Why not u64 bytes directly: operators write "100Gi" in
+                    kustomize; making them write 107374182400 is hostile.
                   type: string
-                description: 'Node selector for the StatefulSet pod spec. Common:
+                hostNetwork:
+                  description: |-
+                    Use the node's network namespace (`hostNetwork: true`).
+                    None/false = pod has its own netns (the default, CNI-
+                    assigned IP). true = pod shares the node's IP + DNS +
+                    /etc/hosts.
 
-                  `rio.build/worker: "true"` to confine to tainted nodes.'
-                nullable: true
-                type: object
-              privileged:
-                description: 'Run the worker container privileged. None/false = the
+                    When to set true: VM tests where scheduler/store run on
+                    a separate VM reachable by node hostname but not cluster
+                    DNS; or bare-metal where pod networking adds unwanted
+                    latency (worker → store is NAR-heavy).
 
-                  default granular caps (SYS_ADMIN + SYS_CHROOT), which is
-
-                  sufficient on most clusters. true = full privileged,
-
-                  which disables seccomp and grants ALL caps.
-
-
-                  When to set true: k3s/kind often have containerd seccomp
-
-                  profiles that block mount(2) even with SYS_ADMIN.
-
-                  Production on EKS/GKE with proper runtime config should
-
-                  NOT need this.'
-                nullable: true
-                type: boolean
-              replicas:
-                description: 'Replica bounds. Autoscaler clamps to [min, max].
-
-
-                  CEL on the struct (not this field) because it''s a cross-field
-
-                  constraint. See `Replicas` below.'
-                properties:
-                  max:
-                    description: "Ceiling. Cost control \u2014 don't burn through\
-                      \ the cluster\nunder a pathological burst."
-                    format: int32
-                    type: integer
-                  min:
-                    description: 'Floor. Autoscaler never scales below this, even
-                      with empty
-
-                      queue. Keeps a warm pool for fast dispatch when builds
-
-                      arrive (cold start = minutes of pod scheduling + FUSE warm).'
-                    format: int32
-                    type: integer
-                required:
-                - max
-                - min
-                type: object
-                x-kubernetes-validations:
-                - rule: self.min <= self.max
-              resources:
-                description: "K8s resource requests/limits for the worker container.\n\
-                  `None` = unbounded (cluster default). Operators should set\nthis\
-                  \ \u2014 unbounded workers on a shared node is a noisy-\nneighbor\
-                  \ risk.\n\nschemars(schema_with): k8s-openapi types don't impl\n\
-                  JsonSchema. `any_object` emits `type: object` +\n`x-kubernetes-preserve-unknown-fields:\
-                  \ true` \u2014 the\napiserver validates against its OWN schema (it\
-                  \ knows\nResourceRequirements), we just tell it \"object, don't\n\
-                  strip unknowns.\" `serde_json::Value` emitted `{}` which\nthe apiserver\
-                  \ REJECTS (`type: Required value`)."
-                nullable: true
-                type: object
-                x-kubernetes-preserve-unknown-fields: true
-              sizeClass:
-                default: ''
-                description: "Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler\n\
-                  routes by this (classify() \u2192 matching-class workers).\nEmpty\
-                  \ = unclassified (scheduler with size_classes\nconfigured REJECTS\
-                  \ unclassified workers \u2014 visible\nmisconfig failure).\n\nConvention:\
-                  \ pool name = size class name. Not enforced\n(you might have `small-x86`\
-                  \ and `small-arm` pools both\nsize_class=\"small\")."
-                type: string
-              systems:
-                description: "Target systems (e.g., \"x86_64-linux\"). CEL: non-empty\
-                  \ \u2014\na worker that builds nothing is a config error."
-                items:
+                    Caveat: hostNetwork pods can't use containerPort-based
+                    Services. The worker doesn't serve anything inbound
+                    (metrics/health are scraped from the node), so this
+                    doesn't break it.
+                  nullable: true
+                  type: boolean
+                image:
+                  description: |-
+                    Container image ref. Required — there's no sensible
+                    default (depends on how operators build/tag).
                   type: string
-                type: array
-                x-kubernetes-validations:
-                - rule: size(self) > 0
-              tlsSecretName:
-                description: "mTLS client cert Secret name. When set, the controller\n\
-                  mounts this Secret at `/etc/rio/tls/` and sets the\n`RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH`\
-                  \ env vars.\n\nThe Secret must have keys `tls.crt`, `tls.key`, `ca.crt`\n\
-                  (cert-manager's standard output for a Certificate with a\nCA issuer).\
-                  \ In the prod overlay, this is `rio-worker-tls`\n(see cert-manager.yaml).\n\
-                  \nUnset = plaintext gRPC (dev mode). The worker's TlsConfig\ndefaults\
-                  \ to empty \u2192 load_client_tls returns None."
-                nullable: true
-                type: string
-              tolerations:
-                description: 'Tolerations for the StatefulSet pod spec. Pairs with
+                imagePullPolicy:
+                  description: |-
+                    Container imagePullPolicy. None = K8s default (IfNotPresent
+                    for tagged images, Always for `:latest`). Airgap/dev clusters
+                    (k3s/kind with `ctr images import`) MUST set "IfNotPresent"
+                    or "Never" — `:latest` otherwise tries docker.io and fails.
 
-                  node_selector: tolerate the `rio.build/worker:NoSchedule`
+                    Controller-managed StatefulSets can't be kustomize-patched
+                    (the CRD is patched, not the generated STS), so this has to
+                    be a CRD field.
+                  nullable: true
+                  type: string
+                maxConcurrentBuilds:
+                  description: |-
+                    Maximum concurrent builds per worker pod. Maps to
+                    `RIO_MAX_BUILDS` env var. CEL: must be >= 1 (0 builds =
+                    pointless worker).
+                  format: int32
+                  type: integer
+                  x-kubernetes-validations:
+                    - rule: self >= 1
+                nodeSelector:
+                  additionalProperties:
+                    type: string
+                  description: |-
+                    Node selector for the StatefulSet pod spec. Common:
+                    `rio.build/worker: "true"` to confine to tainted nodes.
+                  nullable: true
+                  type: object
+                privileged:
+                  description: |-
+                    Run the worker container privileged. None/false = the
+                    default granular caps (SYS_ADMIN + SYS_CHROOT), which is
+                    sufficient on most clusters. true = full privileged,
+                    which disables seccomp and grants ALL caps.
 
-                  taint so workers (and only workers) land on those nodes.'
-                items:
+                    When to set true: k3s/kind often have containerd seccomp
+                    profiles that block mount(2) even with SYS_ADMIN.
+                    Production on EKS/GKE with proper runtime config should
+                    NOT need this.
+                  nullable: true
+                  type: boolean
+                replicas:
+                  description: |-
+                    Replica bounds. Autoscaler clamps to [min, max].
+
+                    CEL on the struct (not this field) because it's a cross-field
+                    constraint. See `Replicas` below.
+                  properties:
+                    max:
+                      description: |-
+                        Ceiling. Cost control — don't burn through the cluster
+                        under a pathological burst.
+                      format: int32
+                      type: integer
+                    min:
+                      description: |-
+                        Floor. Autoscaler never scales below this, even with empty
+                        queue. Keeps a warm pool for fast dispatch when builds
+                        arrive (cold start = minutes of pod scheduling + FUSE warm).
+                      format: int32
+                      type: integer
+                  required:
+                    - max
+                    - min
+                  type: object
+                  x-kubernetes-validations:
+                    - rule: self.min <= self.max
+                resources:
+                  description: |-
+                    K8s resource requests/limits for the worker container.
+                    `None` = unbounded (cluster default). Operators should set
+                    this — unbounded workers on a shared node is a noisy-
+                    neighbor risk.
+
+                    schemars(schema_with): k8s-openapi types don't impl
+                    JsonSchema. `any_object` emits `type: object` +
+                    `x-kubernetes-preserve-unknown-fields: true` — the
+                    apiserver validates against its OWN schema (it knows
+                    ResourceRequirements), we just tell it "object, don't
+                    strip unknowns." `serde_json::Value` emitted `{}` which
+                    the apiserver REJECTS (`type: Required value`).
+                  nullable: true
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
-                nullable: true
-                type: array
-              topologySpread:
-                description: "Spread worker pods across nodes. `None`/`Some(true)`\
-                  \ (the\ndefault) sets `topologySpreadConstraints` with `maxSkew:\
-                  \ 1`\non `kubernetes.io/hostname` (soft \u2014 `whenUnsatisfiable:\n\
-                  ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =\nno spread\
-                  \ (all pods can land on one node; useful for\nsingle-node dev clusters\
-                  \ where spread would just be noise).\n\nSoft (not hard) because\
-                  \ a node drain evicting all but one\nwould temporarily make hard-spread\
-                  \ unsatisfiable \u2192 pods\nstuck Pending. Soft lets them schedule\
-                  \ then re-spread on\nthe next autoscaler action."
-                nullable: true
-                type: boolean
-            required:
-            - autoscaling
-            - image
-            - maxConcurrentBuilds
-            - replicas
-            - systems
-            type: object
-          status:
-            description: "WorkerPool status \u2014 reconciler writes, operators read.\n\
-              \n`Default` because kube-rs initializes it to `None` \u2192 `Some(default())`\n\
-              on first reconcile. All fields zero-value-is-meaningful (0 replicas\n\
-              is a valid observed state)."
-            nullable: true
-            properties:
-              conditions:
-                default: []
-                description: 'Standard K8s Conditions. Single `Scaling` type with
-                  reason
+                sizeClass:
+                  default: ''
+                  description: |-
+                    Size class name. Maps to `RIO_SIZE_CLASS` env. Scheduler
+                    routes by this (classify() → matching-class workers).
+                    Empty = unclassified (scheduler with size_classes
+                    configured REJECTS unclassified workers — visible
+                    misconfig failure).
 
-                  ScaledUp / ScaledDown / UnknownMetric (status=False for
+                    Convention: pool name = size class name. Not enforced
+                    (you might have `small-x86` and `small-arm` pools both
+                    size_class="small").
+                  type: string
+                systems:
+                  description: |-
+                    Target systems (e.g., "x86_64-linux"). CEL: non-empty —
+                    a worker that builds nothing is a config error.
+                  items:
+                    type: string
+                  type: array
+                  x-kubernetes-validations:
+                    - rule: size(self) > 0
+                terminationGracePeriodSeconds:
+                  description: |-
+                    Pod terminationGracePeriodSeconds. SIGTERM → worker drain
+                    (DrainWorker + wait for in-flight builds to complete). After
+                    this many seconds: SIGKILL, builds lost. Also bounds the
+                    finalizer's cleanup() wait (grace + 60s slop for kubelet/STS
+                    status observation).
 
-                  errors). Helps operators see WHY replicas is what it is
+                    Default 7200 (2h) — nix builds can legitimately take that
+                    long (LLVM from cold ccache, full NixOS closure). Clusters
+                    with known-shorter builds (e.g., VM test fixtures with ≤90s
+                    sleeps) should set this lower so WorkerPool deletion doesn't
+                    stall on a stuck/never-Ready pod for 2h.
+                  format: int64
+                  nullable: true
+                  type: integer
+                tlsSecretName:
+                  description: |-
+                    mTLS client cert Secret name. When set, the controller
+                    mounts this Secret at `/etc/rio/tls/` and sets the
+                    `RIO_TLS__CERT_PATH`/`KEY_PATH`/`CA_PATH` env vars.
 
-                  ("ScaledUp" with a message showing from/to; "UnknownMetric"
+                    The Secret must have keys `tls.crt`, `tls.key`, `ca.crt`
+                    (cert-manager's standard output for a Certificate with a
+                    CA issuer). In the prod overlay, this is `rio-worker-tls`
+                    (see cert-manager.yaml).
 
-                  when spec.autoscaling.metric is unsupported).'
-                items:
-                  type: object
-                  x-kubernetes-preserve-unknown-fields: true
-                nullable: true
-                type: array
-              desiredReplicas:
-                default: 0
-                description: 'What the autoscaler WANTS. Clamped to [min, max]. May
+                    Unset = plaintext gRPC (dev mode). The worker's TlsConfig
+                    defaults to empty → load_client_tls returns None.
+                  nullable: true
+                  type: string
+                tolerations:
+                  description: |-
+                    Tolerations for the StatefulSet pod spec. Pairs with
+                    node_selector: tolerate the `rio.build/worker:NoSchedule`
+                    taint so workers (and only workers) land on those nodes.
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  nullable: true
+                  type: array
+                topologySpread:
+                  description: |-
+                    Spread worker pods across nodes. `None`/`Some(true)` (the
+                    default) sets `topologySpreadConstraints` with `maxSkew: 1`
+                    on `kubernetes.io/hostname` (soft — `whenUnsatisfiable:
+                    ScheduleAnyway`) + soft `podAntiAffinity`. `Some(false)` =
+                    no spread (all pods can land on one node; useful for
+                    single-node dev clusters where spread would just be noise).
 
-                  differ from StatefulSet.spec.replicas during the
+                    Soft (not hard) because a node drain evicting all but one
+                    would temporarily make hard-spread unsatisfiable → pods
+                    stuck Pending. Soft lets them schedule then re-spread on
+                    the next autoscaler action.
+                  nullable: true
+                  type: boolean
+              required:
+                - autoscaling
+                - image
+                - maxConcurrentBuilds
+                - replicas
+                - systems
+              type: object
+            status:
+              description: |-
+                WorkerPool status — reconciler writes, operators read.
 
-                  stabilization window (we want 8 but haven''t patched yet).'
-                format: int32
-                type: integer
-              lastScaleTime:
-                description: 'Last time replicas was actually patched (for stabilization
-
-                  window computation). kube 3.0: Time = jiff::Timestamp
-
-                  wrapper, not chrono.'
-                nullable: true
-                type: string
-              readyReplicas:
-                default: 0
-                description: 'Observed StatefulSet.status.readyReplicas. Passed
-
-                  readinessProbe = heartbeat accepted.'
-                format: int32
-                type: integer
-              replicas:
-                default: 0
-                description: 'Observed StatefulSet.status.replicas. What''s actually
-
-                  running (may lag desired during rollout).'
-                format: int32
-                type: integer
-            type: object
-        required:
-        - spec
-        title: WorkerPool
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
+                `Default` because kube-rs initializes it to `None` → `Some(default())`
+                on first reconcile. All fields zero-value-is-meaningful (0 replicas
+                is a valid observed state).
+              nullable: true
+              properties:
+                conditions:
+                  default: []
+                  description: |-
+                    Standard K8s Conditions. Single `Scaling` type with reason
+                    ScaledUp / ScaledDown / UnknownMetric (status=False for
+                    errors). Helps operators see WHY replicas is what it is
+                    ("ScaledUp" with a message showing from/to; "UnknownMetric"
+                    when spec.autoscaling.metric is unsupported).
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  nullable: true
+                  type: array
+                desiredReplicas:
+                  default: 0
+                  description: |-
+                    What the autoscaler WANTS. Clamped to [min, max]. May
+                    differ from StatefulSet.spec.replicas during the
+                    stabilization window (we want 8 but haven't patched yet).
+                  format: int32
+                  type: integer
+                lastScaleTime:
+                  description: |-
+                    Last time replicas was actually patched (for stabilization
+                    window computation). kube 3.0: Time = jiff::Timestamp
+                    wrapper, not chrono.
+                  nullable: true
+                  type: string
+                readyReplicas:
+                  default: 0
+                  description: |-
+                    Observed StatefulSet.status.readyReplicas. Passed
+                    readinessProbe = heartbeat accepted.
+                  format: int32
+                  type: integer
+                replicas:
+                  default: 0
+                  description: |-
+                    Observed StatefulSet.status.replicas. What's actually
+                    running (may lag desired during rollout).
+                  format: int32
+                  type: integer
+              type: object
+          required:
+            - spec
+          title: WorkerPool
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

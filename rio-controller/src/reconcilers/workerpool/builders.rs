@@ -425,11 +425,14 @@ fn build_pod_spec(
         // pod's SA to read secrets.
         automount_service_account_token: Some(false),
 
-        // 2 hours. nix builds can legitimately take that long
-        // (LLVM from cold ccache, NixOS closures). SIGTERM →
-        // worker's drain sequence (DrainWorker + wait for
-        // in-flight). After grace period: SIGKILL, builds lost.
-        termination_grace_period_seconds: Some(7200),
+        // Default 2 hours — nix builds can legitimately take that
+        // long (LLVM from cold ccache, NixOS closures). SIGTERM →
+        // worker's drain sequence (DrainWorker + wait for in-flight).
+        // After grace period: SIGKILL, builds lost. Overridable via
+        // spec for clusters with known-shorter builds.
+        termination_grace_period_seconds: Some(
+            wp.spec.termination_grace_period_seconds.unwrap_or(7200),
+        ),
 
         node_selector: wp.spec.node_selector.clone(),
         tolerations: wp.spec.tolerations.clone(),

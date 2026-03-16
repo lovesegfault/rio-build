@@ -273,11 +273,14 @@ async fn apply(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
 /// build completion doesn't add much latency to delete.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Max wait for replicas=0 during cleanup. terminationGrace is
-/// 7200s (2h — long builds); +60s slop for the kubelet/STS
-/// controller to observe the pod termination and update status.
-/// After this, we give up and let ownerReference GC SIGKILL.
-const DRAIN_MAX_WAIT: Duration = Duration::from_secs(7200 + 60);
+/// Default pod terminationGracePeriodSeconds. 2h — long builds
+/// (LLVM from cold ccache, NixOS closures). Overridable via
+/// `WorkerPoolSpec.termination_grace_period_seconds`.
+const DEFAULT_TERMINATION_GRACE: i64 = 7200;
+
+/// Slop for kubelet/STS controller to observe pod termination
+/// and update status.replicas AFTER grace period SIGKILL.
+const DRAIN_WAIT_SLOP: Duration = Duration::from_secs(60);
 
 /// Cleanup on delete. Three phases:
 ///
@@ -409,7 +412,19 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // exit+grace. We want "all pods GONE" not "all pods not-
     // ready" — otherwise we'd remove the finalizer while pods
     // are still running builds.
-    let deadline = tokio::time::Instant::now() + DRAIN_MAX_WAIT;
+    //
+    // Derived from the spec's grace period (+ 60s slop) instead of
+    // a hardcoded 2h: a cluster with 90s builds and
+    // terminationGracePeriodSeconds=180 shouldn't block WorkerPool
+    // delete for 2h on a stuck/never-Ready pod (vm-lifecycle-k3s
+    // v24/v25: autoscaler-spawned pod-1 never went Ready; STS
+    // sequential termination stalls on it).
+    let grace = wp
+        .spec
+        .termination_grace_period_seconds
+        .unwrap_or(DEFAULT_TERMINATION_GRACE);
+    let drain_max_wait = Duration::from_secs(grace.max(0) as u64) + DRAIN_WAIT_SLOP;
+    let deadline = tokio::time::Instant::now() + drain_max_wait;
     loop {
         match sts_api.get_opt(&sts_name).await? {
             Some(sts) => {
@@ -429,7 +444,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
                     warn!(
                         workerpool = %name,
                         remaining = replicas,
-                        timeout = ?DRAIN_MAX_WAIT,
+                        timeout = ?drain_max_wait,
                         "drain timeout; proceeding (ownerRef GC will force-delete)"
                     );
                     break;
