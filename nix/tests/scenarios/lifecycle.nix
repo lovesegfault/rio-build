@@ -137,7 +137,10 @@ pkgs.testers.runNixOSTest {
   # Bring-up ~3-4min + recovery slow-build 90s sleep + queue-drain 120s
   # + autoscaler drain 120s + finalizer pod-gone 120s + GC grpcurl calls
   # + margin for 2-node k3s churn. Longest scenario by far.
-  globalTimeout = 1200;
+  # v18: 513s to recovery-start + 100s settle-wait = ~615s before
+  # the recovery slow-build (90s) even begins. ~5 subtests remain
+  # after recovery. 1500s keeps headroom against pf-churn variance.
+  globalTimeout = 1500;
 
   inherit (fixture) nodes;
 
@@ -189,9 +192,14 @@ pkgs.testers.runNixOSTest {
     # needs to be shell-evaluable). Inline bash: spawn port-forward, trap
     # EXIT teardown, sleep, curl, grep/awk the condition. Same pattern as
     # fixture.waitReady's workers_active check (k3s-full.nix:307-316).
-    def sched_metric_wait(condition, timeout=60):
+    def sched_metric_wait(condition, timeout=120):
         """Wait until the leader's /metrics satisfies a bash condition.
-        `condition` is a pipe-fragment appended after `curl /metrics |`."""
+        `condition` is a pipe-fragment appended after `curl /metrics |`.
+
+        Default 120s: each retry spawns a fresh port-forward on
+        19091; TIME_WAIT from a long prior wait (settle took 100s
+        in v18) eats the first several retries. 10s Tick + 2s bind
+        + TIME_WAIT slop = very few good retries under 60s."""
         k3s_server.wait_until_succeeds(
             "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
             "  -o jsonpath='{.spec.holderIdentity}') && "
@@ -547,11 +555,13 @@ pkgs.testers.runNixOSTest {
         )
 
         # Poll for dispatch (running ≥1). Settle-wait guaranteed
-        # baseline 0, so a nonzero reading IS our slow build. 30s
-        # timeout: dispatch + Tick latency.
+        # baseline 0, so a nonzero reading IS our slow build. 60s:
+        # settle-wait churned port 19091 for ~100s above → heavy
+        # TIME_WAIT. First few retries fail bind. nix-build needs
+        # ~10-15s to reach dispatch (ssh-ng + SubmitBuild + tick).
         sched_metric_wait(
             "grep -E '^rio_scheduler_derivations_running [1-9]'",
-            timeout=30,
+            timeout=60,
         )
 
         # PG snapshot BEFORE the kill. At kill time the worker's gRPC
