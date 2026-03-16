@@ -111,6 +111,13 @@ let
     # ContainerCreating forever.
     systemd.services.k3s.serviceConfig.Delegate = "yes";
 
+    # Drop the 1Hz retry spam during the ~180s airgap-import window
+    # (apiserver up, kubelet blocked on serial image import → node not
+    # yet registered). 182 lines/run pre-filter. "~" prefix = exclude
+    # matching from journal ingestion (systemd 253+) — never reaches
+    # console→serial→testlog. Other k3s logs unaffected.
+    systemd.services.k3s.serviceConfig.LogFilterPatterns = "~Unable to set control-plane role label";
+
     environment.systemPackages = [
       pkgs.curl
       pkgs.kubectl
