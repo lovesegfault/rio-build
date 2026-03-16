@@ -661,11 +661,36 @@ pkgs.testers.runNixOSTest {
 
         # Wait for Building — watch task running, buildId is a real
         # UUID. THIS is the state the new controller must find.
-        k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} get build test-ctrl-restart "
-            "-o jsonpath='{.status.phase}' | grep -qx Building",
-            timeout=60,
-        )
+        # timeout=120 (not 60): same flannel-race dispatch lag the
+        # terminal-phase wait below already budgets for. build-crd-flow
+        # above got apply→terminal in ~17s this run, but its comment
+        # documents >90s observed on cold informer cache. First-wait
+        # here has no warm-cache guarantee (finalizer delete of
+        # test-watch-dedup above may have triggered a watch resync).
+        # Diagnostic dump on timeout: controller reconcile counts +
+        # scheduler derivations_running + Build CR — distinguishes
+        # "controller never reconciled" vs "reconciled but not dispatched"
+        # vs "dispatched but phase not patched".
+        try:
+            k3s_server.wait_until_succeeds(
+                "k3s kubectl -n ${ns} get build test-ctrl-restart "
+                "-o jsonpath='{.status.phase}' | grep -qx Building",
+                timeout=120,
+            )
+        except Exception:
+            k3s_server.execute(
+                "echo '=== DIAG: controller logs (reconcile events) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 >&2; "
+                "echo '=== DIAG: Build CR (actual phase/buildId) ===' >&2; "
+                "k3s kubectl -n ${ns} get build test-ctrl-restart -o yaml >&2; "
+                "echo '=== DIAG: scheduler leader derivations_running ===' >&2; "
+                "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}') && "
+                "k3s kubectl get --raw "
+                "  /api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics "
+                "| grep -E 'derivations_(running|queued)' >&2 || true"
+            )
+            raise
 
         # Graceful delete — NOT --force. SIGTERM → main() returns →
         # atexit → profraw flush. The OLD controller's profraw captures
@@ -706,9 +731,34 @@ pkgs.testers.runNixOSTest {
                 timeout=120,
             )
         except Exception:
+            # Run 2 (2026-03-16): tail=80 was pure rustls/h2/tower DEBUG
+            # noise — the INFO-level reconnect log from ~120s ago nowhere
+            # near the tail. CR showed progress=0/1 lastSequence=1, but
+            # those are WATCH-TASK-PATCHED fields: stale if reconnect
+            # never fired, regardless of scheduler ground truth.
+            # Distinguishes: (A) scheduler never dispatched vs (B) build
+            # completed but reconnect_watch never consumed it.
+            #   - ctrl spawns_total: 0 → reconcile never reached spawn
+            #     path; ≥1 → reconnect fired (then check sched completed)
+            #   - sched completed delta vs baseline: ≥1 → (B), 0 → (A)
+            #   - sched queued>0 running=0: stuck in queue → (A)
             k3s_server.execute(
-                "echo '=== DIAG: NEW controller logs ===' >&2; "
-                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=80 >&2; "
+                "echo '=== DIAG: NEW controller logs (non-DEBUG) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --since=5m "
+                "  | grep -vE '\"level\":\"DEBUG\"' >&2 || true; "
+                "echo '=== DIAG: NEW controller spawns_total ===' >&2; "
+                "ctrl=$(k3s kubectl -n ${ns} get pods "
+                "  -l app.kubernetes.io/name=rio-controller "
+                "  -o jsonpath='{.items[0].metadata.name}') && "
+                "k3s kubectl get --raw "
+                "  /api/v1/namespaces/${ns}/pods/$ctrl:9094/proxy/metrics "
+                "| grep -E 'build_watch_spawns|reconcile_duration.*build' >&2 || true; "
+                "echo '=== DIAG: scheduler leader derivation counters ===' >&2; "
+                "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+                "  -o jsonpath='{.spec.holderIdentity}') && "
+                "k3s kubectl get --raw "
+                "  /api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics "
+                "| grep -E 'derivations_(running|queued|completed)|builds_completed' >&2 || true; "
                 "echo '=== DIAG: Build CR ===' >&2; "
                 "k3s kubectl -n ${ns} get build test-ctrl-restart -o yaml >&2"
             )
