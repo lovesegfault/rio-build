@@ -99,9 +99,11 @@ rules:
   - apiGroups: [""]
     resources: [services]
     verbs: [get, list, watch, create, update, patch, delete]
-  # `kubectl describe workerpool` shows events. create/patch for aggregation
-  # (K8s dedups by key).
-  - apiGroups: [""]
+  # `kubectl describe workerpool` shows events. create/patch for
+  # aggregation (K8s dedups by key). events.k8s.io (NOT core "")
+  # — kube-runtime's Recorder uses the events.k8s.io/v1 API. K8s
+  # mirrors events to core/v1 automatically for kubectl describe.
+  - apiGroups: [events.k8s.io]
     resources: [events]
     verbs: [create, patch]
   # Per-WorkerPool PDB (maxUnavailable=1) managed by reconciler.

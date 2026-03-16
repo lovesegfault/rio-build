@@ -401,24 +401,15 @@ pkgs.testers.runNixOSTest {
             "EOF"
         )
 
-        # Terminal phase: 5s sleep + dispatch overhead. 60s generous.
-        try:
-            k3s_server.wait_until_succeeds(
-                "k3s kubectl -n ${ns} get build test-watch-dedup "
-                "-o jsonpath='{.status.phase}' | "
-                "grep -E '^(Succeeded|Completed|Cached)$'",
-                timeout=60,
-            )
-        except Exception:
-            # Dump what the Build CR looks like + controller logs so
-            # the next run tells us WHY reconcile isn't progressing.
-            k3s_server.execute(
-                "echo '--- Build CR ---' >&2; "
-                "k3s kubectl -n ${ns} get build test-watch-dedup -o yaml >&2; "
-                "echo '--- controller logs (last 50) ---' >&2; "
-                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=50 >&2"
-            )
-            raise
+        # Terminal phase: 5s sleep + dispatch overhead. 90s: v13 timed
+        # out at 60s (controller's Build informer still warming up
+        # after the CRD Established → cache sync window).
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get build test-watch-dedup "
+            "-o jsonpath='{.status.phase}' | "
+            "grep -E '^(Succeeded|Completed|Cached)$'",
+            timeout=90,
+        )
 
         # ── status.buildId: real UUID, not sentinel ───────────────────
         # If the sentinel patch ran AFTER the watch task's first patch

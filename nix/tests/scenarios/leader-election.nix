@@ -287,11 +287,14 @@ pkgs.testers.runNixOSTest {
         # leader. If we kill too early (build still in SubmitBuild /
         # DAG merge on the leader), we're testing "submit during
         # failover" not "build during failover" — different codepath.
-        # Signal: worker pod logs the derivation name.
+        # Signal: worker pod logs the derivation name. 120s: after the
+        # failover subtest + gateway rollout, the gateway's balanced
+        # channel has to reprobe scheduler pod IPs (replacement pod
+        # has a new IP); first dispatch after that churn is slower.
         k3s_server.wait_until_succeeds(
             "k3s kubectl -n ${ns} logs default-workers-0 --tail=200 "
             "| grep -q 'rio-test-leader-failover'",
-            timeout=60,
+            timeout=120,
         )
 
         old_leader = leader_pod()
