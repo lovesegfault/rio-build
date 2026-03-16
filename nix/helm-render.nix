@@ -59,9 +59,14 @@ pkgs.runCommand "rio-helm-rendered"
 
     mkdir -p $out
     # CRDs come from infra/helm/crds/ (not the chart — Helm's crds/ dir
-    # is install-only, wrong for a dev-phase project). Cat them into
-    # 00-crds.yaml so k3s applies them first.
-    cat ${crds}/*.yaml > $out/00-crds.yaml
+    # is install-only, wrong for a dev-phase project). Concatenate with
+    # explicit --- separators: the generated CRD yamls don't end with
+    # document separators, so a bare `cat` produces one malformed
+    # document — k3s silently applies only part (or none) of it.
+    for f in ${crds}/*.yaml; do
+      cat "$f"
+      echo "---"
+    done > $out/00-crds.yaml
     # yq-go: filter by kind. k3s applies in filename order — CRDs must
     # establish before the controller pod tries to watch them; Namespace
     # must exist before ServiceAccounts can be created in it; RBAC must

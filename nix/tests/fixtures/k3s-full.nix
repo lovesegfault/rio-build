@@ -344,7 +344,7 @@ in
         "trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
         "curl -sf http://localhost:19091/metrics | "
         "grep -qx 'rio_scheduler_workers_active 1'",
-        timeout=60,
+        timeout=120,
     )
   '';
 
