@@ -428,17 +428,74 @@ pkgs.testers.runNixOSTest {
             "EOF"
         )
 
+        # Baseline: did the controller's Build reconciler even wake up
+        # yet? default-workers-0 Ready (waitReady) proves the WorkerPool
+        # watch synced. Build watch started at the same join!(), same
+        # API group — if WorkerPool synced, Build should have too.
+        # Printing this lets the timeout diag below show the DELTA.
+        cm_base = ctrl_metrics()
+        br_base = metric_value(cm_base,
+            "rio_controller_reconcile_duration_seconds_count",
+            '{reconciler="build"}') or 0.0
+        wp_base = metric_value(cm_base,
+            "rio_controller_reconcile_duration_seconds_count",
+            '{reconciler="workerpool"}') or 0.0
+        print(f"build-crd-flow: pre-wait reconcile counts: "
+              f"build={br_base}, workerpool={wp_base}")
+
         # Terminal phase: 5s sleep + dispatch overhead. 180s: the
         # controller's Build informer has variable cache-sync time
         # — if its first watch attempt fires before the CRD is
         # Established, kube-rs backs off. Observed: 48s (v15), >90s
         # (v16). 180s absorbs the backoff variance.
-        k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} get build test-watch-dedup "
-            "-o jsonpath='{.status.phase}' | "
-            "grep -E '^(Succeeded|Completed|Cached)$'",
-            timeout=180,
-        )
+        try:
+            k3s_server.wait_until_succeeds(
+                "k3s kubectl -n ${ns} get build test-watch-dedup "
+                "-o jsonpath='{.status.phase}' | "
+                "grep -E '^(Succeeded|Completed|Cached)$'",
+                timeout=180,
+            )
+        except Exception:
+            # DIAGNOSTIC: 2/2 coverage-full failures today (2026-03-16)
+            # timed out here. Dump everything — controller logs, Build CR
+            # status, reconcile-count delta, scheduler/store connectivity.
+            # The "informer backoff" theory is DOUBTFUL: default-workers-0
+            # Ready proves WorkerPool synced; Build watch joins the same
+            # tokio::join!. Need the real answer.
+            k3s_server.execute(
+                "echo '=== DIAG: controller pod logs (last 100) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --tail=100 >&2; "
+                "echo '=== DIAG: controller pod logs --previous (crashes?) ===' >&2; "
+                "k3s kubectl -n ${ns} logs deploy/rio-controller --previous --tail=50 >&2 || true; "
+                "echo '=== DIAG: test-watch-dedup Build CR ===' >&2; "
+                "k3s kubectl -n ${ns} get build test-watch-dedup -o yaml >&2; "
+                "echo '=== DIAG: Build CR events ===' >&2; "
+                "k3s kubectl -n ${ns} get events "
+                "--field-selector involvedObject.name=test-watch-dedup >&2; "
+                "echo '=== DIAG: controller pod state ===' >&2; "
+                "k3s kubectl -n ${ns} get pods -l app.kubernetes.io/name=rio-controller -o wide >&2; "
+                "echo '=== DIAG: scheduler + store pods ===' >&2; "
+                "k3s kubectl -n ${ns} get pods "
+                "-l 'app.kubernetes.io/name in (rio-scheduler,rio-store)' -o wide >&2"
+            )
+            cm_diag = ctrl_metrics()
+            br_diag = metric_value(cm_diag,
+                "rio_controller_reconcile_duration_seconds_count",
+                '{reconciler="build"}') or 0.0
+            # reconcile_errors_total has TWO labels (reconciler + error_kind);
+            # dump all series rather than guessing the error_kind.
+            err_diag = cm_diag.get("rio_controller_reconcile_errors_total", {})
+            spawns_diag = metric_value(cm_diag,
+                "rio_controller_build_watch_spawns_total") or 0.0
+            print(f"DIAG: build reconcile count {br_base} → {br_diag} "
+                  f"(delta={br_diag - br_base}); "
+                  f"reconcile_errors={err_diag!r}; "
+                  f"watch_spawns={spawns_diag}")
+            # delta=0  → Build informer never delivered the CR (backoff? watch dead?)
+            # delta>0 + errors>0 → reconcile fired but errored (store/scheduler down?)
+            # delta>0 + spawns=0 → reconcile fired but never reached submit_build
+            # delta>0 + spawns=1 → submitted but scheduler/worker never completed it
+            raise
 
         # ── status.buildId: real UUID, not sentinel ───────────────────
         # If the sentinel patch ran AFTER the watch task's first patch

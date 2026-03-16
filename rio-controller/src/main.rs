@@ -165,40 +165,55 @@ async fn main() -> anyhow::Result<()> {
     info!("kubernetes client connected");
 
     // ---- Scheduler client (for autoscaler) ----
-    // Connect eagerly — the autoscaler polls every 30s, holding
-    // a live connection is fine. If the scheduler isn't up yet,
-    // this blocks; the controller pod stays NOT READY until it
-    // connects (health server spawned below). That's correct: a
-    // controller that can't read ClusterStatus can't autoscale.
+    // Retry until connected. All rio-* pods start in parallel via
+    // helm; under coverage-instrumented binaries + the k3s flannel
+    // CNI race (`/run/flannel/subnet.env` written at t≈186s while
+    // pod sandboxes start at t≈185s), this process can reach this
+    // line before the scheduler Service has endpoints. connect_admin
+    // uses eager .connect().await — refused → Err. The previous `?`
+    // here meant process-exit → CrashLoopBackOff → 10s/20s/40s
+    // kubelet backoff → 180s test budget exhausted (observed 2/2
+    // coverage-full failures 2026-03-16). Retry internally instead:
+    // pod stays not-Ready (health server below hasn't spawned), so
+    // the Deployment's Available condition correctly gates on this.
     //
-    // Balanced when scheduler_balance_host is set: the standby
-    // replica returns UNAVAILABLE on AdminService RPCs (leader
-    // guard), so polling via the ClusterIP Service fails ~50% of
-    // ticks. The balanced channel health-probes pod IPs and routes
-    // only to the leader. Guard held in _balance_guard for process
-    // lifetime — dropping it stops the probe loop.
+    // Once connected: hold the channel for process lifetime. The
+    // autoscaler polls every 30s. Balanced when scheduler_balance_host
+    // is set — the standby returns UNAVAILABLE on AdminService RPCs,
+    // so ClusterIP round-robin fails ~50% of ticks; balanced channel
+    // health-probes pod IPs and routes only to the leader. Guard held
+    // in _balance_guard (dropping it stops the probe loop).
     //
-    // The reconciler DOESN'T use this client — it patches K8s
-    // objects only. The WorkerPool finalizer's cleanup() connects
-    // lazily per-call for DrainWorker (single-shot, retry on
-    // UNAVAILABLE is fine there).
-    let (scheduler, _balance_guard) = match &cfg.scheduler_balance_host {
-        None => {
-            info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
-            let c = rio_proto::client::connect_admin(&cfg.scheduler_addr).await?;
-            (c, None)
-        }
-        Some(host) => {
-            info!(
-                %host, port = cfg.scheduler_balance_port,
-                "connecting to scheduler (health-aware balanced)"
-            );
-            let (c, bc) = rio_proto::client::balance::connect_admin_balanced(
-                host.clone(),
-                cfg.scheduler_balance_port,
-            )
-            .await?;
-            (c, Some(bc))
+    // The reconcilers DON'T use this client — they patch K8s objects
+    // only. WorkerPool finalizer's cleanup() connects lazily per-call
+    // for DrainWorker.
+    let (scheduler, _balance_guard) = loop {
+        let result = match &cfg.scheduler_balance_host {
+            None => {
+                info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
+                rio_proto::client::connect_admin(&cfg.scheduler_addr)
+                    .await
+                    .map(|c| (c, None))
+            }
+            Some(host) => {
+                info!(
+                    %host, port = cfg.scheduler_balance_port,
+                    "connecting to scheduler (health-aware balanced)"
+                );
+                rio_proto::client::balance::connect_admin_balanced(
+                    host.clone(),
+                    cfg.scheduler_balance_port,
+                )
+                .await
+                .map(|(c, bc)| (c, Some(bc)))
+            }
+        };
+        match result {
+            Ok(pair) => break pair,
+            Err(e) => {
+                warn!(error = %e, "scheduler connect failed; retrying in 2s (pod stays not-Ready)");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         }
     };
 
