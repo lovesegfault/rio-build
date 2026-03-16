@@ -849,20 +849,37 @@ pkgs.testers.runNixOSTest {
         kubectl("scale statefulset default-workers --replicas=2")
 
         # Reconciler observed the change (via .owns watch), reconciled,
-        # patched WorkerPool.status.desiredReplicas=2. This IS the
+        # patched WorkerPool.status.desiredReplicas. This IS the
         # reconcile — if it were going to stomp replicas, it would have
-        # done so in the same apply() call.
+        # done so in the same apply() call. Accept 1 OR 2: with the 10s
+        # scale-down window (controller.extraEnv[3]), the autoscaler may
+        # have already patched 2→1 before reconcile fires. Either way,
+        # desiredReplicas reflecting a NON-STALE value proves reconcile
+        # ran after our scale.
         k3s_server.wait_until_succeeds(
-            "test \"$(k3s kubectl -n ${ns} get workerpool default "
-            "-o jsonpath='{.status.desiredReplicas}')\" = 2",
+            "dr=$(k3s kubectl -n ${ns} get workerpool default "
+            "-o jsonpath='{.status.desiredReplicas}'); "
+            'test "$dr" = 1 -o "$dr" = 2',
             timeout=20,
         )
 
-        # STILL 2 after the reconcile. Synchronous check — reconciler
-        # had its chance in the status-patch reconcile above.
-        kubectl(
-            "get statefulset default-workers "
-            "-o jsonpath='{.spec.replicas}' | grep -qx 2"
+        # THE ACTUAL INVARIANT: reconciler's SSA patch does NOT claim
+        # spec.replicas. managedFields records which manager owns each
+        # field. If the rio-controller manager's fieldsV1 includes
+        # f:replicas under f:spec, the reconciler is re-claiming it —
+        # the regression. This check is autoscaler-agnostic: whether
+        # replicas is 1 (autoscaler won) or 2 (we won), rio-controller
+        # must NOT be the owner.
+        #
+        # grep -A50 bounds the managedFields entry scan (each manager's
+        # entry is <50 lines). `! grep -q` inverts: PASS if f:replicas
+        # NOT found under rio-controller. Previously checked value==2
+        # which raced with the 10s-window autoscaler.
+        k3s_server.succeed(
+            "! k3s kubectl -n ${ns} get statefulset default-workers -o yaml | "
+            "grep -A50 'manager: rio-controller' | "
+            "grep -B50 -m1 '^  - apiVersion\\|^status:' | "
+            "grep -q 'f:replicas'"
         )
 
         # Reset to 1 so autoscaler observes 1→2 (not 2→2 no-op).
