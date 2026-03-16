@@ -88,44 +88,39 @@ let
         cp $out/ca.crt $out/rio-worker/ca.crt
       '';
 
-  # Base64 helper: reads a PKI file, strips trailing newline,
-  # base64-encodes for k8s Secret.data (which is base64, not
-  # stringData). Nix builtins have no base64 so shell out.
-  #
-  # Two-stage: this runCommand takes the pki derivation as an
-  # input, so Nix sequences it after pki builds. readFile then
-  # pulls the result back into eval for the manifest interpolation.
-  b64 =
-    path:
-    pkgs.lib.removeSuffix "\n" (
-      builtins.readFile (
-        pkgs.runCommand "b64" { } ''
-          base64 -w0 < ${pki}/${path} > $out
-        ''
-      )
-    );
-
-  mkSecret = name: ''
-    ---
-    apiVersion: v1
-    kind: Secret
-    metadata:
-      name: ${name}-tls
-      namespace: ${ns}
-    type: kubernetes.io/tls
-    data:
-      tls.crt: ${b64 "${name}/tls.crt"}
-      tls.key: ${b64 "${name}/tls.key"}
-      ca.crt: ${b64 "${name}/ca.crt"}
-  '';
+  secretNames = map (c: "rio-${c}") components ++ [ "rio-worker" ];
 in
 {
   inherit pki;
 
-  # k8s manifest with all 5 TLS Secrets. Feed into
-  # services.k3s.manifests so it's applied at boot, before the
-  # rio-* pods start (same ordering slot as 03-gateway-ssh-empty).
-  secretsManifest = pkgs.writeText "rio-tls-secrets.yaml" (
-    pkgs.lib.concatMapStringsSep "\n" mkSecret (map (c: "rio-${c}") components ++ [ "rio-worker" ])
-  );
+  # k8s manifest with all TLS Secrets. Feed into services.k3s.manifests
+  # so it's applied at boot, before rio-* pods start.
+  #
+  # Generated inside a runCommand with ${pki} as a regular build input
+  # — NO IFD (builtins.readFile). The pki derivation is non-deterministic
+  # (openssl genrsa = random keys). With IFD, the Secret content came
+  # from the LOCAL eval-time build; the test's ${pki} store path might
+  # be REBUILT on nixbuild.net with different keys. Same path, different
+  # contents → grpcurl's -cacert doesn't match the server cert's CA →
+  # "crypto/rsa: verification error". Observed v23.
+  #
+  # As a regular input, Nix guarantees the SAME pki build feeds both
+  # this manifest and the VM closure's ${pki} reference.
+  secretsManifest = pkgs.runCommand "rio-tls-secrets.yaml" { } ''
+    for name in ${pkgs.lib.concatStringsSep " " secretNames}; do
+      cat >> $out <<EOF
+    ---
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: $name-tls
+      namespace: ${ns}
+    type: kubernetes.io/tls
+    data:
+      tls.crt: $(base64 -w0 < ${pki}/$name/tls.crt)
+      tls.key: $(base64 -w0 < ${pki}/$name/tls.key)
+      ca.crt: $(base64 -w0 < ${pki}/$name/ca.crt)
+    EOF
+    done
+  '';
 }
