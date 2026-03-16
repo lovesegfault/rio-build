@@ -167,11 +167,12 @@ pkgs.testers.runNixOSTest {
         tx_before = lease_transitions()
         old_leader = leader_pod()
 
-        # Capture the OTHER pod's name BEFORE the kill. After delete,
-        # the Deployment controller spawns a replacement with a fresh
-        # name; we want to assert the STANDBY (pre-existing) won, not
-        # the fresh pod. If the fresh pod won, observed-record expiry
-        # is slower than cold-start lease acquire — suspicious.
+        # Record both pod names BEFORE the kill for the diagnostic
+        # print. With graceful step_down (a5b06ef), EITHER the
+        # standby OR the Deployment-spawned replacement can win the
+        # empty lease — standby's next poll tick is 5s, replacement
+        # startup is ~3-5s. Both are valid failover outcomes; the
+        # key invariant is tx == +1 (clean single handoff).
         pods_before = scheduler_pods()
         assert old_leader in pods_before, (
             f"leader_pod()={old_leader!r} not in running pods "
@@ -183,7 +184,7 @@ pkgs.testers.runNixOSTest {
             f"(pods={pods_before!r}, leader={old_leader!r})"
         )
         standby = others[0]
-        print(f"failover: killing leader={old_leader}, expecting standby={standby}")
+        print(f"failover: killing leader={old_leader}, standby={standby}")
 
         kubectl(f"delete pod {old_leader} --grace-period=0 --force")
 
@@ -191,8 +192,7 @@ pkgs.testers.runNixOSTest {
         # holder instantly; either the standby OR the Deployment-spawned
         # replacement acquires on their next poll tick. -n guards
         # against the empty window between step_down and acquire.
-        # Which one actually won is checked by `new_leader == standby`
-        # below — this wait just clears the empty window.
+        # Either outcome is valid (see comment above).
         k3s_server.wait_until_succeeds(
             "h=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
             "-o jsonpath='{.spec.holderIdentity}'); "
@@ -212,13 +212,12 @@ pkgs.testers.runNixOSTest {
             f">1 = leadership bounced; 0 = steal didn't increment tx."
         )
 
-        # The standby won, not a freshly-spawned replacement.
-        assert new_leader == standby, (
-            f"new leader {new_leader!r} is not the pre-existing standby "
-            f"{standby!r}. Either a fresh pod out-raced the standby "
-            f"(observed-record expiry too slow?), or holderIdentity "
-            f"doesn't match pod name."
-        )
+        # Diagnostic: note which pod won. Either is valid with
+        # graceful step_down — the old STEAL-path expectation
+        # ("standby must win because replacement needs > TTL to
+        # start") no longer applies.
+        winner = "standby" if new_leader == standby else "replacement"
+        print(f"failover: new leader = {new_leader} ({winner})")
 
         # renewTime is fresh. The new leader writes renewTime on acquire
         # and every RENEW_INTERVAL after. If it's stale, either the
