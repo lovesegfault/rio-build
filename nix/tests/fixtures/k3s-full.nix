@@ -332,19 +332,19 @@ in
         timeout=180,
     )
 
-    # ── Worker registered at scheduler (via metrics port-forward) ───
-    # Scheduler pods have no shell (minimal image); port-forward to
-    # leader for metrics. Can't wait_until_succeeds across a port-
-    # forward spawn easily — just do a fixed-count retry in bash.
+    # ── Worker registered at scheduler ───────────────────────────────
+    # Scheduler pods have no shell (minimal image). Scrape via the
+    # apiserver's pods/proxy subresource — no local port-forward,
+    # no TIME_WAIT churn, no `sleep 2` bind wait. Named port
+    # `metrics` (templates/scheduler.yaml) → no hardcoded 9091.
     k3s_server.wait_until_succeeds(
         "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
         "  -o jsonpath='{.spec.holderIdentity}') && "
-        "k3s kubectl -n ${ns} port-forward $leader 19091:9091 "
-        "  >/dev/null 2>&1 & pf=$!; "
-        "trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-        "curl -sf http://localhost:19091/metrics | "
-        "grep -qx 'rio_scheduler_workers_active 1'",
-        timeout=120,
+        'test -n "$leader" && '
+        "k3s kubectl get --raw "
+        '"/api/v1/namespaces/${ns}/pods/$leader:metrics/proxy/metrics" '
+        "| grep -qx 'rio_scheduler_workers_active 1'",
+        timeout=60,
     )
   '';
 

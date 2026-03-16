@@ -11,8 +11,9 @@
 # surface.
 #
 # Key adaptation: scheduler pods are minimal images (no shell, no curl).
-# All metric scrapes + grpcurl calls go through `kubectl port-forward`
-# on k3s_server. Scheduler has 2 replicas (podAntiAffinity spreads them
+# Metric scrapes go through apiserver pods/proxy (`kubectl get --raw`);
+# grpcurl (needs TCP for mTLS) through `kubectl port-forward`.
+# Scheduler has 2 replicas (podAntiAffinity spreads them
 # across server+agent), so killing the leader means the STANDBY takes
 # over — a strictly stronger recovery test than phase3b's single-instance
 # restart.
@@ -152,62 +153,59 @@ pkgs.testers.runNixOSTest {
 
     ${fixture.kubectlHelpers}
 
-    # ── Port-forward helpers ──────────────────────────────────────────
+    # ── Metrics-scrape helpers ────────────────────────────────────────
     # Scheduler/controller/store pods are minimal images (no sh, no curl).
-    # For metrics + grpcurl, port-forward on k3s_server and curl localhost.
-    # Each call spawns a fresh port-forward, sleeps 2s for it to bind,
-    # then tears down — fresh leader_pod() lookup every time (the leader
-    # CHANGES across recovery).
+    # Scrape via the apiserver's pods/proxy subresource — `kubectl get
+    # --raw /api/v1/.../pods/{pod}:metrics/proxy/metrics`. Apiserver
+    # proxies HTTP to the pod via kubelet. No local port bind, no
+    # TIME_WAIT churn, no `sleep 2`.
     #
-    # Distinct local ports so forwards never collide if teardown races.
+    # Prior port-forward approach: each sched_metric_wait retry spawned
+    # a fresh pf on port 19091. After a long wait (settle-wait took
+    # 100s in v18 ≈ 30+ retries), the port was in heavy TIME_WAIT and
+    # subsequent calls failed bind for 60s+.
+    #
+    # Named port `metrics` (templates/{scheduler,controller}.yaml).
+    # Fresh leader_pod() lookup per scrape — the leader CHANGES
+    # across recovery.
+
+    def proxy_url(pod, port="metrics", path="metrics"):
+        return (
+            f"/api/v1/namespaces/${ns}/pods/{pod}:{port}/proxy/{path}"
+        )
 
     def sched_metrics():
         """One-shot scrape of the CURRENT scheduler leader's /metrics."""
-        leader = leader_pod()
-        k3s_server.succeed(
-            f"k3s kubectl -n ${ns} port-forward {leader} 19091:9091 "
-            f">/dev/null 2>&1 & echo $! > /tmp/pf-sched.pid; sleep 2"
+        raw = k3s_server.succeed(
+            f"k3s kubectl get --raw '{proxy_url(leader_pod())}'"
         )
-        try:
-            return scrape_metrics(k3s_server, 19091)
-        finally:
-            k3s_server.execute(
-                "kill $(cat /tmp/pf-sched.pid) 2>/dev/null; rm -f /tmp/pf-sched.pid"
-            )
+        return parse_prometheus(raw)
 
     def ctrl_metrics():
         """One-shot scrape of the controller pod's /metrics (port 9094)."""
-        k3s_server.succeed(
-            "k3s kubectl -n ${ns} port-forward deploy/rio-controller 19094:9094 "
-            ">/dev/null 2>&1 & echo $! > /tmp/pf-ctrl.pid; sleep 2"
+        pod = kubectl(
+            "get pods -l app.kubernetes.io/name=rio-controller "
+            "-o jsonpath='{.items[0].metadata.name}'"
+        ).strip()
+        raw = k3s_server.succeed(
+            f"k3s kubectl get --raw '{proxy_url(pod)}'"
         )
-        try:
-            return scrape_metrics(k3s_server, 19094)
-        finally:
-            k3s_server.execute(
-                "kill $(cat /tmp/pf-ctrl.pid) 2>/dev/null; rm -f /tmp/pf-ctrl.pid"
-            )
+        return parse_prometheus(raw)
 
-    # wait_until_succeeds can't easily wrap a Python helper (the condition
-    # needs to be shell-evaluable). Inline bash: spawn port-forward, trap
-    # EXIT teardown, sleep, curl, grep/awk the condition. Same pattern as
-    # fixture.waitReady's workers_active check (k3s-full.nix:307-316).
-    def sched_metric_wait(condition, timeout=120):
+    # Shell-inline version for wait_until_succeeds (condition must be
+    # shell-evaluable). Single kubectl call per retry — no background
+    # process, no cleanup, no port. Retry rate is now limited only by
+    # the NixOS test driver's poll interval (~1s) + apiserver RTT.
+    def sched_metric_wait(condition, timeout=60):
         """Wait until the leader's /metrics satisfies a bash condition.
-        `condition` is a pipe-fragment appended after `curl /metrics |`.
-
-        Default 120s: each retry spawns a fresh port-forward on
-        19091; TIME_WAIT from a long prior wait (settle took 100s
-        in v18) eats the first several retries. 10s Tick + 2s bind
-        + TIME_WAIT slop = very few good retries under 60s."""
+        `condition` is a pipe-fragment appended after `... | `."""
         k3s_server.wait_until_succeeds(
             "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
             "  -o jsonpath='{.spec.holderIdentity}') && "
-            "test -n \"$leader\" && "
-            "k3s kubectl -n ${ns} port-forward $leader 19091:9091 "
-            "  >/dev/null 2>&1 & pf=$!; "
-            "trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-            f"curl -sf http://localhost:19091/metrics | {condition}",
+            'test -n "$leader" && '
+            "k3s kubectl get --raw "
+            '"/api/v1/namespaces/${ns}/pods/$leader:metrics/proxy/metrics" '
+            f"| {condition}",
             timeout=timeout,
         )
 
@@ -556,9 +554,8 @@ pkgs.testers.runNixOSTest {
 
         # Poll for dispatch (running ≥1). Settle-wait guaranteed
         # baseline 0, so a nonzero reading IS our slow build. 60s:
-        # settle-wait churned port 19091 for ~100s above → heavy
-        # TIME_WAIT. First few retries fail bind. nix-build needs
-        # ~10-15s to reach dispatch (ssh-ng + SubmitBuild + tick).
+        # nix-build needs ~10-15s to reach dispatch (ssh-ng handshake
+        # + SubmitBuild + DAG merge + dispatch on 10s Tick).
         sched_metric_wait(
             "grep -E '^rio_scheduler_derivations_running [1-9]'",
             timeout=60,

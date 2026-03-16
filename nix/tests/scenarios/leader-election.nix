@@ -295,18 +295,19 @@ pkgs.testers.runNixOSTest {
         # k3s-server breaks the k3s-agent kubelet's log stream
         # ("Failed when writing line to log file: http2: stream
         # closed" — containerd→kubelet stream dies, doesn't recover).
-        # kubectl-logs returns stale/empty. The build IS running
-        # (client shows `building '...'`), just the log path is dead.
-        # Scheduler metrics via port-forward bypass kubelet entirely.
+        # kubectl-logs returns stale/empty even though the build IS
+        # running (client shows `building '...'`).
+        #
+        # apiserver pods/proxy subresource — no local port-forward,
+        # no TIME_WAIT. Same mechanism as lifecycle's sched_metric_wait.
         k3s_server.wait_until_succeeds(
             "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
             "  -o jsonpath='{.spec.holderIdentity}') && "
-            "k3s kubectl -n ${ns} port-forward $leader 19091:9091 "
-            "  >/dev/null 2>&1 & pf=$!; "
-            "trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
-            "curl -sf http://localhost:19091/metrics | "
-            "grep -E '^rio_scheduler_derivations_running [1-9]'",
-            timeout=60,
+            'test -n "$leader" && '
+            "k3s kubectl get --raw "
+            '"/api/v1/namespaces/${ns}/pods/$leader:metrics/proxy/metrics" '
+            "| grep -E '^rio_scheduler_derivations_running [1-9]'",
+            timeout=30,
         )
 
         old_leader = leader_pod()

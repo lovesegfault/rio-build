@@ -21,13 +21,16 @@ import re
 _METRIC_LINE = re.compile(r"^(\w+)(\{[^}]*\})?\s+([0-9.eE+-]+|NaN|[+-]Inf)$")
 
 
-def scrape_metrics(node, port, host="localhost"):
-    """Parse a Prometheus /metrics endpoint into {name: {labels: float}}.
+def parse_prometheus(text):
+    """Parse Prometheus text-format into {name: {labels: float}}.
 
     Labels key is the raw `{k="v",...}` string (empty string for
     unlabeled series). Float NaN/Inf preserved via float().
+
+    Pure parser — separate from the curl so k3s scenarios can
+    scrape via `kubectl get --raw /api/v1/.../pods/{p}:metrics/
+    proxy/metrics` (apiserver-proxied, no local port-forward).
     """
-    text = node.succeed(f"curl -sf http://{host}:{port}/metrics")
     out = {}
     for line in text.splitlines():
         if not line or line[0] == "#":
@@ -38,6 +41,15 @@ def scrape_metrics(node, port, host="localhost"):
         name, labels, val = m.group(1), m.group(2) or "", m.group(3)
         out.setdefault(name, {})[labels] = float(val)
     return out
+
+
+def scrape_metrics(node, port, host="localhost"):
+    """curl + parse_prometheus. For standalone-fixture VMs where
+    services bind a host-reachable port. k3s fixtures should use
+    parse_prometheus(kubectl_get_raw) instead."""
+    return parse_prometheus(
+        node.succeed(f"curl -sf http://{host}:{port}/metrics")
+    )
 
 
 def metric_value(scraped, name, labels=""):
