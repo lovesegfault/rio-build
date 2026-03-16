@@ -275,6 +275,9 @@ r[ctrl.build.sentinel]
 r[ctrl.build.watch-by-uid]
 **Watch deduplication:** The reconciler spawns a background `WatchBuild` task to stream `BuildEvent`s from the scheduler. To prevent duplicate watches on re-reconcile, a `DashMap` in the reconciler context tracks active watches **keyed by Build UID** (`b.uid()`), not `{namespace}/{name}`. UID-keying guards against a delete+recreate race where a new Build with the same name would collide with an old-Build's still-running watch guard; the old scopeguard (on exit) would then remove the NEW Build's entry. A scopeguard removes the `watching` entry on any watch-task exit (terminal, error, or cancel).
 
+r[ctrl.build.reconnect]
+**Stream reconnect on non-terminal EOF:** When the watch task's `BuildEvent` stream returns `Ok(None)` (clean EOF) and the Build's phase is NOT terminal (`Succeeded`/`Failed`/`Cancelled`), the task MUST treat this as a reconnect trigger, not a clean exit. Kubernetes pod termination (SIGTERM → graceful drain → TCP FIN) surfaces as `Ok(None)` in tonic, not `Err(Transport)` --- a scheduler pod kill mid-build otherwise freezes the Build's status. The task reconnects via `WatchBuild` with the last observed sequence, same backoff as the transport-error path. Each reconnect increments `rio_controller_build_watch_reconnects_total`.
+
 **Finalizer:** All Build CRDs carry a `rio.build/build-cleanup` finalizer. Before a Build CRD is deleted, the controller sends `CancelBuild` to the scheduler to ensure in-flight work is properly handled.
 
 ## Component Deployment Model

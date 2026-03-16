@@ -61,6 +61,12 @@ in
 rec {
   # ── Shared let-bindings ─────────────────────────────────────────────
 
+  # The workspace derivation itself. Scenarios interpolate
+  # `${common.rio-workspace}/bin/rio-cli` (or any other bin) directly
+  # into testScript — string interpolation pulls the store path into
+  # the VM closure, same pattern as grpcurl in lifecycle.nix.
+  inherit rio-workspace;
+
   # Static busybox: closure of exactly 1 path (no glibc, no runtime deps).
   # The sole input seed for all VM tests — FUSE fetches it on every worker,
   # validating the lazy-fetch path.

@@ -354,7 +354,16 @@ impl Filesystem for NixStoreFs {
         };
 
         match read_file_range(file, offset, size as usize) {
-            Ok(data) => reply.data(&data),
+            Ok(data) => {
+                // Userspace read succeeded. When passthrough is ON, the
+                // kernel handles most reads directly and this callback
+                // rarely fires (only for files where open_backing failed).
+                // When passthrough is OFF (RIO_FUSE_PASSTHROUGH=false),
+                // every read comes through here. Near-zero vs nonzero
+                // is the signal that the non-passthrough path ran.
+                metrics::counter!("rio_worker_fuse_fallback_reads_total").increment(1);
+                reply.data(&data);
+            }
             Err(e) => {
                 tracing::warn!(
                     ino = ino.0,

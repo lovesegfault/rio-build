@@ -171,10 +171,15 @@ let
   workerNodes = lib.mapAttrs (
     name: args:
     common.mkWorkerNode (
-      args
+      # Strip extraServiceEnv from args BEFORE the // merge, then
+      # compose it WITH the fixture's workerTlsEnv. Without this,
+      # the // at `args // {...}` would overwrite per-worker env
+      # with the fixture-level TLS env (scenarios couldn't set
+      # RIO_FUSE_PASSTHROUGH on just one worker).
+      (builtins.removeAttrs args [ "extraServiceEnv" ])
       // {
         hostName = name;
-        extraServiceEnv = workerTlsEnv;
+        extraServiceEnv = workerTlsEnv // (args.extraServiceEnv or { });
         otelEndpoint = workerOtelEndpoint;
       }
     )

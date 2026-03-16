@@ -155,6 +155,14 @@ pkgs.testers.runNixOSTest {
             assert_metric_ge(w, 9093,
                 "rio_worker_fuse_cache_misses_total", 1.0)
 
+        # wsmall2 runs with RIO_FUSE_PASSTHROUGH=false (default.nix).
+        # Its reads go through the userspace FUSE callback instead of
+        # kernel passthrough. fallback_reads_total ≥1 proves fuse/ops.rs
+        # read() actually ran — passthrough bypasses it entirely.
+        # wsmall1 (passthrough ON) should be near-zero or absent.
+        assert_metric_ge(wsmall2, 9093,
+            "rio_worker_fuse_fallback_reads_total", 1.0)
+
         # Store: received 5 build outputs via PutPath (+ busybox seed).
         # ≥5 to be robust against retries.
         assert_metric_ge(${gatewayHost}, 9092,

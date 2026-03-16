@@ -49,6 +49,7 @@ let
   observability = import ./scenarios/observability.nix;
   lifecycle = import ./scenarios/lifecycle.nix;
   leader-election = import ./scenarios/leader-election.nix;
+  cli = import ./scenarios/cli.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 in
 {
@@ -93,6 +94,13 @@ in
         wsmall2 = {
           maxBuilds = 2;
           sizeClass = "small";
+          # Non-passthrough FUSE: exercises open_files tracking,
+          # userspace read(), release(). fuse/ops.rs read() at 33%
+          # coverage before this — passthrough bypasses the kernel
+          # callback entirely.
+          extraServiceEnv = {
+            RIO_FUSE_PASSTHROUGH = "false";
+          };
         };
         wlarge = {
           maxBuilds = 1;
@@ -172,11 +180,21 @@ in
         "controller.extraEnv[1].value" = "3";
         "controller.extraEnv[2].name" = "RIO_AUTOSCALER_MIN_INTERVAL_SECS";
         "controller.extraEnv[2].value" = "3";
+        "controller.extraEnv[3].name" = "RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS";
+        "controller.extraEnv[3].value" = "10";
       };
     };
   };
 
   vm-leader-election-k3s = leader-election {
+    inherit pkgs common;
+    fixture = k3sFull { };
+  };
+
+  # rio-cli had 0% coverage — never invoked by any test. This runs
+  # status + create-tenant + list-tenants against the live scheduler's
+  # AdminService. ~5min (mostly k3s bring-up).
+  vm-cli-k3s = cli {
     inherit pkgs common;
     fixture = k3sFull { };
   };

@@ -52,10 +52,13 @@ struct Config {
     health_addr: std::net::SocketAddr,
     /// Autoscaler poll interval (seconds). Default 30s; VM tests
     /// override to 3s so a scale decision happens within the test
-    /// timeout. Scale-DOWN window is NOT configurable (fixed
-    /// 600s) — see SCALE_DOWN_WINDOW comment in scaling.rs.
+    /// timeout.
     autoscaler_poll_secs: u64,
     autoscaler_scale_up_window_secs: u64,
+    /// Scale-down stabilization window. Default 600s (K8s HPA
+    /// convention). VM tests shorten this to ~10s to observe a
+    /// full up→down cycle within the test timeout.
+    autoscaler_scale_down_window_secs: u64,
     autoscaler_min_interval_secs: u64,
     /// mTLS client config for outgoing gRPC (scheduler + store).
     /// Set via `RIO_TLS__*`. The controller's K8s API connection
@@ -81,6 +84,7 @@ impl Default for Config {
             // a const-fn dance — keep them in sync when changing.
             autoscaler_poll_secs: 30,
             autoscaler_scale_up_window_secs: 30,
+            autoscaler_scale_down_window_secs: 600,
             autoscaler_min_interval_secs: 30,
             tls: rio_common::tls::TlsConfig::default(),
         }
@@ -270,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
     let timing = rio_controller::scaling::ScalingTiming {
         poll_interval: std::time::Duration::from_secs(cfg.autoscaler_poll_secs),
         scale_up_window: std::time::Duration::from_secs(cfg.autoscaler_scale_up_window_secs),
+        scale_down_window: std::time::Duration::from_secs(cfg.autoscaler_scale_down_window_secs),
         min_scale_interval: std::time::Duration::from_secs(cfg.autoscaler_min_interval_secs),
     };
     info!(?timing, "autoscaler timing");

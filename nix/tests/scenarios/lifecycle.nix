@@ -38,8 +38,15 @@
 #       "controller.extraEnv[1].value" = "3";
 #       "controller.extraEnv[2].name"  = "RIO_AUTOSCALER_MIN_INTERVAL_SECS";
 #       "controller.extraEnv[2].value" = "3";
+#       "controller.extraEnv[3].name"  = "RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS";
+#       "controller.extraEnv[3].value" = "10";
 #     };
 #   };
+#
+# r[verify ctrl.build.reconnect]
+#   build-crd-reconnect kills the scheduler leader mid-build and asserts
+#   the controller's drain_stream reconnects on non-terminal EOF (Ok(None)
+#   from tonic on TCP FIN). Same bug class as gateway 06a1fa0.
 {
   pkgs,
   common,
@@ -88,6 +95,16 @@ let
   # recover_from_pg → recovery_complete.store(true). Also becomes the
   # backdate target for gc-sweep (unpinned, so sweep can delete it).
   recoveryDrv = drvs.mkTrivial { marker = "lifecycle-recovery"; };
+
+  # build-crd-reconnect in-flight build. 60s sleep survives the kill
+  # window (same rationale as recoverySlowDrv: lease TTL ~15s + standby
+  # recovery ~1s + controller's drain_stream backoff 1/2/4s + WatchBuild
+  # reconnect). Shorter than recoverySlowDrv because the controller's
+  # reconnect is simpler than full scheduler recovery.
+  reconnectDrv = drvs.mkTrivial {
+    marker = "lifecycle-reconnect";
+    sleepSecs = 60;
+  };
 
   # Build CRD watch-dedup. 5s sleep → multiple BuildEvent cycles
   # (Pending → Building → log lines → Succeeded). Each cycle patches
@@ -141,7 +158,9 @@ pkgs.testers.runNixOSTest {
   # v18: 513s to recovery-start + 100s settle-wait = ~615s before
   # the recovery slow-build (90s) even begins. ~5 subtests remain
   # after recovery. 1500s keeps headroom against pf-churn variance.
-  globalTimeout = 1500;
+  # +180s for build-crd-reconnect (60s build + failover + reconnect)
+  # + ~30s for autoscaler scale-down observation.
+  globalTimeout = 1800;
 
   inherit (fixture) nodes;
 
@@ -668,6 +687,100 @@ pkgs.testers.runNixOSTest {
         print(f"recovery PASS: standby took over, loaded {nonterminal} row(s), built {out_recovery}")
 
     # ══════════════════════════════════════════════════════════════════
+    # build-crd-reconnect — controller drain_stream reconnects on EOF
+    # ══════════════════════════════════════════════════════════════════
+    # Regression guard for the Ok(None)-returns-unconditionally bug
+    # (same class as gateway 06a1fa0). k8s pod kill = SIGTERM → graceful
+    # drain → TCP FIN → tonic Ok(None), NOT Err(Transport). Before the
+    # fix, drain_stream returned on ANY Ok(None), so a scheduler pod
+    # kill mid-build froze the Build CR's status at "Building" forever.
+    #
+    # build-crd-flow above runs on a stable scheduler so it never hits
+    # this path. recovery killed the leader once already; this kills
+    # the NEW leader. The Deployment-spawned replacement + the original
+    # standby are both available for failover.
+    with subtest("build-crd-reconnect: status resumes after scheduler kill mid-build"):
+        # Baseline reconnect count. The build-crd-flow Build CR hit
+        # terminal before any scheduler restart, so its drain_stream
+        # never reconnected. recovery's slow build went through ssh-ng
+        # (no Build CR), so the controller was uninvolved. Expect 0.
+        cm0 = ctrl_metrics()
+        reconnects0 = metric_value(cm0, "rio_controller_build_watch_reconnects_total") or 0.0
+
+        # Instantiate + upload .drv closure. Same pattern as build-crd-flow.
+        drv_path = client.succeed(
+            "nix-instantiate "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${reconnectDrv} 2>/dev/null"
+        ).strip()
+        client.succeed(
+            f"nix copy --derivation --to 'ssh-ng://k3s-server' {drv_path}"
+        )
+        k3s_server.succeed(
+            "k3s kubectl apply -f - <<'EOF'\n"
+            "apiVersion: rio.build/v1alpha1\n"
+            "kind: Build\n"
+            "metadata:\n"
+            "  name: test-reconnect\n"
+            "  namespace: ${ns}\n"
+            "spec:\n"
+            f"  derivation: {drv_path}\n"
+            "  priority: 10\n"
+            "EOF"
+        )
+
+        # Wait for Building (not Pending): the build is dispatched and
+        # the worker is actively running it. Started event fired, first
+        # patch landed. If we kill while still Pending, build_id may
+        # still be the "submitted" sentinel and WatchBuild can't work.
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get build test-reconnect "
+            "-o jsonpath='{.status.phase}' | grep -qx Building",
+            timeout=60,
+        )
+
+        # Kill the CURRENT leader. Controller's drain_stream receives
+        # Ok(None) (TCP FIN from graceful pod termination). Without the
+        # fix, it returns; with the fix, it enters the reconnect loop.
+        leader = leader_pod()
+        print(f"build-crd-reconnect: killing leader {leader}")
+        kubectl(f"delete pod {leader} --grace-period=0 --force")
+
+        # THE ASSERTION: status reaches Succeeded. Controller reconnected
+        # via WatchBuild on the new leader, which replayed events from
+        # last_sequence. 180s: 60s build + lease TTL 15s + controller
+        # backoff 1+2+4s + new leader's recover_from_pg + informer lag.
+        # Before the fix: status stuck at Building, this times out.
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n ${ns} get build test-reconnect "
+            "-o jsonpath='{.status.phase}' | "
+            "grep -E '^(Succeeded|Completed|Cached)$'",
+            timeout=180,
+        )
+
+        # Metric proof: reconnect counter incremented. drain_stream's
+        # shared reconnect body fires this on every attempt (EOF or
+        # Err). ≥1 not ==1: if the first WatchBuild hits the
+        # still-draining old leader or the not-yet-leader standby,
+        # drain_stream retries.
+        cm = ctrl_metrics()
+        reconnects = metric_value(cm, "rio_controller_build_watch_reconnects_total") or 0.0
+        assert reconnects > reconnects0, (
+            f"expected build_watch_reconnects_total to increment "
+            f"(was {reconnects0}, now {reconnects}) — drain_stream "
+            f"should have entered the reconnect loop on non-terminal EOF"
+        )
+
+        # Cleanup. --wait=false + poll: same finalizer pattern as
+        # build-crd-flow.
+        kubectl("delete build test-reconnect --wait=false")
+        k3s_server.wait_until_succeeds(
+            "! k3s kubectl -n ${ns} get build test-reconnect 2>/dev/null",
+            timeout=15,
+        )
+        print(f"build-crd-reconnect PASS: reconnects {reconnects0}→{reconnects}")
+
+    # ══════════════════════════════════════════════════════════════════
     # gc-dry-run — TriggerGC via AdminService proxy, sweep ROLLBACK
     # ══════════════════════════════════════════════════════════════════
     # Same RPC path as phase3b (scheduler → store → mark → sweep →
@@ -829,7 +942,42 @@ pkgs.testers.runNixOSTest {
             "END {exit !(q==0 && r==0)}'",
             timeout=150,
         )
-        print(f"autoscaler PASS: STS scaled 1→2, scaling_decisions_total={scale_up}")
+
+        # ── Scale-down: queue empty → STS replicas 2→1 ───────────────
+        # With RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS=10 (default 600s,
+        # shortened via controller.extraEnv[3]), after queue=0 is stable
+        # for 10s the autoscaler patches STS back to 1. This exercises
+        # check_stabilization's Direction::Down arm + ScaledDown event
+        # recorder path — both uncovered before this test.
+        # 60s: 10s down-window + 3s poll + 3s min-interval + k3s latency.
+        k3s_server.wait_until_succeeds(
+            "test \"$(k3s kubectl -n ${ns} get statefulset default-workers "
+            "-o jsonpath='{.spec.replicas}')\" = 1",
+            timeout=60,
+        )
+
+        # direction="down" metric. ≥1: same honest-bound rationale as
+        # scale_up above (reconciler-replicas reset MIGHT have raced).
+        cm = ctrl_metrics()
+        scale_down = metric_value(cm, "rio_controller_scaling_decisions_total",
+                                  labels='{direction="down"}')
+        assert scale_down is not None and scale_down >= 1.0, (
+            f"expected scaling_decisions_total{{direction=\"down\"}} >= 1, "
+            f"got {scale_down!r}\n"
+            f"  all scaling series: {cm.get('rio_controller_scaling_decisions_total', {})!r}"
+        )
+
+        # ScaledDown K8s Event on the WorkerPool. The autoscaler's
+        # recorder.publish path for Direction::Down (scaling.rs:359).
+        events_down = kubectl(
+            "get events "
+            "--field-selector involvedObject.name=default,involvedObject.kind=WorkerPool,reason=ScaledDown "
+            "-o name"
+        ).strip()
+        assert events_down, (
+            f"expected ScaledDown K8s Event on WorkerPool/default, got none"
+        )
+        print(f"autoscaler PASS: STS scaled 1→2→1, up={scale_up} down={scale_down}")
 
     # ══════════════════════════════════════════════════════════════════
     # gc-sweep — PinPath + backdate + non-dry-run sweep PROVES commit

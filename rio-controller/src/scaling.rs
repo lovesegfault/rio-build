@@ -49,20 +49,10 @@ use crate::crds::workerpool::WorkerPool;
 /// Stabilization window for scale-down. Long: avoid killing
 /// workers right before the next burst. 10 min is the K8s HPA
 /// default `--horizontal-pod-autoscaler-downscale-stabilization`;
-/// we follow that convention.
-///
-/// NOT in ScalingTiming: the anti-flap property of a long down-
-/// window is a correctness guarantee, not a tuning knob. Tests
-/// that want fast iteration override the UP windows (scale-up
-/// is the thing that needs to happen fast in a VM test); a
-/// short scale-down would make them flaky under load spikes.
-const SCALE_DOWN_WINDOW: Duration = Duration::from_secs(600);
-
-/// Tunable timing. Defaults: 30s each.
-/// Configurable via `RIO_AUTOSCALER_*_SECS` env so VM tests can
-/// use 3s windows instead of waiting ~60s for a single scale-up.
-///
-/// The scale-DOWN window stays a 600s const — see its comment.
+/// we follow that convention as the DEFAULT. Configurable via
+/// `RIO_AUTOSCALER_SCALE_DOWN_WINDOW_SECS` so VM tests can observe
+/// a full up→down cycle without waiting 10 minutes — production
+/// deploys leave this at the default.
 #[derive(Debug, Clone, Copy)]
 pub struct ScalingTiming {
     /// How often to poll ClusterStatus. Granularity for everything
@@ -72,6 +62,10 @@ pub struct ScalingTiming {
     /// (same value) for this long before we patch. Queue depth
     /// is high-confidence → react relatively fast.
     pub scale_up_window: Duration,
+    /// Stabilization window for scale-down. Default 10 min (K8s
+    /// HPA convention). Anti-flap: killing workers right before
+    /// the next burst is the #1 autoscaler failure mode.
+    pub scale_down_window: Duration,
     /// Minimum interval between any two patches. Anti-flap: a
     /// desired that wobbles around a boundary shouldn't cause
     /// rapid patch churn.
@@ -83,6 +77,7 @@ impl Default for ScalingTiming {
         Self {
             poll_interval: Duration::from_secs(30),
             scale_up_window: Duration::from_secs(30),
+            scale_down_window: Duration::from_secs(600),
             min_scale_interval: Duration::from_secs(30),
         }
     }
@@ -138,7 +133,7 @@ pub struct Autoscaler {
     /// iterations. Pruned when a pool disappears from the list.
     states: HashMap<String, ScaleState>,
     /// Timing knobs. `Copy` — passed by value into
-    /// check_stabilization (3 Durations = 24 bytes).
+    /// check_stabilization (4 Durations = 32 bytes).
     timing: ScalingTiming,
     /// K8s Events recorder. Emits ScaledUp/ScaledDown events on
     /// successful scale patches so operators see the autoscaler's
@@ -672,12 +667,13 @@ fn check_stabilization(
         return Decision::Wait(WaitReason::NoChange);
     }
 
-    // Direction + window. Up-window tunable (VM tests want 3s);
-    // down-window is the fixed 10-min const (correctness).
+    // Direction + window. Both tunable: VM tests shorten both
+    // to observe a full up→down cycle; production uses 30s up
+    // / 600s down (K8s HPA convention for downscale anti-flap).
     let (direction, window) = if desired > current {
         (Direction::Up, timing.scale_up_window)
     } else {
-        (Direction::Down, SCALE_DOWN_WINDOW)
+        (Direction::Down, timing.scale_down_window)
     };
 
     if now.duration_since(state.stable_since) < window {
@@ -877,6 +873,7 @@ mod tests {
     const T: ScalingTiming = ScalingTiming {
         poll_interval: Duration::from_secs(30),
         scale_up_window: Duration::from_secs(30),
+        scale_down_window: Duration::from_secs(600),
         min_scale_interval: Duration::from_secs(30),
     };
 
@@ -930,7 +927,7 @@ mod tests {
         let mut state = mk_state(10);
         state.last_desired = 3; // as if we've seen 3 before
 
-        // Age past T.scale_up_window but NOT SCALE_DOWN_WINDOW.
+        // Age past T.scale_up_window but NOT T.scale_down_window.
         state.stable_since = Instant::now()
             .checked_sub(T.scale_up_window + Duration::from_secs(60))
             .unwrap();
@@ -945,7 +942,7 @@ mod tests {
 
         // Age past down window.
         state.stable_since = Instant::now()
-            .checked_sub(SCALE_DOWN_WINDOW + Duration::from_secs(1))
+            .checked_sub(T.scale_down_window + Duration::from_secs(1))
             .unwrap();
         let d2 = check_stabilization(&mut state, 10, 3, T);
         assert!(matches!(d2, Decision::Patch(Direction::Down)));

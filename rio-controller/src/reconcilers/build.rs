@@ -126,7 +126,7 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
         // bother validating UUID format — if the scheduler gave
         // us a non-UUID, WatchBuild will just return NotFound.
         let is_real_uuid = status.build_id != "submitted";
-        let is_terminal = matches!(status.phase.as_str(), "Succeeded" | "Failed" | "Cancelled");
+        let is_terminal = is_terminal_phase(&status.phase);
 
         // Orphaned sentinel check. If build_id=="submitted"
         // AND no watch is running for this Build (watching doesn't
@@ -605,6 +605,15 @@ pub(crate) fn derivation_to_node(
     }
 }
 
+/// Terminal phases: scheduler has closed the build, no more events
+/// will arrive. Used by both apply()'s idempotence gate (don't
+/// reconnect a terminal Build) and drain_stream()'s EOF handling
+/// (stream close with terminal phase = expected; non-terminal =
+/// scheduler pod killed mid-build, same class as 06a1fa0 gateway).
+fn is_terminal_phase(phase: &str) -> bool {
+    matches!(phase, "Succeeded" | "Failed" | "Cancelled")
+}
+
 /// Map CRD's integer priority to the scheduler's priority_class
 /// string. Higher integer → more urgent class.
 ///
@@ -692,7 +701,11 @@ async fn drain_stream(
     const MAX_RECONNECT: u32 = 5;
 
     loop {
-        match stream.message().await {
+        // Both non-terminal-EOF and Err arms fall through to the
+        // reconnect body below. Ok(Some) processes and `continue`s.
+        // reconnect_reason carries the log string so both arms can
+        // share the same backoff+WatchBuild logic.
+        let reconnect_reason: String = match stream.message().await {
             Ok(Some(ev)) => {
                 // Reset reconnect counter: stream is healthy.
                 reconnect_attempts = 0;
@@ -757,100 +770,113 @@ async fn drain_stream(
                     );
                     return;
                 }
+                continue;
             }
             Ok(None) => {
-                // Stream EOF: build terminal, scheduler closed.
-                // Final status was already patched (Completed/
-                // Failed/Cancelled all trigger a patch above).
-                debug!(build = %name, "BuildEvent stream closed");
-                return;
+                // Stream EOF. Terminal phase → scheduler closed
+                // after the final Completed/Failed/Cancelled event
+                // (which was already patched above). Expected.
+                if is_terminal_phase(&status.phase) {
+                    debug!(build = %name, phase = %status.phase, "BuildEvent stream closed (terminal)");
+                    return;
+                }
+                // Non-terminal EOF: k8s pod kill = SIGTERM →
+                // graceful drain → TCP FIN → tonic Ok(None), NOT
+                // Err(Transport). Same bug class as 06a1fa0
+                // (gateway). Fall through to reconnect — WatchBuild
+                // on the new leader delivers the remaining events.
+                // r[impl ctrl.build.reconnect]
+                format!("stream EOF at non-terminal phase {:?}", status.phase)
             }
             Err(e) => {
                 // Scheduler dropped (restart, failover, network).
-                // Reconnect via WatchBuild with last seq. Backoff
-                // 1s/2s/4s/8s/16s; after MAX_RECONNECT fails, give
-                // up — status stale until next controller restart.
-                reconnect_attempts += 1;
-                if reconnect_attempts > MAX_RECONNECT {
-                    warn!(
-                        build = %name,
-                        error = %e,
-                        attempts = reconnect_attempts,
-                        "BuildEvent stream error: max reconnects exhausted; status will stop updating"
-                    );
-                    // Patch phase=Unknown so operator sees "watch
-                    // lost" not just "stuck at last state". Terminal-
-                    // ish (not Succeeded/Failed/Cancelled) so the
-                    // idempotence gate WOULD reconnect on controller
-                    // restart. Best-effort; ignore PATCH error.
-                    status.phase = "Unknown".into();
-                    let _ = patch_status(&api, &name, status).await;
-                    return;
-                }
+                e.to_string()
+            }
+        };
 
-                let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
-                warn!(
-                    build = %name,
-                    error = %e,
-                    attempt = reconnect_attempts,
-                    backoff_secs = backoff.as_secs(),
-                    "BuildEvent stream error; reconnecting"
-                );
-                tokio::time::sleep(backoff).await;
+        // ---- Reconnect via WatchBuild with last seq ----
+        // Backoff 1s/2s/4s/8s/16s; after MAX_RECONNECT fails, give
+        // up — status stale until next controller restart.
+        reconnect_attempts += 1;
+        metrics::counter!("rio_controller_build_watch_reconnects_total").increment(1);
+        if reconnect_attempts > MAX_RECONNECT {
+            warn!(
+                build = %name,
+                error = %reconnect_reason,
+                attempts = reconnect_attempts,
+                "BuildEvent stream error: max reconnects exhausted; status will stop updating"
+            );
+            // Patch phase=Unknown so operator sees "watch
+            // lost" not just "stuck at last state". Terminal-
+            // ish (not Succeeded/Failed/Cancelled) so the
+            // idempotence gate WOULD reconnect on controller
+            // restart. Best-effort; ignore PATCH error.
+            status.phase = "Unknown".into();
+            let _ = patch_status(&api, &name, status).await;
+            return;
+        }
 
-                // Reconnect: fresh scheduler client + WatchBuild.
-                // Need build_id — if we never got the first event
-                // (status.build_id empty), we can't reconnect.
-                // That's the "SubmitBuild stream dropped before
-                // first event" case — rare (scheduler crashed
-                // between MergeDag and first BuildStarted). Just
-                // exit; apply()'s idempotence gate will retry on
-                // next reconcile (build_id is still "submitted"
-                // sentinel → resubmit).
-                if status.build_id.is_empty() {
-                    warn!(build = %name, "no build_id yet; cannot reconnect, exiting watch");
-                    return;
-                }
+        let backoff = std::time::Duration::from_secs(1 << (reconnect_attempts - 1).min(4));
+        warn!(
+            build = %name,
+            error = %reconnect_reason,
+            attempt = reconnect_attempts,
+            backoff_secs = backoff.as_secs(),
+            "BuildEvent stream error; reconnecting"
+        );
+        tokio::time::sleep(backoff).await;
 
-                match rio_proto::client::connect_scheduler(&scheduler_addr).await {
-                    Ok(mut sched) => {
-                        match sched
-                            .watch_build(types::WatchBuildRequest {
-                                build_id: status.build_id.clone(),
-                                since_sequence: status.last_sequence as u64,
-                            })
-                            .await
-                        {
-                            Ok(resp) => {
-                                info!(build = %name, "reconnected WatchBuild");
-                                stream = resp.into_inner();
-                                // Loop continues: next iteration
-                                // reads from the new stream.
-                            }
-                            Err(wb_err) => {
-                                // WatchBuild itself failed (build
-                                // not found — recovery didn't
-                                // reconstruct it). Don't retry
-                                // THIS error — it's not transient.
-                                warn!(build = %name, error = %wb_err,
-                                      "WatchBuild failed (build unknown?); exiting watch");
-                                return;
-                            }
-                        }
+        // Reconnect: fresh scheduler client + WatchBuild.
+        // Need build_id — if we never got the first event
+        // (status.build_id empty), we can't reconnect.
+        // That's the "SubmitBuild stream dropped before
+        // first event" case — rare (scheduler crashed
+        // between MergeDag and first BuildStarted). Just
+        // exit; apply()'s idempotence gate will retry on
+        // next reconcile (build_id is still "submitted"
+        // sentinel → resubmit).
+        if status.build_id.is_empty() {
+            warn!(build = %name, "no build_id yet; cannot reconnect, exiting watch");
+            return;
+        }
+
+        match rio_proto::client::connect_scheduler(&scheduler_addr).await {
+            Ok(mut sched) => {
+                match sched
+                    .watch_build(types::WatchBuildRequest {
+                        build_id: status.build_id.clone(),
+                        since_sequence: status.last_sequence as u64,
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        info!(build = %name, "reconnected WatchBuild");
+                        stream = resp.into_inner();
+                        // Loop continues: next iteration
+                        // reads from the new stream.
                     }
-                    Err(conn_err) => {
-                        // Connect failed. Count as reconnect
-                        // attempt; next iteration of the outer
-                        // loop will Error again (stream is still
-                        // the dead one) → another backoff. After
-                        // MAX, give up.
-                        warn!(build = %name, error = %conn_err,
-                              "scheduler connect failed during reconnect");
-                        // Don't continue — the dead stream will
-                        // just error again immediately. Sleep was
-                        // already done above.
+                    Err(wb_err) => {
+                        // WatchBuild itself failed (build
+                        // not found — recovery didn't
+                        // reconstruct it). Don't retry
+                        // THIS error — it's not transient.
+                        warn!(build = %name, error = %wb_err,
+                              "WatchBuild failed (build unknown?); exiting watch");
+                        return;
                     }
                 }
+            }
+            Err(conn_err) => {
+                // Connect failed. Count as reconnect
+                // attempt; next iteration of the outer
+                // loop will Error again (stream is still
+                // the dead one) → another backoff. After
+                // MAX, give up.
+                warn!(build = %name, error = %conn_err,
+                      "scheduler connect failed during reconnect");
+                // Don't continue — the dead stream will
+                // just error again immediately. Sleep was
+                // already done above.
             }
         }
     }
@@ -1050,6 +1076,26 @@ mod tests {
         assert_eq!(priority_to_class(19), "ci");
         assert_eq!(priority_to_class(20), "interactive");
         assert_eq!(priority_to_class(100), "interactive");
+    }
+
+    /// is_terminal_phase: shared between apply()'s idempotence gate
+    /// and drain_stream()'s EOF handling. Both must agree on the
+    /// terminal set — if apply() thinks "Unknown" is terminal but
+    /// drain_stream doesn't, a stuck-Unknown Build never reconnects.
+    #[test]
+    fn terminal_phase_set() {
+        // Terminal: scheduler has finished, no more events.
+        assert!(is_terminal_phase("Succeeded"));
+        assert!(is_terminal_phase("Failed"));
+        assert!(is_terminal_phase("Cancelled"));
+        // Non-terminal: reconnect-worthy on stream EOF.
+        assert!(!is_terminal_phase("Pending"));
+        assert!(!is_terminal_phase("Building"));
+        // "Unknown" is the "reconnect exhausted" sentinel — NOT
+        // terminal (next controller restart should retry).
+        assert!(!is_terminal_phase("Unknown"));
+        // Empty (BuildStatus::default()) — also non-terminal.
+        assert!(!is_terminal_phase(""));
     }
 
     /// apply_event: state events patch, Log/Derivation don't.

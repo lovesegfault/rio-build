@@ -151,6 +151,7 @@ r[obs.metric.worker]
 | `rio_worker_fuse_cache_hits_total` | Counter | FUSE cache hits |
 | `rio_worker_fuse_cache_misses_total` | Counter | FUSE cache misses |
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
+| `rio_worker_fuse_fallback_reads_total` | Counter | Successful userspace `read()` callbacks. Near-zero when passthrough is on (kernel handles reads directly); nonzero when `fuse_passthrough=false` or passthrough failed for specific files. |
 | `rio_worker_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
 | `rio_worker_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`error`/`malformed`/`panic`). Sustained high `already_cached` = scheduler bloom filter stale. |
 | `rio_worker_upload_bytes_total` | Counter | Bytes uploaded to store via PutPath (nar_size on success) |
@@ -178,6 +179,7 @@ r[obs.metric.controller]
 | `rio_controller_workerpool_replicas` | Gauge | WorkerPool replica count (labeled desired vs actual) |
 | `rio_controller_scaling_decisions_total` | Counter | Scaling decisions (labeled by direction: up/down) |
 | `rio_controller_build_watch_spawns_total` | Counter | WatchBuild background tasks spawned by the Build reconciler. Should equal the number of distinct Build UIDs seen (dedup by `ctx.watching` DashMap). Alert if >> Build count: indicates watch dedup failure → duplicate event processing. |
+| `rio_controller_build_watch_reconnects_total` | Counter | Build watch stream reconnect attempts (both non-terminal EOF and transport errors). Nonzero is normal during scheduler failover; alert on sustained growth: indicates flapping scheduler or persistent connectivity issues. |
 | `rio_controller_gc_runs_total` *(Phase 4+)* | Counter | GC runs (labeled by result: success/failure) — not yet emitted |
 
 ### Histogram Buckets

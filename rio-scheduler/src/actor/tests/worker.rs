@@ -338,6 +338,91 @@ async fn test_force_drain_idle_worker_no_cancel_signals() -> TestResult {
     Ok(())
 }
 
+/// DrainWorker(force=true) on a BUSY worker → CancelSignal per in-flight
+/// build + result.running_builds=N. The preemption hook: controller sees
+/// DisruptionTarget on a pod, calls this so the worker cgroup.kills its
+/// builds NOW instead of running the full 2h terminationGracePeriod.
+///
+/// Counterpart to test_force_drain_idle_worker_no_cancel_signals — that
+/// one proves the CancelSignal loop does 0 iterations on idle; this one
+/// proves it does N iterations on busy. Covers worker.rs:211-258 (the
+/// `if force { ... }` body with a non-empty to_reassign).
+#[tokio::test]
+async fn test_force_drain_busy_worker_sends_cancel_signal() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("busy-worker", "x86_64-linux", 4).await?;
+
+    // Merge + dispatch → Assigned to busy-worker. running_builds={drv}.
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "drain-drv", PriorityClass::Scheduled).await?;
+    // recv_assignment on busy-worker's rx proves it was dispatched here.
+    let _assignment = recv_assignment(&mut rx).await;
+
+    // Force-drain. to_reassign drains running_builds → 1 entry.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::DrainWorker {
+            worker_id: "busy-worker".into(),
+            force: true,
+            reply: reply_tx,
+        })
+        .await?;
+    let result = reply_rx.await?;
+
+    assert!(result.accepted, "known worker → accepted");
+    // force=true → running_builds: 0 (worker.rs:277 "reassigned:
+    // caller doesn't wait"). The count is only nonzero for
+    // force=false (caller polls until it drains naturally).
+    assert_eq!(
+        result.running_builds, 0,
+        "force-drain reassigns immediately; caller doesn't wait"
+    );
+
+    // CancelSignal should arrive in the worker's stream with the
+    // force-drain reason (worker.rs:244). try_send on the stream_tx
+    // is synchronous; barrier ensures the actor finished processing.
+    barrier(&handle).await;
+    let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("CancelSignal should arrive within 2s")
+        .expect("channel should not close");
+    match msg.msg {
+        Some(rio_proto::types::scheduler_message::Msg::Cancel(c)) => {
+            assert!(
+                c.reason.contains("draining") && c.reason.contains("forced"),
+                "cancel reason should be 'worker draining (forced)': {}",
+                c.reason
+            );
+            // CancelSignal is keyed on drv_path (not drv_hash).
+            // merge_single_node uses a synthetic /nix/store/<hash>-... path.
+            assert!(
+                c.drv_path.contains("drain-drv"),
+                "CancelSignal drv_path should reference the in-flight build: {}",
+                c.drv_path
+            );
+        }
+        other => panic!("expected CancelSignal, got {other:?}"),
+    }
+
+    // Derivation reassigned: no longer Running/Assigned on busy-worker.
+    // reassign_derivations resets to Ready (or Queued — depends on
+    // whether another worker exists; here there's only one, which is
+    // now draining, so it stays Ready with busy-worker in failed_workers).
+    let post = handle
+        .debug_query_derivation("drain-drv")
+        .await?
+        .expect("drv exists");
+    assert!(
+        matches!(
+            post.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
+        "force-drain reassigns; drv should not still be Assigned/Running on the draining worker; got {:?}",
+        post.status
+    );
+
+    Ok(())
+}
+
 // r[verify sched.backstop.timeout]
 /// Backstop timeout: a derivation Running far longer than expected
 /// gets CancelSignal + reset_to_ready on Tick. The cfg(test) floor
