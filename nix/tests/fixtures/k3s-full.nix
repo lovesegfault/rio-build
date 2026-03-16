@@ -267,12 +267,17 @@ in
     k3s_server.wait_for_file("/etc/rancher/k3s/k3s.yaml")
 
     # ── Airgap import complete on BOTH nodes (BEFORE agent-ready) ───
-    # ctr images import runs as a separate oneshot unit AFTER k3s
-    # starts. Under TCG (nixbuild.net's non-KVM fallback), 6 images ×
-    # ~20-30s each ≈ 180s just for import. The agent's kubelet can't
-    # reach Ready until pause/CNI images are available, so waiting for
-    # agent-Ready FIRST times out before import completes.
-    # Gate on the last-to-import image (bitnami PG, largest at ~140MB).
+    # k3s imports airgap images SERIALLY (alphabetically) via a
+    # goroutine that runs BEFORE kubelet starts. Under TCG (non-KVM
+    # fallback): system bundle (pause/CNI/bitnami) first, then rio-*
+    # bundle. bitnami is NOT last — the rio-* images (~25s each × 5)
+    # come after and add ~125s of hidden serial import time.
+    # Gate on pause (minimal kubelet pod infra) + rio-store
+    # (alphabetically last-minus-one in the rio bundle; kubelet was
+    # observed starting ~27ms after rio-store finishes, concurrent
+    # with rio-worker import). The rio-store gate is fragile (depends
+    # on image set + alpha order) but gives a named checkpoint more
+    # debuggable than a raw node-exists timeout.
     for n in [k3s_server, k3s_agent]:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
@@ -280,10 +285,28 @@ in
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q 'bitnami/postgresql'", timeout=240
         )
+        n.wait_until_succeeds(
+            "k3s ctr images ls -q | grep -q 'rio-store'", timeout=300
+        )
 
-    # ── Agent joined (images present → kubelet can start pods) ──────
-    # Agent Ready condition means kubelet registered + CNI up. With
-    # images already imported this is just kubelet startup (~30s).
+    # ── Server node registered (kubelet up, images imported) ────────
+    # Agent cannot join until the server's kubelet has registered the
+    # server node with the apiserver. Pre-fix, agent-Ready absorbed
+    # ~107s of rio-* import time in its 120s budget (successful run:
+    # 106.70/120s = 89% burned; 1.8× slower builder blew it by ~72s).
+    # This gate directly tests the actual precondition. EXISTS (not
+    # Ready) is sufficient: Ready needs CNI which needs flannel which
+    # needs the node to exist first. timeout=300: ~180s observed from
+    # wait_for_unit to kubelet-start under TCG + variance headroom.
+    k3s_server.wait_until_succeeds(
+        "k3s kubectl get node k3s-server 2>/dev/null",
+        timeout=300,
+    )
+
+    # ── Agent joined ────────────────────────────────────────────────
+    # With server registered, agent-Ready now measures ONLY the
+    # agent's own kubelet start + CNI bring-up (~30-60s under TCG,
+    # not the 100+s of hidden import it previously absorbed).
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-agent "
         "-o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' "
