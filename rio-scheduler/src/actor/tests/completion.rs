@@ -466,3 +466,126 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.classify.penalty-overwrite]
+/// Misclassification detection: a build routed to "small" (30s cutoff)
+/// that completes in 100s (> 2× cutoff) triggers the penalty-overwrite
+/// branch (completion.rs:303-324). The detection RECORDS the misclass
+/// (metric + EMA overwrite) — next classify() for this pname sees 100s
+/// and picks "large".
+///
+/// dispatch.rs:test_size_class_routing_respects_classification proves
+/// `assigned_size_class` is recorded; this proves the detection USES it.
+#[tokio::test]
+#[traced_test]
+async fn test_misclass_detection_on_slow_completion() -> TestResult {
+    use crate::assignment::SizeClassConfig;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |a| {
+        a.with_size_classes(vec![
+            SizeClassConfig {
+                name: "small".into(),
+                cutoff_secs: 30.0,
+                mem_limit_bytes: u64::MAX,
+            },
+            SizeClassConfig {
+                name: "large".into(),
+                cutoff_secs: 3600.0,
+                mem_limit_bytes: u64::MAX,
+            },
+        ])
+    });
+
+    // Small worker. No EMA pre-seed → classify() defaults to 30s →
+    // routes to "small". Exactly the scenario: something LOOKED small,
+    // but wasn't.
+    let (tx, mut rx) = mpsc::channel(256);
+    handle
+        .send_unchecked(ActorCommand::WorkerConnected {
+            worker_id: "w-small".into(),
+            stream_tx: tx,
+        })
+        .await?;
+    handle
+        .send_unchecked(ActorCommand::Heartbeat {
+            resources: None,
+            bloom: None,
+            size_class: Some("small".into()),
+            worker_id: "w-small".into(),
+            systems: vec!["x86_64-linux".into()],
+            supported_features: vec![],
+            max_builds: 4,
+            running_builds: vec![],
+        })
+        .await?;
+
+    // Merge with pname — the EMA-update block (completion.rs:247-249)
+    // gates on pname.is_some(). Without it, misclass detection never fires.
+    let build_id = Uuid::new_v4();
+    let mut node = make_test_node("misc-drv", "x86_64-linux");
+    node.pname = "slowthing".into();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Dispatch → assigned_size_class="small" set on the state.
+    let _ = recv_assignment(&mut rx).await;
+
+    // Complete with duration=100s (start=1000, stop=1100 unix seconds).
+    // 100 > 2×30 = 60 → misclass branch fires.
+    let drv_path = test_drv_path("misc-drv");
+    handle
+        .send_unchecked(ActorCommand::ProcessCompletion {
+            worker_id: "w-small".into(),
+            drv_key: drv_path,
+            result: rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                built_outputs: vec![rio_proto::types::BuiltOutput {
+                    output_name: "out".into(),
+                    output_path: "/nix/store/zzz-slowthing-out".into(),
+                    output_hash: vec![0u8; 32],
+                }],
+                start_time: Some(prost_types::Timestamp {
+                    seconds: 1000,
+                    nanos: 0,
+                }),
+                stop_time: Some(prost_types::Timestamp {
+                    seconds: 1100,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+            peak_memory_bytes: 0,
+            output_size_bytes: 0,
+            peak_cpu_cores: 0.0,
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // THE ASSERTION: the warn! in completion.rs:308-315 fired. If the
+    // detection branch was dead code (missing assigned_size_class, missing
+    // pname, threshold wrong), this would fail.
+    assert!(
+        logs_contain("misclassification"),
+        "expected 'misclassification: actual > 2× cutoff' warn log; \
+         detection branch at completion.rs:303-324 should have fired \
+         (duration=100s > 2×30s=60s small-class cutoff)"
+    );
+
+    // build_history now has the penalty-overwritten EMA. The overwrite
+    // uses actual duration directly (no blend), so ema_duration_secs ≈100.
+    // ≥ 60 is enough to prove the write happened (update_build_history's
+    // normal blend would give 0.3*100+0.7*30 = 51 for the FIRST sample…
+    // but actually the first sample has no prior to blend with — let me
+    // just check > 2×cutoff, which distinguishes penalty from no-penalty).
+    let ema: f64 =
+        sqlx::query_scalar("SELECT ema_duration_secs FROM build_history WHERE pname = 'slowthing'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        ema > 60.0,
+        "penalty-overwrite should have written actual duration (≈100s), \
+         not the blended EMA; got {ema}"
+    );
+
+    Ok(())
+}
