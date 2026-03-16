@@ -188,6 +188,67 @@ pkgs.testers.runNixOSTest {
         )
 
     # ══════════════════════════════════════════════════════════════════
+    # fuse-direct — readdir/access on the FUSE mount (bypasses overlay)
+    # ══════════════════════════════════════════════════════════════════
+    # chain.nix:43 does `ls -la $dep/` INSIDE the build sandbox (overlay
+    # lower 2 = FUSE). ops.rs readdir() stays 0 hits even in lifecycle-k3s
+    # — overlayfs is not delegating FUSE_READDIR to the lower. This subtest
+    # ls's the FUSE mount DIRECTLY (no overlay) to prove readdir() is
+    # reachable at all; if THIS is 0 hits, the problem is fuser/kernel,
+    # not overlayfs.
+    with subtest("fuse-direct: readdir/access on FUSE mount (overlay bypass)"):
+        # Both small workers fetched ≥1 path (asserted above). `ls` on
+        # /var/rio/fuse-store (the mount point, not /var/rio/cache) hits
+        # FUSE readdir(ino=ROOT) → fs::read_dir(cache_dir).
+        for w in small_workers:
+            listing = w.succeed("ls -la /var/rio/fuse-store/ 2>&1")
+            print(f"{w.name} fuse-store root:\n{listing}")
+            # access(R_OK) via faccessat(2). make_fuse_config (fuse/mod.rs
+            # :189) does NOT set MountOption::DefaultPermissions → kernel
+            # forwards the permission check to userspace access().
+            w.succeed("test -r /var/rio/fuse-store/")
+
+        # Subdir readdir — fast path at ops.rs:410 (tree already
+        # materialized by a prior lookup). Cache contains BOTH .drv
+        # files (regular files) and output dirs; `find -type d` filters
+        # to dirs. busybox is always there (fetched as input for the
+        # leaves wsmall1 built).
+        cached = wsmall1.succeed(
+            "find /var/rio/cache/ -mindepth 1 -maxdepth 1 -type d "
+            "-printf '%f\\n'"
+        ).strip()
+        assert cached, "wsmall1 /var/rio/cache/ has no dirs after fanout"
+        cached = cached.split("\n")[0]
+        sub = wsmall1.succeed(f"ls -la /var/rio/fuse-store/{cached}/ 2>&1")
+        print(f"wsmall1 fuse-store/{cached}:\n{sub}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # overlay-readdir-correctness — does ls INSIDE a build see ALL files?
+    # ══════════════════════════════════════════════════════════════════
+    # fuse-direct above proves readdir() CAN fire. This probes whether
+    # the per-build overlay (lowerdir=/nix/store:{fuse}) serves a
+    # CORRECT listing. multifile.nix: dep has 5 files, consumer ls's it
+    # with a cold overlay dcache (no child names previously looked up).
+    # If overlay shortcuts via its own dcache, count<5 = correctness bug.
+    with subtest("overlay-readdir-correctness: ls in build sees all files"):
+        out = build("${drvs.multifile}", capture_stderr=False).strip()
+        count = client.succeed(
+            f"nix store cat --store 'ssh-ng://${gatewayHost}' {out}"
+        ).strip()
+        # count=5: overlay reads the FULL lower listing (correct). May
+        #   or may not go through /dev/fuse — coverage tells us which.
+        # count<5: overlay serves from dcache (H1). Correctness bug:
+        #   builds that `ls` a FUSE-served dep see only names they've
+        #   already touched. None of our tests would have caught this
+        #   — they all cat known filenames.
+        assert count == "5", (
+            f"overlay readdir returned {count} entries, expected 5. "
+            f"If <5: overlay serves from stale dcache (CORRECTNESS BUG). "
+            f"If =5 but ops.rs readdir still 0: overlay reads lower "
+            f"via a path that skips /dev/fuse (coverage gap only)."
+        )
+
+    # ══════════════════════════════════════════════════════════════════
     # sizeclass — psql-seeded EMA routes bigthing to large
     # ══════════════════════════════════════════════════════════════════
     with subtest("sizeclass: pre-seeded 120s EMA routes to large worker"):

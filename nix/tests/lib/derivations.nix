@@ -29,6 +29,11 @@ rec {
   # (pname in env for estimator lookup), `bigblob` (300KiB → chunked).
   sizeclass = ./derivations/sizeclass.nix;
 
+  # Overlay-readdir correctness probe: 5-file dep + consumer that ls's
+  # it FIRST (no prior lookup of child names). Asserts count=5.
+  # If <5: overlayfs serves readdir from stale dcache (correctness bug).
+  multifile = ./derivations/multifile.nix;
+
   # builtin:fetchurl busybox FOD + raw consumer. Cold-store only.
   # Takes `{ tag, sleepSecs }` at nix-build time via `--arg`.
   coldBootstrap = ./derivations/cold-bootstrap.nix;

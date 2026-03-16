@@ -393,6 +393,15 @@ impl Filesystem for NixStoreFs {
         reply.ok();
     }
 
+    // Coverage note: NOT reached via the per-build overlay. `ls ${dep}/`
+    // inside a build sandbox (overlay lower = this FUSE mount) returns the
+    // correct full listing — verified by scheduling.nix overlay-readdir-
+    // correctness (5-file dep, cold dcache, count=5 asserted) — but ops.rs
+    // readdir stays at 0 hits. overlayfs ovl_iterate() on a pure-lower dir
+    // gets the listing without a FUSE_READDIR round-trip to userspace
+    // (mechanism unconfirmed; not a correctness issue). Exercised directly
+    // by scheduling.nix fuse-direct: `ls /var/rio/fuse-store/` on the mount
+    // point with NO overlay in the path.
     fn readdir(
         &self,
         _req: &Request,
