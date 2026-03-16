@@ -883,24 +883,32 @@ pkgs.testers.runNixOSTest {
         # returns (or times out); don't block kubectl on that.
         kubectl("delete build test-cancel --wait=false")
 
-        # PRIMARY assertion: cgroup.procs empties. Direct evidence
-        # cgroup.kill fired (kernel SIGKILLs all PIDs). The log line
-        # (below) is secondary — it can lag containerd's log flush.
-        # Chain: controller reconcile (deletionTimestamp) → cleanup()
-        # → CancelBuild RPC (balanced, leader) → scheduler dispatch
-        # Cancel to worker → runtime.rs try_cancel_build → write
-        # cgroup.kill="1". Under TCG, budget for each hop.
-        # Diagnostic on timeout distinguishes: procs_after>0 = cancel
-        # never reached worker (scheduler dispatch or finalizer broken);
-        # procs_after=0 + log missing = log-flush lag only.
+        # PRIMARY assertion: cgroup REMOVED within 30s of delete. The
+        # 60s sleep hasn't completed — so removal proves the cancel
+        # chain ran: controller reconcile (deletionTimestamp) →
+        # cleanup() → CancelBuild RPC (balanced, leader) → scheduler
+        # dispatch Cancel → worker try_cancel_build → cgroup.kill="1"
+        # → kernel SIGKILLs procs → BuildCgroup::Drop rmdirs. Kernel
+        # rejects rmdir on non-empty cgroup, so gone ⇒ procs emptied.
+        # Run 7: gone in <1.5s (via || echo 0 fallback on cgroup.procs
+        # read — dir already rmdir'd by the time we polled).
+        #
+        # NOT checking `kubectl logs | grep 'cancelled via cgroup.kill'`:
+        # the polling itself triggers kubelet "Failed when writing line
+        # to log file, err=http2: stream closed" on the worker's log
+        # file (runs 6+7 only, ~4-5s cadence from grep-poll start; runs
+        # 4+5 never reached here). Worker emits the line (runtime.rs:197)
+        # but kubelet's containerd log-read stream is disrupted under
+        # TCG — not persisted to /var/log/pods/.../worker/0.log. Not a
+        # rio bug; the cgroup-gone speed is conclusive.
         try:
             worker_vm.wait_until_succeeds(
-                f"test 0 -eq $(wc -l < {cgroup_path}/cgroup.procs 2>/dev/null || echo 0)",
+                f"! test -e {cgroup_path}",
                 timeout=30,
             )
         except Exception:
             procs_after = worker_vm.succeed(
-                f"cat {cgroup_path}/cgroup.procs 2>/dev/null | wc -l || echo '?'"
+                f"cat {cgroup_path}/cgroup.procs 2>/dev/null | wc -l || echo gone"
             ).strip()
             k3s_server.execute(
                 "echo '=== DIAG: Build CR state (gone = finalizer ran) ===' >&2; "
@@ -916,32 +924,13 @@ pkgs.testers.runNixOSTest {
                   f"(was {procs_before})")
             raise
 
-        # Secondary: worker logs the kill. runtime.rs:197 info! fires
-        # after fs::write(cgroup.kill, "1") returns Ok. Pod logs (not
-        # VM serial — k3s pod stdout isn't in journald). Now that
-        # cgroup.procs is confirmed empty, this is just confirming
-        # the log-line path; generous timeout for containerd flush.
-        k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} logs default-workers-0 | "
-            "grep -q 'cancelled via cgroup.kill'",
-            timeout=30,
-        )
-
-        # Cgroup removed: BuildCgroup::Drop rmdirs it after kill()
-        # + the daemon wait (kill is sync but reap isn't; Drop waits).
-        # Host-side check (distroless pod can't `test -e`).
-        worker_vm.wait_until_succeeds(
-            f"! test -e {cgroup_path}",
-            timeout=30,
-        )
-
         # Build CR gone --- finalizer cleanup() completed, removed itself.
         k3s_server.wait_until_succeeds(
             "! k3s kubectl -n ${ns} get build test-cancel 2>/dev/null",
             timeout=15,
         )
-        print("cancel-cgroup-kill PASS: cgroup.procs emptied, log line seen, "
-              "cgroup rmdir'd, CR gone")
+        print("cancel-cgroup-kill PASS: cgroup rmdir'd in <30s "
+              "(sleep was 60s ⇒ killed not completed), CR gone")
 
     # ══════════════════════════════════════════════════════════════════
     # recovery — kill leader pod mid-build, standby takes over
