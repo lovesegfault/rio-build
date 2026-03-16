@@ -289,16 +289,24 @@ pkgs.testers.runNixOSTest {
         # leader. If we kill too early (build still in SubmitBuild /
         # DAG merge on the leader), we're testing "submit during
         # failover" not "build during failover" — different codepath.
-        # Signal: worker pod logs the derivation name.
         #
-        # --since=5m (not --tail=N): wait_until_succeeds retries with
-        # a FRESH kubectl-logs each time; the initial dispatch line
-        # scrolls past --tail=200 once the 60s build's completion
-        # output starts flowing.
+        # Signal: scheduler metric derivations_running ≥ 1. NOT
+        # kubectl-logs: the prior failover subtest's force-delete on
+        # k3s-server breaks the k3s-agent kubelet's log stream
+        # ("Failed when writing line to log file: http2: stream
+        # closed" — containerd→kubelet stream dies, doesn't recover).
+        # kubectl-logs returns stale/empty. The build IS running
+        # (client shows `building '...'`), just the log path is dead.
+        # Scheduler metrics via port-forward bypass kubelet entirely.
         k3s_server.wait_until_succeeds(
-            "k3s kubectl -n ${ns} logs default-workers-0 --since=5m "
-            "| grep -q 'rio-test-leader-failover'",
-            timeout=30,
+            "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
+            "  -o jsonpath='{.spec.holderIdentity}') && "
+            "k3s kubectl -n ${ns} port-forward $leader 19091:9091 "
+            "  >/dev/null 2>&1 & pf=$!; "
+            "trap 'kill $pf 2>/dev/null' EXIT; sleep 2; "
+            "curl -sf http://localhost:19091/metrics | "
+            "grep -E '^rio_scheduler_derivations_running [1-9]'",
+            timeout=60,
         )
 
         old_leader = leader_pod()
