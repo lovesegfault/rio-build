@@ -517,13 +517,15 @@ pkgs.testers.runNixOSTest {
         # ~10s; worker.rs:604-623). Without this baseline, the running
         # gauge might still show a stale count from pinDrv/watchDedup →
         # we'd kill the leader before the slow build is even dispatched
-        # → PG has 0 non-terminal rows → assert fails. 60s covers ≥3
-        # default-interval Ticks.
+        # → PG has 0 non-terminal rows → assert fails. 120s: Tick is
+        # 10s, each retry spawns a fresh port-forward (2s bind), and
+        # port 19091 TIME_WAIT can eat a retry. Observed: v17 timed
+        # out at 60s with connection-reset noise from the pf churn.
         sched_metric_wait(
             "awk '/^rio_scheduler_derivations_queued / {q=$2} "
             "/^rio_scheduler_derivations_running / {r=$2} "
             "END {exit !(q==0 && r==0)}'",
-            timeout=60,
+            timeout=120,
         )
 
         # Capture the pre-kill leader name. After `delete pod`, the
@@ -607,7 +609,7 @@ pkgs.testers.runNixOSTest {
         # finished yet.
         sched_metric_wait(
             "grep -qx 'rio_scheduler_recovery_total{outcome=\"success\"} 1'",
-            timeout=60,
+            timeout=120,
         )
 
         # Worker re-registered with the new leader. Fresh scheduler
