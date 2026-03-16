@@ -66,9 +66,14 @@ pkgs.testers.runNixOSTest {
     )
 
     # One CLI invocation. Always returns stdout+stderr (2>&1) so error
-    # messages show up in the test log on failure.
+    # messages show up in the test log on failure. covShellEnv sets
+    # LLVM_PROFILE_FILE in coverage mode (empty otherwise) — without
+    # it, the instrumented rio-cli binary runs but flushes profraws
+    # to the default `./default.profraw` (CWD of k3s_server's shell,
+    # probably /) which collectCoverage's tar doesn't pick up.
     def cli(args):
         return k3s_server.succeed(
+            "${common.covShellEnv}"
             "${tlsEnv}"
             "RIO_SCHEDULER_ADDR=localhost:19001 "
             f"${rioCli} {args} 2>&1"

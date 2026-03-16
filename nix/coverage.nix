@@ -39,6 +39,7 @@ let
     "gateway"
     "worker"
     "controller"
+    "cli"
   ];
   objectFlags = lib.concatMapStringsSep " " (b: "--object ${b}") covBins;
 

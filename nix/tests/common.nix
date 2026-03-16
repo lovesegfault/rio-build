@@ -67,6 +67,12 @@ rec {
   # the VM closure, same pattern as grpcurl in lifecycle.nix.
   inherit rio-workspace;
 
+  # Shell env prefix for non-systemd binary invocations (e.g., rio-cli
+  # in scenarios/cli.nix). Single %: the shell doesn't expand %p/%m so
+  # no escape needed — the double-%% above is systemd-specific. Empty
+  # string when coverage=false → safe to interpolate unconditionally.
+  covShellEnv = if coverage then "LLVM_PROFILE_FILE=/var/lib/rio/cov/rio-%p-%m.profraw " else "";
+
   # Static busybox: closure of exactly 1 path (no glibc, no runtime deps).
   # The sole input seed for all VM tests — FUSE fetches it on every worker,
   # validating the lazy-fetch path.
