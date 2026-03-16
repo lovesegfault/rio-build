@@ -70,12 +70,17 @@ let
         found=1
       done
       # Check for actual profraw files (tarballs may be empty).
-      if [ $found -eq 0 ] || ! ls $TMPDIR/raw/*.profraw >/dev/null 2>&1; then
+      # nullglob: if no match, the glob expands to nothing instead
+      # of a literal '*.profraw' — makes the array-length check
+      # below reliable regardless of bash globbing defaults.
+      shopt -s nullglob
+      profraws=($TMPDIR/raw/*.profraw)
+      if [ "''${#profraws[@]}" -eq 0 ]; then
         echo "WARNING: no profraws for ${name}, emitting empty lcov"
         touch $out
         exit 0
       fi
-      ${sysroot}/llvm-profdata merge -sparse $TMPDIR/raw/*.profraw -o $TMPDIR/m.profdata
+      ${sysroot}/llvm-profdata merge -sparse "''${profraws[@]}" -o $TMPDIR/m.profdata
       # 2>/dev/null: llvm-cov writes warnings ("N functions have
       # mismatched data") to stdout, which corrupts the lcov file.
       # These warnings are expected (shared libs between binaries);
@@ -97,7 +102,15 @@ let
         -a $TMPDIR/raw.lcov -o $out
     '';
 
-  perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCov;
+  # k3s-full fixture doesn't wire pod-level profraw collection yet
+  # (TODO in fixtures/k3s-full.nix: controller.extraEnv LLVM_PROFILE_
+  # FILE + hostPath cov volume). collectCoverage's systemctl-stop is a
+  # no-op on k3s nodes (no rio-* systemd units). Filtering them out
+  # avoids wasting VM-test wall-clock on builds that contribute zero
+  # coverage. Remove this filter once the fixture TODO is resolved.
+  vmTestsCovFiltered = lib.filterAttrs (n: _: !(lib.hasSuffix "-k3s" n)) vmTestsCov;
+
+  perTestLcov = lib.mapAttrs mkPerTestLcov vmTestsCovFiltered;
 
   # Union all per-test lcovs. `lcov -a` is additive — a line hit
   # in ANY VM test is hit in the union.
