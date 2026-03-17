@@ -36,6 +36,11 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("worker", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("worker")?;
 
+    // One token, cancelled on SIGTERM OR SIGINT. Cloned into every
+    // loop that must break for main() to return (profraw flush,
+    // FUSE Drop).
+    let shutdown = rio_common::signal::shutdown_signal();
+
     // Client TLS init BEFORE connect_store/connect_worker. Same
     // pattern as gateway: one config, all outgoing connections.
     // server_name matches the most common target (scheduler);
@@ -387,7 +392,7 @@ async fn main() -> anyhow::Result<()> {
         fod_proxy_url: cfg.fod_proxy_url,
     };
 
-    // Process incoming scheduler messages + SIGTERM for graceful drain.
+    // Process incoming scheduler messages + shutdown signal for graceful drain.
     //
     // Wrapped in a reconnect loop: on stream close/error, open a
     // fresh BuildExecution via the balanced channel (p2c routes to
@@ -399,14 +404,12 @@ async fn main() -> anyhow::Result<()> {
     // connected + running_builds populated → no reassignment.
     // See rio-scheduler/src/actor/recovery.rs handle_reconcile_assignments.
     //
-    // select! is biased toward sigterm: poll it FIRST each iteration.
+    // select! is biased toward shutdown: poll it FIRST each iteration.
     // Without `biased;`, select! picks a ready branch pseudorandomly —
-    // under heavy assignment traffic, SIGTERM could starve behind
+    // under heavy assignment traffic, the token could starve behind
     // stream messages. K8s sends SIGTERM then starts the grace period
     // clock; we want to react immediately, not after the next gap in
     // assignments.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
     'reconnect: loop {
         // Fresh per-connection outbound channel. The relay pumps
         // the permanent sink into this; when the gRPC bidi dies,
@@ -443,23 +446,31 @@ async fn main() -> anyhow::Result<()> {
                 // channel's probe loop rediscovers within ~3s.
                 tracing::warn!(error = %e, "BuildExecution open failed; retrying in 1s");
                 relay_target_tx.send_replace(None);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue 'reconnect;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'reconnect,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue 'reconnect,
+                }
             }
         };
         info!("BuildExecution stream open");
 
         let stream_end = loop {
             if heartbeat_handle.is_finished() {
-                tracing::error!("heartbeat loop terminated unexpectedly; exiting");
-                std::process::exit(1);
+                // bail! not exit(1): unwind the stack so fuse_session
+                // (above) drops → Mount::drop → fusermount -u.
+                // exit(1) would leak the mount → next start EBUSY.
+                // Skip run_drain: heartbeat is the scheduler probe;
+                // if it's dead, DrainWorker won't land anyway.
+                anyhow::bail!("heartbeat loop terminated unexpectedly");
             }
 
             tokio::select! {
                 biased;
 
-                _ = sigterm.recv() => {
-                    break StreamEnd::Sigterm;
+                // r[impl worker.shutdown.sigint]
+                _ = shutdown.cancelled() => {
+                    break StreamEnd::Shutdown;
                 }
 
                 msg_result = tokio_stream::StreamExt::next(&mut build_stream) => {
@@ -527,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         match stream_end {
-            StreamEnd::Sigterm => break 'reconnect,
+            StreamEnd::Shutdown => break 'reconnect,
             StreamEnd::Closed | StreamEnd::Error => {
                 // Swap relay target to None — relay buffers until
                 // we open the next stream. Running builds' send()s
@@ -541,8 +552,11 @@ async fn main() -> anyhow::Result<()> {
                     "BuildExecution stream ended; reconnecting (running builds continue)"
                 );
                 relay_target_tx.send_replace(None);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue 'reconnect;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'reconnect,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue 'reconnect,
+                }
             }
         }
     }
@@ -584,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Execute the SIGTERM drain sequence.
+/// Execute the shutdown drain sequence (SIGTERM or SIGINT).
 ///
 /// K8s preStop (controller.md:211-216):
 ///   1. DrainWorker: scheduler stops sending assignments
@@ -596,12 +610,12 @@ async fn main() -> anyhow::Result<()> {
 /// SIGKILL — builds lost. 2h is enough for ~any single build; the
 /// ones that take longer (LLVM+ccache-cold) are rare.
 ///
-/// Only called on SIGTERM. Stream close/error is handled by the
-/// reconnect loop — we no longer exit on those.
+/// Only called on shutdown signal. Stream close/error is handled
+/// by the reconnect loop — we no longer exit on those.
 async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str, worker_id: &str) {
     info!(
         in_flight = max_builds as usize - semaphore.available_permits(),
-        "SIGTERM received, draining"
+        "shutdown signal received, draining"
     );
 
     // Step 1: DrainWorker. Best-effort — if it fails (scheduler
@@ -661,10 +675,10 @@ async fn run_drain(semaphore: &Semaphore, max_builds: u32, scheduler_addr: &str,
     info!("drain complete, exiting");
 }
 
-/// Why the inner select loop exited. Sigterm breaks the outer
+/// Why the inner select loop exited. Shutdown breaks the outer
 /// reconnect loop; Closed/Error trigger a reconnect.
 enum StreamEnd {
-    Sigterm,
+    Shutdown,
     Closed,
     Error,
 }

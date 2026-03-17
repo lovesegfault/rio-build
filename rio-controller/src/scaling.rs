@@ -157,10 +157,11 @@ impl Autoscaler {
         }
     }
 
-    /// Main loop. Never returns (barring panic). main.rs spawns
-    /// this via `spawn_monitored` — if it dies, logged, controller
-    /// keeps reconciling (just without autoscale).
-    pub async fn run(mut self) {
+    /// Main loop. main.rs spawns this via `spawn_monitored`.
+    /// Returns on cancellation (SIGTERM/SIGINT) or panic (logged
+    /// by spawn_monitored; controller keeps reconciling without
+    /// autoscale).
+    pub async fn run(mut self, shutdown: rio_common::signal::Token) {
         let mut interval = tokio::time::interval(self.timing.poll_interval);
         // MissedTickBehavior::Skip: if one iteration takes >30s
         // (slow apiserver), don't fire twice immediately after.
@@ -168,7 +169,11 @@ impl Autoscaler {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => {}
+            }
             if let Err(e) = self.tick().await {
                 // Error on one tick doesn't kill the loop. The
                 // scheduler might be restarting, apiserver busy,

@@ -130,6 +130,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("controller", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("controller")?;
 
+    // Cancellation for the non-kube-runtime loops (autoscaler,
+    // health). kube-rs's .shutdown_on_signal() installs its OWN
+    // SIGTERM/SIGINT watcher for the Controller loops — tokio's
+    // signal() is broadcast, both watchers fire. This token is
+    // for the spawn_monitored tasks that kube-rs doesn't manage.
+    let shutdown = rio_common::signal::shutdown_signal();
+
     // Client TLS init BEFORE connect_admin. The controller connects
     // lazily per-reconcile (Ctx holds String addrs) — all those
     // connect calls go through rio_proto::client::connect_* which
@@ -240,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     // beyond "process is up" — the controller has no "I'm
     // connected but not yet leading" state (no leader election;
     // single replica per controller.md design).
-    spawn_health_server(cfg.health_addr);
+    spawn_health_server(cfg.health_addr, shutdown.clone());
 
     // ---- Events Recorder ----
     // Reporter identifies US (the controller) in emitted events.
@@ -310,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(?timing, "autoscaler timing");
     let autoscaler = Autoscaler::new(client.clone(), admin, timing, recorder);
-    rio_common::task::spawn_monitored("autoscaler", autoscaler.run());
+    rio_common::task::spawn_monitored("autoscaler", autoscaler.run(shutdown.clone()));
 
     // ---- Build controller ----
     // No `.owns()` — Builds don't own K8s children. The watch
@@ -345,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
 /// rio-controller's deps and adding it for one /healthz endpoint
 /// is heavy. K8s livenessProbe sends `GET /healthz HTTP/1.1` and
 /// checks for `200` — that's all we need to match.
-fn spawn_health_server(addr: std::net::SocketAddr) {
+fn spawn_health_server(addr: std::net::SocketAddr, shutdown: rio_common::signal::Token) {
     rio_common::task::spawn_monitored("health-server", async move {
         info!(addr = %addr, "starting HTTP health server");
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -356,8 +363,13 @@ fn spawn_health_server(addr: std::net::SocketAddr) {
             }
         };
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                continue; // accept fail is transient; retry
+            let (mut stream, _) = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                r = listener.accept() => match r {
+                    Ok(pair) => pair,
+                    Err(_) => continue, // accept fail is transient; retry
+                },
             };
             // Fire-and-forget: don't block accept on one slow client.
             tokio::spawn(async move {
@@ -422,7 +434,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener); // release so spawn_health_server can bind
-        spawn_health_server(addr);
+        spawn_health_server(addr, rio_common::signal::Token::new());
 
         // Give it a tick to bind.
         tokio::task::yield_now().await;

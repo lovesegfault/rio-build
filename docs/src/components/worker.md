@@ -374,6 +374,13 @@ When the scheduler sends a `CancelSignal` on the BuildExecution stream, the work
 r[worker.cancel.flag-clear-enoent]
 If `cgroup.kill` returns ENOENT (cancel raced cgroup creation), the cancel flag MUST be cleared. Leaving it set causes a subsequent unrelated failure to be misreported as Cancelled.
 
+## Shutdown
+
+r[worker.shutdown.sigint]
+
+The worker handles both SIGTERM and SIGINT by breaking the BuildExecution select loop, running `run_drain()`, and returning from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet → SIGTERM) share the same exit path. Returning from `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire (LLVM profraw flush).
+
+
 ## Key Files
 
 - `rio-worker/src/config.rs` --- `Config` + `CliArgs` (two-struct figment split) and `detect_system()`
