@@ -155,9 +155,12 @@ pub fn redact_db_url(url: &str) -> String {
     };
     let after_scheme = &url[scheme_end + 3..];
 
-    // Find the userinfo@host boundary. If no '@', there's no
-    // userinfo component → no password → safe as-is.
-    let Some(at_idx) = after_scheme.find('@') else {
+    // Find the userinfo@host boundary. RFC 3986: the userinfo delimiter
+    // is the *last* '@' before the host — passwords may contain literal
+    // '@' (percent-encoding is "should", not "must"). Using find('@')
+    // here would truncate at the first '@' and leak the password tail.
+    // If no '@', there's no userinfo component → no password → safe as-is.
+    let Some(at_idx) = after_scheme.rfind('@') else {
         return url.to_string();
     };
 
@@ -589,6 +592,21 @@ mod tests {
         assert_eq!(
             redact_db_url("postgres://u:pw@h:5432/d?sslmode=require&connect_timeout=30"),
             "postgres://u:***@h:5432/d?sslmode=require&connect_timeout=30"
+        );
+    }
+
+    #[test]
+    fn redact_db_url_password_with_at_sign() {
+        // RFC 3986: userinfo delimiter is the *last* '@'. Passwords
+        // containing '@' must not leak the tail past the first '@'.
+        assert_eq!(
+            redact_db_url("postgres://user:has@sign@host/db"),
+            "postgres://user:***@host/db"
+        );
+        // Multiple '@' in password.
+        assert_eq!(
+            redact_db_url("postgres://admin:a@b@c@db.example.com:5432/rio"),
+            "postgres://admin:***@db.example.com:5432/rio"
         );
     }
 }

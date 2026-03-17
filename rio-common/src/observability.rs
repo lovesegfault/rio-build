@@ -48,7 +48,7 @@ impl FromStr for LogFormat {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "json" => Ok(LogFormat::Json),
             "pretty" => Ok(LogFormat::Pretty),
             other => Err(format!(
@@ -150,11 +150,35 @@ where
         return Ok((None, OtelGuard(None)));
     };
 
-    let sample_rate = std::env::var("RIO_OTEL_SAMPLE_RATE")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
+    // Empty-string is distinct from unset: `RIO_OTEL_ENDPOINT=""` in a
+    // k8s env block or a shell export reaches here as Ok(""). Building
+    // an exporter against an empty URL succeeds but every export fails
+    // at DEBUG level — effectively silent. Treat empty as unset.
+    if endpoint.is_empty() {
+        eprintln!("RIO_OTEL_ENDPOINT is empty — OTel disabled");
+        return Ok((None, OtelGuard(None)));
+    }
+
+    // f64::clamp(NaN, 0.0, 1.0) returns NaN (both min() and max()
+    // propagate NaN), so a finite-check must happen BEFORE clamp.
+    // Parse errors and non-finite values both fall back loudly to
+    // the default; unset is the normal case and stays silent.
+    let sample_rate = match std::env::var("RIO_OTEL_SAMPLE_RATE") {
+        Ok(val) => match val.parse::<f64>() {
+            Ok(rate) if rate.is_finite() => rate.clamp(0.0, 1.0),
+            Ok(rate) => {
+                eprintln!("warning: RIO_OTEL_SAMPLE_RATE={rate} is not finite; defaulting to 1.0");
+                1.0
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: invalid RIO_OTEL_SAMPLE_RATE={val:?}, expected a float 0.0-1.0; defaulting to 1.0"
+                );
+                1.0
+            }
+        },
+        Err(_) => 1.0,
+    };
 
     // OTLP gRPC span exporter.
     let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -311,6 +335,16 @@ mod tests {
     }
 
     #[test]
+    fn log_format_parse_case_insensitive() {
+        // RIO_LOG_FORMAT=JSON (or Json, Pretty, etc.) should not be
+        // rejected just because the casing doesn't match.
+        assert_eq!("JSON".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("Json".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("PRETTY".parse::<LogFormat>().unwrap(), LogFormat::Pretty);
+        assert_eq!("Pretty".parse::<LogFormat>().unwrap(), LogFormat::Pretty);
+    }
+
+    #[test]
     fn otel_guard_none_drop_is_noop() {
         // Dropping a guard with no provider must not panic or hang.
         let g = OtelGuard(None);
@@ -339,6 +373,22 @@ mod tests {
                 build_otel_layer::<tracing_subscriber::Registry>("test-component").unwrap();
             assert!(layer.is_none(), "no endpoint → no layer");
             assert!(guard.0.is_none(), "no endpoint → no provider to flush");
+            Ok(())
+        });
+    }
+
+    /// `RIO_OTEL_ENDPOINT=""` (empty string, as from an unset Helm value
+    /// or `export RIO_OTEL_ENDPOINT=`) must behave like unset: no layer,
+    /// no provider. Without the guard, the exporter builds against an
+    /// empty URL and every export fails silently at DEBUG.
+    #[test]
+    fn build_otel_layer_empty_endpoint_returns_none() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("RIO_OTEL_ENDPOINT", "");
+            let (layer, guard) =
+                build_otel_layer::<tracing_subscriber::Registry>("test-component").unwrap();
+            assert!(layer.is_none(), "empty endpoint → no layer");
+            assert!(guard.0.is_none(), "empty endpoint → no provider");
             Ok(())
         });
     }
