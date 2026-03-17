@@ -536,15 +536,25 @@ impl DagActor {
             if let Some(worker) = self.workers.get(worker_id)
                 && let Some(tx) = &worker.stream_tx
             {
-                let _ = tx.try_send(rio_proto::types::SchedulerMessage {
-                    msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
-                        rio_proto::types::CancelSignal {
-                            drv_path: drv_path.clone(),
-                            reason: "backstop timeout (stuck build)".into(),
-                        },
-                    )),
-                });
-                metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
+                // Only count the signal if it actually landed on the stream.
+                // try_send Err = channel full or closed — no signal was sent.
+                // This keeps cancel_signals_total semantically "signals delivered",
+                // which makes the gap vs backstop_timeouts_total explainable:
+                // backstop fires for silent workers; silent workers often have
+                // no stream_tx (disconnected) → no increment here. That's correct.
+                if tx
+                    .try_send(rio_proto::types::SchedulerMessage {
+                        msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
+                            rio_proto::types::CancelSignal {
+                                drv_path: drv_path.clone(),
+                                reason: "backstop timeout (stuck build)".into(),
+                            },
+                        )),
+                    })
+                    .is_ok()
+                {
+                    metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
+                }
             }
             // Remove from worker's running set (we're taking it back).
             if let Some(worker) = self.workers.get_mut(worker_id) {
@@ -578,14 +588,16 @@ impl DagActor {
         // rows from builds that never hit terminal-cleanup (actor
         // restart mid-build, PG restored before recovery).
         //
-        // Fire-and-forget spawn: a slow PG doesn't stall handle_tick.
+        // spawn_monitored (not bare spawn): a PG panic in the sweep
+        // logs with task=event-log-sweep + component=scheduler instead
+        // of vanishing. Still fire-and-forget — handle_tick doesn't block.
         // 24h retention is plenty for WatchBuild replay (gateway
         // reconnects are within minutes of disconnect).
         const EVENT_LOG_SWEEP_EVERY: u64 = 360;
         if self.tick_count.is_multiple_of(EVENT_LOG_SWEEP_EVERY) && self.event_persist_tx.is_some()
         {
             let pool = self.db.pool().clone();
-            tokio::spawn(async move {
+            rio_common::task::spawn_monitored("event-log-sweep", async move {
                 match sqlx::query(
                     "DELETE FROM build_event_log WHERE created_at < now() - interval '24 hours'",
                 )

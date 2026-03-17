@@ -477,11 +477,13 @@ impl SchedulerDb {
     /// (worker disconnect mid-build) so recovery can rebuild the
     /// HashSet that feeds best_worker exclusion + poison detection.
     ///
-    /// `array_append` is idempotent for our purposes: PG arrays CAN
-    /// have duplicates (not a set), but recovery builds a HashSet
-    /// from the array so dupes collapse. We COULD de-dup in SQL with
-    /// `WHERE NOT ($2 = ANY(failed_workers))` — not worth the extra
-    /// clause for a rare path (transient failures).
+    /// The `WHERE NOT ($2 = ANY(failed_workers))` guard makes this a
+    /// no-op when the worker is already recorded. PG arrays are NOT
+    /// sets — without the guard, a flapping worker (disconnect →
+    /// reconnect → disconnect) would append duplicates unboundedly.
+    /// Recovery builds a HashSet from this array so dupes would
+    /// collapse in-mem, but the PG row itself grows forever. The
+    /// guard keeps the array bounded to distinct-workers-ever-failed.
     pub async fn append_failed_worker(
         &self,
         drv_hash: &DrvHash,
@@ -490,7 +492,7 @@ impl SchedulerDb {
         sqlx::query(
             "UPDATE derivations \
              SET failed_workers = array_append(failed_workers, $2), updated_at = now() \
-             WHERE drv_hash = $1",
+             WHERE drv_hash = $1 AND NOT ($2 = ANY(failed_workers))",
         )
         .bind(drv_hash.as_str())
         .bind(worker_id.as_str())

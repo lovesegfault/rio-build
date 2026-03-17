@@ -554,6 +554,8 @@ impl DagActor {
                                 && tx.try_send(ActorCommand::ReconcileAssignments).is_err()
                             {
                                 tracing::warn!("reconcile command dropped (channel full)");
+                                metrics::counter!("rio_scheduler_reconcile_dropped_total")
+                                    .increment(1);
                             }
                         });
                     }

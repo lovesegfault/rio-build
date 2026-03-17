@@ -185,10 +185,18 @@ impl SchedulerGrpc {
 /// comment field); the scheduler resolves it here. Empty name → `Ok(None)`
 /// (single-tenant mode; no PG roundtrip). Unknown name →
 /// `Status::invalid_argument`. PG error → `Status::internal`.
+//
+// TODO(phase4b): introduce a `NormalizedName` newtype. This is the 4th
+// callsite patching trim/empty normalization ad-hoc (gateway, store,
+// controller all have tenant lookups). Newtype enforces at construction.
 pub(crate) async fn resolve_tenant_name(
     pool: &sqlx::PgPool,
     name: &str,
 ) -> Result<Option<Uuid>, Status> {
+    // Trim before lookup: gateway sends `tenant_name` from the
+    // authorized_keys comment field, which may carry whitespace.
+    // " team-a " must resolve the same as "team-a".
+    let name = name.trim();
     if name.is_empty() {
         return Ok(None);
     }
@@ -434,13 +442,14 @@ impl SchedulerService for SchedulerGrpc {
         // authorized_keys comment); resolve to UUID here via the tenants
         // table. Empty string → None (single-tenant mode). Unknown name →
         // InvalidArgument. Keeps gateway PG-free (stateless N-replica HA).
-        let tenant_id = if req.tenant_name.is_empty() {
+        let tenant_name = req.tenant_name.trim();
+        let tenant_id = if tenant_name.is_empty() {
             None
         } else {
             let pool = self.pool.as_ref().ok_or_else(|| {
                 Status::failed_precondition("tenant lookup requires database connection")
             })?;
-            resolve_tenant_name(pool, &req.tenant_name).await?
+            resolve_tenant_name(pool, tenant_name).await?
         };
 
         // Capture the current span's traceparent BEFORE sending to the

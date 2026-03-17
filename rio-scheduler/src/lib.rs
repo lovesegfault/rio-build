@@ -106,6 +106,12 @@ pub fn describe_metrics() {
         "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
     );
     describe_counter!(
+        "rio_scheduler_reconcile_dropped_total",
+        "Post-recovery ReconcileAssignments command dropped (actor channel full). \
+         Assigned-but-worker-gone derivations leak until NEXT recovery. Rare (channel \
+         is 1024 deep); alert if > 0."
+    );
+    describe_counter!(
         "rio_scheduler_transition_rejected_total",
         "State-machine transition rejections (labeled by target state); alert if rate > 0"
     );
