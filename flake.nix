@@ -510,10 +510,11 @@
           # --------------------------------------------------------------
           #
           #   vm-protocol-{warm,cold}-standalone — 3 VMs: opcode coverage
-          #   vm-scheduling-standalone — 5 VMs: fanout, size-class, cgroup
+          #   vm-scheduling-{core,disrupt}-standalone — 5 VMs: fanout, size-class, cgroup
           #   vm-security-standalone — 3 VMs: mTLS, HMAC, tenant-resolve
           #   vm-observability-standalone — 5 VMs: metrics, traces, logs
-          #   vm-{lifecycle,leader-election}-k3s — 2-node k3s fixture
+          #   vm-lifecycle-{core,ctrlrestart,recovery,reconnect,autoscale}-k3s
+          #   vm-le-{stability,build}-k3s — 2-node k3s fixture (fragment splits)
           #
           # mkVmTests: build the attrset for a given (workspace,
           # dockerImages, coverage) triple. vmTests uses the normal
@@ -561,14 +562,23 @@
                 vm-protocol-warm-standalone = 3;
                 vm-protocol-cold-standalone = 3;
                 # 5 VMs: control + wsmall1/wsmall2/wlarge + client.
-                vm-scheduling-standalone = 5;
+                # Both scheduling splits boot the full 3-worker fixture.
+                vm-scheduling-core-standalone = 5;
+                vm-scheduling-disrupt-standalone = 5;
                 # 3 VMs: control + worker + client.
                 vm-security-standalone = 3;
                 # 5 VMs: control + worker1/2/3 + client.
                 vm-observability-standalone = 5;
                 # 3 VMs but k3s-server is 8-core 6GB + k3s-agent 8-core 4GB.
-                vm-lifecycle-k3s = 8;
-                vm-leader-election-k3s = 8;
+                # All lifecycle + leader-election splits boot the same
+                # 2-node k3s fixture.
+                vm-lifecycle-core-k3s = 8;
+                vm-lifecycle-ctrlrestart-k3s = 8;
+                vm-lifecycle-recovery-k3s = 8;
+                vm-lifecycle-reconnect-k3s = 8;
+                vm-lifecycle-autoscale-k3s = 8;
+                vm-le-stability-k3s = 8;
+                vm-le-build-k3s = 8;
               };
             in
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (

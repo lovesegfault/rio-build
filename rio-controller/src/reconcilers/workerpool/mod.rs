@@ -401,7 +401,7 @@ async fn cleanup(wp: Arc<WorkerPool>, ctx: &Ctx) -> Result<Action> {
     // Derived from the spec's grace period (+ 60s slop) instead of
     // a hardcoded 2h: a cluster with 90s builds and
     // terminationGracePeriodSeconds=180 shouldn't block WorkerPool
-    // delete for 2h on a stuck/never-Ready pod (vm-lifecycle-k3s
+    // delete for 2h on a stuck/never-Ready pod (vm-lifecycle-autoscale-k3s
     // v24/v25: autoscaler-spawned pod-1 never went Ready; STS
     // sequential termination stalls on it).
     let grace = wp
