@@ -44,6 +44,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# tests/metrics_registered.rs: custom Recorder intercepts describe_*
+# calls — asserts every spec'd metric name is covered.
+metrics = { workspace = true }
 rio-test-support = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

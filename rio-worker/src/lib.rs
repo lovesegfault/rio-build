@@ -101,6 +101,14 @@ pub fn describe_metrics() {
         "rio_worker_fuse_fetch_bytes_total",
         "Bytes fetched from store via FUSE misses (nar_data.len())"
     );
+    describe_counter!(
+        "rio_worker_fuse_fallback_reads_total",
+        "Userspace read() callbacks served. When passthrough is ON (default), \
+         the kernel handles reads directly and this counter stays near zero — \
+         nonzero means open_backing() failed for some file. When passthrough \
+         is OFF (RIO_FUSE_PASSTHROUGH=false), every read comes through here. \
+         Sustained nonzero rate with passthrough ON = investigate open_backing."
+    );
     describe_gauge!(
         "rio_worker_cpu_fraction",
         "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. \

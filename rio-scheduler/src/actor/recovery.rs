@@ -54,7 +54,6 @@ impl DagActor {
     /// Returns Err on PG failure; caller sets `recovery_complete=
     /// true` anyway (see module doc — degrade not block).
     pub(super) async fn recover_from_pg(&mut self) -> Result<(), ActorError> {
-        let start = Instant::now();
         info!("starting state recovery from PG");
 
         // --- Clear in-mem state ---
@@ -318,17 +317,12 @@ impl DagActor {
             self.check_build_completion(build_id).await;
         }
 
-        let elapsed = start.elapsed();
         info!(
             builds = self.builds.len(),
             derivations = self.dag.iter_nodes().count(),
             ready_queue = self.ready_queue.len(),
-            elapsed_ms = elapsed.as_millis(),
             "state recovery complete"
         );
-        metrics::histogram!("rio_scheduler_recovery_duration_seconds")
-            .record(elapsed.as_secs_f64());
-        metrics::counter!("rio_scheduler_recovery_total", "outcome" => "success").increment(1);
 
         Ok(())
     }
@@ -343,7 +337,22 @@ impl DagActor {
     /// inconsistent). MergeDag from a standby-period SubmitBuild
     /// would queue in the mpsc channel and get processed after.
     pub(super) async fn handle_leader_acquired(&mut self) {
-        match self.recover_from_pg().await {
+        let start = Instant::now();
+        let result = self.recover_from_pg().await;
+
+        // Record BEFORE the match — both arms need it, and the error
+        // arm's partial-state clear (.dag = new(), etc.) doesn't touch
+        // `start`. Label by outcome: a 30s failure (PG timeout) and a
+        // 30s success (huge DAG) are very different signals; without the
+        // label, one washes out the other.
+        let outcome = if result.is_ok() { "success" } else { "failure" };
+        let elapsed = start.elapsed();
+        metrics::histogram!("rio_scheduler_recovery_duration_seconds", "outcome" => outcome)
+            .record(elapsed.as_secs_f64());
+        metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
+        info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
+
+        match result {
             Ok(()) => {
                 // Stale-pin cleanup: crash-between-pin-and-unpin
                 // (scheduler crashed after dispatch pin but before
@@ -376,8 +385,6 @@ impl DagActor {
                     "state recovery FAILED — continuing with empty DAG \
                      (Phase 3a behavior: in-flight builds lost)"
                 );
-                metrics::counter!("rio_scheduler_recovery_total", "outcome" => "failure")
-                    .increment(1);
                 // Explicitly re-clear: recovery may have partially
                 // populated before failing.
                 self.dag = DerivationDag::new();

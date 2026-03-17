@@ -609,7 +609,12 @@ impl DagActor {
 
         // Update metrics. All gauges are set from ground-truth state on each
         // Tick — this is self-healing against any counting bugs elsewhere.
+        // The inc/dec calls at connect/disconnect/heartbeat (worker.rs:52/
+        // :76/:384) stay — they give sub-tick responsiveness. This block
+        // corrects any drift every tick.
         metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
+        metrics::gauge!("rio_scheduler_workers_active")
+            .set(self.workers.values().filter(|w| w.is_registered()).count() as f64);
         metrics::gauge!("rio_scheduler_builds_active").set(
             self.builds
                 .values()

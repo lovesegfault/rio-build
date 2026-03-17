@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
-    describe_metrics();
+    rio_controller::describe_metrics();
 
     // ---- K8s client ----
     // try_default reads in-cluster config (service account token
@@ -335,39 +335,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("controller shutting down");
     Ok(())
-}
-
-// r[impl obs.metric.controller]
-fn describe_metrics() {
-    use metrics::{describe_counter, describe_gauge, describe_histogram};
-
-    describe_histogram!(
-        "rio_controller_reconcile_duration_seconds",
-        "Reconcile loop latency. reconciler=build|workerpool. \
-         Recorded on both success and error paths — long durations + errors \
-         = slow/timing-out apiserver."
-    );
-    describe_counter!(
-        "rio_controller_reconcile_errors_total",
-        "Reconcile errors. reconciler=build|workerpool, error_kind=kube|finalizer|invalid_spec|scheduler_unavailable. \
-         error_kind is the variant discriminator (stable, low cardinality). \
-         Sustained rate > 0 = check controller logs."
-    );
-    describe_counter!(
-        "rio_controller_scaling_decisions_total",
-        "Autoscale patches executed. direction=up|down. \
-         High rate = queue depth oscillating (check stabilization windows)."
-    );
-    describe_gauge!(
-        "rio_controller_workerpool_replicas",
-        "WorkerPool replica counts. kind=actual|desired, pool=namespace/name. \
-         Gap between actual and desired = StatefulSet rollout lag or stabilization window."
-    );
-    describe_counter!(
-        "rio_controller_build_watch_spawns_total",
-        "drain_stream tasks spawned (initial + reconnect). \
-         Should be ~1 per Build lifetime; high rate = reconnect churn (scheduler instability)."
-    );
 }
 
 /// Spawn a trivial /healthz server. Always 200 — reaching the
