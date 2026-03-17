@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::{RwLock, Semaphore, mpsc, watch};
-use tracing::info;
+use tracing::{info, warn};
 
 use rio_proto::types::{WorkerMessage, WorkerRegister, scheduler_message, worker_message};
 use rio_worker::runtime::handle_prefetch_hint;
@@ -146,29 +146,51 @@ async fn main() -> anyhow::Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rio_worker::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready));
 
-    // Connect to gRPC services. Scheduler has two modes:
-    // - Balanced (K8s, multi-replica scheduler): DNS-resolve the
-    //   headless Service, health-probe pod IPs, route to leader.
-    //   Heartbeat (separate unary RPC) routes through the same
-    //   balanced channel — when leadership flips, the probe task
-    //   sees NOT_SERVING on the old leader within one tick (~3s)
-    //   and removes it; next heartbeat goes to the new leader.
+    // Retry-until-connected. Cold-start race (see rio-controller/src/
+    // main.rs:168 for the full story): store/scheduler Services may
+    // have no endpoints yet. Bare `?` → process exit → kubelet sees
+    // exit-after-liveness-passed → restart → same race → flapping.
+    // Retry internally: /healthz stays 200 (process IS alive, restart
+    // won't help), /readyz stays 503 (ready flag won't flip until
+    // first heartbeat accepted, far past this loop).
+    //
+    // Scheduler has two modes:
+    // - Balanced (K8s, multi-replica): DNS-resolve headless Service,
+    //   health-probe pod IPs, route to leader. Heartbeat routes
+    //   through the same balanced channel — leadership flip detected
+    //   within one probe tick (~3s).
     // - Single (non-K8s): plain connect. VM tests use this.
-    let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
-    let (mut scheduler_client, _balance_guard) = match cfg.scheduler_balance_host {
-        None => {
-            info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
-            let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
-            (c, None)
+    let (store_client, mut scheduler_client, _balance_guard) = loop {
+        let result: anyhow::Result<_> = async {
+            let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
+            let (sched, guard) = match &cfg.scheduler_balance_host {
+                None => {
+                    info!(addr = %cfg.scheduler_addr, "scheduler: single-channel mode");
+                    let c = rio_proto::client::connect_worker(&cfg.scheduler_addr).await?;
+                    (c, None)
+                }
+                Some(host) => {
+                    info!(
+                        %host, port = cfg.scheduler_balance_port,
+                        "scheduler: health-aware balanced mode"
+                    );
+                    let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
+                        host.clone(),
+                        cfg.scheduler_balance_port,
+                    )
+                    .await?;
+                    (c, Some(bc))
+                }
+            };
+            Ok((store, sched, guard))
         }
-        Some(host) => {
-            info!(%host, port = cfg.scheduler_balance_port, "scheduler: health-aware balanced mode");
-            let (c, bc) = rio_proto::client::balance::connect_worker_balanced(
-                host,
-                cfg.scheduler_balance_port,
-            )
-            .await?;
-            (c, Some(bc))
+        .await;
+        match result {
+            Ok(triple) => break triple,
+            Err(e) => {
+                warn!(error = %e, "upstream connect failed; retrying in 2s (liveness stays 200, readiness stays 503)");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         }
     };
 

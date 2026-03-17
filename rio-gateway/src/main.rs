@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -198,49 +198,68 @@ async fn main() -> anyhow::Result<()> {
     rio_common::observability::init_metrics(cfg.metrics_addr)?;
     rio_gateway::describe_metrics();
 
-    info!(addr = %cfg.store_addr, "connecting to store service");
-    let store_client = rio_proto::client::connect_store(&cfg.store_addr).await?;
-
-    // Scheduler connection. Two modes:
+    // Retry-until-connected. Cold-start race: all rio-* pods start
+    // in parallel (helm install, node drain+reschedule); this process
+    // can reach here before rio-store / rio-scheduler Services have
+    // endpoints. connect_* uses eager .connect().await → refused →
+    // Err. Bare `?` meant process-exit → CrashLoopBackOff → kubelet's
+    // 10s/20s/40s backoff delays recovery past dep readiness.
+    // Retry internally: pod stays not-Ready (health server below
+    // hasn't spawned yet). Same pattern as rio-controller/src/main.rs:192.
+    //
+    // Both connects in ONE loop body: partial success (store OK,
+    // scheduler refused) reconnects store on next iteration rather
+    // than leaking a half-configured state.
+    //
+    // Scheduler has two modes:
     // - Balanced (K8s): DNS-resolve headless Service, health-probe
     //   each pod IP, route to the leader. The BalancedChannel guard
     //   must live for process lifetime — dropping it stops the probe
-    //   loop. We box it into an Option and just hold it.
-    // - Single (non-K8s): plain connect to ClusterIP Service or a
-    //   fixed addr. VM tests and local dev use this.
-    //
-    // The branch is on Option, not on "am I in K8s." Explicit
-    // config (env unset → None), no magic detection.
-    let (scheduler_client, _balance_guard) = match cfg.scheduler_balance_host {
-        None => {
-            info!(addr = %cfg.scheduler_addr, "connecting to scheduler service (single-channel)");
-            let c = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
-            (c, None)
+    //   loop. Held in _balance_guard.
+    // - Single (non-K8s): plain connect. VM tests and local dev.
+    let (store_client, scheduler_client, _balance_guard) = loop {
+        let result: anyhow::Result<_> = async {
+            info!(addr = %cfg.store_addr, "connecting to store service");
+            let store = rio_proto::client::connect_store(&cfg.store_addr).await?;
+
+            let (sched, guard) = match &cfg.scheduler_balance_host {
+                None => {
+                    info!(addr = %cfg.scheduler_addr, "connecting to scheduler (single-channel)");
+                    let c = rio_proto::client::connect_scheduler(&cfg.scheduler_addr).await?;
+                    (c, None)
+                }
+                Some(host) => {
+                    info!(
+                        %host, port = cfg.scheduler_balance_port,
+                        "connecting to scheduler (health-aware balanced)"
+                    );
+                    let (c, bc) = rio_proto::client::balance::connect_scheduler_balanced(
+                        host.clone(),
+                        cfg.scheduler_balance_port,
+                    )
+                    .await?;
+                    (c, Some(bc))
+                }
+            };
+            Ok((store, sched, guard))
         }
-        Some(host) => {
-            info!(
-                %host,
-                port = cfg.scheduler_balance_port,
-                "connecting to scheduler service (health-aware balanced)"
-            );
-            let (c, bc) = rio_proto::client::balance::connect_scheduler_balanced(
-                host,
-                cfg.scheduler_balance_port,
-            )
-            .await?;
-            (c, Some(bc))
+        .await;
+        match result {
+            Ok(triple) => break triple,
+            Err(e) => {
+                warn!(error = %e, "upstream connect failed; retrying in 2s (pod stays not-Ready)");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         }
     };
 
     // gRPC health server. Dedicated tonic instance — the gateway's main
     // protocol is SSH (russh), no existing tonic server to attach to.
     //
-    // SERVING gate: both gRPC connects above succeeded. That's the right
-    // signal — a gateway that can't reach the scheduler would accept SSH
-    // connections and then hang every wopBuild* opcode. Better to fail
-    // readiness so K8s doesn't route to this pod until it's actually
-    // usable. store/scheduler connect are `.await?` (fail-fast) so by
-    // the time we're here, both are up.
+    // SERVING gate: retry loop above exited ⇒ both store + scheduler
+    // are reachable. A gateway that can't reach the scheduler would
+    // accept SSH and then hang every wopBuild* opcode — fail readiness
+    // instead so K8s doesn't route here.
     //
     // spawn_monitored: the SSH server's `.run().await` below blocks
     // forever. Health must run concurrently. If the health server dies

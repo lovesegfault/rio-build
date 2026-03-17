@@ -331,3 +331,64 @@ pub async fn get_path_nar(
         ))),
     }
 }
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Retry loop pattern: connect to a closed port, assert it fails
+    /// fast (not hang), bind the port, assert next attempt succeeds.
+    /// This is the contract the main.rs retry loops depend on:
+    /// closed port = fast Err, not 10s CONNECT_TIMEOUT hang.
+    ///
+    /// NOT start_paused: real TCP sockets + auto-advancing mock clock
+    /// fires CONNECT_TIMEOUT spuriously while the kernel does real work.
+    #[tokio::test]
+    async fn connect_closed_port_fails_fast_then_succeeds() {
+        // Reserve a port, then close the listener — port is now free
+        // but nothing's listening. connect() should get ECONNREFUSED
+        // in <100ms (kernel fast-path, no SYN retry).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        // First attempt: refused, fast.
+        let t0 = std::time::Instant::now();
+        let err = connect_channel(&addr.to_string()).await.unwrap_err();
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "closed port should fail fast (ECONNREFUSED), got {err:?} after {:?}",
+            t0.elapsed()
+        );
+
+        // Bind a real gRPC server on that port. connect_channel only
+        // needs the transport (HTTP/2 handshake) to come up — a
+        // tonic-health service suffices (already a non-dev dep for
+        // balance.rs, same pattern as balance.rs:426-439).
+        let (_reporter, health_svc) = tonic_health::server::health_reporter();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(health_svc)
+                .serve_with_incoming(incoming),
+        );
+
+        // Simulate the retry loop: poll until Ok. Bounded at 10 tries
+        // (= 20s with the real 2s sleep; here 50ms so the test is fast).
+        let mut ch = None;
+        for _ in 0..10 {
+            match connect_channel(&addr.to_string()).await {
+                Ok(c) => {
+                    ch = Some(c);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert!(ch.is_some(), "connect never succeeded after port opened");
+
+        server.abort();
+    }
+}
