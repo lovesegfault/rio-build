@@ -186,18 +186,27 @@ let
           "00-rio-crds".source = "${helmRendered}/00-crds.yaml";
           "01-rio-rbac".source = "${helmRendered}/01-rbac.yaml";
           "02-rio-workloads".source = "${helmRendered}/02-workloads.yaml";
-          # Empty authorized_keys Secret so the gateway pod's volume
-          # mount resolves (no unbound Secret → Pending). sshKeySetup
-          # patches this + rollout-restarts. Mirrors the NixOS module's
-          # tmpfiles empty-file pattern (common.nix gatewayTmpfiles).
-          "03-gateway-ssh-empty".source = pkgs.writeText "gateway-ssh.yaml" ''
+          # Placeholder authorized_keys Secret so the gateway pod's
+          # volume mount resolves (no unbound Secret → Pending) AND
+          # load_authorized_keys() parses ≥1 key (empty file →
+          # anyhow::bail! → process exit → CrashLoopBackOff). The
+          # empty-string approach worked but cost ~2 crashed containers
+          # per test before sshKeySetup runs: each crash = gRPC retry
+          # loop connects to store+scheduler (~1s CPU, ~8K IP traffic),
+          # then bails at server.rs:89, then kubelet's 10s backoff. On
+          # coverage builds, each crash also flushes ~6M of profraw.
+          #
+          # This key authorizes nothing — its private half was discarded
+          # at generation time. sshKeySetup patches with the client's
+          # real key + rollout-restarts before any SSH connect happens.
+          "03-gateway-ssh-placeholder".source = pkgs.writeText "gateway-ssh.yaml" ''
             apiVersion: v1
             kind: Secret
             metadata:
               name: rio-gateway-ssh
               namespace: ${ns}
             stringData:
-              authorized_keys: ""
+              authorized_keys: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICOWXl9/32g/wAtRqYblAdI7wmPNL6phTBMlkn2o6psr placeholder-unused-vmtest"
           '';
           # mTLS certs. Applied before 02-workloads so pods' TLS
           # Secret volume mounts resolve on first start (no Pending
@@ -382,12 +391,12 @@ in
     # store + scheduler crash-loop until PG is up (sqlx migrate retry),
     # then come clean. controller just needs apiserver.
     #
-    # Gateway NOT waited here: 03-gateway-ssh-empty seeds an empty
-    # authorized_keys so the Secret volume mount resolves, but
-    # load_authorized_keys bails on 0 keys → process exits. Gateway
-    # can't come up until sshKeySetup patches in the real key (which
-    # runs AFTER waitReady in every scenario). sshKeySetup does its
-    # own rollout restart + rollout status wait.
+    # Gateway NOT waited here: 03-gateway-ssh-placeholder seeds a
+    # throwaway key (private half discarded, authorizes nothing) so
+    # the pod starts cleanly instead of CrashLooping on empty. But the
+    # pod is still useless until sshKeySetup patches in the client's
+    # real key + rollout-restarts — that runs AFTER waitReady in every
+    # scenario and does its own rollout status wait.
     for d in ["rio-store", "rio-scheduler", "rio-controller"]:
         k3s_server.wait_until_succeeds(
             f"k3s kubectl -n ${ns} wait --for=condition=Available "
@@ -435,8 +444,8 @@ in
 
   # SSH key → k8s Secret for gateway. Replaces common.sshKeySetup
   # (which writes to /var/lib/rio/gateway/authorized_keys on a systemd
-  # host). The 03-gateway-ssh-empty manifest above pre-creates the Secret
-  # with an empty key list so the pod's volume mount resolves during
+  # host). The 03-gateway-ssh-placeholder manifest above pre-creates
+  # the Secret with a throwaway key so the pod starts cleanly during
   # waitReady; this patches in the real key + rollout-restarts.
   sshKeySetup = ''
     client.succeed(
