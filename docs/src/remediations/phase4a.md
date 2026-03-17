@@ -1292,7 +1292,7 @@ One line each. Grouped by crate.
 | ID | Claim | Location | Fix |
 |---|---|---|---|
 | `cfg-worker-knobs-unreachable-in-k8s` | 6 worker config fields (incl. `daemon_timeout_secs`) not in `builders.rs` → not settable via `WorkerPoolSpec` CRD. Only reachable via env var in pod spec. | `rio-controller/src/builders.rs` | Add CRD fields; plumb through builders.rs; update CRD schema |
-| `cfg-zero-interval-tokio-panic` | `heartbeat_interval_secs=0` → `tokio::time::interval(ZERO)` → panic `"period must be non-zero"`. | `main.rs:481` | `serde validate: min=1` at config load |
+| `cfg-zero-interval-tokio-panic` | `tick_interval_secs=0` → `tokio::time::interval(ZERO)` → panic `"period must be non-zero"`. (Original claim cited `heartbeat_interval_secs` — that's a `const`, not configurable.) | `rio-scheduler/src/main.rs:481` | `serde validate: min=1` at config load |
 
 ### pg
 
@@ -1300,7 +1300,7 @@ One line each. Grouped by crate.
 |---|---|---|---|
 | `pg-dual-migrate-race` | Both scheduler AND store call `sqlx::migrate!()` at startup. Race: both try to acquire migration lock. One waits, wastes startup time. | `scheduler/main.rs`, `store/main.rs` | Single migrator (store); scheduler checks `_sqlx_migrations` version only |
 | `pg-zero-compile-time-checked-queries` | 194 `sqlx::query("...")` calls, 0 `sqlx::query!(...)` calls. Zero compile-time SQL checking. | workspace-wide | Opportunistic conversion; start with the 12 queries that have had runtime SQL errors in git history |
-| `pg-drain-max-attempts-const-drift` | `MAX_DRAIN_ATTEMPTS = 10` at `drain.rs:22`. Migration `009` hardcodes `10` in a CHECK constraint. No link. | `drain.rs:22` vs migration 009 | Generate the CHECK constraint from the const (build.rs) OR test that asserts they match |
+| `pg-drain-max-attempts-const-drift` | `MAX_DRAIN_ATTEMPTS = 10` at `drain.rs:22`. Migration `009` hardcodes `10` in a CHECK constraint. No link. | `rio-store/src/gc/drain.rs:22` vs migration 009 | Generate the CHECK constraint from the const (build.rs) OR test that asserts they match |
 
 ### wire
 
@@ -1313,7 +1313,7 @@ One line each. Grouped by crate.
 
 | ID | Claim | Location | Fix |
 |---|---|---|---|
-| `obs-fallback-reads-unregistered` | `rio_store_fallback_reads_total` incremented but never `describe_counter!`. No `# HELP` line → Prometheus scrape shows untyped metric. | store | Add `describe_counter!` in metric registration |
+| `obs-fallback-reads-unregistered` | `rio_worker_fuse_fallback_reads_total` incremented but never `describe_counter!`. No `# HELP` line → Prometheus scrape shows untyped metric. **[FIXED by plan 14 — `describe_counter!` at `rio-worker/src/lib.rs:104`.]** | worker | Add `describe_counter!` in metric registration |
 | `obs-watch-reconnects-unregistered` | Same for `rio_controller_watch_reconnects_total`. | controller | Same |
 | `obs-recovery-histogram-success-only` | `rio_scheduler_recovery_duration_seconds` recorded at `:329` (success) but not `:379` (error return). Failed recovery attempts invisible in histogram. | `recovery.rs:329` vs `:379` | Record before return on both paths; add `outcome` label |
 
@@ -1548,13 +1548,13 @@ Complete index of all findings by ID, for PR cross-referencing.
 | `gw-temp-roots-unbounded-insert-only` | P2 | §3 gateway | `rio-gateway/src/handler/opcodes_read.rs:180` | OPEN |
 | `gw-submit-build-bare-question-mark-no-stderr` | P2 | §3 gateway | `rio-gateway/src/handler/build.rs:203,210,213` | OPEN |
 | `cfg-worker-knobs-unreachable-in-k8s` | P2 | §3 config | `rio-controller/src/builders.rs` | OPEN |
-| `cfg-zero-interval-tokio-panic` | P2 | §3 config | `rio-worker/src/main.rs:481` | OPEN |
+| `cfg-zero-interval-tokio-panic` | P2 | §3 config | `rio-scheduler/src/main.rs:481` | OPEN |
 | `pg-dual-migrate-race` | P2 | §3 pg | `rio-scheduler/src/main.rs`, `rio-store/src/main.rs` | OPEN |
 | `pg-zero-compile-time-checked-queries` | P2 | §3 pg | workspace-wide | OPEN |
-| `pg-drain-max-attempts-const-drift` | P2 | §3 pg | `rio-scheduler/src/drain.rs:22` | OPEN |
+| `pg-drain-max-attempts-const-drift` | P2 | §3 pg | `rio-store/src/gc/drain.rs:22` | OPEN |
 | `wire-query-realisation-error-after-stderr-last` | P2 | §3 wire | `rio-gateway/src/handler/opcodes_read.rs:543-584` | OPEN |
 | `wire-synth-db-narhash-format-unverified` | P2 | §3 wire | `rio-worker/src/synth_db.rs:68` | OPEN |
-| `obs-fallback-reads-unregistered` | P2 | §3 obs | `rio-store` | OPEN |
+| `obs-fallback-reads-unregistered` | P2 | §3 obs | `rio-worker` | FIXED (plan 14) |
 | `obs-watch-reconnects-unregistered` | P2 | §3 obs | `rio-controller` | OPEN |
 | `obs-recovery-histogram-success-only` | P2 | §3 obs | `rio-scheduler/src/actor/recovery.rs:329,379` | OPEN |
 | `nix-hash-no-proptest` | P3 | §4 test-cov | `rio-nix/src/hash.rs` | OPEN |

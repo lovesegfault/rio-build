@@ -48,6 +48,16 @@ service ChunkService {
   rpc FindMissingChunks(FindMissingChunksRequest) returns (FindMissingChunksResponse);
 }
 
+// store.proto — administrative RPCs. Separate service from StoreService
+// so it can have distinct RBAC/TLS (admin ops are more privileged than
+// PutPath/GetPath). The scheduler's AdminService.TriggerGC proxies to
+// this after populating extra_roots from live builds.
+service StoreAdminService {
+  rpc TriggerGC(GCRequest) returns (stream GCProgress);  // mark/sweep; dry_run rolls back
+  rpc PinPath(PinPathRequest) returns (PinPathResponse);   // add to gc_roots
+  rpc UnpinPath(PinPathRequest) returns (PinPathResponse); // remove from gc_roots
+}
+
 // admin.proto — implemented by the rio-scheduler process (co-located with
 // SchedulerService). The rio-cli and rio-dashboard call these RPCs.
 // gRPC-Web compatibility required for the dashboard (via tonic-web).
@@ -59,8 +69,12 @@ service AdminService {
   rpc TriggerGC(GCRequest) returns (stream GCProgress);
   rpc DrainWorker(DrainWorkerRequest) returns (DrainWorkerResponse);
   rpc ClearPoison(ClearPoisonRequest) returns (ClearPoisonResponse);
+  rpc ListTenants(Empty) returns (ListTenantsResponse);
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
 }
 ```
+
+> **TriggerGC layering:** `AdminService.TriggerGC` (scheduler) proxies to `StoreAdminService.TriggerGC` (store). The scheduler populates `GCRequest.extra_roots` with expected output paths from all non-terminal derivations before forwarding — this protects in-flight build outputs that the worker hasn't uploaded yet. Calling `StoreAdminService.TriggerGC` directly bypasses this protection.
 
 ## Key Messages
 
@@ -191,7 +205,8 @@ The `sequence` field enables stream resumption: `WatchBuild` accepts a `since_se
 
 ```protobuf
 message SubmitBuildRequest {
-  string tenant_id = 1;            // Tenant identifier (from SSH key mapping)
+  reserved 1;
+  reserved "tenant_id";           // Migrated to tenant_name (field 9) — see below
   string priority_class = 2;       // "ci", "interactive", or "scheduled"
   repeated DerivationNode nodes = 3;  // All derivations in the DAG
   repeated DerivationEdge edges = 4;  // Dependency edges
@@ -201,6 +216,9 @@ message SubmitBuildRequest {
   uint64 build_timeout = 6;
   uint64 build_cores = 7;
   bool keep_going = 8;             // Continue building independent derivations on failure
+  string tenant_name = 9;          // Tenant name (from gateway's authorized_keys comment);
+                                   //   scheduler resolves to UUID via tenants table.
+                                   //   Empty string = single-tenant mode.
 }
 
 message DerivationNode {
@@ -231,7 +249,7 @@ message DerivationEdge {
 
 > **Size limits:** A full nixpkgs stdenv rebuild DAG contains ~60,000 nodes. At ~200 bytes per `DerivationNode`, the message is ~12MB. The gateway should enforce a per-tenant `max_dag_size` limit (default: 100,000 nodes) before constructing the request. gRPC max message size should be set to at least 32MB.
 
-> **Tenant identification:** `tenant_id` is set by the gateway from the SSH key -> tenant mapping, not from client-provided data. The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`) for downstream authorization checks.
+> **Tenant identification:** `tenant_name` is set by the gateway from the SSH `authorized_keys` comment field, not from client-provided data. The scheduler resolves the name to a tenant UUID via the `tenants` table (see `r[sched.tenant.resolve]`). Field 1 (`tenant_id`) is reserved — it was removed when resolution moved scheduler-side. The tenant's JWT is propagated via gRPC metadata (`x-rio-tenant-token`) for downstream authorization checks. Note: `tenant_id` still appears as a UUID-string field in `BuildInfo` and `TenantInfo` — those are the **resolved** UUID, not the pre-resolution name.
 
 > **BuildResultStatus ↔ Nix BuildStatus mapping:** The gRPC `BuildResultStatus` enum is a **subset** of Nix's wire `BuildStatus` with a different numbering scheme. The proto enum has `UNSPECIFIED=0` (proto3 default), then `BUILT=1`, `SUBSTITUTED=2`, `ALREADY_VALID=3`, `PERMANENT_FAILURE=4`, `TRANSIENT_FAILURE=5`, `CACHED_FAILURE=6`, `DEPENDENCY_FAILED=7`, `LOG_LIMIT_EXCEEDED=8`, `OUTPUT_REJECTED=9`, `INFRASTRUCTURE_FAILURE=10`. This differs from Nix's wire values (where `TransientFailure=6`, `DependencyFailed=10`). The worker (`executor.rs`) and gateway translate explicitly; they do NOT map 1:1. The proto enum is currently missing `InputRejected`, `TimedOut`, `MiscFailure`, `NotDeterministic`, `ResolvesToAlreadyValid`, and `NoSubstituters` — these Nix statuses currently round-trip through `PERMANENT_FAILURE` or `TRANSIENT_FAILURE` in the gRPC layer. `InfrastructureFailure` is gRPC-only (worker-internal errors: daemon crash, overlay failure); the gateway maps it to Nix `TransientFailure` (6).
 
@@ -252,8 +270,8 @@ message WatchBuildRequest {
 |---|---|
 | `scheduler.proto` | `SchedulerService` --- gateway-facing RPCs (SubmitBuild, WatchBuild, QueryBuildStatus, CancelBuild) |
 | `worker.proto` | `WorkerService` --- worker-facing RPCs (BuildExecution, Heartbeat) |
-| `store.proto` | `StoreService`, `ChunkService` |
-| `admin.proto` | `AdminService` --- dashboard and CLI RPCs |
+| `store.proto` | `StoreService`, `ChunkService`, `StoreAdminService` |
+| `admin.proto` | `AdminService` --- dashboard and CLI RPCs (cluster status, workers, builds, GC, drain, poison, tenants) |
 | `types.proto` | Shared message types (BuildEvent, HeartbeatRequest, ResourceUsage, BloomFilter, etc.) |
 
 Worker-facing RPCs are in a separate `WorkerService` (in `worker.proto`) to allow distinct interceptors (auth, rate-limiting), independent evolution, and potential future separation to a dedicated port. Both `SchedulerService` and `WorkerService` are served by the same scheduler binary.
