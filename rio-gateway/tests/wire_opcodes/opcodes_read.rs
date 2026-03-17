@@ -323,7 +323,12 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
 
     let drv_hash_hex = "cc".repeat(32);
     let drv_hash = hex::decode(&drv_hash_hex)?;
-    let out_path = "/nix/store/11111111111111111111111111111111-ca-hit";
+    // Store-side repr (full path, how we seed MockStore) vs wire repr
+    // (basename, what the gateway serializes). Real nix clients parse
+    // outPath via StorePath::parse — full path fails with "illegal
+    // base-32 char '/'".
+    let out_path_store = "/nix/store/11111111111111111111111111111111-ca-hit";
+    let out_path_wire = "11111111111111111111111111111111-ca-hit";
 
     // Seed MockStore's realisations map directly.
     h.store.realisations.write().unwrap().insert(
@@ -331,7 +336,7 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
         rio_proto::types::Realisation {
             drv_hash,
             output_name: "out".into(),
-            output_path: out_path.into(),
+            output_path: out_path_store.into(),
             output_hash: vec![0xDDu8; 32],
             signatures: vec!["sig:seeded".into()],
         },
@@ -353,8 +358,12 @@ async fn test_query_realisation_hit_returns_json() -> anyhow::Result<()> {
     // string, not from the store response).
     assert_eq!(parsed["id"], id);
     // outPath comes from MockStore — this is the payload that matters for
-    // the cache hit.
-    assert_eq!(parsed["outPath"], out_path);
+    // the cache hit. MockStore has the full path; gateway stripped the
+    // prefix for the wire.
+    assert_eq!(
+        parsed["outPath"], out_path_wire,
+        "gateway should strip STORE_PREFIX"
+    );
     // Sigs roundtrip.
     assert_eq!(parsed["signatures"][0], "sig:seeded");
     // dependentRealisations always empty (phase5 fills this).

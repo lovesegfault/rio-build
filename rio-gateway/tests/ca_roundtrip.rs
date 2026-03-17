@@ -40,7 +40,12 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
     // This is what a worker does after a successful CA build. The
     // nar_hash is the content identity — same bytes always give the
     // same hash, regardless of the input-addressed store path.
+    // output_path: internal (gRPC/PG) repr — full /nix/store/ path.
+    // output_basename: wire repr — what real nix clients send in
+    //   Realisation JSON (CppNix StorePath::to_string() omits prefix).
+    // The gateway translates between them; these assertions prove it.
     let output_path = "/nix/store/caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca-output";
+    let output_basename = "caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ca-output";
     let (nar, nar_hash) = make_nar(b"deterministic CA output bytes");
     sess.store
         .seed(make_path_info(output_path, &nar, nar_hash), nar);
@@ -60,7 +65,7 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
     let drv_output_id = format!("sha256:{drv_hash_hex}!out");
     let realisation_json = serde_json::json!({
         "id": drv_output_id,
-        "outPath": output_path,
+        "outPath": output_basename,  // wire format: basename, NOT /nix/store/...
         "signatures": ["test-key:fake-sig-base64"],
         "dependentRealisations": {}
     })
@@ -81,7 +86,12 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
         let stored = realisations
             .get(&(drv_hash_bytes.clone(), "out".into()))
             .expect("realisation should be stored via gRPC");
-        assert_eq!(stored.output_path, output_path);
+        // Sent basename on the wire; gateway prepended /nix/store/ before
+        // the gRPC call. This is the Step-1 (register-direction) assertion.
+        assert_eq!(
+            stored.output_path, output_path,
+            "gateway should prepend STORE_PREFIX"
+        );
         assert_eq!(stored.signatures, vec!["test-key:fake-sig-base64"]);
     }
 
@@ -104,9 +114,11 @@ async fn test_ca_register_query_content_roundtrip() -> anyhow::Result<()> {
 
     // Roundtrip: what we registered is what we get back.
     assert_eq!(parsed["id"], drv_output_id, "id echoes what we sent");
+    // Store has the full path; gateway stripped /nix/store/ before the
+    // json! serialize. This is the Step-2 (query-direction) assertion.
     assert_eq!(
-        parsed["outPath"], output_path,
-        "outPath roundtrips (THIS is the cache-hit payload)"
+        parsed["outPath"], output_basename,
+        "gateway should strip STORE_PREFIX for wire (THIS is the cache-hit payload)"
     );
     assert_eq!(
         parsed["signatures"][0], "test-key:fake-sig-base64",

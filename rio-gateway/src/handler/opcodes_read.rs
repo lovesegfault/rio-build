@@ -444,10 +444,21 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let out_path = parsed
+    // Wire outPath is a BASENAME ("<hashpart>-<name>") per CppNix
+    // StorePath::to_string(). Our gRPC/PG repr uses full paths. Prepend
+    // the prefix here — the gateway is the translation boundary. Idempotent
+    // guard: if a (buggy or future) client sends the full path, don't
+    // double-prepend. Reference: rio-nix/src/protocol/build.rs:350-351
+    // (same transform for BuildResult.builtOutputs read path).
+    let out_path_raw = parsed
         .get("outPath")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let out_path = if out_path_raw.starts_with(rio_nix::store_path::STORE_PREFIX) {
+        out_path_raw.to_string()
+    } else {
+        format!("{}{out_path_raw}", rio_nix::store_path::STORE_PREFIX)
+    };
 
     let Some((drv_hash, output_name)) = parse_drv_output_id(id) else {
         warn!(id = %id, "wopRegisterDrvOutput: malformed DrvOutput id, discarding");
@@ -483,7 +494,7 @@ pub(super) async fn handle_register_drv_output<R: AsyncRead + Unpin, W: AsyncWri
         realisation: Some(types::Realisation {
             drv_hash: drv_hash.to_vec(),
             output_name,
-            output_path: out_path.to_string(),
+            output_path: out_path,
             output_hash: output_hash.to_vec(),
             signatures,
         }),
@@ -546,6 +557,16 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
     match result {
         Ok(resp) => {
             let r = resp.into_inner();
+            // Wire outPath is a BASENAME — CppNix Realisation::fromJSON
+            // feeds it to StorePath::parse, which rejects '/' with
+            // "illegal base-32 char '/'". Strip the prefix. Reference:
+            // rio-nix/src/protocol/build.rs:415-418 (same transform for
+            // BuildResult.builtOutputs write path). unwrap_or defensive:
+            // if the store somehow returns a basename, pass it through.
+            let out_path_basename = r
+                .output_path
+                .strip_prefix(rio_nix::store_path::STORE_PREFIX)
+                .unwrap_or(&r.output_path);
             // Reconstruct the Nix Realisation JSON. id is the same string
             // we got; outPath from the store; signatures from the store;
             // dependentRealisations is always empty (phase 5 populates it).
@@ -555,7 +576,7 @@ pub(super) async fn handle_query_realisation<R: AsyncRead + Unpin, W: AsyncWrite
             // won't, store paths are nixbase32+name, but defensive).
             let json = serde_json::json!({
                 "id": id,
-                "outPath": r.output_path,
+                "outPath": out_path_basename,
                 "signatures": r.signatures,
                 "dependentRealisations": {}
             });

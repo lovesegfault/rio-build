@@ -10,9 +10,11 @@
 #     if workers don't advertise it, can_build() is always false and the
 #     DAG leaf never dispatches. Build-completes assertion catches this.
 #
-#   Realisation outPath basename — build succeeding at all requires the
-#     client to parse BuildResult (which contains the Realisation JSON).
-#     Full-path outPath → "illegal base-32 char '/'" → build fails.
+#   BuildResult builtOutputs outPath basename — opcode 47
+#     (wopBuildPathsWithResults). Build succeeding requires the client to
+#     parse BuildResult, whose builtOutputs[].outPath is a basename.
+#     Full-path → "illegal base-32 char '/'" → build fails.
+#     NOT opcode 43 (wopQueryRealisation) — see phase4a §1.6 golden test.
 #
 # The `cold=false` variant subsumes phase1a (read-only opcodes, narHash/
 # narSize exact equality) + phase1b (single trivial build) + cache-hit.
@@ -78,8 +80,9 @@ let
         #   system="builtin" not advertised → busybox FOD can_build()
         #     always false → DAG leaf never dispatches → hang (globalTimeout).
         #
-        #   Realisation outPath full-path → client's BuildResult parser
-        #     rejects with "illegal base-32 character '/'" after build.
+        #   BuildResult builtOutputs outPath full-path (opcode 47) →
+        #     client's BuildResult parser rejects with "illegal base-32
+        #     character '/'" after build.
         #
         # Build succeeding = all three absent. Capture stderr to make any
         # failure mode diagnosable from CI logs.
@@ -103,10 +106,14 @@ let
         # (exactly 1 inputDrv) is independently valuable.
         _ = busybox_fod_drv
 
-    with subtest("output round-trips (Realisation outPath basename parsed)"):
-        # The build succeeding at all requires the client's BuildResult
-        # parser to accept the Realisation JSON. But prove the output is
-        # also queryable — a separate opcode path (wopQueryPathInfo) that
+    with subtest("output round-trips (BuildResult builtOutputs parsed)"):
+        # Opcode 47 coverage, NOT opcode 43. The build succeeding requires
+        # the client's BuildResult parser to accept builtOutputs[].outPath
+        # as a basename. Opcode 43 (wopQueryRealisation) has wire-level
+        # coverage in ca_roundtrip.rs and wire_opcodes/opcodes_read.rs;
+        # TODO(phase4b): golden conformance test against live nix-daemon.
+        # Prove the output is also
+        # queryable — a separate opcode path (wopQueryPathInfo) that
         # goes through the store.
         info = client.succeed(
             f"nix path-info --json --store '{store_url}' {out}"

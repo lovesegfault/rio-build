@@ -376,9 +376,13 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
 
     // 64-char hex = 32-byte SHA-256. All-AA for test determinism.
     let drv_hash_hex = "aa".repeat(32);
-    let out_path = "/nix/store/00000000000000000000000000000000-ca-test-out";
+    // Wire repr (basename) vs internal repr (full path). Real nix clients
+    // send the basename — CppNix StorePath::to_string() omits /nix/store/.
+    // Gateway prepends it before the gRPC call.
+    let out_path_wire = "00000000000000000000000000000000-ca-test-out";
+    let out_path_full = "/nix/store/00000000000000000000000000000000-ca-test-out";
     let realisation_json = format!(
-        r#"{{"id":"sha256:{drv_hash_hex}!out","outPath":"{out_path}","signatures":["sig:test"],"dependentRealisations":{{}}}}"#
+        r#"{{"id":"sha256:{drv_hash_hex}!out","outPath":"{out_path_wire}","signatures":["sig:test"],"dependentRealisations":{{}}}}"#
     );
 
     wire_send!(&mut h.stream;
@@ -394,7 +398,11 @@ async fn test_register_drv_output_stores_realisation() -> anyhow::Result<()> {
     let key = (drv_hash, "out".to_string());
     let stored = h.store.realisations.read().unwrap().get(&key).cloned();
     let stored = stored.expect("MockStore should have the realisation");
-    assert_eq!(stored.output_path, out_path);
+    // Sent basename, MockStore got full path — gateway's prepend is working.
+    assert_eq!(
+        stored.output_path, out_path_full,
+        "gateway should prepend STORE_PREFIX"
+    );
     assert_eq!(stored.signatures, vec!["sig:test"]);
 
     h.finish().await;

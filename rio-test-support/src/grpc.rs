@@ -309,6 +309,12 @@ impl StoreService for MockStore {
             .into_inner()
             .realisation
             .ok_or_else(|| Status::invalid_argument("realisation required"))?;
+        // Mirror the real store's validation at rio-store/src/grpc/mod.rs:464.
+        // Without this, the mock accepts basenames that the real store rejects,
+        // masking wire-format bugs (see phase4a §1.6: gateway passed basename
+        // verbatim, real store returned invalid_argument, mock swallowed it).
+        let _ = rio_nix::store_path::StorePath::parse(&r.output_path)
+            .map_err(|e| Status::invalid_argument(format!("mock: invalid store path: {e}")))?;
         // Key by (drv_hash, output_name) — mirrors the real store's PK.
         let key = (r.drv_hash.clone(), r.output_name.clone());
         self.realisations.write().unwrap().insert(key, r);
