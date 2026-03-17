@@ -1321,9 +1321,10 @@ let
       # unreachable set → proves the stream runs end-to-end, NOT that
       # the for-batch loop body executes (that's gc-sweep's job).
       with subtest("gc-dry-run: TriggerGC completes, currentPath describes outcome"):
-          # force=true bypasses the empty-refs safety gate — worker uploads
-          # have references=vec![] (phase4 gap, see gc-sweep comment below)
-          # which trips the >10%-empty-refs precondition even on dry-run.
+          # force=true bypasses the empty-refs safety gate — mkTrivial
+          # outputs embed no store-path strings, so the ref scanner
+          # correctly finds refs=[] for every fixture path, tripping
+          # the >10%-empty-refs precondition even on dry-run.
           result = sched_grpc(
               '{"dry_run": true, "grace_period_hours": 24, "force": true}',
               "rio.admin.AdminService/TriggerGC",
@@ -1689,9 +1690,11 @@ let
 
           # Backdate out_victim past grace. This is the path sweep will
           # delete. out_victim is unpinned (we only pinned out_pin) AND
-          # unreferenced (worker uploads have references=vec![] — phase4
-          # gap, see phase3b.nix:922-924). created_at = now() - 25h puts
-          # it 1h past a 24h grace window.
+          # unreferenced: gcVictimDrv is mkTrivial, its output is plain
+          # text with no embedded store paths, so the ref scanner
+          # correctly finds refs=[] — correct behavior for a leaf
+          # derivation, not a gap (see line ~100 + ~225). created_at =
+          # now() - 25h puts it 1h past a 24h grace window.
           #
           # Single-quote SQL avoids bash-escaping (psql_k8s wraps in
           # double quotes). Python f-string interpolates the path.
@@ -1704,10 +1707,10 @@ let
           # ONLY out_victim is past grace → unreachable={out_victim}
           # → for-batch loop iterates once → DELETE → COMMIT.
           #
-          # force=true bypasses the empty-refs safety gate — this test seeds
-          # synthetic paths without references (see line above: "worker
-          # uploads have references=vec![] — phase4 gap"), which would
-          # otherwise trip the gate (FailedPrecondition).
+          # force=true bypasses the empty-refs safety gate — mkTrivial
+          # leaf outputs genuinely have refs=[] (scanner finds no store
+          # paths, see comment above), which would otherwise trip the
+          # gate (FailedPrecondition).
           result = sched_grpc(
               '{"dry_run": false, "grace_period_hours": 24, "force": true}',
               "rio.admin.AdminService/TriggerGC",
@@ -1763,9 +1766,10 @@ let
       # ══════════════════════════════════════════════════════════════════
       # refs-end-to-end — refscan → PG references → GC mark walks refs
       # ══════════════════════════════════════════════════════════════════
-      # Closes the "references=vec![] — phase4 gap" called out in gc-sweep
-      # (line ~1688). gc-sweep proves the DELETE path (victim has refs=[]
-      # by construction, sweep removes it). This proves the SURVIVAL path:
+      # End-to-end test of the worker ref scanner → PG references →
+      # GC mark-walks-refs chain. gc-sweep proves the DELETE path
+      # (victim has refs=[] by construction — mkTrivial leaf, scanner
+      # correctly finds nothing). This proves the SURVIVAL path:
       # consumer's refscan-populated references[] makes dep REACHABLE via
       # mark's recursive CTE → dep survives a sweep even though dep itself
       # is unpinned AND past grace AND has refs=[] (no outbound edges).

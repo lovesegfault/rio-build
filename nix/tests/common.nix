@@ -117,13 +117,20 @@ rec {
 
   # ── Gateway tmpfiles (5× identical) ─────────────────────────────────
   # Gateway starts after store + scheduler via After= in the module, but
-  # load_authorized_keys() errors if the file is missing. Create an empty
-  # file via tmpfiles so the gateway unit can start; testScript populates
-  # it before the client connects.
+  # load_authorized_keys() bails on 0 keys (server.rs:90) → process
+  # exit → Restart=on-failure churns every 5s until sshKeySetup runs
+  # (each churn = gRPC connect to store+scheduler, then bail; on
+  # coverage builds, each also flushes profraw). Seed a throwaway
+  # ed25519 public key via tmpfiles so the unit starts cleanly. The
+  # private half was discarded at generation — authorizes nothing.
+  # sshKeySetup truncates with the client's real key + restarts before
+  # any connect happens. Same fix as k3s-full.nix 03-gateway-ssh-
+  # placeholder (6da3676).
+  gatewayPlaceholderKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICOWXl9/32g/wAtRqYblAdI7wmPNL6phTBMlkn2o6psr placeholder-unused-vmtest";
   gatewayTmpfiles = [
     "d /var/lib/rio 0755 root root -"
     "d /var/lib/rio/gateway 0755 root root -"
-    "f /var/lib/rio/gateway/authorized_keys 0600 root root -"
+    "f /var/lib/rio/gateway/authorized_keys 0600 root root - ${gatewayPlaceholderKey}"
   ];
 
   # ── Control node config (5× near-identical) ─────────────────────────
@@ -371,9 +378,9 @@ rec {
   # ── SSH key setup testScript snippet ────────────────────────────────
   #
   # Generate client key, install on the gateway host, restart gateway so
-  # load_authorized_keys() picks up the real key. The gateway may have
-  # started with the empty authorized_keys file (tmpfiles); restart
-  # is required.
+  # load_authorized_keys() picks up the real key. The gateway started
+  # with the placeholder key (gatewayTmpfiles above — authorizes
+  # nothing); `>` truncates, then restart swaps it in.
   #
   # Interpolate as `${common.sshKeySetup "control"}` in testScript.
   # The `gatewayHost` arg is the Python variable name for the gateway
