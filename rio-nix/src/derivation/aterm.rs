@@ -709,6 +709,30 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        /// String strategy that includes all five ATerm-escaped characters.
+        /// Weighted so ~10-15% of generated chars need escaping — exercises
+        /// write_aterm_string's escape branches which the old regex-only
+        /// strategy never hit.
+        fn arb_aterm_string(max_len: usize) -> impl Strategy<Value = String> {
+            proptest::collection::vec(
+                prop_oneof![
+                    // 85%: safe ASCII
+                    30 => proptest::char::range('a', 'z'),
+                    10 => proptest::char::range('0', '9'),
+                    5  => Just(' '),
+                    5  => Just('/'),
+                    // 15%: escape-requiring chars
+                    2  => Just('\\'),
+                    2  => Just('"'),
+                    2  => Just('\n'),
+                    1  => Just('\r'),
+                    1  => Just('\t'),
+                ],
+                0..max_len,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        }
+
         fn arb_output() -> impl Strategy<Value = DerivationOutput> {
             (
                 "[a-z]{1,8}",                                                 // name
@@ -739,8 +763,11 @@ mod tests {
                 proptest::collection::btree_set("/nix/store/[a-z0-9]{32}-[a-z]{1,8}", 0..3),
                 "(x86_64|aarch64)-linux",
                 "/nix/store/[a-z0-9]{32}-bash/bin/bash",
-                proptest::collection::vec("[a-zA-Z0-9 ./-]{0,20}", 0..4),
-                proptest::collection::btree_map("[a-zA-Z_]{1,10}", "[a-zA-Z0-9 =/_.-]{0,30}", 0..5),
+                // args + env: include the five ATerm-escaped chars (\\, ", \n,
+                // \r, \t) so the proptest actually exercises
+                // write_aterm_string's escape branches. ~15% escape density.
+                proptest::collection::vec(arb_aterm_string(20), 0..4),
+                proptest::collection::btree_map("[a-zA-Z_]{1,10}", arb_aterm_string(30), 0..5),
             )
                 .prop_map(
                     |(outputs, input_drvs_vec, input_srcs, platform, builder, args, env)| {

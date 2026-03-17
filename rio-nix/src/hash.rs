@@ -321,4 +321,63 @@ mod tests {
         assert!(NixHash::new(HashAlgo::SHA256, vec![0u8; 33]).is_err());
         assert!(NixHash::new(HashAlgo::SHA256, vec![0u8; 32]).is_ok());
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_hash_algo() -> impl Strategy<Value = HashAlgo> {
+            prop_oneof![
+                Just(HashAlgo::SHA256),
+                Just(HashAlgo::SHA512),
+                Just(HashAlgo::SHA1),
+            ]
+        }
+
+        fn arb_nixhash() -> impl Strategy<Value = NixHash> {
+            arb_hash_algo().prop_flat_map(|algo| {
+                proptest::collection::vec(any::<u8>(), algo.digest_len()).prop_map(move |digest| {
+                    NixHash::new(algo, digest).expect("length matches algo")
+                })
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4096))]
+
+            #[test]
+            fn colon_roundtrip(h in arb_nixhash()) {
+                let s = h.to_colon();
+                let parsed = NixHash::parse_colon(&s)?;
+                prop_assert_eq!(parsed, h);
+            }
+
+            #[test]
+            fn sri_roundtrip(h in arb_nixhash()) {
+                let s = h.to_sri();
+                let parsed = NixHash::parse_sri(&s)?;
+                prop_assert_eq!(parsed, h);
+            }
+
+            /// Any byte sequence of wrong length must be rejected by NixHash::new.
+            #[test]
+            fn new_rejects_wrong_length(
+                algo in arb_hash_algo(),
+                digest in proptest::collection::vec(any::<u8>(), 0..128),
+            ) {
+                let result = NixHash::new(algo, digest.clone());
+                let expect_ok = digest.len() == algo.digest_len();
+                // prop_assert! stringifies its arg as a format string, so
+                // `{ .. }` in a matches! pattern would be parsed as a format
+                // placeholder — bind the bool first.
+                let got_ok = result.is_ok();
+                let got_wrong_len = matches!(result, Err(HashError::WrongDigestLength { .. }));
+                if expect_ok {
+                    prop_assert!(got_ok);
+                } else {
+                    prop_assert!(got_wrong_len);
+                }
+            }
+        }
+    }
 }

@@ -49,6 +49,9 @@ pub enum StorePathError {
 
     #[error("invalid nixbase32 length: expected {expected}, got {got}")]
     InvalidBase32Length { expected: usize, got: usize },
+
+    #[error("invalid nixbase32 string: non-zero padding bits (non-canonical encoding)")]
+    InvalidBase32Padding,
 }
 
 /// The 20-byte hash part of a Nix store path.
@@ -214,10 +217,17 @@ impl StorePath {
         hash: &crate::hash::NixHash,
         references: &[StorePath],
     ) -> Result<Self, StorePathError> {
+        // Nix uses StorePathSet (a BTreeSet), so references are always
+        // iterated in sorted order. The wire protocol does not mandate
+        // sorted references from the client, so we must sort here.
+        // narinfo.rs fingerprint() does the same thing for the same reason.
+        let mut sorted: Vec<&str> = references.iter().map(|r| r.as_str()).collect();
+        sorted.sort_unstable();
+
         let mut type_str = "text".to_string();
-        for r in references {
+        for r in sorted {
             type_str.push(':');
-            type_str.push_str(r.as_str());
+            type_str.push_str(r);
         }
 
         let fingerprint = format!(
@@ -391,11 +401,24 @@ pub mod nixbase32 {
             let byte_idx = bit_pos / 8;
             let bit_offset = bit_pos % 8;
 
+            // Low bits of this digit land in out[byte_idx].
+            let lo = digit << bit_offset;
             if byte_idx < out_len {
-                out[byte_idx] |= digit << bit_offset;
+                out[byte_idx] |= lo;
+            } else if lo != 0 {
+                // These bits have nowhere to go — non-canonical encoding.
+                // Nix's parseHash32 throws here.
+                return Err(StorePathError::InvalidBase32Padding);
             }
-            if bit_offset > 3 && byte_idx + 1 < out_len {
-                out[byte_idx + 1] |= digit >> (8 - bit_offset);
+
+            // High bits (if bit_offset > 3) spill into out[byte_idx + 1].
+            if bit_offset > 3 {
+                let hi = digit >> (8 - bit_offset);
+                if byte_idx + 1 < out_len {
+                    out[byte_idx + 1] |= hi;
+                } else if hi != 0 {
+                    return Err(StorePathError::InvalidBase32Padding);
+                }
             }
         }
 
@@ -592,17 +615,64 @@ mod tests {
         Ok(())
     }
 
-    /// make_text with non-empty references exercises the ref-append loop.
+    /// make_text must sort references before hashing. Nix uses a StorePathSet
+    /// (BTreeSet), so iteration order is always sorted; the wire protocol does
+    /// not mandate sorted order from the client.
     #[test]
-    fn test_make_text_with_references() -> anyhow::Result<()> {
-        let r1 = StorePath::parse("/nix/store/00000000000000000000000000000000-ref1")?;
-        let r2 = StorePath::parse("/nix/store/11111111111111111111111111111111-ref2")?;
+    fn test_make_text_sorts_references() -> anyhow::Result<()> {
+        let r_a = StorePath::parse("/nix/store/00000000000000000000000000000000-a-ref")?;
+        let r_b = StorePath::parse("/nix/store/11111111111111111111111111111111-b-ref")?;
         let hash = crate::hash::NixHash::new(crate::hash::HashAlgo::SHA256, vec![0u8; 32])?;
-        let p = StorePath::make_text("mytext", &hash, &[r1, r2])?;
-        // Exact hash is tested elsewhere (golden conformance); here we just
-        // verify the function succeeds with multiple refs.
-        assert_eq!(p.name(), "mytext");
+
+        // Same reference set, two orderings. Must produce identical path.
+        let p_sorted = StorePath::make_text("mytext", &hash, &[r_a.clone(), r_b.clone()])?;
+        let p_rev = StorePath::make_text("mytext", &hash, &[r_b, r_a])?;
+
+        assert_eq!(
+            p_sorted, p_rev,
+            "make_text must be insensitive to caller ref ordering"
+        );
+        assert_eq!(p_sorted.name(), "mytext");
         Ok(())
+    }
+
+    /// nixbase32 encoding is NOT surjective onto the full input-char space when
+    /// output_len*8 is not a multiple of 5. For a 32-byte (SHA-256) decode,
+    /// 52 chars * 5 = 260 bits but only 256 fit — the top 4 bits of the
+    /// most-significant (first) char are padding and must be zero.
+    #[test]
+    fn test_nixbase32_rejects_nonzero_padding() {
+        // 52 chars decode to 32 bytes. The first char's top 4 bits are overflow.
+        // 'z' = 31 (0b11111) → all 4 overflow bits set.
+        let bad = format!("z{}", "0".repeat(51));
+        assert!(matches!(
+            nixbase32::decode(&bad),
+            Err(StorePathError::InvalidBase32Padding)
+        ));
+
+        // '0' = 0 → zero overflow bits. Must still decode cleanly.
+        let good = "0".repeat(52);
+        let decoded = nixbase32::decode(&good).expect("zero padding is canonical");
+        assert_eq!(decoded, vec![0u8; 32]);
+
+        // '1' = 1 (0b00001) → only bit 0 set, which lands in out[31] bit 7.
+        // That bit IS in-bounds for 32 bytes (bit 255). No padding, must succeed.
+        let one_in_lsb = format!("{}1", "0".repeat(51));
+        assert!(nixbase32::decode(&one_in_lsb).is_ok());
+    }
+
+    #[test]
+    fn test_nixbase32_20byte_no_padding() {
+        // 20 bytes = 160 bits = 32 chars * 5 exactly. No padding exists,
+        // so every valid-alphabet input is canonical. Exhaustively verify
+        // the first char can be anything.
+        for c in "0123456789abcdfghijklmnpqrsvwxyz".chars() {
+            let s = format!("{c}{}", "0".repeat(31));
+            assert!(
+                nixbase32::decode(&s).is_ok(),
+                "rejected valid first char {c:?}"
+            );
+        }
     }
 
     #[test]
@@ -630,6 +700,49 @@ mod tests {
                 let encoded = nixbase32::encode(&data);
                 let decoded = nixbase32::decode(&encoded)?;
                 prop_assert_eq!(decoded, data);
+            }
+
+            /// encode is canonical: decode∘encode = id for 20-byte store-path
+            /// hashes (no padding bits exist at 160/5=32 chars exactly).
+            #[test]
+            fn nixbase32_roundtrip_20(data in proptest::array::uniform20(any::<u8>())) {
+                let encoded = nixbase32::encode(&data);
+                let decoded = nixbase32::decode(&encoded)?;
+                prop_assert_eq!(decoded.as_slice(), &data[..]);
+            }
+
+            /// 32-byte SHA-256 hashes have 4 padding bits; padding rejection
+            /// enforces canonicality.
+            #[test]
+            fn nixbase32_roundtrip_32(data in proptest::array::uniform32(any::<u8>())) {
+                let encoded = nixbase32::encode(&data);
+                let decoded = nixbase32::decode(&encoded)?;
+                prop_assert_eq!(decoded.as_slice(), &data[..]);
+            }
+
+            /// Mutating a single char in a canonical encoding either fails to
+            /// decode (bad char / bad padding) or decodes to DIFFERENT bytes.
+            /// This is the injectivity property the padding check restores.
+            #[test]
+            fn nixbase32_decode_injective(
+                data in proptest::array::uniform32(any::<u8>()),
+                mutate_idx in 0usize..52,
+                mutate_to in 0u8..32,
+            ) {
+                let encoded = nixbase32::encode(&data);
+                let orig_char = encoded.as_bytes()[mutate_idx];
+                let new_char = b"0123456789abcdfghijklmnpqrsvwxyz"[mutate_to as usize];
+                prop_assume!(orig_char != new_char);
+
+                let mut mutated = encoded.into_bytes();
+                mutated[mutate_idx] = new_char;
+                let mutated = String::from_utf8(mutated).unwrap();
+
+                match nixbase32::decode(&mutated) {
+                    Err(_) => {} // padding rejection — good
+                    Ok(decoded) => prop_assert_ne!(decoded.as_slice(), &data[..],
+                        "two distinct inputs decoded to identical output: injectivity violated"),
+                }
             }
         }
     }

@@ -13,7 +13,7 @@ use super::{Derivation, DerivationError, MAX_HASH_RECURSION_DEPTH};
 /// Compute the modular derivation hash, matching Nix C++ `hashDerivationModulo`.
 ///
 /// Three cases:
-/// - **FOD** (fixed-output): `SHA-256("fixed:out:{hash_algo}:{hash}:")`
+/// - **FOD** (fixed-output): `SHA-256("fixed:out:{hash_algo}:{hash}:{output_path}")`
 /// - **Input-addressed**: replace `inputDrvs` keys with recursive modular hashes,
 ///   then `SHA-256(modified_aterm)`
 /// - **CA floating / impure**: same as input-addressed but output paths are masked
@@ -66,7 +66,16 @@ fn hash_derivation_modulo_inner<'c>(
         if drv.is_fixed_output() {
             // FOD base case: hash the fingerprint string (no recursion)
             let output = &drv.outputs()[0];
-            let fingerprint = format!("fixed:out:{}:{}:", output.hash_algo(), output.hash());
+            // Nix C++ derivations.cc:hashDerivationModulo — the output path
+            // IS part of the fingerprint. The trailing-colon-no-path shape
+            // was a copy-paste from store_path.rs make_store_path_hash
+            // where it IS correct (different function). See phase4a.md §5.
+            let fingerprint = format!(
+                "fixed:out:{}:{}:{}",
+                output.hash_algo(),
+                output.hash(),
+                output.path()
+            );
             Ok(Sha256::digest(fingerprint.as_bytes()).into())
         } else {
             // Input-addressed or CA floating: recurse on input drvs
@@ -136,9 +145,9 @@ mod hash_derivation_modulo_tests {
         let resolve = |_: &str| -> Option<&Derivation> { None };
         let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
 
-        // Expected: SHA-256("fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:")
+        // Expected: SHA-256("fixed:out:sha256:<hex>:/nix/store/xyz-fixed")
         let expected: [u8; 32] = Sha256::digest(
-            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:",
+            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/xyz-fixed",
         )
         .into();
 
@@ -184,7 +193,7 @@ mod hash_derivation_modulo_tests {
 
         // The FOD modular hash
         let fod_hash: [u8; 32] = Sha256::digest(
-            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:",
+            b"fixed:out:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/xyz-fixed",
         )
         .into();
         let fod_hex = hex::encode(fod_hash);
@@ -413,13 +422,39 @@ mod hash_derivation_modulo_tests {
         let resolve = |_: &str| -> Option<&Derivation> { None };
         let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-rec.drv", &resolve, &mut cache)?;
 
-        // Expected: SHA-256("fixed:out:r:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:")
+        // Expected: SHA-256("fixed:out:r:sha256:<hex>:/nix/store/xyz-rec")
         let expected: [u8; 32] = Sha256::digest(
-            b"fixed:out:r:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:",
+            b"fixed:out:r:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:/nix/store/xyz-rec",
         )
         .into();
 
         assert_eq!(hash, expected);
+        Ok(())
+    }
+
+    /// Two FODs with identical (algo, hash) but different output paths must
+    /// produce different modular hashes — nix-aterm-modulo-key-collision.
+    /// Before this fix they collided because the fingerprint omitted path.
+    #[test]
+    fn fod_different_paths_different_hashes() -> anyhow::Result<()> {
+        let drv_a = Derivation::parse(
+            r#"Derive([("out","/nix/store/aaa-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed-a"),("out","/nix/store/aaa-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
+        )?;
+        let drv_b = Derivation::parse(
+            r#"Derive([("out","/nix/store/bbb-fixed","sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed-b"),("out","/nix/store/bbb-fixed"),("outputHash","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#,
+        )?;
+
+        let mut cache = HashMap::new();
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let hash_a =
+            hash_derivation_modulo(&drv_a, "/nix/store/aaa-fixed.drv", &resolve, &mut cache)?;
+        let hash_b =
+            hash_derivation_modulo(&drv_b, "/nix/store/bbb-fixed.drv", &resolve, &mut cache)?;
+
+        assert_ne!(
+            hash_a, hash_b,
+            "FODs differing only in output path must not collide"
+        );
         Ok(())
     }
 

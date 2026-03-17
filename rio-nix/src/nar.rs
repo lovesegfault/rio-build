@@ -37,6 +37,13 @@ const MAX_NAME_LEN: u64 = 256;
 /// Maximum allowed symlink target length.
 const MAX_TARGET_LEN: u64 = 4096;
 
+/// Maximum NAR directory nesting depth. Nix's PATH_MAX is 4096; with the
+/// 1-char minimum entry name plus separator that caps legitimate nesting
+/// at ~2048, but no real store path approaches 256 components.
+/// Each level costs ~300 bytes of stack; 256 * 300 = 77 KiB, well within
+/// the 2 MiB thread stack.
+const MAX_NAR_DEPTH: usize = 256;
+
 /// Errors from NAR operations.
 #[derive(Debug, Error)]
 pub enum NarError {
@@ -63,6 +70,9 @@ pub enum NarError {
 
     #[error("directory entries not in sorted order: {prev:?} >= {cur:?}")]
     UnsortedEntries { prev: String, cur: String },
+
+    #[error("directory nesting depth {0} exceeds maximum {MAX_NAR_DEPTH}")]
+    NestingTooDeep(usize),
 
     #[error("not a single-file NAR")]
     NotSingleFile,
@@ -203,7 +213,7 @@ pub fn parse(r: &mut impl Read) -> Result<NarNode> {
         return Err(NarError::InvalidMagic(magic));
     }
 
-    parse_node(r)
+    parse_node(r, 0)
 }
 
 /// Parse a single NAR node.
@@ -211,14 +221,17 @@ pub fn parse(r: &mut impl Read) -> Result<NarNode> {
 /// Each sub-parser is responsible for consuming its own closing ")".
 /// This is necessary because `parse_directory` reads tokens in a loop
 /// and must consume ")" to detect end-of-directory.
-fn parse_node(r: &mut impl Read) -> Result<NarNode> {
+fn parse_node(r: &mut impl Read, depth: usize) -> Result<NarNode> {
+    if depth > MAX_NAR_DEPTH {
+        return Err(NarError::NestingTooDeep(depth));
+    }
     expect_str(r, "(")?;
     expect_str(r, "type")?;
 
     let node_type = read_string(r)?;
     match node_type.as_str() {
         "regular" => parse_regular(r),
-        "directory" => parse_directory(r),
+        "directory" => parse_directory(r, depth),
         "symlink" => parse_symlink(r),
         _ => Err(NarError::UnknownNodeType(node_type)),
     }
@@ -239,16 +252,9 @@ fn parse_regular(r: &mut impl Read) -> Result<NarNode> {
             let contents = read_bytes_bounded(r, MAX_CONTENT_SIZE)?;
             (false, contents)
         }
-        ")" => {
-            // Empty file with no "contents" field: ( type regular )
-            return Ok(NarNode::Regular {
-                executable: false,
-                contents: vec![],
-            });
-        }
         _ => {
             return Err(NarError::UnexpectedToken {
-                expected: "\"executable\" or \"contents\" or \")\"".to_string(),
+                expected: "\"executable\" or \"contents\"".to_string(),
                 got: token,
             });
         }
@@ -264,7 +270,7 @@ fn parse_regular(r: &mut impl Read) -> Result<NarNode> {
 /// Maximum number of directory entries (DoS prevention for unbounded allocation).
 const MAX_DIRECTORY_ENTRIES: usize = 1_048_576;
 
-fn parse_directory(r: &mut impl Read) -> Result<NarNode> {
+fn parse_directory(r: &mut impl Read, depth: usize) -> Result<NarNode> {
     let mut entries = Vec::new();
     let mut prev_name: Option<String> = None;
 
@@ -303,7 +309,7 @@ fn parse_directory(r: &mut impl Read) -> Result<NarNode> {
                 prev_name = Some(name.clone());
 
                 expect_str(r, "node")?;
-                let node = parse_node(r)?;
+                let node = parse_node(r, depth + 1)?;
                 expect_str(r, ")")?; // close the entry's parens
 
                 entries.push(NarEntry { name, node });
@@ -737,25 +743,75 @@ mod tests {
         Ok(())
     }
 
+    /// The NAR grammar requires a "contents" token even for empty regular
+    /// files. `( type regular )` is not a valid production — reject it.
     #[test]
-    fn parse_empty_regular_no_contents() -> anyhow::Result<()> {
-        // NAR allows empty regular files without a "contents" field:
-        // nix-archive-1 ( type regular )
+    fn reject_regular_without_contents() {
+        // Hand-roll: nix-archive-1 ( type regular )
         let mut buf = Vec::new();
-        write_str(&mut buf, "nix-archive-1")?;
-        write_str(&mut buf, "(")?;
-        write_str(&mut buf, "type")?;
-        write_str(&mut buf, "regular")?;
-        write_str(&mut buf, ")")?;
+        write_str(&mut buf, NAR_MAGIC).unwrap();
+        write_str(&mut buf, "(").unwrap();
+        write_str(&mut buf, "type").unwrap();
+        write_str(&mut buf, "regular").unwrap();
+        write_str(&mut buf, ")").unwrap();
 
-        let parsed = parse(&mut Cursor::new(&buf))?;
-        assert_eq!(
-            parsed,
-            NarNode::Regular {
-                executable: false,
-                contents: vec![],
-            }
+        let result = parse(&mut Cursor::new(&buf));
+        assert!(
+            matches!(result, Err(NarError::UnexpectedToken { .. })),
+            "expected UnexpectedToken for contents-less regular, got {result:?}"
         );
+    }
+
+    /// A malicious NAR with ~300 levels of nested directories must be rejected
+    /// with NestingTooDeep, not crash with a stack overflow.
+    #[test]
+    fn reject_deeply_nested_nar() {
+        // Build inside-out: each level wraps the previous in a one-entry dir.
+        let mut node = NarNode::Regular {
+            executable: false,
+            contents: vec![],
+        };
+        for _ in 0..(MAX_NAR_DEPTH + 10) {
+            node = NarNode::Directory {
+                entries: vec![NarEntry {
+                    name: "a".to_string(),
+                    node,
+                }],
+            };
+        }
+
+        // serialize() recurses too — at 266 levels it's fine on a default
+        // 2 MiB test stack. If this ever blows the test stack, switch to
+        // hand-rolling bytes with write_str.
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node).expect("serialize succeeds");
+
+        let result = parse(&mut Cursor::new(&buf));
+        assert!(
+            matches!(result, Err(NarError::NestingTooDeep(d)) if d > MAX_NAR_DEPTH),
+            "expected NestingTooDeep, got {result:?}"
+        );
+    }
+
+    /// A NAR at exactly MAX_NAR_DEPTH must still parse.
+    #[test]
+    fn accept_nar_at_depth_limit() -> anyhow::Result<()> {
+        let mut node = NarNode::Regular {
+            executable: false,
+            contents: b"leaf".to_vec(),
+        };
+        for _ in 0..MAX_NAR_DEPTH {
+            node = NarNode::Directory {
+                entries: vec![NarEntry {
+                    name: "a".to_string(),
+                    node,
+                }],
+            };
+        }
+        let mut buf = Vec::new();
+        serialize(&mut buf, &node)?;
+        let parsed = parse(&mut Cursor::new(&buf))?;
+        assert_eq!(parsed, node);
         Ok(())
     }
 
