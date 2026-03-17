@@ -240,6 +240,20 @@ impl StoreServiceImpl {
             return;
         };
 
+        // r[impl store.signing.empty-refs-warn]
+        // Defensive: a non-CA path with zero references is almost certainly
+        // a worker that didn't scan (pre-fix upload.rs) or a scanning bug.
+        // CA paths legitimately have empty refs (fetchurl, etc.). Don't block
+        // the upload — just make noise so it's visible in logs/alerts.
+        if info.content_address.is_none() && info.references.is_empty() {
+            warn!(
+                store_path = %info.store_path.as_str(),
+                "signing non-CA path with zero references — suspicious for non-leaf derivation; \
+                 GC will not protect deps (check worker ref-scanner)"
+            );
+            metrics::counter!("rio_store_sign_empty_refs_total").increment(1);
+        }
+
         // References for the fingerprint are FULL store paths (not
         // basenames — that's a narinfo-text-format thing). ValidatedPathInfo
         // stores them as StorePath, which stringifies to full paths.
@@ -558,5 +572,108 @@ impl StoreService for StoreServiceImpl {
             output_hash: r.output_hash.to_vec(),
             signatures: r.signatures,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_test_support::fixtures::{make_path_info, test_store_path};
+    use tracing_test::traced_test;
+
+    /// Build a StoreServiceImpl with a test signer but no DB/backend.
+    /// `maybe_sign` only touches the signer, so pool can be dangling —
+    /// we construct one that's never awaited (lazy connect).
+    fn svc_with_signer() -> StoreServiceImpl {
+        // 32-byte seed → Signer::parse accepts `name:base64(seed)` (seed-only
+        // form; ed25519 derives pubkey deterministically).
+        let seed_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42u8; 32]);
+        let signer = Signer::parse(&format!("test-key-1:{seed_b64}")).expect("valid test signer");
+        // Pool is lazy — never connects since maybe_sign doesn't touch it.
+        let pool = PgPool::connect_lazy("postgres://unused").expect("lazy pool never connects");
+        StoreServiceImpl::new(pool).with_signer(signer)
+    }
+
+    /// r[verify store.signing.empty-refs-warn]
+    /// Signing a non-CA path with zero references emits a warn! log
+    /// containing "suspicious". The signing still proceeds (no block).
+    #[tokio::test]
+    #[traced_test]
+    async fn maybe_sign_warns_on_empty_refs_non_ca() {
+        let svc = svc_with_signer();
+        // make_path_info gives: references=[], content_address=None. Exactly
+        // the suspicious case.
+        let mut info = make_path_info(&test_store_path("suspect"), b"nar", [0u8; 32]);
+        assert!(info.references.is_empty());
+        assert!(info.content_address.is_none());
+
+        svc.maybe_sign(&mut info);
+
+        assert!(
+            logs_contain("suspicious"),
+            "expected warn! with 'suspicious' in message"
+        );
+        assert!(
+            logs_contain("zero references"),
+            "expected warn! to mention zero references"
+        );
+        // Signing still happened — warn is observability only, not a block.
+        assert_eq!(info.signatures.len(), 1, "signing should still proceed");
+    }
+
+    /// r[verify store.signing.empty-refs-warn]
+    /// CA paths with empty refs do NOT warn (fetchurl etc. legitimately
+    /// have no runtime deps).
+    #[tokio::test]
+    #[traced_test]
+    async fn maybe_sign_no_warn_for_ca_path() {
+        let svc = svc_with_signer();
+        let mut info = make_path_info(&test_store_path("ca-path"), b"nar", [0u8; 32]);
+        info.content_address = Some("fixed:r:sha256:abc".into());
+
+        svc.maybe_sign(&mut info);
+
+        assert!(
+            !logs_contain("suspicious"),
+            "CA path with empty refs should NOT warn"
+        );
+        assert_eq!(info.signatures.len(), 1);
+    }
+
+    /// r[verify store.signing.empty-refs-warn]
+    /// Non-CA path WITH references does NOT warn (normal case).
+    #[tokio::test]
+    #[traced_test]
+    async fn maybe_sign_no_warn_with_references() {
+        let svc = svc_with_signer();
+        let mut info = make_path_info(&test_store_path("normal"), b"nar", [0u8; 32]);
+        info.references =
+            vec![rio_nix::store_path::StorePath::parse(&test_store_path("dep-a")).unwrap()];
+
+        svc.maybe_sign(&mut info);
+
+        assert!(
+            !logs_contain("suspicious"),
+            "path with refs should NOT warn"
+        );
+        assert_eq!(info.signatures.len(), 1);
+    }
+
+    /// No signer configured → maybe_sign is a no-op. No warn emitted
+    /// (the early return is BEFORE the check — intentional: unsigned
+    /// stores don't cryptographically commit to the empty refs, so the
+    /// blast radius is smaller).
+    #[tokio::test]
+    #[traced_test]
+    async fn maybe_sign_noop_without_signer() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let svc = StoreServiceImpl::new(pool); // no .with_signer()
+        let mut info = make_path_info(&test_store_path("unsigned"), b"nar", [0u8; 32]);
+
+        svc.maybe_sign(&mut info);
+
+        assert!(!logs_contain("suspicious"));
+        assert!(info.signatures.is_empty(), "no signer → no signature");
     }
 }

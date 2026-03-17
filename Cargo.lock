@@ -4748,6 +4748,7 @@ dependencies = [
  "tonic-health",
  "tower",
  "tracing",
+ "tracing-test",
  "x509-parser",
  "zstd",
 ]

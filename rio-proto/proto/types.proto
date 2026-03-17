@@ -744,6 +744,13 @@ message GCRequest {
   // may not be in narinfo yet (worker hasn't uploaded). The store's
   // mark phase includes these as root seeds.
   repeated string extra_roots = 3;
+  // Bypass the empty-refs safety gate. Use ONLY if you've verified
+  // the empty-ref paths are genuinely ref-free (static binaries,
+  // fetchurl outputs with missing CA field, etc.). The gate exists
+  // to prevent catastrophic sweep on stores populated before the
+  // worker reference scanner shipped (pre-refscan data has ~100%
+  // empty refs → GC would collect everything past grace).
+ bool force = 4;
 }
 
 message GCProgress {

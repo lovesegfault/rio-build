@@ -115,3 +115,5 @@ tower = { workspace = true, features = ["util"] }
 # production code uses figment via rio_common::config::load. dev-dep
 # here for Toml::string + Jail (env manipulation under global mutex).
 figment = { workspace = true, features = ["test"] }
+# For log-assertion tests (maybe_sign warn on empty refs).
+tracing-test = "0.2"

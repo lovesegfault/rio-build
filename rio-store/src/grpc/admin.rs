@@ -10,7 +10,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use rio_proto::types::{GcProgress, GcRequest, PinPathRequest, PinPathResponse};
 
@@ -34,6 +34,84 @@ impl StoreAdminServiceImpl {
             chunk_backend,
         }
     }
+}
+
+/// Default threshold for the empty-refs safety gate. 10% is
+/// intentionally low: in a healthy post-fix store, empty-ref non-CA
+/// paths should be ~0% (only genuinely ref-free outputs like static
+/// binaries). 10% gives headroom for legitimate cases without allowing
+/// a pre-fix store (where it'd be ~100%) through.
+const GC_EMPTY_REFS_THRESHOLD_PCT: f64 = 10.0;
+
+/// Safety gate: if more than `threshold_pct`% of COMPLETE narinfo rows
+/// older than `grace_hours` have empty references AND no content
+/// address, refuse GC. Protects against running GC on pre-refscan data
+/// (worker upload.rs bug where references were never populated).
+///
+/// CA paths are excluded from the numerator (legitimately ref-free).
+/// Paths inside the grace window are excluded entirely (they're
+/// protected anyway; their ref-state doesn't matter for this sweep).
+///
+/// Schema note: narinfo column is `ca` (not `content_address`), and
+/// `"references"` is a TEXT[] — empty array is `'{}'` in PG.
+// r[impl store.gc.empty-refs-gate]
+async fn check_empty_refs_gate(
+    pool: &PgPool,
+    grace_hours: u32,
+    threshold_pct: f64,
+) -> Result<(), Status> {
+    let row: (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            count(*) FILTER (
+                WHERE n."references" = '{}'
+                  AND (n.ca IS NULL OR n.ca = '')
+            ) AS empty_ref_non_ca,
+            count(*) AS total
+        FROM narinfo n
+        JOIN manifests m USING (store_path_hash)
+        WHERE m.status = 'complete'
+          AND n.created_at < now() - make_interval(hours => $1::int)
+        "#,
+    )
+    .bind(grace_hours as i32)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        // Don't leak sqlx chain to client; log full detail server-side.
+        warn!(error = %e, "empty-refs gate query failed");
+        Status::internal("empty-refs gate query failed")
+    })?;
+
+    let (empty, total) = row;
+    if total == 0 {
+        return Ok(()); // nothing sweep-eligible anyway
+    }
+    let pct = (empty as f64 / total as f64) * 100.0;
+    metrics::gauge!("rio_store_gc_empty_refs_pct").set(pct);
+
+    if pct > threshold_pct {
+        error!(
+            empty_ref_non_ca = empty,
+            total,
+            pct,
+            threshold_pct,
+            "GC REFUSED: high empty-refs ratio — store likely contains pre-refscan data"
+        );
+        return Err(Status::failed_precondition(format!(
+            "GC refused: {empty}/{total} ({pct:.1}%) of sweep-eligible paths have empty \
+             references (threshold {threshold_pct}%) — worker upload.rs bug? \
+             Run backfill first or use force=true to override."
+        )));
+    }
+
+    if empty > 0 {
+        warn!(
+            empty_ref_non_ca = empty,
+            total, pct, "GC proceeding with some empty-ref paths (below threshold)"
+        );
+    }
+    Ok(())
 }
 
 type TriggerGcStream = ReceiverStream<Result<GcProgress, Status>>;
@@ -197,6 +275,23 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                 {
                     warn!(error = %e, "TriggerGC: advisory unlock failed");
                 }
+            }
+
+            // r[impl store.gc.empty-refs-gate]
+            // Safety gate: refuse if >threshold% of sweep-eligible narinfo
+            // have empty refs (pre-refscan data). Runs AFTER advisory lock
+            // so two gated requests don't race on the check. Skip if
+            // force=true, but still log so the override is visible.
+            if !req.force {
+                if let Err(e) =
+                    check_empty_refs_gate(&pool, grace_hours, GC_EMPTY_REFS_THRESHOLD_PCT).await
+                {
+                    let _ = tx.send(Err(e)).await;
+                    gc_unlock(lock_conn).await;
+                    return;
+                }
+            } else {
+                warn!("TriggerGC: force=true — bypassing empty-refs safety gate");
             }
 
             // --- Mark phase ---
@@ -543,6 +638,7 @@ mod tests {
                 dry_run: true,
                 grace_period_hours: Some(24),
                 extra_roots: vec![],
+                force: false,
             }))
             .await
             .unwrap();
@@ -568,6 +664,7 @@ mod tests {
                 dry_run: true,
                 grace_period_hours: Some(24),
                 extra_roots: vec![],
+                force: false,
             }))
             .await
             .unwrap();
@@ -600,6 +697,7 @@ mod tests {
                 extra_roots: roots,
                 dry_run: true,
                 grace_period_hours: Some(24),
+                force: false,
             }))
             .await
             .unwrap_err();
@@ -621,6 +719,7 @@ mod tests {
                 extra_roots: vec!["not-a-store-path".into()],
                 dry_run: true,
                 grace_period_hours: Some(24),
+                force: false,
             }))
             .await
             .unwrap_err();
@@ -688,5 +787,216 @@ mod tests {
         );
         // internal_error() emits this generic string.
         assert_eq!(err.message(), "storage operation failed");
+    }
+
+    // --- GC empty-refs safety gate (remediation 02) ---
+
+    /// Seed a narinfo+manifests row pair for gate tests.
+    /// `created_at` is forced into the past so the row is sweep-eligible
+    /// under any non-zero grace window. `ca` and `references` are the
+    /// two axes the gate pivots on.
+    async fn seed_narinfo_for_gate(pool: &PgPool, name: &str, refs: &[String], ca: Option<&str>) {
+        use sha2::Digest;
+        let path = rio_test_support::fixtures::test_store_path(name);
+        let hash: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        // created_at = 7 days ago — comfortably past any test grace.
+        sqlx::query(
+            r#"INSERT INTO narinfo
+               (store_path_hash, store_path, nar_hash, nar_size, "references", ca, created_at)
+               VALUES ($1, $2, $3, 42, $4, $5, now() - interval '7 days')"#,
+        )
+        .bind(&hash)
+        .bind(&path)
+        .bind(vec![0u8; 32])
+        .bind(refs)
+        .bind(ca)
+        .execute(pool)
+        .await
+        .expect("seed narinfo");
+        // Manifest must be 'complete' — gate query joins on this.
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("seed manifest");
+    }
+
+    /// Drain the TriggerGC stream to the first Err, or return the final
+    /// Ok(GcProgress) if no Err arrives. GC gate failures arrive as an
+    /// Err(Status) over the stream (the handler returns Ok(stream) then
+    /// the spawned task sends Err).
+    async fn drain_gc_stream(
+        stream: &mut (impl futures_util::Stream<Item = Result<GcProgress, Status>> + Unpin),
+    ) -> Result<GcProgress, Status> {
+        use futures_util::StreamExt;
+        let mut last_ok = None;
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(p) => last_ok = Some(p),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(last_ok.expect("stream produced at least one message"))
+    }
+
+    /// r[verify store.gc.empty-refs-gate]
+    /// Store with >10% empty-ref non-CA paths past grace → gate refuses
+    /// with FailedPrecondition. Message names the ratio + suggests force.
+    #[tokio::test]
+    async fn gc_refuses_on_high_empty_ref_ratio() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // 8 empty-ref non-CA + 2 with-refs = 80% empty. Well above 10%.
+        for i in 0..8 {
+            seed_narinfo_for_gate(&db.pool, &format!("empty-{i}"), &[], None).await;
+        }
+        let good_ref = vec![rio_test_support::fixtures::test_store_path("dep")];
+        for i in 0..2 {
+            seed_narinfo_for_gate(&db.pool, &format!("good-{i}"), &good_ref, None).await;
+        }
+
+        let resp = svc
+            .trigger_gc(Request::new(GcRequest {
+                dry_run: true,
+                grace_period_hours: Some(1),
+                extra_roots: vec![],
+                force: false,
+            }))
+            .await
+            .expect("handler returns Ok(stream)");
+        let mut stream = resp.into_inner();
+
+        let err = drain_gc_stream(&mut stream)
+            .await
+            .expect_err("gate should refuse");
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "gate returns FailedPrecondition, got {:?}: {}",
+            err.code(),
+            err.message()
+        );
+        // Message contains ratio + force hint.
+        let msg = err.message();
+        assert!(
+            msg.contains("GC refused"),
+            "message should say GC refused: {msg}"
+        );
+        assert!(
+            msg.contains("8/10") && msg.contains("80.0%"),
+            "message should show 8/10 (80.0%) ratio: {msg}"
+        );
+        assert!(
+            msg.contains("force=true"),
+            "message should hint force override: {msg}"
+        );
+    }
+
+    /// r[verify store.gc.empty-refs-gate]
+    /// Same high-ratio setup, but `force=true` bypasses the gate.
+    /// GC proceeds to mark+sweep (dry-run so nothing actually deleted).
+    #[tokio::test]
+    async fn gc_force_overrides_empty_refs_gate() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // 100% empty-ref non-CA.
+        for i in 0..5 {
+            seed_narinfo_for_gate(&db.pool, &format!("empty-{i}"), &[], None).await;
+        }
+
+        let resp = svc
+            .trigger_gc(Request::new(GcRequest {
+                dry_run: true, // don't actually sweep, just verify gate is bypassed
+                grace_period_hours: Some(1),
+                extra_roots: vec![],
+                force: true,
+            }))
+            .await
+            .expect("handler returns Ok(stream)");
+        let mut stream = resp.into_inner();
+
+        // Gate bypassed → mark+sweep runs → stream ends with Ok(complete).
+        let final_msg = drain_gc_stream(&mut stream)
+            .await
+            .expect("force=true should bypass gate and complete");
+        assert!(
+            final_msg.is_complete,
+            "force=true should let GC complete, got: {final_msg:?}"
+        );
+        assert!(
+            !final_msg.current_path.contains("already running"),
+            "should not be the advisory-lock early-return path"
+        );
+    }
+
+    /// r[verify store.gc.empty-refs-gate]
+    /// CA paths with empty refs are NOT counted toward the threshold
+    /// (fetchurl outputs etc. legitimately have no runtime deps).
+    /// 100% of paths have empty refs but they're all CA → gate passes.
+    #[tokio::test]
+    async fn gc_gate_excludes_ca_paths_from_ratio() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // All empty-ref but all CA. Numerator = 0, pct = 0%.
+        for i in 0..5 {
+            seed_narinfo_for_gate(
+                &db.pool,
+                &format!("ca-{i}"),
+                &[],
+                Some("fixed:r:sha256:abc"),
+            )
+            .await;
+        }
+
+        let resp = svc
+            .trigger_gc(Request::new(GcRequest {
+                dry_run: true,
+                grace_period_hours: Some(1),
+                extra_roots: vec![],
+                force: false,
+            }))
+            .await
+            .expect("handler returns Ok(stream)");
+        let mut stream = resp.into_inner();
+
+        let final_msg = drain_gc_stream(&mut stream)
+            .await
+            .expect("CA-only store should pass gate");
+        assert!(final_msg.is_complete);
+    }
+
+    /// r[verify store.gc.empty-refs-gate]
+    /// Paths INSIDE the grace window don't count toward the ratio
+    /// (they're protected from sweep anyway). Seed recent empty-ref
+    /// paths + use a large grace → denominator = 0 → gate passes.
+    #[tokio::test]
+    async fn gc_gate_excludes_paths_inside_grace() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // seed_narinfo_for_gate sets created_at = 7 days ago.
+        // With grace = 30 days (720h), they're INSIDE grace → excluded.
+        for i in 0..5 {
+            seed_narinfo_for_gate(&db.pool, &format!("recent-{i}"), &[], None).await;
+        }
+
+        let resp = svc
+            .trigger_gc(Request::new(GcRequest {
+                dry_run: true,
+                grace_period_hours: Some(720), // 30 days > 7 days
+                extra_roots: vec![],
+                force: false,
+            }))
+            .await
+            .expect("handler returns Ok(stream)");
+        let mut stream = resp.into_inner();
+
+        let final_msg = drain_gc_stream(&mut stream)
+            .await
+            .expect("paths inside grace don't trip gate");
+        assert!(final_msg.is_complete);
     }
 }
