@@ -736,6 +736,108 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: the refscan candidate set MUST be the TRANSITIVE input
+    /// closure (what compute_input_closure returns), not just the direct
+    /// inputs (resolved_input_srcs). See executor/mod.rs:733 — the
+    /// candidate set is `input_paths` (closure), not `resolved_input_srcs`
+    /// (direct). If that line regresses to the direct set, a build output
+    /// that embeds a transitive dependency (e.g., glibc via closure(stdenv))
+    /// would have that reference SILENTLY DROPPED.
+    ///
+    /// This test exercises the real compute_input_closure → CandidateSet →
+    /// RefScanSink path. The `direct_only` scan at the end is the
+    /// sensitivity proof: same output bytes, direct-only candidate set →
+    /// transitive ref is missed. That's the exact shape of the original bug.
+    ///
+    // r[verify worker.upload.references-scanned]
+    #[tokio::test]
+    async fn test_candidate_set_is_transitive_not_direct() -> anyhow::Result<()> {
+        use rio_nix::refscan::{CandidateSet, RefScanSink};
+        use std::io::Write;
+
+        // Distinct nixbase32 hash parts. tp() uses a single TEST_HASH for
+        // all paths — fine for closure BFS (which compares full strings)
+        // but CandidateSet keys on the 32-char hash part, so we need real
+        // distinct hashes here.
+        const H_DIRECT: &str = "7rjj5xmrxb3n63wlk6mzlwxzxbvg7r3a";
+        const H_TRANSITIVE: &str = "v5sv61sszx301i0x6xysaqzla09nksnd";
+        let p_direct = format!("/nix/store/{H_DIRECT}-stdenv");
+        let p_transitive = format!("/nix/store/{H_TRANSITIVE}-glibc");
+        let p_drv = tp("hello.drv");
+
+        // Reference graph: direct → transitive. transitive is NOT in
+        // drv.input_srcs; it's only reachable via BFS from direct.
+        let (store, client) = spawn_and_connect().await?;
+        seed_with_refs(&store, &p_drv, &[]);
+        seed_with_refs(&store, &p_direct, std::slice::from_ref(&p_transitive));
+        seed_with_refs(&store, &p_transitive, &[]);
+
+        let drv = drv_with_srcs(std::slice::from_ref(&p_direct));
+
+        // --- mod.rs step 1: compute_input_closure (mod.rs:379-380) ---
+        let closure = compute_input_closure(&client, &drv, &p_drv).await?;
+        let closure_set: std::collections::HashSet<_> = closure.iter().cloned().collect();
+        assert!(
+            closure_set.contains(&p_transitive),
+            "precondition: closure BFS reaches transitive dep"
+        );
+
+        // --- mod.rs step 2: merge resolved_input_srcs (mod.rs:384-388) ---
+        // drv_with_srcs has no input_drvs, so resolved_input_srcs == input_srcs.
+        // (mod.rs:327 clones the BTreeSet into a fresh one and extends it.)
+        let resolved_input_srcs: Vec<String> = drv.input_srcs().iter().cloned().collect();
+        let input_paths: Vec<String> = {
+            let mut s = closure_set;
+            s.extend(resolved_input_srcs.iter().cloned());
+            s.into_iter().collect()
+        };
+
+        // --- mod.rs step 3: ref_candidates = input_paths ∪ outputs (mod.rs:733-734) ---
+        let mut ref_candidates = input_paths.clone();
+        ref_candidates.extend(drv.outputs().iter().map(|o| o.path().to_string()));
+
+        // Simulated build output: embeds ONLY the transitive dep's path
+        // (the way a real binary's RPATH embeds glibc but not stdenv).
+        let output_bytes = format!("RPATH={p_transitive}/lib\n");
+
+        // --- THE FIX: scan with closure-based candidates ---
+        let cs_closure = CandidateSet::from_paths(&ref_candidates);
+        let mut sink = RefScanSink::new(cs_closure.hashes());
+        sink.write_all(output_bytes.as_bytes())?;
+        let found_with_closure = cs_closure.resolve(&sink.into_found());
+        assert_eq!(
+            found_with_closure,
+            vec![p_transitive.clone()],
+            "closure-based candidate set finds transitive ref"
+        );
+
+        // --- THE BUG: scan with direct-only candidates ---
+        // If mod.rs:733 were `resolved_input_srcs.clone()` instead of
+        // `input_paths.clone()`, THIS is the candidate set that would be
+        // passed. transitive is not in it → scan silently misses the ref.
+        let cs_direct = CandidateSet::from_paths(&resolved_input_srcs);
+        let mut sink = RefScanSink::new(cs_direct.hashes());
+        sink.write_all(output_bytes.as_bytes())?;
+        let found_with_direct = cs_direct.resolve(&sink.into_found());
+        assert!(
+            found_with_direct.is_empty(),
+            "sensitivity proof: direct-only set misses transitive ref \
+             (this is the original bug's behavior)"
+        );
+
+        // Structural ⊇: input_paths was built by EXTENDING the closure
+        // with resolved_input_srcs, so it contains every direct input.
+        let input_set: std::collections::HashSet<_> = input_paths.iter().collect();
+        for direct in &resolved_input_srcs {
+            assert!(
+                input_set.contains(direct),
+                "input_paths ⊇ resolved_input_srcs (merge at mod.rs:386)"
+            );
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_fetch_drv_from_store_success() -> anyhow::Result<()> {
         let (store, mut client) = spawn_and_connect().await?;

@@ -27,7 +27,7 @@ use crate::store_path::{HASH_CHARS, StorePath};
 /// Initialized at compile time — the hot path is a single array index.
 const IS_BASE32: [bool; 256] = {
     let mut t = [false; 256];
-    let alphabet = b"0123456789abcdfghijklmnpqrsvwxyz";
+    let alphabet = crate::store_path::nixbase32::CHARS;
     let mut i = 0;
     while i < alphabet.len() {
         t[alphabet[i] as usize] = true;

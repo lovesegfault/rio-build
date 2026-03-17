@@ -349,7 +349,7 @@ pub mod nixbase32 {
     use super::StorePathError;
 
     /// The nixbase32 alphabet (note: missing `e`, `o`, `t`, `u`).
-    const CHARS: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    pub const CHARS: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
     /// Encode raw bytes into a nixbase32 string.
     ///
