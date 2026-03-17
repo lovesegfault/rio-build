@@ -487,14 +487,16 @@
           # Factored into a function so the coverage pipeline can rebuild
           # images with the instrumented workspace (dockerImagesCov below).
           mkDockerImages =
-            ws:
+            {
+              rio-workspace,
+              coverage ? false,
+            }:
             pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
               import ./nix/docker.nix {
-                inherit pkgs;
-                rio-workspace = ws;
+                inherit pkgs rio-workspace coverage;
               }
             );
-          dockerImages = mkDockerImages rio-workspace;
+          dockerImages = mkDockerImages { inherit rio-workspace; };
 
           # Subcharts from nixhelm (FODs — hash-pinned `helm pull`).
           # Referenced by: helm-lint check (symlinked into charts/ in-sandbox),
@@ -595,7 +597,10 @@
           # + consumed by nix/coverage.nix for the merged lcov.
           vmTestsCov = mkVmTests {
             rio-workspace = rio-workspace-cov;
-            dockerImages = mkDockerImages rio-workspace-cov;
+            dockerImages = mkDockerImages {
+              rio-workspace = rio-workspace-cov;
+              coverage = true;
+            };
             coverage = true;
           };
 

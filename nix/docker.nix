@@ -14,7 +14,11 @@
 # Worker is the outlier: it needs the `nix` binary (spawns `nix-daemon --stdio`)
 # + `fuse3` + `util-linux` (mount/umount for overlay teardown) + passwd/group
 # stubs (nix-daemon drops privs to nixbld). Gateway/scheduler/store are minimal.
-{ pkgs, rio-workspace }:
+{
+  pkgs,
+  rio-workspace,
+  coverage ? false,
+}:
 let
   inherit (pkgs) lib dockerTools;
 
@@ -28,13 +32,20 @@ let
   # buildLayeredImage is a runCommand whose attrs become builder
   # env. overrideAttrs threads it through.
   #
-  # Level 6: ~2MB window. Do NOT crank this + --long: wharfie's
-  # zstd decoder on k3s nodes caps at 32MB, exceeding that OOMs
-  # the VM test airgap import.
+  # Normal builds: level 6 (~2MB window, fast). Coverage builds:
+  # level 19 (8MB window) — instrumented binaries are ~3-4x larger,
+  # so the airgap import budget (~15min on nixbuild.net, serial
+  # alphabetical import before kubelet starts) runs out before the
+  # testScript begins. -19 is a one-time build cost; decompression
+  # speed is nearly level-independent. Do NOT use --ultra / --long:
+  # wharfie's zstd decoder on k3s nodes caps at a 32MB window,
+  # exceeding that OOMs the VM test airgap import. Level 19's 8MB
+  # window is safe; --ultra -22 (128MB) is not.
+  zstdLevel = if coverage then "19" else "6";
   buildZstd =
     args:
     (dockerTools.buildLayeredImage (args // { compressor = "zstd"; })).overrideAttrs {
-      ZSTD_CLEVEL = "6";
+      ZSTD_CLEVEL = zstdLevel;
     };
 
   # Common to all images. cacert for TLS (S3, gRPC with mTLS if enabled),
