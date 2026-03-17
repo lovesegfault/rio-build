@@ -100,4 +100,15 @@ pub fn describe_metrics() {
         "rio_store_gc_chunk_resurrected_total",
         "Chunks skipped by drain because PutPath cleared deleted=false after sweep enqueued (TOCTOU catch)"
     );
+
+    // Pre-register drain gauges at 0. metrics-rs only materializes a gauge
+    // on first .set(); describe_gauge! alone doesn't. drain_once (gc/drain.rs)
+    // sets these every 30s, but:
+    //   - for the first 30s after boot, PromQL `_stuck > 0` can't tell
+    //     "0" from "store hasn't reported yet"
+    //   - inline-only (non-S3) deployments never run drain_once, so the
+    //     gauges stay absent forever without this
+    // Zero is the correct initial value (no pending deletes at boot).
+    metrics::gauge!("rio_store_s3_deletes_pending").set(0.0);
+    metrics::gauge!("rio_store_s3_deletes_stuck").set(0.0);
 }
