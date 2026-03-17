@@ -13,13 +13,21 @@ use rio_proto::StoreServiceClient;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
-use russh::{ChannelId, CryptoVec};
+use russh::{ChannelId, CryptoVec, MethodKind, MethodSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
 use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::session::run_protocol;
+
+/// Max active protocol sessions per SSH connection. Matches Nix's
+/// default `max-jobs` — a well-behaved `nix build -j4` opens at most
+/// this many channels. Each session = 2 spawned tasks + 2×256 KiB
+/// duplex buffers, so this bounds per-connection memory at ~2 MiB.
+///
+/// Counted via `self.sessions.len()` — see `channel_open_session`.
+const MAX_CHANNELS_PER_CONNECTION: usize = 4;
 
 /// Load or generate an SSH host key.
 pub fn load_or_generate_host_key(path: &Path) -> anyhow::Result<PrivateKey> {
@@ -114,13 +122,7 @@ impl GatewayServer {
 
     /// Start the SSH server on the given address.
     pub async fn run(mut self, host_key: PrivateKey, addr: SocketAddr) -> anyhow::Result<()> {
-        let config = russh::server::Config {
-            keys: vec![host_key],
-            inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
-            auth_rejection_time: std::time::Duration::from_secs(1),
-            ..Default::default()
-        };
-        let config = Arc::new(config);
+        let config = Arc::new(build_ssh_config(host_key));
 
         info!(addr = %addr, "starting SSH server");
 
@@ -133,8 +135,67 @@ impl GatewayServer {
     }
 }
 
+/// Build the russh server `Config` with hardened defaults.
+///
+/// Extracted from `GatewayServer::run` so tests can assert individual
+/// field values (keepalive, nodelay, methods) without spinning up a
+/// real SSH server.
+pub fn build_ssh_config(host_key: PrivateKey) -> russh::server::Config {
+    russh::server::Config {
+        keys: vec![host_key],
+        // r[impl gw.conn.keepalive]
+        // keepalive_max defaults to 3 (russh server/mod.rs:123).
+        // 30s × 3 unanswered = connection dropped at ~90s. Catches
+        // half-open TCP: NLB idle-timeout RST that never reached
+        // us, client kernel panic, cable pull. Without this, a
+        // half-open connection holds its ConnectionHandler (and
+        // all its ChannelSessions) until inactivity_timeout — 1h.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        // Keep inactivity_timeout as a backstop; keepalive is primary.
+        inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
+        // r[impl gw.conn.nodelay]
+        // Worker protocol is small-request/small-response ping-pong
+        // (opcode u64 + a few strings, then STDERR_LAST + result).
+        // Nagle buffers the response waiting for more bytes that
+        // won't come until the client sends the NEXT opcode —
+        // which it won't until it sees this response. ~40ms/RTT.
+        nodelay: true,
+        // Only advertise publickey. Default MethodSet::all()
+        // includes none/password/hostbased/keyboard-interactive
+        // which we reject anyway — advertising them wastes a
+        // client round-trip per rejected method.
+        //
+        // &[..] coercion: russh's `From` impl is for `&[MethodKind]`
+        // (slice), not `[MethodKind; N]` (array) — auth.rs:83.
+        methods: MethodSet::from(&[MethodKind::PublicKey][..]),
+        auth_rejection_time: std::time::Duration::from_secs(1),
+        // OpenSSH sends `none` first to probe available methods
+        // (RFC 4252 §5.2). That probe is not an attack; skip the
+        // constant-time delay for it. Subsequent real rejections
+        // (unknown pubkey) still get the full 1s.
+        auth_rejection_time_initial: Some(std::time::Duration::from_millis(10)),
+        ..Default::default()
+    }
+}
+
 impl russh::server::Server for GatewayServer {
     type Handler = ConnectionHandler;
+
+    // r[impl gw.conn.session-error-visible]
+    /// russh default is a no-op (`server/mod.rs:839`). Called from the
+    /// accept loop when a connection task reports an error — both
+    /// connection-setup failure and any `?`-propagated error from a
+    /// `Handler` method. Without this override, `session.channel_success(..)?`
+    /// failures (and every other `?` in this file's `Handler` impl) drop
+    /// the connection with zero server-side signal.
+    ///
+    /// NOTE: this is on `Server`, not `Handler` — it runs on the accept
+    /// loop task, so `self.peer_addr` is not available. The error itself
+    /// is the only context we get.
+    fn handle_session_error(&mut self, error: <Self::Handler as Handler>::Error) {
+        error!(error = %error, "SSH session error");
+        metrics::counter!("rio_gateway_errors_total", "type" => "session").increment(1);
+    }
 
     fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
         // TCP accept only — NLB health checks and kubelet liveness probes
@@ -227,6 +288,50 @@ impl Drop for ConnectionHandler {
 impl Handler for ConnectionHandler {
     type Error = anyhow::Error;
 
+    // r[impl gw.conn.real-connection-marker]
+    /// OpenSSH clients send `none` first (RFC 4252 §5.2 probe). This is
+    /// the FIRST auth callback for a well-behaved client — the earliest
+    /// point we can distinguish "real SSH client" from "TCP probe."
+    /// Without this override, `mark_real_connection` only fires on
+    /// `auth_password`/`auth_publickey`, missing clients that probe and
+    /// disconnect (or probe, see `publickey` in the method list, and
+    /// then fail key offering below before ever reaching
+    /// `auth_publickey`).
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        self.mark_real_connection();
+        Ok(Auth::reject())
+    }
+
+    /// russh default accepts every offered key, forcing the client to
+    /// compute a signature we'll then reject in `auth_publickey`. Check
+    /// `authorized_keys` here instead — unknown key → reject before
+    /// signature, saving the client a round-trip per ssh-agent key.
+    ///
+    /// DO NOT set `self.tenant_name` here. The client hasn't proven
+    /// ownership yet (no signature). `auth_publickey` does the final
+    /// match-and-set after russh verifies the signature.
+    ///
+    /// No `mark_real_connection()` — `auth_none` always fires first
+    /// for OpenSSH clients. A non-OpenSSH client that skips the `none`
+    /// probe and goes straight to publickey is covered by the
+    /// `auth_publickey` call that follows on accept.
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        key: &PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        let known = self
+            .authorized_keys
+            .iter()
+            .any(|authorized| authorized.key_data() == key.key_data());
+        if known {
+            Ok(Auth::Accept)
+        } else {
+            debug!(peer = ?self.peer_addr, "offered key not in authorized_keys");
+            Ok(Auth::reject())
+        }
+    }
+
     async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
         self.mark_real_connection();
         warn!(peer = ?self.peer_addr, "rejecting password authentication");
@@ -272,6 +377,23 @@ impl Handler for ConnectionHandler {
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let channel_id = channel.id();
+        // r[impl gw.conn.channel-limit]
+        // Gate on sessions.len(), not "channels ever opened" — a channel
+        // without an `exec_request` has no ChannelSession, no spawned
+        // tasks, no buffers. Only exec'd channels consume resources.
+        // This DOES mean a client can burst 5 opens before the first
+        // exec lands; russh's event loop serializes handler calls so
+        // in practice exec-after-open is the common interleaving.
+        if self.sessions.len() >= MAX_CHANNELS_PER_CONNECTION {
+            warn!(
+                peer = ?self.peer_addr,
+                active = self.sessions.len(),
+                limit = MAX_CHANNELS_PER_CONNECTION,
+                "rejecting SSH channel open: per-connection limit reached"
+            );
+            metrics::counter!("rio_gateway_errors_total", "type" => "channel_limit").increment(1);
+            return Ok(false);
+        }
         info!(channel = ?channel_id, "SSH session channel opened");
         Ok(true)
     }

@@ -83,13 +83,12 @@ impl ClientOptions {
 /// Per-session mutable state, threaded through all opcode handlers.
 ///
 /// Holds the gRPC clients and protocol-session-scoped state (options,
-/// temp roots, drv cache, build tracking). Constructed once per session
+/// drv cache, build tracking). Constructed once per session
 /// in [`crate::session::run_protocol`].
 pub struct SessionContext {
     pub store_client: StoreServiceClient<Channel>,
     pub scheduler_client: SchedulerServiceClient<Channel>,
     pub options: Option<ClientOptions>,
-    pub temp_roots: HashSet<StorePath>,
     pub drv_cache: HashMap<StorePath, Derivation>,
     /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
     /// is likely an IFD or build-hook request.
@@ -112,7 +111,6 @@ impl SessionContext {
             store_client,
             scheduler_client,
             options: None,
-            temp_roots: HashSet::new(),
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
             active_build_ids: HashMap::new(),
@@ -177,9 +175,7 @@ where
         Some(WorkerOp::QueryValidPaths) => {
             handle_query_valid_paths(reader, &mut stderr, &mut ctx.store_client).await
         }
-        Some(WorkerOp::AddTempRoot) => {
-            handle_add_temp_root(reader, &mut stderr, &mut ctx.temp_roots).await
-        }
+        Some(WorkerOp::AddTempRoot) => handle_add_temp_root(reader, &mut stderr).await,
         Some(WorkerOp::SetOptions) => {
             handle_set_options(reader, &mut stderr, &mut ctx.options).await
         }

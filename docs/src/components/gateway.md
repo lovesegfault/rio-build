@@ -471,7 +471,7 @@ After DAG construction, the gateway optionally inlines the ATerm content of `.dr
 - Applies a **total budget of 16 MB** (`INLINE_BUDGET_BYTES`) across all inlined nodes. Once the budget is exhausted, remaining nodes fall back to worker-fetch.
 - Is **best-effort**: on any error (`FindMissingPaths` timeout, store unreachable), inlining is skipped entirely and all nodes fall back to worker-fetch. This is an optimization, not a correctness requirement.
 
-> **Session state:** Although the gateway is described as "stateless beyond the lifetime of a single SSH connection," each SSH channel does accumulate per-session state: the parsed `.drv` cache, the `wopSetOptions` configuration, and the `wopAddTempRoot` set. This state is connection-scoped and discarded when the SSH channel closes.
+> **Session state:** Although the gateway is described as "stateless beyond the lifetime of a single SSH connection," each SSH channel does accumulate per-session state: the parsed `.drv` cache and the `wopSetOptions` configuration. `wopAddTempRoot` is acknowledged as a no-op (rio's GC is store-side with explicit pins; a gateway-session-scoped set would be invisible to it). This state is connection-scoped and discarded when the SSH channel closes.
 
 ## Authentication + Tenant Identity
 
@@ -499,6 +499,33 @@ r[gw.conn.exec-request]
 **SSH transport:** Nix connects via `ssh ... nix-daemon --stdio`. The gateway must handle `exec_request` for this command and start the protocol on the SSH channel data stream. The `channel_open_session` alone does not start the protocol.
 
 The gateway matches the **suffix** of the second-to-last whitespace-separated argument (`ends_with("nix-daemon")`) and requires the last argument to be exactly `--stdio`. This allows clients that send a full store path (e.g., `/nix/store/...-nix-2.20.0/bin/nix-daemon --stdio`) to connect successfully.
+
+r[gw.conn.session-error-visible]
+Any error propagated from an SSH handler method (via `?`) is logged at
+`error!` and increments `rio_gateway_errors_total{type="session"}`. The
+russh default swallows these silently.
+
+r[gw.conn.channel-limit]
+A single SSH connection may open at most `MAX_CHANNELS_PER_CONNECTION`
+(default 4) active protocol sessions. Additional `channel_open_session`
+requests receive `SSH_MSG_CHANNEL_OPEN_FAILURE`. The limit matches Nix's
+default `max-jobs`.
+
+r[gw.conn.keepalive]
+The gateway sends SSH keepalive requests every 30 seconds. After 3
+consecutive unanswered keepalives (~90 s), the connection is closed.
+This detects half-open TCP that kernel-level keepalive would not.
+
+r[gw.conn.nodelay]
+TCP_NODELAY is set on all accepted sockets. The worker protocol's
+small-request/small-response pattern interacts pathologically with
+Nagle's algorithm (~40 ms added per round-trip).
+
+r[gw.conn.real-connection-marker]
+`rio_gateway_connections_total{result="new"}` and
+`rio_gateway_connections_active` count connections that reached the SSH
+authentication layer (any `auth_*` callback). TCP probes that close
+before the SSH handshake are logged at `trace!` only.
 
 ## STDERR Message Types
 

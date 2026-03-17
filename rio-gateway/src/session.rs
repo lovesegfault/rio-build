@@ -15,6 +15,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::handler::{self, SessionContext};
 
+/// Max time to wait for the NEXT opcode after the previous one completes.
+/// Catches alive-but-idle clients (handshake, then silence). Does NOT
+/// bound per-opcode duration — `handle_opcode` runs outside this timer,
+/// so a 3-hour `wopBuildDerivation` is unaffected. Real Nix clients'
+/// inter-opcode gap is milliseconds.
+const OPCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 // r[impl gw.conn.per-channel-state]
 // r[impl gw.conn.sequential]
 // r[impl gw.conn.lifecycle]
@@ -80,9 +87,24 @@ where
     }
 
     loop {
-        let opcode = match wire::read_u64(reader).await {
-            Ok(op) => op,
-            Err(wire::WireError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        let opcode = match tokio::time::timeout(OPCODE_IDLE_TIMEOUT, wire::read_u64(reader)).await {
+            Ok(Ok(op)) => op,
+            Err(_elapsed) => {
+                warn!(timeout = ?OPCODE_IDLE_TIMEOUT, "idle timeout waiting for next opcode");
+                metrics::counter!("rio_gateway_errors_total", "type" => "idle_timeout")
+                    .increment(1);
+                // Best-effort: try to tell the client why. If the
+                // write fails, the connection is already dead.
+                let mut stderr = StderrWriter::new(&mut *writer);
+                let _ = stderr
+                    .error(&StderrError::simple(
+                        "rio-gateway",
+                        format!("idle timeout: no opcode received in {OPCODE_IDLE_TIMEOUT:?}"),
+                    ))
+                    .await;
+                return Ok(());
+            }
+            Ok(Err(wire::WireError::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!("client disconnected (EOF)");
 
                 for build_id in ctx.active_build_ids.keys() {
@@ -113,7 +135,7 @@ where
 
                 return Ok(());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 metrics::counter!("rio_gateway_errors_total", "type" => "wire_read").increment(1);
                 error!(error = %e, "error reading opcode");
                 return Err(e.into());

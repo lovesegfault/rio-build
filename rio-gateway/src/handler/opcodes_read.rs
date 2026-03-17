@@ -165,23 +165,28 @@ pub(super) async fn handle_query_valid_paths<R: AsyncRead + Unpin, W: AsyncWrite
 }
 
 // r[impl gw.opcode.mandatory-set]
-/// wopAddTempRoot (11): Register a temporary GC root.
+/// wopAddTempRoot (11): read-and-ack no-op.
+///
+/// Temp roots are a local-daemon concept — "don't GC this path while
+/// my session holds it." rio's GC is store-side with explicit pins
+/// (see `rio-store/src/gc/`); a gateway-session-scoped set is invisible
+/// to it. We MUST still consume the path off the wire and ack with `1`,
+/// or the client desyncs.
+///
+/// Previously this inserted into a `HashSet<StorePath>` that nothing
+/// read — unbounded growth on `nix copy` of large closures.
 #[instrument(skip_all)]
 pub(super) async fn handle_add_temp_root<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     stderr: &mut StderrWriter<&mut W>,
-    temp_roots: &mut HashSet<StorePath>,
 ) -> anyhow::Result<()> {
     let path_str = wire::read_string(reader).await?;
     debug!(path = %path_str, "wopAddTempRoot");
 
-    match StorePath::parse(&path_str) {
-        Ok(path) => {
-            temp_roots.insert(path);
-        }
-        Err(e) => {
-            warn!(path = %path_str, error = %e, "invalid store path in wopAddTempRoot, ignoring");
-        }
+    // Still validate — a malformed path is a client bug worth logging,
+    // even though we do nothing with the result.
+    if let Err(e) = StorePath::parse(&path_str) {
+        warn!(path = %path_str, error = %e, "invalid store path in wopAddTempRoot, ignoring");
     }
 
     stderr.finish().await?;
