@@ -85,9 +85,10 @@ let
         return now_epoch - rt_epoch
 
     def scheduler_pods():
-        # Running-only: during failover the deleted pod briefly lingers
-        # in Terminating (which get pods still lists). Filter on phase
-        # so we only see the live replicas.
+        # status.phase=Running. CAUTION: a Terminating pod keeps
+        # phase=Running (only deletionTimestamp is set) — this helper
+        # returns terminating pods too. Callers that need a stable
+        # replica set must gate on deploy .status.readyReplicas first.
         return kubectl(
             "get pods -l app.kubernetes.io/name=rio-scheduler "
             "--field-selector=status.phase=Running "
@@ -266,14 +267,19 @@ let
               f"got {tx_before}→{tx_after}"
           )
 
-          # Wait for Deployment replacement to settle — failover below
-          # expects 2 running pods. --wait=false above returned
-          # immediately; the old pod is still draining for up to 30s.
+          # Wait for Deployment replacement to be Ready — failover below
+          # asserts scheduler_pods() == 2. The old pod (--wait=false,
+          # grace=30s) keeps status.phase=Running while Terminating, so
+          # `phase=Running | wc -l = 2` passes in ~5s by counting
+          # [terminating old] + [remaining] — NOT [remaining] + [new].
+          # .status.readyReplicas is the Deployment controller's truth:
+          # terminating pods don't count, Pending replacements don't
+          # count. Replacement lands where the old pod was (antiAffinity);
+          # image is already imported there → ~10-30s to Ready.
           k3s_server.wait_until_succeeds(
-              "test $(k3s kubectl -n ${ns} get pods "
-              "-l app.kubernetes.io/name=rio-scheduler "
-              "--field-selector=status.phase=Running --no-headers | wc -l) = 2",
-              timeout=60,
+              "test \"$(k3s kubectl -n ${ns} get deploy rio-scheduler "
+              "-o jsonpath='{.status.readyReplicas}')\" = 2",
+              timeout=90,
           )
           print(f"graceful-release PASS: {leader}→{new_leader} in {elapsed:.1f}s, "
                 f"deletion-cost=1 on new leader")
