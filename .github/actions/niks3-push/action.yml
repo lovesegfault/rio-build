@@ -3,73 +3,37 @@ description: Wait for the post-build-hook uploader to finish, then stop it
 runs:
   using: composite
   steps:
-    # This used to be the push itself. Now setup-nix installs a
+    # This used to do the push itself. Now setup-nix installs a
     # post-build-hook that queues every locally-built path the
-    # moment its derivation finishes, and a background daemon
-    # uploads continuously. So by the time we get here, most
-    # paths are already in S3 — even if the build step failed
-    # partway through (cargoArtifacts uploaded, clippy crashed
-    # → next run substitutes cargoArtifacts, only re-runs clippy).
+    # instant its derivation finishes, and a daemon uploads in
+    # the background. By the time we get here most paths are
+    # already in S3 — including when the build step failed
+    # partway (cargoArtifacts built+uploaded, clippy crashed →
+    # next run substitutes cargoArtifacts, only reruns clippy).
     #
-    # All this step does is wait for the queue to drain so we
-    # don't lose uploads that were mid-flight at step exit.
+    # All this step does now is wait for the queue to drain and
+    # kill the daemon. ci.yml's `if: always() && !cancelled()`
+    # still applies — we drain on failure too, that's the point.
     #
-    # The `if: always()` in ci.yml still applies — we drain on
-    # failure too.
+    # $GITHUB_ACTION_PATH here is THIS action's dir (niks3-push),
+    # so we reach sideways for the script. Fragile-looking but
+    # the two actions are versioned together in one repo, so the
+    # relative layout is as stable as the rest of .github/.
     - name: Drain niks3 upload queue
       shell: bash
       run: |
         set -euo pipefail
-
         QUEUE="$RUNNER_TEMP/niks3-queue"
-        DONE="$QUEUE.done"
-        PID_FILE="$RUNNER_TEMP/niks3-daemon.pid"
+        SCRIPT="$GITHUB_ACTION_PATH/../setup-nix/niks3_hook.py"
         LOG="$RUNNER_TEMP/niks3-daemon.log"
 
-        # No pid file → daemon never started (fork PR without OIDC,
-        # or setup-nix never ran). Nothing to drain.
-        if [[ ! -f "$PID_FILE" ]]; then
-          echo "No uploader daemon running — nothing to drain"
-          [[ -f "$QUEUE" ]] && echo "($(wc -l < "$QUEUE") paths were queued but not uploaded)"
-          exit 0
-        fi
+        /usr/bin/python3 "$SCRIPT" \
+          --mode=drain \
+          --queue="$QUEUE" \
+          --done="$QUEUE.done" \
+          --pid-file="$RUNNER_TEMP/niks3-daemon.pid" \
+          --timeout=300
 
-        # Wait until .done line count catches up with queue. The
-        # daemon writes one .done line per queue line (even on push
-        # failure), so counts converge unless the daemon died.
-        #
-        # 5min timeout: generous. In-cluster niks3 pushes are fast
-        # (seconds per path); even a few hundred queued paths should
-        # drain in well under a minute. Timeout hit = something is
-        # wedged; kill and move on rather than hang the job.
-        deadline=$((SECONDS + 300))
-        queued=$(wc -l < "$QUEUE")
-        while (( SECONDS < deadline )); do
-          done=$(wc -l < "$DONE")
-          if (( done >= queued )); then
-            echo "niks3: drained $done/$queued queue entries"
-            break
-          fi
-          echo "niks3: $done/$queued uploaded, waiting…"
-          sleep 2
-          # Refresh queued in case a straggler build finished after
-          # the main step exited (unlikely but cheap to handle).
-          queued=$(wc -l < "$QUEUE")
-        done
-
-        if (( SECONDS >= deadline )); then
-          echo "::warning::niks3 drain timed out after 300s ($done/$queued)"
-        fi
-
-        # Daemon reads from tail -F which never EOFs, so it won't
-        # exit on its own. Kill the whole process group (setsid
-        # gave it one) so tail dies too.
-        pid=$(cat "$PID_FILE")
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        rm -f "$PID_FILE"
-
-        # Surface the daemon log for debugging. ::group:: collapses
-        # it by default so it doesn't spam the step view.
         if [[ -s "$LOG" ]]; then
           echo "::group::niks3 daemon log"
           cat "$LOG"

@@ -7,27 +7,38 @@ inputs:
 runs:
   using: composite
   steps:
-    # The post-build-hook path goes into /etc/nix/nix.conf via
-    # extra-conf below, and the daemon reads that at startup — so
-    # the script must exist on disk BEFORE the installer runs.
+    # post-build-hook goes into /etc/nix/nix.conf via extra-conf, and
+    # the daemon reads that at startup — so the hook script must exist
+    # on disk BEFORE the installer runs.
     #
-    # The hook runs as root inside a stripped env (only $DRV_PATH
-    # and $OUT_PATHS survive per `man nix.conf`), so it can't read
-    # $RUNNER_TEMP at runtime. We bake the resolved queue path in
-    # with sed here. Same goes for the queue/done files: the hook
-    # may fire as root before the uploader daemon ever starts (e.g.
-    # while building niks3 itself on a cold cache), so touch them
-    # now as the runner user — root appends, runner reads.
-    - name: Install niks3 post-build-hook
+    # Nix invokes the hook with NO arguments and a stripped env (only
+    # $DRV_PATH and $OUT_PATHS — see `man nix.conf`). So we can't pass
+    # --mode=hook or --queue on the command line, and we can't read
+    # $RUNNER_TEMP or $GITHUB_ACTION_PATH at hook-exec time. Hence
+    # the two-line shim: it bakes in the resolved absolute paths to
+    # both the python script and the queue file, determined NOW, so
+    # the hook itself needs zero environment.
+    #
+    # /usr/bin/python3 not /usr/bin/env python3 — the nix daemon's
+    # PATH when executing the hook is anyone's guess, but /usr/bin
+    # is always there on the ARC runner image.
+    #
+    # Queue and done files are created here as the runner user so
+    # the daemon (also runner user) can read them; the hook runs as
+    # root via the nix daemon and appends.
+    - name: Install niks3 post-build-hook shim
       shell: bash
       run: |
         set -euo pipefail
         QUEUE="$RUNNER_TEMP/niks3-queue"
+        SCRIPT="$GITHUB_ACTION_PATH/niks3_hook.py"
         install -m 0666 /dev/null "$QUEUE"
         install -m 0666 /dev/null "$QUEUE.done"
-        sed "s|__NIKS3_QUEUE__|$QUEUE|" \
-          "$GITHUB_ACTION_PATH/niks3-hook.sh" > "$RUNNER_TEMP/niks3-hook.sh"
-        chmod 0755 "$RUNNER_TEMP/niks3-hook.sh"
+        cat > "$RUNNER_TEMP/niks3-hook" <<SHIM
+        #!/bin/sh
+        exec /usr/bin/python3 "$SCRIPT" --mode=hook --queue="$QUEUE"
+        SHIM
+        chmod 0755 "$RUNNER_TEMP/niks3-hook"
 
     # Upstream NixOS action (no telemetry). No tags yet — pin by SHA.
     - uses: NixOS/nix-installer-action@228d8a956062db04221c97c2794ea443194824aa
@@ -36,35 +47,30 @@ runs:
         # which doesn't exist in ARC runner containers. We handle KVM
         # ourselves: hostPath mount (arc.tf) + system-features below.
         enable-kvm: false
-        # extra-conf is written verbatim into /etc/nix/nix.conf before
-        # the daemon is launched. ${{ runner.temp }} is a GHA context
-        # expanded at action-evaluation time, not a shell variable —
-        # the daemon sees a literal absolute path.
+        # extra-conf lands verbatim in /etc/nix/nix.conf before the
+        # daemon launches. ${{ runner.temp }} is a GHA context expanded
+        # at action-evaluation time — the daemon sees a literal path.
         extra-conf: |
           substituters = https://rio-nix-cache.s3.us-west-2.amazonaws.com https://cache.nixos.org
           trusted-public-keys = rio-nix-cache:er1fTC0pPR1nSGU+qcYJPle1CW1xtTJul+gA/kUo0KI= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
           max-jobs = auto
           sandbox = true
-          post-build-hook = ${{ runner.temp }}/niks3-hook.sh
+          post-build-hook = ${{ runner.temp }}/niks3-hook
           ${{ inputs.kvm == 'true' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
 
-    # Background uploader daemon. Tails the queue (from line 1, so
-    # anything the hook queued while we were building niks3 below
-    # gets picked up), fetches a fresh OIDC token per batch, pushes,
-    # and records completion in .done for the drain step to count.
+    # Uploader daemon. Follows the queue from line 1 (so anything
+    # queued during the niks3 build below is picked up), fetches a
+    # fresh OIDC per entry, pushes, writes a .done line for drain
+    # to count against.
     #
-    # OIDC tokens have a ~5-10min TTL. Builds can run for an hour.
-    # Fetching per-push keeps us always-valid; the curl is in-cluster
-    # (niks3.svc.cluster.local) so latency is negligible.
+    # Fork PRs don't get id-token:write → request token env is unset.
+    # Skip the daemon. The hook still fires (queue grows harmlessly);
+    # drain sees no pid file and short-circuits.
     #
-    # Fork PRs don't get id-token:write, so the request token env is
-    # unset. We skip the daemon — hook still fires (queue file grows
-    # harmlessly), but nobody uploads. The drain step short-circuits
-    # on the missing pid file.
-    #
-    # nohup + redirect + setsid decouples from the step's shell so
-    # the process survives into later steps. GHA job teardown reaps
-    # it at the end, but niks3-push also explicitly kills it.
+    # nohup + setsid + full stdio redirect decouples the process from
+    # this step's shell. GHA steps share a job container, so a process
+    # backgrounded here survives into later steps as long as nothing
+    # still ties it to the step's fds.
     - name: Start niks3 uploader daemon
       shell: bash
       run: |
@@ -75,43 +81,24 @@ runs:
           exit 0
         fi
 
-        # Build (or substitute) the niks3 CLI up front. If this
-        # builds locally, the hook queues it → the daemon's first
-        # upload is niks3 itself. Self-hosting.
+        # Build (or substitute) the niks3 CLI. If it builds locally
+        # the hook queues it → daemon's first upload is niks3 itself.
         NIKS3_BIN=$(nix build .#githubActions.niks3 --no-link --print-out-paths)/bin/niks3
 
         QUEUE="$RUNNER_TEMP/niks3-queue"
-        DONE="$QUEUE.done"
         LOG="$RUNNER_TEMP/niks3-daemon.log"
         PID="$RUNNER_TEMP/niks3-daemon.pid"
+        SCRIPT="$GITHUB_ACTION_PATH/niks3_hook.py"
 
-        # Exported explicitly — the daemon subshell inherits these,
-        # but nohup+setsid can be finicky about env depending on
-        # the runner image. Paranoia costs nothing here.
-        export NIKS3_BIN QUEUE DONE NIKS3_URL
-        export ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
-
-        nohup setsid bash -c '
-          set -f  # store paths have no globs, but word-split $paths below would try
-          tail -F -n +1 "$QUEUE" 2>/dev/null | while IFS= read -r paths; do
-            [[ -z "$paths" ]] && continue
-            # Fresh OIDC per push — short TTL, cheap fetch.
-            oidc=$(curl -sSfH "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$NIKS3_URL" | jq -r .value)
-            if [[ -n "$oidc" ]]; then
-              # $paths intentionally unquoted: one queue line = one
-              # derivation'\''s space-separated outputs → one push RPC.
-              # shellcheck disable=SC2086
-              "$NIKS3_BIN" push --server-url "$NIKS3_URL" --auth-token "$oidc" $paths \
-                || echo "[niks3] push failed (non-fatal): $paths"
-            else
-              echo "[niks3] OIDC fetch failed, skipping: $paths"
-            fi
-            # Always mark done — even on failure — so drain doesn'\''t
-            # hang on transient upload errors. Worst case: cache miss.
-            echo "$paths" >> "$DONE"
-          done
-        ' >"$LOG" 2>&1 &
+        # OIDC env vars are job-scoped, so the subshell inherits them;
+        # the python script reads them directly.
+        nohup setsid /usr/bin/python3 "$SCRIPT" \
+          --mode=daemon \
+          --queue="$QUEUE" \
+          --done="$QUEUE.done" \
+          --niks3-bin="$NIKS3_BIN" \
+          --server-url="$NIKS3_URL" \
+          </dev/null >"$LOG" 2>&1 &
 
         echo $! > "$PID"
-        echo "Started niks3 uploader daemon (pid $(cat "$PID"), log: $LOG)"
+        echo "niks3 uploader daemon started (pid $(cat "$PID"), log: $LOG)"
