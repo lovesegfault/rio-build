@@ -1,41 +1,77 @@
-name: Push to niks3
-description: Push Nix store paths to rio-nix-cache via OIDC-authenticated niks3
-inputs:
-  paths:
-    description: Store paths or result symlinks to push (space-separated glob)
-    default: './result*'
+name: Drain niks3 queue
+description: Wait for the post-build-hook uploader to finish, then stop it
 runs:
   using: composite
   steps:
-    - name: Push store paths to niks3
+    # This used to be the push itself. Now setup-nix installs a
+    # post-build-hook that queues every locally-built path the
+    # moment its derivation finishes, and a background daemon
+    # uploads continuously. So by the time we get here, most
+    # paths are already in S3 — even if the build step failed
+    # partway through (cargoArtifacts uploaded, clippy crashed
+    # → next run substitutes cargoArtifacts, only re-runs clippy).
+    #
+    # All this step does is wait for the queue to drain so we
+    # don't lose uploads that were mid-flight at step exit.
+    #
+    # The `if: always()` in ci.yml still applies — we drain on
+    # failure too.
+    - name: Drain niks3 upload queue
       shell: bash
       run: |
         set -euo pipefail
-        # Bail silently if build produced nothing (e.g. failed early).
-        shopt -s nullglob
-        paths=(${{ inputs.paths }})
-        if [[ ${#paths[@]} -eq 0 ]]; then
-          echo "No result paths found, skipping cache push"
+
+        QUEUE="$RUNNER_TEMP/niks3-queue"
+        DONE="$QUEUE.done"
+        PID_FILE="$RUNNER_TEMP/niks3-daemon.pid"
+        LOG="$RUNNER_TEMP/niks3-daemon.log"
+
+        # No pid file → daemon never started (fork PR without OIDC,
+        # or setup-nix never ran). Nothing to drain.
+        if [[ ! -f "$PID_FILE" ]]; then
+          echo "No uploader daemon running — nothing to drain"
+          [[ -f "$QUEUE" ]] && echo "($(wc -l < "$QUEUE") paths were queued but not uploaded)"
           exit 0
         fi
 
-        # Fork PRs don't get id-token: write (GitHub security policy),
-        # so ACTIONS_ID_TOKEN_REQUEST_TOKEN is unset. Skip the push —
-        # cache miss on fork PRs is acceptable, failing CI is not.
-        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
-          echo "No OIDC token available (fork PR?), skipping cache push"
-          exit 0
+        # Wait until .done line count catches up with queue. The
+        # daemon writes one .done line per queue line (even on push
+        # failure), so counts converge unless the daemon died.
+        #
+        # 5min timeout: generous. In-cluster niks3 pushes are fast
+        # (seconds per path); even a few hundred queued paths should
+        # drain in well under a minute. Timeout hit = something is
+        # wedged; kill and move on rather than hang the job.
+        deadline=$((SECONDS + 300))
+        queued=$(wc -l < "$QUEUE")
+        while (( SECONDS < deadline )); do
+          done=$(wc -l < "$DONE")
+          if (( done >= queued )); then
+            echo "niks3: drained $done/$queued queue entries"
+            break
+          fi
+          echo "niks3: $done/$queued uploaded, waiting…"
+          sleep 2
+          # Refresh queued in case a straggler build finished after
+          # the main step exited (unlikely but cheap to handle).
+          queued=$(wc -l < "$QUEUE")
+        done
+
+        if (( SECONDS >= deadline )); then
+          echo "::warning::niks3 drain timed out after 300s ($done/$queued)"
         fi
 
-        # Get OIDC token with niks3 as audience.
-        OIDC=$(curl -sSfH "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$NIKS3_URL" | jq -r .value)
-        echo "::add-mask::$OIDC"
+        # Daemon reads from tail -F which never EOFs, so it won't
+        # exit on its own. Kill the whole process group (setsid
+        # gave it one) so tail dies too.
+        pid=$(cat "$PID_FILE")
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE"
 
-        # niks3 CLI via Nix — build (or substitute) and get the
-        # store path. Include it in the push so the first job to
-        # complete uploads it to S3; subsequent jobs cache-hit.
-        niks3=$(nix build .#githubActions.niks3 --no-link --print-out-paths)
-        "$niks3/bin/niks3" push \
-          --server-url "$NIKS3_URL" --auth-token "$OIDC" \
-          "${paths[@]}" "$niks3"
+        # Surface the daemon log for debugging. ::group:: collapses
+        # it by default so it doesn't spam the step view.
+        if [[ -s "$LOG" ]]; then
+          echo "::group::niks3 daemon log"
+          cat "$LOG"
+          echo "::endgroup::"
+        fi
