@@ -6,7 +6,7 @@
 //!
 //! Build reconciler runs as a second Controller::run, merged
 //! with the WorkerPool controller via futures::join. Both
-//! terminate on SIGTERM (shutdown_on_signal).
+//! terminate on SIGTERM via graceful_shutdown_on(token).
 
 use std::sync::Arc;
 
@@ -130,11 +130,16 @@ async fn main() -> anyhow::Result<()> {
     let cfg: Config = rio_common::config::load("controller", cli)?;
     let _otel_guard = rio_common::observability::init_tracing("controller")?;
 
-    // Cancellation for the non-kube-runtime loops (autoscaler,
-    // health). kube-rs's .shutdown_on_signal() installs its OWN
-    // SIGTERM/SIGINT watcher for the Controller loops — tokio's
-    // signal() is broadcast, both watchers fire. This token is
-    // for the spawn_monitored tasks that kube-rs doesn't manage.
+    // Single SIGTERM/SIGINT handler, registered eagerly HERE.
+    // This token drives EVERYTHING: autoscaler, health server,
+    // and both kube-rs Controller loops (via graceful_shutdown_on
+    // below). kube-rs's .shutdown_on_signal() would register its
+    // own handler lazily on first poll of `join(controllers)` at
+    // the bottom of main() — but the scheduler connect retry
+    // loop below is unbounded, so a SIGTERM that arrives during
+    // that loop cancels this token but kube-rs's late-registered
+    // handler never sees it → join() hangs → SIGKILL after grace.
+    // One eager handler, one token, no window.
     let shutdown = rio_common::signal::shutdown_signal();
 
     // Client TLS init BEFORE connect_admin. The controller connects
@@ -302,13 +307,14 @@ async fn main() -> anyhow::Result<()> {
     // StatefulSet → StatefulSet controller updates its status →
     // we get notified → re-reconcile → patch WorkerPool.status.
     //
-    // shutdown_on_signal: SIGTERM → graceful stop (drains
-    // in-flight reconciles). K8s sends SIGTERM on pod delete.
+    // graceful_shutdown_on: SIGTERM cancels the token (registered
+    // eagerly at top of main()), which drains in-flight reconciles.
+    // K8s sends SIGTERM on pod delete.
     let pools: Api<WorkerPool> = Api::all(client.clone());
     let stses: Api<StatefulSet> = Api::all(client.clone());
     let wp_controller = Controller::new(pools, watcher::Config::default())
         .owns(stses, watcher::Config::default())
-        .shutdown_on_signal()
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(workerpool::reconcile, workerpool::error_policy, ctx.clone())
         .for_each(|res| async move {
             match res {
@@ -345,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
     // re-reconcile.
     let builds: Api<Build> = Api::all(client);
     let build_controller = Controller::new(builds, watcher::Config::default())
-        .shutdown_on_signal()
+        .graceful_shutdown_on(shutdown.clone().cancelled_owned())
         .run(build::reconcile, build::error_policy, ctx)
         .for_each(|res| async move {
             match res {
