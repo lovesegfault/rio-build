@@ -1,4 +1,59 @@
 //! FUSE `Filesystem` trait implementation for `NixStoreFs`.
+//!
+//! # Slow-path reachability (the five constraints)
+//!
+//! Each of `getattr`/`open`/`readlink`/`readdir` has a slow-path fallback:
+//! fast-path `File::open`/`read_link`/etc ENOENTs → `ensure_cached` → retry.
+//! These fallbacks are **structurally unreachable** in normal operation
+//! because `lookup()` eagerly materializes the entire NAR on first
+//! root-child access. By the time any other op fires for an inode under
+//! that root, the file is on disk. Reaching the slow path for a test
+//! requires fault-injecting around five interacting constraints:
+//!
+//! 1. **`ensure_cached` checks the SQLite index, not disk.** `rm -rf` the
+//!    cache file with the index row intact → `ensure_cached` returns
+//!    `Ok(path-that-doesn't-exist)`, slow path's `&& let Err(errno)` is
+//!    false, second `File::open` still ENOENTs → "failed after
+//!    ensure_cached" branch. (The §2.10 self-heal makes this work again
+//!    in prod; tests bypass by deleting the *child* file, not the
+//!    store-path root — the root stat in `ensure_cached` passes, the
+//!    child stat here fails.)
+//!
+//! 2. **`ATTR_TTL = 3600s`** — kernel won't re-ask FUSE `getattr` within a
+//!    short test. Attrs cached from a prior `ls -la`. BUT `open`/
+//!    `readlink`/`readdir` don't consult the attr cache: kernel resolves
+//!    path via cached dentry → calls FUSE op by inode. **`getattr`'s slow
+//!    path stays dark within ATTR_TTL.** Mark COVERAGE-unreachable.
+//!
+//! 3. **`lookup`'s `ensure_cached` is root-only** (`parent == ROOT` gate).
+//!    Delete a subdir → fresh `lookup(parent_ino, "subdir")` returns plain
+//!    ENOENT without trying `ensure_cached`. So `echo 3 > drop_caches`
+//!    BREAKS the test — must rely on cached dentries.
+//!
+//! 4. **`readdir` doesn't populate dcache; `ls -la`'s stat-per-entry
+//!    does.** A file only seen in plain `ls` (no `-la`) has no dentry;
+//!    the kernel re-looks-up on access → constraint 3 applies → plain
+//!    ENOENT, not slow path. `ls -la` the parent first.
+//!
+//! 5. **Intervening worker restart clears the dentry cache.**
+//!    `MountOption::AutoUnmount` + systemd `Restart=on-failure` → fresh
+//!    mount → kernel drops ALL dentries. If an earlier subtest SIGKILLed
+//!    the target worker, re-seed dentries (`ls -la`) *inside* the
+//!    fault-inject subtest, immediately before the `rm`.
+//!
+//! **Tell for partial success:** journalctl shows a subset of expected
+//! "failed after ensure_cached" warns; the ones that DID fire have low
+//! inode numbers (fresh counter post-restart); the missing ones are for
+//! files no build accesses by name after the restart.
+//!
+//! Pattern (VM test `testScript`):
+//! ```text
+//! ls -la /var/rio/fuse-store/<busybox>/   # seed dentries (c. 4, 5)
+//! rm /var/rio/cache/<busybox>/bin/sh      # child of root, index untouched (c. 1)
+//! # DO NOT drop_caches (c. 3)
+//! cat /var/rio/fuse-store/<busybox>/bin/sh     → open slow path
+//! # getattr: unreachable within ATTR_TTL (c. 2)
+//! ```
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -172,7 +227,14 @@ impl Filesystem for NixStoreFs {
                         "getattr failed"
                     );
                 }
-                // If it's a known store path, try ensuring it's cached
+                // COVERAGE: unreachable within ATTR_TTL (3600s). Constraint 2
+                // in the module doc — the kernel caches attrs from lookup()'s
+                // reply.entry and never re-asks getattr for that inode within
+                // a VM test's runtime. open/readlink/readdir don't consult the
+                // attr cache (they route by cached dentry → FUSE op by inode)
+                // so THEIR slow paths are reachable; this one is not. Kept as
+                // belt-and-suspenders for the post-TTL case and ATTR_TTL=0
+                // debug builds.
                 if let Some(basename) = self.store_basename_for_inode(ino.0) {
                     match self.ensure_cached(&basename) {
                         Ok(_) => match path.symlink_metadata() {
