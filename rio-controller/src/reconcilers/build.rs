@@ -273,7 +273,40 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
     )
     .await?;
 
-    let stream = sched.submit_build(req).await?.into_inner();
+    let resp = sched.submit_build(req).await?;
+
+    // build_id from initial response metadata. Scheduler sets this
+    // AFTER MergeDag commits (scheduler/grpc/mod.rs) — if present,
+    // the build IS durable and WatchBuild can resume it. Reconnect
+    // protection is total: even zero stream events is recoverable
+    // via drain_stream's inner retry loop (status.build_id populated
+    // via known_build_id → the is_empty() check at the reconnect
+    // body is false → WatchBuild fires, no resubmit).
+    //
+    // None → legacy scheduler (pre-phase4a). clear_sentinel path
+    // fires on empty stream — safe, converges, just creates a
+    // zombie PG builds row (resubmit instead of reconnect).
+    let header_build_id = resp
+        .metadata()
+        .get(rio_proto::BUILD_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let stream = resp.into_inner();
+
+    // Persist the real build_id to the CRD status NOW (before
+    // drain_stream's first event patch). Closes the controller-
+    // restart-during-empty-stream gap: idempotence gate above sees
+    // a real UUID → spawn_reconnect_watch instead of orphaned-
+    // sentinel resubmit. Best-effort — if this fails, known_build_id
+    // still carries it into drain_stream's reconnect loop.
+    if let Some(id) = &header_build_id {
+        let _ = patch_build_id(&api, &name, id).await;
+    } else {
+        debug!(
+            build = %name,
+            "scheduler did not set x-rio-build-id header (legacy); clear_sentinel fires on empty stream"
+        );
+    }
 
     // K8s Event for the submit. Operators see this in
     // `kubectl describe build <name>` before any scheduler events
@@ -329,9 +362,11 @@ async fn apply(b: Arc<Build>, ctx: &Ctx) -> Result<Action> {
             // since_seq=0 for initial connect — this IS the
             // SubmitBuild stream, it starts from the beginning.
             0,
-            // No known build_id yet — scheduler assigns it on
-            // MergeDag, first event carries it.
-            None,
+            // build_id from the response header if the scheduler
+            // set it (phase4a+). None for legacy schedulers —
+            // first event carries it (clear_sentinel fires on
+            // empty stream).
+            header_build_id,
             Arc::clone(&ctx.watching),
             watch_key,
             ctx.recorder.clone(),
@@ -683,11 +718,12 @@ fn priority_to_class(p: i32) -> &'static str {
 ///
 /// `known_build_id`: if Some, initializes status.build_id directly.
 /// For the reconnect path, the caller already knows the build_id
-/// (from the CRD's persisted status). Passing it means the internal
-/// reconnect loop below can WatchBuild even if the stream errors
-/// before the first event. For the initial spawn (SubmitBuild
-/// stream), pass None — the first event carries the scheduler-
-/// assigned build_id.
+/// (from the CRD's persisted status). For the initial spawn
+/// (SubmitBuild stream), the build_id comes from the x-rio-build-id
+/// response header (phase4a+ schedulers). Either way, passing it
+/// means the internal reconnect loop below can WatchBuild even if
+/// the stream errors before the first event. None → legacy scheduler
+/// without the header; clear_sentinel fires on empty stream (resubmit).
 #[allow(clippy::too_many_arguments)]
 async fn drain_stream(
     name: String,
@@ -829,15 +865,20 @@ async fn drain_stream(
         };
 
         // ---- Reconnect via WatchBuild with last seq ----
-        // No build_id → can't WatchBuild. This is the "SubmitBuild
-        // stream dropped before first event" case (scheduler crashed
+        // No build_id → can't WatchBuild. LEGACY PATH: pre-phase4a
+        // scheduler doesn't set x-rio-build-id header → apply()
+        // passed known_build_id=None → status.build_id empty here.
+        // Stream dropped before first event (scheduler crashed
         // between MergeDag and BuildStarted). The CRD still has
-        // build_id="submitted" sentinel from apply(). apply()'s
-        // orphaned-sentinel detection depends on `!watching.contains
-        // _key`, but await_change() never re-fires after this task
-        // exits (nothing changes the CR). Clear the sentinel →
-        // triggers a reconcile → apply() sees build_id empty →
-        // clean resubmit.
+        // build_id="submitted" sentinel. apply()'s orphaned-sentinel
+        // detection depends on `!watching.contains_key`, but
+        // await_change() never re-fires after this task exits
+        // (nothing changes the CR). Clear the sentinel → triggers
+        // a reconcile → apply() sees build_id empty → clean resubmit.
+        //
+        // With the header (phase4a+), this branch is unreachable
+        // for the initial spawn — status.build_id is the real UUID
+        // via known_build_id → the inner retry loop below handles it.
         if status.build_id.is_empty() {
             warn!(build = %name, "no build_id yet; cannot reconnect, clearing sentinel for resubmit");
             let _ = clear_sentinel(&api, &name).await;
@@ -1107,6 +1148,22 @@ async fn patch_status(api: &Api<Build>, name: &str, status: BuildStatus) -> Resu
 /// `pub(crate)` for kube_mock tests.
 pub(crate) async fn clear_sentinel(api: &Api<Build>, name: &str) -> Result<()> {
     let patch = serde_json::json!({"status": {"buildId": ""}});
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+/// Merge-patch the real build_id into status. apply() calls this
+/// right after SubmitBuild returns with the x-rio-build-id header,
+/// BEFORE spawning drain_stream. Closes the controller-restart-
+/// during-empty-stream gap: idempotence gate sees a real UUID →
+/// spawn_reconnect_watch instead of orphaned-sentinel resubmit.
+///
+/// Merge (not SSA): only touches buildId. Preserves phase/progress.
+///
+/// `pub(crate)` for kube_mock tests.
+pub(crate) async fn patch_build_id(api: &Api<Build>, name: &str, build_id: &str) -> Result<()> {
+    let patch = serde_json::json!({"status": {"buildId": build_id}});
     api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
     Ok(())
@@ -1440,6 +1497,82 @@ mod tests {
         let obj = body["status"].as_object().unwrap();
         assert_eq!(obj.len(), 1, "Merge body must ONLY set buildId");
         assert_eq!(obj["buildId"], "");
+    }
+
+    /// patch_build_id sends exactly one PATCH to
+    /// `/builds/<name>/status`. apply() calls this right after
+    /// SubmitBuild returns with the x-rio-build-id header —
+    /// persists the REAL build_id to the CRD before drain_stream
+    /// spawns. Controller restart during empty-stream then sees a
+    /// real UUID (→ spawn_reconnect_watch) instead of "submitted"
+    /// (→ orphaned-sentinel resubmit → zombie PG row).
+    ///
+    /// Body shape: only `buildId`, nothing else (Merge semantics —
+    /// preserve phase/progress/counts from the sentinel patch).
+    #[tokio::test]
+    async fn patch_build_id_sends_merge_patch_to_status() {
+        let (client, verifier) = ApiServerVerifier::new();
+        let api: Api<Build> = Api::namespaced(client, "rio");
+
+        let guard = verifier.run(vec![Scenario::ok(
+            http::Method::PATCH,
+            "/builds/fresh-build/status",
+            mock_build_body("fresh-build", "rio"),
+        )]);
+
+        let real_id = "abc12345-1111-2222-3333-444444444444";
+        patch_build_id(&api, "fresh-build", real_id)
+            .await
+            .expect("patch ok");
+
+        guard.verified().await;
+
+        // Body shape: only buildId (the REAL one, not "submitted"
+        // and not ""). Merge — must not stomp phase/progress.
+        let body = serde_json::json!({"status": {"buildId": real_id}});
+        let obj = body["status"].as_object().unwrap();
+        assert_eq!(obj.len(), 1, "Merge body must ONLY set buildId");
+        assert_eq!(obj["buildId"], real_id);
+        assert!(!obj.contains_key("phase"), "must not stomp phase");
+        assert!(!obj.contains_key("progress"), "must not stomp progress");
+    }
+
+    /// Header extraction: the same 4-line chain as rio-gateway.
+    /// Scheduler sets x-rio-build-id in initial response metadata
+    /// AFTER MergeDag commits. Present → build is durable,
+    /// known_build_id populates drain_stream's status.build_id →
+    /// reconnect loop at line ~890 works from event 0. Absent →
+    /// legacy scheduler, clear_sentinel fallback.
+    ///
+    /// Tests a manually-constructed tonic::Response<()> — the
+    /// extraction is generic over the body type.
+    #[test]
+    fn header_build_id_extraction() {
+        // Header present → Some(uuid). This is the chain inlined
+        // in apply() after submit_build.
+        let mut resp = tonic::Response::new(());
+        resp.metadata_mut().insert(
+            rio_proto::BUILD_ID_HEADER,
+            "abc12345-1111-2222-3333-444444444444".parse().unwrap(),
+        );
+        let extracted = resp
+            .metadata()
+            .get(rio_proto::BUILD_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert_eq!(
+            extracted,
+            Some("abc12345-1111-2222-3333-444444444444".to_string())
+        );
+
+        // Header absent → None (legacy scheduler).
+        let resp = tonic::Response::new(());
+        let extracted = resp
+            .metadata()
+            .get(rio_proto::BUILD_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert_eq!(extracted, None);
     }
 
     /// patch_phase_unknown sends PATCH to `/builds/<name>/status`
