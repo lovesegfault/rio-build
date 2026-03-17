@@ -25,6 +25,9 @@ spec:
         - name: store
           image: {{ include "rio.image" (list . $s.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- with $s.command }}
+          command: {{ toJson . }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: 9002

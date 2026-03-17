@@ -32,6 +32,9 @@ spec:
         - name: controller
           image: {{ include "rio.image" (list . $c.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- with $c.command }}
+          command: {{ toJson . }}
+          {{- end }}
           ports:
             - name: metrics
               containerPort: 9094

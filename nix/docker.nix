@@ -55,6 +55,92 @@ let
     pkgs.tzdata
   ];
 
+  baseEnv = [
+    # JSON logs by default in containers — orchestrators (k8s,
+    # systemd-in-container) expect structured output.
+    "RIO_LOG_FORMAT=json"
+    # cacert's bundle location. aws-sdk-s3 + rustls read this.
+    "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+  ];
+
+  # OCI-standard labels for provenance.
+  mkLabels = desc: {
+    "org.opencontainers.image.source" = "https://github.com/lovesegfault/rio-build";
+    "org.opencontainers.image.description" = desc;
+    "org.opencontainers.image.licenses" = "MIT OR Apache-2.0";
+  };
+
+  # ── Worker runtime extras ────────────────────────────────────────────
+  # Factored out so the `all` aggregate image (VM-test-only) can reuse
+  # them. Worker is the only component that needs nix/fuse/mount at
+  # runtime, but the aggregate must be a superset of every component.
+  workerExtraContents = [
+    pkgs.nix # nix-daemon --stdio, spawned per-build
+    pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
+    pkgs.util-linux # mount, umount for overlay teardown
+
+    # nix-daemon drops privs to a nixbld{N} user inside its sandbox.
+    # It enumerates build users via getgrnam("nixbld")->gr_mem — the
+    # EXPLICIT member list in /etc/group. A user's primary group (gid
+    # field in passwd) does NOT appear in gr_mem; the member list must
+    # be populated or daemon fails: "nixbld group has no members".
+    #
+    # 8 users: one per concurrent build slot. maxConcurrentBuilds
+    # can go up to this without running out. UIDs 30001-30008 match
+    # the NixOS convention (nixbld1 at 30001, etc).
+    (pkgs.writeTextDir "etc/passwd" (
+      ''
+        root:x:0:0:root:/root:/bin/sh
+      ''
+      + lib.concatMapStrings (
+        n: "nixbld${toString n}:x:${toString (30000 + n)}:30000:Nix build user ${toString n}:/:/bin/false\n"
+      ) (lib.range 1 8)
+    ))
+    (pkgs.writeTextDir "etc/group" ''
+      root:x:0:
+      nixbld:x:30000:${lib.concatMapStringsSep "," (n: "nixbld${toString n}") (lib.range 1 8)}
+    '')
+    # nix-daemon also reads /etc/nix/nix.conf. Give it a minimal one
+    # with the settings the executor's per-build nix.conf overrides
+    # anyway (via bind-mount), but a baseline prevents "no such file"
+    # on the host-daemon startup probe.
+    (pkgs.writeTextDir "etc/nix/nix.conf" ''
+      build-users-group = nixbld
+      sandbox = true
+      experimental-features = nix-command
+    '')
+  ];
+
+  workerExtraEnv = [
+    # nix-daemon --stdio must be findable. The worker's executor does
+    # `Command::new("nix-daemon")` (no absolute path), relying on PATH.
+    "PATH=${
+      lib.makeBinPath [
+        pkgs.nix
+        pkgs.fuse3
+        pkgs.util-linux
+      ]
+    }"
+  ];
+
+  # spawn_daemon_in_namespace bind-mounts the per-build synthetic DB
+  # at /nix/var/nix/db and the nix.conf at /etc/nix. Bind mount
+  # targets must exist. /etc/nix exists (writeTextDir above creates
+  # it); /nix/var doesn't — the closure only populates /nix/store.
+  # The NixOS VM worker module creates /nix/var/nix/db via tmpfiles;
+  # we do it here for the container case.
+  #
+  # /tmp: nix-daemon's sandbox needs a tmpdir. Containers don't have
+  # one by default. sticky-bit (1777) matches the standard /tmp.
+  #
+  # extraCommands runs in the customisation layer's root dir (unprivileged;
+  # nix's sandbox builder user) — paths are relative to image /.
+  workerExtraCommands = ''
+    mkdir -p nix/var/nix/db
+    mkdir -p tmp
+    chmod 1777 tmp
+  '';
+
   mkImage =
     {
       name,
@@ -81,20 +167,8 @@ let
 
       config = {
         Entrypoint = [ "${rio-workspace}/bin/rio-${name}" ];
-        Env = [
-          # JSON logs by default in containers — orchestrators (k8s,
-          # systemd-in-container) expect structured output.
-          "RIO_LOG_FORMAT=json"
-          # cacert's bundle location. aws-sdk-s3 + rustls read this.
-          "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        ]
-        ++ extraEnv;
-        # OCI-standard labels for provenance.
-        Labels = {
-          "org.opencontainers.image.source" = "https://github.com/lovesegfault/rio-build";
-          "org.opencontainers.image.description" = "rio-${name} — Nix build orchestration";
-          "org.opencontainers.image.licenses" = "MIT OR Apache-2.0";
-        };
+        Env = baseEnv ++ extraEnv;
+        Labels = mkLabels "rio-${name} — Nix build orchestration";
       };
     };
 in
@@ -234,69 +308,35 @@ in
   # Worker needs the nix toolchain + FUSE runtime + mount utilities.
   worker = mkImage {
     name = "worker";
-    extraContents = [
-      pkgs.nix # nix-daemon --stdio, spawned per-build
-      pkgs.fuse3 # fusermount3, required by the fuser crate's AutoUnmount
-      pkgs.util-linux # mount, umount for overlay teardown
+    extraContents = workerExtraContents;
+    extraEnv = workerExtraEnv;
+    extraCommands = workerExtraCommands;
+  };
 
-      # nix-daemon drops privs to a nixbld{N} user inside its sandbox.
-      # It enumerates build users via getgrnam("nixbld")->gr_mem — the
-      # EXPLICIT member list in /etc/group. A user's primary group (gid
-      # field in passwd) does NOT appear in gr_mem; the member list must
-      # be populated or daemon fails: "nixbld group has no members".
-      #
-      # 8 users: one per concurrent build slot. maxConcurrentBuilds
-      # can go up to this without running out. UIDs 30001-30008 match
-      # the NixOS convention (nixbld1 at 30001, etc).
-      (pkgs.writeTextDir "etc/passwd" (
-        ''
-          root:x:0:0:root:/root:/bin/sh
-        ''
-        + lib.concatMapStrings (
-          n: "nixbld${toString n}:x:${toString (30000 + n)}:30000:Nix build user ${toString n}:/:/bin/false\n"
-        ) (lib.range 1 8)
-      ))
-      (pkgs.writeTextDir "etc/group" ''
-        root:x:0:
-        nixbld:x:30000:${lib.concatMapStringsSep "," (n: "nixbld${toString n}") (lib.range 1 8)}
-      '')
-      # nix-daemon also reads /etc/nix/nix.conf. Give it a minimal one
-      # with the settings the executor's per-build nix.conf overrides
-      # anyway (via bind-mount), but a baseline prevents "no such file"
-      # on the host-daemon startup probe.
-      (pkgs.writeTextDir "etc/nix/nix.conf" ''
-        build-users-group = nixbld
-        sandbox = true
-        experimental-features = nix-command
-      '')
-    ];
-    extraEnv = [
-      # nix-daemon --stdio must be findable. The worker's executor does
-      # `Command::new("nix-daemon")` (no absolute path), relying on PATH.
-      "PATH=${
-        lib.makeBinPath [
-          pkgs.nix
-          pkgs.fuse3
-          pkgs.util-linux
-        ]
-      }"
-    ];
-    # spawn_daemon_in_namespace bind-mounts the per-build synthetic DB
-    # at /nix/var/nix/db and the nix.conf at /etc/nix. Bind mount
-    # targets must exist. /etc/nix exists (writeTextDir above creates
-    # it); /nix/var doesn't — the closure only populates /nix/store.
-    # The NixOS VM worker module creates /nix/var/nix/db via tmpfiles;
-    # we do it here for the container case.
-    #
-    # /tmp: nix-daemon's sandbox needs a tmpdir. Containers don't have
-    # one by default. sticky-bit (1777) matches the standard /tmp.
-    #
-    # extraCommands runs in the customisation layer's root dir (unprivileged;
-    # nix's sandbox builder user) — paths are relative to image /.
-    extraCommands = ''
-      mkdir -p nix/var/nix/db
-      mkdir -p tmp
-      chmod 1777 tmp
-    '';
+  # ── VM-test aggregate: all five rio binaries, one image ──────────────
+  # The five per-component images share the same rio-workspace closure
+  # and differ ONLY in Entrypoint. k3s airgap-imports serially and
+  # alphabetically before kubelet starts — five near-identical ~170MB
+  # tarballs decompress back-to-back, burning ~125s of wall time under
+  # TCG (k3s-full.nix:280). This image carries every component (worker's
+  # contents are the superset) with NO Entrypoint; pods set `command:`
+  # per container instead. One decompress cycle instead of five.
+  #
+  # NOT for prod — ECR pushes distinct per-component images (skopeo
+  # docker-archive: transport) so rolling one component doesn't touch
+  # the others. VM tests don't have that constraint.
+  all = buildZstd {
+    name = "rio-all";
+    tag = "dev";
+    maxLayers = 60;
+    contents = baseContents ++ [ rio-workspace ] ++ workerExtraContents;
+    config = {
+      # No Entrypoint. buildLayeredImage's `contents` symlinks
+      # rio-workspace/bin/* into /bin/, so pods use
+      # `command: ["/bin/rio-gateway"]` etc.
+      Env = baseEnv ++ workerExtraEnv;
+      Labels = mkLabels "rio-all — all rio components (VM-test aggregate)";
+    };
+    extraCommands = workerExtraCommands;
   };
 }

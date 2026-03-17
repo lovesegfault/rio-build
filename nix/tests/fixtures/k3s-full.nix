@@ -79,12 +79,14 @@ let
   # Same list on BOTH nodes — pods land on either via scheduler whims
   # (especially scheduler.replicas=2 antiAffinity). fod-proxy/bootstrap
   # excluded (disabled in vmtest-full.yaml).
+  #
+  # `all` replaces the five per-component images (gateway/scheduler/
+  # store/controller/worker): they share the same rio-workspace
+  # closure and differed only in Entrypoint. k3s imports serially
+  # alphabetically before kubelet — one tarball decompress instead
+  # of five. vmtest-full.yaml sets `command:` per pod.
   rioImages = [
-    dockerImages.gateway
-    dockerImages.scheduler
-    dockerImages.store
-    dockerImages.controller
-    dockerImages.worker
+    dockerImages.all
     pulled.bitnami-postgresql
   ];
 
@@ -321,17 +323,13 @@ in
     # k3s imports airgap images SERIALLY (alphabetically) via a
     # goroutine that runs BEFORE kubelet starts. Under TCG (non-KVM
     # fallback): system bundle (pause/CNI/bitnami) first, then rio-*
-    # bundle. bitnami is NOT last — the rio-* images (~25s each × 5)
-    # come after and add ~125s of hidden serial import time.
-    # Gate on pause (minimal kubelet pod infra) + rio-store
-    # (alphabetically last-minus-one in the rio bundle; kubelet was
-    # observed starting ~27ms after rio-store finishes, concurrent
-    # with rio-worker import). The rio-store gate is fragile (depends
-    # on image set + alpha order) but gives a named checkpoint more
-    # debuggable than a raw node-exists timeout. timeout=600: covers
-    # pathological builders (leader-election cov run 2026-03-17 saw
-    # agent rio-controller import at 170s vs 35-40s typical --- 5x
-    # slower; agent gate blew 300s at ~302s with 3 images remaining).
+    # bundle. bitnami is NOT last — rio-all (~170MB) comes after.
+    # Gate on pause (minimal kubelet pod infra) + rio-all (the one
+    # rio image, replaces the former 5-image bundle). timeout=600:
+    # covers pathological builders (leader-election cov run 2026-03-17
+    # saw agent rio-controller import at 170s vs 35-40s typical — 5x
+    # slower; single-image load should be proportionally faster but
+    # keep the headroom for builder I/O variance).
     for n in [k3s_server, k3s_agent]:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
@@ -340,7 +338,7 @@ in
             "k3s ctr images ls -q | grep -q 'bitnami/postgresql'", timeout=240
         )
         n.wait_until_succeeds(
-            "k3s ctr images ls -q | grep -q 'rio-store'", timeout=600
+            "k3s ctr images ls -q | grep -q 'rio-all'", timeout=600
         )
 
     # ── Server node registered (kubelet up, images imported) ────────
@@ -352,7 +350,7 @@ in
     # Ready) is sufficient: Ready needs CNI which needs flannel which
     # needs the node to exist first. timeout=600: ~180s typical from
     # wait_for_unit to kubelet-start under TCG, but proportional to
-    # builder speed (same variance as rio-store gate above).
+    # builder speed (same variance as rio-all gate above).
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-server 2>/dev/null",
         timeout=600,

@@ -920,6 +920,7 @@
             docker-controller = dockerImages.controller;
             docker-fod-proxy = dockerImages.fod-proxy;
             docker-bootstrap = dockerImages.bootstrap;
+            docker-all = dockerImages.all;
             dockerImages = pkgs.linkFarm "rio-docker-images" (
               pkgs.lib.mapAttrsToList (name: drv: {
                 name = "${name}.tar.zst";

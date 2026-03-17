@@ -52,6 +52,12 @@ bootstrap:
 
 controller:
   enabled: true
+  # All rio pods share one airgap image (see nix/docker.nix `all`).
+  # k3s imports serially+alphabetically before kubelet; five near-
+  # identical tarballs → five decompress cycles. One image, pods set
+  # command: per container. /bin/rio-* symlinked by buildLayeredImage.
+  image: rio-all
+  command: ["/bin/rio-controller"]
   # In-cluster Service DNS. hostNetwork=false — unlike vmtest.yaml,
   # everything is in-cluster so CoreDNS works.
   hostNetwork: false
@@ -62,12 +68,16 @@ controller:
 
 store:
   enabled: true
+  image: rio-all
+  command: ["/bin/rio-store"]
   chunkBackend:
     # inline = NARs in PG. No MinIO/Rook airgapped.
     kind: inline
 
 scheduler:
   enabled: true
+  image: rio-all
+  command: ["/bin/rio-scheduler"]
   # 2 replicas → podAntiAffinity spreads across k3s server + agent.
   # Exercises leader election for scenarios/leader-election.nix.
   replicas: 2
@@ -76,6 +86,8 @@ scheduler:
 
 gateway:
   enabled: true
+  image: rio-all
+  command: ["/bin/rio-gateway"]
   # 1 replica: no LB in VM. podAntiAffinity renders only at replicas>1.
   replicas: 1
   schedulerAddr: rio-scheduler:9001
@@ -115,7 +127,10 @@ workerPool:
   systems: [x86_64-linux]
   features: []
   sizeClass: ""
-  image: rio-worker
+  # Same aggregate image as control-plane pods. builders.rs sets
+  # `command: ["/bin/rio-worker"]` unconditionally (no-op for prod's
+  # rio-worker image whose Entrypoint is already rio-worker).
+  image: rio-all
   # Smaller than prod defaults — k3s agent VM is 4GB.
   resources:
     requests:

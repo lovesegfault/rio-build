@@ -451,6 +451,12 @@ fn build_container(
     Container {
         name: "worker".into(),
         image: Some(wp.spec.image.clone()),
+        // Unconditional: overrides the image Entrypoint. For the
+        // per-component rio-worker image this is a no-op (Entrypoint
+        // is already rio-worker). For the VM-test rio-all aggregate
+        // image (no Entrypoint), this selects the right binary.
+        // buildLayeredImage symlinks rio-workspace/bin/* into /bin/.
+        command: Some(vec!["/bin/rio-worker".into()]),
         // imagePullPolicy: K8s defaults to Always for :latest,
         // IfNotPresent otherwise. Airgap clusters need an explicit
         // IfNotPresent/Never — kustomize can't patch the generated

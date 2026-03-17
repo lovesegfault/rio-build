@@ -22,6 +22,9 @@ spec:
         - name: gateway
           image: {{ include "rio.image" (list . $g.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- with $g.command }}
+          command: {{ toJson . }}
+          {{- end }}
           ports:
             - name: ssh
               containerPort: 2222
