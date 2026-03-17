@@ -1,6 +1,6 @@
 //! Kubernetes Lease-based leader election.
 //!
-//! When `RIO_LEASE_NAME` is set, a background task acquires and
+//! When `lease_name` is configured, a background task acquires and
 //! renews a `coordination.k8s.io/v1` Lease. On acquire, it
 //! increments the generation counter (workers see the new gen in
 // r[impl sched.lease.k8s-lease]
@@ -70,11 +70,11 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// while still giving 3 attempts before LEASE_TTL.
 const RENEW_SLOP: Duration = Duration::from_secs(2);
 
-/// Lease configuration, read from env at startup.
+/// Lease configuration, built from the scheduler's figment Config.
 ///
 /// `Option` because it's entirely optional — `None` means non-K8s
-/// mode (the common case for VM tests and dev). `from_env()`
-/// returns `None` unless `RIO_LEASE_NAME` is set.
+/// mode (the common case for VM tests and dev). `from_parts()`
+/// returns `None` unless `lease_name` is set.
 #[derive(Debug, Clone)]
 pub struct LeaseConfig {
     /// The Lease object's `.metadata.name`. Unique per scheduler
@@ -92,23 +92,28 @@ pub struct LeaseConfig {
 }
 
 impl LeaseConfig {
-    /// Read from environment. Returns `None` if `RIO_LEASE_NAME`
-    /// is unset — the signal for "not running under K8s."
+    /// Build from figment-merged config fields. Returns `None` if
+    /// `lease_name` is unset — the signal for "not running under
+    /// K8s." Goes through figment like every other config knob
+    /// (previously read `std::env::var` directly, bypassing the
+    /// TOML/CLI layers — plan 21 Batch E).
     ///
-    /// `RIO_LEASE_NAMESPACE` defaults to reading the service-account
-    /// namespace mount (standard K8s downward-API path). If that's
-    /// ALSO missing (running locally against a remote cluster),
-    /// defaults to "default" — probably wrong, but the operator
-    /// will notice when the Lease doesn't appear where expected.
+    /// `lease_namespace = None` falls through to reading the
+    /// in-cluster service-account namespace mount (standard K8s
+    /// downward-API path). If that's ALSO missing (running locally
+    /// against a remote cluster), defaults to "default" — probably
+    /// wrong, but the operator will notice when the Lease doesn't
+    /// appear where expected.
     ///
-    /// `HOSTNAME` is set by K8s to the pod name. If missing (non-
-    /// K8s with RIO_LEASE_NAME manually set — weird but possible
-    /// for testing), falls back to a UUID. Unique, just not
-    /// human-readable in `kubectl get lease`.
-    pub fn from_env() -> Option<Self> {
-        let lease_name = std::env::var("RIO_LEASE_NAME").ok()?;
+    /// `HOSTNAME` stays a raw env read: it's set by K8s (not us),
+    /// not `RIO_`-prefixed, and has no TOML/CLI equivalent. If
+    /// missing (non-K8s with lease_name manually set — weird but
+    /// possible for testing), falls back to a UUID. Unique, just
+    /// not human-readable in `kubectl get lease`.
+    pub fn from_parts(lease_name: Option<String>, lease_namespace: Option<String>) -> Option<Self> {
+        let lease_name = lease_name?;
 
-        let namespace = std::env::var("RIO_LEASE_NAMESPACE").unwrap_or_else(|_| {
+        let namespace = lease_namespace.unwrap_or_else(|| {
             // The standard in-cluster namespace mount. Every pod
             // gets this via the service-account projected volume.
             std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
@@ -537,58 +542,61 @@ fn spawn_patch_deletion_cost(client: kube::Client, namespace: String, pod_name: 
 mod tests {
     use super::*;
 
-    /// from_env returns None when RIO_LEASE_NAME unset — the
-    /// signal for "non-K8s mode." This is how VM tests stay
-    /// unaffected.
-    ///
-    /// figment Jail restores env on closure exit (parallel tests
-    /// won't see each other's set_env). It does NOT clear env on
-    /// entry — we explicitly remove_var for the unset case.
+    /// from_parts returns None when lease_name unset — the signal
+    /// for "non-K8s mode." This is how VM tests stay unaffected.
+    /// Previously `from_env()` read `std::env::var("RIO_LEASE_NAME")`
+    /// directly (bypassing figment); now the scheduler's Config
+    /// passes the merged value through.
     #[test]
-    #[allow(clippy::result_large_err)] // figment::Error is 208B, API-fixed
-    fn from_env_none_when_unset() -> figment::error::Result<()> {
-        figment::Jail::expect_with(|_jail| {
-            // SAFETY: Jail serializes env access across tests
-            // (it's a global mutex under the hood). No other
-            // thread is touching RIO_LEASE_NAME while we're here.
-            // std::env::remove_var is unsafe in Rust 2024 because
-            // of the general "env is process-global, don't race"
-            // rule — Jail's serialization is exactly the
-            // synchronization that makes it safe.
-            unsafe {
-                std::env::remove_var("RIO_LEASE_NAME");
-            }
-            assert!(
-                LeaseConfig::from_env().is_none(),
-                "no RIO_LEASE_NAME → None → non-K8s mode"
-            );
-            Ok(())
-        });
-        Ok(())
+    fn from_parts_none_when_unset() {
+        assert!(
+            LeaseConfig::from_parts(None, None).is_none(),
+            "no lease_name → None → non-K8s mode"
+        );
+        // Namespace alone doesn't trigger K8s mode — lease_name is
+        // the gate.
+        assert!(
+            LeaseConfig::from_parts(None, Some("rio-prod".into())).is_none(),
+            "namespace without lease_name → still None"
+        );
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
-    fn from_env_reads_all_three() -> figment::error::Result<()> {
+    #[allow(clippy::result_large_err)] // figment::Error is 208B, API-fixed
+    fn from_parts_reads_all_three() {
+        // HOSTNAME is still a raw env read (K8s sets it, not us).
+        // figment Jail serializes env access across parallel tests.
         figment::Jail::expect_with(|jail| {
-            jail.set_env("RIO_LEASE_NAME", "rio-scheduler-leader");
-            jail.set_env("RIO_LEASE_NAMESPACE", "rio-prod");
             jail.set_env("HOSTNAME", "rio-scheduler-0");
 
-            let cfg = LeaseConfig::from_env().expect("all vars set → Some");
+            let cfg = LeaseConfig::from_parts(
+                Some("rio-scheduler-leader".into()),
+                Some("rio-prod".into()),
+            )
+            .expect("lease_name set → Some");
             assert_eq!(cfg.lease_name, "rio-scheduler-leader");
             assert_eq!(cfg.namespace, "rio-prod");
             assert_eq!(cfg.holder_id, "rio-scheduler-0");
             Ok(())
         });
-        Ok(())
+    }
+
+    /// Namespace None → read serviceaccount mount → fall back to
+    /// "default" when that's also missing (non-K8s host running
+    /// tests has no /var/run/secrets/kubernetes.io mount).
+    #[test]
+    fn from_parts_namespace_fallback() {
+        let cfg = LeaseConfig::from_parts(Some("lease".into()), None).unwrap();
+        // On a dev/CI host with no serviceaccount mount, the
+        // read_to_string fails → "default". On the off chance the
+        // CI runner IS a pod with a mount, the namespace will be
+        // something else — just check it's non-empty.
+        assert!(!cfg.namespace.is_empty());
     }
 
     // HOSTNAME fallback to UUID is a one-liner
     // (`.unwrap_or_else(|| Uuid::new_v4())`). Not worth a test —
-    // the UUID crate tests itself, and Jail doesn't clear env on
-    // entry so we can't easily simulate "HOSTNAME unset" without
-    // more unsafe remove_var.
+    // the UUID crate tests itself.
 
     #[test]
     fn leader_state_always_leader() {

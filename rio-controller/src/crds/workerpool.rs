@@ -86,6 +86,31 @@ pub struct WorkerPoolSpec {
     #[serde(default = "default_fuse_cache_size")]
     pub fuse_cache_size: String,
 
+    /// FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
+    /// `None` = worker default (4). Tune up for NAR-heavy build
+    /// profiles where FUSE readahead is the bottleneck (visible
+    /// as `rio_worker_fuse_read_latency_seconds` tail > 10ms
+    /// with low CPU).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_threads: Option<u32>,
+
+    /// FUSE passthrough mode (kernel handles reads directly, no
+    /// userspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =
+    /// worker default (`true`). Set `false` only as a diagnostic
+    /// escape hatch — disabling adds ~2x per-build latency.
+    /// Requires kernel >= 6.9 + `CAP_SYS_ADMIN` (the worker
+    /// container always has SYS_ADMIN for the FUSE mount itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuse_passthrough: Option<bool>,
+
+    /// Timeout (seconds) for the local nix-daemon subprocess when
+    /// the client didn't specify `BuildOptions.build_timeout`.
+    /// Maps to `RIO_DAEMON_TIMEOUT_SECS`. `None` = worker default
+    /// (7200 = 2h). Raise for pools running known-long builds
+    /// (LLVM, chromium, full NixOS closure from cold cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_timeout_secs: Option<u64>,
+
     /// requiredSystemFeatures this pool advertises (e.g., "kvm",
     /// "big-parallel"). Worker's Nix config `system-features`.
     #[serde(default)]
@@ -386,5 +411,9 @@ mod tests {
         assert!(!json.contains("max_concurrent_builds"));
         assert!(json.contains("fuseCacheSize"));
         assert!(json.contains("targetValue"));
+        // Batch E (plan 21): new worker-knob passthrough fields.
+        assert!(json.contains("fuseThreads"));
+        assert!(json.contains("fusePassthrough"));
+        assert!(json.contains("daemonTimeoutSecs"));
     }
 }

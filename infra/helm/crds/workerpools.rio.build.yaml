@@ -71,6 +71,21 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              daemonTimeoutSecs:
+                description: 'Timeout (seconds) for the local nix-daemon subprocess
+                  when
+
+                  the client didn''t specify `BuildOptions.build_timeout`.
+
+                  Maps to `RIO_DAEMON_TIMEOUT_SECS`. `None` = worker default
+
+                  (7200 = 2h). Raise for pools running known-long builds
+
+                  (LLVM, chromium, full NixOS closure from cold cache).'
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               features:
                 default: []
                 description: 'requiredSystemFeatures this pool advertises (e.g., "kvm",
@@ -110,6 +125,29 @@ spec:
 
                   kustomize; making them write 107374182400 is hostile.'
                 type: string
+              fusePassthrough:
+                description: "FUSE passthrough mode (kernel handles reads directly,\
+                  \ no\nuserspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =\n\
+                  worker default (`true`). Set `false` only as a diagnostic\nescape\
+                  \ hatch \u2014 disabling adds ~2x per-build latency.\nRequires kernel\
+                  \ >= 6.9 + `CAP_SYS_ADMIN` (the worker\ncontainer always has SYS_ADMIN\
+                  \ for the FUSE mount itself)."
+                nullable: true
+                type: boolean
+              fuseThreads:
+                description: 'FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
+
+                  `None` = worker default (4). Tune up for NAR-heavy build
+
+                  profiles where FUSE readahead is the bottleneck (visible
+
+                  as `rio_worker_fuse_read_latency_seconds` tail > 10ms
+
+                  with low CPU).'
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
               hostNetwork:
                 description: "Use the node's network namespace (`hostNetwork: true`).\n\
                   None/false = pod has its own netns (the default, CNI-\nassigned\

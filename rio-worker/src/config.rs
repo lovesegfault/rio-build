@@ -57,6 +57,12 @@ pub(crate) struct Config {
     pub(crate) health_addr: std::net::SocketAddr,
     /// Log limits (configuration.md:68-69). 0 = unlimited.
     /// Wired into LogLimits → LogBatcher in main().
+    ///
+    /// NOT in WorkerPoolSpec (CRD): the defaults (10k lines/sec,
+    /// 100 MiB) are already generous enough that hitting them
+    /// means the build is broken, not the limit. Operators
+    /// shouldn't be tuning around a runaway log producer. See
+    /// plan 21 Batch E `cfg-worker-knobs-unreachable-in-k8s`.
     pub(crate) log_rate_limit: u64,
     pub(crate) log_size_limit: u64,
     /// Size-class this worker is deployed as. Empty = unclassified.
@@ -71,6 +77,12 @@ pub(crate) struct Config {
     /// After N umount2 failures (stuck-busy mounts), the worker is
     /// degraded; execute_build short-circuits with InfrastructureFailure
     /// so the scheduler reassigns and the supervisor can restart.
+    ///
+    /// NOT in WorkerPoolSpec (CRD): this is a "when to give up"
+    /// threshold, not a tunable. 3 leaked mounts is the point where
+    /// the overlay namespace is corrupt enough that continuing to
+    /// accept builds wastes scheduler time. No operator has a reason
+    /// to set this to 5 or 10.
     pub(crate) max_leaked_mounts: usize,
     /// Timeout (seconds) for the local nix-daemon subprocess build when
     /// the client didn't specify BuildOptions.build_timeout. Intentionally

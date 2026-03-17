@@ -56,6 +56,14 @@ struct Config {
     /// probe loop (DEFAULT_PROBE_INTERVAL=3s) time to observe
     /// NOT_SERVING and reroute. 0 = no drain (tests). Default 6.
     drain_grace_secs: u64,
+    /// Kubernetes Lease name for leader election. `None` = non-K8s
+    /// mode (single-scheduler; is_leader=true immediately, generation
+    /// stays 1). Env: `RIO_LEASE_NAME`. See rio_scheduler::lease.
+    lease_name: Option<String>,
+    /// Kubernetes namespace for the Lease. `None` = read from the
+    /// in-cluster serviceaccount mount, fall back to "default".
+    /// Env: `RIO_LEASE_NAMESPACE`. Ignored when `lease_name` is None.
+    lease_namespace: Option<String>,
 }
 
 impl Default for Config {
@@ -78,6 +86,8 @@ impl Default for Config {
             // all three binaries even though scheduler's actual client
             // probe is 3s — 6s out of 30s termGrace is cheap.
             drain_grace_secs: 6,
+            lease_name: None,
+            lease_namespace: None,
         }
     }
 }
@@ -161,6 +171,15 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(
         !cfg.database_url.is_empty(),
         "database_url is required (set --database-url, RIO_DATABASE_URL, or scheduler.toml)"
+    );
+    // `tokio::time::interval(ZERO)` panics. The tick loop (below at
+    // ~537) feeds `from_secs(cfg.tick_interval_secs)` straight in —
+    // `tick_interval_secs = 0` would crash the scheduler on spawn,
+    // AFTER migrations ran and the gRPC port was already bound (a
+    // very late, very confusing failure). Fail fast at config load.
+    anyhow::ensure!(
+        cfg.tick_interval_secs > 0,
+        "tick_interval_secs must be positive (tokio::time::interval panics on ZERO)"
     );
 
     let _root_guard = tracing::info_span!("scheduler", component = "scheduler").entered();
@@ -297,7 +316,10 @@ async fn main() -> anyhow::Result<()> {
     // instance. spawn_with_leader injects it into the actor,
     // REPLACING the actor's default Arc(1) — same init value,
     // shared reference.
-    let lease_cfg = rio_scheduler::lease::LeaseConfig::from_env();
+    let lease_cfg = rio_scheduler::lease::LeaseConfig::from_parts(
+        cfg.lease_name.clone(),
+        cfg.lease_namespace.clone(),
+    );
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let leader = match &lease_cfg {
         Some(cfg) => {
@@ -310,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
             rio_scheduler::lease::LeaderState::pending(Arc::clone(&generation))
         }
         None => {
-            info!("no RIO_LEASE_NAME set; running as sole leader (non-K8s mode)");
+            info!("lease_name unset; running as sole leader (non-K8s mode)");
             rio_scheduler::lease::LeaderState::always_leader(Arc::clone(&generation))
         }
     };
@@ -678,6 +700,9 @@ mod tests {
         // Phase3b: plaintext health port for K8s probes when mTLS on.
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9101");
         assert_eq!(d.drain_grace_secs, 6);
+        // Phase 4a (plan 21E): lease config via figment, not raw env.
+        assert_eq!(d.lease_name, None, "non-K8s mode by default");
+        assert_eq!(d.lease_namespace, None);
         // Phase3b: TLS off by default (dev mode, VM tests).
         assert!(!d.tls.is_configured());
     }

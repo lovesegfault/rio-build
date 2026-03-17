@@ -22,6 +22,9 @@ fn test_wp() -> WorkerPool {
         resources: None,
         max_concurrent_builds: 4,
         fuse_cache_size: "50Gi".into(),
+        fuse_threads: None,
+        fuse_passthrough: None,
+        daemon_timeout_secs: None,
         features: vec!["kvm".into()],
         systems: vec!["x86_64-linux".into()],
         size_class: "small".into(),
@@ -353,6 +356,17 @@ fn statefulset_env_vars() {
         "features comma-joined → worker's comma_vec deserialize"
     );
 
+    // Worker tuning knobs (plan 21 Batch E): NOT injected when None
+    // in the spec — figment layering means the worker's compiled-in
+    // default wins. Injecting would pin the default at controller-
+    // build time instead of worker-build time.
+    assert!(
+        !envs.contains_key("RIO_FUSE_THREADS"),
+        "unset in spec → not injected → worker default"
+    );
+    assert!(!envs.contains_key("RIO_FUSE_PASSTHROUGH"));
+    assert!(!envs.contains_key("RIO_DAEMON_TIMEOUT_SECS"));
+
     // RIO_WORKER_ID uses fieldRef, not value — check separately.
     let worker_id = container
         .env
@@ -374,6 +388,35 @@ fn statefulset_env_vars() {
         "metadata.name",
         "downward API: pod name (StatefulSet ordinal, unique)"
     );
+}
+
+/// Worker tuning knobs: when set in the spec, they ARE injected.
+/// Complements the `statefulset_env_vars` assertions above (which
+/// check the unset → not-injected case).
+#[test]
+fn statefulset_worker_knobs_injected_when_set() {
+    let mut wp = test_wp();
+    wp.spec.fuse_threads = Some(8);
+    wp.spec.fuse_passthrough = Some(false);
+    wp.spec.daemon_timeout_secs = Some(14400);
+    let sts = test_sts(&wp);
+
+    let container = &sts.spec.unwrap().template.spec.unwrap().containers[0];
+    let envs: BTreeMap<String, String> = container
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.value.clone().map(|v| (e.name.clone(), v)))
+        .collect();
+
+    assert_eq!(envs.get("RIO_FUSE_THREADS"), Some(&"8".into()));
+    assert_eq!(
+        envs.get("RIO_FUSE_PASSTHROUGH"),
+        Some(&"false".into()),
+        "figment bool parse accepts true/false (rio-common config.rs test)"
+    );
+    assert_eq!(envs.get("RIO_DAEMON_TIMEOUT_SECS"), Some(&"14400".into()));
 }
 
 #[test]

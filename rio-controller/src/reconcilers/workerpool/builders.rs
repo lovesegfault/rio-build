@@ -513,6 +513,27 @@ fn build_container(
                     &scheduler.balance_port.to_string(),
                 ));
             }
+            // Worker tuning knobs (plan 21 Batch E). Only inject when
+            // explicitly set in the CRD — `None` means the worker's
+            // compiled-in default wins (figment layering: env unset
+            // → Config::default value). Injecting the default here
+            // would pin it at controller-build time, not worker-build
+            // time — subtle drift if they're built from different
+            // commits.
+            if let Some(n) = wp.spec.fuse_threads {
+                e.push(env("RIO_FUSE_THREADS", &n.to_string()));
+            }
+            if let Some(p) = wp.spec.fuse_passthrough {
+                // figment bool parse accepts "true"/"false" (see
+                // rio-common/src/config.rs bool test).
+                e.push(env(
+                    "RIO_FUSE_PASSTHROUGH",
+                    if p { "true" } else { "false" },
+                ));
+            }
+            if let Some(s) = wp.spec.daemon_timeout_secs {
+                e.push(env("RIO_DAEMON_TIMEOUT_SECS", &s.to_string()));
+            }
             if wp.spec.tls_secret_name.is_some() {
                 // Paths match the volume mount below and cert-
                 // manager's standard Secret key names.

@@ -153,6 +153,26 @@ async fn main() -> anyhow::Result<()> {
         !cfg.scheduler_addr.is_empty(),
         "scheduler_addr is required (set --scheduler-addr, RIO_SCHEDULER_ADDR, or controller.toml)"
     );
+    // `tokio::time::interval(ZERO)` panics. Autoscaler::run feeds
+    // `from_secs(cfg.autoscaler_poll_secs)` into interval() —
+    // `autoscaler_poll_secs = 0` would panic inside spawn_monitored
+    // (logged, controller survives, but autoscaling silently dead).
+    // Fail fast at config load instead.
+    anyhow::ensure!(
+        cfg.autoscaler_poll_secs > 0,
+        "autoscaler_poll_secs must be positive (tokio::time::interval panics on ZERO)"
+    );
+    // WorkerPool-only deployments legitimately leave store_addr
+    // empty (doc comment on Config.store_addr). Build CRDs fail
+    // their first reconcile with a tonic malformed-URI error —
+    // deep inside error_policy backoff, easy to miss. Warn loudly
+    // at startup so the operator sees it in `kubectl logs` tail.
+    if cfg.store_addr.is_empty() {
+        warn!(
+            "RIO_STORE_ADDR not set; Build CRDs will fail (connect_store \
+             gets empty URI). Fine for WorkerPool-only deployments."
+        );
+    }
 
     let _root_guard = tracing::info_span!("controller", component = "controller").entered();
     info!(
