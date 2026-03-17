@@ -715,7 +715,24 @@ pub async fn execute_build(
 
         tracing::info!(drv_path = %drv_path, "build succeeded, uploading outputs");
 
-        // Upload outputs
+        // Upload outputs.
+        //
+        // Reference-scan candidate set = input_paths ∪ drv.outputs():
+        //   - input_paths: the TRANSITIVE input closure, built above via
+        //     compute_input_closure (BFS over QueryPathInfo.references,
+        //     seeded from input_srcs + inputDrv outputs). This matches
+        //     Nix's computeFSClosure — see derivation-building-goal.cc:444,450
+        //     and derivation-builder.cc:1335-1344 in Nix 2.31.3. A build can
+        //     legitimately embed any path reachable from its inputs: e.g.
+        //     hello-2.12.2 references glibc, which is NOT a direct input
+        //     but comes via closure(stdenv). Scanning only direct inputs
+        //     would drop those references.
+        //   - drv.outputs(): self-references and cross-output references are
+        //     legal (e.g., a -dev output referencing the lib output's rpath,
+        //     or a binary embedding its own store path in an rpath).
+        let mut ref_candidates: Vec<String> = input_paths.clone();
+        ref_candidates.extend(drv.outputs().iter().map(|o| o.path().to_string()));
+
         match upload::upload_all_outputs(
             store_client,
             overlay_mount.upper_dir(),
@@ -724,6 +741,8 @@ pub async fn execute_build(
             // token (scheduler without hmac_signer, dev mode) →
             // no header → store with verifier=None accepts.
             &assignment.assignment_token,
+            drv_path,
+            &ref_candidates,
         )
         .await
         {

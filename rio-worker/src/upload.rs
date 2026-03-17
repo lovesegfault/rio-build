@@ -7,6 +7,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt};
@@ -16,6 +17,7 @@ use tonic::transport::Channel;
 use tracing::instrument;
 
 use rio_nix::nar;
+use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::StoreServiceClient;
 use rio_proto::types::{
     PathInfo, PutPathMetadata, PutPathRequest, PutPathTrailer, put_path_request,
@@ -51,6 +53,11 @@ pub struct UploadResult {
     pub nar_hash: [u8; 32],
     /// Size of the NAR in bytes.
     pub nar_size: u64,
+    /// Store paths this output references (runtime deps). Sorted, full
+    /// `/nix/store/...` paths. Populated by the pre-scan pass in
+    /// `upload_output`. Empty for outputs with no runtime deps (legal for
+    /// CA paths like fetchurl; suspicious for non-CA).
+    pub references: Vec<String>,
 }
 
 /// Errors from upload operations.
@@ -120,6 +127,8 @@ async fn upload_output(
     upper_dir: &Path,
     output_basename: &str,
     assignment_token: &str,
+    deriver: &str,
+    candidates: Arc<CandidateSet>,
 ) -> Result<UploadResult, UploadError> {
     let output_path = upper_dir.join("nix/store").join(output_basename);
     let store_path = format!("/nix/store/{output_basename}");
@@ -137,7 +146,52 @@ async fn upload_output(
         }
     })?;
 
-    tracing::info!(store_path = %store_path, "uploading output (streaming tee)");
+    // --- Pre-scan for references -------------------------------------
+    // r[impl worker.upload.references-scanned]
+    // Single extra disk read through RefScanSink ONLY (no hash, no
+    // network). spawn_blocking because dump_path_streaming is sync I/O.
+    //
+    // Done HERE (outside the retry loop) so retries don't re-scan. The
+    // scan is deterministic — re-scanning on retry would waste disk
+    // bandwidth for the same result. At NVMe speeds a 4 GiB output adds
+    // ~4s wall time; the Boyer-Moore skip-scan does ~memcpy speed on
+    // binary sections (skips ~31/32 bytes).
+    //
+    // Why a separate pass instead of a three-way tee inside
+    // do_upload_streaming: references go in PathInfo, which is the FIRST
+    // gRPC message (trailer-mode protocol requires metadata at index 0).
+    // We can't know refs until the dump finishes. Changing the proto to
+    // send refs in the trailer would ripple into store-side put_path.rs,
+    // ValidatedPathInfo, and the re-sign path — scope creep for a P0 fix.
+    // TODO(phase4b): trailer-refs protocol extension if pre-scan cost
+    // becomes measurable.
+    let references = {
+        let scan_path = output_path.clone();
+        let cands = Arc::clone(&candidates);
+        tokio::task::spawn_blocking(move || {
+            let mut sink = RefScanSink::new(cands.hashes());
+            nar::dump_path_streaming(&scan_path, &mut sink)
+                .map(|_| cands.resolve(&sink.into_found()))
+        })
+        .await
+        .map_err(|e| UploadError::UploadExhausted {
+            path: store_path.clone(),
+            source: tonic::Status::internal(format!("ref-scan task panicked: {e}")),
+        })?
+        .map_err(|e| UploadError::UploadExhausted {
+            path: store_path.clone(),
+            source: nar_err_to_status(&output_path, e),
+        })?
+    };
+
+    tracing::info!(
+        store_path = %store_path,
+        ref_count = references.len(),
+        deriver = %deriver,
+        "scanned references; uploading output (streaming tee)"
+    );
+    metrics::histogram!("rio_worker_upload_references_count").record(references.len() as f64);
+    // -----------------------------------------------------------------
 
     let mut last_error = None;
     for attempt in 0..MAX_UPLOAD_RETRIES {
@@ -157,6 +211,8 @@ async fn upload_output(
             &store_path,
             output_path.clone(),
             assignment_token,
+            deriver,
+            &references,
         )
         .await
         {
@@ -173,6 +229,7 @@ async fn upload_output(
                     store_path,
                     nar_hash,
                     nar_size,
+                    references,
                 });
             }
             Err(e) => {
@@ -206,6 +263,8 @@ async fn do_upload_streaming(
     store_path: &str,
     output_path: PathBuf,
     assignment_token: &str,
+    deriver: &str,
+    references: &[String],
 ) -> Result<([u8; 32], u64), tonic::Status> {
     // Channel bridges sync `dump_path_streaming` (spawn_blocking) to async
     // gRPC. Backpressure: when full, `blocking_send` inside the writer
@@ -220,8 +279,9 @@ async fn do_upload_streaming(
         nar_hash: Vec::new(), // EMPTY → triggers trailer mode on the store
         nar_size: 0,          //         (real values arrive in trailer)
         store_path_hash: Vec::new(),
-        deriver: String::new(),
-        references: Vec::new(),
+        // r[impl worker.upload.deriver-populated]
+        deriver: deriver.to_string(),
+        references: references.to_vec(),
         registration_time: 0,
         ultimate: false,
         signatures: Vec::new(),
@@ -426,8 +486,15 @@ pub async fn upload_all_outputs(
     store_client: &StoreServiceClient<Channel>,
     upper_dir: &Path,
     assignment_token: &str,
+    deriver: &str,
+    ref_candidates: &[String],
 ) -> Result<Vec<UploadResult>, UploadError> {
     let outputs = scan_new_outputs(upper_dir)?;
+
+    // Build the candidate set ONCE. Same input closure applies to every
+    // output of a derivation; Arc so buffer_unordered's per-task clone
+    // is a pointer copy, not a full HashMap clone.
+    let candidates = Arc::new(CandidateSet::from_paths(ref_candidates));
 
     tracing::info!(
         count = outputs.len(),
@@ -439,12 +506,25 @@ pub async fn upload_all_outputs(
     // Clone the token into each task (it's a String in each async
     // block; MAX_PARALLEL_UPLOADS=4 copies of ~150 bytes — trivial).
     let token = assignment_token.to_string();
+    let deriver = deriver.to_string();
     let results: Vec<Result<UploadResult, UploadError>> = stream::iter(outputs)
         .map(|output| {
             let mut client = store_client.clone();
             let upper_dir = upper_dir.clone();
             let token = token.clone();
-            async move { upload_output(&mut client, &upper_dir, &output, &token).await }
+            let deriver = deriver.clone();
+            let candidates = Arc::clone(&candidates);
+            async move {
+                upload_output(
+                    &mut client,
+                    &upper_dir,
+                    &output,
+                    &token,
+                    &deriver,
+                    candidates,
+                )
+                .await
+            }
         })
         .buffer_unordered(MAX_PARALLEL_UPLOADS)
         .collect()
@@ -495,7 +575,7 @@ mod tests {
     // gRPC upload tests via MockStore
     // -----------------------------------------------------------------------
 
-    use rio_test_support::fixtures::test_store_basename;
+    use rio_test_support::fixtures::{test_drv_path, test_store_basename};
     use rio_test_support::grpc::{spawn_mock_store_inproc, spawn_mock_store_with_client};
     use std::sync::atomic::Ordering;
 
@@ -508,13 +588,18 @@ mod tests {
         Ok(tmp)
     }
 
+    /// Empty candidate set — for tests that don't care about ref scanning.
+    fn no_candidates() -> Arc<CandidateSet> {
+        Arc::new(CandidateSet::from_paths(std::iter::empty::<&str>()))
+    }
+
     #[tokio::test]
     async fn test_upload_output_success() -> anyhow::Result<()> {
         let (store, mut client, _h) = spawn_mock_store_with_client().await?;
         let basename = test_store_basename("hello");
         let tmp = make_output_file(&basename, b"hello world")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename, "")
+        let result = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
             .await
             .expect("upload should succeed");
 
@@ -542,7 +627,7 @@ mod tests {
         let basename = test_store_basename("retry");
         let tmp = make_output_file(&basename, b"retry me")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename, "")
+        let result = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
             .await
             .expect("upload should succeed on 3rd attempt");
 
@@ -564,7 +649,7 @@ mod tests {
         let basename = test_store_basename("exhaust");
         let tmp = make_output_file(&basename, b"never uploads")?;
 
-        let err = upload_output(&mut client, tmp.path(), &basename, "")
+        let err = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
             .await
             .expect_err("upload should exhaust retries");
 
@@ -593,7 +678,7 @@ mod tests {
         fs::write(store_dir.join(&b2), b"two")?;
         fs::write(store_dir.join(&b3), b"three")?;
 
-        let results = upload_all_outputs(&client, tmp.path(), "")
+        let results = upload_all_outputs(&client, tmp.path(), "", "", &[])
             .await
             .expect("all uploads succeed");
 
@@ -609,10 +694,9 @@ mod tests {
     }
 
     /// ENOENT during streaming dump → UploadExhausted (wraps the NAR error).
-    /// The dump happens inside spawn_blocking AFTER the gRPC stream opens,
-    /// so the PutPath call is attempted — the store sees metadata then the
-    /// channel closes without a trailer, and fails. We just verify the
-    /// worker surfaces a useful error.
+    /// With the pre-scan pass, the ENOENT is caught BEFORE the gRPC stream
+    /// opens (pre-scan reads from disk first). The error still surfaces as
+    /// UploadExhausted with a NAR-serialization message.
     #[tokio::test(start_paused = true)]
     async fn test_upload_output_nar_serialize_error() -> anyhow::Result<()> {
         let (_store, mut client) = spawn_mock_store_inproc().await?;
@@ -623,13 +707,13 @@ mod tests {
         // Use a VALID basename (32-char hash) so we get past the path
         // validation and into the dump that actually ENOENTs.
         let basename = test_store_basename("nonexistent");
-        let err = upload_output(&mut client, tmp.path(), &basename, "")
+        let err = upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates())
             .await
             .expect_err("should fail NAR serialization");
 
-        // NAR error happens inside the retry loop (each retry re-reads
-        // disk, each gets the same ENOENT) → UploadExhausted. Error
-        // message still names path + cause.
+        // NAR error happens in the pre-scan pass (before the retry loop) —
+        // same ENOENT every time → UploadExhausted. Error message still
+        // names path + cause.
         assert!(
             matches!(err, UploadError::UploadExhausted { .. }),
             "expected UploadExhausted, got {err:?}"
@@ -682,7 +766,8 @@ mod tests {
         let basename = test_store_basename("tee-hash");
         let tmp = make_output_file(&basename, b"tee upload test data")?;
 
-        let result = upload_output(&mut client, tmp.path(), &basename, "").await?;
+        let result =
+            upload_output(&mut client, tmp.path(), &basename, "", "", no_candidates()).await?;
 
         // The hash returned by upload_output == the hash MockStore recorded
         // == SHA-256 of dump_path(). Three-way consistency.
@@ -698,6 +783,144 @@ mod tests {
             "MockStore should have the TRAILER's hash, not the empty metadata hash"
         );
         assert_eq!(puts[0].nar_size, expected_nar.len() as u64);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Reference scanning (pre-scan pass → PathInfo.references)
+    // -----------------------------------------------------------------------
+
+    /// Two distinct valid nixbase32 hashes for building test candidate paths.
+    /// Must differ from TEST_HASH (aaaa...) used by test_store_basename, so
+    /// the CandidateSet's hash→path map doesn't collide.
+    const DEP_HASH_A: &str = "7rjj5xmrxb3n63wlk6mzlwxzxbvg7r3a";
+    const DEP_HASH_B: &str = "v5sv61sszx301i0x6xysaqzla09nksnd";
+
+    /// r[verify worker.upload.references-scanned]
+    /// r[verify worker.upload.deriver-populated]
+    ///
+    /// End-to-end: output file embeds a store-path string → pre-scan finds
+    /// it → PathInfo.references arrives at MockStore non-empty. Also checks
+    /// PathInfo.deriver is populated (was String::new() before this fix).
+    #[tokio::test]
+    async fn test_upload_output_scans_references() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
+        let basename = test_store_basename("scanned");
+        let deriver = test_drv_path("scanned");
+
+        // Two candidate deps. Output contents mention dep-A (as a full store
+        // path, the way a real RPATH or shebang would). dep-B is NOT in the
+        // output — verifies we don't over-report.
+        let dep_a = format!("/nix/store/{DEP_HASH_A}-glibc-2.38");
+        let dep_b = format!("/nix/store/{DEP_HASH_B}-unused");
+        let self_path = format!("/nix/store/{basename}");
+        let contents = format!("RPATH={dep_a}/lib\nself={self_path}\n");
+        let tmp = make_output_file(&basename, contents.as_bytes())?;
+
+        // Candidate set: both deps + the output itself (self-references are
+        // legal — binaries embed their own store path in rpaths).
+        let candidates = Arc::new(CandidateSet::from_paths([&dep_a, &dep_b, &self_path]));
+
+        let result =
+            upload_output(&mut client, tmp.path(), &basename, "", &deriver, candidates).await?;
+
+        // UploadResult carries the scanned refs. Sorted: /nix/store/7rjj...
+        // < /nix/store/aaaa... (self). dep-B absent.
+        assert_eq!(
+            result.references,
+            vec![dep_a.clone(), self_path.clone()],
+            "scanned refs: dep-A + self, sorted, no dep-B"
+        );
+
+        // MockStore recorded the PathInfo WITH references + deriver. This is
+        // the actual fix — pre-fix, both were always empty (upload.rs:223-224).
+        let puts = store.put_calls.read().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].references,
+            vec![dep_a, self_path],
+            "PathInfo.references delivered to store"
+        );
+        assert_eq!(
+            puts[0].deriver, deriver,
+            "PathInfo.deriver delivered to store"
+        );
+        Ok(())
+    }
+
+    /// Output with no embedded store paths → empty references (but deriver
+    /// still populated). Legal for CA paths like fetchurl.
+    #[tokio::test]
+    async fn test_upload_output_no_references_found() -> anyhow::Result<()> {
+        let (store, mut client, _h) = spawn_mock_store_with_client().await?;
+        let basename = test_store_basename("noref");
+        let deriver = test_drv_path("noref");
+        let tmp = make_output_file(&basename, b"plain text, no store paths here")?;
+
+        let dep = format!("/nix/store/{DEP_HASH_A}-dep");
+        let candidates = Arc::new(CandidateSet::from_paths([&dep]));
+
+        let result =
+            upload_output(&mut client, tmp.path(), &basename, "", &deriver, candidates).await?;
+
+        assert!(result.references.is_empty(), "no refs in output contents");
+        let puts = store.put_calls.read().unwrap();
+        assert!(puts[0].references.is_empty());
+        assert_eq!(
+            puts[0].deriver, deriver,
+            "deriver still set even with zero refs"
+        );
+        Ok(())
+    }
+
+    /// Reference scanning in upload_all_outputs: candidate set built once,
+    /// shared across all outputs. Each output gets its own scan result.
+    #[tokio::test]
+    async fn test_upload_all_outputs_per_output_refs() -> anyhow::Result<()> {
+        let (store, client, _h) = spawn_mock_store_with_client().await?;
+        let tmp = tempfile::tempdir()?;
+        let store_dir = tmp.path().join("nix/store");
+        fs::create_dir_all(&store_dir)?;
+
+        // Two outputs: one mentions dep-A, the other mentions dep-B.
+        // Use distinct hashes for the outputs so CandidateSet doesn't
+        // collapse them (test_store_basename uses a single TEST_HASH).
+        let out1 = format!("{DEP_HASH_A}-out1");
+        let out2 = format!("{DEP_HASH_B}-out2");
+        let dep_a = format!("/nix/store/{DEP_HASH_A}-out1"); // out1 self-ref
+        let dep_b = format!("/nix/store/{DEP_HASH_B}-out2"); // out2 self-ref
+        fs::write(store_dir.join(&out1), format!("ref={dep_a}"))?;
+        fs::write(store_dir.join(&out2), format!("ref={dep_b}"))?;
+
+        let deriver = test_drv_path("multi");
+        let results = upload_all_outputs(
+            &client,
+            tmp.path(),
+            "",
+            &deriver,
+            &[dep_a.clone(), dep_b.clone()],
+        )
+        .await?;
+
+        assert_eq!(results.len(), 2);
+        // Find by store_path (buffer_unordered → result order is not guaranteed).
+        let r1 = results
+            .iter()
+            .find(|r| r.store_path.ends_with("-out1"))
+            .expect("out1 result");
+        let r2 = results
+            .iter()
+            .find(|r| r.store_path.ends_with("-out2"))
+            .expect("out2 result");
+        assert_eq!(r1.references, vec![dep_a], "out1 refs itself only");
+        assert_eq!(r2.references, vec![dep_b], "out2 refs itself only");
+
+        // All MockStore PathInfos carry the deriver.
+        let puts = store.put_calls.read().unwrap();
+        assert_eq!(puts.len(), 2);
+        for p in puts.iter() {
+            assert_eq!(p.deriver, deriver);
+        }
         Ok(())
     }
 

@@ -187,7 +187,17 @@ Derivations may produce multiple outputs (e.g., `out`, `dev`, `lib`). After a bu
 2. **NAR each output**: Serialize each output path independently into a NAR archive.
 3. **Chunk**: Split each NAR into content-addressed chunks (matching rio-store's chunk size).
 4. **Upload**: Upload chunks to rio-store in parallel across outputs. Deduplicate against existing chunks (CAS).
-5. **Register**: Register each output path's NAR hash and NAR size with rio-store. References and signatures are sent **empty**. **Phase deferral:** neither the worker nor rio-store currently computes output references (NAR content scanning for store-path strings). Stored outputs have empty `references`; this is a known gap that will need resolution for GC correctness and for serving accurate narinfo from the binary cache. Output signing is a Phase 4 concern.
+5. **Register**: Register each output path's NAR hash, NAR size, references, and deriver with rio-store. Signatures are sent empty --- output signing is done store-side (see [store signing](store.md#signing)).
+
+r[worker.upload.references-scanned]
+
+Before the retry loop, `upload_output` performs a **pre-scan pass**: a single extra disk read through `RefScanSink` only (no hash, no network). The NAR is dumped via `dump_path_streaming` into the scanner, which finds every candidate hash part embedded anywhere in the stream (including inside binaries, RPATH strings, symlink targets, directory names). The candidate set is the **transitive input closure** ∪ `drv.outputs()`: every path reachable via BFS over store references from the derivation's inputs, plus all of this derivation's own outputs (for self-references and cross-output references). This matches Nix's `computeFSClosure` (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`). A build can legitimately embed any transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`, which is not a direct input but arrives via `closure(stdenv)`. The resolved reference list is **sorted** (affects the narinfo signature fingerprint --- must be deterministic).
+
+r[worker.upload.deriver-populated]
+
+`PathInfo.deriver` is set to the `.drv` store path of the derivation that produced this output. The deriver is the same for all outputs of a multi-output derivation.
+
+> **Pre-scan cost:** the scan is a separate disk read before the first upload attempt. Retries do NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan over the restricted nixbase32 alphabet does ~memcpy speed on binary sections (skips ~31/32 bytes); a 4 GiB output adds ~4s wall time on NVMe. If this becomes measurable, the escape hatch is a trailer-refs protocol extension (send refs in `PutPathTrailer` instead of the first `PathInfo` message) --- deferred to a later phase.
 
 Outputs are uploaded **concurrently and independently** via `buffer_unordered(MAX_PARALLEL_UPLOADS)` --- each output is its own `PutPath` stream. There is no cross-output atomicity: if one output's upload fails, the other outputs may already be registered. Partial registration is possible.
 
