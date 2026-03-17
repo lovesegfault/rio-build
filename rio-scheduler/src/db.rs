@@ -5,24 +5,73 @@
 //!
 //! UUIDs are bound natively via the sqlx `uuid` feature — no `::uuid` casts or
 //! `.to_string()` conversions needed.
+//
+// TODO(phase4b): convert query("...") → query!(...) for compile-time
+// SQL checking. Blocked on .sqlx/ in Crane source filter + `just
+// sqlx-prepare` target. See remediations/phase4a/12-pg-transaction-safety.md §6.
 
 use std::collections::HashMap;
 
-use sqlx::{PgConnection, PgPool, QueryBuilder};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::state::{BuildState, DerivationStatus, DrvHash, WorkerId};
 
-/// Terminal derivation statuses (wire strings). Single source of
-/// truth for SQL filters in both `sweep_stale_live_pins` (delete
-/// pins whose drv is terminal) and `load_nonterminal_derivations`
-/// (exclude terminal drvs from recovery). A new terminal status
-/// added to [`DerivationStatus::is_terminal`] must also be added
-/// here or recovery/GC will diverge.
+// r[impl sched.db.partial-index-literal]
+/// Terminal statuses as a SQL `NOT IN` literal fragment.
 ///
-/// Bound as `status <> ALL($1::text[])` — cleaner than a hardcoded
-/// `NOT IN (...)` literal and gets the planner the same predicate.
+/// MUST match both:
+///   - [`DerivationStatus::is_terminal`] (enum ground truth)
+///   - `migrations/004_recovery.sql:85` partial index predicate
+///
+/// Inlined as a literal (not bound as `$1::text[]`) so the planner
+/// can prove the query predicate implies the partial index predicate.
+/// With a bind parameter, that proof is impossible at plan time —
+/// the planner doesn't know what `$1` will contain — so the partial
+/// index is never chosen and recovery seq-scans the whole table.
+///
+/// The drift test [`tests::test_terminal_statuses_match_is_terminal`]
+/// iterates all `DerivationStatus` variants and asserts that
+/// `is_terminal() ⇔ as_str() ∈ TERMINAL_STATUSES`. Adding a new
+/// terminal status without updating this list fails that test.
+/// Updating this list without updating the migration fails the
+/// PG-side check (`test_partial_index_predicate_matches_const`).
+const TERMINAL_STATUS_SQL: &str = "('completed', 'poisoned', 'dependency_failed', 'cancelled')";
+
+#[cfg(test)]
 const TERMINAL_STATUSES: &[&str] = &["completed", "poisoned", "dependency_failed", "cancelled"];
+
+/// Encode a `&[String]` as a PostgreSQL text-array literal: `{a,b,c}`.
+/// Used for the nested-array columns in `batch_upsert_derivations` —
+/// PG multidim arrays must be rectangular, so we can't bind
+/// `Vec<Vec<String>>` directly. Instead: bind as flat `text[]` of
+/// literals, cast back to `text[]` in the SELECT.
+///
+/// Escaping: double-quote each element, backslash-escape embedded
+/// `"` and `\`. PG array-literal syntax, not SQL string syntax —
+/// single quotes are literal, double quotes delimit.
+fn encode_pg_text_array(items: &[String]) -> String {
+    let mut out = String::with_capacity(2 + items.iter().map(|s| s.len() + 3).sum::<usize>());
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        for ch in item.chars() {
+            match ch {
+                '"' | '\\' => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
 
 /// One row from `build_history`. Fields in SELECT order:
 /// `(pname, system, ema_duration_secs, ema_peak_memory_bytes, ema_peak_cpu_cores)`.
@@ -584,20 +633,21 @@ impl SchedulerDb {
     /// crash-between-pin-and-unpin — scheduler crashed after pin at
     /// dispatch but before unpin at completion).
     ///
-    /// The subquery matches load_nonterminal_derivations' filter
-    /// (both use `TERMINAL_STATUSES`): a drv NOT in that set is
-    /// terminal (or deleted entirely).
+    /// The subquery matches `load_nonterminal_derivations`' filter
+    /// (both interpolate `TERMINAL_STATUS_SQL`): a drv NOT in that
+    /// set is terminal (or deleted entirely).
     pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
+        // format! of a compile-time const — no injection surface.
+        // See TERMINAL_STATUS_SQL doc for why this isn't a bind param.
+        let result = sqlx::query(&format!(
+            r"
             DELETE FROM scheduler_live_pins
              WHERE drv_hash NOT IN (
                SELECT drv_hash FROM derivations
-                WHERE status <> ALL($1::text[])
+                WHERE status NOT IN {TERMINAL_STATUS_SQL}
              )
-            "#,
-        )
-        .bind(TERMINAL_STATUSES)
+            "
+        ))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -632,10 +682,13 @@ impl SchedulerDb {
     // Batch operations (for persist_merge_to_db)
     // -----------------------------------------------------------------------
 
+    // r[impl sched.db.batch-unnest]
     /// Batch-upsert derivations. Returns a map `drv_hash -> derivation_id`.
     ///
-    /// Uses QueryBuilder::push_values for multi-row INSERT. RETURNING includes
-    /// drv_hash because PG doesn't guarantee RETURNING order matches input.
+    /// Array parameters via `UNNEST`: 9 bind params total regardless of
+    /// row count (vs `push_values`' 9×N, which hits PG's 65535-param
+    /// limit at 7282 rows). `RETURNING drv_hash` because PG doesn't
+    /// guarantee `RETURNING` order matches `UNNEST` input order either.
     pub async fn batch_upsert_derivations(
         tx: &mut PgConnection,
         rows: &[DerivationRow],
@@ -644,38 +697,79 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        let mut qb = QueryBuilder::new(
-            "INSERT INTO derivations \
-             (drv_hash, drv_path, pname, system, status, required_features, \
-              expected_output_paths, output_names, is_fixed_output) ",
-        );
-        qb.push_values(rows, |mut b, row| {
-            b.push_bind(&row.drv_hash)
-                .push_bind(&row.drv_path)
-                .push_bind(&row.pname)
-                .push_bind(&row.system)
-                .push_bind(row.status.as_str())
-                .push_bind(&row.required_features)
-                .push_bind(&row.expected_output_paths)
-                .push_bind(&row.output_names)
-                .push_bind(row.is_fixed_output);
-        });
+        // Decompose struct-of-rows into row-of-arrays. Nine parallel
+        // Vecs, one per column. This IS a transpose — lives for the
+        // duration of one INSERT, cheaper than N roundtrips.
+        //
+        // Nested-array columns (required_features, expected_output_paths,
+        // output_names) can't unnest as text[][] — PG's multidim arrays
+        // are rectangular, but per-row feature lists have variable
+        // length. Encode as pg text[] literals ("{a,b,c}") and cast
+        // back in the SELECT. sqlx doesn't expose a Vec<Vec<String>>
+        // → text[][] Encode anyway.
+        let mut drv_hash = Vec::with_capacity(rows.len());
+        let mut drv_path = Vec::with_capacity(rows.len());
+        let mut pname = Vec::with_capacity(rows.len());
+        let mut system = Vec::with_capacity(rows.len());
+        let mut status = Vec::with_capacity(rows.len());
+        let mut required_features = Vec::with_capacity(rows.len());
+        let mut expected_output_paths = Vec::with_capacity(rows.len());
+        let mut output_names = Vec::with_capacity(rows.len());
+        let mut is_fixed_output = Vec::with_capacity(rows.len());
+        for r in rows {
+            drv_hash.push(r.drv_hash.as_str());
+            drv_path.push(r.drv_path.as_str());
+            pname.push(r.pname.as_deref());
+            system.push(r.system.as_str());
+            status.push(r.status.as_str());
+            required_features.push(encode_pg_text_array(&r.required_features));
+            expected_output_paths.push(encode_pg_text_array(&r.expected_output_paths));
+            output_names.push(encode_pg_text_array(&r.output_names));
+            is_fixed_output.push(r.is_fixed_output);
+        }
+
         // ON CONFLICT: update the recovery columns too. A second
         // build requesting the same derivation may have fresher
         // expected_output_paths (same drv_hash → same outputs, so
         // this is idempotent in practice, but keeps the row in sync
         // with in-mem). status/retry etc stay as-is — those reflect
         // LIVE state, not merge-time snapshot.
-        qb.push(
-            " ON CONFLICT (drv_hash) DO UPDATE SET \
-                updated_at = now(), \
-                expected_output_paths = EXCLUDED.expected_output_paths, \
-                output_names = EXCLUDED.output_names, \
-                is_fixed_output = EXCLUDED.is_fixed_output \
-             RETURNING drv_hash, derivation_id",
-        );
-
-        let result: Vec<(String, Uuid)> = qb.build_query_as().fetch_all(&mut *tx).await?;
+        let result: Vec<(String, Uuid)> = sqlx::query_as(
+            r#"
+            INSERT INTO derivations
+                (drv_hash, drv_path, pname, system, status, required_features,
+                 expected_output_paths, output_names, is_fixed_output)
+            SELECT
+                drv_hash, drv_path, pname, system, status,
+                required_features::text[],
+                expected_output_paths::text[],
+                output_names::text[],
+                is_fixed_output
+            FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                $6::text[], $7::text[], $8::text[], $9::bool[]
+            ) AS t(drv_hash, drv_path, pname, system, status,
+                   required_features, expected_output_paths, output_names,
+                   is_fixed_output)
+            ON CONFLICT (drv_hash) DO UPDATE SET
+                updated_at = now(),
+                expected_output_paths = EXCLUDED.expected_output_paths,
+                output_names = EXCLUDED.output_names,
+                is_fixed_output = EXCLUDED.is_fixed_output
+            RETURNING drv_hash, derivation_id
+            "#,
+        )
+        .bind(&drv_hash)
+        .bind(&drv_path)
+        .bind(&pname)
+        .bind(&system)
+        .bind(&status)
+        .bind(&required_features)
+        .bind(&expected_output_paths)
+        .bind(&output_names)
+        .bind(&is_fixed_output)
+        .fetch_all(&mut *tx)
+        .await?;
         Ok(result.into_iter().collect())
     }
 
@@ -688,13 +782,19 @@ impl SchedulerDb {
         if derivation_ids.is_empty() {
             return Ok(());
         }
-
-        let mut qb = QueryBuilder::new("INSERT INTO build_derivations (build_id, derivation_id) ");
-        qb.push_values(derivation_ids, |mut b, did| {
-            b.push_bind(build_id).push_bind(did);
-        });
-        qb.push(" ON CONFLICT DO NOTHING");
-        qb.build().execute(&mut *tx).await?;
+        // build_id is constant across rows — bind once as scalar $1,
+        // cross-join UNNEST of the derivation_id array. Two binds total.
+        sqlx::query(
+            r#"
+            INSERT INTO build_derivations (build_id, derivation_id)
+            SELECT $1, derivation_id FROM UNNEST($2::uuid[]) AS t(derivation_id)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(build_id)
+        .bind(derivation_ids)
+        .execute(&mut *tx)
+        .await?;
         Ok(())
     }
 
@@ -706,13 +806,18 @@ impl SchedulerDb {
         if edges.is_empty() {
             return Ok(());
         }
-
-        let mut qb = QueryBuilder::new("INSERT INTO derivation_edges (parent_id, child_id) ");
-        qb.push_values(edges, |mut b, (p, c)| {
-            b.push_bind(p).push_bind(c);
-        });
-        qb.push(" ON CONFLICT DO NOTHING");
-        qb.build().execute(&mut *tx).await?;
+        let (parents, children): (Vec<Uuid>, Vec<Uuid>) = edges.iter().copied().unzip();
+        sqlx::query(
+            r#"
+            INSERT INTO derivation_edges (parent_id, child_id)
+            SELECT * FROM UNNEST($1::uuid[], $2::uuid[])
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&parents)
+        .bind(&children)
+        .execute(&mut *tx)
+        .await?;
         Ok(())
     }
 
@@ -859,24 +964,23 @@ impl SchedulerDb {
         .await
     }
 
-    /// Load all non-terminal derivations. Same terminal-exclusion
-    /// filter (`TERMINAL_STATUSES`) as sweep_stale_live_pins; the
-    /// partial index (status_idx) makes this efficient for large
-    /// tables.
+    /// Load all non-terminal derivations. Literal `NOT IN` so the
+    /// planner can prove the predicate implies the partial index
+    /// predicate (`migrations/004_recovery.sql:85`). Same exclusion
+    /// set as `sweep_stale_live_pins`.
     pub async fn load_nonterminal_derivations(
         &self,
     ) -> Result<Vec<RecoveryDerivationRow>, sqlx::Error> {
-        sqlx::query_as(
-            r#"
+        sqlx::query_as(&format!(
+            r"
             SELECT derivation_id, drv_hash, drv_path, pname, system, status,
                    required_features, assigned_worker_id, retry_count,
                    expected_output_paths, output_names, is_fixed_output,
                    failed_workers
             FROM derivations
-            WHERE status <> ALL($1::text[])
-            "#,
-        )
-        .bind(TERMINAL_STATUSES)
+            WHERE status NOT IN {TERMINAL_STATUS_SQL}
+            "
+        ))
         .fetch_all(&self.pool)
         .await
     }
@@ -1653,6 +1757,259 @@ mod tests {
         .await?;
         assert_eq!(status, "created");
         assert!(poisoned_at.is_none());
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Remediation 12: PG transaction safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_pg_text_array() {
+        assert_eq!(encode_pg_text_array(&[]), "{}");
+        assert_eq!(encode_pg_text_array(&["a".into()]), r#"{"a"}"#);
+        assert_eq!(
+            encode_pg_text_array(&["a".into(), "b".into()]),
+            r#"{"a","b"}"#
+        );
+        // Escaping: embedded double-quote and backslash.
+        assert_eq!(
+            encode_pg_text_array(&[r#"has"quote"#.into()]),
+            r#"{"has\"quote"}"#
+        );
+        assert_eq!(
+            encode_pg_text_array(&[r"has\backslash".into()]),
+            r#"{"has\\backslash"}"#
+        );
+        // Comma inside a value is fine — double-quoting handles it.
+        assert_eq!(encode_pg_text_array(&["a,b".into()]), r#"{"a,b"}"#);
+    }
+
+    /// PG roundtrip: our encoder ⇔ PG's `::text[]` parser.
+    #[tokio::test]
+    async fn test_encode_pg_text_array_roundtrip() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let cases: &[&[&str]] = &[
+            &[],
+            &["plain"],
+            &["has\"quote", "has\\slash", "has,comma", "has{brace}"],
+        ];
+        for case in cases {
+            let input: Vec<String> = case.iter().map(|s| s.to_string()).collect();
+            let encoded = encode_pg_text_array(&input);
+            let (decoded,): (Vec<String>,) = sqlx::query_as("SELECT $1::text[]")
+                .bind(&encoded)
+                .fetch_one(&test_db.pool)
+                .await?;
+            assert_eq!(decoded, input, "roundtrip failed for {encoded:?}");
+        }
+        Ok(())
+    }
+
+    // r[verify sched.db.partial-index-literal]
+    /// Drift guard: `TERMINAL_STATUSES` const ⇔ `DerivationStatus::is_terminal()`.
+    ///
+    /// Exhaustive over all variants. If you add a variant without
+    /// updating the match arm below, `non_exhaustive_patterns` fires.
+    /// If you add it to the match but flip terminality without updating
+    /// `TERMINAL_STATUSES`, the assertion fires.
+    ///
+    /// ALSO asserts `TERMINAL_STATUS_SQL` is the `(a,b,c)`-joined form
+    /// of `TERMINAL_STATUSES` — catches the case where someone edits
+    /// one but not the other.
+    #[test]
+    fn test_terminal_statuses_match_is_terminal() {
+        use crate::state::DerivationStatus::*;
+        // Exhaustive binding — not `_ =>` — so adding a variant to
+        // the enum is a compile error here until you handle it.
+        let all = [
+            Created,
+            Queued,
+            Ready,
+            Assigned,
+            Running,
+            Completed,
+            Failed,
+            Poisoned,
+            DependencyFailed,
+            Cancelled,
+        ];
+        // Compile-time exhaustiveness: this match has no wildcard.
+        // Add a variant → this function stops compiling.
+        for v in all {
+            match v {
+                Created | Queued | Ready | Assigned | Running | Completed | Failed | Poisoned
+                | DependencyFailed | Cancelled => {}
+            }
+        }
+
+        let terminal_set: std::collections::HashSet<&str> =
+            TERMINAL_STATUSES.iter().copied().collect();
+
+        for v in all {
+            let in_const = terminal_set.contains(v.as_str());
+            let is_term = v.is_terminal();
+            assert_eq!(
+                in_const, is_term,
+                "TERMINAL_STATUSES drift: {v:?}.is_terminal()={is_term} but \
+                 presence in TERMINAL_STATUSES={in_const}. Update db.rs const \
+                 AND migrations/004_recovery.sql:85 partial index predicate."
+            );
+        }
+
+        // SQL literal must be the quoted, comma-joined form of the const.
+        // Order matters here only in the sense that both sides agree —
+        // PG doesn't care about IN-list order.
+        let expected_sql = format!(
+            "({})",
+            TERMINAL_STATUSES
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            TERMINAL_STATUS_SQL, expected_sql,
+            "TERMINAL_STATUS_SQL out of sync with TERMINAL_STATUSES const"
+        );
+    }
+
+    // r[verify sched.db.partial-index-literal]
+    /// PG-side drift check: the partial index predicate in
+    /// `pg_indexes.indexdef` must match `TERMINAL_STATUSES`.
+    ///
+    /// PG normalizes the predicate (adds `::text` casts, may reorder),
+    /// so we check that every status in `TERMINAL_STATUSES` appears as
+    /// a quoted literal in the indexdef, not that the strings are equal.
+    #[tokio::test]
+    async fn test_partial_index_predicate_matches_const() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let (indexdef,): (String,) = sqlx::query_as(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE tablename = 'derivations' AND indexname = 'derivations_status_idx'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+
+        for status in TERMINAL_STATUSES {
+            assert!(
+                indexdef.contains(&format!("'{status}'")),
+                "partial index predicate missing '{status}': {indexdef}"
+            );
+        }
+        // And nothing extra — count quoted literals. PG normalizes
+        // NOT IN (a,b) to <> ALL(ARRAY[a,b]) in indexdef output, so
+        // count via the ::text cast suffix that PG attaches.
+        let literal_count = indexdef.matches("'::text").count();
+        assert_eq!(
+            literal_count,
+            TERMINAL_STATUSES.len(),
+            "partial index has {literal_count} status literals, \
+             TERMINAL_STATUSES has {}: {indexdef}",
+            TERMINAL_STATUSES.len()
+        );
+        Ok(())
+    }
+
+    // r[verify sched.db.batch-unnest]
+    /// Large-DAG persistence: 10k nodes. Would fail on main
+    /// with "bind message has 90000 parameter formats" (or similar —
+    /// sqlx catches it before PG does) at 7282 nodes.
+    ///
+    /// 10k is past the old derivations limit (7281 = 65535/9).
+    #[tokio::test]
+    async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        const N: usize = 10_000;
+        let rows: Vec<DerivationRow> = (0..N)
+            .map(|i| DerivationRow {
+                drv_hash: format!("{i:032x}"), // 32-hex-char fake hash
+                drv_path: format!("/nix/store/{}-test-{i}.drv", "a".repeat(32)),
+                pname: Some(format!("pkg-{i}")),
+                system: "x86_64-linux".into(),
+                status: DerivationStatus::Created,
+                // Exercise the nested-array encoding: varied lengths
+                // including empty (which was the rectangular-array
+                // failure mode if we'd tried text[][]).
+                required_features: match i % 3 {
+                    0 => vec![],
+                    1 => vec!["kvm".into()],
+                    _ => vec!["kvm".into(), "big-parallel".into()],
+                },
+                expected_output_paths: vec![format!("/nix/store/{}-out-{i}", "b".repeat(32))],
+                output_names: vec!["out".into()],
+                is_fixed_output: i % 7 == 0,
+            })
+            .collect();
+
+        let mut tx = db.pool().begin().await?;
+        let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+        tx.commit().await?;
+
+        assert_eq!(id_map.len(), N, "RETURNING gave back every row");
+        // Spot-check: row 0 and row N-1 both present, distinct ids.
+        let id0 = id_map.get(&format!("{:032x}", 0)).copied().unwrap();
+        let id_last = id_map.get(&format!("{:032x}", N - 1)).copied().unwrap();
+        assert_ne!(id0, id_last);
+
+        // And they actually landed in PG, with nested arrays intact.
+        let (features,): (Vec<String>,) =
+            sqlx::query_as("SELECT required_features FROM derivations WHERE drv_hash = $1")
+                .bind(format!("{:032x}", 2)) // i=2 → i%3==2 → [kvm, big-parallel]
+                .fetch_one(&test_db.pool)
+                .await?;
+        assert_eq!(features, vec!["kvm", "big-parallel"]);
+
+        Ok(())
+    }
+
+    // r[verify sched.db.batch-unnest]
+    /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
+    /// dense DAG over 10k nodes (fresh DB, so re-insert).
+    #[tokio::test]
+    async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
+        let test_db = TestDb::new(&crate::MIGRATOR).await;
+        let db = SchedulerDb::new(test_db.pool.clone());
+
+        // Need N nodes first (FK constraint). Reuse shape from above.
+        const N: usize = 10_000;
+        let rows: Vec<DerivationRow> = (0..N)
+            .map(|i| DerivationRow {
+                drv_hash: format!("{i:032x}"),
+                drv_path: format!("/nix/store/{}-e{i}.drv", "a".repeat(32)),
+                pname: None,
+                system: "x86_64-linux".into(),
+                status: DerivationStatus::Created,
+                required_features: vec![],
+                expected_output_paths: vec![],
+                output_names: vec!["out".into()],
+                is_fixed_output: false,
+            })
+            .collect();
+        let mut tx = db.pool().begin().await?;
+        let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+
+        // 40k edges: each node i>0 has 4 parents among [i-1, i-2, ...].
+        // ON CONFLICT DO NOTHING dedups any collisions.
+        let ids: Vec<Uuid> = (0..N)
+            .map(|i| *id_map.get(&format!("{i:032x}")).unwrap())
+            .collect();
+        let ids = &ids; // borrow so inner `move` closure copies the ref
+        let edges: Vec<(Uuid, Uuid)> = (1..N)
+            .flat_map(|i| (1..=4.min(i)).map(move |d| (ids[i - d], ids[i])))
+            .collect();
+        assert!(edges.len() > 32_768, "test must exceed old 2-col limit");
+
+        SchedulerDb::batch_insert_edges(&mut tx, &edges).await?;
+        tx.commit().await?;
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM derivation_edges")
+            .fetch_one(&test_db.pool)
+            .await?;
+        // ≤ edges.len() because of ON CONFLICT dedup, but > old limit.
+        assert!(count > 32_768);
         Ok(())
     }
 }

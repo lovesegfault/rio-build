@@ -407,6 +407,16 @@ Normal processing resumes when the queue depth drops below 60% (hysteresis to pr
 | `build_event_log` | Prost-encoded `BuildEvent` per (build_id, sequence) for gateway `since_sequence` replay across failover |
 | `scheduler_live_pins` | Auto-pinned live-build input closures (`store_path_hash`, `drv_hash`). Written by `pin_live_inputs` at dispatch; unpinned on completion. Used by rio-store's GC mark phase as a root seed. |
 
+r[sched.db.tx-commit-before-mutate]
+In-memory `DerivationState.db_id` MUST NOT be set until the persisting transaction has committed. Edge resolution during `persist_merge_to_db` reads the transaction-local `id_map` (returned by `RETURNING`), not `self.dag` — decoupling the two eliminates the phantom-`db_id` class of bug where a rollback leaves in-memory state pointing at a `derivation_id` that never became durable.
+
+r[sched.db.batch-unnest]
+Batch INSERTs into `derivations` / `build_derivations` / `derivation_edges` MUST use `UNNEST` array parameters (one bind per column, any row count). `QueryBuilder::push_values` generates one bind parameter per column per row, which hits PostgreSQL's 65535-parameter wire-protocol limit at 7282 rows × 9 columns — below the ~30k-derivation size of a NixOS system closure.
+
+r[sched.db.partial-index-literal]
+Queries that filter by terminal status MUST interpolate the terminal-status list as a SQL literal (`NOT IN ('completed', ...)`), not bind it as a parameter (`<> ALL($1::text[])`). The partial index `derivations_status_idx` has a literal predicate; the planner can only prove a query's `WHERE` implies the index predicate at plan time, before bind values are known. A parameterized filter is opaque and forces a seq scan. The literal string and `DerivationStatus::is_terminal()` MUST stay in sync (drift-tested).
+
+
 ### Schema (pseudo-DDL)
 
 ```sql

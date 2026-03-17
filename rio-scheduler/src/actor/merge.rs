@@ -375,36 +375,48 @@ impl DagActor {
             })
             .collect();
 
+        // drv_path → drv_hash lookup for edge resolution below. Edges
+        // carry paths (proto wire format); id_map keys by hash.
+        let path_to_hash: HashMap<&str, &str> = node_rows
+            .iter()
+            .map(|r| (r.drv_path.as_str(), r.drv_hash.as_str()))
+            .collect();
+
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
         let mut tx = self.db.pool().begin().await?;
 
         // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
-        // Update in-memory db_id from returned map.
-        for (hash, db_id) in &id_map {
-            if let Some(state) = self.dag.node_mut(hash) {
-                state.db_id = Some(*db_id);
-            }
-        }
-
         // Batch 2: link all nodes to this build.
         let db_ids: Vec<Uuid> = id_map.values().copied().collect();
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
-        // Batch 3: insert edges (resolve drv_path -> db_id via find_db_id_by_path).
+        // Batch 3: insert edges. Resolve drv_path -> db_id via:
+        //   1. this tx's id_map (covers newly-inserted + re-upserted
+        //      nodes from this batch — ON CONFLICT RETURNING gives
+        //      back existing ids for the latter),
+        //   2. fall back to self.dag (covers cross-batch edges to
+        //      nodes merged by a PRIOR SubmitBuild that aren't in
+        //      this request's `nodes` list at all — rare but legal
+        //      when gateway deduplicates against live DAG).
+        // Does NOT read self.dag.node().db_id for nodes in THIS
+        // batch — that field isn't set until after commit() below.
+        let resolve = |drv_path: &str| -> Option<Uuid> {
+            path_to_hash
+                .get(drv_path)
+                .and_then(|h| id_map.get(*h).copied())
+                .or_else(|| self.find_db_id_by_path(drv_path))
+        };
         let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
             .iter()
             .map(|e| {
-                let parent = self.find_db_id_by_path(&e.parent_drv_path).ok_or_else(|| {
-                    ActorError::MissingDbId {
+                let parent =
+                    resolve(&e.parent_drv_path).ok_or_else(|| ActorError::MissingDbId {
                         drv_path: e.parent_drv_path.clone(),
-                    }
-                })?;
-                let child = self.find_db_id_by_path(&e.child_drv_path).ok_or_else(|| {
-                    ActorError::MissingDbId {
-                        drv_path: e.child_drv_path.clone(),
-                    }
+                    })?;
+                let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
+                    drv_path: e.child_drv_path.clone(),
                 })?;
                 Ok((parent, child))
             })
@@ -413,6 +425,16 @@ impl DagActor {
         crate::db::SchedulerDb::batch_insert_edges(&mut tx, &edge_rows).await?;
 
         tx.commit().await?;
+
+        // r[impl sched.db.tx-commit-before-mutate]
+        // In-mem db_id write ONLY after the tx is durable. If anything
+        // above returned Err, the tx rolled back and we never reach
+        // here — cleanup_failed_merge sees nodes with db_id = None.
+        for (hash, db_id) in &id_map {
+            if let Some(state) = self.dag.node_mut(hash) {
+                state.db_id = Some(*db_id);
+            }
+        }
         Ok(())
     }
 
