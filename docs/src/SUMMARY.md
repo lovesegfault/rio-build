@@ -49,6 +49,11 @@
 - [Verification](./verification.md)
 - [Glossary](./glossary.md)
 
+# Runbooks
+
+- [GC Enablement Checklist](./runbooks/gc-enablement.md)
+- [EKS Smoke Test](./runbooks/eks-smoke.md)
+
 # Roadmap
 
 - [Implementation Phases](./phases.md)
