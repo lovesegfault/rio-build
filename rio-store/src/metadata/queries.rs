@@ -222,7 +222,8 @@ pub async fn query_by_hash_part(
 /// `RETURNING cardinality` lets us check the post-dedup count in one
 /// round-trip. Over `MAX_SIGNATURES` after dedup → the client sent novel
 /// garbage sigs AND we grew past the cap → reject (InvariantViolation,
-/// maps to INTERNAL — a clearer RESOURCE_EXHAUSTED variant is TODO).
+/// maps to INTERNAL — TODO(phase4b): add a RESOURCE_EXHAUSTED MetadataError
+/// variant so this surfaces to clients as the correct gRPC status).
 ///
 /// Returns rows updated (0 = path not found, 1 = appended). Caller maps
 /// 0 to NOT_FOUND.
