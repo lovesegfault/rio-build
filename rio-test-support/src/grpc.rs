@@ -35,7 +35,7 @@ type RealisationKey = (Vec<u8>, String);
 ///
 /// Records PutPath calls and supports prefix-match QueryPathInfo (for
 /// hash-part lookups via QueryPathFromHashPart).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MockStore {
     /// store_path -> (PathInfo, NAR bytes)
     pub paths: Arc<RwLock<HashMap<String, StoredPath>>>,
@@ -54,9 +54,34 @@ pub struct MockStore {
     /// If true, get_path returns garbage non-NAR bytes in the NarChunk.
     /// For NAR parse error tests (FUSE fetch → EIO on parse failure).
     pub get_path_garbage: Arc<AtomicBool>,
+    /// If `get_path_gate_armed` is true, `GetPath` awaits this Notify before
+    /// responding. Tests arm it at construction, spawn concurrent callers,
+    /// then `.notify_waiters()` to release all at once. Distinct from
+    /// `fail_get_path` (which errors immediately) — this holds-then-succeeds.
+    pub get_path_gate: Arc<tokio::sync::Notify>,
+    /// Whether `get_path_gate` is armed. When false, `GetPath` ignores the
+    /// gate (backwards-compatible with existing tests).
+    pub get_path_gate_armed: Arc<AtomicBool>,
     /// CA realisations: (drv_hash, output_name) -> Realisation.
     /// Used by gateway wopRegisterDrvOutput/wopQueryRealisation tests.
     pub realisations: Arc<RwLock<HashMap<RealisationKey, types::Realisation>>>,
+}
+
+impl Default for MockStore {
+    fn default() -> Self {
+        Self {
+            paths: Arc::default(),
+            put_calls: Arc::default(),
+            fail_next_puts: Arc::default(),
+            fail_find_missing: Arc::default(),
+            fail_query_path_info: Arc::default(),
+            fail_get_path: Arc::default(),
+            get_path_garbage: Arc::default(),
+            get_path_gate: Arc::new(tokio::sync::Notify::new()),
+            get_path_gate_armed: Arc::default(),
+            realisations: Arc::default(),
+        }
+    }
 }
 
 impl MockStore {
@@ -187,6 +212,13 @@ impl StoreService for MockStore {
     ) -> Result<Response<Self::GetPathStream>, Status> {
         if self.fail_get_path.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected get_path failure"));
+        }
+        // Slow-fetch gate: park until the test releases us. The fetcher thread
+        // blocks inside block_on here, which is exactly the condition the
+        // FUSE concurrent-waiter test needs — waiters park on the condvar
+        // past at least one WAIT_SLICE before the gate opens.
+        if self.get_path_gate_armed.load(Ordering::SeqCst) {
+            self.get_path_gate.notified().await;
         }
         let store_path = request.into_inner().store_path;
         // Garbage mode: return a stream with valid PathInfo but garbage NAR

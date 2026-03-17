@@ -109,6 +109,13 @@ pub fn describe_metrics() {
          is OFF (RIO_FUSE_PASSTHROUGH=false), every read comes through here. \
          Sustained nonzero rate with passthrough ON = investigate open_backing."
     );
+    describe_counter!(
+        "rio_worker_fuse_index_divergence_total",
+        "FUSE cache index/disk divergences detected and self-healed. Nonzero \
+         means something rm'd cache files out from under the SQLite index \
+         (manual debugging, disk cleanup scripts, interrupted eviction). \
+         The path is purged and re-fetched; investigate if sustained."
+    );
     describe_gauge!(
         "rio_worker_cpu_fraction",
         "Worker cgroup CPU utilization: delta cpu.stat usage_usec / wall-clock µs. \

@@ -23,17 +23,69 @@ use tracing::instrument;
 use rio_proto::StoreServiceClient;
 
 use super::NixStoreFs;
-use super::cache::{Cache, FetchClaim};
+use super::cache::{Cache, FetchClaim, InflightEntry};
+
+/// Per-slice wait for the `WaitFor` arm's condvar heartbeat. NOT a deadline:
+/// after each slice we check whether the fetcher finished and loop if not. The
+/// real deadline is `WAIT_DEADLINE` (GRPC_STREAM_TIMEOUT + slop). 30s in prod
+/// for visible debug logs on slow fetches; 200ms in tests so the concurrent-
+/// waiter test runs in under a second.
+#[cfg(not(test))]
+const WAIT_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Global deadline for the `WaitFor` loop. The fetcher's own
+/// `GRPC_STREAM_TIMEOUT` (300s) is the real deadline; the +30s slop absorbs
+/// the gap between `block_on` returning and the guard's `Drop` firing. If we
+/// exceed this, the fetcher's timeout should already have dropped the guard;
+/// something is deeply wrong (executor starvation?) and EAGAIN is the
+/// least-bad errno.
+const WAIT_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(rio_common::grpc::GRPC_STREAM_TIMEOUT.as_secs() + 30);
 
 impl NixStoreFs {
     /// Ensure a store path is cached locally, fetching from remote if needed.
     ///
     /// Returns the local filesystem path to the materialized store path.
     /// If another thread is already fetching, blocks on a condition variable
-    /// until that fetch completes (or a 30s timeout, then returns EAGAIN).
+    /// in heartbeat slices until that fetch completes or `WAIT_DEADLINE`
+    /// (GRPC_STREAM_TIMEOUT + 30s slop) passes.
     pub(super) fn ensure_cached(&self, store_basename: &str) -> Result<PathBuf, Errno> {
         match self.cache.get_path(store_basename) {
-            Ok(Some(local_path)) => return Ok(local_path),
+            Ok(Some(local_path)) => {
+                // Self-healing fast path: the index says present — verify
+                // disk agrees. If an external rm (debugging, interrupted
+                // eviction) deleted the file but left the SQLite row,
+                // trusting the index here makes the path PERMANENTLY
+                // unfetchable (every call returns a path that doesn't exist;
+                // we never fall through to fetch). Stat is one extra syscall
+                // per store-path-root lookup — cheap, and ensure_cached only
+                // runs when ops.rs already missed.
+                match local_path.symlink_metadata() {
+                    Ok(_) => return Ok(local_path),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        tracing::warn!(
+                            store_path = store_basename,
+                            local_path = %local_path.display(),
+                            "cache index says present but disk disagrees; purging stale row and re-fetching"
+                        );
+                        metrics::counter!("rio_worker_fuse_index_divergence_total").increment(1);
+                        self.cache.remove_stale(store_basename);
+                        // fall through to try_start_fetch below
+                    }
+                    Err(e) => {
+                        // EACCES/EIO on the stat — something else is wrong.
+                        // Don't silently re-fetch (would mask disk failure).
+                        tracing::error!(
+                            store_path = store_basename,
+                            error = %e,
+                            "cache stat failed (not ENOENT)"
+                        );
+                        return Err(Errno::EIO);
+                    }
+                }
+            }
             Ok(None) => {} // not cached, fetch below
             Err(e) => {
                 tracing::error!(store_path = store_basename, error = %e, "FUSE cache index query failed");
@@ -44,8 +96,16 @@ impl NixStoreFs {
         match self.cache.try_start_fetch(store_basename) {
             FetchClaim::Fetch(_guard) => {
                 // We own the fetch. _guard notifies waiters on drop (success,
-                // error, or panic) — no explicit cleanup needed.
-                // Delegate to the free fn — same code path prefetch uses.
+                // error, or panic). The _permit bounds concurrent FUSE-thread
+                // fetches so at least one thread stays free for hot-path ops.
+                //
+                // Permit is acquired AFTER the singleflight claim, so waiters
+                // for this path don't contend for a permit — they're parked
+                // on _guard's condvar, which is a cheap sleep, not a block_on.
+                // If acquire() blocks here, we're the (fuse_threads)th
+                // concurrent fetch; the builder that triggered this lookup
+                // waits, which is the lesser evil vs. starving warm builds.
+                let _permit = self.fetch_sem.acquire();
                 fetch_extract_insert(
                     &self.cache,
                     &self.store_client,
@@ -54,29 +114,64 @@ impl NixStoreFs {
                 )
             }
             FetchClaim::WaitFor(entry) => {
-                // Another thread is fetching. Wait for it with a timeout as
-                // belt-and-suspenders against a stuck fetcher (the guard's
-                // Drop impl fires even on panic, so this timeout is defensive).
-                const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                if !entry.wait(WAIT_TIMEOUT) {
-                    tracing::warn!(
-                        store_path = store_basename,
-                        timeout_secs = WAIT_TIMEOUT.as_secs(),
-                        "concurrent fetch did not complete within timeout, returning EAGAIN"
-                    );
-                    return Err(Errno::EAGAIN);
-                }
-                // Fetch completed — check cache again. Fetcher failure =>
-                // Ok(None) => ENOENT so the FUSE caller can retry.
-                // Index error => EIO (loud failure, not silent re-fetch).
-                match self.cache.get_path(store_basename) {
-                    Ok(Some(p)) => Ok(p),
-                    Ok(None) => Err(Errno::ENOENT),
-                    Err(e) => {
-                        tracing::error!(store_path = store_basename, error = %e, "FUSE cache index query failed after wait");
-                        Err(Errno::EIO)
-                    }
-                }
+                // Another thread is fetching. The fetcher has GRPC_STREAM_TIMEOUT
+                // (300s) to finish; a single wait(30s) returning false means
+                // "slow", not "dead" — the guard's Drop fires even on panic, so
+                // a truly dead fetcher would have notified. We loop wait() as
+                // a heartbeat and bound the TOTAL wait at stream-timeout + slop.
+                // If we exceed that, the fetcher's own timeout should already
+                // have fired and dropped the guard; something is deeply wrong
+                // (executor starvation?) and EAGAIN is the least-bad errno.
+                self.wait_for_fetcher(&entry, store_basename)
+            }
+        }
+    }
+
+    /// Park on the singleflight condvar until the fetcher finishes or the
+    /// global deadline passes. See the `WaitFor` arm in `ensure_cached`.
+    fn wait_for_fetcher(
+        &self,
+        entry: &InflightEntry,
+        store_basename: &str,
+    ) -> Result<PathBuf, Errno> {
+        let started = std::time::Instant::now();
+        loop {
+            if entry.wait(WAIT_SLICE) {
+                break; // fetcher done (success, error, or panic — guard dropped)
+            }
+            if entry.is_done() {
+                // Belt-and-suspenders: wait() returned false but done flipped
+                // between wait_timeout_while releasing and us checking. The
+                // guard dropped; proceed to the cache check.
+                break;
+            }
+            if started.elapsed() >= WAIT_DEADLINE {
+                tracing::warn!(
+                    store_path = store_basename,
+                    waited_secs = started.elapsed().as_secs(),
+                    "fetcher exceeded GRPC_STREAM_TIMEOUT + slop; returning EAGAIN"
+                );
+                return Err(Errno::EAGAIN);
+            }
+            tracing::debug!(
+                store_path = store_basename,
+                waited_secs = started.elapsed().as_secs(),
+                "waiting on concurrent fetch (fetcher still working)"
+            );
+        }
+        // Fetcher finished — check cache. Fetcher-failure ⇒ Ok(None) ⇒ ENOENT
+        // (kernel will re-lookup; ATTR_TTL won't cache a negative here because
+        // we never reply.entry'd). Index error ⇒ EIO (loud, not silent retry).
+        match self.cache.get_path(store_basename) {
+            Ok(Some(p)) => Ok(p),
+            Ok(None) => Err(Errno::ENOENT),
+            Err(e) => {
+                tracing::error!(
+                    store_path = store_basename,
+                    error = %e,
+                    "cache index query failed after wait"
+                );
+                Err(Errno::EIO)
             }
         }
     }
@@ -556,5 +651,160 @@ mod tests {
             matches!(second, Ok(Some(PrefetchSkip::AlreadyCached))),
             "second fetch: {second:?}"
         );
+    }
+
+    // ========================================================================
+    // ensure_cached tests (remediation 16: loop-wait + self-heal + semaphore)
+    // ========================================================================
+    //
+    // ensure_cached is a method on NixStoreFs; unlike prefetch_path_blocking
+    // it needs a full fs instance (for self.fetch_sem). NixStoreFs is Send+Sync
+    // (all fields are sync primitives / Arc / atomics) so Arc-wrapping lets
+    // spawn_blocking share it across the test's worker threads.
+
+    /// Build a NixStoreFs wrapped in Arc for cross-thread ensure_cached tests.
+    /// `fuse_threads` controls the fetch semaphore permits (threads - 1, min 1).
+    fn make_fs(
+        cache: Arc<Cache>,
+        client: StoreServiceClient<Channel>,
+        rt: Handle,
+        fuse_threads: u32,
+    ) -> Arc<NixStoreFs> {
+        Arc::new(NixStoreFs::new(cache, client, rt, false, fuse_threads))
+    }
+
+    /// Concurrent `ensure_cached` calls for the same path during a slow fetch
+    /// all succeed — none get EAGAIN. Before the loop-wait fix, waiters timed
+    /// out at WAIT_TIMEOUT=30s while the fetcher was still healthy.
+    ///
+    /// Mechanism: MockStore's get_path is gated on a Notify. One ensure_cached
+    /// wins Fetch and parks in block_on(GetPath) at the gate. The other N-1 get
+    /// WaitFor and park on the condvar. We sleep past one WAIT_SLICE (200ms in
+    /// cfg(test)) so each waiter does at least one heartbeat loop iteration —
+    /// the point where the OLD code returned EAGAIN. Then we open the gate;
+    /// the fetcher completes, guard drops, notify_all wakes all waiters, and
+    /// every call returns Ok(path).
+    ///
+    // r[verify worker.fuse.lookup-caches]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_waiters_no_eagain_during_slow_fetch() {
+        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("slowfetch");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"slow-payload");
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+        store.get_path_gate_armed.store(true, Ordering::SeqCst);
+
+        // N=5 concurrent ensure_cached. One wins Fetch, four get WaitFor.
+        // fuse_threads=N → permits = N-1 = 4 ≥ 1 fetcher, so the semaphore
+        // doesn't interfere (only one thread fetches this singleflight path).
+        const N: usize = 5;
+        let fs = make_fs(Arc::clone(&cache), client, rt, N as u32);
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let fs = Arc::clone(&fs);
+            let bn = basename.clone();
+            handles.push(tokio::task::spawn_blocking(move || fs.ensure_cached(&bn)));
+        }
+
+        // Let the fetcher reach the gate and the waiters park on the condvar.
+        // Sleep past one WAIT_SLICE so waiters do ≥1 heartbeat iteration —
+        // the OLD code returned EAGAIN here. 2× slice + margin for CI jitter.
+        tokio::time::sleep(WAIT_SLICE * 2 + std::time::Duration::from_millis(100)).await;
+
+        // Release the fetcher.
+        store.get_path_gate.notify_waiters();
+
+        // All N must succeed with the same path. Zero EAGAIN.
+        let mut paths = Vec::with_capacity(N);
+        for h in handles {
+            let r = h.await.expect("join");
+            let p = r.expect("ensure_cached must succeed (no EAGAIN)");
+            paths.push(p);
+        }
+        assert!(
+            paths.iter().all(|p| p == &paths[0]),
+            "all waiters see same path: {paths:?}"
+        );
+        assert!(paths[0].exists(), "fetched path on disk: {:?}", paths[0]);
+        assert_eq!(std::fs::read(&paths[0]).expect("read"), b"slow-payload");
+        drop(dir); // keep tempdir alive to here
+    }
+
+    /// `ensure_cached` with a stale index row (file rm'd, SQLite row intact)
+    /// detects the divergence, purges the row, re-fetches, and succeeds.
+    /// Before the self-heal fix, this returned Ok(path-that-doesn't-exist)
+    /// forever — every subsequent lookup would ENOENT in the caller's stat.
+    ///
+    // r[verify worker.fuse.cache-lru]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ensure_cached_self_heals_index_disk_divergence() {
+        let (cache, client, store, dir, rt, _srv) = setup_fetch_harness().await;
+
+        let basename = test_store_basename("diverge");
+        let store_path = format!("/nix/store/{basename}");
+        let (nar, hash) = make_nar(b"heal-me");
+        store.seed(make_path_info(&store_path, &nar, hash), nar);
+
+        let fs = make_fs(Arc::clone(&cache), client, rt, 4);
+
+        // First fetch: populates both disk and index.
+        let p1 = {
+            let fs = Arc::clone(&fs);
+            let bn = basename.clone();
+            tokio::task::spawn_blocking(move || fs.ensure_cached(&bn))
+                .await
+                .expect("join")
+                .expect("first fetch")
+        };
+        assert!(p1.exists(), "first fetch materialized on disk: {p1:?}");
+
+        // Simulate external rm: delete the file, leave the index row intact.
+        // Single-file NARs extract to a plain file (not a dir) — see
+        // test_prefetch_success_roundtrip.
+        std::fs::remove_file(&p1).expect("rm cache file");
+        assert!(!p1.exists(), "precondition: file gone from disk");
+
+        // Index still says present (contains() uses block_on internally).
+        let still_indexed = {
+            let cache = Arc::clone(&cache);
+            let bn = basename.clone();
+            tokio::task::spawn_blocking(move || cache.contains(&bn))
+                .await
+                .expect("join")
+                .expect("contains query")
+        };
+        assert!(
+            still_indexed,
+            "precondition: index row survives external rm"
+        );
+
+        // Second ensure_cached: should stat the fast-path return, detect
+        // ENOENT, purge the row, re-fetch, and return a VALID path.
+        let p2 = {
+            let fs = Arc::clone(&fs);
+            let bn = basename.clone();
+            tokio::task::spawn_blocking(move || fs.ensure_cached(&bn))
+                .await
+                .expect("join")
+                .expect("second fetch (self-heal)")
+        };
+        assert!(p2.exists(), "self-healed path exists: {p2:?}");
+        assert_eq!(std::fs::read(&p2).expect("read"), b"heal-me");
+
+        // The index row was re-inserted by fetch_extract_insert (so the
+        // self-heal's remove_stale was followed by a fresh insert).
+        let reindexed = {
+            let cache = Arc::clone(&cache);
+            let bn = basename.clone();
+            tokio::task::spawn_blocking(move || cache.contains(&bn))
+                .await
+                .expect("join")
+                .expect("contains query")
+        };
+        assert!(reindexed, "index row re-inserted after self-heal fetch");
+        drop(dir);
     }
 }

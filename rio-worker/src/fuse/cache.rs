@@ -37,7 +37,13 @@ pub struct InflightEntry {
 impl InflightEntry {
     /// Block the current thread until the fetch completes or `timeout` elapses.
     ///
-    /// Returns `true` if the fetch completed, `false` on timeout.
+    /// Returns `true` if the fetch completed, `false` on timeout. A `false`
+    /// return does NOT mean the fetcher is dead — the guard's `Drop` impl
+    /// fires on success, error, and panic alike. `false` means only "still
+    /// working after `timeout`." Callers that need to distinguish "slow"
+    /// from "dead" should loop on `wait()` while [`Self::is_done`] stays
+    /// `false`; the fetcher's own timeout (`GRPC_STREAM_TIMEOUT`) is the
+    /// real deadline.
     pub fn wait(&self, timeout: Duration) -> bool {
         let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
         let (done, wait_result) = self
@@ -45,6 +51,12 @@ impl InflightEntry {
             .wait_timeout_while(done, timeout, |d| !*d)
             .unwrap_or_else(|e| e.into_inner());
         !wait_result.timed_out() && *done
+    }
+
+    /// Cheap check: has the fetcher finished (guard dropped)? No condvar wait.
+    /// Use after a timed-out `wait()` to decide whether to wait again.
+    pub fn is_done(&self) -> bool {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -81,6 +93,49 @@ impl Drop for FetchGuard<'_> {
             *entry.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
             entry.cv.notify_all();
         }
+    }
+}
+
+/// Blocking counting semaphore for FUSE-thread fetch concurrency.
+///
+/// `tokio::sync::Semaphore` is async; we're in a sync FUSE callback that
+/// hasn't entered `block_on` yet. Building on `Mutex+Condvar` (same as
+/// `InflightEntry`) avoids a dependency and a nested-block_on wart.
+///
+/// No `try_acquire` — a FUSE-initiated fetch MUST eventually happen (the
+/// build depends on it). We always block; the semaphore just serializes
+/// the rate so some FUSE threads stay free for the hot path.
+pub(super) struct FetchSemaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl FetchSemaphore {
+    pub(super) fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(super) fn acquire(&self) -> FetchPermit<'_> {
+        let mut p = self.permits.lock().unwrap_or_else(|e| e.into_inner());
+        while *p == 0 {
+            p = self.cv.wait(p).unwrap_or_else(|e| e.into_inner());
+        }
+        *p -= 1;
+        FetchPermit { sem: self }
+    }
+}
+
+pub(super) struct FetchPermit<'a> {
+    sem: &'a FetchSemaphore,
+}
+
+impl Drop for FetchPermit<'_> {
+    fn drop(&mut self) {
+        *self.sem.permits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.sem.cv.notify_one();
     }
 }
 
@@ -343,6 +398,29 @@ impl Cache {
             Ok(Some(self.cache_dir.join(store_path)))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Remove a stale index row. Called when the index says "present" but
+    /// the file is gone from disk (external rm, interrupted eviction).
+    /// Best-effort: logs on failure but doesn't propagate — if the DELETE
+    /// fails, the next fetch will `INSERT OR REPLACE` over it anyway.
+    ///
+    /// Does NOT touch the bloom filter (bloom doesn't support deletion;
+    /// `insert()` already documents stale-positive tolerance).
+    pub fn remove_stale(&self, store_path: &str) {
+        let pool = &self.pool;
+        if let Err(e) = self.runtime.block_on(async {
+            sqlx::query("DELETE FROM cached_paths WHERE store_path = ?1")
+                .bind(store_path)
+                .execute(pool)
+                .await
+        }) {
+            tracing::warn!(
+                store_path,
+                error = %e,
+                "failed to remove stale index row (will be overwritten on re-fetch)"
+            );
         }
     }
 
@@ -885,6 +963,73 @@ mod tests {
 
         drop(guard);
         Ok(())
+    }
+
+    /// `is_done()` reflects guard-drop state without waiting on the condvar.
+    /// Before guard drop: `false`. After guard drop: `true`.
+    #[tokio::test]
+    async fn test_inflight_is_done_tracks_guard_drop() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = make_cache(dir.path().join("cache"), 1).await?;
+
+        let FetchClaim::Fetch(guard) = cache.try_start_fetch("done-path") else {
+            panic!("first claim should return Fetch");
+        };
+        let FetchClaim::WaitFor(entry) = cache.try_start_fetch("done-path") else {
+            panic!("second claim should return WaitFor");
+        };
+
+        // Guard still held: not done.
+        assert!(!entry.is_done(), "is_done should be false while guard held");
+
+        // wait() times out → false. is_done() is STILL false (fetcher working).
+        assert!(!entry.wait(Duration::from_millis(50)));
+        assert!(!entry.is_done(), "is_done still false after timed-out wait");
+
+        // Drop the guard: now done.
+        drop(guard);
+        assert!(entry.is_done(), "is_done should be true after guard drop");
+
+        // And wait() now returns immediately true.
+        assert!(entry.wait(Duration::from_secs(1)));
+        Ok(())
+    }
+
+    /// FetchSemaphore: permits are consumed by acquire, restored on permit drop.
+    /// Second acquire blocks until first permit drops.
+    #[test]
+    fn test_fetch_semaphore_permit_raii() {
+        let sem = Arc::new(FetchSemaphore::new(1));
+
+        // First acquire succeeds immediately.
+        let p1 = sem.acquire();
+
+        // Second acquire on another thread blocks until p1 drops.
+        let sem2 = Arc::clone(&sem);
+        let started = std::time::Instant::now();
+        let t = std::thread::spawn(move || {
+            let _p2 = sem2.acquire();
+            started.elapsed()
+        });
+
+        // Hold p1 for 100ms, then drop.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(p1);
+
+        // t should have waited ~100ms for the permit.
+        let waited = t.join().expect("thread");
+        assert!(
+            waited >= Duration::from_millis(90),
+            "second acquire should have blocked, waited only {waited:?}"
+        );
+
+        // Both permits released: a fresh acquire succeeds immediately.
+        let start = std::time::Instant::now();
+        let _p3 = sem.acquire();
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "acquire with available permit should be immediate"
+        );
     }
 
     #[tokio::test]

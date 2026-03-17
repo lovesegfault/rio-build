@@ -69,6 +69,13 @@ pub struct NixStoreFs {
     store_client: StoreServiceClient<Channel>,
     /// Tokio runtime handle for async-in-sync bridging.
     runtime: Handle,
+    /// Bounds concurrent FUSE-initiated fetches to `fuse_threads - 1` so at
+    /// least one FUSE thread stays free for hot-path ops (lookup on cached
+    /// paths, getattr, read). Without this, N cold paths blocking in
+    /// `fetch_extract_insert` for up to `GRPC_STREAM_TIMEOUT` each starve
+    /// warm-path ops that would complete in microseconds. See phase4a §2.10
+    /// fuse-blockon-thread-exhaustion.
+    fetch_sem: cache::FetchSemaphore,
 }
 
 impl NixStoreFs {
@@ -88,7 +95,13 @@ impl NixStoreFs {
         store_client: StoreServiceClient<Channel>,
         runtime: Handle,
         passthrough: bool,
+        fuse_threads: u32,
     ) -> Self {
+        // fuse_threads - 1, floored at 1: with n_threads=1 (tests, weird
+        // configs) this degrades to current behavior (serialized fetches).
+        // With n_threads=4 (default) we get 3 concurrent fetches + 1 free
+        // thread for the hot path.
+        let fetch_permits = (fuse_threads as usize).saturating_sub(1).max(1);
         let inodes = InodeMap::new(cache.cache_dir().to_path_buf());
         Self {
             inodes: RwLock::new(inodes),
@@ -100,6 +113,7 @@ impl NixStoreFs {
             cache,
             store_client,
             runtime,
+            fetch_sem: cache::FetchSemaphore::new(fetch_permits),
         }
     }
 
@@ -207,7 +221,7 @@ pub fn mount_fuse_background(
     passthrough: bool,
     n_threads: u32,
 ) -> anyhow::Result<fuser::BackgroundSession> {
-    let fs = NixStoreFs::new(cache, store_client, runtime, passthrough);
+    let fs = NixStoreFs::new(cache, store_client, runtime, passthrough, n_threads);
 
     let config = make_fuse_config(n_threads);
     let session = fuser::spawn_mount2(fs, mount_point, &config)?;

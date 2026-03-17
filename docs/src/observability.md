@@ -152,6 +152,7 @@ r[obs.metric.worker]
 | `rio_worker_fuse_cache_misses_total` | Counter | FUSE cache misses |
 | `rio_worker_fuse_fetch_duration_seconds` | Histogram | Store path fetch latency |
 | `rio_worker_fuse_fallback_reads_total` | Counter | Successful userspace `read()` callbacks. Near-zero when passthrough is on (kernel handles reads directly); nonzero when `fuse_passthrough=false` or passthrough failed for specific files. |
+| `rio_worker_fuse_index_divergence_total` | Counter | FUSE cache index/disk divergences self-healed. Nonzero = something rm'd cache files under the SQLite index (debugging, interrupted eviction). Investigate if sustained. |
 | `rio_worker_overlay_teardown_failures_total` | Counter | Overlay unmount failures (leaked mount). Alert if rate > 0: indicates resource leak on worker. |
 | `rio_worker_prefetch_total` | Counter | PrefetchHint outcomes (labeled by `result`: `fetched`/`already_cached`/`already_in_flight`/`error`/`malformed`/`panic`). Sustained high `already_cached` = scheduler bloom filter stale. |
 | `rio_worker_upload_bytes_total` | Counter | Bytes uploaded to store via PutPath (nar_size on success) |
