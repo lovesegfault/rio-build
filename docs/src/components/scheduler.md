@@ -348,6 +348,9 @@ Recovery sequence:
 
 Workers buffer completion reports with retry logic: if `ReportCompletion` fails (scheduler unreachable during failover), the worker retries with exponential backoff until the scheduler accepts it.
 
+r[sched.recovery.poisoned-failed-count]
+Recovered builds whose derivations include failure-terminal states (Poisoned, DependencyFailed, Cancelled) MUST count those derivations in `failed`, not omit them from the denominator. A build whose only non-success-terminal derivation was poisoned before the crash transitions to `Failed` after recovery, never `Succeeded`. Concretely: `load_poisoned_derivations` rows are inserted into the recovery-time `id_to_hash` map so the `build_derivations` join resolves them, so `build_summary` counts them, so `check_build_completion` sees `failed > 0`.
+
 ## Worker Registration Protocol
 
 r[sched.worker.dual-register]

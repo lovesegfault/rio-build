@@ -883,7 +883,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
             "permanent",
         )
         .await?;
-        // Barrier: ensure persist_status + set_poisoned_at hit PG.
+        // Barrier: ensure persist_poisoned hit PG.
         barrier(&handle).await;
         drop(handle);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -1098,6 +1098,170 @@ async fn test_recovered_poison_clear_then_resubmit_progresses() -> TestResult {
         DerivationStatus::Created,
         "node must progress past Created (compute_initial_states ran)"
     );
+
+    Ok(())
+}
+
+// r[verify sched.recovery.poisoned-failed-count]
+/// Route 1: crash between persist_poisoned and the build transition to
+/// Failed. PG has drv status='poisoned', poisoned_at SET (atomic persist
+/// landed), build status='active'. Recovery must load the poisoned drv
+/// into id_to_hash → bd_rows join succeeds → build_summary counts it in
+/// `failed` → build → Failed.
+///
+/// Simulation: don't actually crash mid-await. Directly write the
+/// inconsistent PG state that a crash WOULD leave, then recover. The
+/// actor's completion path is deterministic; we're testing recovery's
+/// interpretation of the state, not the crash itself.
+///
+/// Before the keystone fix: the poisoned row was loaded into the DAG but
+/// NOT into id_to_hash → bd_rows join fell through → build_drv_hashes
+/// stayed empty → total=0, completed=0, failed=0 → 0>=0 && 0==0 →
+/// spurious Succeeded. After: total=1, failed=1 → Failed.
+#[tokio::test]
+async fn test_recovery_poisoned_orphan_build_fails_not_succeeds() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let build_id = Uuid::new_v4();
+
+    // Phase 1: actor A merges a single-drv build with keep_going=true.
+    // This variant exercises the `all_resolved && failed>0` half of the
+    // condition. The _keep_going_false variant below covers the default
+    // (and more common) path. Dispatches it, then we directly write the
+    // crash-window PG state and kill actor A.
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "r1-w", "x86_64-linux", 1).await?;
+        let _ev = merge_dag(
+            &handle,
+            build_id,
+            vec![make_test_node("r1-drv", "x86_64-linux")],
+            vec![],
+            true, // keep_going
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Simulate crash-after-persist_poisoned-before-handle_derivation_failure:
+    // drv is poisoned+timestamped, build is still active.
+    sqlx::query("UPDATE derivations SET status='poisoned', poisoned_at=now() WHERE drv_hash=$1")
+        .bind("r1-drv")
+        .execute(&db.pool)
+        .await?;
+    // Build row: leave as-is (status='active' from merge).
+    let (build_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        build_status, "active",
+        "precondition: build still active in PG"
+    );
+
+    // Phase 2: fresh actor B recovers.
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // THE assertion: build must be Failed, not Succeeded.
+    // Before the keystone fix: Succeeded (total=0, failed=0).
+    // After: Failed (total=1, failed=1).
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "recovered build with only-poisoned drv MUST be Failed, got state={}",
+        status.state
+    );
+
+    // Belt-and-suspenders: PG should reflect the transition.
+    let (pg_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(pg_status, "failed", "PG build status must follow in-mem");
+
+    Ok(())
+}
+
+// r[verify sched.recovery.poisoned-failed-count]
+/// Route 1, keep_going=false (the DEFAULT): same crash window as the
+/// _fails_not_succeeds test above, but with the common-case flag.
+///
+/// This is the spec's unconditional claim: a crash between
+/// persist_poisoned and the build transition MUST result in Failed on
+/// recovery — regardless of keep_going. Before the `|| !keep_going`
+/// condition fix in check_build_completion, keep_going=false builds
+/// fell through: failed=1 but `keep_going && all_resolved` was false
+/// → no branch taken → build stuck Active forever. (Live keep_going=
+/// false failures go through handle_derivation_failure, but recovery's
+/// sweep doesn't invoke that path — it calls check_build_completion
+/// directly.)
+#[tokio::test]
+async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let build_id = Uuid::new_v4();
+
+    // Phase 1: actor A merges a single-drv build with keep_going=FALSE
+    // (the default — this is the common case). Dispatch, then write
+    // the crash-window PG state and kill actor A.
+    {
+        let (handle, task) = setup_actor(db.pool.clone());
+        let mut worker_rx = connect_worker(&handle, "r1f-w", "x86_64-linux", 1).await?;
+        let _ev = merge_dag(
+            &handle,
+            build_id,
+            vec![make_test_node("r1f-drv", "x86_64-linux")],
+            vec![],
+            false, // keep_going=false — the default
+        )
+        .await?;
+        let _ = worker_rx.recv().await.expect("assignment");
+        barrier(&handle).await;
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Simulate crash-after-persist_poisoned-before-handle_derivation_failure:
+    // drv is poisoned+timestamped, build is still active.
+    sqlx::query("UPDATE derivations SET status='poisoned', poisoned_at=now() WHERE drv_hash=$1")
+        .bind("r1f-drv")
+        .execute(&db.pool)
+        .await?;
+    let (build_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        build_status, "active",
+        "precondition: build still active in PG"
+    );
+
+    // Phase 2: fresh actor B recovers.
+    let (handle, _task) = setup_actor(db.pool.clone());
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // THE assertion: build must be Failed. NOT Succeeded, NOT Active.
+    // Before the `|| !keep_going` fix: Active (fell through both branches).
+    // After: Failed (failed=1, !keep_going → branch fires).
+    let status = query_status(&handle, build_id).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "recovered keep_going=false build with poisoned drv MUST be Failed (not stuck Active), got state={}",
+        status.state
+    );
+
+    // PG follows in-mem.
+    let (pg_status,): (String,) = sqlx::query_as("SELECT status FROM builds WHERE build_id=$1")
+        .bind(build_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(pg_status, "failed", "PG build status must follow in-mem");
 
     Ok(())
 }

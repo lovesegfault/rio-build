@@ -311,13 +311,23 @@ impl DagActor {
             if let Err(e) = self.complete_build(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist build completion");
             }
-        } else if keep_going && all_resolved && failed > 0 {
-            // keepGoing: all derivations resolved but some failed
+        } else if failed > 0 && (all_resolved || !keep_going) {
+            // keep_going=true: all derivations resolved but some failed.
+            //
+            // keep_going=false: live failures go through handle_derivation_failure
+            // immediately (which calls transition_build_to_failed directly, never
+            // this function). This branch catches RECOVERY: the post-recovery
+            // sweep calls check_build_completion on a build whose only drv is
+            // Poisoned in PG — failed=1, but handle_derivation_failure never
+            // fires because recovery doesn't replay completion events. Without
+            // this, keep_going=false (the default!) falls through and the build
+            // hangs Active forever. Live operation never reaches this branch
+            // for !keep_going: the build is already terminal by the time
+            // check_build_completion is called (early return above).
             if let Err(e) = self.transition_build_to_failed(build_id).await {
                 error!(build_id = %build_id, error = %e, "failed to persist build-failed transition");
             }
         }
-        // !keep_going failures are handled immediately in handle_derivation_failure
     }
 
     pub(super) async fn complete_build(&mut self, build_id: Uuid) -> Result<(), ActorError> {

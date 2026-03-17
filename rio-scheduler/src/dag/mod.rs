@@ -504,8 +504,15 @@ impl DerivationDag {
         let mut to_reap = Vec::new();
 
         for (hash, state) in &mut self.nodes {
-            state.interested_builds.remove(&build_id);
-            if state.interested_builds.is_empty() && state.status().is_terminal() {
+            // HashSet::remove returns true iff the element was present.
+            // Only reap nodes that THIS call emptied. Recovered-poisoned
+            // nodes have interested_builds=∅ from birth (from_poisoned_row
+            // at state/derivation.rs) — without this guard, the FIRST
+            // build completion post-recovery reaps every one of them,
+            // silently disabling poison-TTL tracking.
+            let was_interested = state.interested_builds.remove(&build_id);
+            if was_interested && state.interested_builds.is_empty() && state.status().is_terminal()
+            {
                 to_reap.push(hash.clone());
             }
         }

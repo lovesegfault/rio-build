@@ -451,14 +451,22 @@ impl SchedulerDb {
     }
 
     // r[impl sched.poison.ttl-persist]
-    /// Persist `poisoned_at = now()` for a derivation. Called from
-    /// `poison_and_cascade` and `handle_permanent_failure` after
-    /// `persist_status(.., Poisoned)`. Best-effort — status write
-    /// already happened; missing poisoned_at means recovery won't
-    /// load it (same as pre-009 behavior).
-    pub async fn set_poisoned_at(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+    /// Atomically set `status='poisoned'` AND `poisoned_at=now()`.
+    ///
+    /// Replaces the previous two-call sequence (`update_derivation_status`
+    /// then `set_poisoned_at`) which had a crash window: status='poisoned'
+    /// but poisoned_at=NULL. Rows in that state were invisible to
+    /// `load_poisoned_derivations` (filtered by `poisoned_at IS NOT NULL`)
+    /// — poison TTL tracking silently broken for those rows.
+    ///
+    /// `assigned_worker_id` is NULLed: a poisoned derivation has no
+    /// assignment. Matches the in-mem semantics the caller should enforce.
+    pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE derivations SET poisoned_at = now(), updated_at = now() WHERE drv_hash = $1",
+            "UPDATE derivations \
+             SET status = 'poisoned', poisoned_at = now(), \
+                 assigned_worker_id = NULL, updated_at = now() \
+             WHERE drv_hash = $1",
         )
         .bind(drv_hash.as_str())
         .execute(&self.pool)
@@ -484,9 +492,15 @@ impl SchedulerDb {
 
     /// Load poisoned derivations with their `poisoned_at` timestamps
     /// for recovery. Separate from `load_nonterminal_derivations`
-    /// because `TERMINAL_STATUSES` includes `"poisoned"`. Rows with
-    /// `poisoned_at IS NULL` are pre-009 orphans — skip them (they'll
-    /// be overwritten by a fresh submit; same as pre-009 behavior).
+    /// because `TERMINAL_STATUSES` includes `"poisoned"`.
+    ///
+    /// Rows with `poisoned_at IS NULL` are crash-window artifacts from
+    /// the old two-call persist sequence (status set, timestamp not yet).
+    /// `COALESCE(..., 0.0)` treats them as freshly poisoned (elapsed=0)
+    /// — conservative: a slight TTL over-extension is harmless; omitting
+    /// the row entirely (the old `IS NOT NULL` filter) caused spurious
+    /// Succeeded on recovery. After `persist_poisoned` landed, new rows
+    /// can never be in this state.
     ///
     /// Returns minimal fields — poisoned rows aren't dispatched, just
     /// TTL-tracked. The `failed_workers` count matters for display;
@@ -499,9 +513,12 @@ impl SchedulerDb {
             r#"
             SELECT derivation_id, drv_hash, drv_path, pname, system,
                    failed_workers,
-                   EXTRACT(EPOCH FROM (now() - poisoned_at))::float8 AS elapsed_secs
+                   COALESCE(
+                       EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
+                       0.0
+                   ) AS elapsed_secs
             FROM derivations
-            WHERE status = 'poisoned' AND poisoned_at IS NOT NULL
+            WHERE status = 'poisoned'
             "#,
         )
         .fetch_all(&self.pool)
@@ -1580,9 +1597,12 @@ mod tests {
     }
 
     // r[verify sched.poison.ttl-persist]
-    /// Roundtrip: set_poisoned_at → load_poisoned_derivations → clear_poison.
+    /// Roundtrip: persist_poisoned → load_poisoned_derivations → clear_poison.
     /// Catches the `.as_bytes()` vs `.as_str()` binding regression — PG rejects
     /// BYTEA against a TEXT column, but call sites swallow the error as best-effort.
+    ///
+    /// Also verifies atomicity: a single `persist_poisoned` call sets BOTH
+    /// status AND poisoned_at (no crash window between two UPDATEs).
     #[tokio::test]
     async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
         let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -1590,17 +1610,24 @@ mod tests {
         let drv_hash: DrvHash = "poison-rt-hash".into();
         let _ = insert_test_derivation(&db, drv_hash.as_str()).await?;
 
-        // load_poisoned_derivations filters on status='poisoned' AND
-        // poisoned_at IS NOT NULL. set_poisoned_at only touches poisoned_at;
-        // status must be set separately (actors do this via persist_status).
-        sqlx::query("UPDATE derivations SET status='poisoned' WHERE drv_hash=$1")
-            .bind(drv_hash.as_str())
-            .execute(&test_db.pool)
-            .await?;
-        db.set_poisoned_at(&drv_hash).await?;
+        // Single atomic call: sets status='poisoned' AND poisoned_at=now()
+        // AND assigned_worker_id=NULL. No separate status update needed.
+        db.persist_poisoned(&drv_hash).await?;
+
+        // Verify all three columns updated in one statement.
+        let (status, has_ts, worker): (String, bool, Option<String>) = sqlx::query_as(
+            "SELECT status, poisoned_at IS NOT NULL, assigned_worker_id \
+             FROM derivations WHERE drv_hash=$1",
+        )
+        .bind(drv_hash.as_str())
+        .fetch_one(&test_db.pool)
+        .await?;
+        assert_eq!(status, "poisoned");
+        assert!(has_ts, "poisoned_at must be set in the same statement");
+        assert!(worker.is_none(), "assigned_worker_id must be NULLed");
 
         let rows = db.load_poisoned_derivations().await?;
-        assert_eq!(rows.len(), 1, "set_poisoned_at should make row loadable");
+        assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");
         assert_eq!(rows[0].drv_hash, drv_hash.as_str());
         assert_ne!(rows[0].derivation_id, Uuid::nil());
         assert!(

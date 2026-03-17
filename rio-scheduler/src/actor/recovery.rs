@@ -117,6 +117,7 @@ impl DagActor {
         }
         let ttl_secs = crate::state::POISON_TTL.as_secs_f64();
         for row in poisoned_rows {
+            let derivation_id = row.derivation_id;
             // Expired-at-load: clear in PG, don't insert. Avoids the
             // from_poisoned_row Instant-arithmetic trap on fresh
             // nodes — checked_sub(30h) on a node booted 1h ago returns
@@ -124,6 +125,17 @@ impl DagActor {
             // instead of immediate expiry. PG's elapsed_secs is wall-
             // clock so the comparison here is correct regardless of
             // node uptime.
+            //
+            // KNOWN GAP (narrow): skipping the id_to_hash insert means
+            // an Active build referencing this drv via bd_rows will
+            // fall through on the `continue` at the bd_rows join below
+            // → build.derivation_hashes shrinks by 1. If other drvs
+            // complete: spurious Succeeded with this drv's output
+            // missing. Window: scheduler must crash in the poison-
+            // before-transition gap AND stay down > POISON_TTL (24h).
+            // Normal operation transitions the build to Failed within
+            // the same actor turn. Not worth the re-load complexity
+            // for a 24h-outage + crash-window intersection.
             if row.elapsed_secs > ttl_secs {
                 info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
@@ -141,6 +153,12 @@ impl DagActor {
                     continue;
                 }
             };
+            let hash = state.drv_hash.clone();
+            // r[impl sched.recovery.poisoned-failed-count]
+            // Keystone: without this, the bd_rows join below falls through
+            // on `continue` for poisoned derivations → build.derivation_hashes
+            // stays empty → check_build_completion sees 0/0 → Succeeded.
+            id_to_hash.insert(derivation_id, hash);
             self.dag.insert_recovered_node(state);
         }
 
@@ -165,12 +183,25 @@ impl DagActor {
         let mut build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>> = HashMap::new();
         for (build_id, drv_id) in &bd_rows {
             let Some(hash) = id_to_hash.get(drv_id) else {
-                // Derivation is terminal (not in our non-terminal
-                // load). That's fine — it doesn't need interested_
-                // builds tracking (it's done). BuildInfo's
-                // derivation_hashes set will be smaller than it was,
-                // but check_build_completion only counts non-
-                // terminal derivations anyway.
+                // Derivation is success-terminal (Completed) OR in a
+                // terminal state we don't load (Cancelled,
+                // DependencyFailed). Poisoned IS loaded (separate query
+                // above) and IS in id_to_hash — if we hit this branch
+                // for a poisoned drv, the keystone insert is broken.
+                //
+                // check_build_completion uses build.derivation_hashes.len()
+                // as the denominator. Every drv that falls through here
+                // shrinks that denominator. For a build whose ONLY
+                // remaining drv is here: total=0, completed=0, failed=0
+                // → 0>=0 && 0==0 → spurious Succeeded. The orphan-guard
+                // below catches total=0; but a build with ONE Completed
+                // drv + ONE fall-through has total=1, completed=1 →
+                // Succeeded, and the guard doesn't fire. That case is
+                // correct iff the fall-through was genuinely Completed.
+                // It is WRONG if the fall-through was Cancelled (Route 2
+                // in remediation 01 — needs its own fix).
+                warn!(build_id = %build_id, derivation_id = %drv_id,
+                      "bd_row derivation not in id_to_hash — success-terminal or unloaded-terminal");
                 continue;
             };
             if let Some(state) = self.dag.node_mut(hash) {

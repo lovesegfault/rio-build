@@ -29,6 +29,16 @@ impl DagActor {
         }
     }
 
+    /// Best-effort atomic persist of `status='poisoned'` + `poisoned_at=now()`.
+    /// Single SQL UPDATE — no crash window between the two columns.
+    /// Logs error!, never returns it (same semantics as `persist_status`).
+    pub(super) async fn persist_poisoned(&self, drv_hash: &DrvHash) {
+        if let Err(e) = self.db.persist_poisoned(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e,
+                   "failed to persist poisoned status+timestamp");
+        }
+    }
+
     /// Best-effort unpin of `scheduler_live_pins` rows for a
     /// terminal derivation. Called at every terminal transition
     /// (Completed/Poisoned/Cancelled; DependencyFailed is never
@@ -452,11 +462,7 @@ impl DagActor {
         }
         state.poisoned_at = Some(Instant::now());
 
-        self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
-            .await;
-        if let Err(e) = self.db.set_poisoned_at(drv_hash).await {
-            error!(drv_hash = %drv_hash, error = %e, "failed to persist poisoned_at");
-        }
+        self.persist_poisoned(drv_hash).await;
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
@@ -608,11 +614,7 @@ impl DagActor {
         }
         state.poisoned_at = Some(Instant::now());
 
-        self.persist_status(drv_hash, DerivationStatus::Poisoned, None)
-            .await;
-        if let Err(e) = self.db.set_poisoned_at(drv_hash).await {
-            error!(drv_hash = %drv_hash, error = %e, "failed to persist poisoned_at");
-        }
+        self.persist_poisoned(drv_hash).await;
         self.unpin_best_effort(drv_hash).await;
 
         // Cascade: parents of a poisoned derivation can never complete.
