@@ -10,14 +10,15 @@
 # `pnpm run build`), then patch build.rs to copy the pre-built dist/ into
 # $OUT_DIR instead of invoking pnpm. Assets are embedded via
 # include_str!(concat!(env!("OUT_DIR"), "/dashboard/dist/...")) on main.
-{ craneLib, pkgs }:
+{
+  craneLib,
+  pkgs,
+  tracey-src,
+}:
 let
-  src = pkgs.fetchFromGitHub {
-    owner = "bearcove";
-    repo = "tracey";
-    rev = "2446b4f7433c6220c18737737970f6eccbe2081d";
-    hash = "sha256-xAPNDW7Ey0z959eTrlIYu8xnDK9Xf7SvsZG2HgL28Ps=";
-  };
+  # Flake input (not fetchFromGitHub): crane reads Cargo.lock from a
+  # pre-fetched path, so evaluation doesn't need allow-import-from-derivation.
+  src = tracey-src;
   # Workspace Cargo.toml on main still reports 1.3.0 — no tag yet past
   # the Nix-lang-support / validate-exit-code commits we want.
   version = "1.3.0-unstable-2026-03-13";
@@ -31,12 +32,13 @@ let
   traceyDashboard = pkgs.stdenvNoCC.mkDerivation {
     pname = "tracey-dashboard";
     inherit version src;
-    sourceRoot = "${src.name}/${dashboardRoot}";
+    # Flake inputs are /nix/store/<hash>-source; stripHash → "source".
+    sourceRoot = "source/${dashboardRoot}";
 
     pnpmDeps = pkgs.fetchPnpmDeps {
       pname = "tracey-dashboard";
       inherit version src;
-      sourceRoot = "${src.name}/${dashboardRoot}";
+      sourceRoot = "source/${dashboardRoot}";
       pnpm = pkgs.pnpm_10;
       fetcherVersion = 3;
       hash = "sha256-PtaMB8FSS4vNZMcRiGCqzm5tug9CFvzx3O8GLlv/xyk=";
@@ -99,7 +101,7 @@ craneLib.buildPackage (
 
     # build.rs: emit_tracey_version_metadata() falls back to `git rev-parse`
     # (fails in sandbox). Setting this makes `tracey --version` show the pin.
-    TRACEY_GIT_COMMIT = src.rev;
+    TRACEY_GIT_COMMIT = tracey-src.rev;
 
     # build.rs: build_dashboard() is patched below to copy from here into
     # $OUT_DIR/dashboard/dist and return, skipping pnpm entirely. We can't

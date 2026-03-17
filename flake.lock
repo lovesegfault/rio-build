@@ -372,6 +372,7 @@
         "nixhelm": "nixhelm",
         "nixpkgs": "nixpkgs_2",
         "rust-overlay": "rust-overlay",
+        "tracey-src": "tracey-src",
         "treefmt-nix": "treefmt-nix"
       }
     },
@@ -407,6 +408,23 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "tracey-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773236204,
+        "narHash": "sha256-xAPNDW7Ey0z959eTrlIYu8xnDK9Xf7SvsZG2HgL28Ps=",
+        "owner": "bearcove",
+        "repo": "tracey",
+        "rev": "2446b4f7433c6220c18737737970f6eccbe2081d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bearcove",
+        "repo": "tracey",
+        "rev": "2446b4f7433c6220c18737737970f6eccbe2081d",
         "type": "github"
       }
     },

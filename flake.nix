@@ -18,6 +18,13 @@
       flake = false;
     };
 
+    # Spec-coverage tool (nix/tracey.nix). Flake input (not fetchFromGitHub)
+    # so crane reads Cargo.lock from a pre-fetched path — no IFD.
+    tracey-src = {
+      url = "github:bearcove/tracey/2446b4f7433c6220c18737737970f6eccbe2081d";
+      flake = false;
+    };
+
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -271,7 +278,10 @@
 
           # Spec-coverage CLI + web dashboard. The SPA is built via
           # fetchPnpmDeps in nix/tracey.nix and embedded at compile time.
-          traceyPkg = import ./nix/tracey.nix { inherit craneLib pkgs; };
+          traceyPkg = import ./nix/tracey.nix {
+            inherit craneLib pkgs;
+            inherit (inputs) tracey-src;
+          };
 
           # --------------------------------------------------------------
           # Golden conformance test fixtures
