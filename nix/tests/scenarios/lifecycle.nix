@@ -469,14 +469,18 @@ let
           # ── LEADER: SERVING on named service ──────────────────────────
           # Exit 0 = SERVING. Leader acquired lease during waitReady →
           # LeaderAcquired → recover_from_pg → recovery_complete=true →
-          # set_serving on named service.
+          # set_serving on named service. DISTINCT local port (19102,
+          # not 19101): the kill above leaves :19101 in TIME_WAIT for
+          # ~60s, and port-forward without SO_REUSEADDR can't rebind —
+          # it dies silently (stderr→/dev/null), probe gets conn-refused
+          # → exit 2. sleep 2 doesn't help; TIME_WAIT outlasts it.
           k3s_server.succeed(
-              f"k3s kubectl -n ${ns} port-forward {leader} 19101:9101 "
+              f"k3s kubectl -n ${ns} port-forward {leader} 19102:9101 "
               f">/dev/null 2>&1 & echo $! > /tmp/pf-health.pid; sleep 2"
           )
           try:
               k3s_server.succeed(
-                  "grpc-health-probe -addr localhost:19101 "
+                  "grpc-health-probe -addr localhost:19102 "
                   "-service rio.scheduler.SchedulerService"
               )
           finally:
