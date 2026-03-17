@@ -117,10 +117,18 @@ pub enum ActivityType {
 }
 
 /// Writes STDERR messages to the Nix client.
+///
+/// **State machine:** the writer is *live* until exactly one of `finish()`
+/// or `error()` succeeds. After `finish()`, `inner_mut()` becomes available
+/// for writing the operation result. After `error()`, the writer is poisoned:
+/// all further STDERR calls return `Err`, and `inner_mut()` panics. See
+/// `r[gw.stderr.error-before-return+2]` — `STDERR_ERROR` and `STDERR_LAST` are
+/// mutually exclusive terminal frames.
 pub struct StderrWriter<W> {
     writer: W,
     next_activity_id: u64,
     finished: bool,
+    errored: bool,
 }
 
 impl<W: AsyncWrite + Unpin> StderrWriter<W> {
@@ -129,14 +137,15 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
             writer,
             next_activity_id: 1,
             finished: false,
+            errored: false,
         }
     }
 
-    /// Check that the writer has not been finished; return an error if it has.
+    /// Check that the writer is still live (neither finished nor errored).
     fn check_not_finished(&self) -> Result<(), WireError> {
-        if self.finished {
+        if self.finished || self.errored {
             return Err(WireError::Io(std::io::Error::other(
-                "StderrWriter already finished",
+                "StderrWriter already terminated (finish() or error() was called)",
             )));
         }
         Ok(())
@@ -146,13 +155,15 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     ///
     /// # Panics
     ///
-    /// Panics if called before `finish()`. The STDERR streaming loop must be
-    /// terminated before writing result data to the underlying stream.
+    /// Panics if called before `finish()`, or if `error()` was called.
+    /// `STDERR_ERROR` is terminal — no result payload follows it on the wire,
+    /// so handing out the raw writer after an error would let the handler
+    /// emit bytes that a real Nix client will never consume.
     pub fn inner_mut(&mut self) -> &mut W {
         assert!(
-            self.finished,
+            self.finished && !self.errored,
             "StderrWriter::inner_mut() called before finish() — \
-             this would corrupt the STDERR stream"
+             or after error() — this would corrupt the STDERR stream"
         );
         &mut self.writer
     }
@@ -168,7 +179,10 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
 
     /// Send STDERR_LAST to end the streaming loop.
     /// After this, the caller should write the operation result directly.
+    /// Returns `Err` if `error()` or `finish()` was already called —
+    /// `STDERR_ERROR` and `STDERR_LAST` are mutually exclusive terminal frames.
     pub async fn finish(&mut self) -> Result<(), WireError> {
+        self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_LAST).await?;
         self.writer.flush().await?;
         self.finished = true;
@@ -189,8 +203,13 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
     }
 
     // r[impl gw.stderr.error-format]
-    // r[impl gw.stderr.error-before-return]
+    // r[impl gw.stderr.error-before-return+2]
     /// Send STDERR_ERROR with the full structured error format.
+    ///
+    /// This is a **terminal** operation. After calling `error()`, the writer
+    /// is poisoned: `finish()`, `log()`, `start_activity()`, etc. all return
+    /// `Err`, and `inner_mut()` panics. The handler MUST `return Err(...)`
+    /// immediately after this call — see `r[gw.stderr.error-before-return+2]`.
     pub async fn error(&mut self, err: &StderrError) -> Result<(), WireError> {
         self.check_not_finished()?;
         wire::write_u64(&mut self.writer, STDERR_ERROR).await?;
@@ -208,6 +227,10 @@ impl<W: AsyncWrite + Unpin> StderrWriter<W> {
         }
 
         self.writer.flush().await?;
+        // Flag-set-after-flush: if the write failed (broken pipe), the
+        // writer is NOT poisoned. No handler retries wire writes today,
+        // but the semantics are cleaner.
+        self.errored = true;
         Ok(())
     }
 
@@ -610,5 +633,74 @@ mod tests {
         let result = writer.log("x").await;
         assert!(result.is_err());
         Ok(())
+    }
+
+    // r[verify gw.stderr.error-before-return+2]
+    /// error() is terminal: a subsequent finish() must be rejected
+    /// (STDERR_ERROR and STDERR_LAST are mutually exclusive).
+    #[tokio::test]
+    async fn test_error_then_finish_rejected() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .error(&StderrError::simple("rio-build", "boom"))
+            .await
+            .unwrap();
+
+        let result = writer.finish().await;
+        assert!(result.is_err(), "finish() after error() must return Err");
+
+        // Byte-level: STDERR_ERROR frame, NOT followed by STDERR_LAST.
+        let mut reader = Cursor::new(&buf);
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), STDERR_ERROR);
+        // Consume the error body (type, level, name, message, havePos, traceCount).
+        let _ = wire::read_string(&mut reader).await.unwrap(); // type
+        let _ = wire::read_u64(&mut reader).await.unwrap(); // level
+        let _ = wire::read_string(&mut reader).await.unwrap(); // name
+        let _ = wire::read_string(&mut reader).await.unwrap(); // message
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0); // havePos
+        assert_eq!(wire::read_u64(&mut reader).await.unwrap(), 0); // traceCount
+        // The cursor is now at EOF. No STDERR_LAST bytes follow.
+        assert_eq!(
+            reader.position() as usize,
+            buf.len(),
+            "no bytes after STDERR_ERROR frame"
+        );
+    }
+
+    /// error() is terminal: subsequent log() is rejected.
+    #[tokio::test]
+    async fn test_error_then_log_rejected() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .error(&StderrError::simple("rio-build", "boom"))
+            .await
+            .unwrap();
+        assert!(writer.log("this should not be sent").await.is_err());
+    }
+
+    /// error() is terminal: inner_mut() panics (no result payload after STDERR_ERROR).
+    #[tokio::test]
+    #[should_panic(expected = "after error()")]
+    async fn test_error_then_inner_mut_panics() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer
+            .error(&StderrError::simple("rio-build", "boom"))
+            .await
+            .unwrap();
+        let _ = writer.inner_mut(); // ← panic here
+    }
+
+    /// finish() is idempotent-rejecting: double finish() is an error.
+    #[tokio::test]
+    async fn test_double_finish_rejected() {
+        let mut buf = Vec::new();
+        let mut writer = StderrWriter::new(&mut buf);
+        writer.finish().await.unwrap();
+        assert!(writer.finish().await.is_err());
+        // Exactly one STDERR_LAST in the buffer (8 bytes).
+        assert_eq!(buf.len(), 8);
     }
 }

@@ -235,7 +235,7 @@ async fn test_nar_from_path_streams_chunks() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.stderr.error-before-return]
+// r[verify gw.stderr.error-before-return+2]
 #[tokio::test]
 async fn test_nar_from_path_missing_returns_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -252,7 +252,7 @@ async fn test_nar_from_path_missing_returns_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.stderr.error-before-return]
+// r[verify gw.stderr.error-before-return+2]
 #[tokio::test]
 async fn test_nar_from_path_invalid_path_returns_error() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -427,7 +427,7 @@ async fn test_query_missing_reports_will_build() -> anyhow::Result<()> {
 }
 
 // r[verify gw.opcode.query-derivation-output-map]
-// r[verify gw.stderr.error-before-return]
+// r[verify gw.stderr.error-before-return+2]
 /// wopQueryDerivationOutputMap (41): reads drv path, writes count +
 /// (name, path) pairs. Error path: missing .drv in store.
 #[tokio::test]

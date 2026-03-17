@@ -519,8 +519,14 @@ r[gw.stderr.message-types]
 r[gw.stderr.error-format]
 This is a complex nested structure. The gateway must construct it correctly for every error response (rejected opcodes, failed builds, etc.):
 
-r[gw.stderr.error-before-return]
-**Every handler error path that returns `Err(...)` MUST send `STDERR_ERROR` to the client first.** Never use bare `?` to propagate errors from store operations, NAR extraction, or ATerm parsing --- always wrap in a match that sends `STDERR_ERROR` before returning. For batch opcodes like `wopBuildPathsWithResults`, per-entry errors should push `BuildResult::failure` and `continue`, not abort the entire batch.
+r[gw.stderr.error-before-return+2]
+**`STDERR_ERROR` and `STDERR_LAST` are mutually exclusive terminal frames. A handler sends exactly one of them, exactly once.**
+
+- If a handler returns `Err(...)`, it MUST send `STDERR_ERROR` first, and the session loop MUST NOT follow up with `STDERR_LAST`. Never use bare `?` to propagate errors from store operations, NAR extraction, or ATerm parsing --- always wrap in a match that sends `STDERR_ERROR` before returning.
+- If a handler sends `STDERR_ERROR`, it MUST `return Err(...)` immediately after. It MUST NOT call `stderr.finish()`, and it MUST NOT write a result payload. `STDERR_ERROR` is terminal for the operation --- the client stops reading STDERR frames and throws, so any bytes that follow are stranded in the TCP buffer and corrupt the next opcode on a pooled connection.
+- To report a **recoverable** per-operation failure while keeping the session open for subsequent opcodes, use `BuildResult::failure` (or the opcode's equivalent failure-carrying result type) delivered via `STDERR_LAST` + result. For batch opcodes like `wopBuildPathsWithResults`, per-entry errors push `BuildResult::failure` and `continue` --- they do not abort the batch.
+
+The `StderrWriter` API enforces this: `error()` poisons the writer so that subsequent `finish()` returns `Err` and `inner_mut()` panics.
 
 > **Exception — `wopQueryRealisation`:** The handler invokes the store first, then sends `STDERR_LAST` unconditionally, then matches on the store result. A store error (already past `STDERR_LAST`) is too late for `STDERR_ERROR`; instead the handler returns empty-set (`u64(0)`) and logs a warning. This is a degraded path (one missed CA cache hit), not a correctness violation; the next opcode on the session will hit the same store and fail through its own error path. (This could be restructured to match before `STDERR_LAST` --- the result is already buffered --- but the degraded-path cost is trivial and the structure is simpler.)
 

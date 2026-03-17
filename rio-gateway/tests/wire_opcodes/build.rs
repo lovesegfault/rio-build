@@ -15,6 +15,11 @@ use super::*;
 /// body.
 const TEST_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
 
+/// ATerm derivation with __noChroot=1 in env. Triggers validate_dag rejection.
+/// Seeded into the store so resolve_derivation populates drv_cache; the inline
+/// BasicDerivation sent on the wire stays CLEAN so the :466 inline check passes.
+const NOCHROOT_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/zzz-output")])"#;
+
 // ===========================================================================
 // Build opcode tests
 // ===========================================================================
@@ -284,6 +289,164 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
         let _drv_output_id = wire::read_string(&mut h.stream).await?;
         let _realisation_json = wire::read_string(&mut h.stream).await?;
     }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// Consume the tail of a BuildResult after status+errorMsg have been read.
+/// Shared by the two DAG-reject regression tests below.
+async fn drain_build_result_tail(stream: &mut tokio::io::DuplexStream) -> anyhow::Result<()> {
+    let _ = wire::read_u64(stream).await?; // timesBuilt
+    let _ = wire::read_bool(stream).await?; // isNonDet
+    let _ = wire::read_u64(stream).await?; // start
+    let _ = wire::read_u64(stream).await?; // stop
+    if wire::read_u64(stream).await? == 1 {
+        let _ = wire::read_u64(stream).await?; // cpuUser
+    }
+    if wire::read_u64(stream).await? == 1 {
+        let _ = wire::read_u64(stream).await?; // cpuSystem
+    }
+    let outs = wire::read_u64(stream).await?; // builtOutputs count
+    for _ in 0..outs {
+        let _ = wire::read_string(stream).await?;
+        let _ = wire::read_string(stream).await?;
+    }
+    Ok(())
+}
+
+// r[verify gw.stderr.error-before-return+2]
+/// wopBuildDerivation (36): DAG-validation failure (cached drv has __noChroot)
+/// sends STDERR_LAST + failure BuildResult, NOT STDERR_ERROR.
+///
+/// Regression for phase4a remediation 07: prior code sent STDERR_ERROR then
+/// STDERR_LAST, leaving stale bytes in the TCP buffer that would corrupt the
+/// next opcode on a pooled connection.
+///
+/// Trigger mechanics: seed a __noChroot ATerm in the mock store so
+/// resolve_derivation populates drv_cache, but send a CLEAN inline
+/// BasicDerivation (no __noChroot) so the build.rs:466 inline check passes
+/// and control reaches the build.rs:515 validate_dag path.
+#[tokio::test]
+async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000001-nochroot.drv";
+    // Seed the POISONED aterm — validate_dag reads from drv_cache, which is
+    // populated by resolve_derivation from the store. The inline BasicDerivation
+    // sent below is clean (no __noChroot) so the inline check passes.
+    h.store
+        .seed_with_content(drv_path, NOCHROOT_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/zzz-output",
+        string: "",                              // hash_algo
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair (NOT __noChroot)
+        string: "out",
+        string: "/nix/store/zzz-output",
+        u64: 0,                                  // build_mode
+    );
+
+    // KEY ASSERTION: drain_stderr_until_last panics on STDERR_ERROR.
+    // Before this fix, the handler sent STDERR_ERROR first → panic
+    // "unexpected STDERR_ERROR: build rejected: ...". After the fix,
+    // STDERR_LAST arrives cleanly.
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    // BuildResult: failure status, errorMsg mentions sandbox/noChroot.
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_ne!(status, 0, "status must be a failure code (not Built=0)");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.contains("noChroot") || error_msg.contains("sandbox"),
+        "errorMsg should mention the rejection reason, got: {error_msg:?}"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    // NO-STALE-BYTES ASSERTION: send a second opcode on the same stream.
+    // If the handler had written extra bytes after STDERR_ERROR (the bug),
+    // they would be sitting in the buffer right now and this opcode's
+    // response would be garbage. wopSetOptions is the simplest ping:
+    // fixed payload, responds with just STDERR_LAST.
+    wire_send!(&mut h.stream;
+        u64: 19,                                 // wopSetOptions
+        u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+        u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+        u64: 0,                                  // overrides count
+    );
+    // If stale bytes were present, the first read wouldn't be STDERR_LAST.
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    // Scheduler must NOT have been called — rejection is pre-submit.
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "DAG rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.stderr.error-before-return+2]
+/// wopBuildPathsWithResults (46): DAG-validation failure sends STDERR_LAST +
+/// per-path failure results, NOT STDERR_ERROR. Sibling of the opcode-36 test
+/// above, covering the second bug site at build.rs:799-806.
+#[tokio::test]
+async fn test_build_paths_with_results_dag_reject_clean_stderr_last() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000002-nochroot.drv";
+    h.store
+        .seed_with_content(drv_path, NOCHROOT_DRV_ATERM.as_bytes());
+
+    let derived_path = format!("{drv_path}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,                                  // build_mode = Normal
+    );
+
+    // KEY ASSERTION: same as opcode-36 — panics on STDERR_ERROR.
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    // KeyedBuildResult: u64(count) + per-entry (string:path, BuildResult)
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1, "one result for one input path");
+    let echoed_path = wire::read_string(&mut h.stream).await?;
+    assert_eq!(echoed_path, derived_path);
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_ne!(status, 0, "status must be a failure code (not Built=0)");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.contains("noChroot") || error_msg.contains("sandbox"),
+        "errorMsg should mention the rejection reason, got: {error_msg:?}"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    // Second-opcode probe — stream alignment check.
+    wire_send!(&mut h.stream;
+        u64: 19,
+        u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+        u64: 0, u64: 0, u64: 0, u64: 0, u64: 0, u64: 0,
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "DAG rejection happens BEFORE SubmitBuild"
+    );
 
     h.finish().await;
     Ok(())

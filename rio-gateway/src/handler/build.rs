@@ -514,15 +514,10 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // early MAX_DAG_NODES.
     if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
         warn!(reason = %reason, "rejecting build: DAG validation failed");
-        stderr
-            .error(&rio_nix::protocol::stderr::StderrError::simple(
-                "DAGValidationFailed",
-                format!("build rejected: {reason}"),
-            ))
-            .await?;
-        // BuildResult::failure so the wire protocol gets a clean
-        // STDERR_LAST + result sequence (caller expects one even
-        // on rejection).
+        // Do NOT send STDERR_ERROR here — it is a terminal frame.
+        // The client receives the rejection via BuildResult.errorMsg
+        // after STDERR_LAST. See build.rs:160-164 for the inverse
+        // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
         let failure = BuildResult::failure(BuildStatus::MiscFailure, reason);
         stderr.finish().await?;
         write_build_result(stderr.inner_mut(), &failure).await?;
@@ -677,7 +672,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
 }
 
 // r[impl gw.opcode.build-paths-with-results]
-// r[impl gw.stderr.error-before-return]
+// r[impl gw.stderr.error-before-return+2]
 /// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
 #[instrument(skip_all)]
 pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -794,16 +789,11 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             .retain(|e| seen_edges.insert((e.parent_drv_path.clone(), e.child_drv_path.clone())));
 
         // Validate BEFORE inlining: __noChroot check + early
-        // MAX_DAG_NODES. On reject: STDERR_ERROR + per-path failure,
-        // no SubmitBuild.
+        // MAX_DAG_NODES. On reject: per-path BuildResult::failure,
+        // no SubmitBuild. No STDERR_ERROR — the failure BuildResult
+        // is delivered via STDERR_LAST + result at the write loop below.
         let build_result = if let Err(reason) = translate::validate_dag(&all_nodes, drv_cache) {
             warn!(reason = %reason, "rejecting build: DAG validation failed");
-            stderr
-                .error(&rio_nix::protocol::stderr::StderrError::simple(
-                    "DAGValidationFailed",
-                    format!("build rejected: {reason}"),
-                ))
-                .await?;
             BuildResult::failure(BuildStatus::MiscFailure, reason)
         } else {
             // Inline .drv content for will-dispatch nodes.
