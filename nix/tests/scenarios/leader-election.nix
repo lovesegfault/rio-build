@@ -477,6 +477,13 @@ let
   # If build-during-failover follows failover, its own buildprep handles
   # the stabilization wait. No ordering assertion needed — fragments are
   # independent at the Python level.
+  # Coverage-instrumented images are ~3-4× larger → k3s airgap import
+  # on a slow builder adds up to ~900s of serial I/O BEFORE testScript
+  # starts (le-stability 2026-03-17: rio-gateway import 2m10s vs 37s
+  # typical, 3.5× tail). Additive so any explicit globalTimeout override
+  # still stacks. Normal-mode headroom stays at 0 — CI budget unchanged.
+  covTimeoutHeadroom = if common.coverage then 900 else 0;
+
   mkTest =
     {
       name,
@@ -485,7 +492,7 @@ let
     }:
     pkgs.testers.runNixOSTest {
       name = "rio-leader-election-${name}";
-      inherit globalTimeout;
+      globalTimeout = globalTimeout + covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
         ${prelude}

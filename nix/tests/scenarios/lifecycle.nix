@@ -1762,6 +1762,14 @@ let
     ) "lifecycle: build-crd-flow must precede cancel-cgroup-kill (spawns==1 assertion)";
     true;
 
+  # Coverage-instrumented images are ~3-4× larger → k3s airgap import
+  # on a slow builder adds up to ~900s of serial I/O BEFORE testScript
+  # starts (lifecycle-core cov-mode 2026-03-17: rio-store gate 489s,
+  # >half of the default 900s budget burned on bootstrap alone).
+  # Additive so explicit overrides (autoscale's 1200 → 2100) stack.
+  # Normal-mode headroom stays at 0 — CI budget unchanged.
+  covTimeoutHeadroom = if common.coverage then 900 else 0;
+
   mkTest =
     {
       name,
@@ -1771,7 +1779,7 @@ let
     assert assertChains subtests;
     pkgs.testers.runNixOSTest {
       name = "rio-lifecycle-${name}";
-      inherit globalTimeout;
+      globalTimeout = globalTimeout + covTimeoutHeadroom;
       inherit (fixture) nodes;
       testScript = ''
         ${prelude}

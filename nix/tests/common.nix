@@ -67,6 +67,10 @@ rec {
   # the VM closure, same pattern as grpcurl in lifecycle.nix.
   inherit rio-workspace;
 
+  # Re-exported so scenario mkTest can gate globalTimeout headroom on
+  # coverage mode (instrumented images inflate k3s airgap import time).
+  inherit coverage;
+
   # Shell env prefix for non-systemd binary invocations (e.g., rio-cli
   # in scenarios/cli.nix). Single %: the shell doesn't expand %p/%m so
   # no escape needed — the double-%% above is systemd-specific. Empty
