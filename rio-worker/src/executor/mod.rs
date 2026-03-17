@@ -317,6 +317,24 @@ pub async fn execute_build(
             .map_err(|e| ExecutorError::BuildFailed(format!("failed to parse derivation: {e}")))?
     };
 
+    // wkr-fod-flag-trust (21-p2-p3-rollup Batch B): the .drv is ground
+    // truth — it's what the worker actually executes. The scheduler-sent
+    // `assignment.is_fixed_output` is derived from the same .drv on the
+    // scheduler side, but drift is possible (stale proto, scheduler bug,
+    // inline-budget edge). Compute from `drv` here; warn if the two
+    // disagree so scheduler-side drift is visible. The assignment field
+    // stays read for one release cycle; remove in a follow-up once this
+    // warn! has been silent in prod.
+    let is_fod = drv.is_fixed_output();
+    if is_fod != assignment.is_fixed_output {
+        tracing::warn!(
+            drv_path = %drv_path,
+            drv_is_fod = is_fod,
+            assignment_is_fod = assignment.is_fixed_output,
+            "FOD flag disagreement: drv.is_fixed_output() != assignment.is_fixed_output — using drv"
+        );
+    }
+
     // Resolve inputDrv outputs → add to BasicDerivation's inputSrcs.
     // `drv.to_basic()` only copies the static input_srcs (e.g., busybox);
     // it does NOT resolve inputDrvs to their output paths. nix-daemon's
@@ -440,7 +458,7 @@ pub async fn execute_build(
     // the daemon. Nix's FOD sandbox passes these through to the
     // builder; the Squid proxy (infra/helm/rio-build/templates/fod-proxy.yaml)
     // allowlists known source hosts.
-    let fod_proxy = if assignment.is_fixed_output {
+    let fod_proxy = if is_fod {
         env.fod_proxy_url.as_deref()
     } else {
         None
@@ -680,7 +698,7 @@ pub async fn execute_build(
         // (fs::read for flat, dump_path_streaming for recursive) +
         // hashing. Typical FOD outputs are small (fetchurl), so
         // this is fast.
-        if assignment.is_fixed_output {
+        if is_fod {
             let drv_for_verify = drv.clone();
             let upper_for_verify = overlay_mount.upper_dir().to_path_buf();
             let verify_result = tokio::task::spawn_blocking(move || {
@@ -757,28 +775,39 @@ pub async fn execute_build(
                 // prior sequential scan had undefined order (read_dir).
                 let path_to_name: HashMap<&str, &str> =
                     drv.outputs().iter().map(|o| (o.path(), o.name())).collect();
+                // wkr-scan-unfiltered (21-p2-p3-rollup Batch B): if the
+                // lookup misses, scan_new_outputs picked up a stray file
+                // under /nix/store (tempfile leak, .drv, etc.) that is NOT
+                // a declared derivation output. Prior behavior: warn and
+                // upload anyway with basename-as-output-name → phantom
+                // output reported to scheduler. Now: fail the build. The
+                // stray upload has already hit the store (upload_all_outputs
+                // ran first) but it's unreferenced and GC-eligible; the
+                // scheduler won't mark this drv Built so nothing downstream
+                // can depend on the phantom.
                 let built_outputs: Vec<BuiltOutput> = upload_results
                     .iter()
-                    .map(|result| BuiltOutput {
-                        output_name: path_to_name
+                    .map(|result| {
+                        let output_name = path_to_name
                             .get(result.store_path.as_str())
                             .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
+                            .ok_or_else(|| {
                                 tracing::warn!(
                                     store_path = %result.store_path,
-                                    "uploaded path not in derivation outputs; using basename"
+                                    "uploaded path not in derivation outputs — rejecting build"
                                 );
-                                result
-                                    .store_path
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or(&result.store_path)
-                                    .to_string()
-                            }),
-                        output_path: result.store_path.clone(),
-                        output_hash: result.nar_hash.to_vec(),
+                                ExecutorError::BuildFailed(format!(
+                                    "uploaded path {} not in derivation outputs (stray file in overlay upper /nix/store?)",
+                                    result.store_path
+                                ))
+                            })?;
+                        Ok::<_, ExecutorError>(BuiltOutput {
+                            output_name,
+                            output_path: result.store_path.clone(),
+                            output_hash: result.nar_hash.to_vec(),
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // start/stop_time: nix-daemon's BuildResult already has
                 // these as Unix epoch seconds (rio-nix/build.rs:118-120).
