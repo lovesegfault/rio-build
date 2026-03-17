@@ -1762,13 +1762,14 @@ let
     ) "lifecycle: build-crd-flow must precede cancel-cgroup-kill (spawns==1 assertion)";
     true;
 
-  # Coverage-instrumented images are ~3-4× larger → k3s airgap import
-  # on a slow builder adds up to ~900s of serial I/O BEFORE testScript
-  # starts (lifecycle-core cov-mode 2026-03-17: rio-store gate 489s,
-  # >half of the default 900s budget burned on bootstrap alone).
-  # Additive so explicit overrides (autoscale's 1200 → 2100) stack.
-  # Normal-mode headroom stays at 0 — CI budget unchanged.
-  covTimeoutHeadroom = if common.coverage then 900 else 0;
+  # Coverage-instrumented images are ~3-4× larger. The k3s containerd
+  # tmpfs (fixtures/k3s-full.nix) removes the 3.3-5× builder-disk-write
+  # variance that motivated the original +900s (076de36: lifecycle-core
+  # cov rio-store gate hit 489s, >half the 900s budget on bootstrap).
+  # Remaining variance is 9p reads + zstd decompress (CPU-bound). +300s
+  # hedges for the residual tail. Additive so explicit overrides stack
+  # (autoscale 1200 → 1500 in cov). Normal-mode CI budget unchanged.
+  covTimeoutHeadroom = if common.coverage then 300 else 0;
 
   mkTest =
     {

@@ -6,8 +6,8 @@
 # scheduler.replicas=2 podAntiAffinity spreads across server+agent,
 # enabling the leader-election scenario.
 #
-# Topology: k3s-server (6GB) + k3s-agent (4GB) + client (1GB).
-# ~11GB total — use withMinCpu 8 in flake.nix.
+# Topology: k3s-server (8GB) + k3s-agent (6GB) + client (1GB).
+# ~15GB total (normal), ~19GB coverage — use withMinCpu 8 in flake.nix.
 #
 # Airgapped: every image preloaded via services.k3s.images on BOTH
 # nodes (pods can schedule on either). NodePort gateway → client
@@ -88,6 +88,17 @@ let
     pulled.bitnami-postgresql
   ];
 
+  # ── Containerd tmpfs sizing ──────────────────────────────────────────
+  # Decompressed airgap layers: ~1.5GB normal, ~2.5GB cov-mode (the
+  # instrumented rio-* images are ~3-4× larger). The tmpfs cap is a
+  # hard ceiling — if containerd exceeds it, imports ENOSPC. The VM
+  # memory bump must cover what's ACTUALLY written (tmpfs is lazy).
+  containerdTmpfsSize = if coverage then "4G" else "3G";
+  # +2048 over the old baseline (6144/4096) covers the tmpfs-resident
+  # layers at their normal-mode size (~1.5GB) with headroom. Coverage
+  # adds another +2048 for the instrumented-image delta (~1GB extra).
+  k3sCovMemBump = if coverage then 2048 else 0;
+
   # ── Base config shared by server + agent ────────────────────────────
   # Everything except services.k3s (which differs by role). Extracted
   # so the firewall/kernel/systemd bits don't duplicate. Flannel VXLAN
@@ -117,6 +128,37 @@ let
     # matching from journal ingestion (systemd 253+) — never reaches
     # console→serial→testlog. Other k3s logs unaffected.
     systemd.services.k3s.serviceConfig.LogFilterPatterns = "~Unable to set control-plane role label";
+
+    # ── Containerd image store on tmpfs ────────────────────────────────
+    # Eliminates builder-disk variance for airgap imports. Before:
+    # containerd writes decompressed layers to ext4→qcow2→builder-disk;
+    # cache=writeback helps but fsync still hits host fdatasync. Observed
+    # 3.3-5× tail variance on the SAME drv (076de36 commit msg: bitnami
+    # 29.5s vs 97s, rio-gateway 37s vs 130s — I/O-bound, ~10-12% CPU).
+    # With tmpfs, writes are RAM-to-RAM; variance collapses to 9p-read +
+    # decompress (CPU-bound, much tighter distribution).
+    #
+    # NOT full diskImage=null: PG's PVC (/var/lib/rancher/k3s/storage,
+    # local-path-provisioner) stays on qcow2 — PG data growth in tmpfs
+    # could OOM the VM on a long-running test. Only the containerd image
+    # store (write-once, size-bounded by the airgap set) goes to RAM.
+    #
+    # neededForBoot=true: stage-1 initrd mkdir -p's the mount point
+    # before mounting. The parent path /var/lib/rancher/k3s/agent
+    # doesn't exist until k3s creates it — stage-1 ordering avoids
+    # the chicken-and-egg.
+    #
+    # virtualisation.fileSystems (not plain fileSystems): qemu-vm.nix
+    # does `fileSystems = mkVMOverride virtualisation.fileSystems`
+    # (priority 10) — a plain `fileSystems.*` def is silently dropped.
+    virtualisation.fileSystems."/var/lib/rancher/k3s/agent/containerd" = {
+      fsType = "tmpfs";
+      neededForBoot = true;
+      options = [
+        "size=${containerdTmpfsSize}"
+        "mode=0755"
+      ];
+    };
 
     environment.systemPackages = [
       pkgs.curl
@@ -182,10 +224,11 @@ let
         ];
       };
 
-      # 6GB: PG (512Mi) + 5 rio pods (~2GB total) + k3s control plane
-      # (~1.5GB) + images (~1GB decompressed) + headroom.
+      # 8GB (was 6GB): PG (512Mi) + 5 rio pods (~2GB) + k3s control
+      # plane (~1.5GB) + containerd tmpfs (~1.5GB layers, 3G cap) +
+      # headroom. Coverage: +2GB for instrumented-image bloat.
       virtualisation = {
-        memorySize = 6144;
+        memorySize = 8192 + k3sCovMemBump;
         cores = 8;
         diskSize = 16384;
       };
@@ -215,10 +258,11 @@ let
         ];
       };
 
-      # 4GB: scheduler replica (~512Mi) + worker (~1.5Gi with FUSE
-      # cache) + images + k3s agent (~500Mi).
+      # 6GB (was 4GB): scheduler replica (~512Mi) + worker (~1.5Gi
+      # with FUSE cache) + containerd tmpfs (~1.5GB layers, 3G cap)
+      # + k3s agent (~500Mi). Coverage: +2GB for instrumented images.
       virtualisation = {
-        memorySize = 4096;
+        memorySize = 6144 + k3sCovMemBump;
         cores = 8;
         diskSize = 12288;
       };
