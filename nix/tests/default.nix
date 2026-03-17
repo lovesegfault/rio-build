@@ -247,6 +247,7 @@ in
       "gc-dry-run"
       "reconciler-replicas"
       "gc-sweep"
+      "refs-end-to-end"
     ];
   };
 
