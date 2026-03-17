@@ -1,11 +1,10 @@
 # EKS deployment recipes. Invoked as `just eks <recipe>`.
 #
-# Settings do NOT inherit from the root justfile into modules — both
-# `set shell` (pipefail) and `set dotenv-*` (RIO_SSH_PUBKEY, RIO_TFSTATE_*)
-# must be re-declared here or they're silently off.
+# `set shell` does NOT inherit into modules (pipefail silently off without
+# this line). dotenv DOES inherit — the root justfile loads .env.local.
+# working-directory pins recipe CWD to repo root so infra/eks/... paths resolve.
+set working-directory := '..'
 set shell := ["bash", "-euo", "pipefail", "-c"]
-set dotenv-load := true
-set dotenv-filename := ".env.local"
 
 # ── State backend ────────────────────────────────────────────────────
 # Both infra/eks/bootstrap and infra/eks store state in the same S3

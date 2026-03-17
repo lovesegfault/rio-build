@@ -3,12 +3,11 @@
 # (heavyweight — ~3GB memory floor, multi-minute bootstrap, but
 # real S3 semantics). PG is a bitnami subchart inside the rio chart.
 #
-# Settings do NOT inherit from the root justfile into modules — both
-# `set shell` (pipefail) and `set dotenv-*` (RIO_SSH_PUBKEY) must be
-# re-declared here or they're silently off.
+# `set shell` does NOT inherit into modules (pipefail silently off without
+# this line). dotenv DOES inherit — the root justfile loads .env.local.
+# working-directory pins recipe CWD to repo root so infra/... paths resolve.
+set working-directory := '..'
 set shell := ["bash", "-euo", "pipefail", "-c"]
-set dotenv-load := true
-set dotenv-filename := ".env.local"
 
 # Materialize authorized_keys from RIO_SSH_PUBKEY (.env.local).
 # Shebang recipe: `source` + call must share a shell (just runs

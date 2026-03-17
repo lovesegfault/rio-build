@@ -175,7 +175,7 @@
                 # SQL migrations (embedded at compile time via sqlx::migrate!)
                 ./migrations
                 # cargo-deny config (license + advisory policy)
-                ./deny.toml
+                ./.cargo/deny.toml
                 # nextest config (CI profile with JUnit output, test groups)
                 ./.config/nextest.toml
               ];
@@ -1064,12 +1064,14 @@
                 # fails closed (no match → head-on-null error) rather
                 # than passing silently.
                 declared = pkgs.lib.toInt (
-                  builtins.head (builtins.match ".*after_n_builds: ([0-9]+).*" (builtins.readFile ./codecov.yml))
+                  builtins.head (
+                    builtins.match ".*after_n_builds: ([0-9]+).*" (builtins.readFile ./.github/codecov.yml)
+                  )
                 );
               in
               assert pkgs.lib.assertMsg (expected == declared) ''
-                codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
-                Update codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
+                .github/codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
+                Update .github/codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
               '';
               pkgs.emptyFile;
           };
