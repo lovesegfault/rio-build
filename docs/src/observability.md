@@ -143,7 +143,7 @@ r[obs.metric.store]
 r[obs.metric.worker]
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rio_worker_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`/`cancelled`) |
+| `rio_worker_builds_total` | Counter | Total builds executed (labeled by `outcome`: `success`/`failure`/`cancelled`/`timed_out`/`log_limit`/`infra_failure`) |
 | `rio_worker_builds_active` | Gauge | Currently running builds on this worker |
 | `rio_worker_uploads_total` | Counter | Output uploads (labeled by `status`) |
 | `rio_worker_build_duration_seconds` | Histogram | Per-derivation build time |

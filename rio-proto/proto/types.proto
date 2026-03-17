@@ -267,6 +267,18 @@ enum BuildResultStatus {
   BUILD_RESULT_STATUS_OUTPUT_REJECTED = 9;
   BUILD_RESULT_STATUS_INFRASTRUCTURE_FAILURE = 10; // Worker infra issue (not build)
   BUILD_RESULT_STATUS_CANCELLED = 11;        // Explicit cancel (CancelBuild RPC or DrainWorker force)
+  // Build exceeded configured timeout. Operationally: "raise the limit
+  // or fix the build," NOT "retry on another worker" — the same inputs
+  // will time out again. Scheduler treats as permanent-no-reassign.
+  BUILD_RESULT_STATUS_TIMED_OUT = 12;
+  // nix-daemon's determinism check failed (--check or repeat builds).
+  // Operationally distinct from PermanentFailure: the build "works"
+  // but isn't reproducible. Triage = find the nondeterminism source.
+  BUILD_RESULT_STATUS_NOT_DETERMINISTIC = 13;
+  // Derivation inputs rejected by nix-daemon (corrupt .drv, missing
+  // reference, unsupported builder). NOT the same as OutputRejected
+  // (which is post-build hash mismatch).
+  BUILD_RESULT_STATUS_INPUT_REJECTED = 14;
 }
 
 // Work assignment from scheduler to worker.

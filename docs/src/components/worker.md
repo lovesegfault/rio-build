@@ -232,6 +232,9 @@ Per-build cgroups are **siblings** of the worker's own cgroup under the delegate
 r[worker.cgroup.memory-peak]
 cgroup v2 `memory.peak` + polled `cpu.stat` provide **tree-wide** resource accounting for each build. This fixes the Phase 2c bug where `VmHWM` (daemon PID only) measured ~10MB regardless of what the builder consumed.
 
+r[worker.cgroup.kill-on-teardown]
+On any error exit after the build cgroup is populated, the executor MUST write `cgroup.kill` and poll `cgroup.procs` until empty (bounded) before dropping the cgroup handle. `daemon.kill()` alone only signals the daemon PID; forked builders reparent to init.
+
 The overlay is per-build, not per-worker. Each active build on a worker gets its own independent overlayfs mount with separate upper and work directories. This means:
 
 - Multiple builds run concurrently on the same worker without filesystem interference.
@@ -355,10 +358,21 @@ A future improvement would split the worker into two processes:
 
 **Status:** Deferred. Will be investigated when the basic worker architecture is stable (post Phase 3).
 
+## Build Status Reporting
+
+r[worker.status.nix-to-proto]
+The mapping from `rio_nix::BuildStatus` to `proto::BuildResultStatus` MUST be exhaustive (no `_` arm). Adding a Nix variant is a compile error until the mapping is extended.
+
+r[worker.timeout.no-reassign]
+Build timeout is a build outcome, not an executor fault. It MUST surface as `BuildResultStatus::TimedOut` (permanent, not reassignable), not as `InfrastructureFailure`.
+
 ## Build Cancellation
 
 r[worker.cancel.cgroup-kill]
 When the scheduler sends a `CancelSignal` on the BuildExecution stream, the worker's `try_cancel_build` writes `1` to the target build's `cgroup.kill` (SIGKILLs the entire cgroup tree). The build's executor task detects the daemon exit, releases the semaphore permit, tears down the overlay, and sends `CompletionReport{status: Cancelled}`. If the cancel arrives before the cgroup exists (race with build setup), `cgroup.kill` returns ENOENT --- logged and ignored; the cancel is lost and the build proceeds (harmless: a cancel mid-setup will be retried by the scheduler's backstop timeout if needed). This is used for pod-preemption handling: the scheduler cancels builds on an evicting node before the SIGTERM grace period wastes `terminationGracePeriodSeconds`.
+
+r[worker.cancel.flag-clear-enoent]
+If `cgroup.kill` returns ENOENT (cancel raced cgroup creation), the cancel flag MUST be cleared. Leaving it set causes a subsequent unrelated failure to be misreported as Cancelled.
 
 ## Key Files
 

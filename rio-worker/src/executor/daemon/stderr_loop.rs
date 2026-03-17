@@ -87,12 +87,40 @@ pub(in crate::executor) async fn run_daemon_build(
     // stdout is moved into the loop's owned reader task; we don't need it
     // back because the loop itself reads BuildResult after STDERR_LAST.
     let stdout = stdout.take().expect("borrowed above, not yet taken");
-    let build_result = tokio::time::timeout(
+
+    // Timeout is a BUILD OUTCOME, not an executor error. Returning
+    // Ok(failure) flows through execute_build's status-mapping path
+    // (nix_failure_to_proto → BuildResultStatus::TimedOut), which the
+    // scheduler treats as permanent-no-reassign. Returning Err would
+    // land in runtime.rs's InfrastructureFailure arm → reassignment
+    // storm (same build, same inputs, same timeout, forever).
+    //
+    // The inner Result<BuildResult, WireError> is different: a wire
+    // error mid-STDERR-loop IS an executor fault (daemon died, pipe
+    // corrupted) — that `?` stays.
+    //
+    // r[impl worker.timeout.no-reassign]
+    let build_result = match tokio::time::timeout(
         build_timeout,
         read_build_stderr_loop(stdout, batcher, log_tx),
     )
     .await
-    .map_err(|_| ExecutorError::BuildFailed("build timed out".into()))??;
+    {
+        Ok(inner) => inner?,
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_secs = build_timeout.as_secs(),
+                "build exceeded timeout; reporting TimedOut (no reassignment)"
+            );
+            BuildResult::failure(
+                BuildStatus::TimedOut,
+                format!(
+                    "build exceeded configured timeout of {}s",
+                    build_timeout.as_secs()
+                ),
+            )
+        }
+    };
 
     Ok(build_result)
 }

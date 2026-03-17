@@ -477,6 +477,20 @@ pub async fn execute_build(
         .add_process(daemon_pid)
         .map_err(|e| ExecutorError::Cgroup(format!("add daemon to cgroup: {e}")))?;
 
+    // Kill-guard: any `?` between here and the explicit drop at the
+    // bottom of this function fires this. The explicit kill() + drain
+    // + drop below remain the PRIMARY path (they wait for drain; this
+    // guard doesn't). scopeguard::guard not defer! — we need to hand
+    // it the PathBuf, not borrow build_cgroup.
+    let cgroup_kill_path = build_cgroup.path().to_path_buf();
+    let cgroup_kill_guard = scopeguard::guard(cgroup_kill_path, |p| {
+        // Best-effort. No drain — we're in Drop, can't await. The
+        // BuildCgroup's own Drop runs right after this and will EBUSY
+        // if the SIGKILL hasn't landed yet; that's the existing leak
+        // path, just now with the kill attempted.
+        let _ = std::fs::write(p.join("cgroup.kill"), "1");
+    });
+
     // CPU polling task. Runs concurrently with run_daemon_build
     // below (which awaits). Samples cpu.stat usage_usec every second,
     // computes instantaneous cores = delta_usec/elapsed_usec, tracks
@@ -575,17 +589,64 @@ pub async fn execute_build(
     if let Err(e) = daemon.kill().await {
         tracing::warn!(error = %e, "daemon.kill() failed (process may already be dead)");
     }
-    // Reap the zombie (bounded wait). After this, cgroup is empty
-    // and build_cgroup Drop can rmdir cleanly.
+    // Reap the zombie (bounded wait).
     match tokio::time::timeout(Duration::from_secs(2), daemon.wait()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(error = %e, "daemon.wait() failed after kill"),
         Err(_) => tracing::warn!("daemon did not exit within 2s after kill (possible zombie)"),
     }
-    // build_cgroup drops here (end of scope). rmdir should succeed
-    // now that daemon.wait() reaped the tree. If the wait timed out
-    // (zombie), rmdir fails EBUSY → warn! + leak (cleared on pod
-    // restart).
+
+    // daemon.kill() above SIGKILLs the nix-daemon process only. The
+    // builder is a GRANDCHILD (forked by the daemon during wopBuildDerivation)
+    // and is not in the daemon's process group — it lives on in the
+    // cgroup. On the success path the builder has already exited (build
+    // finished → daemon sent STDERR_LAST → we got here); on the timeout/
+    // error path it's still running a `sleep 3600` or a stuck compiler.
+    //
+    // cgroup.kill walks the tree: SIGKILLs everything, including sub-
+    // cgroups the daemon may have created. Idempotent — writing "1" to
+    // an empty cgroup is a no-op — so we call it unconditionally rather
+    // than branching on build_result.is_err().
+    //
+    // r[impl worker.cgroup.kill-on-teardown]
+    if let Err(e) = build_cgroup.kill() {
+        // ENOENT shouldn't happen (we hold the BuildCgroup, Drop hasn't
+        // run); EACCES would mean delegation is broken. Log and fall
+        // through — rmdir will fail EBUSY and warn again, but we don't
+        // want to upgrade a successful build to an error here.
+        tracing::warn!(error = %e, "build_cgroup.kill() failed");
+    }
+    // cgroup.kill is async: write returns before procs are gone. Poll
+    // cgroup.procs until empty or 2s elapsed (same budget as daemon.wait
+    // above; SIGKILL → exit is ~ms, 2s is vast headroom for a zombie-
+    // reparented tree). Sync read on blocking pool — 200 iterations of
+    // a single-line procfs read, negligible.
+    let cgroup_path_for_poll = build_cgroup.path().to_path_buf();
+    let drained = tokio::task::spawn_blocking(move || {
+        for _ in 0..200 {
+            match std::fs::read_to_string(cgroup_path_for_poll.join("cgroup.procs")) {
+                Ok(s) if s.trim().is_empty() => return true,
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                // ENOENT: cgroup already gone (shouldn't happen — we
+                // hold the BuildCgroup — but treat as drained).
+                Err(_) => return true,
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    if !drained {
+        tracing::warn!(
+            cgroup = %build_cgroup.path().display(),
+            "cgroup still has processes 2s after cgroup.kill; rmdir will EBUSY"
+        );
+    }
+
+    // Defuse: explicit kill+drain above already ran; guard is redundant.
+    scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+    // build_cgroup drops here. rmdir succeeds if the drain above emptied
+    // it; otherwise Drop warns EBUSY + leaks (cleared on pod restart).
     drop(build_cgroup);
 
     // (Final log flush happens inside read_build_stderr_loop — it owns
@@ -733,18 +794,8 @@ pub async fn execute_build(
             "build failed"
         );
 
-        let status = match build_result.status {
-            rio_nix::protocol::build::BuildStatus::PermanentFailure => {
-                BuildResultStatus::PermanentFailure
-            }
-            rio_nix::protocol::build::BuildStatus::TransientFailure => {
-                BuildResultStatus::TransientFailure
-            }
-            _ => BuildResultStatus::PermanentFailure,
-        };
-
         ProtoBuildResult {
-            status: status.into(),
+            status: nix_failure_to_proto(build_result.status).into(),
             error_msg: build_result.error_msg.clone(),
             ..Default::default()
         }
@@ -845,6 +896,56 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
         .replace('.', "_")
 }
 
+/// Map a Nix daemon BuildStatus (failure path only — caller has already
+/// branched on is_success()) to the proto BuildResultStatus reported to
+/// the scheduler.
+///
+/// Exhaustive: no `_` arm. Adding a new BuildStatus variant in rio-nix
+/// is a compile error here until the mapping decision is made.
+///
+// r[impl worker.status.nix-to-proto]
+pub(crate) fn nix_failure_to_proto(
+    nix: rio_nix::protocol::build::BuildStatus,
+) -> BuildResultStatus {
+    use rio_nix::protocol::build::BuildStatus as Nix;
+    match nix {
+        // Success variants: caller branched on is_success(), these are
+        // unreachable. Return Built anyway (not a panic — if the caller
+        // contract is ever violated, a wrong-but-success status is less
+        // damaging than a worker crash mid-build).
+        Nix::Built | Nix::Substituted | Nix::AlreadyValid | Nix::ResolvesToAlreadyValid => {
+            debug_assert!(
+                false,
+                "nix_failure_to_proto called with success status {nix:?}"
+            );
+            BuildResultStatus::Built
+        }
+
+        // 1:1 mappings — proto variant exists with identical semantics.
+        Nix::PermanentFailure => BuildResultStatus::PermanentFailure,
+        Nix::TransientFailure => BuildResultStatus::TransientFailure,
+        Nix::CachedFailure => BuildResultStatus::CachedFailure,
+        Nix::DependencyFailed => BuildResultStatus::DependencyFailed,
+        Nix::LogLimitExceeded => BuildResultStatus::LogLimitExceeded,
+        Nix::OutputRejected => BuildResultStatus::OutputRejected,
+        Nix::InputRejected => BuildResultStatus::InputRejected,
+        Nix::TimedOut => BuildResultStatus::TimedOut,
+        Nix::NotDeterministic => BuildResultStatus::NotDeterministic,
+
+        // Intentional collapse: MiscFailure is nix-daemon's own catch-all
+        // (used when it can't classify). PermanentFailure is the honest
+        // proto equivalent — "it failed, we don't know why, don't retry."
+        Nix::MiscFailure => BuildResultStatus::PermanentFailure,
+
+        // Intentional collapse: NoSubstituters means "I was asked to
+        // substitute and couldn't find a substituter." Our workers run
+        // with `substitute = false` (WORKER_NIX_CONF) — we never ask the
+        // daemon to substitute. If we see this, something is misconfigured;
+        // PermanentFailure + the error_msg is the right signal.
+        Nix::NoSubstituters => BuildResultStatus::PermanentFailure,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,5 +1044,73 @@ mod tests {
         // Counter unchanged — short-circuit doesn't touch the overlay.
         assert_eq!(leak_counter.load(Ordering::Relaxed), 999);
         Ok(())
+    }
+
+    /// Every non-success Nix BuildStatus maps to a proto status. No
+    /// variant hits a `_` arm — the mapping fn is exhaustive so adding
+    /// a Nix variant is a compile error.
+    ///
+    /// Stronger than "compiles": asserts the MAPPING DECISIONS stay
+    /// stable. If someone changes TimedOut → TransientFailure (which
+    /// would reintroduce the reassignment storm), this test fails.
+    ///
+    // r[verify worker.status.nix-to-proto]
+    #[test]
+    fn test_nix_failure_to_proto_is_exhaustive_and_stable() {
+        use rio_nix::protocol::build::BuildStatus as Nix;
+        use rio_proto::types::BuildResultStatus as Proto;
+
+        // 1:1 mappings — each Nix failure gets its OWN proto variant.
+        let one_to_one = [
+            (Nix::PermanentFailure, Proto::PermanentFailure),
+            (Nix::TransientFailure, Proto::TransientFailure),
+            (Nix::CachedFailure, Proto::CachedFailure),
+            (Nix::DependencyFailed, Proto::DependencyFailed),
+            (Nix::LogLimitExceeded, Proto::LogLimitExceeded),
+            (Nix::OutputRejected, Proto::OutputRejected),
+            (Nix::InputRejected, Proto::InputRejected),
+            (Nix::TimedOut, Proto::TimedOut),
+            (Nix::NotDeterministic, Proto::NotDeterministic),
+        ];
+        for (nix, want) in one_to_one {
+            assert_eq!(
+                nix_failure_to_proto(nix),
+                want,
+                "1:1 mapping broke for {nix:?}"
+            );
+        }
+
+        // Intentional collapses — documented reasons in the fn body.
+        assert_eq!(
+            nix_failure_to_proto(Nix::MiscFailure),
+            Proto::PermanentFailure
+        );
+        assert_eq!(
+            nix_failure_to_proto(Nix::NoSubstituters),
+            Proto::PermanentFailure
+        );
+    }
+
+    /// TimedOut must NOT map to anything the scheduler reassigns. This
+    /// is the load-bearing invariant for the reassignment-storm fix.
+    ///
+    // r[verify worker.timeout.no-reassign]
+    #[test]
+    fn test_timed_out_is_not_reassignable() {
+        use rio_nix::protocol::build::BuildStatus as Nix;
+        use rio_proto::types::BuildResultStatus as Proto;
+
+        let mapped = nix_failure_to_proto(Nix::TimedOut);
+        // completion.rs:151-152: these two trigger handle_transient_failure
+        // (reassign). TimedOut must not be either.
+        assert_ne!(mapped, Proto::TransientFailure, "TimedOut → reassign storm");
+        assert_ne!(
+            mapped,
+            Proto::InfrastructureFailure,
+            "TimedOut → reassign storm"
+        );
+        // And it must not be Unspecified (which ALSO reassigns per
+        // completion.rs:176-183).
+        assert_ne!(mapped, Proto::Unspecified);
     }
 }

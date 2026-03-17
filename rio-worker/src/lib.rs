@@ -52,7 +52,7 @@ pub fn describe_metrics() {
 
     describe_counter!(
         "rio_worker_builds_total",
-        "Total builds executed (labeled by outcome: success/failure/cancelled)"
+        "Total builds executed (labeled by outcome: success/failure/cancelled/timed_out/log_limit/infra_failure)"
     );
     describe_gauge!(
         "rio_worker_builds_active",

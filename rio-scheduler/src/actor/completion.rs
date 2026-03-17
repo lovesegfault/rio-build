@@ -156,7 +156,17 @@ impl DagActor {
             | rio_proto::types::BuildResultStatus::CachedFailure
             | rio_proto::types::BuildResultStatus::DependencyFailed
             | rio_proto::types::BuildResultStatus::LogLimitExceeded
-            | rio_proto::types::BuildResultStatus::OutputRejected => {
+            | rio_proto::types::BuildResultStatus::OutputRejected
+            // TimedOut: same inputs → same timeout. Reassigning is a
+            // storm. The operator fix is "raise spec.timeoutSeconds,"
+            // not "try another worker."
+            | rio_proto::types::BuildResultStatus::TimedOut
+            // NotDeterministic: nix --check failed. Retrying doesn't
+            // help — the nondeterminism is in the build itself.
+            | rio_proto::types::BuildResultStatus::NotDeterministic
+            // InputRejected: corrupt/invalid .drv. Same .drv on another
+            // worker is still corrupt.
+            | rio_proto::types::BuildResultStatus::InputRejected => {
                 self.handle_permanent_failure(drv_hash, &result.error_msg, worker_id)
                     .await;
             }
