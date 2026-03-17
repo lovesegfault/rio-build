@@ -9,163 +9,164 @@ spec:
     kind: Build
     plural: builds
     shortNames:
-      - rb
+    - rb
     singular: build
   scope: Namespaced
   versions:
-    - additionalPrinterColumns:
-        - jsonPath: '.status.phase'
-          name: Phase
-          type: string
-        - jsonPath: '.status.progress'
-          name: Progress
-          type: string
-        - jsonPath: '.metadata.creationTimestamp'
-          name: Age
-          type: date
-      name: v1alpha1
-      schema:
-        openAPIV3Schema:
-          description: Auto-generated derived type for BuildSpec via `CustomResource`
-          properties:
-            spec:
-              properties:
-                derivation:
-                  description: |-
-                    Store path to the .drv file (e.g.,
-                    `/nix/store/abc...-hello.drv`). MUST be a store path —
-                    evaluation is external (ADR-002). The .drv must already
-                    be in rio-store (upload via `nix copy --to ssh-ng://`
-                    first).
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.progress
+      name: Progress
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BuildSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              derivation:
+                description: "Store path to the .drv file (e.g.,\n`/nix/store/abc...-hello.drv`).\
+                  \ MUST be a store path \u2014\nevaluation is external (ADR-002).\
+                  \ The .drv must already\nbe in rio-store (upload via `nix copy --to\
+                  \ ssh-ng://`\nfirst).\n\nCEL: must start with /nix/store/ AND end\
+                  \ with .drv.\nCatches the two common mistakes: passing an attr path\n\
+                  (`nixpkgs#hello`) instead of a drv path, or forgetting\nthe .drv\
+                  \ suffix (passing an output path)."
+                type: string
+                x-kubernetes-validations:
+                - rule: self.startsWith('/nix/store/') && self.endsWith('.drv')
+              priority:
+                default: 0
+                description: "Inter-build priority. Higher = sooner. Maps to the\n\
+                  scheduler's `PriorityClass` \u2014 the reconciler translates.\n\
+                  Default 0 = `Scheduled` (lowest).\n\nThe scheduler also has INTRA-build\
+                  \ priority (critical\npath within a DAG) \u2014 that's automatic,\
+                  \ not configured\nhere."
+                format: int32
+                type: integer
+              tenant:
+                description: "Tenant name for multi-tenancy. Passed through to the\
+                  \ scheduler\nwhich resolves it to a UUID via the `tenants` table.\
+                  \ Unknown\nname \u2192 build rejected with `InvalidArgument`. String\
+                  \ not UUID \u2014\nthe CRD uses the human-readable tenant name (what\
+                  \ operators know)."
+                nullable: true
+                type: string
+              timeoutSeconds:
+                default: 0
+                description: 'Build timeout in seconds. The scheduler''s
 
-                    CEL: must start with /nix/store/ AND end with .drv.
-                    Catches the two common mistakes: passing an attr path
-                    (`nixpkgs#hello`) instead of a drv path, or forgetting
-                    the .drv suffix (passing an output path).
-                  type: string
-                  x-kubernetes-validations:
-                    - rule: self.startsWith('/nix/store/') && self.endsWith('.drv')
-                priority:
-                  default: 0
-                  description: |-
-                    Inter-build priority. Higher = sooner. Maps to the
-                    scheduler's `PriorityClass` — the reconciler translates.
-                    Default 0 = `Scheduled` (lowest).
+                  `BuildOptions.build_timeout`. 0 = no timeout (builds
 
-                    The scheduler also has INTRA-build priority (critical
-                    path within a DAG) — that's automatic, not configured
-                    here.
-                  format: int32
-                  type: integer
-                tenant:
-                  description: |-
-                    Tenant name for multi-tenancy. Passed through to the scheduler
-                    which resolves it to a UUID via the `tenants` table. Unknown
-                    name → build rejected with `InvalidArgument`. String not UUID —
-                    the CRD uses the human-readable tenant name (what operators know).
-                  nullable: true
-                  type: string
-                timeoutSeconds:
-                  default: 0
-                  description: |-
-                    Build timeout in seconds. The scheduler's
-                    `BuildOptions.build_timeout`. 0 = no timeout (builds
-                    run until complete or nix-daemon's own 2h default).
+                  run until complete or nix-daemon''s own 2h default).
 
-                    CEL: non-negative. Negative timeout is meaningless.
-                  format: int64
-                  type: integer
-                  x-kubernetes-validations:
-                    - rule: self >= 0
-              required:
-                - derivation
-              type: object
-            status:
-              nullable: true
-              properties:
-                buildId:
-                  default: ''
-                  description: |-
-                    Scheduler's build_id (UUID string). Set after
-                    SubmitBuild returns. The finalizer uses this to call
-                    CancelBuild. Empty until submitted.
-                  type: string
-                cachedDerivations:
-                  default: 0
-                  format: int32
-                  type: integer
-                completedDerivations:
-                  default: 0
-                  format: int32
-                  type: integer
-                conditions:
-                  default: []
-                  description: |-
-                    Standard K8s Conditions. Scheduled / InputsResolved /
-                    Building / Succeeded / Failed. Each with
-                    lastTransitionTime + reason + message. Succeeded and
-                    Failed are terminal and mutually exclusive.
-                  items:
-                    type: object
-                    x-kubernetes-preserve-unknown-fields: true
-                  nullable: true
-                  type: array
-                lastSequence:
-                  default: 0
-                  description: |-
-                    Last BuildEvent sequence number seen by drain_stream.
 
-                    Used for WatchBuild reconnect: on controller restart, the
-                    idempotence gate in apply() sees build_id non-empty AND
-                    phase non-terminal, then calls WatchBuild with this as
-                    since_sequence. Scheduler replays from build_event_log
-                    (persisted) for events past this seq. Without it, a
-                    controller restart means status frozen until build
-                    terminates.
+                  CEL: non-negative. Negative timeout is meaningless.'
+                format: int64
+                type: integer
+                x-kubernetes-validations:
+                - rule: self >= 0
+            required:
+            - derivation
+            type: object
+          status:
+            nullable: true
+            properties:
+              buildId:
+                default: ''
+                description: 'Scheduler''s build_id (UUID string). Set after
 
-                    i64 because sequence is u64 in proto but K8s JSON schema
-                    doesn't do uint64 natively. Cast at use; seq=0 means
-                    "replay all" which is the safe default.
-                  format: int64
-                  type: integer
-                phase:
-                  default: ''
-                  description: |-
-                    High-level state. Pending / Building / Succeeded /
-                    Failed / Cancelled. String not enum: same "unknown
-                    value is a reconcile error, not a schema rejection"
-                    policy as Autoscaling.metric. Future phases (e.g.,
-                    "Evaluating" set by external eval orchestrators) don't
-                    need a CRD version bump.
-                  type: string
-                progress:
-                  default: ''
-                  description: |-
-                    "31/47" — completed/total derivations. Derived from
-                    scheduler's BuildEvent stream. String for the printer
-                    column (which only does simple jsonPath, no formatting).
-                  type: string
-                startedAt:
-                  description: |-
-                    When the build actually started (scheduler's first
-                    dispatch). Not `.metadata.creationTimestamp` — that's
-                    when the CRD was applied, which may be earlier (queued
-                    behind other builds).
-                  nullable: true
-                  type: string
-                totalDerivations:
-                  default: 0
-                  description: |-
-                    Derivation counts. Individual fields so dashboards can
-                    `sum(.status.totalDerivations) across builds` etc.
-                  format: int32
-                  type: integer
-              type: object
-          required:
-            - spec
-          title: Build
-          type: object
-      served: true
-      storage: true
-      subresources:
-        status: {}
+                  SubmitBuild returns. The finalizer uses this to call
+
+                  CancelBuild. Empty until submitted.'
+                type: string
+              cachedDerivations:
+                format: int32
+                type: integer
+              completedDerivations:
+                format: int32
+                type: integer
+              conditions:
+                default: []
+                description: 'Standard K8s Conditions. Scheduled / InputsResolved
+                  /
+
+                  Building / Succeeded / Failed. Each with
+
+                  lastTransitionTime + reason + message. Succeeded and
+
+                  Failed are terminal and mutually exclusive.'
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                nullable: true
+                type: array
+              lastSequence:
+                default: 0
+                description: "Last BuildEvent sequence number seen by drain_stream.\n\
+                  \nUsed for WatchBuild reconnect: on controller restart, the\nidempotence\
+                  \ gate in apply() sees build_id non-empty AND\nphase non-terminal,\
+                  \ then calls WatchBuild with this as\nsince_sequence. Scheduler\
+                  \ replays from build_event_log\n(persisted) for events past this\
+                  \ seq. Without it, a\ncontroller restart means status frozen until\
+                  \ build\nterminates.\n\ni64 because sequence is u64 in proto but\
+                  \ K8s JSON schema\ndoesn't do uint64 natively. Cast at use; seq=0\
+                  \ means\n\"replay all\" which is the safe default.\n\nNO `skip_serializing_if`:\
+                  \ seq=0 IS meaningful (\"replay\nall events\") and must survive\
+                  \ a round-trip. Omitting it\non Merge-patch would leave a stale\
+                  \ nonzero seq intact \u2192\nWatchBuild skips events it should replay."
+                format: int64
+                type: integer
+              phase:
+                default: ''
+                description: 'High-level state. Pending / Building / Succeeded /
+
+                  Failed / Cancelled. String not enum: same "unknown
+
+                  value is a reconcile error, not a schema rejection"
+
+                  policy as Autoscaling.metric. Future phases (e.g.,
+
+                  "Evaluating" set by external eval orchestrators) don''t
+
+                  need a CRD version bump.'
+                type: string
+              progress:
+                description: "\"31/47\" \u2014 completed/total derivations. Derived\
+                  \ from\nscheduler's BuildEvent stream. String for the printer\n\
+                  column (which only does simple jsonPath, no formatting).\n\n`skip_serializing_if`:\
+                  \ Merge-patch callers that only set\n`phase`+`lastSequence` must\
+                  \ NOT stomp this to \"\". With\nSSA + `.force()`, a serialized `\"\
+                  \"` claims ownership and\nwipes the real value. Omitting the field\
+                  \ leaves the\napiserver's copy intact."
+                type: string
+              startedAt:
+                description: "When the build actually started (scheduler's first\n\
+                  dispatch). Not `.metadata.creationTimestamp` \u2014 that's\nwhen\
+                  \ the CRD was applied, which may be earlier (queued\nbehind other\
+                  \ builds)."
+                nullable: true
+                type: string
+              totalDerivations:
+                description: "Derivation counts. Individual fields so dashboards can\n\
+                  `sum(.status.totalDerivations) across builds` etc.\n\n`skip_serializing_if`:\
+                  \ same preservation rationale as\n`progress`. The `Unknown`-phase\
+                  \ patch in drain_stream's\nexhaustion path was zeroing these \u2014\
+                  \ `kubectl get build`\nwent from \"5/10\" to nothing at reconnect-exhaustion."
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        title: Build
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
