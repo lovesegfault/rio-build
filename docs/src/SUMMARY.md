@@ -57,6 +57,7 @@
 # Roadmap
 
 - [Implementation Phases](./phases.md)
+  - [Phase DAG — Execution Plan](./phases/DAG.md)
   - [Phase 1a: Wire Format + Read-Only Protocol](./phases/phase1a.md)
   - [Phase 1b: Build Execution](./phases/phase1b.md)
   - [Phase 2a: Core Distribution](./phases/phase2a.md)

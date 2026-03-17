@@ -109,6 +109,25 @@ Pre-commit hooks run treefmt automatically on commit.
 - Keep phase plan docs (`docs/src/phases/`) in sync: mark tasks `[x]` as they're completed.
 - **tracey MCP (optional):** `nix develop -c tracey ai --claude` registers the tracey MCP server + installs the annotation skill. After registration, Claude Code can query `tracey_uncovered` / `tracey_untested` / `tracey_rule` during dev sessions. The daemon caches scan results — `rm -rf .tracey/` to force rescan.
 
+## Phase implementation
+
+Phases are spec'd at `docs/src/phases/phase<ID>.md` (e.g., `phase4b.md`). The dependency graph + file-collision matrix live at `docs/src/phases/DAG.md` — **check the collision matrix before launching parallel worktrees** (migration number collisions and `rio-proto` field-number collisions are not mergeable).
+
+**Every implementation MUST pass `nix-build-remote -- .#ci` before merge.** This is the single gate — it covers build, clippy, nextest, docs, coverage, pre-commit, 2min fuzz, and all VM tests. "Done but CI red" is not done.
+
+Custom tooling (`.claude/agents/`, `.claude/skills/`):
+
+| | Role |
+|---|---|
+| `/impl-phase <ID>` | Reads the phase doc, extracts file refs + spec links, launches `rio-phase-impl` in `../phase-<ID>-dev` |
+| `rio-phase-verify` | Adversarial verifier — read-only by tool list, proves each checked task + Milestone with evidence |
+| `rio-ci-fixer` | Known-patterns catalog for `.#ci` failures (stale CRDs, pyflakes f-strings, IFD×nondeterminism, coverage timeouts, codecov drift, tracey broken refs) — checks the catalog before root-causing |
+| `/merge-phase <br>` | Rebase → ff-merge → `.#ci`+`.#coverage-full` gate → worktree cleanup → rebase broadcast |
+| `/dag-status` | Live frontier: tracey uncovered + worktree ahead/behind + phase Status lines |
+| `/rebase-worktrees` | Batch-rebase all clean sibling worktrees onto the integration branch |
+
+Launching a phase with a general-purpose agent still works, but the custom agent has the scaffold (worktree, tracey marker protocol, convco, TODO(phaseXY) tagging, nightly/stable gotcha) baked in — prompt shrinks from ~60 lines to ~8.
+
 ## Fuzzing
 
 Fuzz targets live in per-crate `fuzz/` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `rio-nix/fuzz/` (protocol/wire parsers) and `rio-store/fuzz/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
