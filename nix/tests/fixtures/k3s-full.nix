@@ -466,6 +466,20 @@ in
         "k3s kubectl -n ${ns} rollout status deploy/rio-gateway --timeout=60s",
         timeout=90,
     )
+    # rollout status returns when the NEW ReplicaSet is Ready, NOT when
+    # the OLD pod is terminated. Before 6da3676 the old pod CrashLooped
+    # on empty authorized_keys → never Ready → never in Service
+    # endpoints. Now it's Ready with the placeholder key → stays in
+    # endpoints until the Deployment controller scales the old RS to 0
+    # and the old pod gets deletionTimestamp. nc -z/nix copy below can
+    # route to the old pod → publickey denied.
+    # status.replicas counts pods across all ReplicaSets; =1 means the
+    # old pod has deletionTimestamp (endpoint controller drops it
+    # immediately) and only the new pod remains.
+    k3s_server.succeed(
+        "k3s kubectl -n ${ns} wait --for=jsonpath='{.status.replicas}'=1 "
+        "deploy/rio-gateway --timeout=60s"
+    )
     # rollout status returns when the Deployment has Ready replicas,
     # but kube-proxy hasn't necessarily synced the endpoint to the
     # NodePort's iptables rules yet. Poll TCP accept from the client.
