@@ -127,6 +127,11 @@ jobs:
           files: result
           flags: ${{ matrix.name }}
           use_oidc: true
+          # Fail the job if Codecov's ingest endpoint rejects the upload.
+          # Without this, all 15 jobs go green even when 14 are dropped.
+          fail_ci_if_error: true
+          # `files:` is exhaustive; don't fall back to repo-wide discovery.
+          disable_search: true
       - uses: ./.github/actions/niks3-push
         if: always() && !cancelled()
 

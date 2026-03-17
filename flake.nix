@@ -1018,7 +1018,30 @@
           # Debug interactively:
           #   nix build .#checks.x86_64-linux.vm-phase2a.driverInteractive
           #   ./result/bin/nixos-test-driver
-          // vmTests;
+          // vmTests
+          # Eval-time assertion: codecov.yml after_n_builds must equal the
+          # coverage matrix length. Catches drift when vm-* fragments are
+          # added without bumping the Codecov gate. See
+          # docs/src/remediations/phase4a/05-coverage-session-drop.md.
+          # Linux-only because githubActions is optionalAttrs isLinux.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            codecov-matrix-sync =
+              let
+                expected = builtins.length (builtins.attrNames githubActions.matrix.coverage);
+                # Single-line grep is fine here; if someone rewrites
+                # codecov.yml to split the key across lines, the check
+                # fails closed (no match → head-on-null error) rather
+                # than passing silently.
+                declared = pkgs.lib.toInt (
+                  builtins.head (builtins.match ".*after_n_builds: ([0-9]+).*" (builtins.readFile ./codecov.yml))
+                );
+              in
+              assert pkgs.lib.assertMsg (expected == declared) ''
+                codecov.yml after_n_builds=${toString declared} but coverage matrix has ${toString expected} entries.
+                Update codecov.yml → codecov.notify.after_n_builds to ${toString expected}.
+              '';
+              pkgs.emptyFile;
+          };
 
           # Formatter for 'nix fmt'
           formatter = config.treefmt.build.wrapper;
