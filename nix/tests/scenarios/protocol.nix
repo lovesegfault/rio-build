@@ -33,6 +33,11 @@ let
   trivialDrv = drvs.mkTrivial { marker = "proto-warm"; };
 
   name = if cold then "protocol-cold" else "protocol-warm";
+
+  # Coverage mode: graceful-stop + profraw tar + copy_from_vm adds ~30s.
+  # protocol-warm entered collectCoverage at 287s with a 300s budget.
+  covTimeoutHeadroom = if common.coverage then 300 else 0;
+
   coldScript = ''
     # ══════════════════════════════════════════════════════════════════
     # COLD PATH: empty store, builtin:fetchurl leaf, exact willBuild set
@@ -245,7 +250,7 @@ pkgs.testers.runNixOSTest {
   name = "rio-${name}";
   # Cold: builtin:fetchurl is a real network fetch inside the sandbox
   # (FOD). ~60s boot + ~30s fetchurl + build + assertions.
-  globalTimeout = if cold then 600 else 300;
+  globalTimeout = (if cold then 600 else 300) + covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 

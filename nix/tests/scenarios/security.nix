@@ -55,12 +55,16 @@ let
       args = [ "-c" "echo should-never-run > $out" ];
     }
   '';
+
+  # Coverage mode: graceful-stop + profraw tar + copy_from_vm. Additive so
+  # normal-mode CI budget is unchanged.
+  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-security";
   # 3 boot + worker registration (~60s) + 4 builds (~30s each) +
   # gateway restart + metric scrapes. Margin for CI jitter.
-  globalTimeout = 600;
+  globalTimeout = 600 + covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 

@@ -45,12 +45,16 @@
 let
   inherit (fixture) gatewayHost;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
+
+  # Coverage mode: graceful-stop + profraw tar + copy_from_vm. Additive so
+  # normal-mode CI budget is unchanged.
+  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-observability";
   # 3 sequential builds (~5s each under VM) + OTLP batch flush interval (~5s)
   # + VM boot overhead. 600s is generous; phase2b was also 600s implicit.
-  globalTimeout = 600;
+  globalTimeout = 600 + covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 

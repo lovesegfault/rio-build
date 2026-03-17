@@ -33,12 +33,16 @@ let
     "RIO_TLS__CERT_PATH=${pki}/rio-controller/tls.crt "
     + "RIO_TLS__KEY_PATH=${pki}/rio-controller/tls.key "
     + "RIO_TLS__CA_PATH=${pki}/ca.crt ";
+
+  # Coverage mode: graceful-stop + profraw tar + copy_from_vm. Additive so
+  # normal-mode CI budget is unchanged.
+  covTimeoutHeadroom = if common.coverage then 300 else 0;
 in
 pkgs.testers.runNixOSTest {
   name = "rio-cli";
 
   # Bring-up ~3-4min + a few CLI calls. No builds, no recovery.
-  globalTimeout = 600;
+  globalTimeout = 600 + covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
