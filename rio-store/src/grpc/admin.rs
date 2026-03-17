@@ -5,20 +5,25 @@
 //! command). Separate service from StoreService so admin ops can
 //! have separate RBAC (more privileged than PutPath).
 
+use std::io::Write;
 use std::sync::Arc;
 
 use sqlx::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
+use rio_nix::refscan::{CandidateSet, RefScanSink};
 use rio_proto::types::{
     GcProgress, GcRequest, PinPathRequest, PinPathResponse, ResignPathsRequest, ResignPathsResponse,
 };
 
 use crate::backend::chunk::ChunkBackend;
+use crate::cas::ChunkCache;
 use crate::gc;
 use crate::gc::{GC_LOCK_ID, GC_MARK_LOCK_ID};
+use crate::metadata::{self, ManifestKind};
+use crate::signing::Signer;
 
 /// StoreAdminService gRPC server.
 pub struct StoreAdminServiceImpl {
@@ -27,6 +32,16 @@ pub struct StoreAdminServiceImpl {
     /// deletes). None = inline-only store, sweep does CASCADE
     /// delete only (no chunk refcounting).
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
+    /// Chunk cache for ResignPaths NAR reassembly (chunked paths).
+    /// None = inline-only store; chunked manifests fail with a
+    /// clear error instead of silently skipping.
+    chunk_cache: Option<Arc<ChunkCache>>,
+    /// ed25519 key for re-signing narinfo after backfilled refs
+    /// change the fingerprint. None = refs are updated but no new
+    /// signature is appended (old sig won't verify against the new
+    /// fingerprint; caller must re-sign out-of-band or accept
+    /// unsigned paths).
+    signer: Option<Arc<Signer>>,
 }
 
 impl StoreAdminServiceImpl {
@@ -34,7 +49,184 @@ impl StoreAdminServiceImpl {
         Self {
             pool,
             chunk_backend,
+            chunk_cache: None,
+            signer: None,
         }
+    }
+
+    /// Enable NAR reassembly for chunked paths in ResignPaths.
+    /// Builder-style; chains after `new()`. Without this, the
+    /// backfill can only process inline-stored paths (chunked
+    /// paths fail with a clear "no chunk backend" error and stay
+    /// `refs_backfilled=FALSE` for retry once the cache is wired).
+    pub fn with_chunk_cache(mut self, cache: Arc<ChunkCache>) -> Self {
+        self.chunk_cache = Some(cache);
+        self
+    }
+
+    /// Enable narinfo re-signing when backfilled refs change the
+    /// fingerprint. Builder-style. Takes an `Arc` so main.rs can
+    /// share one key between StoreServiceImpl (PutPath signing)
+    /// and StoreAdminServiceImpl (ResignPaths re-signing) — same
+    /// key, same `Sig:` line in the narinfo either way.
+    pub fn with_signer(mut self, signer: Arc<Signer>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// Per-row body for ResignPaths wet-run: reassemble NAR, scan
+    /// for refs, UPDATE if changed. Extracted so the batch loop's
+    /// error handling is a single match arm (anything that bubbles
+    /// out here → warn + `failed += 1` + leave `refs_backfilled=
+    /// FALSE` for retry on the next pass).
+    ///
+    /// Returns `Ok(true)` if refs changed, `Ok(false)` if unchanged.
+    /// Either way the row is marked `refs_backfilled = TRUE` on
+    /// success — "backfilled" means "scanned", not "had new refs".
+    async fn resign_one(
+        &self,
+        store_path_hash: &[u8],
+        store_path: &str,
+        nar_hash: &[u8],
+        nar_size: i64,
+        old_refs: &[String],
+        candidates: &CandidateSet,
+    ) -> Result<bool, Status> {
+        // --- 1. Reassemble NAR → RefScanSink ------------------------
+        // get_manifest is the one inline-vs-chunked branch point (see
+        // metadata/queries.rs). Both arms feed the sink directly —
+        // no intermediate Vec, just streaming writes. RefScanSink's
+        // seam-buffer handles chunk-boundary straddling for us.
+        let manifest = metadata::get_manifest(&self.pool, store_path)
+            .await
+            .map_err(|e| crate::grpc::metadata_status("ResignPaths: get_manifest", e))?
+            .ok_or_else(|| {
+                // Batch SELECT joins on manifests.status='complete',
+                // so this is a concurrent-delete race (GC, manual
+                // surgery). Fail the row; next pass won't see it.
+                Status::not_found(format!(
+                    "manifest gone for {store_path} (concurrent delete?)"
+                ))
+            })?;
+
+        let mut sink = RefScanSink::new(candidates.hashes());
+        match manifest {
+            ManifestKind::Inline(bytes) => {
+                // io::Write on an in-memory sink is infallible; the
+                // map_err is just type plumbing for ? ergonomics.
+                sink.write_all(&bytes)
+                    .map_err(|e| Status::internal(format!("refscan write: {e}")))?;
+            }
+            ManifestKind::Chunked(entries) => {
+                let cache = self.chunk_cache.as_ref().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "path is chunked but admin service has no chunk_cache; \
+                         wire .with_chunk_cache() in main.rs",
+                    )
+                })?;
+                // Sequential fetch — no K=8 prefetch here. Backfill
+                // is a one-shot maintenance job, not the hot GetPath
+                // path; simplicity over throughput. The sink writes
+                // are in-memory (no backpressure to hide with
+                // prefetch). If the backfill proves too slow on a
+                // 10M-path store, the prefetch pattern from
+                // get_path.rs drops in cleanly (both loops iterate
+                // the same `entries` vec).
+                for (hash, _size) in &entries {
+                    let chunk = cache.get_verified(hash).await.map_err(|e| {
+                        Status::data_loss(format!("chunk reassembly for {store_path}: {e}"))
+                    })?;
+                    sink.write_all(&chunk)
+                        .map_err(|e| Status::internal(format!("refscan write: {e}")))?;
+                }
+            }
+        }
+
+        // --- 2. Resolve found hashes → full paths -------------------
+        // resolve() sorts lexicographically — MUST be stable because
+        // the fingerprint hashes over the sorted list (Nix uses a
+        // BTreeSet for the same reason; see narinfo::fingerprint).
+        let new_refs = candidates.resolve(&sink.into_found());
+
+        // --- 3. Compare + UPDATE ------------------------------------
+        // old_refs came from PG TEXT[] (order preserved but not
+        // guaranteed sorted — pre-fix rows are '{}' anyway, but
+        // belt-and-suspenders: sort both before comparing). If
+        // unchanged, just flip refs_backfilled and we're done — old
+        // signature still covers the same fingerprint.
+        let mut old_sorted = old_refs.to_vec();
+        old_sorted.sort();
+        let refs_changed = old_sorted != new_refs;
+
+        if !refs_changed {
+            sqlx::query("UPDATE narinfo SET refs_backfilled = TRUE WHERE store_path_hash = $1")
+                .bind(store_path_hash)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::grpc::internal_error("ResignPaths: mark backfilled", e))?;
+            return Ok(false);
+        }
+
+        // Refs changed → old signature (if any) covers a stale
+        // fingerprint. Append a fresh one if we have a key. Per the
+        // remediation doc (02-empty-references §4.2): APPEND, don't
+        // replace — Nix verifies against ANY sig from a trusted key;
+        // the stale sig is harmless noise (won't verify, ignored).
+        let new_sig: Option<String> = self.signer.as_ref().map(|signer| {
+            // nar_hash is BYTEA in PG → Vec<u8>. fingerprint() wants
+            // &[u8;32]. Schema says SHA-256 so this holds; if it
+            // doesn't, the DB is corrupt — pad/truncate to 32 rather
+            // than panic (corrupt hash → bad sig → unverifiable,
+            // which surfaces the corruption where it matters).
+            let mut nh = [0u8; 32];
+            let take = nar_hash.len().min(32);
+            nh[..take].copy_from_slice(&nar_hash[..take]);
+            let fp = rio_nix::narinfo::fingerprint(store_path, &nh, nar_size as u64, &new_refs);
+            signer.sign(&fp)
+        });
+
+        // Single UPDATE: refs + (optional) sig-append + backfilled
+        // flag. Single statement = atomic without an explicit
+        // transaction — if this fails, the row stays exactly as it
+        // was (refs_backfilled=FALSE → retried next pass).
+        match new_sig {
+            Some(sig) => {
+                sqlx::query(
+                    r#"UPDATE narinfo
+                       SET "references" = $1,
+                           signatures = array_append(signatures, $2),
+                           refs_backfilled = TRUE
+                       WHERE store_path_hash = $3"#,
+                )
+                .bind(&new_refs)
+                .bind(&sig)
+                .bind(store_path_hash)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs+sig", e))?;
+                debug!(store_path, refs = new_refs.len(), key = %self.signer.as_ref().unwrap().key_name(), "backfilled refs + re-signed");
+            }
+            None => {
+                sqlx::query(
+                    r#"UPDATE narinfo
+                       SET "references" = $1,
+                           refs_backfilled = TRUE
+                       WHERE store_path_hash = $2"#,
+                )
+                .bind(&new_refs)
+                .bind(store_path_hash)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::grpc::internal_error("ResignPaths: update refs", e))?;
+                debug!(
+                    store_path,
+                    refs = new_refs.len(),
+                    "backfilled refs (no signer — not re-signed)"
+                );
+            }
+        }
+
+        Ok(true)
     }
 }
 
@@ -541,22 +733,16 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
     /// `store_path_hash` order (cursor-paginated) so the caller can
     /// resume after a crash without re-processing.
     ///
-    /// SKELETON (PR 4/6): the cursor-paginated SELECT is real and the
-    /// pagination contract is honored. The per-path body (NAR reassembly
-    /// from chunks, RefScanSink, UPDATE refs + resign + refs_backfilled
-    /// = TRUE) is NOT implemented yet — `dry_run=false` returns
-    /// Unimplemented. `dry_run=true` surveys the pending queue (useful
-    /// for sizing the backfill before the body lands).
-    // TODO(phase4a): implement the per-path body. Open design questions:
-    //   - Candidate set for RefScanSink: the original upload knew the
-    //     input closure; here we only have `deriver`. Re-derive the
-    //     closure from the .drv (store has it), or scan against ALL
-    //     store-path hashes (O(n) hashmap, ~50 bytes/path — feasible
-    //     at current scale, not at 10M+ paths)?
-    //   - Re-sign: needs `Signer` plumbed here (currently only in
-    //     put_path.rs). Lift to StoreAdminServiceImpl struct field.
-    //   - NAR reassembly: get_path.rs streams to a channel; here we
-    //     need to stream into RefScanSink (io::Write). Adapter needed.
+    /// Candidate-set strategy (PR 4b design decision): the original
+    /// upload knew its derivation's input closure — we don't. The
+    /// `deriver` column has the .drv path but the .drv content may
+    /// not be in the store. Rather than chase it, we scan against ALL
+    /// paths with `created_at <= this.created_at` (a path can only
+    /// reference paths that existed when it was built). Correct but
+    /// broader than the true input closure; false positives need a
+    /// 32-byte nixbase32 collision (2^-160, cryptographically
+    /// negligible). Bounded by total store size — fine at current
+    /// scale, revisit if the store grows past ~10M paths.
     #[instrument(skip(self), fields(rpc = "ResignPaths", cursor = %request.get_ref().cursor, batch = request.get_ref().batch_size))]
     async fn resign_paths(
         &self,
@@ -586,13 +772,30 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         // `narinfo_refs_backfill_pending_idx` (migration 010) covers
         // `WHERE refs_backfilled = FALSE` so this is an index-range
         // scan, not a seq-scan of narinfo.
-        let rows: Vec<(Vec<u8>, String, Option<String>)> = sqlx::query_as(
+        //
+        // JOIN on manifests.status='complete': a path with no
+        // complete manifest can't have its NAR reassembled (would
+        // fail inside resign_one anyway). Filter here so such rows
+        // stay `refs_backfilled=FALSE` without burning a `failed`
+        // tick — they'll be picked up once their upload completes.
+        //
+        // EXTRACT(EPOCH ...)::bigint: sqlx has no chrono/time
+        // feature in this workspace, so pull created_at as epoch
+        // seconds (i64) for the in-memory candidate filter.
+        // Second-resolution is plenty: "which paths existed before
+        // this one" doesn't need microseconds.
+        type BatchRow = (Vec<u8>, String, Vec<u8>, i64, Vec<String>, i64);
+        let rows: Vec<BatchRow> = sqlx::query_as(
             r#"
-            SELECT store_path_hash, store_path, deriver
-            FROM narinfo
-            WHERE refs_backfilled = FALSE
-              AND store_path_hash > $1
-            ORDER BY store_path_hash
+            SELECT n.store_path_hash, n.store_path, n.nar_hash, n.nar_size,
+                   n."references",
+                   EXTRACT(EPOCH FROM n.created_at)::bigint
+            FROM narinfo n
+            JOIN manifests m ON m.store_path_hash = n.store_path_hash
+            WHERE n.refs_backfilled = FALSE
+              AND m.status = 'complete'
+              AND n.store_path_hash > $1
+            ORDER BY n.store_path_hash
             LIMIT $2
             "#,
         )
@@ -602,16 +805,16 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
         .await
         .map_err(|e| crate::grpc::internal_error("ResignPaths: select batch", e))?;
 
-        let processed = rows.len() as u32;
         let next_cursor = rows
             .last()
-            .map(|(h, _, _)| hex::encode(h))
+            .map(|(h, ..)| hex::encode(h))
             .unwrap_or_default();
 
         if req.dry_run {
             // Survey mode: report how many pending paths exist in this
             // batch without touching them. Caller can page through to
             // sum the total queue depth.
+            let processed = rows.len() as u32;
             info!(processed, next_cursor = %next_cursor, "resign dry-run batch");
             return Ok(Response::new(ResignPathsResponse {
                 cursor: next_cursor,
@@ -621,22 +824,81 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
             }));
         }
 
-        // TODO(phase4a): per-path body goes here. For each row:
-        //   1. Reassemble NAR from chunk store (see get_path.rs)
-        //   2. Derive candidate set (from deriver .drv closure)
-        //   3. Pipe NAR through rio_nix::refscan::RefScanSink
-        //   4. Compare found refs to current narinfo."references"
-        //   5. If changed: UPDATE refs, re-compute fingerprint, re-sign,
-        //      UPDATE signatures
-        //   6. UPDATE refs_backfilled = TRUE (always — marks as done)
-        //   7. On failure: skip (leave refs_backfilled=FALSE for retry),
-        //      increment `failed`
-        // All of the above in a per-path transaction so partial
-        // failures don't leave a path half-updated.
-        let _ = rows; // silence unused when body is stubbed
-        Err(Status::unimplemented(
-            "ResignPaths body not yet implemented (PR 4/6 skeleton); use dry_run=true to survey",
-        ))
+        if rows.is_empty() {
+            // Nothing to do — skip the (potentially large) universe
+            // fetch entirely. Empty cursor signals "done" to the
+            // caller's pagination loop.
+            return Ok(Response::new(ResignPathsResponse {
+                cursor: String::new(),
+                processed: 0,
+                refs_changed: 0,
+                failed: 0,
+            }));
+        }
+
+        // --- Candidate universe (fetched ONCE per batch) ------------
+        // All store paths + their creation epoch. Filter in-memory per
+        // row below (`created_at <= this.created_at`). This trades one
+        // full-table scan per BATCH for N per-row range scans — at
+        // batch_size=100 that's a 100× saving. Memory cost: ~100B/path
+        // (path string + i64); a 1M-path store is ~100MB, fine for a
+        // maintenance job that runs once.
+        //
+        // Sorted by created_epoch so the per-row filter is a single
+        // partition_point lookup (binary search) instead of a full
+        // Vec re-filter — O(log n) per row vs. O(n).
+        let all_paths: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT store_path, EXTRACT(EPOCH FROM created_at)::bigint \
+             FROM narinfo ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::grpc::internal_error("ResignPaths: load candidate universe", e))?;
+
+        // --- Per-row body -------------------------------------------
+        // Counters: processed = rows that REACHED the end (marked
+        // TRUE); failed = rows that errored (still FALSE, retried
+        // next pass). These are disjoint — a failed row is NOT in
+        // `processed`. Matches the proto field semantics.
+        let mut processed = 0u32;
+        let mut refs_changed = 0u32;
+        let mut failed = 0u32;
+
+        for (hash, store_path, nar_hash, nar_size, old_refs, created_epoch) in &rows {
+            // Candidate set: everything with created_at <= this row's.
+            // partition_point on the sorted universe gives the prefix
+            // length; slicing avoids cloning the Vec.
+            let cutoff = all_paths.partition_point(|(_, t)| *t <= *created_epoch);
+            let cands = CandidateSet::from_paths(all_paths[..cutoff].iter().map(|(p, _)| p));
+
+            match self
+                .resign_one(hash, store_path, nar_hash, *nar_size, old_refs, &cands)
+                .await
+            {
+                Ok(changed) => {
+                    processed += 1;
+                    if changed {
+                        refs_changed += 1;
+                    }
+                }
+                Err(e) => {
+                    // Leave refs_backfilled=FALSE — next pass retries.
+                    // warn! not error!: a single bad path (corrupt
+                    // manifest, S3 blip) shouldn't page someone; the
+                    // `failed` counter in the response is the signal.
+                    warn!(store_path = %store_path, code = ?e.code(), msg = %e.message(), "resign row failed; leaving for retry");
+                    failed += 1;
+                }
+            }
+        }
+
+        info!(processed, refs_changed, failed, next_cursor = %next_cursor, "resign wet batch done");
+        Ok(Response::new(ResignPathsResponse {
+            cursor: next_cursor,
+            processed,
+            refs_changed,
+            failed,
+        }))
     }
 }
 
@@ -1114,9 +1376,10 @@ mod tests {
         assert!(final_msg.is_complete);
     }
 
-    /// Seed a narinfo row with refs_backfilled=FALSE (migration 010's
-    /// "pre-fix" state). No manifest JOIN in ResignPaths, so narinfo
-    /// alone is enough here.
+    /// Seed a narinfo + complete-manifest row pair with refs_backfilled
+    /// =FALSE (migration 010's "pre-fix" state). The batch SELECT joins
+    /// on manifests.status='complete', so both rows are needed even for
+    /// dry-run tests. Inline blob is empty — dry-run never scans it.
     async fn seed_narinfo_pending_backfill(pool: &PgPool, name: &str) -> Vec<u8> {
         use sha2::Digest;
         let path = rio_test_support::fixtures::test_store_path(name);
@@ -1132,7 +1395,66 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed pending-backfill narinfo");
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', ''::bytea)",
+        )
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("seed pending-backfill manifest");
         hash
+    }
+
+    /// Wet-run seeder: distinct hash-part per path (so the ref-scanner
+    /// can discriminate), explicit `created_at` offset (so the
+    /// "candidates with created_at ≤ this" filter is deterministic),
+    /// and an actual `inline_blob` to scan. Returns the full store
+    /// path string for refs assertions.
+    ///
+    /// `hash_part` must be 32 valid nixbase32 chars (use '0'..'9' or
+    /// 'a'/'b'/'c'/etc. padded — NOT 'e'/'o'/'t'/'u', those are
+    /// excluded from the alphabet). `test_store_path` uses all-'a'
+    /// which would collapse every path to the same CandidateSet entry.
+    async fn seed_backfill_path(
+        pool: &PgPool,
+        hash_part: &str,
+        name: &str,
+        days_ago: i32,
+        blob: &[u8],
+    ) -> String {
+        use sha2::Digest;
+        assert_eq!(hash_part.len(), 32, "hash_part must be 32 nixbase32 chars");
+        let path = format!("/nix/store/{hash_part}-{name}");
+        let sph: Vec<u8> = sha2::Sha256::digest(path.as_bytes()).to_vec();
+        // nar_hash = SHA-256(blob) so fingerprint() gets a real digest
+        // (signature verify is out of scope here, but no reason to
+        // seed garbage). nar_size = blob.len() for the same reason.
+        let nar_hash: Vec<u8> = sha2::Sha256::digest(blob).to_vec();
+        sqlx::query(
+            r#"INSERT INTO narinfo
+               (store_path_hash, store_path, nar_hash, nar_size, "references",
+                refs_backfilled, created_at)
+               VALUES ($1, $2, $3, $4, '{}', FALSE, now() - make_interval(days => $5))"#,
+        )
+        .bind(&sph)
+        .bind(&path)
+        .bind(&nar_hash)
+        .bind(blob.len() as i64)
+        .bind(days_ago)
+        .execute(pool)
+        .await
+        .expect("seed wet narinfo");
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', $2)",
+        )
+        .bind(&sph)
+        .bind(blob)
+        .execute(pool)
+        .await
+        .expect("seed wet manifest");
+        path
     }
 
     /// ResignPaths dry_run cursor pagination: seed 3 pending rows,
@@ -1213,23 +1535,289 @@ mod tests {
         assert!(resp3.cursor.is_empty(), "empty cursor signals done");
     }
 
-    /// ResignPaths dry_run=false returns Unimplemented until the
-    /// per-path body lands (PR 4/6 skeleton contract).
+    /// ResignPaths wet-run happy path: three paths with distinct
+    /// hash-parts and controlled creation times. B's blob embeds A's
+    /// hash; C's blob doesn't. After backfill: B.refs=[A], C.refs=[],
+    /// all three refs_backfilled=TRUE, refs_changed=1 (just B).
+    ///
+    /// Also verifies the created_at filter: B is newer than A so A is
+    /// in B's candidate set. A self-referencing test is implicit —
+    /// A's blob doesn't contain A's own hash, so A.refs stays [].
     #[tokio::test]
-    async fn resign_paths_wet_run_unimplemented() {
+    async fn resign_paths_wet_run_backfills_refs() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
-        seed_narinfo_pending_backfill(&db.pool, "wet").await;
 
-        let err = svc
+        // A: oldest. Blob is arbitrary bytes with no nixbase32 hash
+        // substrings. '0' is valid nixbase32 but we don't have 32 of
+        // them in a row — the scanner skips on the 'X'.
+        let hash_a = "00000000000000000000000000000000";
+        let path_a = seed_backfill_path(&db.pool, hash_a, "pkg-a", 30, b"X leaf content X").await;
+
+        // B: newer. Blob contains A's hash embedded mid-stream —
+        // this is what a real NAR looks like (paths appear as
+        // /nix/store/<hash>-<name> strings inside binaries/scripts).
+        // Pad with non-nixbase32 bytes ('T' is not in the alphabet)
+        // so ONLY hash_a's window is a valid candidate.
+        let blob_b = format!("TT padding TT /nix/store/{hash_a}-pkg-a TT more TT");
+        let path_b = seed_backfill_path(
+            &db.pool,
+            "11111111111111111111111111111111",
+            "pkg-b",
+            20,
+            blob_b.as_bytes(),
+        )
+        .await;
+
+        // C: also newer. Blob has nothing that looks like a hash.
+        let path_c = seed_backfill_path(
+            &db.pool,
+            "22222222222222222222222222222222",
+            "pkg-c",
+            10,
+            b"T plain T",
+        )
+        .await;
+
+        // Run the wet backfill (no signer — refs update only).
+        let resp = svc
             .resign_paths(Request::new(ResignPathsRequest {
                 cursor: String::new(),
                 batch_size: 10,
                 dry_run: false,
             }))
             .await
-            .expect_err("wet run should be unimplemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect("wet run succeeds")
+            .into_inner();
+
+        assert_eq!(resp.processed, 3, "all three rows processed");
+        assert_eq!(resp.refs_changed, 1, "only B had refs added");
+        assert_eq!(resp.failed, 0);
+
+        // Verify DB state directly — the response counters are the
+        // contract, but the actual row state is what GC reads.
+        let (refs_b, done_b): (Vec<String>, Option<bool>) = sqlx::query_as(
+            r#"SELECT "references", refs_backfilled FROM narinfo WHERE store_path = $1"#,
+        )
+        .bind(&path_b)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(refs_b, vec![path_a.clone()], "B references A");
+        assert_eq!(done_b, Some(true));
+
+        // A and C: refs unchanged (empty), but still marked done.
+        for p in [&path_a, &path_c] {
+            let (refs, done): (Vec<String>, Option<bool>) = sqlx::query_as(
+                r#"SELECT "references", refs_backfilled FROM narinfo WHERE store_path = $1"#,
+            )
+            .bind(p)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(refs.is_empty(), "{p}: refs should be empty, got {refs:?}");
+            assert_eq!(done, Some(true), "{p}: refs_backfilled should be TRUE");
+        }
+    }
+
+    /// Wet-run with a signer: when refs change, a fresh signature is
+    /// APPENDED (not replacing the old one — per remediation 02 §4.2
+    /// the stale sig is harmless noise, Nix just ignores it). When
+    /// refs DON'T change, signatures are left alone.
+    #[tokio::test]
+    async fn resign_paths_wet_run_appends_signature_on_change() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let seed_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42u8; 32]);
+        let signer =
+            Signer::parse(&format!("test-resign-1:{seed_b64}")).expect("valid test signer");
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None).with_signer(Arc::new(signer));
+
+        // A: leaf; B references A (blob embeds A's hash).
+        let hash_a = "33333333333333333333333333333333";
+        let path_a = seed_backfill_path(&db.pool, hash_a, "dep", 30, b"T no refs here T").await;
+        let blob_b = format!("T see /nix/store/{hash_a}-dep T");
+        let path_b = seed_backfill_path(
+            &db.pool,
+            "44444444444444444444444444444444",
+            "app",
+            20,
+            blob_b.as_bytes(),
+        )
+        .await;
+
+        // Pre-seed B with an "old" signature — simulates the pre-fix
+        // state where PutPath signed empty refs. We want to see this
+        // one preserved AND a new one appended.
+        sqlx::query(
+            "UPDATE narinfo SET signatures = ARRAY['old-key:stale-sig'] WHERE store_path = $1",
+        )
+        .bind(&path_b)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let resp = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: String::new(),
+                batch_size: 10,
+                dry_run: false,
+            }))
+            .await
+            .expect("wet run succeeds")
+            .into_inner();
+        assert_eq!(resp.refs_changed, 1);
+
+        // B: old sig preserved + new sig appended.
+        let (sigs_b, refs_b): (Vec<String>, Vec<String>) =
+            sqlx::query_as(r#"SELECT signatures, "references" FROM narinfo WHERE store_path = $1"#)
+                .bind(&path_b)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(refs_b, vec![path_a.clone()]);
+        assert_eq!(sigs_b.len(), 2, "old sig + new sig");
+        assert_eq!(sigs_b[0], "old-key:stale-sig", "old sig untouched");
+        assert!(
+            sigs_b[1].starts_with("test-resign-1:"),
+            "new sig uses our key name, got: {}",
+            sigs_b[1]
+        );
+
+        // A: refs unchanged → signatures untouched (still empty).
+        let (sigs_a,): (Vec<String>,) =
+            sqlx::query_as("SELECT signatures FROM narinfo WHERE store_path = $1")
+                .bind(&path_a)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            sigs_a.is_empty(),
+            "unchanged refs → no re-sign, got: {sigs_a:?}"
+        );
+    }
+
+    /// Wet-run with NO signer: refs still update, but no signature
+    /// is appended. Verifies the None-signer branch is genuinely a
+    /// no-op on signatures (not e.g. appending an empty string).
+    #[tokio::test]
+    async fn resign_paths_wet_run_no_signer_updates_refs_only() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None); // no .with_signer
+
+        let hash_a = "55555555555555555555555555555555";
+        seed_backfill_path(&db.pool, hash_a, "lib", 30, b"T T").await;
+        let blob_b = format!("T /nix/store/{hash_a}-lib T");
+        let path_b = seed_backfill_path(
+            &db.pool,
+            "66666666666666666666666666666666",
+            "bin",
+            20,
+            blob_b.as_bytes(),
+        )
+        .await;
+
+        let resp = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: String::new(),
+                batch_size: 10,
+                dry_run: false,
+            }))
+            .await
+            .expect("wet run succeeds")
+            .into_inner();
+        assert_eq!(resp.refs_changed, 1);
+
+        let (sigs, refs, done): (Vec<String>, Vec<String>, Option<bool>) = sqlx::query_as(
+            r#"SELECT signatures, "references", refs_backfilled FROM narinfo WHERE store_path = $1"#,
+        )
+        .bind(&path_b)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(refs.len(), 1, "refs backfilled");
+        assert!(sigs.is_empty(), "no signer → no sig appended");
+        assert_eq!(done, Some(true));
+    }
+
+    /// Wet-run failure isolation: a path with no manifest is filtered
+    /// out by the JOIN (doesn't burn a `failed` tick); a path with a
+    /// manifest row but NULL inline_blob + no manifest_data (invariant
+    /// violation, see metadata::get_manifest) fails cleanly and
+    /// leaves refs_backfilled=FALSE while the good path proceeds.
+    #[tokio::test]
+    async fn resign_paths_wet_run_isolates_failures() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let svc = StoreAdminServiceImpl::new(db.pool.clone(), None);
+
+        // Good path: will process fine.
+        let good = seed_backfill_path(
+            &db.pool,
+            "77777777777777777777777777777777",
+            "good",
+            10,
+            b"T fine T",
+        )
+        .await;
+
+        // Bad path: narinfo + manifest (status=complete, inline_blob
+        // =NULL) but NO manifest_data → get_manifest returns
+        // InvariantViolation. Constructed raw because
+        // seed_backfill_path always sets inline_blob.
+        use sha2::Digest;
+        let bad_path = "/nix/store/88888888888888888888888888888888-bad";
+        let bad_sph: Vec<u8> = sha2::Sha256::digest(bad_path.as_bytes()).to_vec();
+        sqlx::query(
+            r#"INSERT INTO narinfo
+               (store_path_hash, store_path, nar_hash, nar_size, refs_backfilled)
+               VALUES ($1, $2, $3, 0, FALSE)"#,
+        )
+        .bind(&bad_sph)
+        .bind(bad_path)
+        .bind(vec![0u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', NULL)",
+        )
+        .bind(&bad_sph)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let resp = svc
+            .resign_paths(Request::new(ResignPathsRequest {
+                cursor: String::new(),
+                batch_size: 10,
+                dry_run: false,
+            }))
+            .await
+            .expect("handler returns Ok even with per-row failures")
+            .into_inner();
+
+        assert_eq!(resp.processed, 1, "good path processed");
+        assert_eq!(resp.failed, 1, "bad path counted as failed");
+        assert_eq!(resp.refs_changed, 0);
+
+        // Good path is marked done; bad path stays FALSE for retry.
+        let (done_good,): (Option<bool>,) =
+            sqlx::query_as("SELECT refs_backfilled FROM narinfo WHERE store_path = $1")
+                .bind(&good)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(done_good, Some(true));
+
+        let (done_bad,): (Option<bool>,) =
+            sqlx::query_as("SELECT refs_backfilled FROM narinfo WHERE store_path = $1")
+                .bind(bad_path)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(done_bad, Some(false), "failed row stays FALSE for retry");
     }
 
     /// ResignPaths rejects malformed cursors cleanly (not a 500).

@@ -322,17 +322,32 @@ async fn main() -> anyhow::Result<()> {
     // ARE no chunks to get).
     let chunk_service = ChunkServiceImpl::new(pool.clone(), chunk_cache.clone());
 
-    // StoreAdminServiceImpl: TriggerGC + PinPath/UnpinPath. Gets
-    // the chunk backend directly (for key_for in sweep's pending_
-    // s3_deletes enqueue). None for inline-only stores — sweep
-    // does CASCADE delete only, no chunk refcounting.
+    // StoreAdminServiceImpl: TriggerGC + PinPath/UnpinPath +
+    // ResignPaths backfill. Gets the chunk backend directly (for
+    // key_for in sweep's pending_s3_deletes enqueue) AND the
+    // chunk cache (for ResignPaths NAR reassembly) AND the signer
+    // (for ResignPaths re-sign). None for inline-only stores —
+    // sweep does CASCADE delete only, ResignPaths handles inline
+    // blobs without the cache.
+    //
+    // Signer is shared with StoreServiceImpl (same Arc) so
+    // PutPath and ResignPaths produce sigs under the SAME key.
     //
     // Also spawn GC background tasks (orphan scanner + drain).
     // Both are periodic (15min / 30s). spawn_monitored: if one
     // panics, logged; store keeps serving (degraded GC, not down).
     let chunk_backend_for_gc: Option<Arc<dyn ChunkBackend>> =
         chunk_cache.as_ref().map(|c| c.backend());
-    let admin_service = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone());
+    let admin_service = {
+        let mut s = StoreAdminServiceImpl::new(pool.clone(), chunk_backend_for_gc.clone());
+        if let Some(cache) = &chunk_cache {
+            s = s.with_chunk_cache(Arc::clone(cache));
+        }
+        if let Some(signer) = store_service.signer() {
+            s = s.with_signer(signer);
+        }
+        s
+    };
     rio_store::gc::orphan::spawn_scanner(
         pool.clone(),
         chunk_backend_for_gc.clone(),

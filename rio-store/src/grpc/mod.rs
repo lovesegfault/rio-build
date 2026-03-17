@@ -209,6 +209,15 @@ impl StoreServiceImpl {
         self
     }
 
+    /// Clone the signer Arc for sharing with StoreAdminServiceImpl.
+    /// ResignPaths needs the SAME key as PutPath so re-signed narinfos
+    /// verify against the same `trusted-public-keys` entry. Returning
+    /// an `Option<Arc>` (rather than exposing the field) keeps the
+    /// Arc-wrapping detail internal.
+    pub fn signer(&self) -> Option<Arc<Signer>> {
+        self.signer.clone()
+    }
+
     /// Override the global NAR buffer budget (total permits across all
     /// concurrent PutPath handlers). Builder-style. Tests use small values
     /// (e.g., `10 * 4096`) to exercise backpressure without 32 GiB of RAM.
