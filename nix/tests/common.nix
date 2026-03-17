@@ -240,7 +240,7 @@ rec {
   #     not strictly needed for the milestone but make the trace tree
   #     look like the observability.md spec diagram)
   #
-  # The writableStore=false + /nix/var tmpfs pattern is load-bearing —
+  # The writableStore=false setting is load-bearing —
   # see the inline rationale. The 4-core virtualisation setting is also
   # intentional (tokio multi_thread runtime uses num_cpus worker threads;
   # FUSE callbacks doing Handle::block_on(gRPC) need spare worker threads
@@ -312,20 +312,13 @@ rec {
         # but the parent can't see it → OutputRejected. With
         # writableStore=false, /nix/store is the plain 9p mount.
         writableStore = false;
-        # But the host nix-daemon (NixOS module) still wants to create
-        # /nix/var/nix/gcroots etc. — point it at a tmpfs via /nix/var.
-        # (Our per-build daemon uses the overlay's synth DB via
-        # bind-mount, so this only affects the host daemon's state, not
-        # builds.)
-      };
-
-      # With writableStore=false, /nix/var is on the RO 9p mount too.
-      # Mount tmpfs there so host nix-daemon + our synth-DB bind target
-      # have writable paths. The per-build overlay handles /nix/store
-      # writes.
-      fileSystems."/nix/var" = {
-        fsType = "tmpfs";
-        neededForBoot = true;
+        # /nix/var stays on the writable root fs (/): the 9p mount is at
+        # /nix/.ro-store → /nix/store, NOT /nix. Host nix-daemon's gcroots
+        # etc. work without any extra mount. (A `fileSystems."/nix/var"`
+        # tmpfs sat here for months — dead code: qemu-vm.nix does
+        # `fileSystems = mkVMOverride virtualisation.fileSystems` at
+        # priority 10, silently dropping plain `fileSystems.*` defs. Never
+        # applied, never needed, premise was wrong.)
       };
     };
 

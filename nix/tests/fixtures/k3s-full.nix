@@ -325,11 +325,11 @@ in
     # fallback): system bundle (pause/CNI/bitnami) first, then rio-*
     # bundle. bitnami is NOT last — rio-all (~170MB) comes after.
     # Gate on pause (minimal kubelet pod infra) + rio-all (the one
-    # rio image, replaces the former 5-image bundle). timeout=600:
-    # covers pathological builders (leader-election cov run 2026-03-17
-    # saw agent rio-controller import at 170s vs 35-40s typical — 5x
-    # slower; single-image load should be proportionally faster but
-    # keep the headroom for builder I/O variance).
+    # rio image, replaces the former 5-image bundle).
+    # TODO: timeout=600 predates the containerd-tmpfs fix (24c8537).
+    # Pre-tmpfs, agent rio-controller import hit 170s vs 35-40s typical
+    # (5× builder-disk tail). Tmpfs collapses that to CPU-bound
+    # decompress — once verified green, 300 (or 180) should suffice.
     for n in [k3s_server, k3s_agent]:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
@@ -348,9 +348,10 @@ in
     # 106.70/120s = 89% burned; 1.8× slower builder blew it by ~72s).
     # This gate directly tests the actual precondition. EXISTS (not
     # Ready) is sufficient: Ready needs CNI which needs flannel which
-    # needs the node to exist first. timeout=600: ~180s typical from
-    # wait_for_unit to kubelet-start under TCG, but proportional to
-    # builder speed (same variance as rio-all gate above).
+    # needs the node to exist first.
+    # TODO: timeout=600 predates containerd-tmpfs (same story as the
+    # rio-all gate above). ~180s typical under TCG; reduce to 300 once
+    # tmpfs is verified to have collapsed the builder-disk tail.
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-server 2>/dev/null",
         timeout=600,
