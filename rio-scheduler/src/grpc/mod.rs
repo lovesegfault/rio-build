@@ -135,7 +135,12 @@ impl SchedulerGrpc {
             ActorError::Backpressure => {
                 Status::resource_exhausted("scheduler is overloaded, please retry later")
             }
-            ActorError::ChannelSend => Status::internal("scheduler actor is unavailable"),
+            // ChannelSend = actor's mpsc receiver dropped. Either the
+            // actor panicked OR it exited on its shutdown-token arm
+            // during drain. UNAVAILABLE (retriable) not INTERNAL —
+            // BalancedChannel clients retry on the next replica; with
+            // INTERNAL they'd surface the error to the user.
+            ActorError::ChannelSend => Status::unavailable("scheduler actor is unavailable"),
             ActorError::Database(e) => Status::internal(format!("database error: {e}")),
             ActorError::Dag(e) => Status::internal(format!("DAG merge failed: {e}")),
             ActorError::MissingDbId { .. } => Status::internal(err.to_string()),

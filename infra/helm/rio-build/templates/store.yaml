@@ -41,6 +41,8 @@ spec:
               value: "0.0.0.0:9002"
             - name: RIO_HEALTH_ADDR
               value: "0.0.0.0:9102"
+            - name: RIO_DRAIN_GRACE_SECS
+              value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:

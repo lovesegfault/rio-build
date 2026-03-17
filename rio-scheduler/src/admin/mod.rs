@@ -86,6 +86,12 @@ pub struct AdminServiceImpl {
     /// Shared with the lease loop (same Arc as `SchedulerGrpc`).
     /// Admin RPCs mutate state via the actor — standby must refuse.
     is_leader: Arc<AtomicBool>,
+    /// For aborting long-running proxy tasks (TriggerGC forward).
+    /// Parent token, not serve_shutdown — the forward task should
+    /// exit IMMEDIATELY on SIGTERM (store-side GC continues; we
+    /// just stop forwarding progress to a client who's about to be
+    /// disconnected anyway).
+    shutdown: rio_common::signal::Token,
 }
 
 /// Spawn a background task that refreshes `store_size_bytes` every 60s
@@ -127,6 +133,7 @@ pub fn spawn_store_size_refresh(
 }
 
 impl AdminServiceImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_buffers: Arc<LogBuffers>,
         s3: Option<(S3Client, String)>,
@@ -135,6 +142,7 @@ impl AdminServiceImpl {
         store_addr: String,
         store_size_bytes: Arc<std::sync::atomic::AtomicU64>,
         is_leader: Arc<AtomicBool>,
+        shutdown: rio_common::signal::Token,
     ) -> Self {
         Self {
             log_buffers,
@@ -145,6 +153,7 @@ impl AdminServiceImpl {
             store_addr,
             store_size_bytes,
             is_leader,
+            shutdown,
         }
     }
 
@@ -559,10 +568,23 @@ impl AdminService for AdminServiceImpl {
         // directly compatible with our TriggerGCStream type (we
         // declare it as ReceiverStream).
         let (tx, rx) = mpsc::channel::<Result<GcProgress, Status>>(8);
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             let mut store_stream = store_stream;
             loop {
-                match store_stream.message().await {
+                // biased: check shutdown first. A store-side sweep
+                // can go minutes between progress messages; without
+                // this arm the task holds the store channel alive
+                // past main()'s lease_loop.await.
+                let msg = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        tracing::debug!("TriggerGC forward: shutdown, dropping store stream");
+                        break;
+                    }
+                    m = store_stream.message() => m,
+                };
+                match msg {
                     Ok(Some(progress)) => {
                         if tx.send(Ok(progress)).await.is_err() {
                             // Client disconnected. Let the store-

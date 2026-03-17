@@ -36,6 +36,8 @@ spec:
             {{- include "rio.covEnv" . | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "0.0.0.0:2222"
+            - name: RIO_DRAIN_GRACE_SECS
+              value: "6"  # readinessProbe.periodSeconds (5) + 1
             # Still used even with balance host — it's the TLS verify domain
             # (cert SAN is `rio-scheduler`).
             - name: RIO_SCHEDULER_ADDR

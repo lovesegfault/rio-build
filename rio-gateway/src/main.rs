@@ -52,6 +52,11 @@ struct Config {
     /// = plaintext (dev mode). The gateway's INCOMING connections
     /// are SSH — TLS doesn't apply there.
     tls: rio_common::tls::TlsConfig,
+    /// Seconds to wait after SIGTERM between health=NOT_SERVING and
+    /// stopping the SSH accept loop. Gives kubelet readinessProbe
+    /// (periodSeconds: 5) + NLB target deregistration time. 0 = no
+    /// drain. Default 6.
+    drain_grace_secs: u64,
 }
 
 impl Default for Config {
@@ -76,6 +81,7 @@ impl Default for Config {
             // pattern keeps it discoverable without a doc lookup.
             health_addr: "0.0.0.0:9190".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
+            drain_grace_secs: 6,
         }
     }
 }
@@ -120,6 +126,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     health_addr: Option<std::net::SocketAddr>,
+
+    /// Drain grace period in seconds (0 = disabled)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drain_grace_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -266,6 +277,44 @@ async fn main() -> anyhow::Result<()> {
     // (port conflict, etc), spawn_monitored logs it — K8s readiness
     // probe starts failing, pod restarts. Self-healing.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
+
+    // Two-stage shutdown. `shutdown` (parent) fires on SIGTERM.
+    // `serve_shutdown` is an INDEPENDENT token — NOT child_token(),
+    // which would cascade and cancel the instant SIGTERM fires (zero
+    // drain window). It fires only via the drain task below, AFTER
+    // set_not_serving + sleep. Both the health server AND the SSH
+    // accept loop wait for serve_shutdown — new SSH connections that
+    // were already NLB-routed before endpoint propagation land on a
+    // live listener.
+    let serve_shutdown = rio_common::signal::Token::new();
+    {
+        let reporter = health_reporter.clone();
+        let parent = shutdown.clone();
+        let child = serve_shutdown.clone();
+        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
+        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
+            parent.cancelled().await;
+            // r[impl common.drain.not-serving-before-exit]
+            // Gateway's probe is empty-string (no `service:` field in
+            // helm gateway.yaml). set_not_serving::<S>() only flips
+            // the NAMED service — must use set_service_status("")
+            // directly. See scheduler/main.rs health_toggle_not_serving
+            // test for the proof that named-only is tonic-health's
+            // behavior.
+            reporter
+                .set_service_status("", tonic_health::ServingStatus::NotServing)
+                .await;
+            tracing::info!(
+                grace_secs = grace.as_secs(),
+                "SIGTERM: health=NOT_SERVING, draining"
+            );
+            if !grace.is_zero() {
+                tokio::time::sleep(grace).await;
+            }
+            child.cancel();
+        });
+    }
+
     // Generic param: we don't have a "GatewayService" proto. Use the
     // tonic-health server's own type as a stand-in — the empty-string
     // "whole server" health check (which K8s sends) doesn't care about
@@ -276,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
         >>()
         .await;
     let health_addr = cfg.health_addr;
-    let health_shutdown = shutdown.clone();
+    let health_shutdown = serve_shutdown.clone();
     rio_common::task::spawn_monitored("health-server", async move {
         info!(addr = %health_addr, "starting gRPC health server");
         if let Err(e) = tonic::transport::Server::builder()
@@ -300,12 +349,14 @@ async fn main() -> anyhow::Result<()> {
         "rio-gateway ready"
     );
 
-    // Race the SSH server against shutdown. Dropping the run() future
-    // cancels the accept loop; per-session tasks die at process exit.
-    // Clean enough for graceful shutdown + coverage flush.
+    // Race the SSH server against serve_shutdown (child), not the
+    // parent: the SSH accept loop stays live during the drain window
+    // so late-routed connections (NLB propagation lag) still land on
+    // a listener. Dropping the run() future cancels the accept loop;
+    // per-session tasks die at process exit.
     tokio::select! {
         r = server.run(host_key, cfg.listen_addr) => r?,
-        _ = shutdown.cancelled() => {
+        _ = serve_shutdown.cancelled() => {
             info!("gateway shut down cleanly");
         }
     }
@@ -333,6 +384,7 @@ mod tests {
         assert!(d.store_addr.is_empty());
         assert!(d.host_key.as_os_str().is_empty());
         assert!(d.authorized_keys.as_os_str().is_empty());
+        assert_eq!(d.drain_grace_secs, 6);
     }
 
     /// clap --help must still work (no panics in derive expansion).

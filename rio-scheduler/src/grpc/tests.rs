@@ -612,7 +612,7 @@ fn test_actor_error_to_status_all_arms() {
             Code::ResourceExhausted,
             "overloaded",
         ),
-        (ActorError::ChannelSend, Code::Internal, "unavailable"),
+        (ActorError::ChannelSend, Code::Unavailable, "unavailable"),
         (
             ActorError::Database(sqlx::Error::PoolClosed),
             Code::Internal,

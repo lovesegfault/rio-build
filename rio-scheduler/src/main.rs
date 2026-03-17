@@ -51,6 +51,11 @@ struct Config {
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
     hmac_key_path: Option<std::path::PathBuf>,
+    /// Seconds to wait after SIGTERM between set_not_serving()
+    /// and serve_with_shutdown returning. Gives the BalancedChannel
+    /// probe loop (DEFAULT_PROBE_INTERVAL=3s) time to observe
+    /// NOT_SERVING and reroute. 0 = no drain (tests). Default 6.
+    drain_grace_secs: u64,
 }
 
 impl Default for Config {
@@ -69,6 +74,10 @@ impl Default for Config {
             health_addr: "0.0.0.0:9101".parse().unwrap(),
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
+            // periodSeconds: 5 (helm) + 1s propagation. Uniform across
+            // all three binaries even though scheduler's actual client
+            // probe is 3s — 6s out of 30s termGrace is cheap.
+            drain_grace_secs: 6,
         }
     }
 }
@@ -113,6 +122,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_s3_prefix: Option<String>,
+
+    /// Drain grace period in seconds (0 = disabled)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drain_grace_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -390,6 +404,44 @@ async fn main() -> anyhow::Result<()> {
     //       port: 9001
     //       service: rio.scheduler.SchedulerService
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
+
+    // Two-stage shutdown: `shutdown` (parent) fires on SIGTERM and
+    // stops background loops immediately. `serve_shutdown` is an
+    // INDEPENDENT token fired only by the drain task below, AFTER
+    // set_not_serving + sleep. NOT `shutdown.child_token()` —
+    // child_token cascades parent→child synchronously, which would
+    // cancel serve_shutdown the instant SIGTERM fires and give zero
+    // drain window (test drain_sets_not_serving_before_child_cancel
+    // proves this). The drain task is the ONLY path to serve_shutdown
+    // cancellation; if it somehow died, process hangs until SIGKILL
+    // at terminationGracePeriodSeconds — acceptable, the drain body
+    // cannot realistically panic.
+    let serve_shutdown = rio_common::signal::Token::new();
+    {
+        let reporter = health_reporter.clone();
+        let parent = shutdown.clone();
+        let child = serve_shutdown.clone();
+        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
+        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
+            parent.cancelled().await;
+            // The health-toggle loop below breaks on the SAME parent
+            // token and its break arm does NOT call set_serving — so
+            // it cannot un-flip us here. Last write wins.
+            // r[impl common.drain.not-serving-before-exit]
+            reporter
+                .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                .await;
+            tracing::info!(
+                grace_secs = grace.as_secs(),
+                "SIGTERM: health=NOT_SERVING, draining"
+            );
+            if !grace.is_zero() {
+                tokio::time::sleep(grace).await;
+            }
+            child.cancel();
+        });
+    }
+
     {
         // Own task for the toggle loop. Captures the reporter
         // clone (HealthReporter is Clone) and the is_leader Arc.
@@ -474,6 +526,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.store_addr.clone(),
         store_size_bytes,
         is_leader_for_grpc,
+        shutdown.clone(),
     );
 
     // Start periodic tick task
@@ -533,7 +586,11 @@ async fn main() -> anyhow::Result<()> {
         // concurrently with the main (blocking) serve() below.
         let health_addr = cfg.health_addr;
         info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
-        let health_plain_shutdown = shutdown.clone();
+        // serve_shutdown (child), not the parent: the K8s probe
+        // hits THIS port when mTLS is on. If it exits on the
+        // parent, the probe gets ECONNREFUSED instead of
+        // NOT_SERVING — same bug, different symptom.
+        let health_plain_shutdown = serve_shutdown.clone();
         rio_common::task::spawn_monitored("health-plaintext", async move {
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(health_service_plain)
@@ -583,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
                 .max_decoding_message_size(max_message_size)
                 .max_encoding_message_size(max_message_size),
         )
-        .serve_with_shutdown(listen_addr, shutdown.cancelled_owned())
+        .serve_with_shutdown(listen_addr, serve_shutdown.cancelled_owned())
         .await?;
 
     // Wait for step_down() to complete. serve_with_shutdown has
@@ -620,6 +677,7 @@ mod tests {
         assert!(d.size_classes.is_empty());
         // Phase3b: plaintext health port for K8s probes when mTLS on.
         assert_eq!(d.health_addr.to_string(), "0.0.0.0:9101");
+        assert_eq!(d.drain_grace_secs, 6);
         // Phase3b: TLS off by default (dev mode, VM tests).
         assert!(!d.tls.is_configured());
     }
@@ -896,6 +954,138 @@ mod tests {
             check(&mut client).await?,
             ServingStatus::Serving,
             "re-acquired leadership → resume traffic"
+        );
+        Ok(())
+    }
+
+    /// r[verify common.drain.not-serving-before-exit]
+    /// Drain task sequencing: parent token cancel → health flips to
+    /// NOT_SERVING → child token cancels AFTER grace. A client checking
+    /// health between parent-cancel and child-cancel sees NOT_SERVING.
+    /// This is the window K8s kubelet needs to pull us from Endpoints.
+    #[tokio::test]
+    async fn drain_sets_not_serving_before_child_cancel() -> anyhow::Result<()> {
+        use rio_common::signal::Token as CancellationToken;
+        use tonic_health::pb::{
+            HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+        };
+
+        let (addr, reporter) = spawn_health_server().await;
+        reporter
+            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+            .await;
+
+        let parent = CancellationToken::new();
+        // INDEPENDENT token — NOT parent.child_token(). child_token
+        // cascades synchronously: parent.cancel() would set
+        // child.is_cancelled()=true instantly, giving zero drain
+        // window. This test proves the independent-token pattern
+        // actually works (it was the thing that caught the bug in
+        // the original child_token-based remediation plan).
+        let child = CancellationToken::new();
+        // Short grace for test speed — the production default is 6s.
+        let grace = std::time::Duration::from_millis(200);
+
+        // Inline the drain task body (can't call main()).
+        {
+            let reporter = reporter.clone();
+            let parent = parent.clone();
+            let child = child.clone();
+            tokio::spawn(async move {
+                parent.cancelled().await;
+                reporter
+                    .set_not_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+                    .await;
+                tokio::time::sleep(grace).await;
+                child.cancel();
+            });
+        }
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(channel);
+        let req = || HealthCheckRequest {
+            service: "rio.scheduler.SchedulerService".into(),
+        };
+
+        // Pre-cancel: SERVING, child not cancelled.
+        assert_eq!(
+            ServingStatus::try_from(client.check(req()).await?.into_inner().status)?,
+            ServingStatus::Serving
+        );
+        assert!(!child.is_cancelled());
+
+        // Fire parent. The drain task is woken; set_not_serving is an
+        // async RwLock write — yield to let it run.
+        parent.cancel();
+        tokio::task::yield_now().await;
+        // A few more yields for the broadcast to propagate to the
+        // health service's watch channel.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // CRITICAL ASSERTION: during the grace window, health is
+        // NOT_SERVING but child is NOT YET cancelled. This is the
+        // window where kubelet probes NOT_SERVING → removes endpoint.
+        assert_eq!(
+            ServingStatus::try_from(client.check(req()).await?.into_inner().status)?,
+            ServingStatus::NotServing,
+            "health must flip BEFORE child cancels — this is the drain window"
+        );
+        assert!(
+            !child.is_cancelled(),
+            "child must NOT cancel until grace elapses — serve_with_shutdown \
+             would return early and we'd exit while kubelet still thinks SERVING"
+        );
+
+        // After grace: child cancelled.
+        tokio::time::timeout(grace * 3, child.cancelled())
+            .await
+            .expect("child should cancel within ~grace");
+
+        Ok(())
+    }
+
+    /// Gateway's kubelet probe sends empty service name. set_not_serving<S>
+    /// does NOT flip "" (proven by health_toggle_not_serving). This test
+    /// proves set_service_status("", NotServing) DOES.
+    #[tokio::test]
+    async fn set_service_status_empty_string_flips_whole_server() -> anyhow::Result<()> {
+        use tonic_health::pb::{
+            HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+        };
+
+        let (addr, reporter) = spawn_health_server().await;
+        // Register "" as SERVING (side effect of any set_serving call).
+        reporter
+            .set_serving::<SchedulerServiceServer<SchedulerGrpc>>()
+            .await;
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+        let mut client = HealthClient::new(channel);
+        let empty = || HealthCheckRequest {
+            service: String::new(),
+        };
+
+        assert_eq!(
+            ServingStatus::try_from(client.check(empty()).await?.into_inner().status)?,
+            ServingStatus::Serving
+        );
+
+        // The gateway's drain call.
+        reporter
+            .set_service_status("", tonic_health::ServingStatus::NotServing)
+            .await;
+
+        assert_eq!(
+            ServingStatus::try_from(client.check(empty()).await?.into_inner().status)?,
+            ServingStatus::NotServing,
+            "gateway drain must flip the empty-string check — that's what \
+             kubelet probes when helm gateway.yaml has no grpc.service field"
         );
         Ok(())
     }

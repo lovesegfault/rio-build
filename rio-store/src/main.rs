@@ -89,6 +89,11 @@ struct Config {
     /// (mapped to tenant via `tenants.cache_token` column). Set
     /// `true` explicitly for single-tenant/dev deployments.
     cache_allow_unauthenticated: bool,
+    /// Seconds to wait after SIGTERM between set_not_serving() and
+    /// exit. Gives kubelet readinessProbe (periodSeconds: 5) time to
+    /// observe NOT_SERVING + endpoint-controller to propagate. 0 =
+    /// no drain. Default 6 (= 5 + 1).
+    drain_grace_secs: u64,
 }
 
 impl Default for Config {
@@ -110,6 +115,7 @@ impl Default for Config {
             tls: rio_common::tls::TlsConfig::default(),
             hmac_key_path: None,
             cache_allow_unauthenticated: false,
+            drain_grace_secs: 6,
         }
     }
 }
@@ -134,6 +140,11 @@ struct CliArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_addr: Option<std::net::SocketAddr>,
+
+    /// Drain grace period in seconds (0 = disabled)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drain_grace_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -196,6 +207,36 @@ async fn main() -> anyhow::Result<()> {
     // correct: by the time we're listening, migrations are done. If
     // migrations failed, the `?` above already bailed.
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
+
+    // Two-stage shutdown. `shutdown` (parent) stops background tasks
+    // (orphan scanner, GC drain, cache HTTP) immediately on SIGTERM.
+    // `serve_shutdown` is an INDEPENDENT token — NOT child_token(),
+    // which would cascade and cancel immediately. It fires only via
+    // the drain task below, AFTER set_not_serving + sleep. See
+    // rio-scheduler/src/main.rs drain_sets_not_serving_before_child_cancel
+    // test for why independent-not-child is load-bearing.
+    let serve_shutdown = rio_common::signal::Token::new();
+    {
+        let reporter = health_reporter.clone();
+        let parent = shutdown.clone();
+        let child = serve_shutdown.clone();
+        let grace = std::time::Duration::from_secs(cfg.drain_grace_secs);
+        rio_common::task::spawn_monitored("drain-on-sigterm", async move {
+            parent.cancelled().await;
+            // r[impl common.drain.not-serving-before-exit]
+            reporter
+                .set_not_serving::<StoreServiceServer<StoreServiceImpl>>()
+                .await;
+            tracing::info!(
+                grace_secs = grace.as_secs(),
+                "SIGTERM: health=NOT_SERVING, draining"
+            );
+            if !grace.is_zero() {
+                tokio::time::sleep(grace).await;
+            }
+            child.cancel();
+        });
+    }
 
     // Construct the chunk backend + ONE shared ChunkCache. The cache
     // Arc is cloned into all three consumers (StoreServiceImpl,
@@ -361,7 +402,9 @@ async fn main() -> anyhow::Result<()> {
     let health_service_plain = health_service.clone();
     if server_tls.is_some() {
         let health_addr = cfg.health_addr;
-        let health_shutdown = shutdown.clone();
+        // serve_shutdown (child): if this exits on the parent, the
+        // K8s probe gets ECONNREFUSED instead of NOT_SERVING.
+        let health_shutdown = serve_shutdown.clone();
         info!(addr = %health_addr, "spawning plaintext health server for K8s probes (mTLS on main port)");
         rio_common::task::spawn_monitored("health-plaintext", async move {
             if let Err(e) = Server::builder()
@@ -386,7 +429,7 @@ async fn main() -> anyhow::Result<()> {
         .add_service(StoreServiceServer::new(store_service).max_decoding_message_size(max_msg_size))
         .add_service(ChunkServiceServer::new(chunk_service))
         .add_service(StoreAdminServiceServer::new(admin_service))
-        .serve_with_shutdown(addr, shutdown.cancelled_owned())
+        .serve_with_shutdown(addr, serve_shutdown.cancelled_owned())
         .await?;
 
     info!("store shut down cleanly");
@@ -415,6 +458,7 @@ mod tests {
         assert!(!d.tls.is_configured());
         // Binary cache auth required by default — fail loud on misconfigured deployments.
         assert!(!d.cache_allow_unauthenticated);
+        assert_eq!(d.drain_grace_secs, 6);
     }
 
     /// TOML parsing for the tagged enum via figment (what main.rs
