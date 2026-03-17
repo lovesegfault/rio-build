@@ -284,7 +284,10 @@ in
     # observed starting ~27ms after rio-store finishes, concurrent
     # with rio-worker import). The rio-store gate is fragile (depends
     # on image set + alpha order) but gives a named checkpoint more
-    # debuggable than a raw node-exists timeout.
+    # debuggable than a raw node-exists timeout. timeout=600: covers
+    # pathological builders (leader-election cov run 2026-03-17 saw
+    # agent rio-controller import at 170s vs 35-40s typical --- 5x
+    # slower; agent gate blew 300s at ~302s with 3 images remaining).
     for n in [k3s_server, k3s_agent]:
         n.wait_until_succeeds(
             "k3s ctr images ls -q | grep -q pause", timeout=240
@@ -293,7 +296,7 @@ in
             "k3s ctr images ls -q | grep -q 'bitnami/postgresql'", timeout=240
         )
         n.wait_until_succeeds(
-            "k3s ctr images ls -q | grep -q 'rio-store'", timeout=300
+            "k3s ctr images ls -q | grep -q 'rio-store'", timeout=600
         )
 
     # ── Server node registered (kubelet up, images imported) ────────
@@ -303,11 +306,12 @@ in
     # 106.70/120s = 89% burned; 1.8× slower builder blew it by ~72s).
     # This gate directly tests the actual precondition. EXISTS (not
     # Ready) is sufficient: Ready needs CNI which needs flannel which
-    # needs the node to exist first. timeout=300: ~180s observed from
-    # wait_for_unit to kubelet-start under TCG + variance headroom.
+    # needs the node to exist first. timeout=600: ~180s typical from
+    # wait_for_unit to kubelet-start under TCG, but proportional to
+    # builder speed (same variance as rio-store gate above).
     k3s_server.wait_until_succeeds(
         "k3s kubectl get node k3s-server 2>/dev/null",
-        timeout=300,
+        timeout=600,
     )
 
     # ── Agent joined ────────────────────────────────────────────────
