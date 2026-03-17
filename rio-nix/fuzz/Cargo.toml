@@ -58,3 +58,9 @@ name = "build_result_parsing"
 path = "fuzz_targets/build_result_parsing.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "refscan"
+path = "fuzz_targets/refscan.rs"
+test = false
+doc = false

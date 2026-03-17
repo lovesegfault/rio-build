@@ -11,4 +11,5 @@ pub mod hash;
 pub mod nar;
 pub mod narinfo;
 pub mod protocol;
+pub mod refscan;
 pub mod store_path;
