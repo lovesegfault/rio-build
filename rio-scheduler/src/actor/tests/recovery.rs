@@ -1265,3 +1265,133 @@ async fn test_recovery_poisoned_orphan_build_fails_keep_going_false() -> TestRes
 
     Ok(())
 }
+
+// ---- Recovery TOCTOU on lease flap (remediation 08) ------------
+// r[verify sched.recovery.gate-dispatch]
+//   Generation snapshot + re-check: if the lease flaps (lose→
+//   reacquire) mid-recovery, discard the stale DAG instead of
+//   dispatching from it with the NEW generation stamped on.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Lease flaps during recovery: gen bumps mid-flight → discard.
+///
+/// Timeline simulated:
+///   T+0   lease loop acquires (gen 1→2), sends LeaderAcquired
+///   T+1   actor enters handle_leader_acquired, snapshots gen=2
+///   T+1   actor runs recover_from_pg (fast, empty PG)
+///   T+1   actor hits the test gate, signals "reached", blocks
+///   T+4   [SIMULATED] lease loop lose-transition: clears
+///         recovery_complete=false
+///   T+9   [SIMULATED] lease loop re-acquire: fetch_add gen 2→3
+///   T+9   test releases the gate
+///   T+12  actor re-loads gen=3, sees 3 ≠ 2 → DISCARD, early-return
+///
+/// Pre-fix: the unconditional store(true) at the old :367 would
+/// clobber the lease loop's clear at T+4. dispatch_ready would then
+/// fire with a DAG loaded under gen=2 but stamped with gen=3.
+#[tokio::test]
+async fn test_recovery_toctou_gen_bump_discards() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Shared atomics simulating LeaderState. Start gen=2 (lease
+    // loop's first fetch_add already happened).
+    let generation = Arc::new(AtomicU64::new(2));
+    let recovery_complete = Arc::new(AtomicBool::new(false));
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+
+    let gen_for_actor = Arc::clone(&generation);
+    let rc_for_actor = Arc::clone(&recovery_complete);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |a| {
+        a.with_generation(gen_for_actor)
+            .with_recovery_flag(rc_for_actor)
+            .with_recovery_toctou_gate(reached_tx, release_rx)
+    });
+
+    // Trigger recovery.
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+
+    // Deterministic rendezvous: actor signals it has finished
+    // recover_from_pg and is parked at the gate. No sleep/yield.
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate within 10s")
+        .expect("reached_tx not dropped");
+
+    // Simulate lease flap: lose (clear) + reacquire (bump gen).
+    // Order matches the real lease loop (lose-transition at
+    // lease/mod.rs clears recovery_complete, THEN next acquire
+    // fetch_add's). Both are Relaxed/Release there.
+    recovery_complete.store(false, Ordering::Relaxed);
+    generation.fetch_add(1, Ordering::Release); // 2 → 3
+
+    // Release recovery. Actor re-loads gen, sees 3 ≠ 2, discards.
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    // THE assertion: recovery_complete must STILL be false. The
+    // early-return preserved the lease loop's clear. Without the
+    // fix, the unconditional store(true) clobbers it → dispatch_
+    // ready would fire with the stale (gen-2) DAG.
+    assert!(
+        !recovery_complete.load(Ordering::Acquire),
+        "TOCTOU: recovery_complete clobbered lease loop's clear \u{2014} \
+         would dispatch gen-2 DAG with gen-3 stamps"
+    );
+
+    // DAG discarded: debug_query returns None for any hash.
+    // (Empty PG → nothing was loaded anyway, but this proves the
+    // clear-on-discard didn't leave half-state.)
+    let info = handle.debug_query_derivation("nonexistent").await?;
+    assert!(info.is_none(), "DAG should be empty after discard");
+
+    Ok(())
+}
+
+/// Negative control: generation stable during recovery → normal
+/// completion. Proves the TOCTOU check doesn't false-positive on a
+/// clean recovery (would regress every existing recovery test if so).
+#[tokio::test]
+async fn test_recovery_toctou_no_bump_completes() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    let generation = Arc::new(AtomicU64::new(2));
+    let recovery_complete = Arc::new(AtomicBool::new(false));
+
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+
+    let gen_for_actor = Arc::clone(&generation);
+    let rc_for_actor = Arc::clone(&recovery_complete);
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |a| {
+        a.with_generation(gen_for_actor)
+            .with_recovery_flag(rc_for_actor)
+            .with_recovery_toctou_gate(reached_tx, release_rx)
+    });
+
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("actor reached gate")
+        .expect("reached_tx not dropped");
+
+    // NO gen bump. Release immediately.
+    release_tx.send(()).expect("actor still listening");
+    barrier(&handle).await;
+
+    // gen_now == gen_at_entry → normal path → store(true).
+    assert!(
+        recovery_complete.load(Ordering::Acquire),
+        "clean recovery (no flap) should set recovery_complete=true"
+    );
+    assert_eq!(
+        generation.load(Ordering::Acquire),
+        2,
+        "generation unchanged (empty PG → no fetch_max bump)"
+    );
+
+    Ok(())
+}

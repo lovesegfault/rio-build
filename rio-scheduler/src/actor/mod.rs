@@ -207,6 +207,14 @@ pub struct DagActor {
     /// Default (from `new()`) is a fresh never-cancelled token →
     /// tests and non-production constructors are unchanged.
     shutdown: rio_common::signal::Token,
+    /// Test-only: oneshot pair for deterministic interleaving in
+    /// `handle_leader_acquired`. When set, the actor sends on `.0`
+    /// after `recover_from_pg()` returns, then awaits `.1` before
+    /// the gen re-check. Lets the TOCTOU test bump `generation`
+    /// between recovery completion and the staleness check —
+    /// simulating a lease flap mid-recovery without mocking PG.
+    #[cfg(test)]
+    recovery_toctou_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 impl DagActor {
@@ -248,6 +256,8 @@ impl DagActor {
             event_persist_tx: None,
             hmac_signer: None,
             shutdown: rio_common::signal::Token::new(),
+            #[cfg(test)]
+            recovery_toctou_gate: None,
         }
     }
 
@@ -750,6 +760,18 @@ impl DagActor {
     /// three come from the same `LeaderState`.
     pub fn with_recovery_flag(mut self, recovery_complete: Arc<AtomicBool>) -> Self {
         self.recovery_complete = recovery_complete;
+        self
+    }
+
+    /// Test-only: install a oneshot gate pair for deterministic
+    /// interleaving in `handle_leader_acquired`. See the field doc.
+    #[cfg(test)]
+    pub fn with_recovery_toctou_gate(
+        mut self,
+        reached_tx: oneshot::Sender<()>,
+        release_rx: oneshot::Receiver<()>,
+    ) -> Self {
+        self.recovery_toctou_gate = Some((reached_tx, release_rx));
         self
     }
 

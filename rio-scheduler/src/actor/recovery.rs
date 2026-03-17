@@ -51,9 +51,17 @@ impl DagActor {
     /// live), then loads from PG as the single source of truth.
     /// Priorities recomputed via critical_path::full_sweep.
     ///
+    /// Returns the PG high-water generation on success (for the
+    /// caller's monotonicity seed). The caller does `fetch_max`
+    /// AFTER the TOCTOU check — keeping this function free of
+    /// writes to `self.generation` is load-bearing for the
+    /// gen-snapshot check in `handle_leader_acquired` (any change
+    /// to `generation` during recovery then unambiguously means
+    /// the lease loop fetch_add'd, i.e. a flap).
+    ///
     /// Returns Err on PG failure; caller sets `recovery_complete=
     /// true` anyway (see module doc — degrade not block).
-    pub(super) async fn recover_from_pg(&mut self) -> Result<(), ActorError> {
+    pub(super) async fn recover_from_pg(&mut self) -> Result<Option<i64>, ActorError> {
         info!("starting state recovery from PG");
 
         // --- Clear in-mem state ---
@@ -264,25 +272,11 @@ impl DagActor {
             self.build_sequences.insert(build_id, max_seq as u64);
         }
 
-        // --- Seed generation from assignments high-water mark ---
-        // fetch_max not store: the lease loop already did
-        // fetch_add(1) on this SAME Arc. store would clobber it.
-        // fetch_max takes the larger of (lease's value, PG + 1).
-        // Defensive against Lease annotation reset.
-        if let Some(max_gen) = self.db.max_assignment_generation().await? {
-            let target = (max_gen as u64).saturating_add(1);
-            let prev = self
-                .generation
-                .fetch_max(target, std::sync::atomic::Ordering::Release);
-            if target > prev {
-                info!(
-                    prev_gen = prev,
-                    pg_high_water = max_gen,
-                    new_gen = target,
-                    "seeded generation from PG high-water mark (defensive monotonicity)"
-                );
-            }
-        }
+        // --- Fetch PG generation high-water mark (caller seeds) ---
+        // NOT applied here: the caller (handle_leader_acquired) does
+        // fetch_max AFTER the TOCTOU gen-snapshot check. Writing to
+        // self.generation here would false-positive that check.
+        let pg_max_gen = self.db.max_assignment_generation().await?;
 
         // --- Recompute priorities (critical-path sweep) ---
         // est_duration is recomputed from the estimator (build_
@@ -355,7 +349,7 @@ impl DagActor {
             "state recovery complete"
         );
 
-        Ok(())
+        Ok(pg_max_gen)
     }
 
     /// Handle `LeaderAcquired`: run recovery, then set the
@@ -368,8 +362,33 @@ impl DagActor {
     /// inconsistent). MergeDag from a standby-period SubmitBuild
     /// would queue in the mpsc channel and get processed after.
     pub(super) async fn handle_leader_acquired(&mut self) {
+        // Snapshot generation BEFORE recovery. If the lease flaps
+        // (lose→reacquire) while recover_from_pg() is running, the
+        // lease loop will fetch_add again AND will have cleared
+        // recovery_complete (lease/mod.rs lose-transition). An
+        // unconditional store(true) here would clobber that clear
+        // and let dispatch_ready fire with a DAG loaded under the
+        // OLD generation but stamped with the NEW one — worker-side
+        // gen fence can't catch that.
+        //
+        // recover_from_pg() does NOT write to self.generation (it
+        // returns the PG high-water for us to seed below). So any
+        // change between gen_at_entry and gen_now is unambiguously
+        // a lease-loop fetch_add — no false positives from PG seeding.
+        let gen_at_entry = self.generation.load(std::sync::atomic::Ordering::Acquire);
+
         let start = Instant::now();
         let result = self.recover_from_pg().await;
+
+        // Test-only interleave gate: lets a test bump `generation`
+        // between recovery completion and the gen re-check below,
+        // deterministically proving the TOCTOU fix. Signal "reached"
+        // then wait for "release".
+        #[cfg(test)]
+        if let Some((reached_tx, release_rx)) = self.recovery_toctou_gate.take() {
+            let _ = reached_tx.send(());
+            let _ = release_rx.await;
+        }
 
         // Record BEFORE the match — both arms need it, and the error
         // arm's partial-state clear (.dag = new(), etc.) doesn't touch
@@ -383,8 +402,65 @@ impl DagActor {
         metrics::counter!("rio_scheduler_recovery_total", "outcome" => outcome).increment(1);
         info!(elapsed_ms = elapsed.as_millis(), outcome, "recovery timing");
 
+        // TOCTOU re-check: did the lease task fetch_add during
+        // recovery? recover_from_pg doesn't touch self.generation,
+        // so gen_now != gen_at_entry ⇒ lease loop fetch_add'd ⇒ flap.
+        // The re-acquire's LeaderAcquired is already queued in our
+        // mpsc — discard this recovery, let the next one re-run.
+        let gen_now = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        if gen_now != gen_at_entry {
+            warn!(
+                gen_at_entry,
+                gen_now,
+                recovery_ok = result.is_ok(),
+                "generation changed during recovery \u{2014} lease flapped; \
+                 DISCARDING this recovery (next LeaderAcquired will retry)"
+            );
+            metrics::counter!("rio_scheduler_recovery_total", "outcome" => "discarded_flap")
+                .increment(1);
+            // Clear the partial state we loaded. The next
+            // LeaderAcquired's recover_from_pg() will do this
+            // again but do it here too so any Tick that sneaks in
+            // before the next LeaderAcquired sees a consistent
+            // (empty) DAG.
+            self.dag = DerivationDag::new();
+            self.ready_queue.clear();
+            self.builds.clear();
+            self.build_events.clear();
+            self.build_sequences.clear();
+            // DON'T set recovery_complete — the lease loop's clear
+            // at the lose-transition stays in effect. dispatch_ready
+            // gates on this (dispatch.rs:27); early-return here
+            // makes the post-LeaderAcquired dispatch a no-op.
+            return;
+        }
+
         match result {
-            Ok(()) => {
+            Ok(pg_max_gen) => {
+                // --- Seed generation from PG high-water mark ---
+                // fetch_max not store: the lease loop already did
+                // fetch_add(1) on this SAME Arc. store would clobber
+                // it. fetch_max takes the larger of (lease's value,
+                // PG + 1). Defensive against Lease annotation reset
+                // (`kubectl delete lease` zeros the annotation; PG's
+                // high-water persists). Applied HERE (not inside
+                // recover_from_pg) so it happens AFTER the TOCTOU
+                // check — this write is deliberate, not a flap.
+                if let Some(max_gen) = pg_max_gen {
+                    let target = (max_gen as u64).saturating_add(1);
+                    let prev = self
+                        .generation
+                        .fetch_max(target, std::sync::atomic::Ordering::Release);
+                    if target > prev {
+                        info!(
+                            prev_gen = prev,
+                            pg_high_water = max_gen,
+                            new_gen = target,
+                            "seeded generation from PG high-water mark (defensive monotonicity)"
+                        );
+                    }
+                }
+
                 // Stale-pin cleanup: crash-between-pin-and-unpin
                 // (scheduler crashed after dispatch pin but before
                 // completion unpin) leaves rows in scheduler_live_

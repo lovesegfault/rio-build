@@ -46,7 +46,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::serde_json::json;
@@ -62,6 +62,13 @@ const LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// Renewal interval. LEASE_TTL / 3 per K8s convention.
 const RENEW_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Slack between renew timeout and RENEW_INTERVAL. Each renew
+/// attempt must return BEFORE the next interval tick would fire;
+/// otherwise a hung apiserver burns multiple ticks on one call.
+/// 3s deadline for a Lease GET+PUT is generous (healthy p99 <100ms)
+/// while still giving 3 attempts before LEASE_TTL.
+const RENEW_SLOP: Duration = Duration::from_secs(2);
 
 /// Lease configuration, read from env at startup.
 ///
@@ -259,6 +266,7 @@ pub async fn run_lease_loop(
     );
 
     let mut was_leading = false;
+    let mut last_successful_renew = Instant::now();
     let mut interval = tokio::time::interval(RENEW_INTERVAL);
     // Skip: if one renewal is slow (apiserver busy), don't fire
     // twice immediately. The lease TTL is 15s; we have slack.
@@ -270,8 +278,15 @@ pub async fn run_lease_loop(
             _ = interval.tick() => {}
         }
 
-        match election.try_acquire_or_renew().await {
-            Ok(result) => {
+        let renew_deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+        match tokio::time::timeout(renew_deadline, election.try_acquire_or_renew()).await {
+            Ok(Ok(result)) => {
+                // Successful round-trip (apiserver answered). Even
+                // Standby/Conflict reset the self-fence clock — we
+                // KNOW the apiserver state, we just don't hold the
+                // lease. The clock tracks "am I blind", not "am I
+                // leader".
+                last_successful_renew = Instant::now();
                 // Conflict on renew = someone stole since our GET
                 // → unambiguous lose. Conflict on steal = another
                 // standby raced us → we were never leading. Both
@@ -382,19 +397,36 @@ pub async fn run_lease_loop(
 
                 was_leading = now_leading;
             }
-            Err(e) => {
-                // K8s API error. Transient — retry next tick. If
-                // this persists past LEASE_TTL, our lease expires
-                // and another replica acquires. That's CORRECT
-                // behavior for "this replica's K8s connectivity
-                // is broken."
+            outcome @ (Ok(Err(_)) | Err(_)) => {
+                // Either apiserver returned an error (Ok(Err)) or
+                // our timeout fired before it answered (Err(Elapsed)).
+                // Both mean: no fresh view of the Lease object.
+                match &outcome {
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "lease renew failed (apiserver error); retrying next tick");
+                    }
+                    Err(_) => {
+                        warn!(deadline = ?renew_deadline, "lease renew TIMED OUT (apiserver hung?); retrying next tick");
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                }
                 //
-                // DON'T flip is_leader here. We might still hold
-                // the lease (apiserver is down for EVERYONE; no
-                // one can acquire). Flipping would stop dispatch
-                // even though we're the only viable leader. Let
-                // the TTL expiry decide.
-                warn!(error = %e, "lease renew failed (transient?); retrying next tick");
+                // Local self-fence: if LEASE_TTL has elapsed since
+                // the last SUCCESSFUL round-trip, flip is_leader
+                // locally. At this point, any replica that CAN reach
+                // the apiserver has already stolen (observed-record
+                // TTL = our TTL; same clock).
+                //
+                // The old "DON'T flip — apiserver down for EVERYONE"
+                // argument is wrong once elapsed > TTL. In the
+                // symmetric-partition case (nobody reaches apiserver)
+                // flipping costs nothing: workers can't be scheduled
+                // anyway. In the asymmetric case (WE are partitioned,
+                // peer is not) NOT flipping makes us a stale-assignment
+                // noise generator. Worker-side generation fence
+                // (r[sched.lease.generation-fence]) saves correctness
+                // either way; this fence saves ops sanity.
+                maybe_self_fence(&state, &mut was_leading, last_successful_renew);
             }
         }
     }
@@ -415,6 +447,40 @@ pub async fn run_lease_loop(
         }
     }
     debug!("lease loop exited");
+}
+
+/// Local self-fence: if we believed we were leading but haven't
+/// had a successful apiserver round-trip in over `LEASE_TTL`, flip
+/// `is_leader=false` locally. At this point, any replica that CAN
+/// reach the apiserver has already stolen. The only world where we're
+/// still the rightful leader is one where NOBODY can reach the
+/// apiserver — in which case dispatch is pointless anyway.
+///
+/// Extracted from `run_lease_loop`'s error arm so it can be unit-
+/// tested without spawning the full loop (paused time + real TCP
+/// mocks cause spurious deadline-exceeded; see lang-gotchas).
+///
+/// Returns `true` if the fence fired (for test assertions).
+fn maybe_self_fence(
+    state: &LeaderState,
+    was_leading: &mut bool,
+    last_successful_renew: Instant,
+) -> bool {
+    if *was_leading && last_successful_renew.elapsed() > LEASE_TTL {
+        warn!(
+            blind_for = ?last_successful_renew.elapsed(),
+            "LOCAL SELF-FENCE: no successful renew in > LEASE_TTL, stepping down locally"
+        );
+        state.is_leader.store(false, Ordering::Relaxed);
+        state.recovery_complete.store(false, Ordering::Relaxed);
+        metrics::counter!("rio_scheduler_lease_lost_total").increment(1);
+        *was_leading = false;
+        // No spawn_patch_deletion_cost: can't reach apiserver.
+        // The peer (if leading) patched its OWN pod.
+        true
+    } else {
+        false
+    }
 }
 
 // r[impl sched.lease.deletion-cost]
@@ -546,5 +612,130 @@ mod tests {
             !state.is_leader.load(Ordering::Relaxed),
             "K8s mode: NOT leader until lease loop acquires"
         );
+    }
+
+    // ---- Renewal timeout + self-fence (remediation 08) -----------
+
+    use super::election::LeaderElection;
+    use rio_test_support::kube_mock::ApiServerVerifier;
+
+    /// Apiserver accepts the connection but never responds. The
+    /// renew timeout must fire within RENEW_INTERVAL - RENEW_SLOP.
+    /// Without the timeout wrapper at `run_lease_loop`'s callsite,
+    /// `try_acquire_or_renew` would hang until the outer tokio::test
+    /// timeout — proving the bug.
+    ///
+    /// Hang injection: hold the verifier WITHOUT calling `.run()`.
+    /// The tower-test mock's Handle stays alive (request can queue)
+    /// but nobody ever calls `next_request()` to pull + respond →
+    /// the client's GET pends forever. Calling `.run(vec![])` would
+    /// NOT work: the spawned task drops the Handle on return, which
+    /// makes the mock return `ServiceError::Closed` immediately.
+    #[tokio::test]
+    async fn renew_timeout_fires_on_hung_apiserver() {
+        // _verifier binding keeps the tower-test Handle alive for
+        // the whole test body. No drop-bomb on ApiServerVerifier
+        // itself (only on the VerifierGuard returned by .run()).
+        let (client, _verifier) = ApiServerVerifier::new();
+
+        let mut election = LeaderElection::new(
+            client,
+            "default",
+            "rio-sched".into(),
+            "us".into(),
+            LEASE_TTL,
+        );
+
+        let deadline = RENEW_INTERVAL.saturating_sub(RENEW_SLOP);
+        let started = Instant::now();
+        let result = tokio::time::timeout(deadline, election.try_acquire_or_renew()).await;
+
+        assert!(
+            result.is_err(),
+            "timeout should fire (apiserver hung), got {result:?}"
+        );
+        // Prove it was OUR timeout, not some inner kube-rs deadline.
+        // If kube-rs had a default request timeout < 3s, this would
+        // complete early with Ok(Err(_)) and the elapsed check would
+        // catch it.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= deadline && elapsed < deadline + Duration::from_millis(500),
+            "timeout fired at {elapsed:?}, expected ~{deadline:?}"
+        );
+    }
+
+    /// Self-fence fires when `last_successful_renew` is older than
+    /// LEASE_TTL and we believed we were leading. Simulates the
+    /// state after 4+ failed renew ticks (5s each, TTL=15s).
+    #[test]
+    fn self_fence_flips_is_leader_after_ttl_of_failures() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
+        state.is_leader.store(true, Ordering::Relaxed);
+        state.recovery_complete.store(true, Ordering::Relaxed);
+
+        let mut was_leading = true;
+        // 20s ago > LEASE_TTL (15s). Pattern matches election.rs:535.
+        let last_renew = Instant::now() - Duration::from_secs(20);
+
+        let fired = maybe_self_fence(&state, &mut was_leading, last_renew);
+
+        assert!(fired, "self-fence should fire past TTL");
+        assert!(
+            !state.is_leader.load(Ordering::Relaxed),
+            "self-fence should flip is_leader=false"
+        );
+        assert!(
+            !state.recovery_complete.load(Ordering::Relaxed),
+            "self-fence should clear recovery_complete (re-acquire re-runs recovery)"
+        );
+        assert!(
+            !was_leading,
+            "was_leading should flip so next tick is edge-free"
+        );
+    }
+
+    /// Self-fence does NOT fire within TTL. One or two transient
+    /// apiserver blips should not cause step-down — the lease may
+    /// still be validly held (the original "DON'T flip" comment's
+    /// reasoning is correct for the FIRST few failures).
+    #[test]
+    fn self_fence_does_not_flip_before_ttl() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(2)));
+        state.is_leader.store(true, Ordering::Relaxed);
+        state.recovery_complete.store(true, Ordering::Relaxed);
+
+        let mut was_leading = true;
+        // 10s ago < LEASE_TTL (15s). Two failed ticks, lease still valid.
+        let last_renew = Instant::now() - Duration::from_secs(10);
+
+        let fired = maybe_self_fence(&state, &mut was_leading, last_renew);
+
+        assert!(!fired, "within TTL → no self-fence");
+        assert!(
+            state.is_leader.load(Ordering::Relaxed),
+            "within TTL → still leader (transient blip)"
+        );
+        assert!(state.recovery_complete.load(Ordering::Relaxed));
+        assert!(was_leading);
+    }
+
+    /// Self-fence is gated on `was_leading`. A standby that has
+    /// NEVER held the lease should not "step down" — it has nothing
+    /// to step down from. Avoids spurious lease_lost_total increments
+    /// from a standby whose apiserver connectivity is flaky.
+    #[test]
+    fn self_fence_no_op_when_not_leading() {
+        let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));
+        // is_leader already false, recovery_complete already false.
+
+        let mut was_leading = false;
+        let last_renew = Instant::now() - Duration::from_secs(20);
+
+        let fired = maybe_self_fence(&state, &mut was_leading, last_renew);
+
+        assert!(!fired, "not leading → no fence even past TTL");
+        assert!(!state.is_leader.load(Ordering::Relaxed));
+        assert!(!was_leading);
     }
 }
