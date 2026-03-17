@@ -10,10 +10,12 @@ on a bare ARC runner image without any setup.
           builds while running, and a non-zero exit stops Nix from
           scheduling any further builds for the whole session.
 
-  daemon  Started by setup-nix. Follows the queue, fetches a fresh
-          OIDC token per entry (short TTL, builds are long), shells
-          out to `niks3 push`, writes a completion marker. SIGTERM
-          finishes the current upload before exiting.
+  daemon  Started by setup-nix. Follows the queue, batches entries
+          (up to BATCH_SIZE paths or BATCH_WAIT_S, whichever first),
+          fetches ONE OIDC token per batch, shells out to `niks3 push`
+          with the whole batch at once (niks3 uploads in parallel and
+          dedups shared closure deps), writes completion markers.
+          SIGTERM flushes the pending batch before exiting.
 
   drain   Called by the niks3-push action (if: always()). Waits for
           completions to catch up with the queue, then SIGTERMs the
@@ -102,21 +104,25 @@ def _sigterm(_signum: int, _frame: object) -> None:
     _stop = True
 
 
-def _follow(path: Path) -> "iter[str]":
-    """Yield appended lines forever. Poor man's tail -F.
+def _follow(path: Path):
+    """Yield appended lines; yield None on each EOF poll. Poor man's tail -F.
 
     Stdlib only — no inotify. 200ms poll on EOF is fine: the daemon
     exists to keep uploads off the hook's critical path, not to be
     low-latency. Starts from line 1 so anything queued before the
     daemon came up (e.g. the niks3 build itself, on a cold cache)
     gets processed.
+
+    Yields None on every EOF tick so the daemon loop can check
+    batch-age timeouts without blocking on the next real line.
     """
-    with open(path, "r") as f:
+    with open(path) as f:
         while not _stop:
             line = f.readline()
             if line:
                 yield line.rstrip("\n")
             else:
+                yield None
                 time.sleep(0.2)
 
 
@@ -158,22 +164,93 @@ def _mark_done(done: Path, entry: dict) -> None:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+# Batch tuning. `niks3 push` accepts multiple paths (<store-paths...>)
+# and uploads them with 30-way parallelism + shared-closure dedup —
+# so one batched call amortizes OIDC fetch + HTTP setup across many
+# paths. 32 paths × ~85 chars ≈ 3KB argv, nowhere near ARG_MAX.
+BATCH_SIZE = 32
+BATCH_WAIT_S = 2.0
+
+# Stall timeout for the niks3 subprocess. Not an upload budget — if
+# niks3 makes progress it won't hit this. Catches wedged subprocesses
+# (server hang, network black hole) that would otherwise wedge drain.
+PUSH_TIMEOUT_S = 300
+
+
 def run_daemon(queue: Path, done: Path, niks3_bin: str, server_url: str) -> int:
-    """Tail the queue, push each entry, log completion.
+    """Tail the queue, batch entries, push, log completions.
 
-    SIGTERM sets _stop; we finish the in-flight upload and exit
-    cleanly at the next loop boundary. SIGINT treated the same
-    (someone ran the daemon by hand and hit ^C).
+    SIGTERM sets _stop; we flush the pending batch and exit cleanly
+    at the next loop boundary. SIGINT same (local ^C).
 
-    Push failures are logged, not fatal. Cache population is
-    best-effort; the worst outcome is a cache miss next run.
+    Push failures mark the whole batch as failed. Worst case is a
+    cache miss next run; the one-bad-path-fails-31-good trade-off is
+    acceptable given the 10×+ speedup over per-entry pushing.
     """
     signal.signal(signal.SIGTERM, _sigterm)
     signal.signal(signal.SIGINT, _sigterm)
 
     sys.stderr.write(f"[niks3] daemon started, following {queue}\n")
+    sys.stderr.flush()
+
+    batch_entries: list[dict] = []
+    batch_paths: list[str] = []
+    batch_started = time.monotonic()
+
+    def _flush() -> bool:
+        """Push the accumulated batch. Returns False iff niks3 binary is gone."""
+        nonlocal batch_entries, batch_paths, batch_started
+        entries, paths = batch_entries, batch_paths
+        batch_entries, batch_paths = [], []
+        batch_started = time.monotonic()
+        if not paths:
+            return True
+
+        oidc = _fetch_oidc(server_url)
+        if oidc is None:
+            for e in entries:
+                _mark_done(done, {**e, "pushed": False, "reason": "no_oidc"})
+            return True
+
+        cmd = [niks3_bin, "push", "--server-url", server_url, "--auth-token", oidc, *paths]
+        try:
+            subprocess.run(cmd, check=True, timeout=PUSH_TIMEOUT_S)
+            for e in entries:
+                _mark_done(done, {**e, "pushed": True})
+            sys.stderr.write(
+                f"[niks3] pushed batch: {len(paths)} path(s) from {len(entries)} drv(s)\n"
+            )
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(
+                f"[niks3] push timed out after {PUSH_TIMEOUT_S}s: {len(paths)} path(s)\n"
+            )
+            for e in entries:
+                _mark_done(done, {**e, "pushed": False, "reason": "timeout"})
+        except subprocess.CalledProcessError as ex:
+            sys.stderr.write(
+                f"[niks3] push failed (exit {ex.returncode}): {len(paths)} path(s) "
+                f"from {len(entries)} drv(s)\n"
+            )
+            for e in entries:
+                _mark_done(done, {**e, "pushed": False, "reason": f"exit_{ex.returncode}"})
+        except FileNotFoundError:
+            sys.stderr.write(f"[niks3] {niks3_bin} not found, bailing\n")
+            sys.stderr.flush()
+            for e in entries:
+                _mark_done(done, {**e, "pushed": False, "reason": "no_binary"})
+            return False
+        sys.stderr.flush()
+        return True
 
     for line in _follow(queue):
+        if _stop:
+            break
+        if line is None:
+            # EOF poll tick — flush if the batch has aged out.
+            if batch_paths and time.monotonic() - batch_started > BATCH_WAIT_S:
+                if not _flush():
+                    return 1
+            continue
         if not line:
             continue
         try:
@@ -181,35 +258,28 @@ def run_daemon(queue: Path, done: Path, niks3_bin: str, server_url: str) -> int:
             out_paths = entry.get("out_paths", [])
         except json.JSONDecodeError as e:
             sys.stderr.write(f"[niks3] skipping bad queue line: {e}\n")
+            sys.stderr.flush()
             _mark_done(done, {"error": "bad_json", "raw": line[:200]})
             continue
         if not out_paths:
             _mark_done(done, {**entry, "pushed": False, "reason": "empty"})
             continue
 
-        oidc = _fetch_oidc(server_url)
-        if oidc is None:
-            _mark_done(done, {**entry, "pushed": False, "reason": "no_oidc"})
-            continue
+        if not batch_paths:
+            batch_started = time.monotonic()
+        batch_entries.append(entry)
+        batch_paths.extend(out_paths)
 
-        cmd = [niks3_bin, "push", "--server-url", server_url, "--auth-token", oidc, *out_paths]
-        try:
-            subprocess.run(cmd, check=True)
-            _mark_done(done, {**entry, "pushed": True})
-            sys.stderr.write(f"[niks3] pushed {len(out_paths)} path(s) from {entry.get('drv_path', '?')}\n")
-        except subprocess.CalledProcessError as e:
-            sys.stderr.write(f"[niks3] push failed (exit {e.returncode}): {out_paths}\n")
-            _mark_done(done, {**entry, "pushed": False, "reason": f"exit_{e.returncode}"})
-        except FileNotFoundError:
-            # niks3 binary vanished — unrecoverable for this run.
-            sys.stderr.write(f"[niks3] {niks3_bin} not found, bailing\n")
-            _mark_done(done, {**entry, "pushed": False, "reason": "no_binary"})
-            return 1
+        if len(batch_paths) >= BATCH_SIZE:
+            if not _flush():
+                return 1
 
-        if _stop:
-            break
+    # SIGTERM or generator exhausted — flush whatever's left.
+    if not _flush():
+        return 1
 
     sys.stderr.write("[niks3] daemon exiting\n")
+    sys.stderr.flush()
     return 0
 
 
@@ -223,6 +293,39 @@ def _linecount(path: Path) -> int:
         return 0
 
 
+def _print_pending(queue: Path, done: Path) -> None:
+    """Drain-timeout diagnostics: which queue entries never reached .done."""
+    done_drvs: set[str] = set()
+    try:
+        with open(done) as f:
+            for raw in f:
+                try:
+                    done_drvs.add(json.loads(raw).get("drv_path", ""))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    pending: list[dict] = []
+    try:
+        with open(queue) as f:
+            for raw in f:
+                try:
+                    e = json.loads(raw)
+                    if e.get("drv_path", "") not in done_drvs:
+                        pending.append(e)
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        return
+    print(f"[niks3] {len(pending)} entries still pending:")
+    for e in pending[:20]:
+        drv = e.get("drv_path", "?")
+        base = drv.rsplit("/", 1)[-1] if "/" in drv else drv
+        print(f"  {base}  ({len(e.get('out_paths', []))} path(s))")
+    if len(pending) > 20:
+        print(f"  … and {len(pending) - 20} more")
+
+
 def run_drain(queue: Path, done: Path, pid_file: Path, timeout: int) -> int:
     """Wait for done-count ≥ queued-count, then SIGTERM the daemon.
 
@@ -232,6 +335,11 @@ def run_drain(queue: Path, done: Path, pid_file: Path, timeout: int) -> int:
     Returns 0 even on timeout: cache push is not a CI gate. We emit
     a ::warning:: so it's visible in the GHA summary.
     """
+    # GHA buffers stdout when not a TTY; force line buffering so
+    # progress updates appear with correct timestamps instead of
+    # all flushing at once on exit.
+    sys.stdout.reconfigure(line_buffering=True)
+
     if not pid_file.exists():
         queued = _linecount(queue)
         print(f"[niks3] no daemon pid file — nothing to drain ({queued} queued, 0 uploaded)")
@@ -255,6 +363,7 @@ def run_drain(queue: Path, done: Path, pid_file: Path, timeout: int) -> int:
         time.sleep(2)
     else:
         print(f"::warning::niks3 drain timed out after {timeout}s ({done_n}/{queued})")
+        _print_pending(queue, done)
 
     # Try the process group first (daemon started under setsid, so
     # -pid hits its whole group including any niks3 child). Fall
@@ -300,7 +409,7 @@ def main() -> int:
     p.add_argument("--niks3-bin", help="daemon only")
     p.add_argument("--server-url", help="daemon only")
     p.add_argument("--pid-file", type=Path, help="drain only")
-    p.add_argument("--timeout", type=int, default=300, help="drain only")
+    p.add_argument("--timeout", type=int, default=600, help="drain only")
     a = p.parse_args()
 
     if a.mode == "hook":

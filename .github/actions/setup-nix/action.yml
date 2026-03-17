@@ -59,9 +59,11 @@ runs:
           ${{ inputs.kvm == 'true' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
 
     # Uploader daemon. Follows the queue from line 1 (so anything
-    # queued during the niks3 build below is picked up), fetches a
-    # fresh OIDC per entry, pushes, writes a .done line for drain
-    # to count against.
+    # queued during the niks3 build below is picked up), batches
+    # entries (32 paths or 2s, whichever first), fetches one OIDC
+    # per batch, pushes the whole batch in one `niks3 push` call
+    # (parallel upload + closure dedup inside niks3), writes .done
+    # lines for drain to count against.
     #
     # Fork PRs don't get id-token:write → request token env is unset.
     # Skip the daemon. The hook still fires (queue grows harmlessly);

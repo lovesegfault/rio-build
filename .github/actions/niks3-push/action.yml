@@ -27,15 +27,26 @@ runs:
         SCRIPT="$GITHUB_ACTION_PATH/../setup-nix/niks3_hook.py"
         LOG="$RUNNER_TEMP/niks3-daemon.log"
 
+        # Stream the daemon log alongside drain progress. -n +1 shows
+        # the whole file from the start (daemon's been running since
+        # setup-nix); -F retries if briefly unavailable. Interleaves
+        # with drain's stdout — that's the point, so you can see
+        # daemon batch pushes landing while drain ticks forward.
+        if [[ -f "$LOG" ]]; then
+          tail -F -n +1 "$LOG" 2>/dev/null &
+          TAIL_PID=$!
+        fi
+
         /usr/bin/python3 "$SCRIPT" \
           --mode=drain \
           --queue="$QUEUE" \
           --done="$QUEUE.done" \
           --pid-file="$RUNNER_TEMP/niks3-daemon.pid" \
-          --timeout=300
+          --timeout=600 || true
 
-        if [[ -s "$LOG" ]]; then
-          echo "::group::niks3 daemon log"
-          cat "$LOG"
-          echo "::endgroup::"
+        if [[ -n "${TAIL_PID:-}" ]]; then
+          # Give tail a beat to flush the daemon's exit line.
+          sleep 0.5
+          kill "$TAIL_PID" 2>/dev/null || true
+          wait "$TAIL_PID" 2>/dev/null || true
         fi
