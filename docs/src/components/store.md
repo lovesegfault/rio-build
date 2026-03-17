@@ -166,6 +166,10 @@ r[store.signing.fingerprint]
 - Signed message: canonical fingerprint `1;<store-path>;sha256:<nar-hash-nixbase32>;<nar-size>;<sorted-refs-comma-sep>` — semicolon separator, `1;` version prefix, `sha256:` algorithm tag, references are full paths (not basenames) joined by comma. Matches Nix's `ValidPathInfo::fingerprint()` in `path-info.cc`. See `fingerprint()` in `rio-nix/src/narinfo.rs`.
 - Multi-tenant: each tenant can have their own signing key for their paths
 
+r[store.signing.empty-refs-warn]
+
+When signing a non-CA path with zero references, the store MUST emit a warning. Non-leaf derivations with empty references indicate the worker's reference scanner missed deps.
+
 ### Key Rotation
 
 1. Generate a new ed25519 signing key
@@ -188,6 +192,10 @@ r[store.gc.two-phase]
 **Orphan cleanup:** Stale `'uploading'` manifests are reclaimed after a configurable timeout (default: 2 hours). Their chunk lists are used to decrement refcounts for referenced chunks; only chunks whose refcount drops to 0 are eligible for deletion via `pending_s3_deletes`. No full S3 enumeration needed. A weekly full orphan scan remains as a safety net for any leaked chunks not covered by manifest-based cleanup.
 
 Configurable retention policies per tenant/project. Supports dry-run mode via `GCRequest.dry_run`.
+
+r[store.gc.empty-refs-gate]
+
+Before the mark phase, GC MUST check the ratio of sweep-eligible paths with empty references. If >10%, refuse with `FailedPrecondition` unless `force=true`. This prevents mass deletion when the worker's reference scanner is broken.
 
 ## Crash-Safe S3 Deletion (`pending_s3_deletes`)
 
